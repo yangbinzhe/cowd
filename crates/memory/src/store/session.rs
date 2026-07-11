@@ -18,8 +18,9 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, TransactionBehavior};
+use serde::{Deserialize, Serialize};
 
-use crate::{error::MemoryError, runtime_event::RUNTIME_EVENT_TYPE, store::Result};
+use crate::{error::MemoryError, runtime_event::SESSION_DOMAIN_EVENT_TYPE, store::Result};
 
 // ---------------------------------------------------------------------------
 // Sentinel for in-memory databases (tests only)
@@ -112,6 +113,118 @@ pub struct SessionMessage {
     pub created_at_ms: u64,
 }
 
+/// Durable state of one Session -> Runtime materialization request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboxStatus {
+    Pending,
+    Claimed,
+    RetryScheduled,
+    Materialized,
+    BlockedMaterialization,
+}
+
+impl OutboxStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Claimed => "claimed",
+            Self::RetryScheduled => "retry_scheduled",
+            Self::Materialized => "materialized",
+            Self::BlockedMaterialization => "blocked_materialization",
+        }
+    }
+
+    fn parse(value: &str) -> rusqlite::Result<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "claimed" => Ok(Self::Claimed),
+            "retry_scheduled" => Ok(Self::RetryScheduled),
+            "materialized" => Ok(Self::Materialized),
+            "blocked_materialization" => Ok(Self::BlockedMaterialization),
+            other => Err(rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                format!("unknown session runtime outbox status `{other}`").into(),
+            )),
+        }
+    }
+}
+
+/// Failure classes determine whether the bridge may retry automatically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboxFailureClass {
+    Retryable,
+    Permanent,
+    AuthorizationBlocked,
+    CorruptPayload,
+}
+
+impl OutboxFailureClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Retryable => "retryable",
+            Self::Permanent => "permanent",
+            Self::AuthorizationBlocked => "authorization_blocked",
+            Self::CorruptPayload => "corrupt_payload",
+        }
+    }
+
+    fn parse(value: &str) -> rusqlite::Result<Self> {
+        match value {
+            "retryable" => Ok(Self::Retryable),
+            "permanent" => Ok(Self::Permanent),
+            "authorization_blocked" => Ok(Self::AuthorizationBlocked),
+            "corrupt_payload" => Ok(Self::CorruptPayload),
+            other => Err(rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                format!("unknown session runtime outbox failure class `{other}`").into(),
+            )),
+        }
+    }
+}
+
+/// Stable IDs supplied by ingress for one user message and Runtime request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRuntimeOutboxRequest {
+    pub request_id: String,
+    pub turn_id: String,
+    pub message_id: String,
+    pub created_at_ms: u64,
+}
+
+/// Persisted bridge work item. `revision` protects every status transition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRuntimeOutboxRecord {
+    pub request_id: String,
+    pub turn_id: String,
+    pub message_id: String,
+    pub session_id: String,
+    pub sequence: usize,
+    pub status: OutboxStatus,
+    pub runtime_commit_cursor: Option<u64>,
+    pub attempts: u32,
+    pub next_attempt_at_ms: u64,
+    pub claim_owner: Option<String>,
+    pub claim_expires_at_ms: Option<u64>,
+    pub failure_class: Option<OutboxFailureClass>,
+    pub last_error: Option<String>,
+    pub revision: u64,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRuntimeOutboxHealth {
+    pub pending: usize,
+    pub claimed: usize,
+    pub retry_scheduled: usize,
+    pub materialized: usize,
+    pub blocked: usize,
+}
+
 fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE;").map_err(sql_err)?;
 
@@ -170,6 +283,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
         r"CREATE INDEX IF NOT EXISTS idx_sessions_last_activity ON sessions(last_activity)",
         r"CREATE TABLE IF NOT EXISTS messages (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            stable_message_id TEXT NOT NULL,
             session_id      TEXT NOT NULL,
             sequence        INTEGER NOT NULL,
             role            TEXT NOT NULL,
@@ -180,6 +294,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
             token_usage_json TEXT,
             created_at_ms   INTEGER NOT NULL,
             FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+            UNIQUE(stable_message_id),
             UNIQUE(session_id, sequence)
         )",
         r"CREATE INDEX IF NOT EXISTS idx_messages_session     ON messages(session_id)",
@@ -222,6 +337,8 @@ fn init_schema(conn: &Connection) -> Result<()> {
     }
 
     ensure_messages_schema(conn)?;
+    ensure_session_runtime_outbox_schema(conn)?;
+    migrate_legacy_session_domain_events(conn)?;
 
     let existing_session_columns = {
         let mut stmt = conn
@@ -350,6 +467,18 @@ fn table_columns(conn: &Connection, table: &str) -> Result<std::collections::BTr
 
 fn ensure_messages_schema(conn: &Connection) -> Result<()> {
     let existing_message_columns = table_columns(conn, "messages")?;
+    if !existing_message_columns.contains("stable_message_id") {
+        conn.execute("ALTER TABLE messages ADD COLUMN stable_message_id TEXT", [])
+            .map_err(sql_err)?;
+        conn.execute_batch(
+            r#"
+            UPDATE messages
+               SET stable_message_id = 'legacy:' || lower(hex(CAST(session_id AS BLOB))) || ':' || sequence
+             WHERE stable_message_id IS NULL OR stable_message_id = '';
+            "#,
+        )
+        .map_err(sql_err)?;
+    }
     if !existing_message_columns.contains("content_json") {
         conn.execute(
             r#"ALTER TABLE messages ADD COLUMN content_json TEXT NOT NULL DEFAULT '[{"type":"text","text":""}]'"#,
@@ -449,6 +578,20 @@ fn ensure_messages_schema(conn: &Connection) -> Result<()> {
 
     conn.execute_batch(
         r#"
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_stable_message_id
+            ON messages(stable_message_id);
+        CREATE TRIGGER IF NOT EXISTS messages_stable_id_required_insert
+        BEFORE INSERT ON messages
+        WHEN NEW.stable_message_id IS NULL OR NEW.stable_message_id = ''
+        BEGIN
+            SELECT RAISE(ABORT, 'messages.stable_message_id is required');
+        END;
+        CREATE TRIGGER IF NOT EXISTS messages_stable_id_required_update
+        BEFORE UPDATE OF stable_message_id ON messages
+        WHEN NEW.stable_message_id IS NULL OR NEW.stable_message_id = ''
+        BEGIN
+            SELECT RAISE(ABORT, 'messages.stable_message_id is required');
+        END;
         DROP TRIGGER IF EXISTS messages_fts_ai;
         DROP TRIGGER IF EXISTS messages_fts_ad;
         DROP TRIGGER IF EXISTS messages_fts_au;
@@ -492,6 +635,74 @@ fn ensure_messages_schema(conn: &Connection) -> Result<()> {
     )
     .map_err(sql_err)?;
 
+    Ok(())
+}
+
+fn ensure_session_runtime_outbox_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS session_runtime_outbox (
+            request_id TEXT PRIMARY KEY,
+            turn_id TEXT NOT NULL UNIQUE,
+            message_id TEXT NOT NULL UNIQUE,
+            session_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            runtime_commit_cursor INTEGER,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at_ms INTEGER NOT NULL,
+            claim_owner TEXT,
+            claim_expires_at_ms INTEGER,
+            failure_class TEXT,
+            last_error TEXT,
+            revision INTEGER NOT NULL DEFAULT 0,
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+            FOREIGN KEY (message_id) REFERENCES messages(stable_message_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_session_runtime_outbox_claim
+            ON session_runtime_outbox(status, next_attempt_at_ms, claim_expires_at_ms, sequence);
+        CREATE INDEX IF NOT EXISTS idx_session_runtime_outbox_session
+            ON session_runtime_outbox(session_id, sequence);
+        CREATE TABLE IF NOT EXISTS session_runtime_outbox_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            actor TEXT,
+            reason TEXT,
+            from_status TEXT NOT NULL,
+            to_status TEXT NOT NULL,
+            attempts INTEGER NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            FOREIGN KEY (request_id) REFERENCES session_runtime_outbox(request_id) ON DELETE CASCADE
+        );
+        "#,
+    )
+    .map_err(sql_err)
+}
+
+fn migrate_legacy_session_domain_events(conn: &Connection) -> Result<()> {
+    conn.execute(
+        r#"
+        UPDATE session_events
+           SET event_type = ?1,
+               event_json = json_set(
+                   event_json,
+                   '$.scope',
+                   CASE json_extract(event_json, '$.scope')
+                       WHEN 'task' THEN 'application_task'
+                       ELSE json_extract(event_json, '$.scope')
+                   END
+               )
+         WHERE event_type = 'RuntimeEvent'
+           AND json_valid(event_json)
+           AND json_extract(event_json, '$.scope') IN
+               ('session', 'message', 'turn', 'context', 'tool', 'memory', 'policy', 'task', 'mfg')
+        "#,
+        params![SESSION_DOMAIN_EVENT_TYPE],
+    )
+    .map_err(sql_err)?;
     Ok(())
 }
 
@@ -567,6 +778,91 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMessage> {
         token_usage_json: row.get(7)?,
         created_at_ms: row.get::<_, i64>(8)? as u64,
     })
+}
+
+fn row_to_outbox(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRuntimeOutboxRecord> {
+    Ok(SessionRuntimeOutboxRecord {
+        request_id: row.get(0)?,
+        turn_id: row.get(1)?,
+        message_id: row.get(2)?,
+        session_id: row.get(3)?,
+        sequence: row.get::<_, i64>(4)? as usize,
+        status: OutboxStatus::parse(&row.get::<_, String>(5)?)?,
+        runtime_commit_cursor: row.get::<_, Option<i64>>(6)?.map(|value| value as u64),
+        attempts: row.get::<_, i64>(7)? as u32,
+        next_attempt_at_ms: row.get::<_, i64>(8)? as u64,
+        claim_owner: row.get(9)?,
+        claim_expires_at_ms: row.get::<_, Option<i64>>(10)?.map(|value| value as u64),
+        failure_class: row
+            .get::<_, Option<String>>(11)?
+            .as_deref()
+            .map(OutboxFailureClass::parse)
+            .transpose()?,
+        last_error: row.get(12)?,
+        revision: row.get::<_, i64>(13)? as u64,
+        created_at_ms: row.get::<_, i64>(14)? as u64,
+        updated_at_ms: row.get::<_, i64>(15)? as u64,
+    })
+}
+
+fn query_outbox(conn: &Connection, request_id: &str) -> Result<Option<SessionRuntimeOutboxRecord>> {
+    conn.query_row(
+        r"SELECT request_id, turn_id, message_id, session_id, sequence, status,
+                  runtime_commit_cursor, attempts, next_attempt_at_ms, claim_owner,
+                  claim_expires_at_ms, failure_class, last_error, revision,
+                  created_at_ms, updated_at_ms
+             FROM session_runtime_outbox WHERE request_id = ?1",
+        params![request_id],
+        row_to_outbox,
+    )
+    .optional()
+    .map_err(sql_err)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_outbox_history(
+    tx: &rusqlite::Transaction<'_>,
+    record: &SessionRuntimeOutboxRecord,
+    action: &str,
+    actor: Option<&str>,
+    reason: Option<&str>,
+    from_status: &str,
+    to_status: &str,
+    now_ms: u64,
+) -> Result<()> {
+    tx.execute(
+        r"INSERT INTO session_runtime_outbox_history
+            (request_id, action, actor, reason, from_status, to_status, attempts, created_at_ms)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            record.request_id,
+            action,
+            actor,
+            reason,
+            from_status,
+            to_status,
+            record.attempts as i64,
+            now_ms as i64,
+        ],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
+fn validate_outbox_identity(
+    message: &SessionMessage,
+    request: &SessionRuntimeOutboxRequest,
+) -> Result<()> {
+    if message.session_id.trim().is_empty()
+        || request.request_id.trim().is_empty()
+        || request.turn_id.trim().is_empty()
+        || request.message_id.trim().is_empty()
+    {
+        return Err(MemoryError::Store(
+            "session/runtime outbox identities must be non-empty".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1183,12 +1479,22 @@ impl SqliteSessionStore {
     /// unique constraint).
     pub fn insert_message(&self, msg: &SessionMessage) -> Result<()> {
         let conn = self.conn()?;
+        let message_id = legacy_message_id(&msg.session_id, msg.sequence);
         conn.execute(
-            r"INSERT OR REPLACE INTO messages
-                (session_id, sequence, role, content_json, blocks_count,
+            r"INSERT INTO messages
+                (stable_message_id, session_id, sequence, role, content_json, blocks_count,
                  tool_use_id, tool_name, token_usage_json, created_at_ms)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+               ON CONFLICT(session_id, sequence) DO UPDATE SET
+                   role = excluded.role,
+                   content_json = excluded.content_json,
+                   blocks_count = excluded.blocks_count,
+                   tool_use_id = excluded.tool_use_id,
+                   tool_name = excluded.tool_name,
+                   token_usage_json = excluded.token_usage_json,
+                   created_at_ms = excluded.created_at_ms",
             params![
+                message_id,
                 msg.session_id,
                 msg.sequence as i64,
                 msg.role,
@@ -1204,6 +1510,99 @@ impl SqliteSessionStore {
         Ok(())
     }
 
+    /// Materialize one Runtime terminal message with a stable cross-store ID.
+    ///
+    /// A repeated delivery is idempotent when the immutable message content
+    /// matches. Reusing the ID for another message is rejected. Sequence
+    /// allocation and insertion happen under one immediate transaction so two
+    /// delivery workers cannot create duplicate assistant messages.
+    pub fn append_terminal_message_idempotent(
+        &self,
+        message_id: &str,
+        session_id: &str,
+        content_json: &str,
+        created_at_ms: u64,
+    ) -> Result<(SessionMessage, bool)> {
+        if message_id.trim().is_empty() || session_id.trim().is_empty() {
+            return Err(MemoryError::Store(
+                "terminal message requires stable message and session IDs".to_string(),
+            ));
+        }
+        let mut conn = self.conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_err)?;
+        let existing = tx
+            .query_row(
+                "SELECT session_id, sequence, role, content_json, blocks_count,
+                        tool_use_id, tool_name, token_usage_json, created_at_ms
+                 FROM messages WHERE stable_message_id = ?1",
+                params![message_id],
+                |row| {
+                    Ok(SessionMessage {
+                        session_id: row.get(0)?,
+                        sequence: row.get::<_, i64>(1)? as usize,
+                        role: row.get(2)?,
+                        content_json: row.get(3)?,
+                        blocks_count: row.get::<_, i64>(4)? as usize,
+                        tool_use_id: row.get(5)?,
+                        tool_name: row.get(6)?,
+                        token_usage_json: row.get(7)?,
+                        created_at_ms: row.get::<_, i64>(8)? as u64,
+                    })
+                },
+            )
+            .optional()
+            .map_err(sql_err)?;
+        if let Some(existing) = existing {
+            if existing.session_id != session_id
+                || existing.role != "assistant"
+                || existing.content_json != content_json
+            {
+                return Err(MemoryError::Store(format!(
+                    "terminal message_id `{message_id}` conflicts with committed content"
+                )));
+            }
+            tx.commit().map_err(sql_err)?;
+            return Ok((existing, false));
+        }
+        let sequence = tx
+            .query_row(
+                "SELECT COALESCE(MAX(sequence), -1) + 1 FROM messages WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(sql_err)? as usize;
+        tx.execute(
+            "INSERT INTO messages
+             (stable_message_id, session_id, sequence, role, content_json, blocks_count,
+              created_at_ms) VALUES (?1, ?2, ?3, 'assistant', ?4, 1, ?5)",
+            params![
+                message_id,
+                session_id,
+                sequence as i64,
+                content_json,
+                created_at_ms as i64
+            ],
+        )
+        .map_err(sql_err)?;
+        tx.commit().map_err(sql_err)?;
+        Ok((
+            SessionMessage {
+                session_id: session_id.to_string(),
+                sequence,
+                role: "assistant".to_string(),
+                content_json: content_json.to_string(),
+                blocks_count: 1,
+                tool_use_id: None,
+                tool_name: None,
+                token_usage_json: None,
+                created_at_ms,
+            },
+            true,
+        ))
+    }
+
     /// Insert multiple messages in a single transaction.
     pub fn insert_messages_batch(&self, messages: &[SessionMessage]) -> Result<()> {
         let mut conn = self.conn()?;
@@ -1211,14 +1610,23 @@ impl SqliteSessionStore {
         {
             let mut stmt = tx
                 .prepare(
-                    r"INSERT OR REPLACE INTO messages
-                       (session_id, sequence, role, content_json, blocks_count,
+                    r"INSERT INTO messages
+                       (stable_message_id, session_id, sequence, role, content_json, blocks_count,
                         tool_use_id, tool_name, token_usage_json, created_at_ms)
-                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                      ON CONFLICT(session_id, sequence) DO UPDATE SET
+                          role = excluded.role,
+                          content_json = excluded.content_json,
+                          blocks_count = excluded.blocks_count,
+                          tool_use_id = excluded.tool_use_id,
+                          tool_name = excluded.tool_name,
+                          token_usage_json = excluded.token_usage_json,
+                          created_at_ms = excluded.created_at_ms",
                 )
                 .map_err(sql_err)?;
             for msg in messages {
                 stmt.execute(params![
+                    legacy_message_id(&msg.session_id, msg.sequence),
                     msg.session_id,
                     msg.sequence as i64,
                     msg.role,
@@ -1234,6 +1642,576 @@ impl SqliteSessionStore {
         }
         tx.commit().map_err(sql_err)?;
         Ok(())
+    }
+
+    /// Atomically persist a stable user message and its Runtime ingress outbox row.
+    ///
+    /// Reusing `request_id` with identical identities is idempotent. Reusing it
+    /// for another turn/message is rejected rather than silently overwriting data.
+    pub fn append_message_with_runtime_outbox(
+        &self,
+        message: &SessionMessage,
+        request: &SessionRuntimeOutboxRequest,
+    ) -> Result<SessionRuntimeOutboxRecord> {
+        validate_outbox_identity(message, request)?;
+        let mut conn = self.conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_err)?;
+
+        if let Some(existing) = query_outbox(&tx, &request.request_id)? {
+            if existing.turn_id == request.turn_id
+                && existing.message_id == request.message_id
+                && existing.session_id == message.session_id
+                && existing.sequence == message.sequence
+            {
+                tx.commit().map_err(sql_err)?;
+                return Ok(existing);
+            }
+            return Err(MemoryError::Store(format!(
+                "outbox request_id `{}` is already bound to another message",
+                request.request_id
+            )));
+        }
+
+        tx.execute(
+            r"INSERT INTO messages
+                (stable_message_id, session_id, sequence, role, content_json, blocks_count,
+                 tool_use_id, tool_name, token_usage_json, created_at_ms)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                request.message_id,
+                message.session_id,
+                message.sequence as i64,
+                message.role,
+                message.content_json,
+                message.blocks_count as i64,
+                message.tool_use_id,
+                message.tool_name,
+                message.token_usage_json,
+                message.created_at_ms as i64,
+            ],
+        )
+        .map_err(sql_err)?;
+        tx.execute(
+            r"INSERT INTO session_runtime_outbox
+                (request_id, turn_id, message_id, session_id, sequence, status,
+                 attempts, next_attempt_at_ms, revision, created_at_ms, updated_at_ms)
+               VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, 0, ?6, ?6)",
+            params![
+                request.request_id,
+                request.turn_id,
+                request.message_id,
+                message.session_id,
+                message.sequence as i64,
+                request.created_at_ms as i64,
+            ],
+        )
+        .map_err(sql_err)?;
+        let stored = query_outbox(&tx, &request.request_id)?.ok_or_else(|| {
+            MemoryError::Store("outbox insert committed without a readable row".to_string())
+        })?;
+        tx.commit().map_err(sql_err)?;
+        Ok(stored)
+    }
+
+    /// Persist an ingress message and Runtime request while allocating the
+    /// session-local message sequence inside the same write transaction.
+    ///
+    /// Surface and Gateway callers must use this entry point for live input;
+    /// accepting a caller-computed sequence would create a race between
+    /// concurrent surfaces writing to the same session.
+    pub fn append_ingress_with_runtime_outbox(
+        &self,
+        session_id: &str,
+        role: &str,
+        content_json: Option<&str>,
+        created_at_ms: u64,
+        request: &SessionRuntimeOutboxRequest,
+    ) -> Result<SessionRuntimeOutboxRecord> {
+        let mut conn = self.conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_err)?;
+        if let Some(existing) = query_outbox(&tx, &request.request_id)? {
+            if existing.session_id == session_id
+                && existing.message_id == request.message_id
+                && existing.turn_id == request.turn_id
+            {
+                tx.commit().map_err(sql_err)?;
+                return Ok(existing);
+            }
+            return Err(MemoryError::Store(format!(
+                "outbox request `{}` conflicts with its committed ingress",
+                request.request_id
+            )));
+        }
+        let sequence = tx
+            .query_row(
+                "SELECT COALESCE(MAX(sequence), -1) + 1 FROM messages WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(sql_err)? as usize;
+        tx.execute(
+            r"INSERT INTO messages
+                (stable_message_id, session_id, sequence, role, content_json, blocks_count,
+                 created_at_ms)
+               VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)",
+            params![
+                request.message_id,
+                session_id,
+                sequence as i64,
+                role,
+                content_json,
+                created_at_ms as i64,
+            ],
+        )
+        .map_err(sql_err)?;
+        tx.execute(
+            r"INSERT INTO session_runtime_outbox
+                (request_id, turn_id, message_id, session_id, sequence, status,
+                 attempts, next_attempt_at_ms, revision, created_at_ms, updated_at_ms)
+               VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, 0, ?6, ?6)",
+            params![
+                request.request_id,
+                request.turn_id,
+                request.message_id,
+                session_id,
+                sequence as i64,
+                request.created_at_ms as i64,
+            ],
+        )
+        .map_err(sql_err)?;
+        let stored = query_outbox(&tx, &request.request_id)?.ok_or_else(|| {
+            MemoryError::Store("ingress outbox insert produced no readable row".to_string())
+        })?;
+        tx.commit().map_err(sql_err)?;
+        Ok(stored)
+    }
+
+    /// Claim due ingress rows under a renewable lease.
+    pub fn claim_session_runtime_outbox(
+        &self,
+        worker_id: &str,
+        now_ms: u64,
+        lease_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<SessionRuntimeOutboxRecord>> {
+        if worker_id.trim().is_empty() || lease_ms == 0 || limit == 0 {
+            return Err(MemoryError::Store(
+                "outbox claim requires worker_id, positive lease and positive limit".to_string(),
+            ));
+        }
+        let claim_expires_at_ms = now_ms.saturating_add(lease_ms);
+        let mut conn = self.conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_err)?;
+        let candidates = {
+            let mut stmt = tx
+                .prepare(
+                    r"SELECT request_id, revision, status
+                        FROM session_runtime_outbox
+                       WHERE ((status IN ('pending', 'retry_scheduled') AND next_attempt_at_ms <= ?1)
+                          OR (status = 'claimed' AND claim_expires_at_ms <= ?1))
+                       ORDER BY next_attempt_at_ms ASC, sequence ASC, request_id ASC
+                       LIMIT ?2",
+                )
+                .map_err(sql_err)?;
+            let rows = stmt
+                .query_map(params![now_ms as i64, limit as i64], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)? as u64,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(sql_err)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(sql_err)?
+        };
+
+        let mut claimed = Vec::with_capacity(candidates.len());
+        for (request_id, revision, from_status) in candidates {
+            let changed = tx
+                .execute(
+                    r"UPDATE session_runtime_outbox
+                          SET status = 'claimed',
+                              attempts = attempts + 1,
+                              claim_owner = ?1,
+                              claim_expires_at_ms = ?2,
+                              updated_at_ms = ?3,
+                              revision = revision + 1
+                        WHERE request_id = ?4 AND revision = ?5
+                          AND ((status IN ('pending', 'retry_scheduled') AND next_attempt_at_ms <= ?3)
+                           OR (status = 'claimed' AND claim_expires_at_ms <= ?3))",
+                    params![
+                        worker_id,
+                        claim_expires_at_ms as i64,
+                        now_ms as i64,
+                        request_id,
+                        revision as i64,
+                    ],
+                )
+                .map_err(sql_err)?;
+            if changed == 1 {
+                let record = query_outbox(&tx, &request_id)?.ok_or_else(|| {
+                    MemoryError::Store(format!("claimed outbox `{request_id}` disappeared"))
+                })?;
+                append_outbox_history(
+                    &tx,
+                    &record,
+                    if from_status == "claimed" {
+                        "reclaim"
+                    } else {
+                        "claim"
+                    },
+                    Some(worker_id),
+                    None,
+                    &from_status,
+                    OutboxStatus::Claimed.as_str(),
+                    now_ms,
+                )?;
+                claimed.push(record);
+            }
+        }
+        tx.commit().map_err(sql_err)?;
+        Ok(claimed)
+    }
+
+    /// Ack a claimed ingress row after Runtime has durably committed it.
+    pub fn ack_session_runtime_outbox(
+        &self,
+        request_id: &str,
+        worker_id: &str,
+        expected_revision: u64,
+        runtime_commit_cursor: u64,
+        now_ms: u64,
+    ) -> Result<SessionRuntimeOutboxRecord> {
+        self.transition_claimed_outbox(
+            request_id,
+            worker_id,
+            expected_revision,
+            now_ms,
+            |tx, current| {
+                tx.execute(
+                    r"UPDATE session_runtime_outbox
+                          SET status = 'materialized', runtime_commit_cursor = ?1,
+                              claim_owner = NULL, claim_expires_at_ms = NULL,
+                              failure_class = NULL, last_error = NULL,
+                              updated_at_ms = ?2, revision = revision + 1
+                        WHERE request_id = ?3 AND status = 'claimed'
+                          AND claim_owner = ?4 AND revision = ?5",
+                    params![
+                        runtime_commit_cursor as i64,
+                        now_ms as i64,
+                        request_id,
+                        worker_id,
+                        expected_revision as i64,
+                    ],
+                )
+                .map_err(sql_err)?;
+                Ok(("ack", OutboxStatus::Materialized, current.status))
+            },
+        )
+    }
+
+    /// Extend a live ingress claim. The revision is advanced so stale workers
+    /// can no longer acknowledge or fail work after ownership has moved.
+    pub fn renew_session_runtime_outbox_lease(
+        &self,
+        request_id: &str,
+        worker_id: &str,
+        expected_revision: u64,
+        now_ms: u64,
+        lease_ms: u64,
+    ) -> Result<SessionRuntimeOutboxRecord> {
+        if lease_ms == 0 {
+            return Err(MemoryError::Store(
+                "outbox lease renewal requires a positive lease".to_string(),
+            ));
+        }
+        let mut conn = self.conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_err)?;
+        let current = query_outbox(&tx, request_id)?.ok_or_else(|| {
+            MemoryError::Store(format!("session runtime outbox `{request_id}` not found"))
+        })?;
+        if current.status != OutboxStatus::Claimed
+            || current.claim_owner.as_deref() != Some(worker_id)
+            || current.revision != expected_revision
+        {
+            return Err(MemoryError::Store(format!(
+                "stale outbox lease renewal for `{request_id}`"
+            )));
+        }
+        let expires_at = now_ms.saturating_add(lease_ms);
+        let changed = tx
+            .execute(
+                r"UPDATE session_runtime_outbox
+                      SET claim_expires_at_ms = ?1, updated_at_ms = ?2,
+                          revision = revision + 1
+                    WHERE request_id = ?3 AND status = 'claimed'
+                      AND claim_owner = ?4 AND revision = ?5",
+                params![
+                    expires_at as i64,
+                    now_ms as i64,
+                    request_id,
+                    worker_id,
+                    expected_revision as i64,
+                ],
+            )
+            .map_err(sql_err)?;
+        if changed != 1 {
+            return Err(MemoryError::Store(format!(
+                "outbox lease for `{request_id}` changed during renewal"
+            )));
+        }
+        let renewed = query_outbox(&tx, request_id)?.ok_or_else(|| {
+            MemoryError::Store(format!("renewed outbox `{request_id}` disappeared"))
+        })?;
+        append_outbox_history(
+            &tx,
+            &renewed,
+            "renew_lease",
+            Some(worker_id),
+            None,
+            OutboxStatus::Claimed.as_str(),
+            OutboxStatus::Claimed.as_str(),
+            now_ms,
+        )?;
+        tx.commit().map_err(sql_err)?;
+        Ok(renewed)
+    }
+
+    /// Classify a failed claim and either schedule retry or block it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fail_session_runtime_outbox(
+        &self,
+        request_id: &str,
+        worker_id: &str,
+        expected_revision: u64,
+        failure_class: OutboxFailureClass,
+        error: &str,
+        retry_at_ms: u64,
+        max_attempts: u32,
+        now_ms: u64,
+    ) -> Result<SessionRuntimeOutboxRecord> {
+        self.transition_claimed_outbox(
+            request_id,
+            worker_id,
+            expected_revision,
+            now_ms,
+            |tx, current| {
+                let retry = failure_class == OutboxFailureClass::Retryable
+                    && current.attempts < max_attempts.max(1);
+                let next_status = if retry {
+                    OutboxStatus::RetryScheduled
+                } else {
+                    OutboxStatus::BlockedMaterialization
+                };
+                tx.execute(
+                    r"UPDATE session_runtime_outbox
+                          SET status = ?1, next_attempt_at_ms = ?2,
+                              claim_owner = NULL, claim_expires_at_ms = NULL,
+                              failure_class = ?3, last_error = ?4,
+                              updated_at_ms = ?5, revision = revision + 1
+                        WHERE request_id = ?6 AND status = 'claimed'
+                          AND claim_owner = ?7 AND revision = ?8",
+                    params![
+                        next_status.as_str(),
+                        if retry { retry_at_ms } else { now_ms } as i64,
+                        failure_class.as_str(),
+                        error,
+                        now_ms as i64,
+                        request_id,
+                        worker_id,
+                        expected_revision as i64,
+                    ],
+                )
+                .map_err(sql_err)?;
+                Ok((
+                    if retry { "retry" } else { "block" },
+                    next_status,
+                    current.status,
+                ))
+            },
+        )
+    }
+
+    /// Manually release a blocked row while retaining attempts and audit history.
+    pub fn retry_blocked_session_runtime_outbox(
+        &self,
+        request_id: &str,
+        expected_revision: u64,
+        actor: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<SessionRuntimeOutboxRecord> {
+        if actor.trim().is_empty() || reason.trim().is_empty() {
+            return Err(MemoryError::Store(
+                "manual outbox retry requires actor and reason".to_string(),
+            ));
+        }
+        let mut conn = self.conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_err)?;
+        let current = query_outbox(&tx, request_id)?
+            .ok_or_else(|| MemoryError::Store(format!("outbox `{request_id}` not found")))?;
+        if current.status != OutboxStatus::BlockedMaterialization
+            || current.revision != expected_revision
+        {
+            return Err(MemoryError::Store(format!(
+                "outbox `{request_id}` is not blocked at revision {expected_revision}"
+            )));
+        }
+        let changed = tx
+            .execute(
+                r"UPDATE session_runtime_outbox
+                      SET status = 'pending', next_attempt_at_ms = ?1,
+                          claim_owner = NULL, claim_expires_at_ms = NULL,
+                          failure_class = NULL, updated_at_ms = ?1,
+                          revision = revision + 1
+                    WHERE request_id = ?2 AND status = 'blocked_materialization'
+                      AND revision = ?3",
+                params![now_ms as i64, request_id, expected_revision as i64],
+            )
+            .map_err(sql_err)?;
+        if changed != 1 {
+            return Err(MemoryError::Store(format!(
+                "outbox `{request_id}` changed during manual retry"
+            )));
+        }
+        let updated = query_outbox(&tx, request_id)?.ok_or_else(|| {
+            MemoryError::Store(format!("retried outbox `{request_id}` disappeared"))
+        })?;
+        append_outbox_history(
+            &tx,
+            &updated,
+            "manual_retry",
+            Some(actor),
+            Some(reason),
+            OutboxStatus::BlockedMaterialization.as_str(),
+            OutboxStatus::Pending.as_str(),
+            now_ms,
+        )?;
+        tx.commit().map_err(sql_err)?;
+        Ok(updated)
+    }
+
+    pub fn get_session_runtime_outbox(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<SessionRuntimeOutboxRecord>> {
+        let conn = self.conn()?;
+        query_outbox(&conn, request_id)
+    }
+
+    pub fn session_runtime_outbox_health(&self) -> Result<SessionRuntimeOutboxHealth> {
+        let conn = self.conn()?;
+        let mut health = SessionRuntimeOutboxHealth::default();
+        let mut stmt = conn
+            .prepare("SELECT status, COUNT(*) FROM session_runtime_outbox GROUP BY status")
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(sql_err)?;
+        for row in rows {
+            let (status, count) = row.map_err(sql_err)?;
+            let count = count as usize;
+            match OutboxStatus::parse(&status).map_err(sql_err)? {
+                OutboxStatus::Pending => health.pending = count,
+                OutboxStatus::Claimed => health.claimed = count,
+                OutboxStatus::RetryScheduled => health.retry_scheduled = count,
+                OutboxStatus::Materialized => health.materialized = count,
+                OutboxStatus::BlockedMaterialization => health.blocked = count,
+            }
+        }
+        Ok(health)
+    }
+
+    /// Return blocked ingress rows for operational inspection. The bounded
+    /// result is ordered deterministically so operators can retry the oldest
+    /// poison item first.
+    pub fn blocked_session_runtime_outbox(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<SessionRuntimeOutboxRecord>> {
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare(
+                r"SELECT request_id, turn_id, message_id, session_id, sequence, status,
+                         runtime_commit_cursor, attempts, next_attempt_at_ms, claim_owner,
+                         claim_expires_at_ms, failure_class, last_error, revision,
+                         created_at_ms, updated_at_ms
+                    FROM session_runtime_outbox
+                   WHERE status = 'blocked_materialization'
+                   ORDER BY updated_at_ms ASC, sequence ASC, request_id ASC
+                   LIMIT ?1",
+            )
+            .map_err(sql_err)?;
+        let records = stmt
+            .query_map(params![limit.clamp(1, 500) as i64], row_to_outbox)
+            .map_err(sql_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_err)?;
+        Ok(records)
+    }
+
+    fn transition_claimed_outbox<F>(
+        &self,
+        request_id: &str,
+        worker_id: &str,
+        expected_revision: u64,
+        now_ms: u64,
+        transition: F,
+    ) -> Result<SessionRuntimeOutboxRecord>
+    where
+        F: FnOnce(
+            &rusqlite::Transaction<'_>,
+            &SessionRuntimeOutboxRecord,
+        ) -> Result<(&'static str, OutboxStatus, OutboxStatus)>,
+    {
+        let mut conn = self.conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_err)?;
+        let current = query_outbox(&tx, request_id)?
+            .ok_or_else(|| MemoryError::Store(format!("outbox `{request_id}` not found")))?;
+        if current.status != OutboxStatus::Claimed
+            || current.claim_owner.as_deref() != Some(worker_id)
+            || current.revision != expected_revision
+        {
+            return Err(MemoryError::Store(format!(
+                "outbox `{request_id}` claim owner/status/revision mismatch"
+            )));
+        }
+        let (action, to_status, from_status) = transition(&tx, &current)?;
+        let updated = query_outbox(&tx, request_id)?.ok_or_else(|| {
+            MemoryError::Store(format!("transitioned outbox `{request_id}` disappeared"))
+        })?;
+        if updated.revision != expected_revision + 1 || updated.status != to_status {
+            return Err(MemoryError::Store(format!(
+                "outbox `{request_id}` transition lost an optimistic update"
+            )));
+        }
+        append_outbox_history(
+            &tx,
+            &updated,
+            action,
+            Some(worker_id),
+            updated.last_error.as_deref(),
+            from_status.as_str(),
+            to_status.as_str(),
+            now_ms,
+        )?;
+        tx.commit().map_err(sql_err)?;
+        Ok(updated)
     }
 
     /// Retrieve messages for a session with pagination.
@@ -1634,6 +2612,52 @@ impl SqliteSessionStore {
         Ok(events)
     }
 
+    /// Retrieve the session-domain timeline while excluding legacy Runtime
+    /// lifecycle rows awaiting migration into RuntimeEventStore.
+    pub fn get_session_domain_timeline_limited(
+        &self,
+        session_id: &str,
+        from_seq: usize,
+        limit: usize,
+    ) -> Result<Vec<SessionEvent>> {
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare(
+                r"SELECT id, session_id, event_type, event_json, sequence, created_at_ms
+                    FROM session_events
+                   WHERE session_id = ?1 AND sequence >= ?2
+                     AND event_type != 'RuntimeEvent'
+                   ORDER BY sequence ASC
+                   LIMIT ?3",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(
+                params![session_id, from_seq as i64, limit as i64],
+                row_to_event,
+            )
+            .map_err(sql_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)
+    }
+
+    pub fn count_session_domain_timeline_from(
+        &self,
+        session_id: &str,
+        from_seq: usize,
+    ) -> Result<usize> {
+        let conn = self.conn()?;
+        let count = conn
+            .query_row(
+                r"SELECT COUNT(*) FROM session_events
+                   WHERE session_id = ?1 AND sequence >= ?2
+                     AND event_type != 'RuntimeEvent'",
+                params![session_id, from_seq as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(sql_err)?;
+        Ok(count as usize)
+    }
+
     /// Retrieve at most `limit` events of one type for a session.
     /// Ordered by sequence ascending.
     pub fn get_events_by_type_limited(
@@ -1875,22 +2899,32 @@ impl SqliteSessionStore {
     }
 }
 
+fn legacy_message_id(session_id: &str, sequence: usize) -> String {
+    let mut encoded = String::with_capacity(session_id.len() * 2);
+    for byte in session_id.as_bytes() {
+        use std::fmt::Write as _;
+        let _ = write!(&mut encoded, "{byte:02x}");
+    }
+    format!("legacy:{encoded}:{sequence}")
+}
+
 fn event_json_with_allocated_sequence(event: &SessionEvent, sequence: usize) -> Result<String> {
-    if event.event_type != RUNTIME_EVENT_TYPE {
+    if event.event_type != SESSION_DOMAIN_EVENT_TYPE {
         return Ok(event.event_json.clone());
     }
     let mut payload =
         serde_json::from_str::<serde_json::Value>(&event.event_json).map_err(|error| {
             MemoryError::Store(format!(
-                "runtime event JSON must be valid before sequence allocation: {error}"
+                "session domain event JSON must be valid before sequence allocation: {error}"
             ))
         })?;
-    let object = payload
-        .as_object_mut()
-        .ok_or_else(|| MemoryError::Store("runtime event JSON must be an object".to_string()))?;
+    let object = payload.as_object_mut().ok_or_else(|| {
+        MemoryError::Store("session domain event JSON must be an object".to_string())
+    })?;
     object.insert("sequence".to_string(), serde_json::json!(sequence));
-    serde_json::to_string(&payload)
-        .map_err(|error| MemoryError::Store(format!("runtime event JSON encode failed: {error}")))
+    serde_json::to_string(&payload).map_err(|error| {
+        MemoryError::Store(format!("session domain event JSON encode failed: {error}"))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2462,7 +3496,7 @@ mod tests {
             },
             SessionEvent {
                 session_id: "s-batch-rollback".to_string(),
-                event_type: RUNTIME_EVENT_TYPE.to_string(),
+                event_type: SESSION_DOMAIN_EVENT_TYPE.to_string(),
                 event_json: "not-json".to_string(),
                 sequence: usize::MAX,
                 created_at_ms: 2,
@@ -2575,9 +3609,9 @@ mod tests {
                 let mut stmt = tx
                     .prepare(
                         r"INSERT INTO messages
-                           (session_id, sequence, role, content_json, blocks_count,
+                           (stable_message_id, session_id, sequence, role, content_json, blocks_count,
                             tool_use_id, tool_name, token_usage_json, created_at_ms)
-                           VALUES ('s-100k', ?1, ?2, ?3, 1, NULL, NULL, NULL, ?4)",
+                           VALUES (printf('bulk:%d', ?1), 's-100k', ?1, ?2, ?3, 1, NULL, NULL, NULL, ?4)",
                     )
                     .unwrap();
                 for i in 0..100_000 {
@@ -2811,5 +3845,239 @@ mod tests {
         assert_eq!(removed, 1);
         assert!(store.get_session("old-session").unwrap().is_none());
         assert!(store.get_session("new-session").unwrap().is_some());
+    }
+
+    fn outbox_message(session_id: &str) -> SessionMessage {
+        SessionMessage {
+            session_id: session_id.to_string(),
+            sequence: 0,
+            role: "user".to_string(),
+            content_json: r#"[{"type":"text","text":"run this"}]"#.to_string(),
+            blocks_count: 1,
+            tool_use_id: None,
+            tool_name: None,
+            token_usage_json: None,
+            created_at_ms: 100,
+        }
+    }
+
+    fn outbox_request() -> SessionRuntimeOutboxRequest {
+        SessionRuntimeOutboxRequest {
+            request_id: "request-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            message_id: "message-1".to_string(),
+            created_at_ms: 100,
+        }
+    }
+
+    #[test]
+    fn source_message_and_outbox_are_atomic_and_idempotent() {
+        let (store, _dir) = make_store();
+        store.create_session(&make_record("s-outbox")).unwrap();
+        let message = outbox_message("s-outbox");
+        let request = outbox_request();
+
+        let first = store
+            .append_message_with_runtime_outbox(&message, &request)
+            .unwrap();
+        let duplicate = store
+            .append_message_with_runtime_outbox(&message, &request)
+            .unwrap();
+        assert_eq!(first, duplicate);
+        assert_eq!(first.status, OutboxStatus::Pending);
+        assert_eq!(store.get_message_count("s-outbox").unwrap(), 1);
+
+        let mut conflicting = request;
+        conflicting.turn_id = "turn-other".to_string();
+        assert!(store
+            .append_message_with_runtime_outbox(&message, &conflicting)
+            .is_err());
+        assert_eq!(store.get_message_count("s-outbox").unwrap(), 1);
+    }
+
+    #[test]
+    fn source_transaction_rolls_back_when_outbox_identity_conflicts() {
+        let (store, _dir) = make_store();
+        store.create_session(&make_record("s-rollback")).unwrap();
+        let first = outbox_message("s-rollback");
+        let request = outbox_request();
+        store
+            .append_message_with_runtime_outbox(&first, &request)
+            .unwrap();
+
+        let mut second = first;
+        second.sequence = 1;
+        let conflicting = SessionRuntimeOutboxRequest {
+            request_id: "request-2".to_string(),
+            turn_id: "turn-2".to_string(),
+            message_id: "message-1".to_string(),
+            created_at_ms: 101,
+        };
+        assert!(store
+            .append_message_with_runtime_outbox(&second, &conflicting)
+            .is_err());
+        assert_eq!(store.get_message_count("s-rollback").unwrap(), 1);
+        assert!(store
+            .get_session_runtime_outbox("request-2")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn outbox_claim_lease_retry_block_manual_retry_and_ack_are_guarded() {
+        let (store, _dir) = make_store();
+        store.create_session(&make_record("s-lifecycle")).unwrap();
+        store
+            .append_message_with_runtime_outbox(&outbox_message("s-lifecycle"), &outbox_request())
+            .unwrap();
+
+        let first = store
+            .claim_session_runtime_outbox("worker-a", 100, 50, 10)
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].attempts, 1);
+        assert!(store
+            .claim_session_runtime_outbox("worker-b", 149, 50, 10)
+            .unwrap()
+            .is_empty());
+        let reclaimed = store
+            .claim_session_runtime_outbox("worker-b", 150, 50, 10)
+            .unwrap();
+        assert_eq!(reclaimed[0].attempts, 2);
+
+        let retry = store
+            .fail_session_runtime_outbox(
+                "request-1",
+                "worker-b",
+                reclaimed[0].revision,
+                OutboxFailureClass::Retryable,
+                "runtime unavailable",
+                250,
+                3,
+                151,
+            )
+            .unwrap();
+        assert_eq!(retry.status, OutboxStatus::RetryScheduled);
+        assert!(store
+            .claim_session_runtime_outbox("worker-c", 249, 50, 10)
+            .unwrap()
+            .is_empty());
+        let final_claim = store
+            .claim_session_runtime_outbox("worker-c", 250, 50, 10)
+            .unwrap();
+        assert_eq!(final_claim[0].attempts, 3);
+        let blocked = store
+            .fail_session_runtime_outbox(
+                "request-1",
+                "worker-c",
+                final_claim[0].revision,
+                OutboxFailureClass::Retryable,
+                "retry exhausted",
+                500,
+                3,
+                251,
+            )
+            .unwrap();
+        assert_eq!(blocked.status, OutboxStatus::BlockedMaterialization);
+
+        let pending = store
+            .retry_blocked_session_runtime_outbox(
+                "request-1",
+                blocked.revision,
+                "operator-1",
+                "runtime recovered",
+                300,
+            )
+            .unwrap();
+        assert_eq!(pending.status, OutboxStatus::Pending);
+        assert_eq!(pending.attempts, 3);
+        let claimed = store
+            .claim_session_runtime_outbox("worker-d", 300, 50, 10)
+            .unwrap();
+        let done = store
+            .ack_session_runtime_outbox("request-1", "worker-d", claimed[0].revision, 42, 301)
+            .unwrap();
+        assert_eq!(done.status, OutboxStatus::Materialized);
+        assert_eq!(done.runtime_commit_cursor, Some(42));
+        assert_eq!(
+            store.session_runtime_outbox_health().unwrap().materialized,
+            1
+        );
+    }
+
+    #[test]
+    fn outbox_lease_renewal_rejects_stale_ack_and_prevents_reclaim() {
+        let (store, _dir) = make_store();
+        store.create_session(&make_record("s-renew")).unwrap();
+        store
+            .append_message_with_runtime_outbox(&outbox_message("s-renew"), &outbox_request())
+            .unwrap();
+        let claimed = store
+            .claim_session_runtime_outbox("worker-a", 100, 50, 1)
+            .unwrap()
+            .remove(0);
+        let renewed = store
+            .renew_session_runtime_outbox_lease("request-1", "worker-a", claimed.revision, 140, 50)
+            .unwrap();
+        assert!(store
+            .claim_session_runtime_outbox("worker-b", 151, 50, 1)
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .ack_session_runtime_outbox("request-1", "worker-a", claimed.revision, 7, 152,)
+            .is_err());
+        let done = store
+            .ack_session_runtime_outbox("request-1", "worker-a", renewed.revision, 7, 153)
+            .unwrap();
+        assert_eq!(done.status, OutboxStatus::Materialized);
+    }
+
+    #[test]
+    fn legacy_domain_events_migrate_but_execution_lifecycle_does_not() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("domain-migration.db");
+        {
+            let store = SqliteSessionStore::open(&path).unwrap();
+            store.create_session(&make_record("s-migration")).unwrap();
+            for (sequence, scope, kind) in [
+                (0, "context", "context.prepared"),
+                (1, "agent", "agent.started"),
+            ] {
+                store
+                    .append_event(&SessionEvent {
+                        session_id: "s-migration".to_string(),
+                        event_type: "RuntimeEvent".to_string(),
+                        event_json: serde_json::json!({
+                            "event_id": format!("event-{sequence}"),
+                            "session_id": "s-migration",
+                            "sequence": sequence,
+                            "scope": scope,
+                            "kind": kind,
+                            "refs": [],
+                            "payload": {},
+                            "created_at_ms": sequence + 1
+                        })
+                        .to_string(),
+                        sequence,
+                        created_at_ms: sequence as u64 + 1,
+                    })
+                    .unwrap();
+            }
+        }
+
+        let migrated = SqliteSessionStore::open(&path).unwrap();
+        assert_eq!(
+            migrated
+                .count_events_by_type_from("s-migration", SESSION_DOMAIN_EVENT_TYPE, 0)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            migrated
+                .count_events_by_type_from("s-migration", "RuntimeEvent", 0)
+                .unwrap(),
+            1,
+            "execution lifecycle remains outside the session-domain protocol"
+        );
     }
 }

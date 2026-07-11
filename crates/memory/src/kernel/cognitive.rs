@@ -817,22 +817,27 @@ impl CognitiveContextManager {
         // Step -1: Drain pending L4 push events — other agents' writes
         //          become immediately visible without waiting for a pull.
         // ═══════════════════════════════════════════════════════════════════
-        {
+        let pending_l4_events = {
+            let mut pending = Vec::new();
             let mut rx_guard = self.l4_event_rx.lock();
             if let Some(ref mut rx) = *rx_guard {
                 while let Ok(event) = rx.try_recv() {
-                    if event.operation == crate::layers::shared::L4Operation::Insert {
-                        if let Ok(memory_id) = uuid::Uuid::parse_str(&event.memory_id) {
-                            if let Ok(Some(entry)) = self.orchestrator.recall(&memory_id).await {
-                                entries.push(entry);
-                                tracing::debug!(
-                                    memory_id = %memory_id,
-                                    agent = %event.agent_id,
-                                    title = %event.title,
-                                    "L4 push: loaded new shared entry from event bus"
-                                );
-                            }
-                        }
+                    pending.push(event);
+                }
+            }
+            pending
+        };
+        for event in pending_l4_events {
+            if event.operation == crate::layers::shared::L4Operation::Insert {
+                if let Ok(memory_id) = uuid::Uuid::parse_str(&event.memory_id) {
+                    if let Ok(Some(entry)) = self.orchestrator.recall(&memory_id).await {
+                        entries.push(entry);
+                        tracing::debug!(
+                            memory_id = %memory_id,
+                            agent = %event.agent_id,
+                            title = %event.title,
+                            "L4 push: loaded new shared entry from event bus"
+                        );
                     }
                 }
             }
@@ -1722,29 +1727,28 @@ impl CognitiveContextManager {
             );
 
             // ── 0a. Drain background LLM results from prior turns ─────────
-            {
+            let drained = {
                 let mut pending = self.pending_llm_entries.lock();
-                if !pending.is_empty() {
-                    let drained: Vec<MemoryEntry> = pending.drain(..).collect();
-                    drop(pending);
-                    let drained_count = drained.len();
-                    for entry in &drained {
-                        pending_embeddings.push((entry.id, entry.content.clone()));
+                std::mem::take(&mut *pending)
+            };
+            if !drained.is_empty() {
+                let drained_count = drained.len();
+                for entry in &drained {
+                    pending_embeddings.push((entry.id, entry.content.clone()));
+                }
+                match self.orchestrator.remember_batch(drained).await {
+                    Ok(_) => {
+                        tracing::info!(
+                            count = drained_count,
+                            "extract_and_remember: persisted {} background LLM entries",
+                            drained_count
+                        );
                     }
-                    match self.orchestrator.remember_batch(drained).await {
-                        Ok(_) => {
-                            tracing::info!(
-                                count = drained_count,
-                                "extract_and_remember: persisted {} background LLM entries",
-                                drained_count
-                            );
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                error = %e,
-                                "extract_and_remember: background LLM entries persist failed"
-                            );
-                        }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "extract_and_remember: background LLM entries persist failed"
+                        );
                     }
                 }
             }
@@ -2188,8 +2192,11 @@ impl CognitiveContextManager {
 
         // ── 10. Save Seeds to KV store ──────────────────────────────────────
         {
-            let reg = self.seeds.lock();
-            match serde_json::to_string(reg.all_seeds()) {
+            let serialized = {
+                let reg = self.seeds.lock();
+                serde_json::to_string(reg.all_seeds())
+            };
+            match serialized {
                 Ok(json) => {
                     if let Err(e) = self.orchestrator.store().kv_put("seeds", &json).await {
                         tracing::warn!("failed to save seeds: {}", e);
@@ -2355,20 +2362,9 @@ impl CognitiveContextManager {
         self.maintenance_queue.transition(id, status)
     }
 
-    /// Consume reviewable maintenance candidates from a runtime event.
-    ///
-    /// Irrelevant events return `Ok(None)`. Candidate parsing failures are
-    /// treated as irrelevant so a malformed pulse cannot block the session.
-    pub fn process_memory_pulse_runtime_event(
-        &self,
-        event: &crate::RuntimeEvent,
-    ) -> Result<Option<MemoryPulseReport>> {
-        let Some(batch) = MemoryPulseBatch::from_runtime_event(event) else {
-            return Ok(None);
-        };
-        MemoryPulseConsumer::new(self.maintenance_queue.clone())
-            .process_batch(batch)
-            .map(Some)
+    /// Consume an explicit promotion batch produced by Runtime policy.
+    pub fn process_memory_pulse(&self, batch: MemoryPulseBatch) -> Result<MemoryPulseReport> {
+        MemoryPulseConsumer::new(self.maintenance_queue.clone()).process_batch(batch)
     }
 
     /// List persisted knowledge-graph entities.

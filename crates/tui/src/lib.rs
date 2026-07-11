@@ -56,5 +56,5 @@ pub use app::{App, DelegateTask, FileEntry, MemoryEntry, SkillSummary};
 pub use boundary_policy::{TuiBackendAccess, TuiBoundaryPolicy};
 #[allow(unused_imports)]
 pub use events::{cowd_event_channel, CowdEventReceiver};
-pub use protocol::{CowdEvent, RuntimePolicyDecisionSummary, RuntimeWorkGraphSummary};
+pub use protocol::{CowdEvent, RuntimeExecutionGraphSummary, RuntimePolicyDecisionSummary};
 pub use runner::{run_gateway_tui, terminal_entry, GatewayTuiConfig};

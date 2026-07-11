@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use axum::{
     extract::{Path, State as AxumState},
@@ -8,7 +8,6 @@ use axum::{
     Json, Router,
 };
 
-use crate::runtime_service::RuntimeTurnOptions;
 use crate::services::{
     AddMissionRelationHttpRequest, AttachMissionAgentHttpRequest, AttachMissionTeamHttpRequest,
     ConsumeMissionSessionCommandHttpRequest, DecideMissionApprovalHttpRequest,
@@ -21,8 +20,6 @@ use crate::services::{
 use memory::SessionRecord;
 
 use super::{api_error, AppState, ErrorResponse};
-
-const MISSION_COMMAND_WALL_CLOCK: Duration = Duration::from_secs(900);
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -221,167 +218,73 @@ async fn dispatch_mission_sessions_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(body): Json<runtime::SessionExecutionPolicy>,
 ) -> impl IntoResponse {
-    if body.dispatch_mode == runtime::SessionDispatchMode::StartRuntimeTurn {
-        return Json(dispatch_mission_sessions_as_turns(state, body).await);
-    }
-    Json(state.services.mission.dispatch_mission_sessions(body))
-}
-
-async fn dispatch_mission_sessions_as_turns(
-    state: Arc<AppState>,
-    policy: runtime::SessionExecutionPolicy,
-) -> serde_json::Value {
-    if state.services.runtime.is_none() {
-        return serde_json::json!({
-            "envelope": state.services.mission.session_control_contract(),
-            "kind": "mission_control.session_dispatch_result",
-            "ok": false,
-            "error": "runtime service unavailable",
-            "policy": policy,
-            "projection": runtime::MissionControlRuntime::projection(),
-        });
-    }
-    let report = runtime::SessionExecutionPlane::dispatch_pending(policy);
-    execute_session_turn_dispatch_report(
-        state,
-        report,
-        "mission_control.session_dispatch_result",
-        None,
-    )
-    .await
-}
-
-async fn execute_session_turn_dispatch_report(
-    state: Arc<AppState>,
-    report: runtime::SessionExecutionReport,
-    kind: &'static str,
-    extra: Option<serde_json::Value>,
-) -> serde_json::Value {
     let Some(runtime_service) = state.services.runtime.as_ref().cloned() else {
-        return serde_json::json!({
+        return Json(serde_json::json!({
             "envelope": state.services.mission.session_control_contract(),
-            "kind": kind,
+            "kind": "mission_control.session_dispatch_submission",
             "ok": false,
-            "error": "runtime service unavailable",
-            "report": report,
-            "projection": runtime::MissionControlRuntime::projection(),
-        });
+            "error": "runtime service unavailable"
+        }));
     };
-    let mut turn_results = Vec::new();
-    for turn_request in report
-        .dispatched
-        .iter()
-        .filter_map(|receipt| receipt.turn_request.clone())
-    {
-        let session_runtime = match ensure_active_runtime_session_for_mission_command(
-            &state,
-            &turn_request.session_id,
-        )
+    let result = runtime_service
+        .route_pending_session_inputs(body.max_commands)
         .await
-        {
-            Ok(value) => value,
-            Err((status, error)) => {
-                let message = error.0.error;
-                let command = runtime::global_mission_runtime()
-                    .fail_session_command(
-                        &turn_request.session_id,
-                        &turn_request.command_id,
-                        message.clone(),
-                    )
-                    .ok();
-                turn_results.push(serde_json::json!({
-                    "ok": false,
-                    "status": status.as_u16(),
-                    "session_id": turn_request.session_id,
-                    "command_id": turn_request.command_id,
-                    "error": message,
-                    "command": command,
-                }));
-                continue;
-            }
-        };
-        match runtime_service
-            .run_turn_with_options(
-                &turn_request.session_id,
-                None,
-                turn_request.prompt.clone(),
-                MISSION_COMMAND_WALL_CLOCK,
-                RuntimeTurnOptions {
-                    profile: runtime::ContextProfile::DeepInvestigation,
-                    max_iterations: Some(64),
-                    ..RuntimeTurnOptions::default()
-                },
-            )
-            .await
-        {
-            Ok(execution) => {
-                let result_ref = format!("turn:{}", execution.receipt.turn_id);
-                let command = runtime::global_mission_runtime()
-                    .complete_session_command(
-                        &turn_request.session_id,
-                        &turn_request.command_id,
-                        Some(result_ref.clone()),
-                    )
-                    .ok();
-                turn_results.push(serde_json::json!({
-                    "ok": true,
-                    "session_id": turn_request.session_id,
-                    "command_id": turn_request.command_id,
-                    "turn": execution.receipt,
-                    "result_ref": result_ref,
-                    "session_runtime": session_runtime,
-                    "summary": {
-                        "iterations": execution.summary.iterations,
-                        "assistant_message_count": execution.summary.assistant_messages.len(),
-                        "tool_result_count": execution.summary.tool_results.len(),
-                    },
-                    "command": command,
-                }));
-            }
-            Err(error) => {
-                let message = error.message();
-                let command = runtime::global_mission_runtime()
-                    .fail_session_command(
-                        &turn_request.session_id,
-                        &turn_request.command_id,
-                        message.clone(),
-                    )
-                    .ok();
-                turn_results.push(serde_json::json!({
-                    "ok": false,
-                    "session_id": turn_request.session_id,
-                    "command_id": turn_request.command_id,
-                    "error": message,
-                    "session_runtime": session_runtime,
-                    "command": command,
-                }));
-            }
-        }
-    }
-    let ok = report.errors.is_empty()
-        && turn_results
-            .iter()
-            .all(|result| result["ok"].as_bool().unwrap_or(false));
-    let mut response = serde_json::json!({
+        .map_err(|error| error.message());
+    Json(serde_json::json!({
         "envelope": state.services.mission.session_control_contract(),
-        "kind": kind,
-        "ok": ok,
-        "report": report,
-        "turn_results": turn_results,
-        "projection": runtime::MissionControlRuntime::projection(),
-        "mission": runtime::global_mission_runtime().projection(),
-    });
-    if let Some(extra) = extra {
-        response["extra"] = extra;
-    }
-    response
+        "kind": "mission_control.session_dispatch_submission",
+        "ok": result.is_ok(),
+        "policy": body,
+        "result": result
+    }))
 }
 
 async fn bridge_mission_session_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(body): Json<runtime::CrossSessionMessage>,
 ) -> impl IntoResponse {
-    Json(state.services.mission.bridge_mission_session(body))
+    let Some(runtime_service) = state.services.runtime.as_ref().cloned() else {
+        return Json(serde_json::json!({
+            "ok": false,
+            "kind": "mission_control.session_bridge_submission",
+            "error": "runtime service unavailable"
+        }));
+    };
+    let route = runtime_service
+        .runtime_services()
+        .session_relations()
+        .route(runtime::SessionRouteCommand {
+            from_session_id: body.from_session_id.clone(),
+            target_ref: body.target_ref.clone(),
+            command: body.command.clone(),
+        });
+    let Some(target_session_id) = route.resolved_session_id.clone() else {
+        return Json(serde_json::json!({
+            "ok": false,
+            "kind": "mission_control.session_bridge_submission",
+            "route": route,
+            "error": "cross-session target did not resolve to a session"
+        }));
+    };
+    let envelope = harness_contract::turn::SessionInputEnvelope::text(
+        target_session_id,
+        harness_contract::turn::InputSourceKind::Api,
+        body.command,
+    )
+    .with_source_ref(format!("session:{}", body.from_session_id));
+    let result = runtime_service
+        .admit_session_input_with_materialized(envelope)
+        .await
+        .map_err(|error| error.message());
+    Json(serde_json::json!({
+        "ok": result.is_ok(),
+        "kind": "mission_control.session_bridge_submission",
+        "route": route,
+        "result": result.map(|admission| serde_json::json!({
+            "input": admission.receipt,
+            "materialized": admission.materialized
+        }))
+    }))
 }
 
 async fn interpret_mission_command_handler(
@@ -417,6 +320,7 @@ async fn cancel_team_runtime_handler(
         .services
         .mission
         .cancel_team_runtime(&team_id)
+        .await
         .map(Json)
         .map_err(|error| api_error(StatusCode::NOT_FOUND, error))
 }
@@ -535,33 +439,6 @@ async fn tick_mission_steward_scheduler_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(body): Json<runtime::StewardSchedulerConfig>,
 ) -> impl IntoResponse {
-    if body.dispatch_mode == runtime::SessionDispatchMode::StartRuntimeTurn {
-        if state.services.runtime.is_none() {
-            return Json(serde_json::json!({
-                "envelope": state.services.mission.session_control_contract(),
-                "kind": "mission_control.steward_scheduler_tick",
-                "ok": false,
-                "error": "runtime service unavailable",
-                "config": body,
-                "scheduler": runtime::StewardScheduler::projection(),
-                "projection": runtime::MissionControlRuntime::projection(),
-            }));
-        }
-        let report = runtime::StewardScheduler::tick(body);
-        let session_dispatch = report.session_dispatch.clone();
-        return Json(
-            execute_session_turn_dispatch_report(
-                state,
-                session_dispatch,
-                "mission_control.steward_scheduler_tick",
-                Some(serde_json::json!({
-                    "scheduler_report": report,
-                    "scheduler": runtime::StewardScheduler::projection(),
-                })),
-            )
-            .await,
-        );
-    }
     Json(state.services.mission.tick_steward_scheduler(body))
 }
 
@@ -837,7 +714,9 @@ async fn consume_mission_session_command_as_turn(
     };
     let session_runtime =
         ensure_active_runtime_session_for_mission_command(&state, &session_id).await?;
-    let current = runtime::global_mission_runtime()
+    let current = runtime_service
+        .runtime_services()
+        .mission_runtime()
         .get_session_command(&command_id)
         .ok_or_else(|| {
             api_error(
@@ -851,74 +730,28 @@ async fn consume_mission_session_command_as_turn(
             format!("command {command_id} does not belong to session {session_id}"),
         ));
     }
-    if current.status == runtime::MissionSessionCommandStatus::Pending {
-        runtime::global_mission_runtime()
-            .claim_session_command(&session_id, &command_id)
-            .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
-    }
-    let running = runtime::global_mission_runtime()
-        .mark_session_command_running(&session_id, &command_id)
-        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
-    let prompt = running.command.clone();
-    match runtime_service
-        .run_turn_with_options(
-            &session_id,
-            None,
-            prompt,
-            MISSION_COMMAND_WALL_CLOCK,
-            RuntimeTurnOptions {
-                profile: runtime::ContextProfile::DeepInvestigation,
-                max_iterations: Some(64),
-                ..RuntimeTurnOptions::default()
-            },
-        )
+    let envelope = harness_contract::turn::SessionInputEnvelope::text(
+        session_id,
+        harness_contract::turn::InputSourceKind::Api,
+        current.command.clone(),
+    )
+    .with_source_ref(format!("mission-command:{command_id}"))
+    .with_idempotency_key(format!("mission-command:{command_id}"));
+    let admission = runtime_service
+        .admit_session_input_with_materialized(envelope)
         .await
-    {
-        Ok(execution) => {
-            let result_ref = format!("turn:{}", execution.receipt.turn_id);
-            let command = runtime::global_mission_runtime()
-                .complete_session_command(&session_id, &command_id, Some(result_ref.clone()))
-                .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
-            Ok(Json(serde_json::json!({
-                "envelope": state.services.mission.session_control_contract(),
-                "ok": true,
-                "mode": body.mode,
-                "actor_id": body.actor_id,
-                "reason": body.reason,
-                "command": command,
-                "turn": execution.receipt,
-                "summary": {
-                    "iterations": execution.summary.iterations,
-                    "assistant_message_count": execution.summary.assistant_messages.len(),
-                    "tool_result_count": execution.summary.tool_results.len(),
-                    "prompt_cache_event_count": execution.summary.prompt_cache_events.len(),
-                    "auto_compaction": execution.summary.auto_compaction.map(|event| serde_json::json!({
-                        "removed_message_count": event.removed_message_count,
-                    })),
-                },
-                "result_ref": result_ref,
-                "session_runtime": session_runtime,
-                "mission": runtime::global_mission_runtime().projection(),
-            })))
-        }
-        Err(error) => {
-            let message = error.message();
-            let command = runtime::global_mission_runtime()
-                .fail_session_command(&session_id, &command_id, message.clone())
-                .map_err(|failure| api_error(StatusCode::BAD_REQUEST, failure))?;
-            Ok(Json(serde_json::json!({
-                "envelope": state.services.mission.session_control_contract(),
-                "ok": false,
-                "mode": body.mode,
-                "actor_id": body.actor_id,
-                "reason": body.reason,
-                "error": message,
-                "command": command,
-                "session_runtime": session_runtime,
-                "mission": runtime::global_mission_runtime().projection(),
-            })))
-        }
-    }
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.message()))?;
+    Ok(Json(serde_json::json!({
+        "envelope": state.services.mission.session_control_contract(),
+        "ok": true,
+        "mode": body.mode,
+        "actor_id": body.actor_id,
+        "reason": body.reason,
+        "command": current,
+        "input": admission.receipt,
+        "materialized": admission.materialized,
+        "session_runtime": session_runtime,
+    })))
 }
 
 async fn ensure_active_runtime_session_for_mission_command(
@@ -947,6 +780,7 @@ async fn ensure_active_runtime_session_for_mission_command(
     let runtime = if let Some(store) = state.services.session.unified_store() {
         crate::runtime_factory::create_runtime_entry_with_session_store(
             store,
+            runtime_service.runtime_services(),
             runtime_service.provider_registry(),
             runtime_service.tool_host(),
             session,
@@ -962,6 +796,7 @@ async fn ensure_active_runtime_session_for_mission_command(
         )
     } else {
         crate::runtime_factory::create_runtime_entry(
+            runtime_service.runtime_services(),
             runtime_service.provider_registry(),
             runtime_service.tool_host(),
             session,

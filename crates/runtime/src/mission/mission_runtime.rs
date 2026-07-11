@@ -6,16 +6,15 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
+use crate::{global_agent_lifecycle_service, global_team_runtime_service};
 use crate::{
-    cowd_dirs, global_conflict_arbiter, global_mission_evidence_bus, global_session_relation_graph,
-    record_runtime_event, RuntimeCapabilityCatalog, RuntimeEventInput, RuntimeEventScope,
-    SessionRecoveryCandidate, StewardScheduler, TeamExecutionLoop,
+    RuntimeCapabilityCatalog, SessionRecoveryCandidate, SessionRelationGraph, StewardScheduler,
+    TeamExecutionLoop,
 };
-use crate::{global_agent_lifecycle_service, global_approval_queue, global_team_runtime_service};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -168,7 +167,7 @@ pub struct MissionProjection {
     pub agent_projection: serde_json::Value,
     pub approval_projection: serde_json::Value,
     pub relation_projection: serde_json::Value,
-    pub workgraph_projection: serde_json::Value,
+    pub execution_graph_projection: serde_json::Value,
     pub conflict_projection: serde_json::Value,
     pub evidence_projection: serde_json::Value,
     pub steward_projection: serde_json::Value,
@@ -209,14 +208,14 @@ impl Default for MissionRuntimeState {
 #[derive(Debug)]
 pub struct MissionRuntime {
     state: Mutex<MissionRuntimeState>,
-    persistent: bool,
+    state_path: Option<PathBuf>,
 }
 
 impl Default for MissionRuntime {
     fn default() -> Self {
         Self {
             state: Mutex::new(MissionRuntimeState::default()),
-            persistent: false,
+            state_path: None,
         }
     }
 }
@@ -228,11 +227,11 @@ impl MissionRuntime {
     }
 
     #[must_use]
-    pub fn persistent() -> Self {
-        Self {
-            state: Mutex::new(load_state().unwrap_or_default()),
-            persistent: true,
-        }
+    pub fn persistent_at(state_path: PathBuf) -> Result<Self, String> {
+        Ok(Self {
+            state: Mutex::new(load_state(&state_path)?),
+            state_path: Some(state_path),
+        })
     }
 
     pub fn start_session(
@@ -657,7 +656,7 @@ impl MissionRuntime {
             .clone()
     }
 
-    pub fn projection(&self) -> MissionProjection {
+    pub fn projection(&self, relations: &SessionRelationGraph) -> MissionProjection {
         let state = self
             .state
             .lock()
@@ -673,11 +672,11 @@ impl MissionRuntime {
             session_commands: state.session_commands.values().cloned().collect(),
             team_projection: global_team_runtime_service().projection(),
             agent_projection: global_agent_lifecycle_service().projection(),
-            approval_projection: global_approval_queue().projection(),
-            relation_projection: global_session_relation_graph().projection(),
-            workgraph_projection: mission_workgraph_projection(),
-            conflict_projection: global_conflict_arbiter().projection(),
-            evidence_projection: global_mission_evidence_bus().projection(),
+            approval_projection: serde_json::Value::Null,
+            relation_projection: relations.projection(),
+            execution_graph_projection: mission_execution_graph_projection(),
+            conflict_projection: serde_json::Value::Null,
+            evidence_projection: serde_json::Value::Null,
             steward_projection: serde_json::json!(StewardScheduler::projection()),
             capability_projection: serde_json::json!(RuntimeCapabilityCatalog::current()),
             health_projection: mission_health_projection(&state),
@@ -847,8 +846,8 @@ impl MissionRuntime {
     }
 
     fn persist_if_enabled(&self, state: &MissionRuntimeState) -> Result<(), String> {
-        if self.persistent {
-            persist_state(state)?;
+        if let Some(path) = &self.state_path {
+            persist_state(path, state)?;
         }
         Ok(())
     }
@@ -870,32 +869,8 @@ impl MissionRuntimeState {
             session_id: session_id.clone(),
             emitted_at_ms: now_ms(),
         });
-        let _ = record_runtime_event(RuntimeEventInput {
-            stream_id: session_id
-                .as_ref()
-                .map(|id| format!("session:{id}"))
-                .unwrap_or_else(|| "mission:global".to_string()),
-            scope: if session_id.is_some() {
-                RuntimeEventScope::Session
-            } else {
-                RuntimeEventScope::Mission
-            },
-            kind: event_type,
-            status: None,
-            actor: Some("mission_runtime".to_string()),
-            refs: Vec::new(),
-            payload: serde_json::json!({
-                "message": message,
-                "session_id": session_id,
-            }),
-        });
         self.next_sequence += 1;
     }
-}
-
-pub fn global_mission_runtime() -> &'static MissionRuntime {
-    static RUNTIME: OnceLock<MissionRuntime> = OnceLock::new();
-    RUNTIME.get_or_init(MissionRuntime::persistent)
 }
 
 fn now_ms() -> u64 {
@@ -905,8 +880,8 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn mission_workgraph_projection() -> serde_json::Value {
-    let workgraphs = global_team_runtime_service()
+fn mission_execution_graph_projection() -> serde_json::Value {
+    let execution_graphs = global_team_runtime_service()
         .list()
         .into_iter()
         .map(|team| match TeamExecutionLoop::plan(&team.team_id) {
@@ -914,10 +889,10 @@ fn mission_workgraph_projection() -> serde_json::Value {
                 "team_id": plan.team_id,
                 "session_id": plan.session_id,
                 "objective": plan.objective,
-                "workgraph_id": plan.workgraph.id,
-                "node_count": plan.workgraph.nodes.len(),
-                "edge_count": plan.workgraph.edges.len(),
-                "quality": plan.workgraph_quality,
+                "execution_graph_id": plan.execution_graph.id,
+                "node_count": plan.execution_graph.nodes.len(),
+                "edge_count": plan.execution_graph.edges.len(),
+                "quality": plan.execution_graph_quality,
                 "ready_node_ids": plan.ready_node_ids,
                 "blocked_node_ids": plan.blocked_node_ids,
                 "max_parallelism": plan.spec.max_parallelism,
@@ -930,9 +905,9 @@ fn mission_workgraph_projection() -> serde_json::Value {
         })
         .collect::<Vec<_>>();
     serde_json::json!({
-        "kind": "runtime.mission_workgraphs",
-        "count": workgraphs.len(),
-        "workgraphs": workgraphs,
+        "kind": "runtime.mission_execution_graphs",
+        "count": execution_graphs.len(),
+        "execution_graphs": execution_graphs,
     })
 }
 
@@ -1054,14 +1029,7 @@ fn session_command_summary(
     summary
 }
 
-fn state_path() -> PathBuf {
-    cowd_dirs::user_agents_dir()
-        .join("mission-runtime")
-        .join("state.json")
-}
-
-fn load_state() -> Result<MissionRuntimeState, String> {
-    let path = state_path();
+fn load_state(path: &std::path::Path) -> Result<MissionRuntimeState, String> {
     if !path.exists() {
         return Ok(MissionRuntimeState::default());
     }
@@ -1074,10 +1042,9 @@ fn load_state() -> Result<MissionRuntimeState, String> {
     })
 }
 
-fn persist_state(state: &MissionRuntimeState) -> Result<(), String> {
-    let path = state_path();
+fn persist_state(path: &std::path::Path, state: &MissionRuntimeState) -> Result<(), String> {
     let payload = serde_json::to_string_pretty(state).map_err(|error| error.to_string())?;
-    write_state_file(&path, payload.as_bytes()).map_err(|error| {
+    write_state_file(path, payload.as_bytes()).map_err(|error| {
         format!(
             "failed to persist mission runtime state {}: {error}",
             path.display()
@@ -1146,7 +1113,7 @@ mod tests {
         assert_eq!(routed.status, "queued");
         assert_eq!(routed.target_session_id, "mission-session-b");
 
-        let projection = runtime.projection();
+        let projection = runtime.projection(&SessionRelationGraph::new());
         assert_eq!(projection.active_session_id, None);
         assert_eq!(projection.routed_commands.len(), 1);
         let session = projection
@@ -1182,12 +1149,12 @@ mod tests {
             })
             .expect("session");
 
-        let projection = runtime.projection();
+        let projection = runtime.projection(&SessionRelationGraph::new());
 
         assert_eq!(projection.schema_version, 2);
         assert_eq!(
-            projection.workgraph_projection["kind"],
-            "runtime.mission_workgraphs"
+            projection.execution_graph_projection["kind"],
+            "runtime.mission_execution_graphs"
         );
         assert_eq!(projection.conflict_projection["kind"], "runtime.conflicts");
         assert_eq!(

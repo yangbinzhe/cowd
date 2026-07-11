@@ -9,7 +9,7 @@ use serde_json::Value;
 pub const AI_STRATEGY_DECISION_FACT: &str = "ai_strategy_decision";
 pub const AI_VERIFICATION_RESULT_FACT: &str = "ai_verification_result";
 pub const AI_TOOL_TRANSACTION_RESULT_FACT: &str = "ai_tool_transaction_result";
-pub const AI_WORKGRAPH_QUALITY_FACT: &str = "ai_workgraph_quality";
+pub const AI_EXECUTION_GRAPH_QUALITY_FACT: &str = "ai_execution_graph_quality";
 pub const AI_GROWTH_SIGNAL_FACT: &str = "ai_growth_signal";
 pub const AI_EVAL_RESULT_FACT: &str = "ai_eval_result";
 pub const KNOWLEDGE_CANON_RULE_FACT: &str = "knowledge_canon_rule";
@@ -290,7 +290,7 @@ mod fact_kernel_bridge_tests {
         let fact = MatrixFact::from_input(MatrixFactInput {
             fact_id: Some("fact-3".to_string()),
             snapshot_id: Some("snapshot-3".to_string()),
-            fact_type: AI_WORKGRAPH_QUALITY_FACT.to_string(),
+            fact_type: AI_EXECUTION_GRAPH_QUALITY_FACT.to_string(),
             entity_refs: vec!["harness:runtime".to_string()],
             metric_key: Some("quality_score".to_string()),
             dimensions: serde_json::json!({"area": "runtime"}),

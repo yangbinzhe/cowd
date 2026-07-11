@@ -802,7 +802,10 @@ impl Component for GatewayPanel {
                 lines.push(Line::from(vec![
                     Span::styled("Graphs/Conflicts: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
-                        format!("{} / {}", mission.workgraph_count, mission.conflict_count),
+                        format!(
+                            "{} / {}",
+                            mission.execution_graph_count, mission.conflict_count
+                        ),
                         Style::default().fg(if mission.conflict_count > 0 {
                             Color::Red
                         } else {
@@ -1972,7 +1975,7 @@ mod tests {
             agent_count: 2,
             pending_approvals: 3,
             relation_count: 4,
-            workgraph_count: 2,
+            execution_graph_count: 2,
             conflict_count: 1,
             evidence_count: 5,
             capability_action_count: 7,

@@ -8,6 +8,7 @@ pub mod agent;
 pub mod behavior;
 pub mod context;
 pub mod core;
+pub mod execution_graph;
 pub mod growth;
 pub mod harness;
 pub mod knowledge;
@@ -19,7 +20,6 @@ pub mod task;
 pub mod tool;
 pub mod turn;
 pub mod verification;
-pub mod workgraph;
 
 pub use core::{
     AiKernelError, AiKernelResult, ExecutionModifier, ExecutionPattern, ExecutionPolicyGate,

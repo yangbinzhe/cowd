@@ -21,9 +21,16 @@ pub(super) async fn append_matrix_execution_outcome(
     ensure_matrix_outcome_session_record(state, session_id)
         .await
         .map_err(|error| format!("failed to prepare Matrix outcome session: {error}"))?;
-    let event = outcome.to_runtime_event(session_id.to_string(), 0);
+    let event = memory::SessionDomainEvent::new(
+        session_id,
+        0,
+        memory::SessionDomainScope::Memory,
+        "matrix.execution_outcome",
+        serde_json::to_value(&outcome).map_err(|error| error.to_string())?,
+        outcome.created_at.timestamp_millis().max(0) as u64,
+    );
     store
-        .append_runtime_event_allocating_sequence(&event)
+        .append_session_domain_event_allocating_sequence(&event)
         .await
         .map(|_| ())
         .map_err(|error| error.to_string())

@@ -49,7 +49,7 @@ pub enum BenchCaseKind {
     ArchitecturePlan,
     ContextAssembly,
     VerificationGuard,
-    WorkGraphFanout,
+    ExecutionGraphFanout,
     ToolTransaction,
     BehaviorMinimalScope,
     MemoryGrowthLoop,
@@ -471,8 +471,12 @@ pub fn next_gen_harness_closure_specs() -> Vec<NextGenHarnessScenarioSpec> {
             TeamAgentExecutionOutcome,
             "多 Agent 团队执行结果",
             "复杂问题应能形成团队角色、工作图、进度证据和综合结果。",
-            vec!["team_template", "workgraph", "agent_capability_binding"],
-            vec!["team", "workgraph", "agent"],
+            vec![
+                "team_template",
+                "execution_graph",
+                "agent_capability_binding",
+            ],
+            vec!["team", "execution_graph", "agent"],
             0,
             true,
             false,
@@ -825,7 +829,7 @@ fn next_gen_evidence_refs(
         NextGenHarnessScenarioKind::TeamAgentExecutionOutcome => input
             .mission_evidence_refs
             .iter()
-            .filter(|item| item.contains("team") || item.contains("workgraph"))
+            .filter(|item| item.contains("team") || item.contains("execution_graph"))
             .cloned()
             .collect(),
         NextGenHarnessScenarioKind::CrossSessionDispatch => input
@@ -1777,8 +1781,8 @@ impl ScenarioSpec {
 pub enum ScenarioCheckKind {
     FinalizationBlocked,
     RegressionAllowed,
-    WorkgraphPresent,
-    WorkgraphQualityOk,
+    ExecutionGraphPresent,
+    ExecutionGraphQualityOk,
     GrowthBlocker,
     GrowthSignal,
     MemoryCandidateCount,
@@ -1879,8 +1883,8 @@ pub struct ScenarioObservation {
     pub strategy_pattern: ExecutionPattern,
     pub finalization_blocked: bool,
     pub regression_allowed: bool,
-    pub has_workgraph: bool,
-    pub workgraph_quality_ok: bool,
+    pub has_execution_graph: bool,
+    pub execution_graph_quality_ok: bool,
     pub growth_has_blocker: bool,
     pub growth_signal_kinds: Vec<String>,
     pub memory_candidate_count: usize,
@@ -2013,9 +2017,11 @@ fn evaluate_check(
             compare_bool(check, observation.finalization_blocked)
         }
         ScenarioCheckKind::RegressionAllowed => compare_bool(check, observation.regression_allowed),
-        ScenarioCheckKind::WorkgraphPresent => compare_bool(check, observation.has_workgraph),
-        ScenarioCheckKind::WorkgraphQualityOk => {
-            compare_bool(check, observation.workgraph_quality_ok)
+        ScenarioCheckKind::ExecutionGraphPresent => {
+            compare_bool(check, observation.has_execution_graph)
+        }
+        ScenarioCheckKind::ExecutionGraphQualityOk => {
+            compare_bool(check, observation.execution_graph_quality_ok)
         }
         ScenarioCheckKind::GrowthBlocker => compare_bool(check, observation.growth_has_blocker),
         ScenarioCheckKind::GrowthSignal => match check.expected_text.as_ref() {
@@ -2152,7 +2158,7 @@ impl CowdBenchSmokeSuite {
             "strategy".to_string(),
             "context".to_string(),
             "verification".to_string(),
-            "workgraph".to_string(),
+            "execution_graph".to_string(),
             "tool_transaction".to_string(),
             "policy".to_string(),
             "behavior".to_string(),
@@ -2201,7 +2207,7 @@ pub fn cowdbench_smoke_cases() -> Vec<CowdBenchCase> {
             BenchCaseKind::ArchitecturePlan,
             "compare architecture tradeoffs before selecting a plan",
             ExecutionPattern::Deliberate,
-            "workgraph",
+            "execution_graph",
         ),
         (
             BenchCaseKind::ContextAssembly,
@@ -2216,7 +2222,7 @@ pub fn cowdbench_smoke_cases() -> Vec<CowdBenchCase> {
             "verification_report",
         ),
         (
-            BenchCaseKind::WorkGraphFanout,
+            BenchCaseKind::ExecutionGraphFanout,
             "parallel multi-agent implementation",
             ExecutionPattern::Collaborate,
             "value_verdict",
@@ -2266,7 +2272,7 @@ fn capability_for_check(check: &str) -> Option<&'static str> {
     match check {
         "answered" => Some("strategy"),
         "guardrails" => Some("policy"),
-        "workgraph" | "value_verdict" => Some("workgraph"),
+        "execution_graph" | "value_verdict" => Some("execution_graph"),
         "context_epoch" => Some("context"),
         "verification_report" => Some("verification"),
         "tool_transaction" => Some("tool_transaction"),
@@ -2419,7 +2425,7 @@ pub fn stable_ai_scenario_matrix() -> Vec<E2eScenarioMatrixItem> {
             "complex_plan",
             ComplexPlan,
             "complex task forms a plan, executes, reviews, and emits evidence",
-            ["workgraph", "tool_events", "review_verdict"],
+            ["execution_graph", "tool_events", "review_verdict"],
             true,
             true,
         ),
@@ -2769,8 +2775,8 @@ mod tests {
             strategy_pattern: ExecutionPattern::Direct,
             finalization_blocked: false,
             regression_allowed: true,
-            has_workgraph: false,
-            workgraph_quality_ok: false,
+            has_execution_graph: false,
+            execution_graph_quality_ok: false,
             growth_has_blocker: false,
             growth_signal_kinds: Vec::new(),
             memory_candidate_count: 0,
@@ -2806,8 +2812,8 @@ mod tests {
             strategy_pattern: ExecutionPattern::Execute,
             finalization_blocked: false,
             regression_allowed: false,
-            has_workgraph: false,
-            workgraph_quality_ok: false,
+            has_execution_graph: false,
+            execution_graph_quality_ok: false,
             growth_has_blocker: true,
             growth_signal_kinds: vec!["MatrixQualityGate".to_string()],
             memory_candidate_count: 1,
@@ -2880,8 +2886,8 @@ mod tests {
             strategy_pattern: ExecutionPattern::Direct,
             finalization_blocked: false,
             regression_allowed: true,
-            has_workgraph: false,
-            workgraph_quality_ok: false,
+            has_execution_graph: false,
+            execution_graph_quality_ok: false,
             growth_has_blocker: false,
             growth_signal_kinds: Vec::new(),
             memory_candidate_count: 0,
@@ -3112,7 +3118,7 @@ mod tests {
             real_model_authorized: false,
             mission_evidence_refs: vec![
                 "team:demo".to_string(),
-                "workgraph:demo".to_string(),
+                "execution_graph:demo".to_string(),
                 "session-command:demo".to_string(),
                 "session-relation:demo".to_string(),
             ],

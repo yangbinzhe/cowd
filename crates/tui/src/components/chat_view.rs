@@ -219,7 +219,7 @@ impl ChatView {
             .map(Vec::len)
             .unwrap_or_default();
         self.memory_candidate_count = app
-            .latest_workgraph_summary
+            .latest_execution_graph_summary
             .as_ref()
             .map(|summary| summary.memory_candidates)
             .unwrap_or_default();

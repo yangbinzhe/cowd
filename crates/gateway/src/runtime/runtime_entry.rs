@@ -139,12 +139,23 @@ impl GatewayRuntimeEntry {
         self.runtime_ref().last_context_turn_report()
     }
 
-    pub(crate) async fn run_turn_async(
+    pub(crate) async fn submit_turn(
         &mut self,
         content: &str,
         prompter: &runtime::permissions::SharedPrompter,
     ) -> Result<runtime::TurnSummary, runtime::RuntimeError> {
-        self.runtime_mut().run_turn_async(content, prompter).await
+        self.runtime_mut().submit_turn(content, prompter).await
+    }
+
+    pub(crate) async fn submit_ingress_turn(
+        &mut self,
+        content: &str,
+        prompter: &runtime::permissions::SharedPrompter,
+        ingress: runtime::TurnIngressRef,
+    ) -> Result<runtime::TurnSummary, runtime::RuntimeError> {
+        self.runtime_mut()
+            .submit_ingress_turn(content, prompter, ingress)
+            .await
     }
 
     pub(crate) async fn append_external_message(

@@ -17,6 +17,7 @@ mod approval_service;
 mod connector_service;
 mod context;
 mod context_service;
+mod cross_plane_executor;
 mod cross_plane_service;
 mod error;
 mod evolution_service;
@@ -30,6 +31,7 @@ mod policy;
 pub(crate) mod reality_service;
 mod receipt;
 mod registry;
+mod runtime_event_service;
 mod session_service;
 mod skill_service;
 mod slash_controller;
@@ -41,6 +43,7 @@ mod workspace_service;
 pub(crate) use agent_service::UpsertAgentTeamProfileRequest;
 pub(crate) use approval_service::ApprovalService;
 pub(crate) use context_service::ContextServiceError;
+pub(crate) use cross_plane_executor::{GatewayConnectorServiceExecutor, GatewayCrossPlaneExecutor};
 pub(crate) use cross_plane_service::CrossPlaneExecutionRecord;
 pub(crate) use evolution_service::{
     EvolutionCandidateAdoptionRequest, EvolutionCandidateCreateRequest,
@@ -56,17 +59,17 @@ pub(crate) use mfg_service::{
     MfgService,
 };
 pub(crate) use mission_service::{
-    start_team_runtime_with_spawner_decision, AddMissionRelationHttpRequest,
-    AttachMissionAgentHttpRequest, AttachMissionTeamHttpRequest,
+    AddMissionRelationHttpRequest, AttachMissionAgentHttpRequest, AttachMissionTeamHttpRequest,
     ConsumeMissionSessionCommandHttpRequest, DecideMissionApprovalHttpRequest,
     InterpretMissionCommandHttpRequest, InterruptMissionStewardHttpRequest,
-    MissionSessionCommandConsumeMode, MissionTeamExecutionMode, MissionTeamHandoffHttpRequest,
+    MissionSessionCommandConsumeMode, MissionTeamHandoffHttpRequest,
     RouteMissionCommandHttpRequest, StartMissionSessionHttpRequest, StartMissionStewardHttpRequest,
     StartMissionTeamRuntimeHttpRequest, SubmitAgentTaskOutcomeHttpRequest,
     SubmitMissionApprovalHttpRequest, TickMissionStewardHttpRequest, UpsertMissionProxyHttpRequest,
 };
 pub(crate) use reality_service::RealityService;
 pub(crate) use receipt::{service_envelope, ServiceEnvelope};
+pub(crate) use runtime_event_service::RuntimeEventService;
 pub(crate) use session_service::{
     ActiveMessagesPage, SessionCompactResult, SessionMessageCounts, SessionService,
     SessionStatsSnapshot, SessionTokenCounts, SessionUpdateRequest,
@@ -131,13 +134,15 @@ impl ConnectorService {
 pub(crate) struct CrossPlaneService {
     pub(crate) label: &'static str,
     pub(crate) owner: &'static str,
+    runtime_services: Arc<runtime::RuntimeServices>,
 }
 
 impl CrossPlaneService {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(runtime_services: Arc<runtime::RuntimeServices>) -> Self {
         Self {
             label: "cross_plane",
             owner: "0.9.315 Cross-plane service boundary",
+            runtime_services,
         }
     }
 }
@@ -510,6 +515,7 @@ pub(crate) struct AgentService {
 pub(crate) struct MissionService {
     pub(crate) label: &'static str,
     pub(crate) owner: &'static str,
+    runtime_services: Option<Arc<runtime::RuntimeServices>>,
 }
 
 impl AgentService {
@@ -528,6 +534,7 @@ impl AgentService {
 #[derive(Clone)]
 pub(crate) struct GatewayServices {
     pub(crate) runtime: Option<Arc<RuntimeService>>,
+    pub(crate) runtime_events: RuntimeEventService,
     pub(crate) surface: SurfaceService,
     pub(crate) slash: SlashController,
     pub(crate) session: SessionService,

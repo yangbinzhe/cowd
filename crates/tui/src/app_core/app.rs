@@ -315,7 +315,7 @@ pub struct App {
     pub context_window: u64,
     pub latest_context_envelope: Option<Value>,
     pub latest_runtime_policy: Option<crate::RuntimePolicyDecisionSummary>,
-    pub latest_workgraph_summary: Option<crate::RuntimeWorkGraphSummary>,
+    pub latest_execution_graph_summary: Option<crate::RuntimeExecutionGraphSummary>,
     pub latest_run_projection: Option<Value>,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -603,7 +603,7 @@ impl App {
             context_window: 0,
             latest_context_envelope: None,
             latest_runtime_policy: None,
-            latest_workgraph_summary: None,
+            latest_execution_graph_summary: None,
             latest_run_projection: None,
             input_tokens: 0,
             output_tokens: 0,
@@ -1325,8 +1325,8 @@ impl App {
                 self.latest_runtime_policy = Some(summary);
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
-            CowdEvent::WorkGraphSummary { summary } => {
-                self.latest_workgraph_summary = Some(summary);
+            CowdEvent::ExecutionGraphSummary { summary } => {
+                self.latest_execution_graph_summary = Some(summary);
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
 
@@ -1336,7 +1336,7 @@ impl App {
                 self.streaming_received = false;
                 self.latest_context_envelope = None;
                 self.latest_runtime_policy = None;
-                self.latest_workgraph_summary = None;
+                self.latest_execution_graph_summary = None;
                 self.latest_run_projection = None;
                 self.thinking_id_counter = 0;
                 self.pre_turn_input = self.input_tokens;
@@ -1553,7 +1553,7 @@ mod tests {
             requires_review: true,
             signal_count: 3,
         });
-        app.latest_workgraph_summary = Some(crate::RuntimeWorkGraphSummary {
+        app.latest_execution_graph_summary = Some(crate::RuntimeExecutionGraphSummary {
             graph_id: Some("g".into()),
             board_id: Some("b".into()),
             status: "done".into(),
@@ -1570,7 +1570,7 @@ mod tests {
 
         assert!(app.latest_context_envelope.is_none());
         assert!(app.latest_runtime_policy.is_none());
-        assert!(app.latest_workgraph_summary.is_none());
+        assert!(app.latest_execution_graph_summary.is_none());
         assert!(app.latest_run_projection.is_none());
     }
 

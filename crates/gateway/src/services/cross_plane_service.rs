@@ -1,19 +1,29 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::OnceLock,
-};
-
 use connector::{ConnectorRegistrySnapshot, ProviderAccount};
+use harness_contract::execution_graph::{ExecutionGraphCommand, ExecutionNodeKind};
+use runtime::ExecutionGraphHost;
 use runtime::{
-    ConnectorActionContext, CrossPlaneAction, CrossPlaneAuditRecord, CrossPlaneControlPlane,
-    CrossPlaneDecisionEvidence, CrossPlaneDispatchOutcome, CrossPlaneDispatchTarget,
-    CrossPlaneExecutionReceipt, CrossPlanePolicyDecision,
+    ConnectorActionContext, CrossPlaneAction, CrossPlaneAuditRecord, CrossPlaneDecisionEvidence,
+    CrossPlaneDispatchOutcome, CrossPlaneDispatchTarget, CrossPlaneExecutionReceipt,
+    CrossPlanePolicyDecision, CrossPlaneRuntimeService,
 };
 
 use super::{CrossPlaneService, ServiceEnvelope};
 
-static CROSS_PLANE_CONTROL: OnceLock<CrossPlaneControlPlane> = OnceLock::new();
-static CROSS_PLANE_LOADED: OnceLock<()> = OnceLock::new();
+struct CrossPlaneGraphResolver {
+    graph_id: String,
+    backend: std::sync::Arc<dyn runtime::execution_core::ScopedNodeBackend>,
+}
+
+impl runtime::execution_core::graph::executors::ScopedNodeBackendResolver
+    for CrossPlaneGraphResolver
+{
+    fn resolve(
+        &self,
+        ticket: &runtime::execution_core::NodeExecutionTicket,
+    ) -> Option<std::sync::Arc<dyn runtime::execution_core::ScopedNodeBackend>> {
+        (ticket.graph_id == self.graph_id).then(|| std::sync::Arc::clone(&self.backend))
+    }
+}
 
 pub(crate) struct CrossPlaneExecutionRecord {
     pub(crate) idempotency_key: Option<String>,
@@ -28,9 +38,46 @@ pub(crate) struct CrossPlaneExecutionRecord {
     pub(crate) evidence: CrossPlaneDecisionEvidence,
     pub(crate) audit_result: String,
     pub(crate) audit_summary: String,
+    pub(crate) execution_graph_id: Option<String>,
 }
 
 impl CrossPlaneService {
+    pub(crate) fn record_non_commit_action(
+        &self,
+        idempotency_key: Option<String>,
+        mode: String,
+        action: CrossPlaneAction,
+        decision: CrossPlanePolicyDecision,
+        evidence: CrossPlaneDecisionEvidence,
+    ) -> Result<CrossPlaneExecutionReceipt, runtime::CrossPlaneRuntimeError> {
+        let allowed = decision.decision == runtime::PolicyDecisionKind::Allow;
+        let (_, receipt) = self.record_action_execution(CrossPlaneExecutionRecord {
+            idempotency_key,
+            mode,
+            status: if allowed { "planned" } else { "blocked" }.into(),
+            dispatch_status: if allowed { "dry_run" } else { "policy_blocked" }.into(),
+            blockers: if allowed {
+                Vec::new()
+            } else {
+                vec![format!("policy:{}", decision.reason)]
+            },
+            action,
+            decision,
+            dispatch_target: None,
+            dispatch_outcome: None,
+            evidence,
+            audit_result: if allowed { "dry_run" } else { "blocked" }.into(),
+            audit_summary: if allowed {
+                "cross_plane_dry_run_plan"
+            } else {
+                "cross_plane_policy_blocked"
+            }
+            .into(),
+            execution_graph_id: None,
+        })?;
+        Ok(receipt)
+    }
+
     pub(crate) fn envelope(&self, operation: &'static str) -> ServiceEnvelope {
         ServiceEnvelope {
             service: self.label,
@@ -41,26 +88,20 @@ impl CrossPlaneService {
         }
     }
 
-    pub(crate) fn control(&self) -> &'static CrossPlaneControlPlane {
-        CROSS_PLANE_CONTROL.get_or_init(CrossPlaneControlPlane::new)
+    pub(crate) fn control(&self) -> &CrossPlaneRuntimeService {
+        self.runtime_services.cross_plane()
     }
 
-    pub(crate) fn ensure_loaded(&self, config_home: impl AsRef<Path>) {
-        let path = self.state_path(config_home);
-        let _ = CROSS_PLANE_LOADED.get_or_init(|| {
-            let _ = self.control().load_from_path(&path);
-        });
-    }
-
-    pub(crate) fn save_state(&self, config_home: impl AsRef<Path>) {
-        let _ = self.control().save_to_path(&self.state_path(config_home));
+    pub(crate) fn runtime_control(&self) -> std::sync::Arc<CrossPlaneRuntimeService> {
+        std::sync::Arc::clone(self.runtime_services.cross_plane())
     }
 
     pub(crate) fn find_execution_by_idempotency_key(
         &self,
         idempotency_key: &str,
     ) -> Option<CrossPlaneExecutionReceipt> {
-        self.control()
+        self.runtime_services
+            .cross_plane()
             .find_execution_by_idempotency_key(idempotency_key)
     }
 
@@ -68,13 +109,17 @@ impl CrossPlaneService {
         &self,
         decision: &CrossPlanePolicyDecision,
     ) -> Option<(String, u32)> {
-        self.control().consume_matched_grant_for_decision(decision)
+        self.runtime_services
+            .cross_plane()
+            .consume_matched_grant_for_decision(decision)
+            .ok()
+            .flatten()
     }
 
     pub(crate) fn record_action_execution(
         &self,
         record: CrossPlaneExecutionRecord,
-    ) -> (String, CrossPlaneExecutionReceipt) {
+    ) -> Result<(String, CrossPlaneExecutionReceipt), runtime::CrossPlaneRuntimeError> {
         let audit_record = CrossPlaneAuditRecord::new(
             record.action.clone(),
             record.decision.clone(),
@@ -83,8 +128,6 @@ impl CrossPlaneService {
         )
         .with_evidence(record.evidence);
         let audit_record_id = audit_record.id.clone();
-        self.control().record_audit(audit_record);
-
         let receipt = CrossPlaneExecutionReceipt::new(
             record.idempotency_key,
             record.mode,
@@ -96,9 +139,11 @@ impl CrossPlaneService {
             Some(audit_record_id.clone()),
         )
         .with_dispatch_target(record.dispatch_target)
-        .with_dispatch_outcome(record.dispatch_outcome);
-        self.control().record_execution(receipt.clone());
-        (audit_record_id, receipt)
+        .with_dispatch_outcome(record.dispatch_outcome)
+        .with_execution_graph_id(record.execution_graph_id);
+        self.runtime_services
+            .cross_plane()
+            .record_action_execution(audit_record, receipt)
     }
 
     pub(crate) fn decide_connector_action(
@@ -113,15 +158,125 @@ impl CrossPlaneService {
         CrossPlaneDecisionEvidence,
     ) {
         let connector_context = connector_context_from_snapshot(snapshot, &action, mode);
-        self.control()
+        self.runtime_services
+            .cross_plane()
             .decide_with_connector_context(action, connector_context, now)
     }
 
-    fn state_path(&self, config_home: impl AsRef<Path>) -> PathBuf {
-        config_home
-            .as_ref()
-            .join("cross-plane")
-            .join("control-state.json")
+    pub(crate) async fn execute_commit_graph(
+        &self,
+        action: &CrossPlaneAction,
+        decision: &CrossPlanePolicyDecision,
+        idempotency_key: &str,
+        backend: std::sync::Arc<dyn runtime::execution_core::ScopedNodeBackend>,
+    ) -> Result<harness_contract::execution_graph::ExecutionGraphProjection, String> {
+        let mut graph = self.runtime_services.cross_plane().compile_commit_graph(
+            action,
+            decision,
+            idempotency_key,
+        );
+        let executor_kind = "cross_plane_connector".to_string();
+        for node in &mut graph.nodes {
+            if node.kind == ExecutionNodeKind::ToolBatch {
+                node.executor_kind.clone_from(&executor_kind);
+            }
+        }
+        let graph_id = graph.id.clone();
+        self.runtime_services
+            .cross_plane_connector_executor()
+            .install_resolver(std::sync::Arc::new(CrossPlaneGraphResolver {
+                graph_id: graph_id.clone(),
+                backend,
+            }));
+        let result = self
+            .runtime_services
+            .graph_runner()
+            .submit_graph(
+                graph,
+                ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            )
+            .await
+            .map(|receipt| receipt.graph)
+            .map_err(|error| error.to_string());
+        if let Ok(projection) = &result {
+            let outcome = projection
+                .nodes
+                .iter()
+                .find(|node| node.kind == ExecutionNodeKind::ToolBatch)
+                .and_then(|node| node.result_ref.as_deref())
+                .and_then(|value| serde_json::from_str::<CrossPlaneDispatchOutcome>(value).ok());
+            let (status, dispatch_status, audit_result, audit_summary, blockers) =
+                graph_receipt_state(outcome.as_ref());
+            let audit = CrossPlaneAuditRecord::new(
+                action.clone(),
+                decision.clone(),
+                audit_result,
+                audit_summary,
+            );
+            let receipt = CrossPlaneExecutionReceipt::new(
+                Some(idempotency_key.to_string()),
+                "commit",
+                status,
+                dispatch_status,
+                action.clone(),
+                decision.clone(),
+                blockers,
+                Some(audit.id.clone()),
+            )
+            .with_dispatch_outcome(outcome)
+            .with_execution_graph_id(Some(projection.graph_id.clone()));
+            self.runtime_services
+                .cross_plane()
+                .record_action_execution(audit, receipt)
+                .map_err(|error| error.to_string())?;
+        }
+        result
+    }
+}
+
+fn graph_receipt_state(
+    outcome: Option<&CrossPlaneDispatchOutcome>,
+) -> (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    Vec<String>,
+) {
+    match outcome.map(|outcome| outcome.status.as_str()) {
+        Some("sent") => (
+            "dispatched",
+            "sent",
+            "dispatched",
+            "cross_plane_execution_graph_sent",
+            Vec::new(),
+        ),
+        Some("delivery_uncertain") => (
+            "delivery_uncertain",
+            "blocked_reconciliation",
+            "delivery_uncertain",
+            "cross_plane_delivery_requires_reconciliation",
+            vec!["delivery_uncertain:manual_reconciliation_required".into()],
+        ),
+        Some("failed") => (
+            "blocked",
+            "dispatch_failed",
+            "blocked_dispatch",
+            "cross_plane_execution_graph_failed",
+            outcome
+                .and_then(|outcome| outcome.error.clone())
+                .into_iter()
+                .collect(),
+        ),
+        _ => (
+            "blocked",
+            "graph_outcome_missing",
+            "blocked_dispatch",
+            "cross_plane_execution_graph_outcome_missing",
+            vec!["execution_graph:dispatch_outcome_missing".into()],
+        ),
     }
 }
 
@@ -205,5 +360,32 @@ fn normalize_execute_mode(mode: &str) -> String {
     match mode.trim().to_ascii_lowercase().as_str() {
         "commit" | "live" | "execute" => "commit".to_string(),
         _ => "dry_run".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::graph_receipt_state;
+    use runtime::CrossPlaneDispatchOutcome;
+
+    #[test]
+    fn graph_receipt_status_only_reports_dispatch_for_sent_outcome() {
+        let sent = CrossPlaneDispatchOutcome::sent("feishu", "send_text", "user:1", None);
+        let sent_state = graph_receipt_state(Some(&sent));
+        assert_eq!((sent_state.0, sent_state.1), ("dispatched", "sent"));
+
+        let uncertain =
+            CrossPlaneDispatchOutcome::delivery_uncertain("feishu", "send_text", "user:1");
+        let uncertain_state = graph_receipt_state(Some(&uncertain));
+        assert_eq!(
+            (uncertain_state.0, uncertain_state.1),
+            ("delivery_uncertain", "blocked_reconciliation")
+        );
+
+        let missing_state = graph_receipt_state(None);
+        assert_eq!(
+            (missing_state.0, missing_state.1),
+            ("blocked", "graph_outcome_missing")
+        );
     }
 }

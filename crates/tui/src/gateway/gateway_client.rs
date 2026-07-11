@@ -2125,11 +2125,11 @@ pub fn gateway_sse_json_to_cowd_event(value: &serde_json::Value) -> Option<CowdE
             .cloned()
             .and_then(|summary| serde_json::from_value(summary).ok())
             .map(|summary| CowdEvent::RuntimePolicyDecision { summary }),
-        "WorkGraphSummary" | "workgraph_summary" => value
+        "ExecutionGraphSummary" | "execution_graph_summary" => value
             .get("summary")
             .cloned()
             .and_then(|summary| serde_json::from_value(summary).ok())
-            .map(|summary| CowdEvent::WorkGraphSummary { summary }),
+            .map(|summary| CowdEvent::ExecutionGraphSummary { summary }),
         _ => None,
     }
 }

@@ -12,9 +12,8 @@ use harness_contract::core::TaskRisk;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    record_runtime_event, ApprovalSource, ApprovalSourceKind, ApprovalTimeoutPolicy,
-    AutonomyProfileId, RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, StewardActionRequest,
-    StewardActionStatus, StewardAgent, StewardDecisionRecord,
+    ApprovalSource, ApprovalSourceKind, ApprovalTimeoutPolicy, AutonomyProfileId,
+    StewardActionRequest, StewardActionStatus, StewardAgent, StewardDecisionRecord,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,6 +215,7 @@ impl StewardRuntimeService {
         &self,
         steward_id: &str,
         request: TickStewardRuntimeRequest,
+        approval_queue: &crate::ApprovalQueue,
     ) -> Result<StewardDecisionRecord, String> {
         let session = self
             .get(steward_id)
@@ -244,20 +244,23 @@ impl StewardRuntimeService {
             team_id: None,
             mission_id: Some(session.mission_id.clone()),
         };
-        let record = StewardAgent::new().evaluate_action(StewardActionRequest {
-            steward_id: session.steward_id.clone(),
-            profile_id: session.profile_id,
-            source,
-            action,
-            summary,
-            risk: request.risk,
-            requested_tool: request.requested_tool,
-            template_id: None,
-            requires_write: request.requires_write,
-            is_critical_operation: request.is_critical_operation,
-            evidence_refs: request.evidence_refs,
-            timeout_policy: request.timeout_policy,
-        })?;
+        let record = StewardAgent::new().evaluate_action(
+            StewardActionRequest {
+                steward_id: session.steward_id.clone(),
+                profile_id: session.profile_id,
+                source,
+                action,
+                summary,
+                risk: request.risk,
+                requested_tool: request.requested_tool,
+                template_id: None,
+                requires_write: request.requires_write,
+                is_critical_operation: request.is_critical_operation,
+                evidence_refs: request.evidence_refs,
+                timeout_policy: request.timeout_policy,
+            },
+            approval_queue,
+        )?;
         self.decisions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -266,50 +269,6 @@ impl StewardRuntimeService {
             .push(record.clone());
         self.update_after_decision(steward_id, &record)?;
         Ok(record)
-    }
-
-    pub fn tick_all_once(&self) -> StewardLoopReport {
-        let sessions = self.list();
-        let mut decisions = Vec::new();
-        let mut errors = Vec::new();
-        let mut skipped = 0usize;
-
-        for session in sessions {
-            if !matches!(
-                session.status,
-                StewardStatus::Running | StewardStatus::WaitingDependency
-            ) {
-                skipped = skipped.saturating_add(1);
-                continue;
-            }
-            match self.tick(
-                &session.steward_id,
-                TickStewardRuntimeRequest {
-                    action: Some(format!("watch mission {}", session.mission_id)),
-                    summary: Some(format!(
-                        "supervise objective and preserve evidence: {}",
-                        session.objective
-                    )),
-                    risk: TaskRisk::Low,
-                    requested_tool: Some("read_file".to_string()),
-                    requires_write: false,
-                    is_critical_operation: false,
-                    evidence_refs: session.evidence_refs.clone(),
-                    timeout_policy: ApprovalTimeoutPolicy::Pending,
-                },
-            ) {
-                Ok(decision) => decisions.push(decision),
-                Err(error) => errors.push(format!("{}: {error}", session.steward_id)),
-            }
-        }
-
-        StewardLoopReport {
-            kind: "runtime.steward_loop_report".to_string(),
-            ticked: decisions.len(),
-            skipped,
-            decisions,
-            errors,
-        }
     }
 
     pub fn pause(&self, steward_id: &str) -> Result<StewardSession, String> {
@@ -481,26 +440,6 @@ impl StewardRuntimeService {
                 related_approval_id: related_approval_id.clone(),
                 created_at_ms: now_ms(),
             });
-        let refs = related_approval_id
-            .into_iter()
-            .map(|id| RuntimeEventRef {
-                kind: "approval".to_string(),
-                id,
-            })
-            .collect();
-        let _ = record_runtime_event(RuntimeEventInput {
-            stream_id: format!("steward:{}", session.steward_id),
-            scope: RuntimeEventScope::Steward,
-            kind,
-            status: Some(session.status.as_str().to_string()),
-            actor: Some("steward_runtime".to_string()),
-            refs,
-            payload: serde_json::json!({
-                "summary": summary,
-                "mission_id": session.mission_id,
-                "root_session_id": session.root_session_id,
-            }),
-        });
     }
 }
 
@@ -522,6 +461,7 @@ mod tests {
 
     #[test]
     fn steward_runtime_tracks_lifecycle_and_handoff() {
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
         let runtime = StewardRuntimeService::new();
         let steward = runtime
             .start(StartStewardRuntimeRequest {
@@ -542,6 +482,7 @@ mod tests {
                     requested_tool: Some("read_file".to_string()),
                     ..TickStewardRuntimeRequest::default()
                 },
+                services.approval_queue(),
             )
             .expect("tick steward");
         assert_eq!(decision.status, StewardActionStatus::Delegated);
@@ -555,7 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn steward_runtime_ticks_all_active_sessions_and_marks_recovery() {
+    fn steward_runtime_marks_recovery_without_an_out_of_runner_tick() {
         let runtime = StewardRuntimeService::new();
         let steward = runtime
             .start(StartStewardRuntimeRequest {
@@ -565,15 +506,6 @@ mod tests {
                 objective: "keep mission moving".to_string(),
             })
             .expect("start steward");
-
-        let report = runtime.tick_all_once();
-        assert_eq!(report.kind, "runtime.steward_loop_report");
-        assert_eq!(report.ticked, 1);
-        assert!(report.errors.is_empty());
-        assert_eq!(
-            runtime.get(&steward.steward_id).expect("steward").status,
-            StewardStatus::WaitingDependency
-        );
 
         let recovered = runtime
             .mark_recovery_required(&steward.steward_id, "gateway restart")

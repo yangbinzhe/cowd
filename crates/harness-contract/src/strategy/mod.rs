@@ -676,7 +676,7 @@ fn required_capabilities_for(
             | ExecutionPattern::Collaborate
             | ExecutionPattern::Supervise
     ) {
-        capabilities.push(KernelCapability::WorkGraph);
+        capabilities.push(KernelCapability::ExecutionGraph);
     }
     if modifiers.contains(&ExecutionModifier::WithVerifier)
         || matches!(
@@ -1064,7 +1064,7 @@ mod tests {
         assert_eq!(decision.policy_version, "strategy-decision-v3");
         assert!(decision
             .required_capabilities
-            .contains(&KernelCapability::WorkGraph));
+            .contains(&KernelCapability::ExecutionGraph));
         assert!(decision
             .required_capabilities
             .contains(&KernelCapability::VerificationLedger));

@@ -2364,10 +2364,10 @@ fn parse_optional_runtime_control_config(
         let memory = expect_object(memory_value, "merged settings.runtime.control.memory")?;
         if let Some(emit) = optional_bool(
             memory,
-            "emit_pulses_from_workgraph",
+            "emit_pulses_from_execution_graph",
             "merged settings.runtime.control.memory",
         )? {
-            config.policy.memory.emit_pulses_from_workgraph = emit;
+            config.policy.memory.emit_pulses_from_execution_graph = emit;
         }
         if let Some(review) = optional_bool(
             memory,

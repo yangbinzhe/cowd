@@ -2,12 +2,13 @@
 
 use std::sync::{Mutex, OnceLock};
 
+use harness_contract::execution_graph::{ExecutionGraph, ExecutionGraphCommand};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    global_steward_runtime_service, MissionControlRuntime, SessionDispatchMode,
-    SessionExecutionPlane, SessionExecutionPolicy, SessionExecutionReport, StewardLoopReport,
-    TeamExecutionLoop, TeamExecutionReport,
+    global_steward_runtime_service, MissionCommandExecutionReceipt, MissionCommandInterpreter,
+    MissionControlRuntime, SessionDispatchMode, SessionExecutionPolicy, StewardLoopReport,
+    TeamExecutionLoop,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,10 +130,18 @@ pub struct StewardSchedulerTickReport {
     pub kind: String,
     pub config: StewardSchedulerConfig,
     pub steward_loop: StewardLoopReport,
-    pub session_dispatch: SessionExecutionReport,
-    pub team_reports: Vec<TeamExecutionReport>,
+    pub session_dispatch: MissionCommandExecutionReceipt,
+    pub team_submissions: Vec<StewardGraphSubmission>,
     pub ledger_records: Vec<StewardDecisionLedgerRecord>,
     pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StewardGraphSubmission {
+    pub team_id: String,
+    pub status: String,
+    pub graph: ExecutionGraph,
+    pub command: ExecutionGraphCommand,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,8 +227,17 @@ pub fn global_steward_decision_ledger() -> &'static StewardDecisionLedger {
 pub struct StewardScheduler;
 
 impl StewardScheduler {
-    pub fn tick(config: StewardSchedulerConfig) -> StewardSchedulerTickReport {
-        let steward_loop = global_steward_runtime_service().tick_all_once();
+    pub fn tick(
+        config: StewardSchedulerConfig,
+        services: &crate::RuntimeServices,
+    ) -> StewardSchedulerTickReport {
+        let steward_loop = StewardLoopReport {
+            kind: "runtime.steward_loop_report".to_string(),
+            ticked: 0,
+            skipped: global_steward_runtime_service().list().len(),
+            decisions: Vec::new(),
+            errors: vec!["capability_unavailable:steward_execution:V8".to_string()],
+        };
         let mut ledger_records = Vec::new();
         for decision in &steward_loop.decisions {
             ledger_records.push(global_steward_decision_ledger().push(
@@ -235,61 +253,55 @@ impl StewardScheduler {
             ));
         }
 
-        let session_dispatch = SessionExecutionPlane::dispatch_pending(SessionExecutionPolicy {
-            max_commands: config.max_session_commands_per_tick,
-            dispatch_mode: config.dispatch_mode,
-            allow_background: config.allow_background_sessions,
-        });
-        if !session_dispatch.dispatched.is_empty() {
-            ledger_records.push(
-                global_steward_decision_ledger().push(StewardDecisionLedgerRecord {
-                    record_id: String::new(),
-                    steward_id: None,
-                    action: "session_dispatch".to_string(),
-                    status: "executed".to_string(),
-                    summary: format!(
-                        "dispatched {} pending session commands",
-                        session_dispatch.dispatched.len()
-                    ),
-                    evidence_refs: session_dispatch
-                        .dispatched
-                        .iter()
-                        .map(|receipt| format!("session-command:{}", receipt.command_id))
-                        .collect(),
-                    created_at_ms: 0,
-                }),
-            );
-        }
+        let session_dispatch = MissionCommandInterpreter::prepare_submission(
+            MissionCommandInterpreter::interpret_session_policy(SessionExecutionPolicy {
+                max_commands: config.max_session_commands_per_tick,
+                dispatch_mode: config.dispatch_mode,
+                allow_background: config.allow_background_sessions,
+            }),
+        );
+        ledger_records.push(
+            global_steward_decision_ledger().push(StewardDecisionLedgerRecord {
+                record_id: String::new(),
+                steward_id: None,
+                action: "session_dispatch_graph_submission".to_string(),
+                status: "pending_runtime_host".to_string(),
+                summary: "prepared SessionDispatch graph for RuntimeHost".to_string(),
+                evidence_refs: Vec::new(),
+                created_at_ms: 0,
+            }),
+        );
 
-        let projection = MissionControlRuntime::projection();
-        let mut team_reports = Vec::new();
+        let projection = MissionControlRuntime::projection(services);
+        let mut team_submissions = Vec::new();
         let mut errors = steward_loop.errors.clone();
         for team in projection.teams.iter().take(config.max_team_ticks) {
-            match TeamExecutionLoop::tick_ready(&team.team_id) {
-                Ok(report) => {
-                    if report.assigned_task_count > 0 || report.delivered_agent_inputs > 0 {
-                        ledger_records.push(
-                            global_steward_decision_ledger().push(StewardDecisionLedgerRecord {
-                                record_id: String::new(),
-                                steward_id: None,
-                                action: "team_execution_tick".to_string(),
-                                status: if report.errors.is_empty() {
-                                    "executed".to_string()
-                                } else {
-                                    "degraded".to_string()
-                                },
-                                summary: format!("ticked team {}", report.team_id),
-                                evidence_refs: report
-                                    .evidence
-                                    .iter()
-                                    .map(|item| item.evidence_id.clone())
-                                    .collect(),
-                                created_at_ms: 0,
-                            }),
-                        );
-                    }
-                    errors.extend(report.errors.clone());
-                    team_reports.push(report);
+            match TeamExecutionLoop::plan(&team.team_id) {
+                Ok(plan) => {
+                    let expected_revision = plan.execution_graph.revision;
+                    ledger_records.push(global_steward_decision_ledger().push(
+                        StewardDecisionLedgerRecord {
+                            record_id: String::new(),
+                            steward_id: None,
+                            action: "team_execution_graph_submission".to_string(),
+                            status: "capability_unavailable".to_string(),
+                            summary: format!(
+                                "prepared team {} graph; collaborate executor activates in V5",
+                                team.team_id
+                            ),
+                            evidence_refs: vec![format!(
+                                "execution-graph:{}",
+                                plan.execution_graph.id
+                            )],
+                            created_at_ms: 0,
+                        },
+                    ));
+                    team_submissions.push(StewardGraphSubmission {
+                        team_id: team.team_id.clone(),
+                        status: "capability_unavailable:collaborate:V5".to_string(),
+                        graph: plan.execution_graph,
+                        command: ExecutionGraphCommand::Start { expected_revision },
+                    });
                 }
                 Err(error) => errors.push(format!("{}: {error}", team.team_id)),
             }
@@ -300,7 +312,7 @@ impl StewardScheduler {
             config,
             steward_loop,
             session_dispatch,
-            team_reports,
+            team_submissions,
             ledger_records,
             errors,
         }
@@ -377,16 +389,18 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::{
-        global_mission_runtime, global_steward_runtime_service, AutonomyProfileId,
-        StartMissionSessionRequest, StartStewardRuntimeRequest,
+        global_steward_runtime_service, AutonomyProfileId, StartMissionSessionRequest,
+        StartStewardRuntimeRequest,
     };
 
     #[test]
     fn steward_scheduler_ticks_stewards_dispatches_and_records_ledger() {
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
         let _guard = crate::test_env_lock();
         let suffix = uuid::Uuid::new_v4();
         let session_id = format!("steward-scheduler-session-{suffix}");
-        global_mission_runtime()
+        services
+            .mission_runtime()
             .start_session(StartMissionSessionRequest {
                 title: "steward scheduler".to_string(),
                 session_id: Some(session_id.clone()),
@@ -401,9 +415,13 @@ mod tests {
             })
             .expect("steward");
 
-        let report = StewardScheduler::tick(StewardSchedulerConfig::default());
+        let report = StewardScheduler::tick(StewardSchedulerConfig::default(), &services);
         assert_eq!(report.kind, "runtime.steward_scheduler_tick_report");
-        assert!(report.steward_loop.ticked >= 1);
+        assert_eq!(report.steward_loop.ticked, 0);
+        assert_eq!(
+            report.steward_loop.errors,
+            vec!["capability_unavailable:steward_execution:V8"]
+        );
         assert!(!report.ledger_records.is_empty());
         let handoff = StewardScheduler::handoff_summary(&steward.steward_id);
         assert_eq!(handoff.steward_id, steward.steward_id);
@@ -411,46 +429,55 @@ mod tests {
     }
 
     #[test]
-    fn steward_scheduler_can_dispatch_session_commands_as_runtime_turns() {
+    fn steward_scheduler_submits_session_dispatch_graph_without_advancing_command() {
         let _guard = crate::test_env_lock();
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
         let suffix = uuid::Uuid::new_v4();
         let session_a = format!("steward-scheduler-turn-a-{suffix}");
         let session_b = format!("steward-scheduler-turn-b-{suffix}");
-        global_mission_runtime()
+        services
+            .mission_runtime()
             .start_session(StartMissionSessionRequest {
                 title: "steward scheduler turn a".to_string(),
                 session_id: Some(session_a.clone()),
             })
             .expect("session a");
-        global_mission_runtime()
+        services
+            .mission_runtime()
             .start_session(StartMissionSessionRequest {
                 title: "steward scheduler turn b".to_string(),
                 session_id: Some(session_b.clone()),
             })
             .expect("session b");
-        let command = global_mission_runtime()
+        let command = services
+            .mission_runtime()
             .enqueue_session_command(&session_a, &session_b, "run deep background analysis")
             .expect("command");
 
-        let report = StewardScheduler::tick(StewardSchedulerConfig {
-            dispatch_mode: SessionDispatchMode::StartRuntimeTurn,
-            ..StewardSchedulerConfig::default()
-        });
+        let report = StewardScheduler::tick(
+            StewardSchedulerConfig {
+                dispatch_mode: SessionDispatchMode::StartRuntimeTurn,
+                ..StewardSchedulerConfig::default()
+            },
+            &services,
+        );
 
-        let receipt = report
-            .session_dispatch
-            .dispatched
-            .iter()
-            .find(|receipt| receipt.command_id == command.command_id)
-            .expect("dispatched command");
-        assert_eq!(receipt.mode, SessionDispatchMode::StartRuntimeTurn);
-        assert!(receipt.turn_request.is_some());
+        assert!(report.session_dispatch.ok);
         assert_eq!(
-            global_mission_runtime()
+            report.session_dispatch.result["status"],
+            "pending_runtime_host"
+        );
+        assert_eq!(
+            report.session_dispatch.result["graph"]["nodes"][0]["kind"],
+            "session_dispatch"
+        );
+        assert_eq!(
+            services
+                .mission_runtime()
                 .get_session_command(&command.command_id)
                 .expect("command after")
                 .status,
-            crate::MissionSessionCommandStatus::Running
+            crate::MissionSessionCommandStatus::Pending
         );
     }
 

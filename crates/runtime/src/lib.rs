@@ -27,8 +27,6 @@ mod compact;
 mod config;
 #[path = "infrastructure/config_validate.rs"]
 pub mod config_validate;
-#[path = "infrastructure/control_plane.rs"]
-pub mod control_plane;
 #[path = "conversation/conversation.rs"]
 mod conversation;
 #[path = "infrastructure/error.rs"]
@@ -46,8 +44,8 @@ pub mod green_contract;
 #[path = "infrastructure/wave.rs"]
 pub mod wave;
 pub use green_contract::GreenLevel;
-#[path = "approval/global_approval_queue.rs"]
-pub mod global_approval_queue;
+#[path = "approval/approval_queue.rs"]
+pub mod approval_queue;
 #[path = "infrastructure/hooks.rs"]
 mod hooks;
 #[path = "infrastructure/json.rs"]
@@ -133,20 +131,14 @@ pub mod agent_collaboration;
 pub mod agent_discussion;
 #[path = "agent/agent_event_bus.rs"]
 pub mod agent_event_bus;
-#[path = "agent/agent_kernel.rs"]
-pub mod agent_kernel;
 #[path = "agent/agent_lifecycle.rs"]
 pub mod agent_lifecycle;
 #[path = "agent/agent_mailbox.rs"]
 pub mod agent_mailbox;
 #[path = "team/agent_outcome_bridge.rs"]
 pub mod agent_outcome_bridge;
-#[path = "agent/agent_protocol.rs"]
-pub mod agent_protocol;
 #[path = "team/agent_task_binding.rs"]
 pub mod agent_task_binding;
-#[path = "agent/agent_workgraph.rs"]
-pub mod agent_workgraph;
 #[path = "approval/approval_gate.rs"]
 pub mod approval_gate;
 #[path = "policy/autonomy_profile.rs"]
@@ -171,6 +163,8 @@ pub mod evidence_planner;
 pub mod evolution;
 #[path = "execution_core/mod.rs"]
 pub mod execution_core;
+#[path = "agent/execution_graph.rs"]
+pub mod execution_graph;
 #[path = "infrastructure/execution_scheduler.rs"]
 pub mod execution_scheduler;
 #[path = "context/fact_extraction.rs"]
@@ -266,8 +260,6 @@ pub mod tool_execution_plan;
 pub mod tool_host;
 #[path = "tooling/tool_invocation.rs"]
 pub mod tool_invocation;
-#[path = "tooling/tool_ledger.rs"]
-pub mod tool_ledger;
 #[path = "tooling/tool_memory.rs"]
 pub mod tool_memory;
 #[path = "tooling/tool_orchestrator.rs"]
@@ -308,7 +300,6 @@ pub use agent_discussion::{
     ConsensusMethod, ConsensusResult, Contribution, Discussion, DiscussionEngine, DiscussionPhase,
 };
 pub use agent_event_bus::{global_agent_event_bus, AgentEventBus, AgentProgressEvent};
-pub use agent_kernel::{AgentGraphError, AgentRunGraph};
 pub use agent_lifecycle::{
     agent_store_dir, build_agent_system_prompt, classify_lane_failure, derive_agent_state,
     global_agent_lifecycle_service, iso8601_now, maybe_commit_provenance, normalize_subagent_type,
@@ -322,17 +313,14 @@ pub use agent_mailbox::{
     AgentTaskOutcome, AgentTaskQualityStatus, AgentTaskReceipt, AgentTaskStatus,
 };
 pub use agent_outcome_bridge::{bridge_agent_terminal_snapshot, AgentRuntimeOutcomeBridgeReceipt};
-pub use agent_protocol::{
-    AgentEvidence, AgentMergeDecision, AgentMessage, AgentNodeStatus, AgentReview, AgentRole,
-    AgentTaskNode, ReviewVerdict,
-};
 pub use agent_task_binding::{
     global_agent_task_binding_registry, AgentTaskBinding, AgentTaskBindingRegistry,
     AgentTaskBindingStatus,
 };
-pub use agent_workgraph::{
-    AgentWorkGraph, WorkGraphEdge, WorkGraphEdgeKind, WorkGraphNode, WorkGraphNodeKind,
-    WorkGraphRef, WorkGraphStatus,
+pub use approval_queue::{
+    ApprovalQueue, ApprovalSource, ApprovalSourceKind, ApprovalTimeoutPolicy,
+    GlobalApprovalDecision, GlobalApprovalDecisionReceipt, GlobalApprovalRequest,
+    GlobalApprovalStatus, SubmitGlobalApprovalRequest,
 };
 pub use autonomy_profile::{
     ApprovalPolicy as AutonomyApprovalPolicy, AutonomyBudget, AutonomyDecision,
@@ -381,15 +369,14 @@ pub use config_validate::{
     DiagnosticKind, ValidationResult,
 };
 pub use conflict_arbiter::{
-    global_conflict_arbiter, ConflictArbiter, ConflictDecisionKind, ConflictResolutionReceipt,
-    ConflictResolutionRequest, ConflictSeverity, ConflictSourceKind,
+    ConflictArbiter, ConflictDecisionKind, ConflictResolutionReceipt, ConflictResolutionRequest,
+    ConflictSeverity, ConflictSourceKind,
 };
 pub use context_evidence::{
     audit_projection as project_evidence_audit, AuditProjection, ModelReceipt,
 };
 pub use context_fanout::{plan_context_fanout, ContextFanoutPlan, FanoutToolCall};
 pub use context_tool_exposure::{ToolExposurePlanner, ToolExposurePolicy, ToolExposureState};
-pub use control_plane::{global_runtime_control_plane, global_task_registry, RuntimeControlPlane};
 pub use conversation::{
     auto_compaction_threshold_from_env, build_cc_memory_config, image_user_message_from_path,
     ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent, CancellationToken,
@@ -397,8 +384,8 @@ pub use conversation::{
     StaticToolExecutor, ToolCallback, ToolError, ToolExecutor, TurnSummary,
 };
 pub use cowd_event::{
-    CowdEvent, CowdEventBus, RunModelTelemetry, RuntimePolicyDecisionSummary,
-    RuntimeWorkGraphSummary,
+    CowdEvent, CowdEventBus, RunModelTelemetry, RuntimeExecutionGraphSummary,
+    RuntimePolicyDecisionSummary,
 };
 pub use cross_plane_policy::{
     ConnectorActionContext, ConnectorDecisionEvidence, CrossPlaneAction, CrossPlaneAuditRecord,
@@ -415,15 +402,20 @@ pub use execution_core::{
     action_selection_report_for_decision, build_runtime_action_selection_report,
     build_runtime_execution_decision, execution_pattern_catalog_response, rewoo_plan_for_intent,
     runtime_execution_guidance_prompt, runtime_orchestration_action_guidance,
-    runtime_orchestration_actions, tool_dag_from_rewoo, DeliberationMode, DeliberationPlan,
-    ExecutionPatternCatalog, ReflexionRecord, ReflexionTrigger, RewooEvidencePlan,
-    RewooEvidenceResult, RewooEvidenceStep, RewooObservation, RewooSolverContract,
-    RuntimeActionSelectionReport, RuntimeCompileTarget, RuntimeEvidenceSummary,
-    RuntimeExecutionActionHint, RuntimeExecutionDecision, RuntimeExecutionPatternCandidate,
-    RuntimeExecutionPatternSpec, RuntimeExecutionReportSpec, StrategyDecisionEngine, StrategyLease,
-    StrategyResourceHealth, ToolDagEdge, ToolDagEdgeKind, ToolDagPlan, ToolDagSafetySummary,
-    ToolDagTask,
+    runtime_orchestration_actions, tool_dag_from_rewoo, CrossPlaneRuntimeError,
+    CrossPlaneRuntimeService, DeliberationMode, DeliberationPlan, ExecutionCommitService,
+    ExecutionCompileRequest, ExecutionGraphCompiler, ExecutionGraphHost, ExecutionGraphHostReceipt,
+    ExecutionGraphRunner, ExecutionGraphStateStore, ExecutionPatternCatalog,
+    ExecutionStartupRecoveryError, ExecutionStartupRecoveryRecord, ExecutionStartupRecoveryReport,
+    ReflexionRecord, ReflexionTrigger, RewooEvidencePlan, RewooEvidenceResult, RewooEvidenceStep,
+    RewooObservation, RewooSolverContract, RuntimeActionSelectionReport, RuntimeCompileTarget,
+    RuntimeEvidenceSummary, RuntimeExecutionActionHint, RuntimeExecutionDecision,
+    RuntimeExecutionPatternCandidate, RuntimeExecutionPatternSpec, RuntimeExecutionReportSpec,
+    RuntimeServices, RuntimeServicesBuilder, RuntimeServicesError, StrategyDecisionEngine,
+    StrategyLease, StrategyResourceHealth, ToolDagEdge, ToolDagEdgeKind, ToolDagPlan,
+    ToolDagSafetySummary, ToolDagTask,
 };
+pub use execution_graph::{execution_graph_from_collaboration_task, project_collaboration_review};
 pub use file_ops::{
     edit_file, glob_search, grep_search, read_file, write_file, EditFileOutput, GlobSearchOutput,
     GrepSearchInput, GrepSearchOutput, ReadFileOutput, StructuredPatchHunk, TextFilePayload,
@@ -435,18 +427,15 @@ pub use gates::{
     PreFlightGate, RevisionCheck, RevisionGate, ViolationSeverity, ViolationType,
 };
 pub use git_context::{GitCommitEntry, GitContext};
-pub use global_approval_queue::{
-    global_approval_queue, ApprovalSource, ApprovalSourceKind, ApprovalTimeoutPolicy,
-    GlobalApprovalDecision, GlobalApprovalDecisionReceipt, GlobalApprovalQueue,
-    GlobalApprovalRequest, GlobalApprovalStatus, SubmitGlobalApprovalRequest,
-};
 pub use hooks::{
     format_hook_output, HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter,
     HookRunResult, HookRunner, HOOK_PREVIEW_CHAR_LIMIT,
 };
 #[path = "conversation/host.rs"]
 pub mod host;
-pub use host::{StandardRuntimeHost, StandardRuntimeHostConfig};
+pub use host::{
+    submit_owned_conversation_turn, StandardRuntimeHost, StandardRuntimeHostConfig, TurnIngressRef,
+};
 pub use input_classifier::{classify_session_input, RuntimeInputState};
 pub use intent_planner::{classify_intent, IntentPlan, TaskIntent};
 pub use joint_problem_solving::{
@@ -512,12 +501,12 @@ pub use mission_control::{
     MissionControlProjection, MissionControlRuntime, MissionControlSessionNode,
     MissionControlStewardNode, MissionControlSummary, MissionControlTeamNode, MissionWorkspace,
 };
-pub use mission_evidence::{global_mission_evidence_bus, MissionEvidenceBus, MissionEvidenceRef};
+pub use mission_evidence::{MissionEvidenceBus, MissionEvidenceRef};
 pub use mission_runtime::{
-    global_mission_runtime, MissionCommandReceipt, MissionEvent, MissionProjection,
-    MissionRecoveryReport, MissionRoutedCommand, MissionRuntime, MissionSessionCommand,
-    MissionSessionCommandKind, MissionSessionCommandStatus, MissionSessionCommandSummary,
-    MissionSessionSnapshot, MissionSessionStatus, StartMissionSessionRequest,
+    MissionCommandReceipt, MissionEvent, MissionProjection, MissionRecoveryReport,
+    MissionRoutedCommand, MissionRuntime, MissionSessionCommand, MissionSessionCommandKind,
+    MissionSessionCommandStatus, MissionSessionCommandSummary, MissionSessionSnapshot,
+    MissionSessionStatus, StartMissionSessionRequest,
 };
 pub use module_map::{
     runtime_module_map, runtime_module_names_by_domain, RuntimeDomain, RuntimeModuleDescriptor,
@@ -527,10 +516,9 @@ pub use mutation_plan::{
     MutationApplyInput, MutationApplyOutput, MutationEdit, MutationPreview, MutationPreviewInput,
 };
 pub use orchestration::{
-    handle_runtime_orchestration_request, handle_runtime_orchestration_request_with_host,
-    handle_runtime_orchestration_request_with_host_and_decision, runtime_orchestration_response,
-    runtime_orchestration_response_with_host,
-    runtime_orchestration_response_with_host_and_decision, RuntimeOrchestrationAction,
+    handle_runtime_orchestration_request, handle_runtime_orchestration_request_with_decision,
+    runtime_orchestration_response, runtime_orchestration_response_with_decision,
+    submit_runtime_orchestration_request, CompiledOrchestration, RuntimeOrchestrationAction,
     RuntimeOrchestrationConstraints, RuntimeOrchestrationDecision, RuntimeOrchestrationRequest,
     RuntimeOrchestrationResult,
 };
@@ -587,8 +575,9 @@ pub use runtime_event_replay::{
     RuntimeRecoveryCandidate, RuntimeReplayReport,
 };
 pub use runtime_event_store::{
-    global_runtime_event_store, record_runtime_event, DurableRuntimeEvent, RuntimeEventInput,
-    RuntimeEventRef, RuntimeEventScope, RuntimeEventStore,
+    DurableRuntimeEvent, RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore,
+    RuntimeEventStoreError, RuntimeSessionOutboxFailureClass, RuntimeSessionOutboxHealth,
+    RuntimeSessionOutboxRecord, SessionTerminalInput,
 };
 pub use sandbox::{
     build_linux_sandbox_command, detect_container_environment, detect_container_environment_from,
@@ -606,14 +595,15 @@ pub use session::{
     SessionError, SessionEventLog, SessionFork, SessionPromptEntry,
 };
 pub use session_execution::{
-    CrossSessionBridgeReceipt, CrossSessionMessage, SessionCommandDispatchReceipt,
-    SessionDispatchMode, SessionExecutionPlane, SessionExecutionPolicy, SessionExecutionReport,
-    SessionExecutionSkip, SessionLeaseState, SessionRecoveryCandidate,
+    session_ingress_graph_id, CrossSessionMessage, SessionDispatchMode, SessionExecutionPolicy,
+    SessionIngressExecutionReceipt, SessionIngressExecutor, SessionInputRouteReceipt,
+    SessionInputRouteReport, SessionInputRouter, SessionInputRouterError, SessionRecoveryCandidate,
+    SESSION_DISPATCH_EXECUTOR,
 };
 pub use session_input::{SessionInputRecord, SessionInputStream};
 pub use session_relation_graph::{
-    global_session_relation_graph, SessionProxy, SessionRelation, SessionRelationGraph,
-    SessionRelationKind, SessionRouteCommand, SessionRouteReceipt,
+    SessionProxy, SessionRelation, SessionRelationGraph, SessionRelationKind, SessionRouteCommand,
+    SessionRouteReceipt,
 };
 pub use skill::{
     memory_candidate_from_skill_activation, RuntimeSkillCandidate, SkillActivationRecord,
@@ -655,7 +645,7 @@ pub use team_cron_registry::{CronEntry, CronRegistry, Team, TeamRegistry};
 pub use team_discovery::{DiscoveredTeam, PersistedTeam, TeamDiscoveryProtocol};
 pub use team_execution::{
     CollaborationTemplateRuntimeSpec, TeamExecutionDependency, TeamExecutionLoop,
-    TeamExecutionPlan, TeamExecutionReport, TeamExecutionRoleSpec, TeamSynthesisPacket,
+    TeamExecutionPlan, TeamExecutionRoleSpec,
 };
 pub use team_runtime::{
     global_team_runtime_service, CollaborationAgentRunProjection, CollaborationRunProjection,
@@ -665,8 +655,8 @@ pub use team_runtime::{
 };
 pub use tool_execution_plan::{ToolExecutionMode, ToolExecutionPlan, ToolExecutionPlanTask};
 pub use tool_host::{
-    RuntimeActionExecutionReceipt, RuntimeExecutionHost, RuntimeToolExecutionOutcome,
-    RuntimeToolExecutionRequest, RuntimeToolExecutionStatus,
+    RuntimeExecutionHost, RuntimeToolExecutionOutcome, RuntimeToolExecutionRequest,
+    RuntimeToolExecutionStatus,
 };
 pub use tool_invocation::{
     now_ms as tool_invocation_now_ms, ToolFailureKind, ToolInvocationRecord, ToolInvocationStatus,
@@ -684,9 +674,11 @@ pub use turn_supervisor::{
     TurnSupervisor,
 };
 pub use upgrade::{
-    ClosureUpgradeInventoryCollector, UpgradeCarrierRecord, UpgradeCarrierStatus,
+    ClosureUpgradeInventoryCollector, LegacyExecutionImportError, LegacyExecutionImportReceipt,
+    LegacyExecutionImporter, UpgradeCarrierRecord, UpgradeCarrierStatus,
     UpgradeCleanShutdownReceipt, UpgradeCoordinator, UpgradeDispositionReceipt, UpgradeError,
     UpgradeInventory, UpgradeInventoryCollector, UpgradeMaintenanceSnapshot,
+    LEGACY_EXECUTION_IMPORTED, UPGRADE_RECOVERY_REQUIRED,
 };
 pub use usage::{
     pricing_for_model, ModelPerformanceRegistry, ModelPerformanceStats, ModelRouteCandidate,

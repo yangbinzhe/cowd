@@ -220,12 +220,14 @@ impl SurfaceMessageStore {
         reply_to_message_id: Option<String>,
     ) -> Result<SurfaceOutboxRecord, String> {
         let surface = normalize_surface_id(&request.surface);
-        let idempotency_key = outbound_idempotency_key(
-            &surface,
-            reply_to_message_id.as_deref(),
-            &request.recipient,
-            &request.text,
-        );
+        let idempotency_key = request.idempotency_key.clone().unwrap_or_else(|| {
+            outbound_idempotency_key(
+                &surface,
+                reply_to_message_id.as_deref(),
+                &request.recipient,
+                &request.text,
+            )
+        });
         let mut state = self.lock_state()?;
         if let Some(existing) = state.outbox.get(&idempotency_key) {
             return Ok(existing.clone());
@@ -1112,6 +1114,7 @@ mod tests {
             recipient: "user-1".to_string(),
             thread: Some("thread-1".to_string()),
             text: "hello".to_string(),
+            idempotency_key: None,
             metadata: serde_json::json!({"reply_to": "msg-1"}),
         };
         let queued = store
@@ -1141,6 +1144,28 @@ mod tests {
     }
 
     #[test]
+    fn caller_owned_idempotency_key_survives_payload_replay() {
+        let root = std::env::temp_dir().join(format!(
+            "cowd-edge-idempotent-store-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = SurfaceMessageStore::new(&root);
+        let mut request = SurfaceSendRequest {
+            surface: "feishu".to_string(),
+            recipient: "user-1".to_string(),
+            thread: None,
+            text: "first attempt".to_string(),
+            idempotency_key: Some("cross-plane:stable-send".to_string()),
+            metadata: serde_json::json!({}),
+        };
+        let first = store.queue_outbox(&request, None, None).unwrap();
+        request.text = "retry after crash".to_string();
+        let replay = store.queue_outbox(&request, None, None).unwrap();
+        assert_eq!(first.delivery_id, replay.delivery_id);
+        assert_eq!(first.idempotency_key, "cross-plane:stable-send");
+    }
+
+    #[test]
     fn surface_retry_dead_letter_requires_operator_action() {
         let root =
             std::env::temp_dir().join(format!("cowd-edge-retry-store-{}", uuid::Uuid::new_v4()));
@@ -1150,6 +1175,7 @@ mod tests {
             recipient: "user-1".to_string(),
             thread: None,
             text: "hello".to_string(),
+            idempotency_key: None,
             metadata: serde_json::json!({}),
         };
         let queued = store.queue_outbox(&request, None, None).unwrap();
@@ -1177,6 +1203,7 @@ mod tests {
             recipient: "user-1".to_string(),
             thread: None,
             text: "hello".to_string(),
+            idempotency_key: None,
             metadata: serde_json::json!({}),
         };
         let queued = store.queue_outbox(&request, None, None).unwrap();
@@ -1224,6 +1251,7 @@ mod tests {
             recipient: "chat".to_string(),
             thread: Some("chat".to_string()),
             text: "reply".to_string(),
+            idempotency_key: None,
             metadata: serde_json::json!({"reply_to": "msg-1"}),
         };
         let delivery = store
@@ -1283,6 +1311,7 @@ mod tests {
             recipient: "chat".to_string(),
             thread: Some("chat".to_string()),
             text: "failed".to_string(),
+            idempotency_key: None,
             metadata: serde_json::json!({
                 "reply_to": "msg-1",
                 "failure_notice": true,
@@ -1372,6 +1401,7 @@ mod tests {
             recipient: "user-1".to_string(),
             thread: None,
             text: "hello".to_string(),
+            idempotency_key: None,
             metadata: serde_json::json!({}),
         };
         let queued = store.queue_outbox(&request, None, None).unwrap();

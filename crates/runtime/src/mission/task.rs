@@ -1,7 +1,8 @@
 //! Runtime task lifecycle, phase audit, and task persistence.
 //!
-//! Gateway may project task state into UI-specific agent graphs, but the task
-//! lifecycle itself belongs to the runtime harness.
+//! Gateway may cache canonical execution projections for UI rendering, but the
+//! task lifecycle itself belongs to the runtime harness and graph state is
+//! committed exclusively by Runtime's execution services.
 
 use std::{
     path::PathBuf,
@@ -9,9 +10,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use harness_contract::strategy::StrategyDecision;
+use harness_contract::{execution_graph::ExecutionGraphProjection, strategy::StrategyDecision};
 use rusqlite::params;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use storage::{SqliteConnectionFactory, StorageHandle};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,7 +94,7 @@ pub struct TaskPhaseRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskRecord<Graph = serde_json::Value> {
+pub struct TaskRecord {
     pub id: String,
     pub objective: String,
     pub status: TaskStatus,
@@ -107,65 +108,9 @@ pub struct TaskRecord<Graph = serde_json::Value> {
     pub updated_at_ms: u64,
     pub audit: Vec<TaskAuditEvent>,
     #[serde(default)]
-    pub agent_graph: Option<Graph>,
+    pub execution_graph: Option<ExecutionGraphProjection>,
     #[serde(default)]
     pub strategy: Option<StrategyDecision>,
-}
-
-impl TaskRecord<serde_json::Value> {
-    pub fn decode_graph<Graph>(self) -> Result<TaskRecord<Graph>, String>
-    where
-        Graph: DeserializeOwned,
-    {
-        let agent_graph = self
-            .agent_graph
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(|error| error.to_string())?;
-        Ok(TaskRecord {
-            id: self.id,
-            objective: self.objective,
-            status: self.status,
-            current_phase: self.current_phase,
-            phases: self.phases,
-            yolo_mode: self.yolo_mode,
-            failure_count: self.failure_count,
-            blocker_reason: self.blocker_reason,
-            created_at_ms: self.created_at_ms,
-            updated_at_ms: self.updated_at_ms,
-            audit: self.audit,
-            agent_graph,
-            strategy: self.strategy,
-        })
-    }
-}
-
-impl<Graph> TaskRecord<Graph>
-where
-    Graph: Serialize,
-{
-    pub fn encode_graph(self) -> Result<TaskRecord<serde_json::Value>, String> {
-        let agent_graph = self
-            .agent_graph
-            .map(serde_json::to_value)
-            .transpose()
-            .map_err(|error| error.to_string())?;
-        Ok(TaskRecord {
-            id: self.id,
-            objective: self.objective,
-            status: self.status,
-            current_phase: self.current_phase,
-            phases: self.phases,
-            yolo_mode: self.yolo_mode,
-            failure_count: self.failure_count,
-            blocker_reason: self.blocker_reason,
-            created_at_ms: self.created_at_ms,
-            updated_at_ms: self.updated_at_ms,
-            audit: self.audit,
-            agent_graph,
-            strategy: self.strategy,
-        })
-    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -212,16 +157,6 @@ impl TaskKernel {
             .clone()
     }
 
-    pub fn list_as<Graph>(&self) -> Result<Vec<TaskRecord<Graph>>, String>
-    where
-        Graph: DeserializeOwned,
-    {
-        self.list()
-            .into_iter()
-            .map(TaskRecord::decode_graph)
-            .collect()
-    }
-
     #[must_use]
     pub fn current(&self) -> Option<TaskRecord> {
         self.list().into_iter().rev().find(|task| {
@@ -230,13 +165,6 @@ impl TaskKernel {
                 TaskStatus::Pending | TaskStatus::Running | TaskStatus::Reviewing
             )
         })
-    }
-
-    pub fn current_as<Graph>(&self) -> Result<Option<TaskRecord<Graph>>, String>
-    where
-        Graph: DeserializeOwned,
-    {
-        self.current().map(TaskRecord::decode_graph).transpose()
     }
 
     pub fn start_goal(
@@ -278,7 +206,7 @@ impl TaskKernel {
                 message: "task started".to_string(),
                 created_at_ms: now,
             }],
-            agent_graph: None,
+            execution_graph: None,
             strategy: None,
         };
         self.store
@@ -542,16 +470,17 @@ impl TaskKernel {
         Ok(updated)
     }
 
-    pub fn upsert_agent_graph<Graph>(
+    /// Cache a read-only projection produced by the canonical execution store.
+    ///
+    /// This method never advances graph state. Callers must first commit through
+    /// `ExecutionCommitService` or `ExecutionGraphHost` and only then persist the
+    /// returned projection for task-list rendering.
+    pub fn record_execution_graph_projection(
         &self,
         task_id: &str,
-        graph: Graph,
-    ) -> Result<TaskRecord, String>
-    where
-        Graph: Serialize,
-    {
+        projection: ExecutionGraphProjection,
+    ) -> Result<TaskRecord, String> {
         let now = now_ms();
-        let graph = serde_json::to_value(graph).map_err(|error| error.to_string())?;
         let mut store = self
             .store
             .lock()
@@ -561,11 +490,11 @@ impl TaskKernel {
             .iter_mut()
             .find(|task| task.id == task_id)
             .ok_or_else(|| format!("task {task_id} not found"))?;
-        task.agent_graph = Some(graph);
+        task.execution_graph = Some(projection);
         task.updated_at_ms = now;
         task.audit.push(TaskAuditEvent {
-            event_type: "agent_graph_updated".to_string(),
-            message: "agent graph updated".to_string(),
+            event_type: "execution_graph_projected".to_string(),
+            message: "execution graph projection refreshed".to_string(),
             created_at_ms: now,
         });
         let updated = task.clone();
@@ -574,29 +503,20 @@ impl TaskKernel {
         Ok(updated)
     }
 
-    pub fn agent_graph_as<Graph>(&self, task_id: &str) -> Result<Option<Graph>, String>
-    where
-        Graph: DeserializeOwned,
-    {
+    #[must_use]
+    pub fn execution_graph(&self, task_id: &str) -> Option<ExecutionGraphProjection> {
         self.list()
             .into_iter()
             .find(|task| task.id == task_id)
-            .and_then(|task| task.agent_graph)
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(|error| error.to_string())
+            .and_then(|task| task.execution_graph)
     }
 
-    pub fn list_agent_graphs_as<Graph>(&self) -> Result<Vec<Graph>, String>
-    where
-        Graph: DeserializeOwned,
-    {
+    #[must_use]
+    pub fn execution_graphs(&self) -> Vec<ExecutionGraphProjection> {
         self.list()
             .into_iter()
-            .filter_map(|task| task.agent_graph)
-            .map(serde_json::from_value)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())
+            .filter_map(|task| task.execution_graph)
+            .collect()
     }
 
     fn persist(&self) -> Result<(), String> {
@@ -731,12 +651,8 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{TaskKernel, TaskStatus};
+    use harness_contract::execution_graph::ExecutionGraphProjection;
     use storage::StorageHandle;
-
-    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-    struct TestGraph {
-        id: String,
-    }
 
     fn temp_path(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -840,30 +756,31 @@ mod tests {
     }
 
     #[test]
-    fn stores_graph_attachment_without_runtime_dependency() {
+    fn stores_read_only_execution_projection() {
         let handle = temp_handle("graph");
         let path = handle.path.clone();
         let kernel = TaskKernel::open_storage_handle(&handle).unwrap();
         let task = kernel.start_goal("Attach graph", false).unwrap();
         kernel
-            .upsert_agent_graph(
+            .record_execution_graph_projection(
                 &task.id,
-                TestGraph {
-                    id: "graph-1".to_string(),
+                ExecutionGraphProjection {
+                    graph_id: "graph-1".to_string(),
+                    revision: 4,
+                    objective: "Attach graph".to_string(),
+                    nodes: Vec::new(),
+                    commit_cursor: 9,
+                    terminal_result_ref: None,
                 },
             )
             .unwrap();
 
         let restored = TaskKernel::open_storage_handle(&handle).unwrap();
         let graph = restored
-            .agent_graph_as::<TestGraph>(&task.id)
-            .unwrap()
+            .execution_graph(&task.id)
             .expect("graph should restore");
-        assert_eq!(graph.id, "graph-1");
-        assert_eq!(
-            restored.list_agent_graphs_as::<TestGraph>().unwrap().len(),
-            1
-        );
+        assert_eq!(graph.graph_id, "graph-1");
+        assert_eq!(restored.execution_graphs().len(), 1);
 
         let _ = std::fs::remove_file(path);
     }

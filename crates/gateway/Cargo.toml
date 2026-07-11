@@ -49,6 +49,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 tracing-appender = "0.2"
 uuid = { version = "1", features = ["v4"] }
+async-trait = "0.1"
 
 [features]
 default = []
@@ -58,7 +59,6 @@ code-index = ["memory/code-index"]
 unsafe_code = "allow"
 
 [dev-dependencies]
-async-trait = "0.1"
 serde_json.workspace = true
 serial_test = "3"
 tempfile = "3"

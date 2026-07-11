@@ -1,7 +1,7 @@
 //! Explainable tool execution planning for batched tool requests.
 
 use harness_contract::core::{ExecutionModifier, ExecutionPolicyGate, TaskRisk};
-use memory::{RuntimeEvent, RuntimeEventScope, RuntimeRef};
+use memory::{SessionDomainEvent, SessionDomainRef, SessionDomainScope};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -352,7 +352,7 @@ impl ToolExecutionPlan {
         session_id: impl Into<String>,
         sequence: usize,
         created_at_ms: u64,
-    ) -> RuntimeEvent {
+    ) -> SessionDomainEvent {
         let payload = serde_json::json!({
             "plan_id": self.plan_id,
             "task_count": self.task_count,
@@ -362,10 +362,10 @@ impl ToolExecutionPlan {
             "wave_count": self.wave_count,
             "tasks": self.tasks,
         });
-        let mut event = RuntimeEvent::new(
+        let mut event = SessionDomainEvent::new(
             session_id,
             sequence,
-            RuntimeEventScope::Tool,
+            SessionDomainScope::Tool,
             "tool.execution_plan.created",
             payload,
             created_at_ms,
@@ -375,7 +375,7 @@ impl ToolExecutionPlan {
         event.refs = self
             .tasks
             .iter()
-            .map(|task| RuntimeRef {
+            .map(|task| SessionDomainRef {
                 ref_type: "tool_call".to_string(),
                 id: task.tool_call_id.clone(),
                 label: Some(task.tool_name.clone()),
@@ -780,7 +780,7 @@ mod tests {
         ]);
         let event = plan.to_runtime_event("session-1", 7, 123);
 
-        assert_eq!(event.scope, RuntimeEventScope::Tool);
+        assert_eq!(event.scope, SessionDomainScope::Tool);
         assert_eq!(event.kind, "tool.execution_plan.created");
         assert_eq!(event.status.as_deref(), Some("planned"));
         assert_eq!(event.refs.len(), 2);
@@ -841,6 +841,27 @@ mod tests {
         assert_eq!(plan.tasks[0].conflicts[0].tool_call_id, "edit-1");
         assert_eq!(plan.tasks[0].conflicts[0].kind, "path_overlap");
         assert_eq!(plan.tasks[1].conflicts[0].tool_call_id, "write-1");
+    }
+
+    #[test]
+    fn independent_file_writes_remain_parallelizable() {
+        let plan = ToolExecutionPlan::from_requests(&[
+            ToolRequest {
+                tool_use_id: "write-a".to_string(),
+                tool_name: "write_file".to_string(),
+                input: r#"{"path":"src/a.rs","content":"a"}"#.to_string(),
+                depends_on: Vec::new(),
+            },
+            ToolRequest {
+                tool_use_id: "write-b".to_string(),
+                tool_name: "write_file".to_string(),
+                input: r#"{"path":"src/b.rs","content":"b"}"#.to_string(),
+                depends_on: Vec::new(),
+            },
+        ]);
+
+        assert!(plan.tasks.iter().all(|task| task.conflicts.is_empty()));
+        assert!(plan.tasks.iter().all(|task| task.can_parallelize));
     }
 
     #[test]

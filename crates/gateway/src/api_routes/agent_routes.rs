@@ -7,6 +7,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use harness_contract::execution_graph::{ExecutionEdge, ExecutionNodeSpec};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -21,7 +22,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route("/api/agents/discover", get(agent_discover_handler))
         .route("/api/agents/assemble", post(agent_assemble_handler))
         .route("/api/agents/reputation", get(agent_reputation_handler))
-        .route("/api/agents/runs", get(agent_runs_handler))
+        .route(
+            "/api/agents/execution-graphs",
+            get(execution_graphs_handler),
+        )
         .route("/api/runtime/agents", get(runtime_agents_list_handler))
         .route("/api/runtime/agents/:id", get(runtime_agent_detail_handler))
         .route(
@@ -55,17 +59,19 @@ pub(super) fn router() -> Router<Arc<AppState>> {
                 .delete(agent_team_profile_delete_handler),
         )
         .route(
-            "/api/tasks/:id/agent-graph",
-            get(task_agent_graph_handler).post(upsert_task_agent_graph_handler),
+            "/api/tasks/:id/execution-graph",
+            get(task_execution_graph_handler).post(register_task_execution_graph_handler),
         )
 }
 
 #[derive(Deserialize)]
-struct UpsertAgentGraphRequest {
+struct RegisterExecutionGraphRequest {
     #[serde(default)]
     objective: Option<String>,
     #[serde(default)]
-    nodes: Vec<Value>,
+    nodes: Vec<ExecutionNodeSpec>,
+    #[serde(default)]
+    edges: Vec<ExecutionEdge>,
 }
 
 #[derive(Deserialize)]
@@ -151,8 +157,16 @@ async fn agent_reputation_handler(
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
 }
 
-async fn agent_runs_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    Json(state.services.agent.list_agent_graphs(&state.services.task))
+async fn execution_graphs_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let value = state
+        .services
+        .agent
+        .list_execution_graphs(&state.services.task)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(value))
 }
 
 async fn runtime_agents_list_handler() -> impl IntoResponse {
@@ -189,18 +203,13 @@ async fn runtime_agent_events_handler(
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "agent not found"))
 }
 
-async fn runtime_agent_cancel_handler(
-    Path(id): Path<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    runtime::global_agent_lifecycle_service()
-        .cancel(&id)
-        .map(|receipt| {
-            Json(serde_json::json!({
-                "kind": "runtime.agent.cancel",
-                "receipt": receipt,
-            }))
-        })
-        .map_err(|error| api_error(StatusCode::NOT_FOUND, error))
+async fn runtime_agent_cancel_handler(Path(id): Path<String>) -> impl IntoResponse {
+    Json(agent_execution_capability_unavailable(
+        "runtime.agent.cancel",
+        &id,
+        None,
+        None,
+    ))
 }
 
 async fn runtime_agent_input_handler(
@@ -237,27 +246,31 @@ fn runtime_agent_command_result(
     command: runtime::AgentExecutionCommandKind,
     payload: Option<Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    runtime::global_agent_lifecycle_service()
-        .command(id, command, payload)
-        .map(|receipt| {
-            Json(serde_json::json!({
-                "kind": "runtime.agent.command",
-                "receipt": receipt,
-            }))
-        })
-        .map_err(|error| api_error(runtime_agent_command_error_status(&error), error))
+    Ok(Json(agent_execution_capability_unavailable(
+        "runtime.agent.command",
+        id,
+        Some(command),
+        payload,
+    )))
 }
 
-fn runtime_agent_command_error_status(error: &str) -> StatusCode {
-    if error.contains("agent not found") {
-        StatusCode::NOT_FOUND
-    } else if error.contains("does not expose a command channel") {
-        StatusCode::CONFLICT
-    } else if error.contains("failed to deliver agent command") {
-        StatusCode::SERVICE_UNAVAILABLE
-    } else {
-        StatusCode::BAD_REQUEST
-    }
+fn agent_execution_capability_unavailable(
+    kind: &str,
+    agent_id: &str,
+    command: Option<runtime::AgentExecutionCommandKind>,
+    payload: Option<Value>,
+) -> Value {
+    serde_json::json!({
+        "kind": kind,
+        "ok": false,
+        "status": "capability_unavailable",
+        "capability": "agent_execution",
+        "available_in": "V5",
+        "side_effects_started": false,
+        "agent_id": agent_id,
+        "command": command,
+        "payload": payload,
+    })
 }
 
 async fn agent_team_profiles_list_handler(
@@ -364,32 +377,34 @@ async fn agent_team_profile_delete_handler(
     })))
 }
 
-async fn task_agent_graph_handler(
+async fn task_execution_graph_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let graph = state
         .services
         .agent
-        .agent_graph(&state.services.task, &id)
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "agent graph not found"))?;
+        .execution_graph(&state.services.task, &id)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "execution graph not found"))?;
     Ok(Json(graph))
 }
 
-async fn upsert_task_agent_graph_handler(
+async fn register_task_execution_graph_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(body): Json<UpsertAgentGraphRequest>,
+    Json(body): Json<RegisterExecutionGraphRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let graph = state
         .services
         .agent
-        .upsert_agent_graph(
+        .register_execution_graph(
             &state.services.task,
-            &state.services.session,
             &id,
             body.objective,
             body.nodes,
+            body.edges,
         )
         .await
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
@@ -404,6 +419,6 @@ fn team_profile_receipt(action: &str, id: &str) -> Value {
         "changed_refs": [format!("agent-team-profile:{id}")],
         "audit_ref": format!("agent-team-profile:{action}:{id}"),
         "warnings": [],
-        "next_actions": ["open profile", "reuse in agent graph", "evaluate team run"],
+        "next_actions": ["open profile", "reuse in execution graph", "evaluate team run"],
     })
 }

@@ -1,20 +1,19 @@
-//! Runtime-owned multi-agent team execution loop.
+//! Pure team planning into the canonical execution graph.
+//!
+//! Team templates describe work. They do not dispatch agents or commit state;
+//! the execution graph runner is the sole execution writer.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use harness_contract::{
-    core::KernelRef,
-    workgraph::{WorkEdgeKind, WorkGraph, WorkGraphQualityReport, WorkNode, WorkNodeKind},
+use harness_contract::execution_graph::{
+    validate_execution_graph, ExecutionEdge, ExecutionEdgeKind, ExecutionGraph,
+    ExecutionGraphQualityReport, ExecutionNodeKind, ExecutionNodeSpec, ExecutionNodeStatus,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    global_agent_event_bus, global_agent_lifecycle_service, global_agent_task_binding_registry,
-    global_agent_task_mailbox, global_conflict_arbiter, global_mission_evidence_bus,
-    global_team_runtime_service, AgentExecutionCommandKind, AgentProgressEvent, AgentTask,
-    AgentTaskCompletionReceipt, AgentTaskOutcome, AgentTaskQualityStatus, AgentTaskStatus,
-    CollaborationTemplateId, ConflictResolutionRequest, ConflictSeverity, ConflictSourceKind,
-    MissionEvidenceRef, TeamRuntimeSnapshot,
+    global_agent_task_mailbox, global_team_runtime_service, AgentTask, AgentTaskStatus,
+    CollaborationTemplateId, TeamRuntimeSnapshot,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,59 +50,25 @@ pub struct TeamExecutionPlan {
     pub objective: String,
     pub spec: CollaborationTemplateRuntimeSpec,
     pub tasks: Vec<AgentTask>,
-    pub workgraph: WorkGraph,
-    pub workgraph_quality: WorkGraphQualityReport,
+    pub execution_graph: ExecutionGraph,
+    pub execution_graph_quality: ExecutionGraphQualityReport,
     pub ready_node_ids: Vec<String>,
     pub blocked_node_ids: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TeamExecutionReport {
-    pub kind: String,
-    pub team_id: String,
-    pub planned_task_count: usize,
-    pub assigned_task_count: usize,
-    pub delivered_agent_inputs: usize,
-    pub events: Vec<AgentProgressEvent>,
-    pub evidence: Vec<MissionEvidenceRef>,
-    pub errors: Vec<String>,
-    pub workgraph_id: String,
-    pub workgraph_quality: WorkGraphQualityReport,
-    pub ready_node_ids: Vec<String>,
-    pub running_node_ids: Vec<String>,
-    pub completed_node_ids: Vec<String>,
-    pub blocked_node_ids: Vec<String>,
-    pub review_ready: bool,
-    pub synthesis_ready: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub synthesis_packet: Option<TeamSynthesisPacket>,
-    #[serde(default)]
-    pub completion_receipts: Vec<AgentTaskCompletionReceipt>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TeamSynthesisPacket {
-    pub team_id: String,
-    pub session_id: String,
-    pub objective: String,
-    pub status: String,
-    pub task_outcomes: Vec<AgentTaskOutcome>,
-    pub evidence_refs: Vec<String>,
-    pub suggested_next_actions: Vec<String>,
-    pub created_at_ms: u64,
 }
 
 #[derive(Debug, Default)]
 pub struct TeamExecutionLoop;
 
 impl TeamExecutionLoop {
+    /// Build a deterministic execution graph projection for a persisted team.
+    /// This function performs no dispatch, lifecycle, evidence, or status write.
     pub fn plan(team_id: &str) -> Result<TeamExecutionPlan, String> {
         let team = global_team_runtime_service()
             .get(team_id)
             .ok_or_else(|| format!("team runtime not found: {team_id}"))?;
         let spec = runtime_spec_for(&team);
-        let existing = global_agent_task_mailbox().list_for_team(team_id);
-        let existing_by_role = existing
+        let existing_by_role = global_agent_task_mailbox()
+            .list_for_team(team_id)
             .into_iter()
             .map(|task| (task.role_id.clone(), task))
             .collect::<BTreeMap<_, _>>();
@@ -135,533 +100,244 @@ impl TeamExecutionLoop {
                     })
             })
             .collect::<Vec<_>>();
-        let workgraph = build_workgraph(&team, &spec, &tasks)?;
-        let workgraph_quality = workgraph.quality_report();
-        let ready_node_ids = workgraph
-            .ready_nodes()
-            .into_iter()
-            .map(|node| node.id.clone())
-            .collect::<Vec<_>>();
-        let blocked_node_ids = graph_nodes_with_status(
-            &workgraph,
-            harness_contract::workgraph::WorkNodeStatus::Blocked,
-        );
+        let execution_graph = build_execution_graph(&team, &spec, &tasks)?;
+        let execution_graph_quality = execution_graph_quality(&execution_graph);
+        let ready_node_ids = ready_node_ids(&execution_graph);
+        let blocked_node_ids =
+            graph_nodes_with_status(&execution_graph, ExecutionNodeStatus::Blocked);
         Ok(TeamExecutionPlan {
             team_id: team.team_id,
             session_id: team.session_id,
             objective: team.objective,
             spec,
             tasks,
-            workgraph,
-            workgraph_quality,
+            execution_graph,
+            execution_graph_quality,
             ready_node_ids,
             blocked_node_ids,
         })
     }
-
-    pub fn tick_ready(team_id: &str) -> Result<TeamExecutionReport, String> {
-        let plan = Self::plan(team_id)?;
-        let mut assigned_task_count = 0usize;
-        let mut delivered_agent_inputs = 0usize;
-        let mut events = Vec::new();
-        let mut evidence = Vec::new();
-        let mut errors = Vec::new();
-        let current_tasks = global_agent_task_mailbox().list_for_team(team_id);
-        let existing_task_ids = current_tasks
-            .iter()
-            .map(|task| task.task_id.as_str())
-            .collect::<BTreeSet<_>>();
-        let task_by_node = task_by_workgraph_node(&plan);
-        let ready_task_node_ids = plan
-            .workgraph
-            .ready_nodes()
-            .into_iter()
-            .filter(|node| node.kind == WorkNodeKind::AgentTask)
-            .filter_map(|node| {
-                task_by_node
-                    .get(&node.id)
-                    .filter(|task| !existing_task_ids.contains(task.task_id.as_str()))
-                    .map(|_| node.id.clone())
-            })
-            .take(plan.spec.max_parallelism.max(1))
-            .collect::<Vec<_>>();
-
-        for node_id in &ready_task_node_ids {
-            let Some(task) = task_by_node.get(node_id) else {
-                continue;
-            };
-            assigned_task_count = assigned_task_count.saturating_add(1);
-            global_agent_task_mailbox().assign((*task).clone());
-            let assigned = (*task).clone();
-            if let Some(agent_id) = assigned.agent_id.as_deref() {
-                let backend_mode = global_agent_lifecycle_service()
-                    .command_capability(agent_id)
-                    .map(|capability| capability.mode);
-                global_agent_task_binding_registry().bind_task(
-                    agent_id.to_string(),
-                    &assigned,
-                    node_id.clone(),
-                    backend_mode,
-                );
-            }
-
-            let progress = global_agent_event_bus().push(AgentProgressEvent {
-                event_id: String::new(),
-                team_id: plan.team_id.clone(),
-                session_id: plan.session_id.clone(),
-                agent_id: assigned.agent_id.clone(),
-                role_id: assigned.role_id.clone(),
-                task_id: Some(assigned.task_id.clone()),
-                event_type: "agent.task.ready".to_string(),
-                message: format!(
-                    "workgraph node {node_id} ready for role {}",
-                    assigned.role_id
-                ),
-                evidence_refs: assigned.evidence_refs.clone(),
-                created_at_ms: 0,
-            });
-            events.push(progress);
-
-            if let Some(agent_id) = &assigned.agent_id {
-                let payload = serde_json::json!({
-                    "task_id": assigned.task_id,
-                    "objective": assigned.objective,
-                    "expected_output": assigned.expected_output,
-                    "context_refs": assigned.context_refs,
-                    "evidence_refs": assigned.evidence_refs,
-                });
-                match global_agent_lifecycle_service().command_capability(agent_id) {
-                    Some(capability)
-                        if capability.backend
-                            == crate::AgentExecutionBackendKind::ManualMailbox =>
-                    {
-                        let _ = global_agent_task_mailbox().set_status(
-                            &assigned.task_id,
-                            AgentTaskStatus::Claimed,
-                            "task assigned to manual mailbox agent",
-                        );
-                        global_agent_task_binding_registry()
-                            .mark_task_status(agent_id, AgentTaskStatus::Claimed);
-                    }
-                    Some(capability) if !capability.supports_input => {
-                        let message = format!(
-                            "agent backend {} does not support runtime input",
-                            capability.mode
-                        );
-                        errors.push(format!("{}: {message}", assigned.task_id));
-                        if let Ok(receipt) = global_agent_task_mailbox().fail(
-                            &assigned.task_id,
-                            message.clone(),
-                            vec![format!("agent:{}", agent_id)],
-                            vec![message],
-                        ) {
-                            let _ =
-                                global_team_runtime_service().apply_agent_task_outcome(&receipt);
-                        }
-                    }
-                    Some(_) => {
-                        match global_agent_lifecycle_service().command(
-                            agent_id,
-                            AgentExecutionCommandKind::Input,
-                            Some(payload),
-                        ) {
-                            Ok(_) => {
-                                delivered_agent_inputs = delivered_agent_inputs.saturating_add(1);
-                                let _ = global_agent_task_mailbox().set_status(
-                                    &assigned.task_id,
-                                    AgentTaskStatus::Running,
-                                    "task delivered to agent",
-                                );
-                                global_agent_task_binding_registry()
-                                    .mark_task_status(agent_id, AgentTaskStatus::Running);
-                            }
-                            Err(error) => {
-                                errors.push(format!("{}: {error}", assigned.task_id));
-                                if let Ok(receipt) = global_agent_task_mailbox().fail(
-                                    &assigned.task_id,
-                                    format!("agent command delivery degraded: {error}"),
-                                    vec![format!("agent:{}", agent_id)],
-                                    vec![error],
-                                ) {
-                                    let _ = global_team_runtime_service()
-                                        .apply_agent_task_outcome(&receipt);
-                                }
-                            }
-                        }
-                    }
-                    None => {
-                        let message = format!("agent {agent_id} not found");
-                        errors.push(format!("{}: {message}", assigned.task_id));
-                    }
-                }
-            }
-
-            let evidence_ref = global_mission_evidence_bus().record(MissionEvidenceRef {
-                evidence_id: String::new(),
-                mission_id: Some("mission-control".to_string()),
-                session_id: plan.session_id.clone(),
-                team_id: Some(plan.team_id.clone()),
-                agent_id: assigned.agent_id.clone(),
-                kind: "agent_task".to_string(),
-                summary: format!(
-                    "{} task prepared from workgraph node {node_id}",
-                    assigned.role_id
-                ),
-                source_ref: Some(assigned.task_id.clone()),
-                created_at_ms: 0,
-            });
-            evidence.push(evidence_ref);
-        }
-
-        let final_plan = Self::plan(team_id)?;
-        let synthesis_packet = synthesis_packet_for_plan(&final_plan);
-        evidence.extend(record_review_and_synthesis_evidence(
-            &final_plan,
-            synthesis_packet.as_ref(),
-        ));
-        if !final_plan.blocked_node_ids.is_empty() {
-            let _ = global_conflict_arbiter().resolve(ConflictResolutionRequest {
-                source: ConflictSourceKind::WorkGraph,
-                severity: ConflictSeverity::High,
-                summary: format!(
-                    "team workgraph {} has blocked nodes: {}",
-                    final_plan.workgraph.id,
-                    final_plan.blocked_node_ids.join(",")
-                ),
-                evidence_refs: vec![format!("workgraph:{}", final_plan.workgraph.id)],
-                affected_scope: vec![
-                    format!("session:{}", final_plan.session_id),
-                    format!("team:{}", final_plan.team_id),
-                ],
-            });
-        }
-        Ok(TeamExecutionReport {
-            kind: "runtime.team_execution_report".to_string(),
-            team_id: plan.team_id,
-            planned_task_count: plan.tasks.len(),
-            assigned_task_count,
-            delivered_agent_inputs,
-            events,
-            evidence,
-            errors,
-            workgraph_id: final_plan.workgraph.id.clone(),
-            workgraph_quality: final_plan.workgraph_quality,
-            ready_node_ids: final_plan.ready_node_ids,
-            running_node_ids: graph_nodes_with_status(
-                &final_plan.workgraph,
-                harness_contract::workgraph::WorkNodeStatus::Running,
-            ),
-            completed_node_ids: graph_nodes_with_status(
-                &final_plan.workgraph,
-                harness_contract::workgraph::WorkNodeStatus::Completed,
-            ),
-            blocked_node_ids: final_plan.blocked_node_ids,
-            review_ready: synthesis_packet.is_some(),
-            synthesis_ready: synthesis_packet.is_some(),
-            synthesis_packet,
-            completion_receipts: Vec::new(),
-        })
-    }
-
-    pub fn ingest_agent_outcome(
-        task_id: &str,
-        outcome: AgentTaskOutcome,
-    ) -> Result<TeamExecutionReport, String> {
-        let receipt = global_agent_task_mailbox().complete(task_id, outcome)?;
-        global_team_runtime_service().apply_agent_task_outcome(&receipt)?;
-        let progress = global_agent_event_bus().push(AgentProgressEvent {
-            event_id: String::new(),
-            team_id: receipt.team_id.clone(),
-            session_id: receipt.session_id.clone(),
-            agent_id: receipt.agent_id.clone(),
-            role_id: receipt.role_id.clone(),
-            task_id: Some(receipt.task_id.clone()),
-            event_type: "agent.task.completed".to_string(),
-            message: receipt
-                .outcome
-                .as_ref()
-                .map(|outcome| outcome.result_summary.clone())
-                .unwrap_or_else(|| receipt.message.clone()),
-            evidence_refs: receipt.evidence_refs.clone(),
-            created_at_ms: 0,
-        });
-        let task_evidence = global_mission_evidence_bus().record(MissionEvidenceRef {
-            evidence_id: String::new(),
-            mission_id: Some("mission-control".to_string()),
-            session_id: receipt.session_id.clone(),
-            team_id: Some(receipt.team_id.clone()),
-            agent_id: receipt.agent_id.clone(),
-            kind: "agent_task_outcome".to_string(),
-            summary: progress.message.clone(),
-            source_ref: Some(receipt.task_id.clone()),
-            created_at_ms: 0,
-        });
-        if let Some(outcome) = &receipt.outcome {
-            for conflict in &outcome.conflicts {
-                let _ = global_conflict_arbiter().resolve(ConflictResolutionRequest {
-                    source: ConflictSourceKind::AgentReturn,
-                    severity: match outcome.quality_status {
-                        AgentTaskQualityStatus::Failed => ConflictSeverity::High,
-                        AgentTaskQualityStatus::Degraded | AgentTaskQualityStatus::NeedsReview => {
-                            ConflictSeverity::Medium
-                        }
-                        AgentTaskQualityStatus::Accepted => ConflictSeverity::Low,
-                    },
-                    summary: conflict.clone(),
-                    evidence_refs: receipt.evidence_refs.clone(),
-                    affected_scope: vec![
-                        format!("session:{}", receipt.session_id),
-                        format!("team:{}", receipt.team_id),
-                        format!("task:{}", receipt.task_id),
-                    ],
-                });
-            }
-        }
-        let mut report = Self::tick_ready(&receipt.team_id)?;
-        report.events.push(progress);
-        report.evidence.push(task_evidence);
-        report.completion_receipts.push(receipt);
-        Ok(report)
-    }
 }
 
-fn build_workgraph(
+fn build_execution_graph(
     team: &TeamRuntimeSnapshot,
     spec: &CollaborationTemplateRuntimeSpec,
     tasks: &[AgentTask],
-) -> Result<WorkGraph, String> {
-    let mut graph = WorkGraph::new(team.objective.clone());
-    graph.id = format!("team-workgraph-{}", stable_id(&team.team_id));
-
+) -> Result<ExecutionGraph, String> {
+    let mut graph = ExecutionGraph::new(team.objective.clone());
+    graph.id = format!("team-execution-graph-{}", stable_id(&team.team_id));
     let mut role_node_ids = BTreeMap::new();
+
     for task in tasks {
-        let node_id = workgraph_node_id(&team.team_id, &task.role_id);
-        let mut node = WorkNode::new(
-            WorkNodeKind::AgentTask,
-            task.role_id.clone(),
-            task.objective.clone(),
+        let node_id = execution_node_id(&team.team_id, &task.role_id);
+        let mut node = ExecutionNodeSpec::new(
+            ExecutionNodeKind::AgentTask,
+            "runtime.agent",
+            format!("agent_task:{}", task.task_id),
         );
         node.id = node_id.clone();
-        node.agent_id = task.agent_id.clone();
-        node.status = worknode_status_for_task(task.status);
-        node.refs = vec![
-            KernelRef {
-                ref_type: "team".to_string(),
-                id: team.team_id.clone(),
-                label: Some("Team runtime".to_string()),
-            },
-            KernelRef {
-                ref_type: "agent_task".to_string(),
-                id: task.task_id.clone(),
-                label: Some(task.role_id.clone()),
-            },
+        node.idempotency_key = format!("{}:{}", graph.id, task.task_id);
+        node.resource_scopes = vec![
+            format!("session:{}", team.session_id),
+            format!("team:{}", team.team_id),
         ];
-        graph.add_node(node).map_err(|error| error.to_string())?;
+        graph
+            .node_statuses
+            .insert(node_id.clone(), execution_status_for_task(task.status));
+        graph.nodes.push(node);
         role_node_ids.insert(task.role_id.clone(), node_id);
     }
 
     for dependency in &spec.dependency_edges {
-        let Some(from) = role_node_ids.get(&dependency.from_role_id) else {
-            return Err(format!(
+        let from = role_node_ids.get(&dependency.from_role_id).ok_or_else(|| {
+            format!(
                 "dependency references missing role: {}",
                 dependency.from_role_id
-            ));
-        };
-        let Some(to) = role_node_ids.get(&dependency.to_role_id) else {
-            return Err(format!(
+            )
+        })?;
+        let to = role_node_ids.get(&dependency.to_role_id).ok_or_else(|| {
+            format!(
                 "dependency references missing role: {}",
                 dependency.to_role_id
-            ));
-        };
-        graph
-            .add_edge(from, to, WorkEdgeKind::DependsOn)
-            .map_err(|error| error.to_string())?;
+            )
+        })?;
+        graph.edges.push(ExecutionEdge {
+            from: from.clone(),
+            to: to.clone(),
+            kind: ExecutionEdgeKind::DependsOn,
+        });
     }
 
-    let review_id = format!("work-node-{}-review", stable_id(&team.team_id));
-    let mut review = WorkNode::new(
-        WorkNodeKind::Review,
-        "review",
-        format!("Review team output for {}", team.objective),
+    let verify_id = format!("execution-node-{}-verify", stable_id(&team.team_id));
+    let mut verify = ExecutionNodeSpec::new(
+        ExecutionNodeKind::Verify,
+        "runtime.verify",
+        format!("team:{}:review", team.team_id),
     );
-    review.id = review_id.clone();
-    review.refs = vec![KernelRef {
-        ref_type: "team".to_string(),
-        id: team.team_id.clone(),
-        label: Some("Team runtime".to_string()),
-    }];
-    graph.add_node(review).map_err(|error| error.to_string())?;
-
+    verify.id = verify_id.clone();
+    verify.idempotency_key = format!("{}:{verify_id}", graph.id);
+    verify.acceptance.criteria = spec.review_gates.clone();
+    graph
+        .node_statuses
+        .insert(verify_id.clone(), ExecutionNodeStatus::Planned);
+    graph.nodes.push(verify);
     for role_node_id in role_node_ids.values() {
-        graph
-            .add_edge(role_node_id, &review_id, WorkEdgeKind::DependsOn)
-            .map_err(|error| error.to_string())?;
+        graph.edges.push(ExecutionEdge {
+            from: role_node_id.clone(),
+            to: verify_id.clone(),
+            kind: ExecutionEdgeKind::DependsOn,
+        });
     }
 
-    let synthesis_id = format!("work-node-{}-synthesis", stable_id(&team.team_id));
-    let mut synthesis = WorkNode::new(
-        WorkNodeKind::Synthesis,
-        "synthesis",
-        spec.final_synthesis_policy.clone(),
+    let synthesis_id = format!("execution-node-{}-synthesis", stable_id(&team.team_id));
+    let mut synthesis = ExecutionNodeSpec::new(
+        ExecutionNodeKind::Synthesize,
+        "runtime.synthesize",
+        format!("team:{}:synthesis", team.team_id),
     );
     synthesis.id = synthesis_id.clone();
-    synthesis.refs = vec![KernelRef {
-        ref_type: "team".to_string(),
-        id: team.team_id.clone(),
-        label: Some("Team runtime".to_string()),
-    }];
+    synthesis.idempotency_key = format!("{}:{synthesis_id}", graph.id);
+    synthesis.acceptance.criteria = vec![spec.final_synthesis_policy.clone()];
     graph
-        .add_node(synthesis)
-        .map_err(|error| error.to_string())?;
-    graph
-        .add_edge(&review_id, &synthesis_id, WorkEdgeKind::DependsOn)
-        .map_err(|error| error.to_string())?;
+        .node_statuses
+        .insert(synthesis_id.clone(), ExecutionNodeStatus::Planned);
+    graph.nodes.push(synthesis);
+    graph.edges.push(ExecutionEdge {
+        from: verify_id,
+        to: synthesis_id,
+        kind: ExecutionEdgeKind::DependsOn,
+    });
 
-    for task in tasks.iter().filter(|task| {
-        matches!(
-            task.status,
-            AgentTaskStatus::Failed | AgentTaskStatus::Cancelled
-        )
-    }) {
-        let node_id = workgraph_node_id(&team.team_id, &task.role_id);
-        graph
-            .mark_failed(&node_id)
-            .map_err(|error| error.to_string())?;
-    }
-
+    validate_execution_graph(&graph).map_err(|error| error.to_string())?;
+    mark_blocked_dependents(&mut graph);
     Ok(graph)
 }
 
-fn task_by_workgraph_node(plan: &TeamExecutionPlan) -> BTreeMap<String, &AgentTask> {
-    plan.tasks
-        .iter()
-        .map(|task| (workgraph_node_id(&plan.team_id, &task.role_id), task))
-        .collect()
-}
-
-fn worknode_status_for_task(
-    status: AgentTaskStatus,
-) -> harness_contract::workgraph::WorkNodeStatus {
+fn execution_status_for_task(status: AgentTaskStatus) -> ExecutionNodeStatus {
     match status {
-        AgentTaskStatus::Pending => harness_contract::workgraph::WorkNodeStatus::Planned,
-        AgentTaskStatus::Claimed | AgentTaskStatus::Running => {
-            harness_contract::workgraph::WorkNodeStatus::Running
-        }
-        AgentTaskStatus::Completed => harness_contract::workgraph::WorkNodeStatus::Completed,
-        AgentTaskStatus::Failed | AgentTaskStatus::Cancelled => {
-            harness_contract::workgraph::WorkNodeStatus::Failed
-        }
+        AgentTaskStatus::Pending => ExecutionNodeStatus::Planned,
+        AgentTaskStatus::Claimed | AgentTaskStatus::Running => ExecutionNodeStatus::Running,
+        AgentTaskStatus::Completed => ExecutionNodeStatus::Completed,
+        AgentTaskStatus::Failed => ExecutionNodeStatus::Failed,
+        AgentTaskStatus::Cancelled => ExecutionNodeStatus::Cancelled,
     }
 }
 
-fn graph_nodes_with_status(
-    graph: &WorkGraph,
-    status: harness_contract::workgraph::WorkNodeStatus,
-) -> Vec<String> {
+fn graph_nodes_with_status(graph: &ExecutionGraph, status: ExecutionNodeStatus) -> Vec<String> {
+    graph
+        .node_statuses
+        .iter()
+        .filter_map(|(id, current)| (*current == status).then_some(id.clone()))
+        .collect()
+}
+
+fn ready_node_ids(graph: &ExecutionGraph) -> Vec<String> {
     graph
         .nodes
         .iter()
-        .filter(|node| node.status == status)
-        .map(|node| node.id.clone())
+        .filter_map(|node| {
+            let current = graph
+                .node_statuses
+                .get(&node.id)
+                .copied()
+                .unwrap_or(ExecutionNodeStatus::Planned);
+            if current != ExecutionNodeStatus::Planned {
+                return None;
+            }
+            graph
+                .edges
+                .iter()
+                .filter(|edge| edge.kind == ExecutionEdgeKind::DependsOn && edge.to == node.id)
+                .map(|edge| {
+                    graph
+                        .node_statuses
+                        .get(&edge.from)
+                        .copied()
+                        .unwrap_or(ExecutionNodeStatus::Planned)
+                })
+                .all(|status| status == ExecutionNodeStatus::Completed)
+                .then_some(node.id.clone())
+        })
         .collect()
 }
 
-fn synthesis_packet_for_plan(plan: &TeamExecutionPlan) -> Option<TeamSynthesisPacket> {
-    if plan.tasks.is_empty()
-        || !plan
-            .tasks
+fn mark_blocked_dependents(graph: &mut ExecutionGraph) {
+    let mut blocked = graph
+        .node_statuses
+        .iter()
+        .filter_map(|(id, status)| {
+            matches!(
+                status,
+                ExecutionNodeStatus::Failed
+                    | ExecutionNodeStatus::Cancelled
+                    | ExecutionNodeStatus::Blocked
+            )
+            .then_some(id.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    loop {
+        let before = blocked.len();
+        for edge in graph
+            .edges
             .iter()
-            .all(|task| task.status == AgentTaskStatus::Completed && task.outcome.is_some())
-    {
-        return None;
+            .filter(|edge| edge.kind == ExecutionEdgeKind::DependsOn)
+        {
+            if blocked.contains(&edge.from) {
+                blocked.insert(edge.to.clone());
+            }
+        }
+        if blocked.len() == before {
+            break;
+        }
     }
-    let task_outcomes = plan
-        .tasks
-        .iter()
-        .filter_map(|task| task.outcome.clone())
-        .collect::<Vec<_>>();
-    let evidence_refs = plan
-        .tasks
-        .iter()
-        .flat_map(|task| task.evidence_refs.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let suggested_next_actions = task_outcomes
-        .iter()
-        .flat_map(|outcome| outcome.suggested_next_actions.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    Some(TeamSynthesisPacket {
-        team_id: plan.team_id.clone(),
-        session_id: plan.session_id.clone(),
-        objective: plan.objective.clone(),
-        status: "ready_for_synthesis".to_string(),
-        task_outcomes,
-        evidence_refs,
-        suggested_next_actions,
-        created_at_ms: now_ms(),
-    })
+    for id in blocked {
+        if !matches!(
+            graph.node_statuses.get(&id),
+            Some(ExecutionNodeStatus::Failed | ExecutionNodeStatus::Cancelled)
+        ) {
+            graph.node_statuses.insert(id, ExecutionNodeStatus::Blocked);
+        }
+    }
 }
 
-fn record_review_and_synthesis_evidence(
-    plan: &TeamExecutionPlan,
-    packet: Option<&TeamSynthesisPacket>,
-) -> Vec<MissionEvidenceRef> {
-    let Some(packet) = packet else {
-        return Vec::new();
-    };
-    let existing_sources = global_mission_evidence_bus()
-        .list_for_team(&plan.team_id)
-        .into_iter()
-        .filter_map(|item| item.source_ref)
-        .collect::<BTreeSet<_>>();
-    let mut evidence = Vec::new();
-    for (kind, source_ref, summary) in [
-        (
-            "team_review_ready",
-            format!("team:{}:review_ready", plan.team_id),
-            format!("team {} has completed upstream agent tasks", plan.team_id),
-        ),
-        (
-            "team_synthesis_ready",
-            format!("team:{}:synthesis_ready", plan.team_id),
-            format!(
-                "team {} synthesis packet is ready with {} task outcomes",
-                plan.team_id,
-                packet.task_outcomes.len()
-            ),
-        ),
-    ] {
-        if existing_sources.contains(&source_ref) {
-            continue;
-        }
-        evidence.push(global_mission_evidence_bus().record(MissionEvidenceRef {
-            evidence_id: String::new(),
-            mission_id: Some("mission-control".to_string()),
-            session_id: plan.session_id.clone(),
-            team_id: Some(plan.team_id.clone()),
-            agent_id: None,
-            kind: kind.to_string(),
-            summary,
-            source_ref: Some(source_ref),
-            created_at_ms: 0,
-        }));
+fn execution_graph_quality(graph: &ExecutionGraph) -> ExecutionGraphQualityReport {
+    let validation = validate_execution_graph(graph);
+    ExecutionGraphQualityReport {
+        node_count: graph.nodes.len(),
+        edge_count: graph.edges.len(),
+        ready_count: ready_node_ids(graph).len(),
+        blocked_count: graph_nodes_with_status(graph, ExecutionNodeStatus::Blocked).len(),
+        failed_count: graph_nodes_with_status(graph, ExecutionNodeStatus::Failed).len(),
+        has_verify_node: graph
+            .nodes
+            .iter()
+            .any(|node| node.kind == ExecutionNodeKind::Verify),
+        has_synthesize_node: graph
+            .nodes
+            .iter()
+            .any(|node| node.kind == ExecutionNodeKind::Synthesize),
+        is_dag: validation.is_ok(),
+        warnings: validation
+            .err()
+            .map(|error| vec![error.to_string()])
+            .unwrap_or_default(),
     }
-    evidence
 }
 
 fn make_task_id(team_id: &str, role_id: &str) -> String {
     format!("agent-task-{}-{}", stable_id(team_id), stable_id(role_id))
 }
 
-fn workgraph_node_id(team_id: &str, role_id: &str) -> String {
-    format!("work-node-{}-{}", stable_id(team_id), stable_id(role_id))
+fn execution_node_id(team_id: &str, role_id: &str) -> String {
+    format!(
+        "execution-node-{}-{}",
+        stable_id(team_id),
+        stable_id(role_id)
+    )
 }
 
 fn stable_id(value: &str) -> String {
-    let normalized = value
+    value
         .chars()
         .map(|ch| {
             if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
@@ -670,15 +346,9 @@ fn stable_id(value: &str) -> String {
                 '-'
             }
         })
-        .collect::<String>();
-    normalized.trim_matches('-').to_string()
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
 }
 
 fn runtime_spec_for(team: &TeamRuntimeSnapshot) -> CollaborationTemplateRuntimeSpec {
@@ -744,19 +414,19 @@ fn runtime_spec_for(team: &TeamRuntimeSnapshot) -> CollaborationTemplateRuntimeS
 mod tests {
     use super::*;
     use crate::{
-        AgentExecutionBackendKind, AgentSnapshot, CancellationToken, CollaborationTemplateMatcher,
-        StartMissionSessionRequest, StartTeamRuntimeRequest,
+        CollaborationTemplateMatcher, StartMissionSessionRequest, StartTeamRuntimeRequest,
     };
     use harness_contract::strategy::{decide_strategy, StrategyInput};
-    use std::sync::mpsc;
 
     #[test]
-    fn team_execution_uses_workgraph_ready_batch_for_sequential_roles() {
+    fn team_plan_is_a_valid_canonical_graph_without_dispatch_side_effects() {
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
         let suffix = uuid::Uuid::new_v4();
-        let session_id = format!("team-exec-session-{suffix}");
-        crate::global_mission_runtime()
+        let session_id = format!("team-plan-session-{suffix}");
+        services
+            .mission_runtime()
             .start_session(StartMissionSessionRequest {
-                title: "team execution".to_string(),
+                title: "team planning".to_string(),
                 session_id: Some(session_id.clone()),
             })
             .expect("session");
@@ -765,432 +435,21 @@ mod tests {
         let decision = CollaborationTemplateMatcher::default().decide(prompt, &strategy);
         let team = global_team_runtime_service()
             .start(StartTeamRuntimeRequest {
-                session_id: session_id.clone(),
+                session_id,
                 objective: prompt.to_string(),
                 collaboration_decision: decision,
             })
             .expect("team");
 
+        let before = global_agent_task_mailbox().list_for_team(&team.team_id);
         let plan = TeamExecutionLoop::plan(&team.team_id).expect("plan");
-        assert_eq!(plan.team_id, team.team_id);
-        assert!(!plan.tasks.is_empty());
+        let after = global_agent_task_mailbox().list_for_team(&team.team_id);
+
+        assert!(before.is_empty() && after.is_empty());
         assert_eq!(plan.tasks.len(), plan.spec.roles.len());
-        assert!(plan.workgraph_quality.is_dag);
-        assert!(plan.workgraph_quality.has_review_node);
-        assert!(plan.workgraph_quality.has_synthesis_node);
-
-        let report = TeamExecutionLoop::tick_ready(&team.team_id).expect("tick");
-        assert_eq!(report.kind, "runtime.team_execution_report");
-        assert_eq!(report.planned_task_count, plan.tasks.len());
-        assert_eq!(report.assigned_task_count, 1);
-        assert_eq!(report.events.len(), 1);
-        assert_eq!(report.evidence.len(), 1);
-        let assigned = global_agent_task_mailbox().list_for_team(&team.team_id);
-        assert_eq!(assigned.len(), 1);
-
-        global_agent_task_mailbox()
-            .set_status(
-                &assigned[0].task_id,
-                AgentTaskStatus::Completed,
-                "first role completed",
-            )
-            .expect("complete first role");
-        let second_report = TeamExecutionLoop::tick_ready(&team.team_id).expect("second tick");
-        assert_eq!(second_report.assigned_task_count, 1);
-        assert_eq!(
-            global_agent_task_mailbox()
-                .list_for_team(&team.team_id)
-                .len(),
-            2
-        );
-        assert!(!global_agent_event_bus()
-            .list_for_team(&team.team_id)
-            .is_empty());
-        assert!(!global_mission_evidence_bus()
-            .list_for_team(&team.team_id)
-            .is_empty());
-    }
-
-    #[test]
-    fn team_execution_respects_template_max_parallelism_for_ready_nodes() {
-        let suffix = uuid::Uuid::new_v4();
-        let session_id = format!("team-fanout-session-{suffix}");
-        crate::global_mission_runtime()
-            .start_session(StartMissionSessionRequest {
-                title: "team fanout execution".to_string(),
-                session_id: Some(session_id.clone()),
-            })
-            .expect("session");
-        let prompt = "research compare analyze multiple implementations and synthesize findings";
-        let strategy = decide_strategy(&StrategyInput::from_prompt(prompt));
-        let decision = CollaborationTemplateMatcher::default().decide(prompt, &strategy);
-        assert_eq!(
-            decision.template_id,
-            CollaborationTemplateId::FanoutResearchSynthesis
-        );
-        let team = global_team_runtime_service()
-            .start(StartTeamRuntimeRequest {
-                session_id,
-                objective: prompt.to_string(),
-                collaboration_decision: decision,
-            })
-            .expect("team");
-
-        let plan = TeamExecutionLoop::plan(&team.team_id).expect("plan");
-        assert!(plan.ready_node_ids.len() >= 2);
-        assert_eq!(plan.spec.max_parallelism, 3);
-
-        let report = TeamExecutionLoop::tick_ready(&team.team_id).expect("tick");
-        assert_eq!(report.assigned_task_count, 3);
-        assert_eq!(
-            global_agent_task_mailbox()
-                .list_for_team(&team.team_id)
-                .len(),
-            3
-        );
-        assert!(report.workgraph_quality.is_dag);
-    }
-
-    #[test]
-    fn blocked_workgraph_nodes_emit_conflict_receipt() {
-        let suffix = uuid::Uuid::new_v4();
-        let session_id = format!("team-conflict-session-{suffix}");
-        crate::global_mission_runtime()
-            .start_session(StartMissionSessionRequest {
-                title: "team conflict execution".to_string(),
-                session_id: Some(session_id.clone()),
-            })
-            .expect("session");
-        let prompt = "implement feature then review and fix";
-        let strategy = decide_strategy(&StrategyInput::from_prompt(prompt));
-        let decision = CollaborationTemplateMatcher::default().decide(prompt, &strategy);
-        let team = global_team_runtime_service()
-            .start(StartTeamRuntimeRequest {
-                session_id,
-                objective: prompt.to_string(),
-                collaboration_decision: decision,
-            })
-            .expect("team");
-
-        let first = TeamExecutionLoop::tick_ready(&team.team_id).expect("first tick");
-        assert_eq!(first.assigned_task_count, 1);
-        let assigned = global_agent_task_mailbox().list_for_team(&team.team_id);
-        global_agent_task_mailbox()
-            .set_status(
-                &assigned[0].task_id,
-                AgentTaskStatus::Failed,
-                "first role failed",
-            )
-            .expect("fail first role");
-        let before = global_conflict_arbiter().receipts().len();
-        let report = TeamExecutionLoop::tick_ready(&team.team_id).expect("blocked tick");
-        assert!(!report.blocked_node_ids.is_empty());
-        let receipts = global_conflict_arbiter().receipts();
-        assert!(receipts.len() > before);
-        assert!(receipts
-            .iter()
-            .any(|receipt| receipt.source == ConflictSourceKind::WorkGraph
-                && receipt.summary.contains("blocked nodes")));
-    }
-
-    #[test]
-    fn agent_outcome_ingestion_builds_synthesis_packet_and_evidence() {
-        let suffix = uuid::Uuid::new_v4();
-        let session_id = format!("team-outcome-session-{suffix}");
-        crate::global_mission_runtime()
-            .start_session(StartMissionSessionRequest {
-                title: "team outcome ingestion".to_string(),
-                session_id: Some(session_id.clone()),
-            })
-            .expect("session");
-        let prompt = "answer a simple delegated question";
-        let strategy = decide_strategy(&StrategyInput::from_prompt(prompt));
-        let decision = CollaborationTemplateMatcher::default().decide(prompt, &strategy);
-        let team = global_team_runtime_service()
-            .start(StartTeamRuntimeRequest {
-                session_id,
-                objective: prompt.to_string(),
-                collaboration_decision: decision,
-            })
-            .expect("team");
-
-        let first = TeamExecutionLoop::tick_ready(&team.team_id).expect("tick");
-        assert_eq!(first.assigned_task_count, 1);
-        let task = global_agent_task_mailbox()
-            .list_for_team(&team.team_id)
-            .into_iter()
-            .next()
-            .expect("assigned task");
-        let report = TeamExecutionLoop::ingest_agent_outcome(
-            &task.task_id,
-            AgentTaskOutcome {
-                result_summary: "role completed with evidence".to_string(),
-                evidence_refs: vec!["evidence:role-output".to_string()],
-                conflicts: Vec::new(),
-                suggested_next_actions: vec!["synthesize".to_string()],
-                quality_status: AgentTaskQualityStatus::Accepted,
-                completed_at_ms: 0,
-            },
-        )
-        .expect("ingest outcome");
-
-        assert!(report.synthesis_ready);
-        assert!(report.review_ready);
-        assert_eq!(
-            report
-                .synthesis_packet
-                .as_ref()
-                .expect("synthesis packet")
-                .task_outcomes
-                .len(),
-            1
-        );
-        assert!(report
-            .evidence
-            .iter()
-            .any(|item| item.kind == "team_synthesis_ready"));
-        let run = global_team_runtime_service()
-            .collaboration_run(&team.team_id)
-            .expect("run");
-        assert!(run.synthesis_ready);
-    }
-
-    #[test]
-    fn commandless_agent_backend_records_degraded_task_receipt() {
-        let suffix = uuid::Uuid::new_v4();
-        let session_id = format!("team-degraded-session-{suffix}");
-        crate::global_mission_runtime()
-            .start_session(StartMissionSessionRequest {
-                title: "team degraded backend".to_string(),
-                session_id: Some(session_id.clone()),
-            })
-            .expect("session");
-        let prompt = "implement feature then review";
-        let strategy = decide_strategy(&StrategyInput::from_prompt(prompt));
-        let decision = CollaborationTemplateMatcher::default().decide(prompt, &strategy);
-        let team = global_team_runtime_service()
-            .start_with_agent_spawner(
-                StartTeamRuntimeRequest {
-                    session_id,
-                    objective: prompt.to_string(),
-                    collaboration_decision: decision,
-                },
-                |request| {
-                    let agent_id = format!("agent-commandless-{}-{}", request.role_id, suffix);
-                    let snapshot = AgentSnapshot {
-                        agent_id: agent_id.clone(),
-                        name: request.role_id.clone(),
-                        description: request.responsibility.clone(),
-                        subagent_type: Some("Explore".to_string()),
-                        model: Some(crate::DEFAULT_AGENT_MODEL.to_string()),
-                        status: "running".to_string(),
-                        backend: AgentExecutionBackendKind::InProcess,
-                        output_file: String::new(),
-                        manifest_file: String::new(),
-                        created_at: "1".to_string(),
-                        started_at: Some("1".to_string()),
-                        completed_at: None,
-                        lane_events: Vec::new(),
-                        current_blocker: None,
-                        derived_state: "working".to_string(),
-                        error: None,
-                    };
-                    crate::global_agent_lifecycle_service()
-                        .register_started(snapshot.clone(), CancellationToken::new());
-                    Ok(snapshot)
-                },
-            )
-            .expect("team");
-
-        let report = TeamExecutionLoop::tick_ready(&team.team_id).expect("tick");
-        assert_eq!(report.assigned_task_count, 1);
-        assert!(!report.errors.is_empty());
-        let task = global_agent_task_mailbox()
-            .list_for_team(&team.team_id)
-            .into_iter()
-            .next()
-            .expect("task");
-        assert_eq!(task.status, AgentTaskStatus::Failed);
-        assert_eq!(
-            task.outcome.as_ref().expect("outcome").quality_status,
-            AgentTaskQualityStatus::Failed
-        );
-        let run = global_team_runtime_service()
-            .collaboration_run(&team.team_id)
-            .expect("run");
-        let capability = run.agent_runs[0]
-            .backend_capability
-            .as_ref()
-            .expect("backend capability");
-        assert!(!capability.supports_input);
-    }
-
-    #[test]
-    fn manual_mailbox_agent_claims_task_without_command_channel_failure() {
-        let suffix = uuid::Uuid::new_v4();
-        let session_id = format!("team-manual-mailbox-session-{suffix}");
-        crate::global_mission_runtime()
-            .start_session(StartMissionSessionRequest {
-                title: "team manual mailbox".to_string(),
-                session_id: Some(session_id.clone()),
-            })
-            .expect("session");
-        let prompt = "use a team to answer one delegated question";
-        let strategy = decide_strategy(&StrategyInput::from_prompt(prompt));
-        let decision = CollaborationTemplateMatcher::default().decide(prompt, &strategy);
-        let team = global_team_runtime_service()
-            .start_with_agent_spawner(
-                StartTeamRuntimeRequest {
-                    session_id,
-                    objective: prompt.to_string(),
-                    collaboration_decision: decision,
-                },
-                |request| {
-                    let agent_id = format!("agent-manual-{}-{suffix}", request.role_id);
-                    let snapshot = AgentSnapshot {
-                        agent_id: agent_id.clone(),
-                        name: request.role_id.clone(),
-                        description: request.responsibility.clone(),
-                        subagent_type: Some("Manual".to_string()),
-                        model: None,
-                        status: "queued".to_string(),
-                        backend: AgentExecutionBackendKind::ManualMailbox,
-                        output_file: String::new(),
-                        manifest_file: String::new(),
-                        created_at: "1".to_string(),
-                        started_at: None,
-                        completed_at: None,
-                        lane_events: Vec::new(),
-                        current_blocker: None,
-                        derived_state: "awaiting_manual_outcome".to_string(),
-                        error: None,
-                    };
-                    crate::global_agent_lifecycle_service()
-                        .register_started(snapshot.clone(), CancellationToken::new());
-                    Ok(snapshot)
-                },
-            )
-            .expect("team");
-
-        let report = TeamExecutionLoop::tick_ready(&team.team_id).expect("tick");
-        assert!(report.errors.is_empty());
-        let claimed = global_agent_task_mailbox()
-            .list_for_team(&team.team_id)
-            .into_iter()
-            .filter(|task| task.status == AgentTaskStatus::Claimed)
-            .count();
-        assert_eq!(claimed, report.assigned_task_count);
-        assert!(claimed > 0);
-    }
-
-    #[test]
-    fn terminal_agent_lifecycle_event_flows_back_to_team_task_and_synthesis() {
-        let suffix = uuid::Uuid::new_v4();
-        let session_id = format!("team-terminal-bridge-session-{suffix}");
-        crate::global_mission_runtime()
-            .start_session(StartMissionSessionRequest {
-                title: "team terminal bridge".to_string(),
-                session_id: Some(session_id.clone()),
-            })
-            .expect("session");
-        let prompt = "answer a simple delegated terminal bridge question";
-        let strategy = decide_strategy(&StrategyInput::from_prompt(prompt));
-        let decision = CollaborationTemplateMatcher::default().decide(prompt, &strategy);
-        let team = global_team_runtime_service()
-            .start_with_agent_spawner(
-                StartTeamRuntimeRequest {
-                    session_id,
-                    objective: prompt.to_string(),
-                    collaboration_decision: decision,
-                },
-                |request| {
-                    let agent_id = format!("agent-terminal-{}-{}", request.role_id, suffix);
-                    let snapshot = AgentSnapshot {
-                        agent_id: agent_id.clone(),
-                        name: request.role_id.clone(),
-                        description: request.responsibility.clone(),
-                        subagent_type: Some("Explore".to_string()),
-                        model: Some(crate::DEFAULT_AGENT_MODEL.to_string()),
-                        status: "running".to_string(),
-                        backend: AgentExecutionBackendKind::ProcessJsonl,
-                        output_file: String::new(),
-                        manifest_file: String::new(),
-                        created_at: "1".to_string(),
-                        started_at: Some("1".to_string()),
-                        completed_at: None,
-                        lane_events: Vec::new(),
-                        current_blocker: None,
-                        derived_state: "working".to_string(),
-                        error: None,
-                    };
-                    crate::global_agent_lifecycle_service()
-                        .register_started(snapshot.clone(), CancellationToken::new());
-                    let (tx, rx) = mpsc::channel();
-                    let _receiver_guard = std::thread::spawn(move || {
-                        let _ = rx.recv_timeout(std::time::Duration::from_secs(2));
-                    });
-                    crate::global_agent_lifecycle_service()
-                        .attach_command_channel(&agent_id, tx)
-                        .expect("attach command channel");
-                    Ok(snapshot)
-                },
-            )
-            .expect("team");
-
-        let tick = TeamExecutionLoop::tick_ready(&team.team_id).expect("tick");
-        assert_eq!(tick.assigned_task_count, 1);
-        assert_eq!(tick.delivered_agent_inputs, 1);
-        let task = global_agent_task_mailbox()
-            .list_for_team(&team.team_id)
-            .into_iter()
-            .next()
-            .expect("task");
-        assert_eq!(task.status, AgentTaskStatus::Running);
-        let binding = crate::global_agent_task_binding_registry()
-            .get_by_task(&task.task_id)
-            .expect("binding");
-        let agent_id = binding.agent_id.clone();
-
-        let terminal = AgentSnapshot {
-            agent_id: agent_id.clone(),
-            name: "Explore".to_string(),
-            description: "terminal bridge".to_string(),
-            subagent_type: Some("Explore".to_string()),
-            model: Some(crate::DEFAULT_AGENT_MODEL.to_string()),
-            status: "completed".to_string(),
-            backend: AgentExecutionBackendKind::ProcessJsonl,
-            output_file: String::new(),
-            manifest_file: String::new(),
-            created_at: "1".to_string(),
-            started_at: Some("1".to_string()),
-            completed_at: Some("2".to_string()),
-            lane_events: Vec::new(),
-            current_blocker: None,
-            derived_state: "bridge completed with evidence".to_string(),
-            error: None,
-        };
-        crate::global_agent_lifecycle_service().update_snapshot(
-            terminal,
-            "agent.completed",
-            "Process JSONL agent completed".to_string(),
-        );
-
-        let completed = global_agent_task_mailbox()
-            .get(&task.task_id)
-            .expect("completed task");
-        assert_eq!(completed.status, AgentTaskStatus::Completed);
-        assert_eq!(
-            completed.outcome.as_ref().expect("outcome").result_summary,
-            "bridge completed with evidence"
-        );
-        let run = global_team_runtime_service()
-            .collaboration_run(&team.team_id)
-            .expect("run");
-        assert!(run.synthesis_ready);
-        assert_eq!(run.team.status, crate::TeamRuntimeStatus::Completed);
-        assert!(global_agent_event_bus()
-            .list_for_agent(&agent_id)
-            .iter()
-            .any(|event| event.event_type == "agent.task.completed"));
+        assert!(plan.execution_graph_quality.is_dag);
+        assert!(plan.execution_graph_quality.has_verify_node);
+        assert!(plan.execution_graph_quality.has_synthesize_node);
+        assert!(!plan.ready_node_ids.is_empty());
     }
 }

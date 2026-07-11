@@ -67,7 +67,7 @@ impl Default for ContextControlPolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryControlPolicy {
-    pub emit_pulses_from_workgraph: bool,
+    pub emit_pulses_from_execution_graph: bool,
     pub review_conflicts: bool,
     pub max_candidates_per_turn: usize,
 }
@@ -75,7 +75,7 @@ pub struct MemoryControlPolicy {
 impl Default for MemoryControlPolicy {
     fn default() -> Self {
         Self {
-            emit_pulses_from_workgraph: true,
+            emit_pulses_from_execution_graph: true,
             review_conflicts: true,
             max_candidates_per_turn: 8,
         }

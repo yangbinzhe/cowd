@@ -97,8 +97,8 @@ mod tests {
             CowdEvent::ResourcesCommitted {
                 ids: vec!["res-a".into()],
             },
-            CowdEvent::WorkGraphSummary {
-                summary: crate::RuntimeWorkGraphSummary {
+            CowdEvent::ExecutionGraphSummary {
+                summary: crate::RuntimeExecutionGraphSummary {
                     graph_id: Some("graph".into()),
                     board_id: Some("board".into()),
                     status: "completed".into(),

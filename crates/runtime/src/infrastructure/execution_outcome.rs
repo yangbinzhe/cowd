@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use memory::{RuntimeEvent, RuntimeEventScope, RuntimeRef};
+use memory::{SessionDomainEvent, SessionDomainRef, SessionDomainScope};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -59,11 +59,15 @@ pub struct CowdExecutionOutcome {
 
 impl CowdExecutionOutcome {
     #[must_use]
-    pub fn to_runtime_event(&self, session_id: impl Into<String>, sequence: usize) -> RuntimeEvent {
-        let mut event = RuntimeEvent::new(
+    pub fn to_runtime_event(
+        &self,
+        session_id: impl Into<String>,
+        sequence: usize,
+    ) -> SessionDomainEvent {
+        let mut event = SessionDomainEvent::new(
             session_id,
             sequence,
-            RuntimeEventScope::Task,
+            SessionDomainScope::ApplicationTask,
             "execution.outcome",
             serde_json::to_value(self).unwrap_or_else(|_| {
                 serde_json::json!({
@@ -77,7 +81,7 @@ impl CowdExecutionOutcome {
         event.refs = self
             .refs
             .iter()
-            .map(|reference| RuntimeRef {
+            .map(|reference| SessionDomainRef {
                 ref_type: reference.ref_type.clone(),
                 id: reference.id.clone(),
                 label: reference.label.clone(),
@@ -136,7 +140,7 @@ mod tests {
                 .any(|reference| reference.ref_type == "structured_batch"
                     && reference.id == "batch-1")
         );
-        assert_eq!(event.scope, RuntimeEventScope::Task);
+        assert_eq!(event.scope, SessionDomainScope::ApplicationTask);
         assert_eq!(event.kind, "execution.outcome");
         assert_eq!(event.status.as_deref(), Some("planned"));
     }

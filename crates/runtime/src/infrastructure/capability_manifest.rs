@@ -172,21 +172,21 @@ impl RuntimeCapabilityCatalog {
             templates,
             operation_groups: vec![
                 operation_group(
-                    "workgraph",
+                    "execution_graph",
                     "Build, validate, schedule, and inspect DAG-based team work.",
                     vec![
                         operation(
-                            "build_workgraph",
+                            "build_execution_graph",
                             "runtime.team_execution",
-                            "Convert a collaboration template into a validated WorkGraph with review and synthesis nodes.",
+                            "Convert a collaboration template into a validated ExecutionGraph with verify and synthesis nodes.",
                             "I need ordered or parallel team work with visible dependencies.",
-                            "WorkGraph quality report must be DAG-valid and policy-approved before dispatch.",
-                            &["workgraph_id", "ready_node_ids", "blocked_node_ids"],
+                            "ExecutionGraph quality must be DAG-valid and policy-approved before dispatch.",
+                            &["execution_graph_id", "ready_node_ids", "blocked_node_ids"],
                         ),
                         operation(
                             "tick_ready_nodes",
                             "runtime.team_execution",
-                            "Dispatch only ready WorkGraph nodes under max_parallelism.",
+                            "Dispatch only ready ExecutionGraph nodes under max_parallelism.",
                             "The team already exists and the next ready work should run.",
                             "Paused/cancelled teams and blocked nodes are rejected.",
                             &["ready_node_ids", "running_node_ids", "mission_evidence"],
@@ -244,7 +244,7 @@ impl RuntimeCapabilityCatalog {
                         operation(
                             "request_arbiter",
                             "runtime.conflict_arbiter",
-                            "Record and resolve a conflict from WorkGraph, session, tool, memory, approval, or agent evidence.",
+                            "Record and resolve a conflict from ExecutionGraph, session, tool, memory, approval, or agent evidence.",
                             "Evidence disagrees or a dependency/permission state blocks progress.",
                             "Severity determines continue, review, pause, or approval.",
                             &["conflict_id", "decision", "mission_evidence"],
@@ -288,14 +288,14 @@ impl RuntimeCapabilityCatalog {
                     "request_team",
                     "Complex implementation, audit, research, debate, incident, or long-running work benefits from role split.",
                     &["intent", "template_hint optional", "reason optional"],
-                    &["team_projection", "agent_projection", "workgraph"],
+                    &["team_projection", "agent_projection", "execution_graph"],
                 ),
                 action_contract(
-                    "build_workgraph",
+                    "build_execution_graph",
                     "request_team",
                     "The model wants explicit dependencies, parallel lanes, review, and synthesis for a team.",
                     &["intent", "template_hint optional"],
-                    &["workgraph", "workgraph_quality", "ready_node_ids"],
+                    &["execution_graph", "execution_graph_quality", "ready_node_ids"],
                 ),
                 action_contract(
                     "dispatch_session",
@@ -1195,7 +1195,7 @@ mod tests {
         assert!(catalog
             .operation_groups
             .iter()
-            .any(|group| group.id == "workgraph"));
+            .any(|group| group.id == "execution_graph"));
         assert!(catalog
             .operation_groups
             .iter()

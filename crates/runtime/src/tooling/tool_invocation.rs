@@ -1,6 +1,6 @@
 //! Lightweight tool invocation facts for runtime/session observability.
 
-use memory::{RuntimeEvent, RuntimeEventScope, RuntimeRef};
+use memory::{SessionDomainEvent, SessionDomainRef, SessionDomainScope};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -271,7 +271,7 @@ impl ToolInvocationRecord {
     }
 
     #[must_use]
-    pub fn to_runtime_event(&self, sequence: usize, kind: impl Into<String>) -> RuntimeEvent {
+    pub fn to_runtime_event(&self, sequence: usize, kind: impl Into<String>) -> SessionDomainEvent {
         let payload = serde_json::json!({
             "contract_version": self.contract_version,
             "invocation_id": self.invocation_id,
@@ -301,10 +301,10 @@ impl ToolInvocationRecord {
             "is_error": self.is_error,
             "failure_kind": self.failure_kind.map(ToolFailureKind::as_str),
         });
-        let mut event = RuntimeEvent::new(
+        let mut event = SessionDomainEvent::new(
             self.session_id.clone(),
             sequence,
-            RuntimeEventScope::Tool,
+            SessionDomainScope::Tool,
             kind,
             payload,
             self.ended_at_ms.unwrap_or(self.started_at_ms),
@@ -313,17 +313,17 @@ impl ToolInvocationRecord {
         event.span_id = Some(self.invocation_id.clone());
         event.correlation_id = Some(self.tool_call_id.clone());
         event.refs = vec![
-            RuntimeRef {
+            SessionDomainRef {
                 ref_type: "tool_invocation".to_string(),
                 id: self.invocation_id.clone(),
                 label: Some(self.tool_name.clone()),
             },
-            RuntimeRef {
+            SessionDomainRef {
                 ref_type: "tool_call".to_string(),
                 id: self.tool_call_id.clone(),
                 label: Some(self.tool_name.clone()),
             },
-            RuntimeRef {
+            SessionDomainRef {
                 ref_type: "tool".to_string(),
                 id: self.tool_name.clone(),
                 label: None,
@@ -477,7 +477,7 @@ mod tests {
 
         let event = record.to_runtime_event(9, "tool.invocation.completed");
 
-        assert_eq!(event.scope, RuntimeEventScope::Tool);
+        assert_eq!(event.scope, SessionDomainScope::Tool);
         assert_eq!(event.status.as_deref(), Some("completed"));
         assert_eq!(event.payload["contract_version"], TOOL_CONTRACT_VERSION);
         assert_eq!(event.payload["stale_registration"], false);

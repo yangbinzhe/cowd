@@ -2,11 +2,10 @@ use chrono::Utc;
 use memory::store::session::SessionRecord;
 use memory::{
     AgentVisibility, CognitiveContextManager, FactChecker, MemoryCategory, MemoryConfig,
-    MemoryEntry, MemoryLayer, MemoryScope, MemorySource, Priority, RuntimeEvent, RuntimeEventScope,
-    RuntimeRef, UnifiedSessionStore,
+    MemoryEntry, MemoryLayer, MemoryScope, MemorySource, Priority, UnifiedSessionStore,
 };
 use memory::{DocumentCategory, DocumentContent, DocumentIngestor};
-use runtime::agent_protocol::{AgentEvidence, AgentReview, ReviewVerdict};
+use runtime::{RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore};
 
 fn memory_config(sqlite_path: &std::path::Path) -> MemoryConfig {
     MemoryConfig {
@@ -185,103 +184,80 @@ async fn cowd_full_capability_eval_covers_document_memory_fact_session_agents_an
     assert!(fact_result.contradiction.is_some());
 
     let agent_evidence = [
-        AgentEvidence {
-            id: "evidence-planner-doc".to_string(),
-            node_id: "agent-planner".to_string(),
-            kind: "complex_document".to_string(),
-            reference: format!("memory:{document_memory_id}"),
-            summary: "Planner extracted manufacturing facts from complex document.".to_string(),
-            created_at_ms: 1_000,
-        },
-        AgentEvidence {
-            id: "evidence-executor-structured".to_string(),
-            node_id: "agent-executor".to_string(),
-            kind: "structured_evidence".to_string(),
-            reference: "structured-evidence:shortage-risk-packet".to_string(),
-            summary: "Executor linked structured shortage evidence and supplier recovery action."
-                .to_string(),
-            created_at_ms: 2_000,
-        },
-        AgentEvidence {
-            id: "evidence-reviewer-fact-check".to_string(),
-            node_id: "agent-reviewer".to_string(),
-            kind: "fact_check".to_string(),
-            reference: "fact-check:triple-full-capability-conflict".to_string(),
-            summary: "Reviewer detected contradictory supplier recovery status.".to_string(),
-            created_at_ms: 3_000,
-        },
+        serde_json::json!({
+            "id": "evidence-planner-doc",
+            "node_id": "agent-planner",
+            "kind": "complex_document",
+            "reference": format!("memory:{document_memory_id}"),
+            "summary": "Planner extracted manufacturing facts from complex document."
+        }),
+        serde_json::json!({
+            "id": "evidence-executor-structured",
+            "node_id": "agent-executor",
+            "kind": "structured_evidence",
+            "reference": "structured-evidence:shortage-risk-packet",
+            "summary": "Executor linked structured shortage evidence and supplier recovery action."
+        }),
+        serde_json::json!({
+            "id": "evidence-reviewer-fact-check",
+            "node_id": "agent-reviewer",
+            "kind": "fact_check",
+            "reference": "fact-check:triple-full-capability-conflict",
+            "summary": "Reviewer detected contradictory supplier recovery status."
+        }),
     ];
-    let review = AgentReview {
-        id: "review-full-capability".to_string(),
-        node_id: "agent-reviewer".to_string(),
-        reviewer: "agent-reviewer".to_string(),
-        verdict: ReviewVerdict::Accept,
-        comment: "All evidence, memory, session, and structured checks are connected.".to_string(),
-        created_at_ms: 4_000,
-    };
+    let review = serde_json::json!({
+        "id": "review-full-capability",
+        "node_id": "agent-reviewer",
+        "reviewer": "agent-reviewer",
+        "verdict": "accept",
+        "comment": "All evidence, memory, session, and structured checks are connected."
+    });
 
-    let mut events = Vec::new();
-    for (index, evidence) in agent_evidence.iter().enumerate() {
-        let mut event = RuntimeEvent::new(
-            session_id,
-            index + 1,
-            RuntimeEventScope::Agent,
-            "agent.evidence",
-            serde_json::to_value(evidence).expect("agent evidence serializes"),
-            evidence.created_at_ms,
-        );
-        event.status = Some("ok".to_string());
-        event.refs = vec![
-            RuntimeRef {
-                ref_type: "agent_node".to_string(),
-                id: evidence.node_id.clone(),
-                label: Some(evidence.kind.clone()),
-            },
-            RuntimeRef {
-                ref_type: "evidence".to_string(),
-                id: evidence.id.clone(),
-                label: Some(evidence.summary.clone()),
-            },
-        ];
-        sessions
-            .append_runtime_event(&event)
-            .await
+    let execution_events = RuntimeEventStore::open_in_memory().expect("runtime event store opens");
+    for evidence in &agent_evidence {
+        execution_events
+            .append(RuntimeEventInput {
+                stream_id: session_id.to_string(),
+                scope: RuntimeEventScope::Agent,
+                kind: "agent.evidence".to_string(),
+                status: Some("ok".to_string()),
+                actor: Some("capability-eval".to_string()),
+                refs: vec![
+                    RuntimeEventRef {
+                        kind: "agent_node".to_string(),
+                        id: evidence["node_id"].as_str().unwrap().to_string(),
+                    },
+                    RuntimeEventRef {
+                        kind: "evidence".to_string(),
+                        id: evidence["id"].as_str().unwrap().to_string(),
+                    },
+                ],
+                payload: evidence.clone(),
+            })
             .expect("agent evidence event appends");
-        events.push(event);
     }
-
-    let mut review_event = RuntimeEvent::new(
-        session_id,
-        10,
-        RuntimeEventScope::Agent,
-        "agent.review",
-        serde_json::to_value(&review).expect("review serializes"),
-        review.created_at_ms,
-    );
-    review_event.status = Some("accepted".to_string());
-    review_event.refs = vec![RuntimeRef {
-        ref_type: "agent_review".to_string(),
-        id: review.id.clone(),
-        label: Some("full capability accepted".to_string()),
-    }];
-    sessions
-        .append_runtime_event(&review_event)
-        .await
+    execution_events
+        .append(RuntimeEventInput {
+            stream_id: session_id.to_string(),
+            scope: RuntimeEventScope::Agent,
+            kind: "agent.review".to_string(),
+            status: Some("accepted".to_string()),
+            actor: Some("agent-reviewer".to_string()),
+            refs: vec![RuntimeEventRef {
+                kind: "agent_review".to_string(),
+                id: review["id"].as_str().unwrap().to_string(),
+            }],
+            payload: review.clone(),
+        })
         .expect("review event appends");
 
-    let timeline = sessions
-        .timeline_events_page(session_id, 0, 20)
-        .await
+    let timeline = execution_events
+        .list_stream(session_id)
         .expect("timeline loads");
-    assert_eq!(timeline.total, 4);
-    assert!(timeline
-        .events
-        .iter()
-        .any(|event| event.kind == "agent.evidence"));
-    assert!(timeline
-        .events
-        .iter()
-        .any(|event| event.kind == "agent.review"));
+    assert_eq!(timeline.len(), 4);
+    assert!(timeline.iter().any(|event| event.kind == "agent.evidence"));
+    assert!(timeline.iter().any(|event| event.kind == "agent.review"));
 
     let associated = sessions
         .get_session_memories(session_id)
@@ -293,7 +269,9 @@ async fn cowd_full_capability_eval_covers_document_memory_fact_session_agents_an
         "Reviewer accepted full capability eval",
         &format!(
             "review={} fact_check_consistent={} structured_ref={}",
-            review.id, fact_result.is_consistent, "structured-evidence:shortage-risk-packet"
+            review["id"].as_str().unwrap(),
+            fact_result.is_consistent,
+            "structured-evidence:shortage-risk-packet"
         ),
         MemoryLayer::L4,
         MemoryCategory::Decision,

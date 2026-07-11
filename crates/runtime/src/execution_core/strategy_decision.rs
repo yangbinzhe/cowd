@@ -378,7 +378,7 @@ fn expected_projection_for(action: &str) -> &'static [&'static str] {
         "request_team" => &[
             "mission.team_projection",
             "mission.agent_projection",
-            "mission.workgraph_projection",
+            "mission.execution_graph_projection",
             "mission.evidence_projection",
         ],
         "request_parallel_tools" | "request_rewoo_evidence" => &[
@@ -387,7 +387,7 @@ fn expected_projection_for(action: &str) -> &'static [&'static str] {
             "runtime.evidence_refs",
         ],
         "request_deliberation" => &["runtime.deliberation_graph", "mission.evidence_projection"],
-        "request_background_review" => &["mission.steward_projection", "runtime.workgraph"],
+        "request_background_review" => &["mission.steward_projection", "runtime.execution_graph"],
         "request_risk_gate" => &["mission.conflict_projection", "mission.approval_projection"],
         _ => &["runtime.execution_decision"],
     }

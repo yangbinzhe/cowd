@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use runtime::{ToolError, ToolExecutor};
 use serde::Deserialize;
@@ -6,7 +6,6 @@ use tools::permissions::PermissionMode as ToolPermissionMode;
 use tools::{ToolHost, ToolHostSnapshot};
 
 use crate::runtime_bootstrap::{GatewayToolRegistry, RuntimeMcpState};
-use crate::services::{start_team_runtime_with_spawner_decision, MissionTeamExecutionMode};
 use crate::{format_tool_result, AllowedToolSet};
 
 #[derive(Debug, Deserialize)]
@@ -60,6 +59,7 @@ pub(crate) struct GatewayToolExecutor {
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     runtime_session_id: Option<String>,
     runtime_execution_decision: Arc<Mutex<Option<runtime::RuntimeExecutionDecision>>>,
+    runtime_services: Arc<OnceLock<Arc<runtime::RuntimeServices>>>,
 }
 
 impl GatewayToolExecutor {
@@ -87,6 +87,7 @@ impl GatewayToolExecutor {
             mcp_state,
             runtime_session_id: None,
             runtime_execution_decision: Arc::new(Mutex::new(None)),
+            runtime_services: Arc::new(OnceLock::new()),
         }
     }
 
@@ -103,6 +104,7 @@ impl GatewayToolExecutor {
             mcp_state,
             runtime_session_id: None,
             runtime_execution_decision: Arc::new(Mutex::new(None)),
+            runtime_services: Arc::new(OnceLock::new()),
         }
     }
 
@@ -113,6 +115,15 @@ impl GatewayToolExecutor {
             self.runtime_session_id = Some(session_id);
         }
         self
+    }
+
+    pub(crate) fn bind_runtime_services(
+        &self,
+        services: Arc<runtime::RuntimeServices>,
+    ) -> Result<(), String> {
+        self.runtime_services
+            .set(services)
+            .map_err(|_| "runtime services already bound to gateway tool executor".to_string())
     }
 
     fn execute_search_tool(&self, value: serde_json::Value) -> Result<String, ToolError> {
@@ -130,14 +141,30 @@ impl GatewayToolExecutor {
                         .and_then(|report| serde_json::to_value(report).ok()),
                 )
             });
-        let mut receipt = self
+        let receipt = self
             .tool_host
             .pin_snapshot()
             .search(&input.query, input.max_results.unwrap_or(5));
-        if pending_mcp_servers.is_some() || mcp_degraded.is_some() {
-            receipt.query = format!("{} [mcp state available]", receipt.query);
+        let mut value =
+            serde_json::to_value(receipt).map_err(|error| ToolError::new(error.to_string()))?;
+        if let Some(object) = value.as_object_mut() {
+            let matches = object
+                .get("activation_candidates")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([]));
+            object.insert("matches".to_string(), matches);
+            object.insert(
+                "pending_mcp_servers".to_string(),
+                pending_mcp_servers.map_or(serde_json::Value::Null, |servers| {
+                    serde_json::json!(servers)
+                }),
+            );
+            object.insert(
+                "mcp_degraded".to_string(),
+                mcp_degraded.unwrap_or(serde_json::Value::Null),
+            );
         }
-        serde_json::to_string_pretty(&receipt).map_err(|error| ToolError::new(error.to_string()))
+        serde_json::to_string_pretty(&value).map_err(|error| ToolError::new(error.to_string()))
     }
 
     fn execute_runtime_tool(
@@ -188,14 +215,34 @@ impl GatewayToolExecutor {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
-            return serde_json::to_string_pretty(
-                &runtime::runtime_orchestration_response_with_host_and_decision(
-                    value,
-                    Some(self),
-                    leased_decision.as_ref(),
-                ),
-            )
-            .map_err(|error| ToolError::new(error.to_string()));
+            let request = serde_json::from_value::<runtime::RuntimeOrchestrationRequest>(value)
+                .map_err(|error| {
+                    ToolError::new(format!("invalid runtime_orchestrate input: {error}"))
+                })?;
+            let services = self.runtime_services.get().cloned().ok_or_else(|| {
+                ToolError::new("runtime_orchestrate requires the workspace RuntimeServices Runner")
+            })?;
+            let decision = leased_decision;
+            let result = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let runtime_handle = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|error| ToolError::new(error.to_string()))?;
+                        Ok(
+                            runtime_handle.block_on(runtime::submit_runtime_orchestration_request(
+                                request,
+                                decision.as_ref(),
+                                services.as_ref(),
+                            )),
+                        )
+                    })
+                    .join()
+                    .map_err(|_| ToolError::new("runtime orchestration worker panicked"))?
+            })?;
+            return serde_json::to_string_pretty(&result)
+                .map_err(|error| ToolError::new(error.to_string()));
         }
 
         let Some(mcp_state) = &self.mcp_state else {
@@ -257,25 +304,6 @@ impl GatewayToolExecutor {
     }
 }
 
-fn ensure_gateway_mission_session(session_id: &str, intent: &str) -> Result<(), ToolError> {
-    if runtime::global_mission_runtime()
-        .get_session(session_id)
-        .is_some()
-    {
-        return Ok(());
-    }
-    runtime::global_mission_runtime()
-        .start_session(runtime::StartMissionSessionRequest {
-            title: format!(
-                "Gateway runtime session: {}",
-                intent.chars().take(80).collect::<String>()
-            ),
-            session_id: Some(session_id.to_string()),
-        })
-        .map(|_| ())
-        .map_err(ToolError::new)
-}
-
 impl ToolExecutor for GatewayToolExecutor {
     fn execute(&self, tool_name: &str, input: &str) -> Result<String, ToolError> {
         if self
@@ -308,9 +336,16 @@ impl ToolExecutor for GatewayToolExecutor {
                 )
                 .map_err(|error| ToolError::new(error.to_string()))
                 .and_then(|decision| {
-                    lease
+                    let output = lease
                         .execute(&decision.authorization, tool_name, &value)
-                        .map_err(|error| ToolError::new(error.to_string()))
+                        .map_err(|error| ToolError::new(error.to_string()))?;
+                    if tool_name.starts_with("mcp__") {
+                        let receipt: serde_json::Value = serde_json::from_str(&output)
+                            .map_err(|error| ToolError::new(error.to_string()))?;
+                        return serde_json::to_string_pretty(&receipt["output"])
+                            .map_err(|error| ToolError::new(error.to_string()));
+                    }
+                    Ok(output)
                 })
         };
         match result {
@@ -426,49 +461,6 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
             },
         }
     }
-
-    fn start_runtime_team(
-        &self,
-        request: &runtime::RuntimeOrchestrationRequest,
-        decision: &runtime::CollaborationDecision,
-    ) -> Option<Result<serde_json::Value, String>> {
-        let result = (|| {
-            let session_id = request
-                .session_id
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| "request_team requires session_id".to_string())?;
-            ensure_gateway_mission_session(session_id, &request.intent)
-                .map_err(|error| error.to_string())?;
-            let team = start_team_runtime_with_spawner_decision(
-                session_id,
-                request.intent.clone(),
-                None,
-                MissionTeamExecutionMode::ProviderInProcess,
-                decision.clone(),
-            )?;
-            let workgraph = runtime::TeamExecutionLoop::plan(&team.team_id)
-                .ok()
-                .map(|plan| {
-                    serde_json::json!({
-                        "workgraph_id": plan.workgraph.id,
-                        "ready_node_ids": plan.ready_node_ids,
-                        "blocked_node_ids": plan.blocked_node_ids,
-                        "quality": plan.workgraph_quality,
-                    })
-                });
-            Ok(serde_json::json!({
-                "type": "team_runtime",
-                "status": "running",
-                "execution_fidelity": "runtime_owned_gateway_adapter",
-                "team": team,
-                "workgraph": workgraph,
-                "mission": runtime::global_mission_runtime().projection(),
-                "control_actions": ["inspect", "tick_ready", "synthesis", "handoff", "cancel", "pause"],
-            }))
-        })();
-        Some(result)
-    }
 }
 
 #[cfg(test)]
@@ -533,6 +525,9 @@ mod tests {
             }])
             .expect("runtime tool registry");
         let executor = GatewayToolExecutor::new(None, false, registry, None);
+        executor
+            .bind_runtime_services(runtime::RuntimeServices::in_memory().unwrap())
+            .unwrap();
 
         let output = executor
             .execute(
@@ -582,6 +577,9 @@ mod tests {
             ])
             .expect("runtime tool registry");
         let executor = GatewayToolExecutor::new(None, false, registry, None);
+        executor
+            .bind_runtime_services(runtime::RuntimeServices::in_memory().unwrap())
+            .unwrap();
         let decision = runtime::build_runtime_execution_decision(
             "并行调研 runtime gateway memory 的当前实现",
             None,
@@ -639,6 +637,9 @@ mod tests {
             .expect("runtime tool registry");
         let executor = GatewayToolExecutor::new(None, false, registry, None)
             .with_runtime_session_id("gateway-session-v26");
+        executor
+            .bind_runtime_services(runtime::RuntimeServices::in_memory().unwrap())
+            .unwrap();
 
         let output = executor
             .execute(
@@ -647,9 +648,17 @@ mod tests {
             )
             .expect("gateway-bound runtime orchestrate should execute without explicit session_id");
 
-        assert!(output.contains("\"status\": \"running\""), "{output}");
-        assert!(output.contains("\"type\": \"team_runtime\""), "{output}");
-        assert!(output.contains("gateway-session-v26"), "{output}");
+        let response: serde_json::Value = serde_json::from_str(&output).expect("typed response");
+        assert_eq!(response["status"], "unavailable");
+        assert_eq!(response["execution"]["type"], "orchestration_not_submitted");
+        assert_eq!(response["evidence"]["accepted"], false);
+        assert!(response["decision"]["validation_findings"]
+            .as_array()
+            .expect("validation findings")
+            .iter()
+            .any(|finding| finding
+                .as_str()
+                .is_some_and(|value| value.contains("execution_capability_unavailable"))));
         assert!(!output.contains("missing_session_id_for_team_runtime"));
     }
 
@@ -673,6 +682,9 @@ mod tests {
             .expect("runtime tool registry");
         let executor = GatewayToolExecutor::new(None, false, registry, None)
             .with_runtime_session_id("gateway-session-v6-tool-host");
+        executor
+            .bind_runtime_services(runtime::RuntimeServices::in_memory().unwrap())
+            .unwrap();
 
         let output = executor
             .execute(
@@ -681,9 +693,11 @@ mod tests {
             )
             .expect("gateway-bound runtime orchestrate should inject a tool host");
 
-        assert!(output.contains("\"status\": \"executed\""), "{output}");
-        assert!(output.contains("runtime.tool_dag.executed"), "{output}");
-        assert!(output.contains("gateway-tool:"), "{output}");
-        assert!(!output.contains("blocked_missing_executor"), "{output}");
+        let response: serde_json::Value = serde_json::from_str(&output).expect("typed response");
+        assert_eq!(response["status"], "compiled");
+        assert_eq!(response["execution"]["type"], "execution_graph_compilation");
+        assert_eq!(response["evidence"]["compiled"], true);
+        assert_eq!(response["evidence"]["accepted"], false);
+        assert!(response["execution"].get("receipt").is_none());
     }
 }

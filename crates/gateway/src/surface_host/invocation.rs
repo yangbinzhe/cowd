@@ -148,13 +148,17 @@ impl SurfaceHost {
             return Ok(SurfaceOperationResult::unavailable(&request.surface));
         }
         let surface_id = normalize_surface_id(&request.surface);
+        let mut metadata = request.metadata;
+        if let Some(idempotency_key) = request.idempotency_key {
+            metadata["idempotency_key"] = serde_json::Value::String(idempotency_key);
+        }
         let frame = SurfaceFrame::Send {
             id: SurfaceFrame::new_id(),
             surface: surface_id.clone(),
             recipient: request.recipient,
             thread: request.thread,
             text: request.text,
-            metadata: request.metadata,
+            metadata,
         };
         self.invoke(surface, frame).await
     }
@@ -510,6 +514,7 @@ mod tests {
                 recipient: "chat-a".to_string(),
                 thread: Some("thread-a".to_string()),
                 text: "hello".to_string(),
+                idempotency_key: None,
                 metadata: serde_json::json!({
                     "reply_to": "om_external",
                     "local_reply_to": "om_external:replay:local",

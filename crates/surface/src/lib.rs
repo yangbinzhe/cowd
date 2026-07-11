@@ -756,6 +756,10 @@ pub struct SurfaceSendRequest {
     pub recipient: String,
     pub thread: Option<String>,
     pub text: String,
+    /// Stable caller-owned key. A sidecar that performs external effects must
+    /// return the original provider receipt when this key is replayed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
     #[serde(default)]
     pub metadata: Value,
 }

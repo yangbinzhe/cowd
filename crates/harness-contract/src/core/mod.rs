@@ -2,7 +2,7 @@
 //!
 //! This crate intentionally has no dependency on `runtime`, `gateway`, or UI
 //! crates. It defines the stable language used by strategy, task, context,
-//! verification, workgraph, transaction, and evaluation layers.
+//! verification, execution_graph, transaction, and evaluation layers.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -295,7 +295,7 @@ pub enum KernelCapability {
     StrategyRouting,
     TaskControl,
     ContextEpoch,
-    WorkGraph,
+    ExecutionGraph,
     ToolTransaction,
     VerificationLedger,
     Evaluation,

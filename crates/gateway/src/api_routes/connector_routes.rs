@@ -8,10 +8,9 @@ use axum::{
 };
 use connector::{
     builtin_service_connector_registry, builtin_source_adapter_manifests, default_capabilities,
-    CapabilityManifest, ConnectorBulkhead, ConnectorBulkheadRejection, ConnectorHealth,
-    ConnectorRegistrySnapshot, ExternalResourceRef, ProviderAccount, ServiceConnector,
-    ServiceToolRequest, ServiceToolResult, SourceConnectorState, SourceIncrementalRunRequest,
-    SourceIncrementalRunResult, SourceReadPlan, SourceWatermark,
+    CapabilityManifest, ConnectorHealth, ConnectorRegistrySnapshot, ExternalResourceRef,
+    ProviderAccount, ServiceConnector, ServiceToolRequest, ServiceToolResult, SourceConnectorState,
+    SourceIncrementalRunRequest, SourceIncrementalRunResult, SourceReadPlan, SourceWatermark,
 };
 use memory::types::{
     AgentVisibility, MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, Priority,
@@ -397,12 +396,6 @@ fn run_local_source_incremental(
 
 const MAX_CONNECTOR_RESOURCE_PAGE: usize = 200;
 const DEFAULT_CONNECTOR_RESOURCE_PAGE: usize = 100;
-
-static CONNECTOR_SERVICE_BULKHEAD: OnceLock<ConnectorBulkhead> = OnceLock::new();
-
-fn connector_service_bulkhead() -> &'static ConnectorBulkhead {
-    CONNECTOR_SERVICE_BULKHEAD.get_or_init(ConnectorBulkhead::default_service_gate)
-}
 
 pub(super) fn connector_snapshot(state: &AppState) -> ConnectorRegistrySnapshot {
     let config = state.runtime_config_json_snapshot();

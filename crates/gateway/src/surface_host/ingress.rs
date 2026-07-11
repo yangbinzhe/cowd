@@ -319,6 +319,7 @@ async fn handle_surface_message(
         recipient,
         thread: thread_id,
         text: response_text,
+        idempotency_key: Some(format!("surface-reply:{surface}:{message_id}")),
         metadata: serde_json::json!({
             "reply_to": platform_reply_to,
             "local_reply_to": message_id,
@@ -548,6 +549,7 @@ async fn send_surface_failure_notice(
             recipient,
             thread,
             text: surface_failure_notice_text(error),
+            idempotency_key: Some(format!("surface-failure:{surface}:{message_id}")),
             metadata: serde_json::json!({
                 "reply_to": platform_reply_to,
                 "local_reply_to": message_id,
@@ -687,6 +689,7 @@ async fn ensure_surface_runtime_session(
     let runtime = if let Some(store) = state.services.session.unified_store() {
         crate::runtime_factory::create_runtime_entry_with_session_store(
             store,
+            runtime_service.runtime_services(),
             runtime_service.provider_registry(),
             runtime_service.tool_host(),
             session,
@@ -702,6 +705,7 @@ async fn ensure_surface_runtime_session(
         )
     } else {
         crate::runtime_factory::create_runtime_entry(
+            runtime_service.runtime_services(),
             runtime_service.provider_registry(),
             runtime_service.tool_host(),
             session,

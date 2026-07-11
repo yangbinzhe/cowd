@@ -4,8 +4,6 @@ use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{record_runtime_event, RuntimeEventInput, RuntimeEventRef, RuntimeEventScope};
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentProgressEvent {
     pub event_id: String,
@@ -49,7 +47,6 @@ impl AgentEventBus {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(event.clone());
-        record_event(&event);
         event
     }
 
@@ -79,31 +76,6 @@ impl AgentEventBus {
 pub fn global_agent_event_bus() -> &'static AgentEventBus {
     static BUS: OnceLock<AgentEventBus> = OnceLock::new();
     BUS.get_or_init(AgentEventBus::new)
-}
-
-fn record_event(event: &AgentProgressEvent) {
-    let _ = record_runtime_event(RuntimeEventInput {
-        stream_id: event
-            .agent_id
-            .as_ref()
-            .map(|agent_id| format!("agent:{agent_id}"))
-            .unwrap_or_else(|| format!("team:{}", event.team_id)),
-        scope: RuntimeEventScope::Agent,
-        kind: event.event_type.clone(),
-        status: None,
-        actor: Some("agent_event_bus".to_string()),
-        refs: vec![
-            RuntimeEventRef {
-                kind: "team".to_string(),
-                id: event.team_id.clone(),
-            },
-            RuntimeEventRef {
-                kind: "session".to_string(),
-                id: event.session_id.clone(),
-            },
-        ],
-        payload: serde_json::json!(event),
-    });
 }
 
 fn now_ms() -> u64 {

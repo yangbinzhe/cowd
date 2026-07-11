@@ -10,7 +10,7 @@ pub enum RecommendedScope {
     Direct,
     MinimalPatch,
     PlannedChange,
-    WorkGraph,
+    ExecutionGraph,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,7 +87,7 @@ pub fn decide_behavior_policy(prompt: &str, strategy: &StrategyDecision) -> Beha
         ExecutionPattern::Execute => RecommendedScope::PlannedChange,
         ExecutionPattern::Deliberate
         | ExecutionPattern::Collaborate
-        | ExecutionPattern::Supervise => RecommendedScope::WorkGraph,
+        | ExecutionPattern::Supervise => RecommendedScope::ExecutionGraph,
     };
     let requires_scope_downgrade = !overengineering_risks.is_empty();
     let requires_human_review = requires_scope_downgrade

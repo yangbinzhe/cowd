@@ -1,13 +1,9 @@
 //! Cross-session relation graph and routing contracts.
 
 use std::collections::BTreeMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
-
-use crate::{
-    global_conflict_arbiter, ConflictResolutionRequest, ConflictSeverity, ConflictSourceKind,
-};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -101,27 +97,6 @@ impl SessionRelationGraph {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(relation.relation_id.clone(), relation.clone());
-        if matches!(
-            relation.kind,
-            SessionRelationKind::ConflictsWith | SessionRelationKind::Blocks
-        ) {
-            let severity = match relation.kind {
-                SessionRelationKind::Blocks => ConflictSeverity::High,
-                SessionRelationKind::ConflictsWith => ConflictSeverity::Medium,
-                _ => ConflictSeverity::Low,
-            };
-            let _ = global_conflict_arbiter().resolve(ConflictResolutionRequest {
-                source: ConflictSourceKind::SessionRelation,
-                severity,
-                summary: relation.summary.clone(),
-                evidence_refs: relation.evidence_refs.clone(),
-                affected_scope: vec![
-                    format!("session:{}", relation.from_session_id),
-                    format!("session:{}", relation.to_session_id),
-                    format!("session_relation:{}", relation.relation_id),
-                ],
-            });
-        }
         Ok(relation)
     }
 
@@ -209,11 +184,6 @@ impl SessionRelationGraph {
     }
 }
 
-pub fn global_session_relation_graph() -> &'static SessionRelationGraph {
-    static GRAPH: OnceLock<SessionRelationGraph> = OnceLock::new();
-    GRAPH.get_or_init(SessionRelationGraph::new)
-}
-
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -261,8 +231,7 @@ mod tests {
     }
 
     #[test]
-    fn conflict_relation_emits_conflict_receipt() {
-        let before = global_conflict_arbiter().receipts().len();
+    fn conflict_relation_is_preserved_for_runtime_resolution() {
         let graph = SessionRelationGraph::new();
         graph
             .add_relation(
@@ -273,11 +242,8 @@ mod tests {
                 vec!["evidence:conflict".to_string()],
             )
             .expect("relation");
-        let receipts = global_conflict_arbiter().receipts();
-        assert!(receipts.len() > before);
-        assert!(receipts.iter().any(|receipt| {
-            receipt.source == ConflictSourceKind::SessionRelation
-                && receipt.summary.contains("incompatible decisions")
-        }));
+        let relations = graph.relations_for("source-session");
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0].kind, SessionRelationKind::ConflictsWith);
     }
 }

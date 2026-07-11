@@ -47,7 +47,7 @@ pub trait SubAgentExecutor: Send + Sync {
         &self,
         config: SubAgentConfig,
         task: &str,
-    ) -> impl std::future::Future<Output = Result<SubAgentResult, SubAgentError>>;
+    ) -> impl std::future::Future<Output = Result<SubAgentResult, SubAgentError>> + Send;
 }
 // ---------------------------------------------------------------------------
 // ProductionExecutor
@@ -94,14 +94,14 @@ where
 
 impl<C, T> SubAgentExecutor for ProductionExecutor<C, T>
 where
-    C: crate::conversation::ApiClient + Send + Sync + 'static,
+    C: crate::conversation::ApiClient + Clone + Send + Sync + 'static,
     T: crate::conversation::ToolExecutor,
 {
     fn execute(
         &self,
         config: SubAgentConfig,
         task: &str,
-    ) -> impl std::future::Future<Output = Result<SubAgentResult, SubAgentError>> {
+    ) -> impl std::future::Future<Output = Result<SubAgentResult, SubAgentError>> + Send {
         let client = (self.make_client)();
         let mut rt = crate::conversation::ConversationRuntime::<C, T>::new_with_features(
             crate::session::Session::new(),
@@ -548,7 +548,8 @@ use crate::conversation::{ApiClient, ConversationRuntime, ToolExecutor};
 /// - Results shared back to parent via L4 `team_remember`
 pub struct SubAgentRuntime<C: ApiClient, T: ToolExecutor> {
     config: SubAgentConfig,
-    runtime: ConversationRuntime<C, T>,
+    runtime: Option<ConversationRuntime<C, T>>,
+    runtime_services: Arc<crate::RuntimeServices>,
     turns_executed: usize,
     tokens_consumed: usize,
     started_at: Instant,
@@ -565,7 +566,11 @@ pub struct SubAgentRuntime<C: ApiClient, T: ToolExecutor> {
     reputation_manager: Option<memory::agent_reputation::ReputationManager>,
 }
 
-impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
+impl<C, T> SubAgentRuntime<C, T>
+where
+    C: ApiClient + Send + Sync + 'static,
+    T: ToolExecutor,
+{
     /// Create a new sub-agent runtime with the given configuration and conversation runtime.
     #[must_use]
     pub fn new(mut config: SubAgentConfig, runtime: ConversationRuntime<C, T>) -> Self {
@@ -606,7 +611,9 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
             reasoning_trace: None,
             reputation_manager: None,
             config,
-            runtime,
+            runtime: Some(runtime),
+            runtime_services: crate::RuntimeServices::in_memory()
+                .expect("sub-agent runtime services must initialize"),
         }
     }
 
@@ -632,9 +639,12 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
     }
 
     fn memory_turn_context(&self) -> MemoryTurnContext {
-        MemoryTurnContext::new(self.runtime.session().session_id, self.agent_id.clone())
-            .with_task_id(Some(stable_agent_task_id(&self.config.task_description)))
-            .with_team_id(Some(format!("agent-role:{}", self.config.agent_role)))
+        MemoryTurnContext::new(
+            self.runtime_ref().session().session_id,
+            self.agent_id.clone(),
+        )
+        .with_task_id(Some(stable_agent_task_id(&self.config.task_description)))
+        .with_team_id(Some(format!("agent-role:{}", self.config.agent_role)))
     }
 
     /// Check if a tool is allowed for this sub-agent.
@@ -761,7 +771,10 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
     ///
     /// After completion, results are shared with the parent agent via
     /// L4 `team_remember` if a parent memory manager is configured.
-    pub async fn run_loop_async(&mut self, initial_prompt: &str) -> SubAgentResult {
+    pub async fn run_loop_async(&mut self, initial_prompt: &str) -> SubAgentResult
+    where
+        C: Clone,
+    {
         use crate::permissions::SharedPrompter;
 
         let mut output_parts: Vec<String> = Vec::new();
@@ -829,11 +842,19 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
             }
 
             let prompter = SharedPrompter::none();
-            let summary = match self
+            let runtime = self
                 .runtime
-                .run_turn_async(&current_prompt, &prompter)
-                .await
-            {
+                .take()
+                .expect("sub-agent conversation runtime must be available");
+            let (runtime, turn_result) = crate::host::submit_owned_conversation_turn(
+                runtime,
+                Arc::clone(&self.runtime_services),
+                &current_prompt,
+                &prompter,
+            )
+            .await;
+            self.runtime = Some(runtime);
+            let summary = match turn_result {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!("SubAgent turn failed: {}", e);
@@ -960,12 +981,21 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
         }
     }
 
+    fn runtime_ref(&self) -> &ConversationRuntime<C, T> {
+        self.runtime
+            .as_ref()
+            .expect("sub-agent conversation runtime must be available")
+    }
+
     /// Execute a single sub-agent request to completion using the owned runtime.
     pub async fn execute_single(
         config: SubAgentConfig,
         req: DelegationRequest,
         runtime: ConversationRuntime<C, T>,
-    ) -> SubAgentResult {
+    ) -> SubAgentResult
+    where
+        C: Clone,
+    {
         let prompt = format!(
             "Task: {}\nContext: {}\nExpected output: {}",
             req.task, req.context, req.expected_output
@@ -983,7 +1013,10 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
         config: SubAgentConfig,
         requests: Vec<DelegationRequest>,
         runtime_factory: impl Fn() -> ConversationRuntime<C, T>,
-    ) -> Vec<SubAgentResult> {
+    ) -> Vec<SubAgentResult>
+    where
+        C: Clone,
+    {
         let mut results = Vec::with_capacity(requests.len());
         for req in requests {
             let rt = runtime_factory();
@@ -1413,7 +1446,7 @@ mod tests {
     #[test]
     fn sub_agent_memory_turn_context_uses_runtime_session_and_agent() {
         let runtime = SubAgentRuntime::new(SubAgentConfig::default(), make_dummy_runtime());
-        let expected_session = runtime.runtime.session().session_id;
+        let expected_session = runtime.runtime_ref().session().session_id;
 
         let ctx = runtime.memory_turn_context();
 

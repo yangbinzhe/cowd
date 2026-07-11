@@ -5,7 +5,7 @@
 use tokio::sync::broadcast;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct RuntimeWorkGraphSummary {
+pub struct RuntimeExecutionGraphSummary {
     pub graph_id: Option<String>,
     pub board_id: Option<String>,
     pub status: String,
@@ -17,24 +17,33 @@ pub struct RuntimeWorkGraphSummary {
     pub complementarity_score: Option<f32>,
 }
 
-impl RuntimeWorkGraphSummary {
+impl RuntimeExecutionGraphSummary {
     #[must_use]
     pub fn from_review(
-        graph: &crate::agent_workgraph::AgentWorkGraph,
+        graph: &harness_contract::execution_graph::ExecutionGraph,
         packet: &crate::agent_collaboration::CollaborationReviewPacket,
     ) -> Self {
         let agent_tasks = graph
             .nodes
             .iter()
-            .filter(|node| node.kind == crate::agent_workgraph::WorkGraphNodeKind::AgentTask)
+            .filter(|node| {
+                node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask
+            })
             .count();
         Self {
-            graph_id: Some(graph.graph_id.clone()),
-            board_id: graph
-                .board_id
-                .clone()
-                .or_else(|| Some(packet.board_id.clone())),
-            status: format!("{:?}", graph.status).to_lowercase(),
+            graph_id: Some(graph.id.clone()),
+            board_id: Some(packet.board_id.clone()),
+            status: if graph.node_statuses.values().any(|status| {
+                matches!(
+                    status,
+                    harness_contract::execution_graph::ExecutionNodeStatus::Failed
+                )
+            }) {
+                "failed"
+            } else {
+                "completed"
+            }
+            .to_string(),
             agent_tasks,
             memory_candidates: packet.maintenance_candidates.len(),
             conflicts: packet.scorecard.conflict_count,
@@ -128,8 +137,8 @@ pub enum CowdEvent {
     RuntimePolicyDecision {
         summary: RuntimePolicyDecisionSummary,
     },
-    WorkGraphSummary {
-        summary: RuntimeWorkGraphSummary,
+    ExecutionGraphSummary {
+        summary: RuntimeExecutionGraphSummary,
     },
     SessionInputReceived {
         receipt: harness_contract::turn::SessionInputReceipt,

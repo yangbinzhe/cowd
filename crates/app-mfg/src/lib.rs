@@ -14,6 +14,7 @@ pub mod ontology;
 mod repository;
 pub mod skill;
 mod store;
+pub mod workflow;
 
 pub use analysis::{
     MfgAttributionCandidate, MfgImpactPath, MfgOperationalAnalysis, MfgRecommendedAction,
@@ -44,6 +45,11 @@ pub use skill::{
     MfgSkillRun,
 };
 pub use store::MfgStore;
+pub use workflow::{
+    MfgWorkflowEvidence, MfgWorkflowGraph, MfgWorkflowGraphError, MfgWorkflowNode,
+    MfgWorkflowNodeKind, MfgWorkflowNodeStatus, MfgWorkflowReview, MfgWorkflowReviewVerdict,
+    MfgWorkflowStatus,
+};
 
 pub use repository::{MfgHealth, MfgMetricRecomputeResult, MfgRepositoryError};
 

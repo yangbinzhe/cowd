@@ -95,8 +95,7 @@ async fn start_task_handler(
     state
         .services
         .task
-        .append_runtime_event(&state.services.session, &task, "task.started")
-        .await
+        .record_lifecycle_event(&state.services.runtime_events, &task, "task.started")
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok((StatusCode::CREATED, Json(task)))
 }
@@ -121,8 +120,7 @@ async fn start_task_phase_handler(
     state
         .services
         .task
-        .append_runtime_event(&state.services.session, &task, "task.phase.started")
-        .await
+        .record_lifecycle_event(&state.services.runtime_events, &task, "task.phase.started")
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok((StatusCode::CREATED, Json(task)))
 }
@@ -140,12 +138,11 @@ async fn record_task_phase_artifact_handler(
     state
         .services
         .task
-        .append_runtime_event(
-            &state.services.session,
+        .record_lifecycle_event(
+            &state.services.runtime_events,
             &task,
             "task.phase.artifact.recorded",
         )
-        .await
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(Json(task))
 }
@@ -163,8 +160,7 @@ async fn review_task_phase_handler(
     state
         .services
         .task
-        .append_runtime_event(&state.services.session, &task, "task.phase.reviewed")
-        .await
+        .record_lifecycle_event(&state.services.runtime_events, &task, "task.phase.reviewed")
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(Json(task))
 }
@@ -181,8 +177,7 @@ async fn cancel_task_handler(
     state
         .services
         .task
-        .append_runtime_event(&state.services.session, &task, "task.cancelled")
-        .await
+        .record_lifecycle_event(&state.services.runtime_events, &task, "task.cancelled")
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(Json(task))
 }
@@ -199,8 +194,7 @@ async fn complete_task_handler(
     state
         .services
         .task
-        .append_runtime_event(&state.services.session, &task, "task.completed")
-        .await
+        .record_lifecycle_event(&state.services.runtime_events, &task, "task.completed")
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(Json(task))
 }
@@ -223,8 +217,7 @@ async fn record_task_failure_handler(
     state
         .services
         .task
-        .append_runtime_event(&state.services.session, &task, kind)
-        .await
+        .record_lifecycle_event(&state.services.runtime_events, &task, kind)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(Json(task))
 }

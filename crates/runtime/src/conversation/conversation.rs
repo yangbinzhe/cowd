@@ -57,9 +57,7 @@ use sha2::{Digest, Sha256};
 use tracing;
 
 use crate::agent::{SubAgentConfig, SubAgentRuntime};
-use crate::agent_collaboration::{
-    CollaborationContextResult, CollaborationOps, MemoryPulseCandidate, MemoryPulseKind,
-};
+use crate::agent_collaboration::{CollaborationContextResult, CollaborationOps};
 use crate::agent_discussion::DiscussionEngine;
 use crate::budget_policy::{
     clamp_context_budget_ratio_bp, resolve_compact_threshold, RuntimeBudgetInputs,
@@ -87,18 +85,13 @@ use crate::permissions::{PermissionContext, PermissionOutcome, PermissionPolicy}
 use crate::runtime_control::RuntimeControlPolicy;
 use crate::runtime_harness::{RuntimeAiKernel, RuntimeAiKernelTrace};
 use crate::session::{ContentBlock, ConversationMessage, MessageEvent, Session, SessionEventLog};
-use crate::skill::{
-    memory_candidate_from_skill_activation, SkillActivationEngine, SkillActivationInput,
-    SkillActivationRecord, SkillMemoryPolicy,
-};
 use crate::tool_execution_plan::{ToolExecutionPlan, ToolExecutionPolicyValidationReport};
 use crate::tool_invocation::{
     now_ms, ToolFailureKind, ToolInvocationRecord, DEFAULT_OUTPUT_REF_MIN_LINES,
 };
-use crate::tool_ledger::{tool_event_idempotency_key, TurnToolLedger};
 use crate::usage::{ModelPerformanceRegistry, ModelRouteIntent, UsageTracker};
 use crate::wave::{TaskId, TaskResult, WaveError, WaveExecutor, WaveTask};
-use crate::{record_runtime_event, RuntimeEventInput, RuntimeEventRef, RuntimeEventScope};
+use crate::{RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore};
 use model_protocol::usage::TokenUsage;
 
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "COWD_AUTO_COMPACT_INPUT_TOKENS";
@@ -186,6 +179,42 @@ fn latest_user_prompt_text(messages: &[ConversationMessage]) -> String {
         .unwrap_or_default()
 }
 
+fn classify_model_step_intent(text: String, calls: Vec<ModelToolCall>) -> ModelStepIntent {
+    if calls.is_empty() {
+        return ModelStepIntent::FinalAnswer { text };
+    }
+    let normalized = calls
+        .iter()
+        .map(|call| call.name.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if normalized
+        .iter()
+        .any(|name| name.contains("approval") || name.contains("permission"))
+    {
+        ModelStepIntent::ApprovalRequired { calls }
+    } else if normalized
+        .iter()
+        .any(|name| name.contains("team") || name.contains("collaborat"))
+    {
+        ModelStepIntent::TeamProposal { calls }
+    } else if normalized
+        .iter()
+        .any(|name| name.contains("agent") || name.contains("subagent"))
+    {
+        ModelStepIntent::AgentProposal { calls }
+    } else if normalized.iter().any(|name| name.contains("replan")) {
+        ModelStepIntent::Replan {
+            reason: if text.is_empty() {
+                "model requested execution graph replanning".to_string()
+            } else {
+                text
+            },
+        }
+    } else {
+        ModelStepIntent::ToolCalls { calls }
+    }
+}
+
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiRequest {
@@ -255,17 +284,6 @@ fn preview_chars(value: &str, max_chars: usize) -> String {
     preview
 }
 
-fn add_token_usage(total: &mut TokenUsage, usage: TokenUsage) {
-    total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
-    total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
-    total.cache_creation_input_tokens = total
-        .cache_creation_input_tokens
-        .saturating_add(usage.cache_creation_input_tokens);
-    total.cache_read_input_tokens = total
-        .cache_read_input_tokens
-        .saturating_add(usage.cache_read_input_tokens);
-}
-
 fn millis_since(start: Instant) -> u64 {
     start.elapsed().as_millis() as u64
 }
@@ -275,12 +293,6 @@ fn rate_per_second(count: u64, duration_ms: u64) -> Option<f64> {
         return None;
     }
     Some(count as f64 / (duration_ms as f64 / 1_000.0))
-}
-
-fn active_rate_per_second(count: u64, active_duration_ms: Option<u64>) -> Option<f64> {
-    active_duration_ms
-        .filter(|duration| *duration >= 250)
-        .and_then(|duration| rate_per_second(count, duration))
 }
 
 fn tool_exposure_for_pattern(
@@ -525,6 +537,9 @@ impl std::error::Error for RuntimeError {}
 /// Summary of one completed runtime turn, including tool results and usage.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TurnSummary {
+    /// The terminal answer selected by the execution graph synthesizer.
+    /// Callers must not infer the result from the session transcript.
+    pub final_answer: String,
     pub assistant_messages: Vec<ConversationMessage>,
     pub tool_results: Vec<ConversationMessage>,
     pub prompt_cache_events: Vec<PromptCacheEvent>,
@@ -534,6 +549,43 @@ pub struct TurnSummary {
     pub auto_compaction: Option<AutoCompactionEvent>,
     pub ai_kernel_trace: RuntimeAiKernelTrace,
     pub context_turn_report: ContextTurnReport,
+}
+
+/// One provider decision. Model steps are deliberately side-effect free with
+/// respect to tools: they may request work, but only a ToolBatch executor may
+/// perform it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelStepIntent {
+    FinalAnswer { text: String },
+    ToolCalls { calls: Vec<ModelToolCall> },
+    AgentProposal { calls: Vec<ModelToolCall> },
+    TeamProposal { calls: Vec<ModelToolCall> },
+    ApprovalRequired { calls: Vec<ModelToolCall> },
+    Replan { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelToolCall {
+    pub id: String,
+    pub name: String,
+    pub input: String,
+    pub depends_on: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelStepResult {
+    pub intent: ModelStepIntent,
+    pub assistant_message: ConversationMessage,
+    pub usage: TokenUsage,
+    pub prompt_cache_events: Vec<PromptCacheEvent>,
+    pub model: Option<String>,
+    pub wall_duration_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolBatchStepResult {
+    pub messages: Vec<ConversationMessage>,
+    pub failed: usize,
 }
 
 /// Details about automatic session compaction applied during a turn.
@@ -722,8 +774,10 @@ pub struct ConversationRuntime<C, T> {
     memory_status: Option<String>,
     /// Optional tool callback for real-time visualization (P0-2).
     tool_callback: Option<Arc<dyn ToolCallback>>,
-    /// Optional managed SQLite session store for messages and runtime events.
+    /// Optional managed SQLite session store for messages and domain events.
     session_store: Option<Arc<memory::session_store::UnifiedSessionStore>>,
+    /// Durable execution lifecycle store. Session-domain events never use it.
+    runtime_event_store: Option<Arc<RuntimeEventStore>>,
     /// Optional event log for time-travel debugging and session rebuild.
     event_log: Option<std::sync::Mutex<SessionEventLog>>,
     /// Runtime-local searchable index for oversized tool outputs.
@@ -742,8 +796,6 @@ pub struct ConversationRuntime<C, T> {
     skill_profiles: Vec<SkillCapabilityProfile>,
     /// Agent-scoped Skill visibility and adapter policy.
     agent_skill_profile: AgentSkillProfile,
-    /// When true, inject available peer agents from AgentDirectory into the system prompt.
-    inject_peer_context: bool,
     /// P2-2: Current project phase (Discovery→Planning→Building→Reviewing→Shipping→Graduated).
     project_phase: String,
     /// Optional commit quality gate evaluator (PreFlight, Revision, Escalation, Abort).
@@ -963,6 +1015,7 @@ where
             memory_status,
             tool_callback: None,
             session_store: None,
+            runtime_event_store: None,
             event_log: None,
             tool_output_sandbox: memory::ToolOutputSandbox::new()
                 .map(|sandbox| Arc::new(std::sync::Mutex::new(sandbox)))
@@ -977,7 +1030,6 @@ where
             collaboration: None,
             skill_profiles: Vec::new(),
             agent_skill_profile: AgentSkillProfile::default(),
-            inject_peer_context: true,
             project_phase: "Discovery".to_string(),
             gate_evaluator: Some(Arc::new(
                 crate::gates::GateEvaluator::new().with_default_gates(),
@@ -1153,23 +1205,6 @@ where
         if let Ok(mut guard) = self.turn_tool_observations.lock() {
             guard.push(observation);
         }
-    }
-
-    fn push_runtime_context_observation(
-        &self,
-        tool_name: impl Into<String>,
-        invocation_id: impl Into<String>,
-        summary: impl Into<String>,
-    ) {
-        let tool_name = tool_name.into();
-        let invocation_id = invocation_id.into();
-        let evidence_id = format!("{}:{invocation_id}", self.session().session_id);
-        self.push_turn_tool_observation(ToolObservation::new(
-            tool_name,
-            invocation_id,
-            EvidenceRef::new("runtime", evidence_id),
-            summary,
-        ));
     }
 
     fn turn_tool_observations(&self) -> Vec<ToolObservation> {
@@ -1378,15 +1413,16 @@ where
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|duration| duration.as_millis() as u64)
                 .unwrap_or(0);
-            let event = memory::SessionEvent {
-                session_id: session_id.clone(),
-                event_type: "ContextTurnReport".to_string(),
-                event_json: payload.to_string(),
-                sequence: 0,
+            let event = memory::SessionDomainEvent::new(
+                session_id.clone(),
+                0,
+                memory::SessionDomainScope::Context,
+                "context.turn_report",
+                payload,
                 created_at_ms,
-            };
-            if let Err(error) = store.append_event_allocating_sequence(&event).await {
-                tracing::warn!(%error, session_id, "context turn report append failed");
+            );
+            if let Err(error) = store.append_session_domain_event(&event).await {
+                tracing::warn!(%error, session_id, "context turn report domain event append failed");
             }
         });
     }
@@ -1411,24 +1447,6 @@ where
     }
 
     fn remember_context_governance_report(&self, report: RuntimeContextGovernanceReport) {
-        let _ = record_runtime_event(RuntimeEventInput {
-            stream_id: format!("session:{}", report.session_id),
-            scope: RuntimeEventScope::Session,
-            kind: "context.governance_report".to_string(),
-            status: Some("recorded".to_string()),
-            actor: Some("conversation_runtime".to_string()),
-            refs: vec![
-                RuntimeEventRef {
-                    kind: "context_envelope".to_string(),
-                    id: report.envelope_id.clone(),
-                },
-                RuntimeEventRef {
-                    kind: "context_epoch".to_string(),
-                    id: report.context_epoch.clone(),
-                },
-            ],
-            payload: serde_json::json!(report),
-        });
         self.persist_context_governance_report(report);
     }
 
@@ -1437,6 +1455,8 @@ where
             return;
         };
         let session_id = report.session_id.clone();
+        let envelope_id = report.envelope_id.clone();
+        let context_epoch = report.context_epoch.clone();
         let payload = serde_json::json!({
             "type": "RuntimeContextGovernanceReport",
             "report": report,
@@ -1444,29 +1464,29 @@ where
         let store = Arc::clone(store);
         tokio::spawn(async move {
             let created_at_ms = now_ms();
-            let event = memory::SessionEvent {
-                session_id: session_id.clone(),
-                event_type: "RuntimeContextGovernanceReport".to_string(),
-                event_json: payload.to_string(),
-                sequence: 0,
-                created_at_ms,
-            };
-            if let Err(error) = store.append_event_allocating_sequence(&event).await {
-                tracing::warn!(%error, session_id, "context governance report append failed");
-            }
-            let runtime_event = memory::RuntimeEvent::new(
+            let mut event = memory::SessionDomainEvent::new(
                 session_id.clone(),
                 0,
-                memory::RuntimeEventScope::Context,
+                memory::SessionDomainScope::Context,
                 "context.governance_report",
                 payload,
                 created_at_ms,
             );
-            if let Err(error) = store
-                .append_runtime_event_allocating_sequence(&runtime_event)
-                .await
-            {
-                tracing::warn!(%error, session_id, "context governance runtime event append failed");
+            event.status = Some("recorded".to_string());
+            event.refs.extend([
+                memory::SessionDomainRef {
+                    ref_type: "context_envelope".to_string(),
+                    id: envelope_id,
+                    label: None,
+                },
+                memory::SessionDomainRef {
+                    ref_type: "context_epoch".to_string(),
+                    id: context_epoch,
+                    label: None,
+                },
+            ]);
+            if let Err(error) = store.append_session_domain_event(&event).await {
+                tracing::warn!(%error, session_id, "context governance domain event append failed");
             }
         });
     }
@@ -1506,24 +1526,35 @@ where
             batch.source_evidence.len(),
             batch.token_usage,
         );
-        let _ = record_runtime_event(RuntimeEventInput {
-            stream_id: format!("session:{}", envelope.identity.session_id),
-            scope: RuntimeEventScope::Session,
-            kind: "context.fact_candidate_review".to_string(),
-            status: Some("reviewable".to_string()),
-            actor: Some("conversation_runtime".to_string()),
-            refs: vec![RuntimeEventRef {
-                kind: "context_envelope".to_string(),
+        if let Some(store) = self.session_store.as_ref() {
+            let mut domain_event = memory::SessionDomainEvent::new(
+                envelope.identity.session_id.clone(),
+                0,
+                memory::SessionDomainScope::Context,
+                "context.fact_candidate_review",
+                serde_json::json!({
+                    "event": event,
+                    "batch_id": batch.batch_id.as_str(),
+                    "candidate_count": batch.candidates.len(),
+                    "candidates": batch.candidates,
+                    "promotion": "review_required",
+                }),
+                now_ms(),
+            );
+            domain_event.status = Some("reviewable".to_string());
+            domain_event.refs.push(memory::SessionDomainRef {
+                ref_type: "context_envelope".to_string(),
                 id: envelope.id.clone(),
-            }],
-            payload: serde_json::json!({
-                "event": event,
-                "batch_id": batch.batch_id.as_str(),
-                "candidate_count": batch.candidates.len(),
-                "candidates": batch.candidates,
-                "promotion": "review_required",
-            }),
-        });
+                label: None,
+            });
+            let store = Arc::clone(store);
+            let session_id = envelope.identity.session_id.clone();
+            tokio::spawn(async move {
+                if let Err(error) = store.append_session_domain_event(&domain_event).await {
+                    tracing::warn!(%error, session_id, "fact candidate domain event append failed");
+                }
+            });
+        }
         Some(RuntimeContextFactDecision {
             trigger: format!("{:?}", decision.trigger),
             mode: decision.mode.as_str().to_string(),
@@ -1684,26 +1715,6 @@ where
         prompt
     }
 
-    fn append_context_items_to_latest_envelope(&self, user_input: &str, items: Vec<ContextItem>) {
-        if items.is_empty() {
-            return;
-        }
-        let mut dynamic_items = self
-            .last_context_envelope()
-            .map(|envelope| envelope.selected)
-            .unwrap_or_default();
-        dynamic_items.extend(items);
-        let envelope =
-            self.build_context_envelope(user_input, dynamic_items, Vec::new(), Vec::new());
-        self.remember_context_envelope(envelope);
-    }
-
-    fn remember_collaboration_result(&self, result: CollaborationContextResult) {
-        if let Ok(mut guard) = self.last_collaboration_result.lock() {
-            *guard = Some(result);
-        }
-    }
-
     fn clear_collaboration_result(&self) {
         if let Ok(mut guard) = self.last_collaboration_result.lock() {
             *guard = None;
@@ -1788,6 +1799,13 @@ where
         store: Arc<memory::session_store::UnifiedSessionStore>,
     ) -> Self {
         self.session_store = Some(store);
+        self
+    }
+
+    /// Attach the durable store that owns tool, graph, agent, and task execution state.
+    #[must_use]
+    pub fn with_runtime_event_store(mut self, store: Arc<RuntimeEventStore>) -> Self {
+        self.runtime_event_store = Some(store);
         self
     }
 
@@ -2025,7 +2043,7 @@ where
     /// Create a sub-agent runtime with independent LLM reasoning capabilities.
     pub fn create_subagent_runtime(&self, config: &SubAgentConfig) -> SubAgentRuntime<C, T>
     where
-        C: Clone,
+        C: Clone + Send + Sync + 'static,
     {
         let mut config = config.clone();
         if config.context_lease().is_none()
@@ -2082,106 +2100,6 @@ where
     }
 
     /// Determine whether the current user message warrants multi-agent collaboration.
-    fn should_use_collaboration(
-        &self,
-        decision: &crate::execution_core::RuntimeExecutionDecision,
-    ) -> bool {
-        if !self.runtime_control_policy.enabled || !self.runtime_control_policy.agent.enabled {
-            return false;
-        }
-        decision.executable
-            && decision.pattern() == harness_contract::core::ExecutionPattern::Collaborate
-            && (!self.runtime_control_policy.agent.require_positive_lift
-                || decision.collaboration_lift().accepted)
-    }
-
-    /// Infer required capability keywords from a task description.
-    fn infer_required_capabilities(user_message: &str) -> Vec<String> {
-        let lower = user_message.to_lowercase();
-        let keyword_map: &[(&str, &[&str])] = &[
-            ("rust", &["rust", "cargo", "borrow checker", "lifetime"]),
-            (
-                "testing",
-                &["test", "assert", "mock", "coverage", "fixture"],
-            ),
-            (
-                "refactoring",
-                &["refactor", "extract", "rename", "restructure", "clean"],
-            ),
-            (
-                "review",
-                &["review", "audit", "inspect", "examine", "check"],
-            ),
-            (
-                "documentation",
-                &["document", "doc", "readme", "explain", "describe"],
-            ),
-            (
-                "planning",
-                &["plan", "design", "architect", "spec", "outline"],
-            ),
-            (
-                "execution",
-                &["execute", "run", "build", "compile", "deploy"],
-            ),
-            ("debugging", &["debug", "fix", "bug", "error", "crash"]),
-            (
-                "security",
-                &["security", "vuln", "exploit", "injection", "xss"],
-            ),
-            (
-                "performance",
-                &["perf", "benchmark", "optimize", "slow", "latency"],
-            ),
-        ];
-        let mut skills = Vec::new();
-        for (skill, keywords) in keyword_map {
-            for kw in *keywords {
-                if lower.contains(kw) {
-                    skills.push(skill.to_string());
-                    break;
-                }
-            }
-        }
-        if skills.is_empty() {
-            skills.push("general".to_string());
-        }
-        skills
-    }
-
-    /// Create a cross-session handoff packet from the current memory state.
-    ///
-    /// Returns `None` if the memory subsystem is disabled.
-    pub async fn create_memory_handoff(&self) -> Option<memory::types::HandoffData> {
-        let mgr = self.memory_manager.as_ref()?;
-        match mgr.create_handoff().await {
-            Ok(data) => Some(data),
-            Err(err) => {
-                tracing::warn!(%err, "memory: failed to create handoff packet");
-                None
-            }
-        }
-    }
-
-    /// Restore memory state from a previously created handoff packet.
-    pub fn restore_memory_handoff(&self, data: memory::types::HandoffData) {
-        let Some(mgr) = self.memory_manager.as_ref() else {
-            return;
-        };
-        let mgr = Arc::clone(mgr);
-        match tokio::runtime::Handle::try_current() {
-            Ok(_handle) => {
-                tokio::spawn(async move {
-                    if let Err(err) = mgr.restore_handoff(data).await {
-                        tracing::warn!(%err, "memory: failed to restore handoff");
-                    }
-                });
-            }
-            Err(_) => {
-                tracing::warn!("memory: no tokio runtime, cannot restore handoff");
-            }
-        }
-    }
 
     fn record_context_event(
         &mut self,
@@ -2295,41 +2213,38 @@ where
 
     /// Run a session health probe to verify the runtime is functional after compaction.
     /// Returns Ok(()) if healthy, Err if the session appears broken.
-    fn run_session_health_probe(&mut self) -> Result<(), String> {
-        // Check if we have basic session integrity
-        if self.session.blocking_read().messages.is_empty()
-            && self.session.blocking_read().compaction.is_some()
-        {
-            // Freshly compacted with no messages - this is normal
-            return Ok(());
-        }
-
-        // Verify tool executor is responsive with a non-destructive probe
-        // Using glob_search with a pattern that won't match anything
-        let probe_input = r#"{"pattern": "*.health-check-probe-"}"#;
-        match self.tool_executor.execute("glob_search", probe_input) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(format!("Tool executor probe failed: {e}")),
-        }
-    }
-
-    #[allow(clippy::too_many_lines)]
-    pub async fn run_turn_async(
+    /// Execute exactly one provider request and translate its response into a
+    /// typed graph intent. This method never invokes ToolExecutor.
+    pub(crate) async fn execute_model_step(
         &mut self,
-        user_input: impl Into<String>,
-        prompter: &crate::permissions::SharedPrompter,
-    ) -> Result<TurnSummary, RuntimeError> {
-        let turn_started_at = Instant::now();
-        let mut first_token_latency_ms: Option<u64> = None;
-        let mut first_stream_token_at: Option<Instant> = None;
-        let mut last_stream_token_at: Option<Instant> = None;
-        let mut output_chars: u64 = 0;
-        let mut output_chunks: u64 = 0;
-        let mut provider_usage_total = TokenUsage::default();
-        let mut provider_usage_seen = false;
-        let mut models_used: Vec<String> = Vec::new();
-        let user_input = user_input.into();
-        let strategy_input = self.strategy_input_for_turn(&user_input);
+        user_input: &str,
+        first_step: bool,
+    ) -> Result<ModelStepResult, RuntimeError> {
+        let started_at = Instant::now();
+        if first_step {
+            self.clear_collaboration_result();
+            self.clear_turn_tool_observations();
+            let budget = self.runtime_budget_plan();
+            if let Ok(mut ledger) = self.turn_context_ledger.lock() {
+                ledger.reset(
+                    budget.effective_context_budget,
+                    budget.tool_result_budget.max_total_tokens as u64,
+                );
+            }
+            self.record_turn_started(user_input);
+            self.record_context_event("user_input", "user", &preview_chars(user_input, 200), 8);
+            self.session
+                .write()
+                .await
+                .push_user_text(user_input.to_string())
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            self.dual_write_message(
+                &ConversationMessage::user_text(user_input.to_string()),
+                self.session().messages.len().wrapping_sub(1),
+            );
+        }
+
+        let strategy_input = self.strategy_input_for_turn(user_input);
         let resource_health = crate::execution_core::StrategyResourceHealth {
             provider_available: self.api_client.provider_available(),
             tools_available: self.tool_executor.has_registered_tools(),
@@ -2341,1296 +2256,433 @@ where
                 && self.tool_executor.mission_runtime_available(),
             observed: true,
         };
-        let execution_decision = crate::execution_core::StrategyDecisionEngine.decide_with_input(
+        let decision = crate::execution_core::StrategyDecisionEngine.decide_with_input(
             strategy_input,
             Some(self.context_profile()),
             resource_health,
         );
-        if !execution_decision.executable {
+        if !decision.executable {
             return Err(RuntimeError::new(format!(
                 "runtime strategy is not executable: {}",
-                execution_decision.blocked_reasons.join("; ")
+                decision.blocked_reasons.join("; ")
             )));
         }
-        let turn_budget_plan = self.runtime_budget_plan();
-        if let Ok(mut ledger) = self.turn_context_ledger.lock() {
-            ledger.reset(
-                turn_budget_plan.effective_context_budget,
-                turn_budget_plan.tool_result_budget.max_total_tokens as u64,
-            );
-        }
-        let runtime_turn_id = self
-            .session_input_stream
-            .active_turn_id()
-            .unwrap_or_else(TurnId::new);
-        let _active_turn_lease = self
-            .session_input_stream
-            .begin_turn(runtime_turn_id.clone());
-        let promoted_queued = self
-            .session_input_stream
-            .promote_queued_next(&runtime_turn_id, 32);
-        if !promoted_queued.is_empty() {
-            self.emit_session_input_projection(None);
-        }
-        tracing::info!(session_id = %self.session().session_id, "turn started");
-        self.clear_collaboration_result();
-        self.clear_turn_tool_observations();
-        let _ = self.take_turn_knowledge_report();
-        let mut runtime_harness = RuntimeAiKernel::begin_turn_with_execution_decision(
-            self.session().session_id.clone(),
-            user_input.clone(),
-            self.context_profile(),
-            &self.system_prompt,
-            execution_decision.clone(),
-        );
-        self.tool_executor
-            .bind_execution_decision(execution_decision.clone());
 
-        if self.session.read().await.compaction.is_some() {
-            if let Err(error) = self.run_session_health_probe() {
-                return Err(RuntimeError::new(format!(
-                    "Session health probe failed: {error}"
-                )));
-            }
-        }
-
-        self.record_turn_started(&user_input);
-        self.record_context_event("user_input", "user", &preview_chars(&user_input, 200), 8);
-        self.session
-            .write()
-            .await
-            .push_user_text(user_input.clone())
-            .map_err(|error| RuntimeError::new(error.to_string()))?;
-        let user_sequence = self.session().messages.len().wrapping_sub(1);
-        self.dual_write_message(
-            &ConversationMessage::user_text(user_input.clone()),
-            user_sequence,
+        let mut system_prompt = self.prepare_reality_context(user_input).await;
+        let evidence = crate::evidence_planner::plan_evidence_with_understanding(
+            user_input,
+            &decision.strategy.understanding,
         );
-        let evidence_plan = crate::evidence_planner::plan_evidence_with_understanding(
-            &user_input,
-            &execution_decision.strategy.understanding,
-        );
-        let evidence_plan_guidance = crate::evidence_planner::evidence_plan_prompt(&evidence_plan);
-        let provider_inventory = self.api_client.context_inventory();
-        let initial_tool_exposure = tool_exposure_for_pattern(
-            execution_decision.pattern(),
-            self.tool_executor.available_tool_names(),
-            provider_inventory.tool_schema_tokens,
-        );
-        self.api_client.configure_tool_exposure(
-            initial_tool_exposure.projection(provider_inventory.tool_schema_tokens),
-        );
-        if let Ok(mut guard) = self.tool_exposure_state.lock() {
-            *guard = Some(initial_tool_exposure);
-        }
-        self.record_runtime_policy_decision(&execution_decision, user_sequence);
-        let execution_decision_guidance =
-            crate::execution_core::runtime_execution_guidance_prompt(&execution_decision);
+        system_prompt.push(crate::evidence_planner::evidence_plan_prompt(&evidence));
+        system_prompt.push(crate::execution_core::runtime_execution_guidance_prompt(
+            &decision,
+        ));
+        self.record_runtime_policy_decision(&decision, self.session().messages.len());
         self.record_context_event(
             "evidence_plan",
             "runtime",
-            &format!("{:?}: {}", evidence_plan.mode, evidence_plan.reason),
+            &format!("{:?}: {}", evidence.mode, evidence.reason),
             7,
-        );
-        self.push_runtime_context_observation(
-            "runtime.evidence_plan",
-            format!("evidence-plan-{user_sequence}"),
-            format!("{:?}: {}", evidence_plan.mode, evidence_plan.reason),
         );
         self.record_context_event(
             "execution_decision",
             "runtime",
             &format!(
                 "{}: {:?}",
-                execution_decision.pattern().as_str(),
-                execution_decision.recommended_actions
+                decision.pattern().as_str(),
+                decision.recommended_actions
             ),
             8,
         );
-        self.push_runtime_context_observation(
-            "runtime.execution_decision",
-            format!("execution-decision-{user_sequence}"),
-            execution_decision_guidance.clone(),
-        );
-
-        let mut effective_system_prompt = self.prepare_reality_context(&user_input).await;
-        effective_system_prompt.push(evidence_plan_guidance.clone());
-        effective_system_prompt.push(execution_decision_guidance);
-        self.consume_runtime_inputs_at_checkpoint(
-            &runtime_turn_id,
-            TurnInputCheckpoint::TurnStart,
-            &mut effective_system_prompt,
-        );
-        if knowledge_hard_gate_active(&effective_system_prompt) {
-            let error = RuntimeError::new("knowledge compliance hard gate blocked turn");
-            self.record_turn_failed(0, &error);
-            return Err(error);
-        }
-
-        // A2: Inject available peer agents from AgentDirectory into the system prompt.
-        if self.inject_peer_context {
-            let active_agents = memory::agent_directory::AgentDirectory::global().list_active();
-            let peers: Vec<String> = active_agents
-                .iter()
-                .filter(|a| a.agent_id != self.session().session_id)
-                .map(|a| {
-                    format!(
-                        "  - {} (role: {}, capabilities: {:?})",
-                        &a.agent_id[..std::cmp::min(8, a.agent_id.len())],
-                        a.role,
-                        a.capabilities
-                    )
-                })
-                .collect();
-            if !peers.is_empty() {
-                effective_system_prompt.push(format!(
-                    "\n## Available Peer Agents\n{}\n",
-                    peers.join("\n")
-                ));
-            }
-        }
-
-        let mut assistant_messages = Vec::new();
-        let mut tool_results = Vec::new();
-        let mut prompt_cache_events = Vec::new();
-        let mut iterations = 0;
-        let mut adaptive_controller = crate::self_regulation::AdaptiveController::new();
-        let mut self_regulation_final_answer_deadline: Option<usize> = None;
-        let explicit_tool_round_budget =
-            crate::turn_supervisor::explicit_tool_round_budget(&user_input);
-        let mut accepted_tool_rounds = 0usize;
-
-        if let Some(ref cowd) = self.cowd_bus {
-            cowd.emit(crate::cowd_event::CowdEvent::TurnStarted);
-        }
-
-        loop {
-            iterations += 1;
-            if iterations > self.max_iterations {
-                let reason = "max iterations exceeded";
-                tracing::warn!(
-                    iterations,
-                    "runtime self-regulation returned partial answer"
-                );
-                let partial_text = adaptive_controller.partial_answer_text(reason);
-                let partial_msg = ConversationMessage::assistant(vec![ContentBlock::Text {
-                    text: partial_text.clone(),
-                }]);
-                self.session
-                    .write()
-                    .await
-                    .push_message(partial_msg.clone())
-                    .map_err(|error| RuntimeError::new(error.to_string()))?;
-                self.dual_write_message(
-                    &partial_msg,
-                    self.session().messages.len().wrapping_sub(1),
-                );
-                if let Some(ref cowd) = self.cowd_bus {
-                    cowd.emit(crate::cowd_event::CowdEvent::Warning {
-                        message: format!(
-                            "tool governance returned partial answer: {}; {}",
-                            reason,
-                            adaptive_controller.tool_ledger().compact_summary()
-                        ),
-                    });
-                }
-                assistant_messages.push(partial_msg);
-                break;
-            }
-
-            if self.auto_compaction_input_tokens_threshold > 0
-                && estimate_session_tokens(&*self.session.read().await)
-                    > self.auto_compaction_input_tokens_threshold as usize
-            {
-                if self
-                    .compact_session_with_checkpoint(self.compaction_config_for_session(
-                        CompactionConfig::default().max_estimated_tokens,
-                    ))
-                    .await
-                    .is_some()
-                {
-                    effective_system_prompt = self.prepare_reality_context(&user_input).await;
-                    effective_system_prompt.push(evidence_plan_guidance.clone());
-                    if knowledge_hard_gate_active(&effective_system_prompt) {
-                        let error =
-                            RuntimeError::new("knowledge compliance hard gate blocked turn");
-                        self.record_turn_failed(iterations, &error);
-                        return Err(error);
-                    }
-                }
-            }
-            if self.model_context_window > 0 {
-                let used = estimate_session_tokens(&*self.session.read().await);
-                let context_decision = adaptive_controller
-                    .observe_context_pressure(used, self.model_context_window as usize);
-                if context_decision.should_inject() {
-                    if let Some(prompt) = context_decision.prompt() {
-                        effective_system_prompt
-                            .push(format!("\n## Runtime self-regulation guidance\n{prompt}"));
-                    }
-                    self.record_context_event(
-                        "self_regulation",
-                        "runtime",
-                        context_decision
-                            .reason()
-                            .unwrap_or(context_decision.kind_str()),
-                        8,
-                    );
-                    self.record_self_regulation_signal(
-                        &context_decision,
-                        vec![format!(
-                            "session:{}:context_pressure:{}:{}",
-                            self.session().session_id,
-                            used,
-                            self.model_context_window
-                        )],
-                    );
-                }
-                if used as f64 / self.model_context_window as f64 > 0.85 {
-                    tracing::warn!(used, "context window pressure critical");
-                }
-            }
-
+        if let Some(turn_id) = self.session_input_stream.active_turn_id() {
             self.consume_runtime_inputs_at_checkpoint(
-                &runtime_turn_id,
+                &turn_id,
                 TurnInputCheckpoint::BeforeProviderRequest,
-                &mut effective_system_prompt,
+                &mut system_prompt,
             );
-            let request = ApiRequest {
-                system_prompt: effective_system_prompt.clone(),
-                messages: self.session.read().await.messages.clone(),
-                model: String::new(), // filled by fallback loop below
-            };
+        }
+        if knowledge_hard_gate_active(&system_prompt) {
+            return Err(RuntimeError::new(
+                "knowledge compliance hard gate blocked turn",
+            ));
+        }
 
-            let model_list = self.model_candidates_for_turn(&user_input);
+        let inventory = self.api_client.context_inventory();
+        let exposure = tool_exposure_for_pattern(
+            decision.pattern(),
+            self.tool_executor.available_tool_names(),
+            inventory.tool_schema_tokens,
+        );
+        self.api_client
+            .configure_tool_exposure(exposure.projection(inventory.tool_schema_tokens));
 
-            // Use the new Stream-based API — consume events as they arrive
+        let request = ApiRequest {
+            system_prompt,
+            messages: self.session.read().await.messages.clone(),
+            model: String::new(),
+        };
+        let mut last_error = None;
+        for model in self.model_candidates_for_turn(user_input) {
+            let mut request = request.clone();
+            request.model.clone_from(&model);
+            self.record_provider_context_request(&request, self.session().messages.len());
+            let idle_timeout = stream_idle_timeout_for_messages(&request.messages);
+            let mut stream = self.api_client.stream(request);
+            let mut text = String::new();
+            let mut thinking = String::new();
+            let mut signature = None;
+            let mut calls = Vec::new();
+            let mut usage = TokenUsage::default();
+            let mut cache_events = Vec::new();
+            let mut failed = None;
             use futures::StreamExt;
-            let mut current_text = String::new();
-            let mut thinking_text = String::new();
-            let mut thinking_signature: Option<String> = None;
-            let mut pending_tool_uses: Vec<(String, String, String)> = Vec::new();
-            let mut turn_usage: Option<TokenUsage> = None;
-            let mut stream_events: Vec<(String, String, String, u8)> = Vec::new();
-
-            let mut stream_error: Option<RuntimeError> = None;
-            let stream_success = 'retry: {
-                for (model_idx, model) in model_list.iter().enumerate() {
-                    let max_retries: u32 = 8;
-                    for attempt in 0..max_retries {
-                        let mut req = request.clone();
-                        req.model = model.to_string();
-                        if let Some(exposure) = self.current_tool_exposure_projection() {
-                            self.api_client.configure_tool_exposure(exposure);
+            loop {
+                let event = match tokio::time::timeout(idle_timeout, stream.next()).await {
+                    Ok(Some(event)) => event,
+                    Ok(None) => break,
+                    Err(_) => {
+                        failed = Some(RuntimeError::new(format!(
+                            "stream idle timed out after {}s",
+                            idle_timeout.as_secs()
+                        )));
+                        break;
+                    }
+                };
+                match event {
+                    Ok(AssistantEvent::TextDelta(delta)) => {
+                        text.push_str(&delta);
+                        if let Some(ref cowd) = self.cowd_bus {
+                            cowd.emit(crate::cowd_event::CowdEvent::TextDelta {
+                                text: delta.clone(),
+                            });
                         }
-                        self.record_provider_context_request(&req, iterations);
-
-                        let stream_idle_timeout = stream_idle_timeout_for_messages(&req.messages);
-                        let mut stream = self.api_client.stream(req);
-                        let mut model_current_text = String::new();
-                        let mut model_thinking_text = String::new();
-                        let mut model_thinking_signature: Option<String> = None;
-                        let mut model_pending_tool_uses: Vec<(String, String, String)> = Vec::new();
-                        let mut model_turn_usage: Option<TokenUsage> = None;
-                        let mut model_stream_events: Vec<(String, String, String, u8)> = Vec::new();
-
-                        let mut failed = false;
-                        loop {
-                            // T35: Check cancellation before each stream poll.
-                            if self.cancellation_token.is_cancelled() {
-                                return Err(RuntimeError::new("conversation cancelled"));
-                            }
-                            let next_event = match tokio::time::timeout(
-                                stream_idle_timeout,
-                                stream.next(),
-                            )
-                            .await
-                            {
-                                Ok(Some(event)) => event,
-                                Ok(None) => break,
-                                Err(_) => {
-                                    return Err(RuntimeError::new(format!(
-                                        "stream idle timed out after {}s",
-                                        stream_idle_timeout.as_secs()
-                                    )));
-                                }
-                            };
-                            match next_event {
-                                Ok(AssistantEvent::TextDelta(text)) => {
-                                    let now = Instant::now();
-                                    if !text.is_empty() {
-                                        if first_token_latency_ms.is_none() {
-                                            first_token_latency_ms =
-                                                Some(millis_since(turn_started_at));
-                                            first_stream_token_at = Some(now);
-                                        }
-                                        last_stream_token_at = Some(now);
-                                        output_chars = output_chars
-                                            .saturating_add(text.chars().count() as u64);
-                                        output_chunks = output_chunks.saturating_add(1);
-                                    }
-                                    model_current_text.push_str(&text);
-                                    if let Some(ref cowd) = self.cowd_bus {
-                                        cowd.emit(crate::cowd_event::CowdEvent::TextDelta {
-                                            text: text.clone(),
-                                        });
-                                    }
-                                    model_stream_events.push((
-                                        "text_delta".into(),
-                                        "assistant".into(),
-                                        preview_chars(&text, 80),
-                                        3,
-                                    ));
-                                    if let Some(ref cb) = self.sse_callback {
-                                        let json = serde_json::json!({
-                                            "type": "TextDelta",
-                                            "content": &text,
-                                        });
-                                        cb(json.to_string());
-                                    }
-                                }
-                                Ok(AssistantEvent::ThinkingDelta(thinking)) => {
-                                    model_thinking_text.push_str(&thinking);
-                                    model_stream_events.push((
-                                        "thinking".into(),
-                                        "reasoning".into(),
-                                        preview_chars(&thinking, 80),
-                                        2,
-                                    ));
-                                    if let Some(ref cb) = self.sse_callback {
-                                        let json = serde_json::json!({
-                                            "type": "ThinkingDelta",
-                                            "content": &thinking,
-                                        });
-                                        cb(json.to_string());
-                                    }
-                                    if let Some(ref cowd) = self.cowd_bus {
-                                        cowd.emit(crate::cowd_event::CowdEvent::ThinkingDelta {
-                                            thinking: thinking.clone(),
-                                        });
-                                    }
-                                }
-                                Ok(AssistantEvent::SignatureDelta(signature)) => {
-                                    model_thinking_signature = Some(signature);
-                                }
-                                Ok(AssistantEvent::ToolUse { id, name, input }) => {
-                                    model_pending_tool_uses.push((id, name, input));
-                                }
-                                Ok(AssistantEvent::Usage(usage)) => {
-                                    provider_usage_seen = true;
-                                    add_token_usage(&mut provider_usage_total, usage);
-                                    if let Some(ref cowd) = self.cowd_bus {
-                                        cowd.emit(crate::cowd_event::CowdEvent::TokenUsage {
-                                            input: u64::from(usage.input_tokens),
-                                            output: u64::from(usage.output_tokens),
-                                            cache_create: u64::from(
-                                                usage.cache_creation_input_tokens,
-                                            ),
-                                            cache_read: u64::from(usage.cache_read_input_tokens),
-                                        });
-                                    }
-                                    model_turn_usage = Some(usage);
-                                }
-                                Ok(AssistantEvent::MessageStop) => break,
-                                Ok(AssistantEvent::ToolStart { id, name, preview }) => {
-                                    if let Some(callback) = &self.tool_callback {
-                                        callback.on_tool_start(&id, &name, &preview);
-                                    }
-                                    if let Some(ref cb) = self.sse_callback {
-                                        let json = serde_json::json!({
-                                            "type": "ToolStart",
-                                            "id": &id,
-                                            "name": &name,
-                                            "preview": &preview,
-                                        });
-                                        cb(json.to_string());
-                                    }
-                                    if let Some(ref cowd) = self.cowd_bus {
-                                        cowd.emit(crate::cowd_event::CowdEvent::ToolStart {
-                                            id: id.clone(),
-                                            name: name.clone(),
-                                            preview: preview.clone(),
-                                        });
-                                    }
-                                }
-                                Ok(AssistantEvent::ToolProgress { id, name, progress }) => {
-                                    if let Some(callback) = &self.tool_callback {
-                                        callback.on_tool_progress(&id, &name, &progress);
-                                    }
-                                    if let Some(ref cb) = self.sse_callback {
-                                        let json = serde_json::json!({
-                                            "type": "ToolProgress",
-                                            "id": &id,
-                                            "name": &name,
-                                            "progress": &progress,
-                                        });
-                                        cb(json.to_string());
-                                    }
-                                    if let Some(ref cowd) = self.cowd_bus {
-                                        cowd.emit(crate::cowd_event::CowdEvent::ToolProgress {
-                                            id: id.clone(),
-                                            name: name.clone(),
-                                            progress: progress.clone(),
-                                        });
-                                    }
-                                }
-                                Ok(AssistantEvent::PromptCache(event)) => {
-                                    prompt_cache_events.push(event);
-                                }
-                                Ok(AssistantEvent::ToolComplete {
-                                    id,
-                                    name,
-                                    result_summary,
-                                    exit_code,
-                                }) => {
-                                    if let Some(callback) = &self.tool_callback {
-                                        callback.on_tool_complete(
-                                            &id,
-                                            &name,
-                                            &result_summary,
-                                            exit_code,
-                                        );
-                                    }
-                                    if let Some(ref cb) = self.sse_callback {
-                                        let json = serde_json::json!({
-                                            "type": "ToolComplete",
-                                            "id": &id,
-                                            "name": &name,
-                                            "summary": &result_summary,
-                                            "exit_code": exit_code,
-                                        });
-                                        cb(json.to_string());
-                                    }
-                                    if let Some(ref cowd) = self.cowd_bus {
-                                        cowd.emit(crate::cowd_event::CowdEvent::ToolComplete {
-                                            id: id.clone(),
-                                            name: name.clone(),
-                                            summary: result_summary.clone(),
-                                            exit_code,
-                                        });
-                                    }
-                                }
-                                Err(e) => {
-                                    let err_str = e.to_string();
-                                    if is_retryable_error(&err_str) {
-                                        tracing::warn!(model, attempt, model_idx, error = %err_str, "retryable stream error");
-                                        // T30: Exponential backoff before retry.
-                                        tokio::time::sleep(Duration::from_millis(
-                                            500 * 2u64.pow(attempt),
-                                        ))
-                                        .await;
-                                        if attempt == max_retries - 1 {
-                                            tracing::warn!(
-                                                model,
-                                                "exhausted retries, switching fallback"
-                                            );
-                                        }
-                                        failed = true;
-                                        stream_error = Some(e);
-                                        break;
-                                    }
-                                    return Err(e);
-                                }
-                            }
-                        }
-                        if !failed {
-                            current_text = model_current_text;
-                            thinking_text = model_thinking_text;
-                            thinking_signature = model_thinking_signature;
-                            pending_tool_uses = model_pending_tool_uses;
-                            turn_usage = model_turn_usage;
-                            stream_events = model_stream_events;
-                            if !model.is_empty() && !models_used.iter().any(|known| known == model)
-                            {
-                                models_used.push(model.to_string());
-                            }
-                            if model_idx > 0 {
-                                tracing::warn!(
-                                    model,
-                                    fallback_model_idx = model_idx,
-                                    "provider fallback succeeded"
-                                );
-                            }
-                            break 'retry true;
+                        if let Some(ref callback) = self.sse_callback {
+                            callback(
+                                serde_json::json!({"type":"TextDelta","content":delta}).to_string(),
+                            );
                         }
                     }
+                    Ok(AssistantEvent::ThinkingDelta(delta)) => {
+                        thinking.push_str(&delta);
+                        if let Some(ref cowd) = self.cowd_bus {
+                            cowd.emit(crate::cowd_event::CowdEvent::ThinkingDelta {
+                                thinking: delta.clone(),
+                            });
+                        }
+                        if let Some(ref callback) = self.sse_callback {
+                            callback(
+                                serde_json::json!({"type":"ThinkingDelta","content":delta})
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    Ok(AssistantEvent::SignatureDelta(value)) => signature = Some(value),
+                    Ok(AssistantEvent::ToolUse { id, name, input }) => calls.push(ModelToolCall {
+                        id,
+                        name,
+                        input,
+                        depends_on: Vec::new(),
+                    }),
+                    Ok(AssistantEvent::Usage(value)) => {
+                        usage = value;
+                    }
+                    Ok(AssistantEvent::PromptCache(value)) => cache_events.push(value),
+                    Ok(AssistantEvent::MessageStop) => break,
+                    Ok(
+                        AssistantEvent::ToolStart { .. }
+                        | AssistantEvent::ToolProgress { .. }
+                        | AssistantEvent::ToolComplete { .. },
+                    ) => {}
+                    Err(error) => {
+                        failed = Some(error);
+                        break;
+                    }
                 }
-                false
-            };
-
-            if !stream_success {
-                return Err(stream_error
-                    .unwrap_or_else(|| RuntimeError::new("all provider fallbacks exhausted")));
+            }
+            drop(stream);
+            if let Some(error) = failed {
+                last_error = Some(error);
+                continue;
             }
 
-            // Flush buffered stream events into context profiler
-            for (event_type, category, summary, priority) in stream_events {
-                self.record_context_event(&event_type, &category, &summary, priority);
-            }
-
-            if let Some(usage) = turn_usage {
-                self.reconcile_provider_context_usage(usage);
-                self.usage_tracker.record(usage);
-                if let Some(cb) = &self.tool_callback {
-                    cb.on_usage(&usage);
-                }
-            }
-
-            if !pending_tool_uses.is_empty()
-                && explicit_tool_round_budget
-                    .is_some_and(|max_rounds| max_rounds > 0 && accepted_tool_rounds >= max_rounds)
-            {
-                let max_rounds = explicit_tool_round_budget.unwrap_or_default();
-                let reason =
-                    format!("user-requested tool round budget exhausted max_rounds={max_rounds}");
-                tracing::warn!(
-                    iterations,
-                    accepted_tool_rounds,
-                    tool_count = pending_tool_uses.len(),
-                    "runtime self-regulation blocked new tool batch after explicit user budget"
-                );
-                let partial_text = adaptive_controller.partial_answer_text(&reason);
-                let partial_msg = ConversationMessage::assistant(vec![ContentBlock::Text {
-                    text: partial_text.clone(),
-                }]);
-                self.session
-                    .write()
-                    .await
-                    .push_message(partial_msg.clone())
-                    .map_err(|error| RuntimeError::new(error.to_string()))?;
-                self.dual_write_message(
-                    &partial_msg,
-                    self.session().messages.len().wrapping_sub(1),
-                );
-                if let Some(ref cowd) = self.cowd_bus {
-                    cowd.emit(crate::cowd_event::CowdEvent::Warning {
-                        message: format!(
-                            "tool governance blocked explicit-budget tool batch: {}; {}",
-                            reason,
-                            adaptive_controller.tool_ledger().compact_summary()
-                        ),
-                    });
-                }
-                assistant_messages.push(partial_msg);
-                break;
-            }
-
-            if !pending_tool_uses.is_empty()
-                && self_regulation_final_answer_deadline
-                    .is_some_and(|deadline| iterations >= deadline)
-            {
-                let reason =
-                    "runtime self-regulation blocked a new tool batch after fallback guidance was ignored";
-                tracing::warn!(
-                    iterations,
-                    tool_count = pending_tool_uses.len(),
-                    "runtime self-regulation blocked new tool batch"
-                );
-                let partial_text = adaptive_controller.partial_answer_text(reason);
-                let partial_msg = ConversationMessage::assistant(vec![ContentBlock::Text {
-                    text: partial_text.clone(),
-                }]);
-                self.session
-                    .write()
-                    .await
-                    .push_message(partial_msg.clone())
-                    .map_err(|error| RuntimeError::new(error.to_string()))?;
-                self.dual_write_message(
-                    &partial_msg,
-                    self.session().messages.len().wrapping_sub(1),
-                );
-                if let Some(ref cowd) = self.cowd_bus {
-                    cowd.emit(crate::cowd_event::CowdEvent::Warning {
-                        message: format!(
-                            "tool governance blocked new tool batch: {}; {}",
-                            reason,
-                            adaptive_controller.tool_ledger().compact_summary()
-                        ),
-                    });
-                }
-                assistant_messages.push(partial_msg);
-                break;
-            }
-
-            // Build assistant message with text + tool_use blocks
             let mut blocks = Vec::new();
-            if !thinking_text.is_empty() {
+            if !thinking.is_empty() {
                 blocks.push(ContentBlock::Thinking {
-                    thinking: thinking_text.clone(),
-                    signature: thinking_signature.clone(),
+                    thinking,
+                    signature,
                 });
-                tracing::debug!(
-                    thinking_len = thinking_text.len(),
-                    has_signature = thinking_signature.is_some(),
-                    "thinking block stored"
-                );
             }
-            blocks.push(ContentBlock::Text { text: current_text });
-            for (id, name, input) in &pending_tool_uses {
-                self.record_context_component(
-                    crate::context_ledger::ContextComponentKind::ToolInput,
-                    crate::context_ledger::estimate_text_tokens(input),
-                    Some(format!("tool-input:{id}:{name}")),
-                    iterations,
-                );
+            blocks.push(ContentBlock::Text { text: text.clone() });
+            for call in &calls {
                 blocks.push(ContentBlock::ToolUse {
-                    id: id.clone(),
-                    name: name.clone(),
-                    input: input.clone(),
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    input: call.input.clone(),
                 });
             }
-            let role = crate::session::MessageRole::Assistant;
-            let assistant_msg = ConversationMessage {
-                role,
+            let assistant_message = ConversationMessage {
+                role: crate::session::MessageRole::Assistant,
                 blocks,
-                usage: turn_usage,
+                usage: Some(usage),
             };
             self.session
                 .write()
                 .await
-                .push_message(assistant_msg.clone())
+                .push_message(assistant_message.clone())
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
             self.dual_write_message(
-                &assistant_msg,
+                &assistant_message,
                 self.session().messages.len().wrapping_sub(1),
             );
-            self.record_assistant_iteration(iterations, &assistant_msg, pending_tool_uses.len());
-            assistant_messages.push(assistant_msg);
-
-            if pending_tool_uses.is_empty() {
-                let consumed = self.consume_runtime_inputs_at_checkpoint(
-                    &runtime_turn_id,
-                    TurnInputCheckpoint::BeforeFinalAnswer,
-                    &mut effective_system_prompt,
-                );
-                if consumed > 0 {
-                    continue;
-                }
-                break;
+            self.reconcile_provider_context_usage(usage);
+            self.usage_tracker.record(usage);
+            if let Some(callback) = &self.tool_callback {
+                callback.on_usage(&usage);
             }
-
-            // Phase 2: Parallel+serial tool dispatch based on safety categories
-            accepted_tool_rounds = accepted_tool_rounds.saturating_add(1);
-            let accepted_tool_round = accepted_tool_rounds;
-            let mut callback_inject = None;
-            {
-                use crate::execution_scheduler::schedule_tool_execution_plan_for_decision;
-                use crate::tool_dispatch::ToolRequest;
-
-                let mut requests: Vec<ToolRequest> = pending_tool_uses
-                    .iter()
-                    .map(|(id, name, input)| ToolRequest {
-                        tool_use_id: id.clone(),
-                        tool_name: name.clone(),
-                        input: input.clone(),
-                        depends_on: Vec::new(),
-                    })
-                    .collect();
-                runtime_harness.record_tool_requests(&pending_tool_uses);
-                let _ = crate::intent_planner::infer_tool_dependencies(&mut requests);
-                let ordered_ids: Vec<String> =
-                    requests.iter().map(|r| r.tool_use_id.clone()).collect();
-                let execution_plan = ToolExecutionPlan::from_requests_with_classifier(
-                    &requests,
-                    |tool_name, input| self.tool_executor.classify_tool_safety(tool_name, input),
-                );
-                self.record_tool_execution_plan(&execution_plan, self.session().messages.len());
-                let mut strategy_validation =
-                    execution_plan.validate_against_execution_decision(&execution_decision);
-                if strategy_validation.allowed {
-                    self.satisfy_tool_strategy_gates(
-                        &execution_plan,
-                        &execution_decision,
-                        &mut strategy_validation,
-                    )
-                    .await;
-                    if strategy_validation.checkpoint_created {
-                        runtime_harness.record_checkpoint_created();
-                    }
-                }
-                self.record_tool_strategy_validation(
-                    &strategy_validation,
-                    self.session().messages.len(),
-                );
-
-                let mut result_map: std::collections::HashMap<
-                    String,
-                    (ConversationMessage, Option<String>),
-                > = std::collections::HashMap::new();
-
-                if strategy_validation.allowed {
-                    let tool_schedule = schedule_tool_execution_plan_for_decision(
-                        &requests,
-                        &execution_plan,
-                        &execution_decision,
-                    );
-                    self.record_tool_schedule(
-                        &tool_schedule,
-                        &requests,
-                        self.session().messages.len(),
-                    );
-                    for batch in &tool_schedule.batches {
-                        self.execute_tool_schedule_batch(
-                            batch,
-                            &requests,
-                            &pending_tool_uses,
-                            prompter,
-                            iterations,
-                            strategy_validation.approval_satisfied,
-                            &mut result_map,
-                        )
-                        .await?;
-                    }
-                } else {
-                    let reason = format!(
-                        "runtime strategy lease `{}` denied tool batch: {}",
-                        strategy_validation.lease_id,
-                        strategy_validation.findings.join(", ")
-                    );
-                    for (tool_use_id, tool_name, input) in &pending_tool_uses {
-                        self.record_tool_invocation_denied(
-                            tool_use_id,
-                            tool_name,
-                            input,
-                            iterations,
-                            ToolFailureKind::GateDenied,
-                            &reason,
-                        );
-                        self.emit_tool_completed(tool_use_id, tool_name, &reason, Some(1));
-                        let denied = ConversationMessage::tool_result(
-                            tool_use_id.clone(),
-                            tool_name.clone(),
-                            reason.clone(),
-                            true,
-                        );
-                        self.session
-                            .write()
-                            .await
-                            .push_message(denied.clone())
-                            .map_err(|error| RuntimeError::new(error.to_string()))?;
-                        self.dual_write_message(
-                            &denied,
-                            self.session().messages.len().wrapping_sub(1),
-                        );
-                        result_map.insert(tool_use_id.clone(), (denied, None));
-                    }
-                }
-
-                for id in &ordered_ids {
-                    if let Some((msg, inject)) = result_map.remove(id) {
-                        self.remember_tool_trace_from_message(&msg);
-                        let tool_name_str = msg
-                            .blocks
-                            .first()
-                            .and_then(|b| match b {
-                                ContentBlock::ToolResult { tool_name, .. } => {
-                                    Some(tool_name.as_str())
-                                }
-                                _ => None,
-                            })
-                            .unwrap_or("unknown");
-                        self.record_context_event(
-                            "tool_use",
-                            "tool",
-                            &format!("{}: {}", tool_name_str, ""),
-                            5,
-                        );
-                        if let Some((output, is_error)) = msg.blocks.first().and_then(|block| {
-                            if let ContentBlock::ToolResult {
-                                output, is_error, ..
-                            } = block
-                            {
-                                Some((output.as_str(), *is_error))
-                            } else {
-                                None
-                            }
-                        }) {
-                            let (supervisor_tool_name, supervisor_input) = pending_tool_uses
-                                .iter()
-                                .find(|(pending_id, _, _)| pending_id == id)
-                                .map(|(_, name, input)| (name.as_str(), input.as_str()))
-                                .unwrap_or((tool_name_str, "{}"));
-                            let (observation, decision) = adaptive_controller.observe_tool_result(
-                                supervisor_tool_name,
-                                supervisor_input,
-                                output,
-                                is_error,
-                            );
-                            if decision.should_inject() {
-                                if matches!(
-                                    decision.kind,
-                                    crate::self_regulation::RuntimeAdaptiveDecisionKind::FallbackAnswerWithCheckedEvidence
-                                ) && self_regulation_final_answer_deadline.is_none()
-                                {
-                                    self_regulation_final_answer_deadline =
-                                        Some(iterations.saturating_add(1));
-                                }
-                                if let Some(prompt) = decision.prompt() {
-                                    effective_system_prompt.push(format!(
-                                        "\n## Runtime self-regulation guidance\n{prompt}"
-                                    ));
-                                }
-                                self.record_context_event(
-                                    "self_regulation",
-                                    "runtime",
-                                    decision.reason().unwrap_or(decision.kind_str()),
-                                    8,
-                                );
-                                self.push_runtime_context_observation(
-                                    "runtime.self_regulation",
-                                    format!(
-                                        "self-regulation-{}-{}",
-                                        self.session().messages.len(),
-                                        observation.fingerprint().input_hash
-                                    ),
-                                    format!(
-                                        "{}: {}",
-                                        decision.kind_str(),
-                                        decision
-                                            .reason()
-                                            .unwrap_or("runtime self-regulation guidance")
-                                    ),
-                                );
-                                self.record_self_regulation_decision(
-                                    &observation,
-                                    &decision,
-                                    self.session().messages.len(),
-                                );
-                                let fingerprint = observation.fingerprint();
-                                self.record_self_regulation_signal(
-                                    &decision,
-                                    vec![format!(
-                                        "tool:{}:{}:{}",
-                                        fingerprint.tool_name,
-                                        fingerprint.target,
-                                        fingerprint.input_hash
-                                    )],
-                                );
-                            }
-                        }
-                        if let Some(new_input) = inject {
-                            callback_inject = Some(new_input);
-                        }
-                        tool_results.push(msg);
-                    }
-                }
-            }
-            self.consume_runtime_inputs_at_checkpoint(
-                &runtime_turn_id,
-                TurnInputCheckpoint::AfterToolResult,
-                &mut effective_system_prompt,
+            self.record_assistant_iteration(
+                self.session().messages.len(),
+                &assistant_message,
+                calls.len(),
             );
-            if explicit_tool_round_budget
-                .is_some_and(|max_rounds| max_rounds > 0 && accepted_tool_round >= max_rounds)
-                && self_regulation_final_answer_deadline.is_none()
-            {
-                let max_rounds = explicit_tool_round_budget.unwrap_or_default();
-                self_regulation_final_answer_deadline = Some(iterations.saturating_add(1));
-                effective_system_prompt.push(format!(
-                    "\n## Runtime self-regulation guidance\nThe user explicitly limited tool usage to {max_rounds} tool round(s). You have reached that budget. Do not request more tools; synthesize the final answer from the checked evidence now, and list uncertainty instead of probing further."
-                ));
-                self.record_context_event(
-                    "self_regulation",
-                    "runtime",
-                    &format!("explicit_tool_round_budget_reached:{max_rounds}"),
-                    8,
-                );
-            }
-            if let Some(inject) = callback_inject {
-                let inject_text = inject.clone();
-                self.session
-                    .write()
-                    .await
-                    .push_user_text(inject)
-                    .map_err(|e| RuntimeError::new(e.to_string()))?;
-                self.dual_write_message(
-                    &ConversationMessage::user_text(inject_text),
-                    self.session().messages.len().wrapping_sub(1),
-                );
-                continue; // continue loop with injected input
-            }
-
-            // A model turn that requested tools is not complete until the model
-            // sees the resulting `tool_result` messages and synthesizes the
-            // next assistant response. Keep post-turn maintenance after the
-            // final no-tool assistant message so runtime supervisor guidance,
-            // tool evidence, and callback-injected context all have a chance to
-            // influence the answer.
-            if self_regulation_final_answer_deadline.is_some_and(|deadline| iterations >= deadline)
-            {
-                let reason =
-                    "runtime self-regulation stopped repeated low-novelty tool loop after fallback guidance was ignored";
-                tracing::warn!(
-                    iterations,
-                    "runtime self-regulation stopped repeated low-novelty tool loop"
-                );
-                let partial_text = adaptive_controller.partial_answer_text(reason);
-                let partial_msg = ConversationMessage::assistant(vec![ContentBlock::Text {
-                    text: partial_text.clone(),
-                }]);
-                self.session
-                    .write()
-                    .await
-                    .push_message(partial_msg.clone())
-                    .map_err(|error| RuntimeError::new(error.to_string()))?;
-                self.dual_write_message(
-                    &partial_msg,
-                    self.session().messages.len().wrapping_sub(1),
-                );
-                if let Some(ref cowd) = self.cowd_bus {
-                    cowd.emit(crate::cowd_event::CowdEvent::Warning {
-                        message: format!(
-                            "tool governance returned partial answer: {}; {}",
-                            reason,
-                            adaptive_controller.tool_ledger().compact_summary()
-                        ),
-                    });
-                }
-                assistant_messages.push(partial_msg);
-                break;
-            }
-            continue;
+            let intent = classify_model_step_intent(text, calls);
+            return Ok(ModelStepResult {
+                intent,
+                assistant_message,
+                usage,
+                prompt_cache_events: cache_events,
+                model: Some(model),
+                wall_duration_ms: millis_since(started_at).max(1),
+            });
         }
+        Err(last_error.unwrap_or_else(|| RuntimeError::new("all provider fallbacks exhausted")))
+    }
 
+    /// Execute one graph-owned tool wave. All tool side effects in a normal
+    /// conversation turn enter through this method.
+    pub(crate) async fn execute_tool_batch_step(
+        &self,
+        calls: &[ModelToolCall],
+        prompter: &crate::permissions::SharedPrompter,
+        iteration: usize,
+    ) -> Result<ToolBatchStepResult, RuntimeError> {
+        use crate::execution_scheduler::schedule_tool_execution_plan_for_decision;
+        use crate::tool_dispatch::ToolRequest;
+
+        let mut requests = calls
+            .iter()
+            .map(|call| ToolRequest {
+                tool_use_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                input: call.input.clone(),
+                depends_on: call.depends_on.clone(),
+            })
+            .collect::<Vec<_>>();
+        let _ = crate::intent_planner::infer_tool_dependencies(&mut requests);
+        let pending = calls
+            .iter()
+            .map(|call| (call.id.clone(), call.name.clone(), call.input.clone()))
+            .collect::<Vec<_>>();
+        let mut decision = crate::execution_core::StrategyDecisionEngine.decide_with_input(
+            self.strategy_input_for_turn(&latest_user_prompt_text(&self.session().messages)),
+            Some(self.context_profile()),
+            crate::execution_core::StrategyResourceHealth {
+                provider_available: self.api_client.provider_available(),
+                tools_available: self.tool_executor.has_registered_tools(),
+                collaboration_available: self.tool_executor.collaboration_runtime_available(),
+                mission_available: self.tool_executor.mission_runtime_available(),
+                observed: true,
+            },
+        );
+        let plan = ToolExecutionPlan::from_requests_with_classifier(&requests, |name, input| {
+            self.tool_executor.classify_tool_safety(name, input)
+        });
+        self.record_tool_execution_plan(&plan, self.session().messages.len());
+        if plan.tasks.iter().any(|task| {
+            task.safety_category != crate::tool_orchestrator::ToolSafetyCategory::ReadOnly
+        }) {
+            decision
+                .strategy
+                .retarget(
+                    harness_contract::core::ExecutionPattern::Execute,
+                    "provider emitted a governed tool intent; execute through ToolBatch",
+                )
+                .map_err(RuntimeError::new)?;
+            if !decision
+                .strategy
+                .modifiers
+                .contains(&harness_contract::core::ExecutionModifier::WithGuardrails)
+            {
+                decision
+                    .strategy
+                    .modifiers
+                    .push(harness_contract::core::ExecutionModifier::WithGuardrails);
+            }
+            if !decision
+                .strategy
+                .gates
+                .contains(&harness_contract::core::ExecutionPolicyGate::Permission)
+            {
+                decision
+                    .strategy
+                    .gates
+                    .push(harness_contract::core::ExecutionPolicyGate::Permission);
+            }
+            decision.compile_target = crate::execution_core::RuntimeCompileTarget::ExecutionGraph;
+        }
+        self.tool_executor.bind_execution_decision(decision.clone());
+        let mut validation = plan.validate_against_execution_decision(&decision);
+        if validation.allowed {
+            self.satisfy_tool_strategy_gates(&plan, &decision, &mut validation)
+                .await;
+        }
+        self.record_tool_strategy_validation(&validation, self.session().messages.len());
+        let mut result_map = std::collections::HashMap::new();
+        if validation.allowed {
+            let schedule = schedule_tool_execution_plan_for_decision(&requests, &plan, &decision);
+            self.record_tool_schedule(&schedule, &requests, self.session().messages.len());
+            for batch in &schedule.batches {
+                self.execute_tool_schedule_batch(
+                    batch,
+                    &requests,
+                    &pending,
+                    prompter,
+                    iteration,
+                    validation.approval_satisfied,
+                    &mut result_map,
+                )
+                .await?;
+            }
+        } else {
+            let reason = format!(
+                "runtime strategy lease `{}` denied tool batch: {}",
+                validation.lease_id,
+                validation.findings.join(", ")
+            );
+            for call in calls {
+                let message = ConversationMessage::tool_result(
+                    call.id.clone(),
+                    call.name.clone(),
+                    reason.clone(),
+                    true,
+                );
+                self.session
+                    .write()
+                    .await
+                    .push_message(message.clone())
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                self.dual_write_message(&message, self.session().messages.len().wrapping_sub(1));
+                result_map.insert(call.id.clone(), (message, None));
+            }
+        }
+        let mut messages = Vec::with_capacity(calls.len());
+        for call in calls {
+            if let Some((message, _)) = result_map.remove(&call.id) {
+                self.remember_tool_trace_from_message(&message);
+                messages.push(message);
+            }
+        }
+        let failed = count_failed_tool_results(&messages);
+        Ok(ToolBatchStepResult { messages, failed })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn finalize_graph_turn(
+        &mut self,
+        user_input: &str,
+        final_answer: String,
+        assistant_messages: Vec<ConversationMessage>,
+        tool_results: Vec<ConversationMessage>,
+        prompt_cache_events: Vec<PromptCacheEvent>,
+        iterations: usize,
+        model: Option<String>,
+        input_tokens: u64,
+        output_tokens: u64,
+        wall_duration_ms: u64,
+    ) -> Result<TurnSummary, RuntimeError> {
+        if final_answer.trim().is_empty() {
+            return Err(RuntimeError::new("model produced an empty final answer"));
+        }
+        let decision = crate::execution_core::StrategyDecisionEngine.decide_with_input(
+            self.strategy_input_for_turn(user_input),
+            Some(self.context_profile()),
+            crate::execution_core::StrategyResourceHealth {
+                provider_available: self.api_client.provider_available(),
+                tools_available: self.tool_executor.has_registered_tools(),
+                collaboration_available: self.tool_executor.collaboration_runtime_available(),
+                mission_available: self.tool_executor.mission_runtime_available(),
+                observed: true,
+            },
+        );
+        let kernel = RuntimeAiKernel::begin_turn_with_execution_decision(
+            self.session().session_id.clone(),
+            user_input.to_string(),
+            self.context_profile(),
+            &self.system_prompt,
+            decision,
+        );
+        let failed_tools = count_failed_tool_results(&tool_results);
+        let ai_kernel_trace = kernel.finalize(
+            &final_answer,
+            tool_results.len().saturating_sub(failed_tools),
+            failed_tools,
+        );
         let auto_compaction = self.maybe_auto_compact().await;
         let _ = self.run_memory_post_turn().await;
-
-        // A3: Synchronously check for L4 conflicts after each turn.
-        if let Some(ref engine_arc) = self.discussion_engine {
-            if let Ok(mut engine) = engine_arc.lock() {
-                engine.start_watcher(); // deferred start: now in tokio context
-                let conflict_count = engine.check_for_conflicts_sync().unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "DiscussionEngine conflict check failed");
-                    0
-                });
-
-                if conflict_count > 0 {
-                    tracing::info!(conflict_count, "L4 conflicts detected");
-
-                    // P3: Trigger discussion if conflicts found
-                    let topic = format!(
-                        "L4 memory conflict resolution ({} conflicts)",
-                        conflict_count
-                    );
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
-                    let participants = vec![memory::agent_directory::AgentInfo {
-                        agent_id: "primary".to_string(),
-                        role: "Resolver".to_string(),
-                        capabilities: vec!["conflict-resolution".to_string(), "memory".to_string()],
-                        status: memory::agent_directory::AgentStatus::Active,
-                        registered_at_ms: now_ms,
-                        last_heartbeat_ms: 0,
-                        reputation: None,
-                    }];
-
-                    // Drop the lock before async operations
-                    drop(engine);
-
-                    // Re-acquire for async operations via spawn_blocking
-                    let engine_clone = Arc::clone(engine_arc);
-                    let session = Arc::clone(&self.session);
-                    tokio::task::spawn_blocking(move || {
-                        let handle = tokio::runtime::Handle::try_current();
-                        let handle = match handle {
-                            Ok(h) => h,
-                            Err(e) => {
-                                tracing::warn!(error = %e, "No tokio handle in spawn_blocking — skipping discussion");
-                                return;
-                            }
-                        };
-                        handle.block_on(async {
-                            if let Ok(mut eng) = engine_clone.lock() {
-                                let _ = eng
-                                    .start_discussion(
-                                        topic,
-                                        participants,
-                                        crate::agent_discussion::ConsensusMethod::MajorityVote,
-                                        2,
-                                    )
-                                    .await;
-                                // After discussion, check and log consensus
-                                match eng.check_consensus().await {
-                                    Ok(consensus) if consensus.reached => {
-                                        tracing::info!(
-                                            score = consensus.score,
-                                            agreeing = consensus.agreeing_count,
-                                            total = consensus.total_count,
-                                            "Discussion reached consensus"
-                                        );
-                                        match eng.finalize().await {
-                                            Ok(decision) if !decision.is_empty() => {
-                                                tracing::info!(decision_len = decision.len(), "Discussion finalized, injecting decision into session");
-                                                use crate::session::{ContentBlock, ConversationMessage, MessageRole};
-                                                let msg = ConversationMessage {
-                                                    role: MessageRole::System,
-                                                    blocks: vec![ContentBlock::Text { text: format!("[AGENT DISCUSSION DECISION]\n{}", decision) }],
-                                                    usage: None,
-                                                };
-                                                if let Err(e) = session.write().await.push_message(msg) {
-                                                    tracing::warn!(error = %e, "Failed to inject discussion decision into session");
-                                                }
-                                            }
-                                            Ok(_) => tracing::debug!("Discussion finalized with empty decision"),
-                                            Err(e) => tracing::warn!(error = %e, "Discussion finalize failed"),
-                                        }
-                                    }
-                                    Ok(consensus) => {
-                                        tracing::info!(
-                                            score = consensus.score,
-                                            "Discussion did not reach consensus"
-                                        );
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            error = %e,
-                                            "Consensus check failed"
-                                        );
-                                    }
-                                }
-                            }
-                        });
-                    });
-                }
-            }
-        }
-
-        // Runtime-owned fallback synthesis path for complex tasks when the model did not
-        // explicitly request orchestration during the turn.
-        if let Some(ref collab) = self.collaboration {
-            let last_user_msg = self
-                .session()
-                .messages
-                .iter()
-                .rev()
-                .find(|m| matches!(m.role, crate::session::MessageRole::User))
-                .map(|m| {
-                    m.blocks
-                        .iter()
-                        .filter_map(|b| match b {
-                            ContentBlock::Text { text } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                })
-                .unwrap_or_default();
-
-            if self.should_use_collaboration(&execution_decision) {
-                let capability_refs: Vec<String> =
-                    Self::infer_required_capabilities(&last_user_msg);
-                if !capability_refs.is_empty() {
-                    let activation_decision =
-                        SkillActivationEngine::activate(SkillActivationInput {
-                            session_id: self.session().session_id.clone(),
-                            turn_index: self.session().messages.len(),
-                            query: last_user_msg.clone(),
-                            capability_refs: capability_refs.clone(),
-                            available_profiles: self.skill_profiles.clone(),
-                            agent_profile: self.agent_skill_profile.clone(),
-                        });
-                    let activation = activation_decision.activation;
-                    let skill_memory_candidate = memory_candidate_from_skill_activation(
-                        &activation,
-                        &SkillMemoryPolicy::default(),
-                    );
-                    self.record_skill_activation_event(&activation, self.session().messages.len());
-                    if let Some(candidate) = &skill_memory_candidate {
-                        self.record_skill_memory_candidate_event(
-                            &activation,
-                            candidate,
-                            self.session().messages.len(),
-                        );
-                    }
-                    let collab_clone = Arc::clone(collab);
-                    let task = last_user_msg.clone();
-                    let capability_refs_clone = capability_refs.clone();
-                    let memory = self.memory_manager().cloned();
-
-                    if let Some(collab_result) = collab_clone
-                        .run_with_strategy_boxed(
-                            &task,
-                            &capability_refs_clone,
-                            &execution_decision.strategy,
-                        )
-                        .await
-                    {
-                        let mut collab_result = collab_result;
-                        if let Some(candidate) = &skill_memory_candidate {
-                            collab_result.review_packet.maintenance_candidates.push(
-                                skill_memory_candidate_to_maintenance(&activation, candidate),
-                            );
-                        }
-                        collab_result.work_graph = collab_result
-                            .work_graph
-                            .with_session_id(self.session().session_id.clone())
-                            .with_review_packet(&collab_result.review_packet);
-                        let synthesis = collab_result.synthesis.clone();
-                        self.append_context_items_to_latest_envelope(
-                            &task,
-                            collab_result.context_items.clone(),
-                        );
-                        self.remember_collaboration_result(collab_result);
-                        tracing::info!(
-                            synthesis_len = synthesis.len(),
-                            capability_refs = ?capability_refs_clone,
-                            "Collaboration synthesis complete"
-                        );
-                        if let Some(mem) = memory {
-                            let memory_ctx = self.memory_turn_context("collaboration-orchestrator");
-                            let kernel = MemoryKernel::new(Arc::clone(&mem));
-                            let entry = memory::types::MemoryEntry {
-                                id: memory::types::MemoryId::new_v4(),
-                                layer: memory::types::MemoryLayer::L4,
-                                category: memory::types::MemoryCategory::Shared,
-                                priority: memory::types::Priority::Normal,
-                                source: memory::types::MemorySource::Import,
-                                title: format!(
-                                    "collaboration-synthesis: {}",
-                                    preview_chars(&task, 80)
-                                ),
-                                content: synthesis,
-                                embedding: None,
-                                tags: vec!["collaboration".to_string(), "synthesis".to_string()],
-                                relations: vec![],
-                                confidence: 0.8,
-                                access_count: 0,
-                                staleness: 0.0,
-                                created_at: chrono::Utc::now(),
-                                updated_at: chrono::Utc::now(),
-                                last_accessed_at: None,
-                                scope: memory::project_scope::MemoryScope::Global,
-                                session_id: None,
-                                source_agent: None,
-                                visibility: memory::types::AgentVisibility::Shared,
-                            };
-                            let _ = kernel.remember(&memory_ctx, entry).await;
-                        }
-                    }
-                }
-            }
-        }
-
-        let assistant_text = assistant_messages
-            .iter()
-            .flat_map(|m| m.blocks.iter())
-            .filter_map(|b| match b {
-                crate::session::ContentBlock::Text { text } => Some(text.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("");
-        let failed_tool_results = count_failed_tool_results(&tool_results);
-        if let Some(envelope) = self.last_context_envelope() {
-            runtime_harness.record_context_envelope(
-                envelope.id,
-                envelope.selected.len(),
-                envelope.omitted.len(),
-            );
-        }
-        let ai_kernel_trace = runtime_harness.finalize(
-            &assistant_text,
-            tool_results.len().saturating_sub(failed_tool_results),
-            failed_tool_results,
-        );
-        if ai_kernel_trace.finalization_blocked {
-            let gate_message = ConversationMessage::assistant(vec![ContentBlock::Text {
-                text: finalization_gate_message(&ai_kernel_trace),
-            }]);
-            self.session
-                .write()
-                .await
-                .push_message(gate_message.clone())
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
-            self.dual_write_message(&gate_message, self.session().messages.len().wrapping_sub(1));
-            assistant_messages.push(gate_message);
-        }
-        self.record_ai_kernel_trace_event(&ai_kernel_trace, self.session().messages.len());
-        self.record_strategy_experience(&ai_kernel_trace);
         let usage = self.usage_tracker.cumulative_usage();
-        let telemetry_usage = if provider_usage_seen {
-            provider_usage_total
-        } else {
-            TokenUsage {
-                input_tokens: ((user_input.chars().count() as u32) / 4).max(1),
-                output_tokens: ((output_chars as u32) / 4).max(u32::from(output_chars > 0)),
-                cache_creation_input_tokens: 0,
-                cache_read_input_tokens: 0,
-            }
-        };
-        let active_stream_duration_ms = first_stream_token_at
-            .zip(last_stream_token_at)
-            .map(|(first, last)| last.saturating_duration_since(first).as_millis() as u64);
-        let wall_duration_ms = millis_since(turn_started_at).max(1);
-        let wall_chars_per_second = rate_per_second(output_chars, wall_duration_ms);
-        let wall_tokens_per_second =
-            rate_per_second(u64::from(telemetry_usage.output_tokens), wall_duration_ms);
-        let active_chars_per_second =
-            active_rate_per_second(output_chars, active_stream_duration_ms);
-        let active_tokens_per_second = active_rate_per_second(
-            u64::from(telemetry_usage.output_tokens),
-            active_stream_duration_ms,
-        );
-        let model_telemetry = crate::cowd_event::RunModelTelemetry {
-            model: models_used.last().cloned().or_else(|| {
-                self.model
-                    .as_ref()
-                    .filter(|model| !model.is_empty())
-                    .cloned()
-            }),
-            models_used,
-            first_token_latency_ms,
-            active_stream_duration_ms,
-            wall_duration_ms,
-            output_chars,
-            output_chunks,
-            input_tokens: u64::from(telemetry_usage.input_tokens),
-            output_tokens: u64::from(telemetry_usage.output_tokens),
-            cache_create_tokens: u64::from(telemetry_usage.cache_creation_input_tokens),
-            cache_read_tokens: u64::from(telemetry_usage.cache_read_input_tokens),
-            total_tokens: u64::from(telemetry_usage.total_tokens()),
-            usage_source: if provider_usage_seen {
-                "provider".to_string()
-            } else {
-                "estimated".to_string()
-            },
-            wall_chars_per_second,
-            wall_tokens_per_second,
-            active_chars_per_second,
-            active_tokens_per_second,
-            chars_per_second: wall_chars_per_second,
-            tokens_per_second: wall_tokens_per_second,
+        let telemetry = crate::cowd_event::RunModelTelemetry {
+            model: model.clone(),
+            models_used: model.into_iter().collect(),
+            first_token_latency_ms: None,
+            active_stream_duration_ms: None,
+            wall_duration_ms: wall_duration_ms.max(1),
+            output_chars: final_answer.chars().count() as u64,
+            output_chunks: iterations as u64,
+            input_tokens,
+            output_tokens,
+            cache_create_tokens: 0,
+            cache_read_tokens: 0,
+            total_tokens: input_tokens.saturating_add(output_tokens),
+            usage_source: "provider".to_string(),
+            wall_chars_per_second: rate_per_second(
+                final_answer.chars().count() as u64,
+                wall_duration_ms.max(1),
+            ),
+            wall_tokens_per_second: rate_per_second(output_tokens, wall_duration_ms.max(1)),
+            active_chars_per_second: None,
+            active_tokens_per_second: None,
+            chars_per_second: rate_per_second(
+                final_answer.chars().count() as u64,
+                wall_duration_ms.max(1),
+            ),
+            tokens_per_second: rate_per_second(output_tokens, wall_duration_ms.max(1)),
         };
         let context_turn_report = self.build_context_turn_report(
             &ai_kernel_trace.harness_receipt.id,
             usage,
             auto_compaction.clone(),
         );
-        if let Ok(mut registry) = self.model_performance_registry.lock() {
-            registry.record_telemetry(&model_telemetry, None, false);
-        }
         self.remember_context_turn_report(context_turn_report.clone());
         let summary = TurnSummary {
+            final_answer,
             assistant_messages,
             tool_results,
             prompt_cache_events,
             iterations,
             usage,
-            model_telemetry: model_telemetry.clone(),
+            model_telemetry: telemetry,
             auto_compaction,
             ai_kernel_trace,
             context_turn_report,
         };
         self.record_turn_completed(&summary);
-        tracing::info!(iterations = %summary.iterations, tokens = %summary.usage.total_tokens(), "turn completed");
+        self.record_ai_kernel_trace_event(&summary.ai_kernel_trace, self.session().messages.len());
+        self.record_strategy_experience(&summary.ai_kernel_trace);
         if let Some(ref cowd) = self.cowd_bus {
             cowd.emit(crate::cowd_event::CowdEvent::RunModelTelemetry {
-                telemetry: model_telemetry,
+                telemetry: summary.model_telemetry.clone(),
             });
             cowd.emit(crate::cowd_event::CowdEvent::TurnComplete {
-                assistant_text,
+                assistant_text: summary.final_answer.clone(),
                 iterations: summary.iterations as u32,
             });
         }
@@ -4940,44 +3992,24 @@ where
             "receipt": receipt,
         });
         let created_at_ms = now_ms();
-        let event = memory::SessionEvent {
-            session_id: session_id.clone(),
-            event_type: "SessionCompacted".to_string(),
-            event_json: payload.to_string(),
-            sequence: 0,
+        let context_event = memory::SessionDomainEvent::new(
+            session_id.clone(),
+            0,
+            memory::SessionDomainScope::Context,
+            "context.session_compacted",
+            payload,
             created_at_ms,
-        };
-        let event = match store.append_event_allocating_sequence(&event).await {
+        );
+        let persisted = match store
+            .append_session_domain_event_allocating_sequence(&context_event)
+            .await
+        {
             Ok(event) => event,
             Err(error) => {
-                tracing::warn!(%error, session_id, "session compaction event append failed");
+                tracing::warn!(%error, session_id, "canonical compaction domain event append failed");
                 return;
             }
         };
-        let context_payload = serde_json::json!({
-            "source": "conversation_runtime.compaction",
-            "sequence": sequence,
-            "compaction": {
-                "count": compaction.count,
-                "removed_message_count": compaction.removed_message_count,
-            },
-            "receipt": receipt,
-        });
-        let context_event = memory::RuntimeEvent::new(
-            session_id.clone(),
-            0,
-            memory::RuntimeEventScope::Context,
-            "context.session_compacted",
-            context_payload,
-            created_at_ms,
-        );
-        if let Err(error) = store
-            .append_runtime_event_allocating_sequence(&context_event)
-            .await
-        {
-            tracing::warn!(%error, session_id, event_sequence = event.sequence, "canonical compaction runtime event append failed");
-            return;
-        }
         if let Some(receipt) = context_event
             .payload
             .get("receipt")
@@ -4988,10 +4020,10 @@ where
                 .and_then(|ids| ids.as_array())
                 .is_some_and(|ids| !ids.is_empty())
             {
-                let memory_event = memory::RuntimeEvent::new(
+                let memory_event = memory::SessionDomainEvent::new(
                     session_id.clone(),
                     0,
-                    memory::RuntimeEventScope::Memory,
+                    memory::SessionDomainScope::Memory,
                     "memory.semantic_checkpoint.created",
                     serde_json::json!({
                         "source": "conversation_runtime.compaction",
@@ -5000,10 +4032,10 @@ where
                     created_at_ms,
                 );
                 if let Err(error) = store
-                    .append_runtime_event_allocating_sequence(&memory_event)
+                    .append_session_domain_event_allocating_sequence(&memory_event)
                     .await
                 {
-                    tracing::warn!(%error, session_id, "semantic checkpoint runtime event append failed");
+                    tracing::warn!(%error, session_id, event_sequence = persisted.sequence, "semantic checkpoint domain event append failed");
                 }
             }
         }
@@ -5136,18 +4168,6 @@ where
         session_tracer.record("turn_completed", attributes);
     }
 
-    fn record_turn_failed(&self, iteration: usize, error: &RuntimeError) {
-        let Some(session_tracer) = &self.session_tracer else {
-            return;
-        };
-
-        let mut attributes = Map::new();
-        attributes.insert("iteration".to_string(), Value::from(iteration as u64));
-        attributes.insert("error".to_string(), Value::String(error.to_string()));
-        session_tracer.record("turn_failed", attributes);
-    }
-
-    // -----------------------------------------------------------------------
     // Memory helpers (private)
     // -----------------------------------------------------------------------
 
@@ -5575,76 +4595,6 @@ where
     /// background task. The in-memory session remains the hot turn state;
     /// SQLite is the managed session source of truth. JSONL is only used by
     /// explicit import/export codecs.
-    fn record_skill_activation_event(&self, activation: &SkillActivationRecord, sequence: usize) {
-        let Some(ref store) = self.session_store else {
-            return;
-        };
-        let session_id = activation.session_id.clone();
-        let mut event = activation.to_runtime_event(sequence);
-        if let Some(payload) = event.payload.as_object_mut() {
-            payload.insert(
-                "source".to_string(),
-                serde_json::json!("conversation_runtime.skill_activation"),
-            );
-        }
-        let store = Arc::clone(store);
-        tokio::spawn(async move {
-            if let Err(error) = store.append_runtime_event(&event).await {
-                tracing::warn!(
-                    %error,
-                    session_id,
-                    sequence,
-                    "skill activation runtime event append failed"
-                );
-            }
-        });
-    }
-
-    fn record_skill_memory_candidate_event(
-        &self,
-        activation: &SkillActivationRecord,
-        candidate: &MemoryPulseCandidate,
-        sequence: usize,
-    ) {
-        let Some(ref store) = self.session_store else {
-            return;
-        };
-        let payload = serde_json::json!({
-            "turn_index": activation.turn_index,
-            "query": activation.query,
-            "selected": activation.selected,
-            "candidate": candidate,
-            "source_event": "skill_candidates",
-            "source": "conversation_runtime.skill_memory_candidate",
-        });
-        let mut event = memory::RuntimeEvent::new(
-            activation.session_id.clone(),
-            sequence,
-            memory::RuntimeEventScope::Context,
-            "skill_memory_candidate",
-            payload,
-            now_ms(),
-        );
-        if let Some(selected) = &activation.selected {
-            event.refs.push(memory::RuntimeRef {
-                ref_type: "skill".to_string(),
-                id: selected.clone(),
-                label: Some("memory_candidate_source".to_string()),
-            });
-        }
-        let session_id = activation.session_id.clone();
-        let store = Arc::clone(store);
-        tokio::spawn(async move {
-            if let Err(error) = store.append_runtime_event(&event).await {
-                tracing::warn!(
-                    %error,
-                    session_id,
-                    sequence,
-                    "skill memory candidate runtime event append failed"
-                );
-            }
-        });
-    }
 
     fn maybe_index_tool_output(
         &self,
@@ -5946,14 +4896,29 @@ where
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_millis() as u64)
             .unwrap_or(0);
-        let event = memory::SessionEvent {
-            session_id: session_id.clone(),
-            event_type: "ToolObservationRaw".to_string(),
-            event_json: payload.to_string(),
-            sequence: 0,
+        let mut event = memory::SessionDomainEvent::new(
+            session_id.clone(),
+            0,
+            memory::SessionDomainScope::Tool,
+            "tool.observation.raw",
+            payload,
             created_at_ms,
-        };
-        let persisted = match store.append_event_allocating_sequence(&event).await {
+        );
+        event.status = Some(if is_error { "failed" } else { "completed" }.to_string());
+        event.refs.push(memory::SessionDomainRef {
+            ref_type: "tool_call".to_string(),
+            id: tool_use_id.to_string(),
+            label: Some(tool_name.to_string()),
+        });
+        event.refs.push(memory::SessionDomainRef {
+            ref_type: "evidence".to_string(),
+            id: evidence_id.clone(),
+            label: Some("raw".to_string()),
+        });
+        let persisted = match store
+            .append_session_domain_event_allocating_sequence(&event)
+            .await
+        {
             Ok(event) => event,
             Err(error) => {
                 tracing::warn!(
@@ -6070,32 +5035,56 @@ where
         &self,
         record: &ToolInvocationRecord,
         kind: &'static str,
-        sequence: usize,
+        _sequence: usize,
     ) {
-        let event = record.to_runtime_event(sequence, kind);
-        self.append_tool_runtime_events(record.turn_index, kind, vec![event]);
+        self.append_execution_runtime_event(
+            RuntimeEventScope::Tool,
+            kind,
+            Some(record.status.as_str().to_string()),
+            vec![
+                RuntimeEventRef {
+                    kind: "tool_invocation".to_string(),
+                    id: record.invocation_id.clone(),
+                },
+                RuntimeEventRef {
+                    kind: "tool_call".to_string(),
+                    id: record.tool_call_id.clone(),
+                },
+            ],
+            serde_json::to_value(record).unwrap_or_else(
+                |error| serde_json::json!({ "serialization_error": error.to_string() }),
+            ),
+        );
     }
 
-    fn record_tool_execution_plan(&self, plan: &ToolExecutionPlan, sequence: usize) {
-        let session_id = self.session().session_id;
-        let event = plan.to_runtime_event(session_id.clone(), sequence, now_ms());
-        self.append_tool_runtime_events(sequence, "tool.execution.plan.created", vec![event]);
+    fn record_tool_execution_plan(&self, plan: &ToolExecutionPlan, _sequence: usize) {
+        self.append_execution_runtime_event(
+            RuntimeEventScope::Tool,
+            "tool.execution_plan.created",
+            Some("planned".to_string()),
+            vec![RuntimeEventRef {
+                kind: "tool_execution_plan".to_string(),
+                id: plan.plan_id.clone(),
+            }],
+            serde_json::to_value(plan).unwrap_or_else(
+                |error| serde_json::json!({ "serialization_error": error.to_string() }),
+            ),
+        );
     }
 
     fn record_tool_strategy_validation(
         &self,
         report: &ToolExecutionPolicyValidationReport,
-        sequence: usize,
+        _sequence: usize,
     ) {
-        if self.session_store.is_none() {
-            return;
-        }
-        let session_id = self.session().session_id;
-        let mut event = memory::RuntimeEvent::new(
-            session_id.clone(),
-            sequence,
-            memory::RuntimeEventScope::Tool,
+        self.append_execution_runtime_event(
+            RuntimeEventScope::Tool,
             "tool.strategy_validation.completed",
+            Some(if report.allowed { "allowed" } else { "denied" }.to_string()),
+            vec![RuntimeEventRef {
+                kind: "strategy_lease".to_string(),
+                id: report.lease_id.clone(),
+            }],
             serde_json::to_value(report).unwrap_or_else(|_| {
                 serde_json::json!({
                     "allowed": false,
@@ -6103,14 +5092,6 @@ where
                     "lease_id": report.lease_id,
                 })
             }),
-            now_ms(),
-        );
-        event.status = Some(if report.allowed { "allowed" } else { "denied" }.to_string());
-        event.span_id = Some(report.lease_id.clone());
-        self.append_tool_runtime_events(
-            sequence,
-            "tool.strategy_validation.completed",
-            vec![event],
         );
     }
 
@@ -6118,76 +5099,30 @@ where
         &self,
         schedule: &crate::execution_scheduler::ToolSchedule,
         requests: &[crate::tool_dispatch::ToolRequest],
-        sequence: usize,
+        _sequence: usize,
     ) {
-        let session_id = self.session().session_id;
-        let event = schedule.to_runtime_event(session_id.clone(), sequence, now_ms(), requests);
-        self.append_tool_runtime_events(sequence, "tool.schedule.created", vec![event]);
-    }
-
-    fn record_self_regulation_decision(
-        &self,
-        observation: &crate::self_regulation::ToolProgressObservation,
-        decision: &crate::self_regulation::RuntimeAdaptiveDecision,
-        sequence: usize,
-    ) {
-        let Some(ref store) = self.session_store else {
-            return;
-        };
-        let session_id = self.session().session_id;
-        let self_regulation_event =
-            crate::self_regulation::RuntimeSelfRegulationEvent::from_tool_decision(
-                observation,
-                decision,
-            );
-        let mut event = memory::RuntimeEvent::new(
-            session_id.clone(),
-            sequence,
-            memory::RuntimeEventScope::Policy,
-            self_regulation_event.event_type,
-            self_regulation_event.payload,
-            now_ms(),
+        self.append_execution_runtime_event(
+            RuntimeEventScope::Schedule,
+            "tool.schedule.created",
+            Some("planned".to_string()),
+            requests
+                .iter()
+                .map(|request| RuntimeEventRef {
+                    kind: "tool_call".to_string(),
+                    id: request.tool_use_id.clone(),
+                })
+                .collect(),
+            serde_json::json!({
+                "schedule": schedule,
+                "tool_count": requests.len(),
+            }),
         );
-        event.status = Some(self_regulation_event.status);
-        let store = Arc::clone(store);
-        tokio::spawn(async move {
-            if let Err(error) = store.append_runtime_event(&event).await {
-                tracing::warn!(
-                    %error,
-                    session_id,
-                    sequence,
-                    "runtime self-regulation event append failed"
-                );
-            }
-        });
-    }
-
-    fn record_self_regulation_signal(
-        &self,
-        decision: &crate::self_regulation::RuntimeAdaptiveDecision,
-        evidence_refs: Vec<String>,
-    ) {
-        let session_id = self.session().session_id;
-        let collector = crate::EvolutionSignalCollector::default_for_config_home(
-            crate::cowd_dirs::config_home_dir(),
-        );
-        if let Err(error) =
-            collector.append_self_regulation_signal(session_id.clone(), decision, evidence_refs)
-        {
-            tracing::warn!(
-                %error,
-                session_id,
-                decision = decision.kind_str(),
-                "runtime self-regulation evolution signal append failed"
-            );
-        }
     }
 
     fn record_ai_kernel_trace_event(&self, trace: &RuntimeAiKernelTrace, sequence: usize) {
-        let Some(ref store) = self.session_store else {
+        if self.runtime_event_store.is_none() {
             return;
-        };
-        let session_id = self.session().session_id;
+        }
         let payload = serde_json::json!({
             "strategy": {
                 "pattern": trace.execution_decision.strategy.pattern.as_str(),
@@ -6263,19 +5198,19 @@ where
                 },
                 "eval_checks": trace.behavior_policy.eval_checks,
             },
-            "workgraph": trace.workgraph.as_ref().map(|graph| serde_json::json!({
+            "execution_graph": trace.execution_graph.as_ref().map(|graph| serde_json::json!({
                 "id": graph.id,
                 "node_count": graph.nodes.len(),
                 "edge_count": graph.edges.len(),
             })),
-            "workgraph_quality": trace.workgraph_quality.as_ref().map(|quality| serde_json::json!({
+            "execution_graph_quality": trace.execution_graph_quality.as_ref().map(|quality| serde_json::json!({
                 "node_count": quality.node_count,
                 "edge_count": quality.edge_count,
                 "ready_count": quality.ready_count,
                 "blocked_count": quality.blocked_count,
                 "failed_count": quality.failed_count,
-                "has_review_node": quality.has_review_node,
-                "has_synthesis_node": quality.has_synthesis_node,
+                "has_verify_node": quality.has_verify_node,
+                "has_synthesize_node": quality.has_synthesize_node,
                 "is_dag": quality.is_dag,
                 "warnings": quality.warnings,
             })),
@@ -6321,29 +5256,20 @@ where
                 "missing_evidence": matrix_missing_evidence(trace),
             },
         });
-        let created_at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as u64)
-            .unwrap_or(0);
-        let mut event = memory::RuntimeEvent::new(
-            session_id.clone(),
-            sequence,
-            memory::RuntimeEventScope::Task,
+        self.append_execution_runtime_event(
+            RuntimeEventScope::Task,
             "runtime.harness_contract.trace",
+            Some(if trace.verification_report.can_finalize {
+                "completed".to_string()
+            } else {
+                "degraded".to_string()
+            }),
+            vec![RuntimeEventRef {
+                kind: "harness_receipt".to_string(),
+                id: trace.harness_receipt.id.clone(),
+            }],
             payload,
-            created_at_ms,
         );
-        event.status = Some(if trace.verification_report.can_finalize {
-            "completed".to_string()
-        } else {
-            "degraded".to_string()
-        });
-        let store = Arc::clone(store);
-        tokio::spawn(async move {
-            if let Err(error) = store.append_runtime_event(&event).await {
-                tracing::warn!(%error, session_id, sequence, "AI kernel runtime trace append failed");
-            }
-        });
     }
 
     fn strategy_input_for_turn(&self, user_input: &str) -> StrategyInput {
@@ -6360,44 +5286,29 @@ where
         }
     }
 
-    fn append_tool_runtime_events(
+    fn append_execution_runtime_event(
         &self,
-        turn_index: usize,
-        event_label: &'static str,
-        events: Vec<memory::RuntimeEvent>,
+        scope: RuntimeEventScope,
+        kind: &'static str,
+        status: Option<String>,
+        refs: Vec<RuntimeEventRef>,
+        payload: serde_json::Value,
     ) {
-        let Some(ref store) = self.session_store else {
+        let Some(store) = self.runtime_event_store.as_ref() else {
             return;
         };
         let session_id = self.session().session_id;
-        let use_ledger = std::env::var("COWD_TOOL_LEDGER_V2").ok().as_deref() == Some("1");
-        let events = if use_ledger {
-            let mut ledger = TurnToolLedger::new(session_id.to_string(), turn_index);
-            for event in events {
-                let idempotency_key = tool_event_idempotency_key(&event);
-                ledger.append_runtime_event(idempotency_key, event);
-            }
-            ledger.flush().events
-        } else {
-            events
-        };
-        let store = Arc::clone(store);
-        tokio::spawn(async move {
-            for event in events {
-                let sequence = event.sequence;
-                let kind = event.kind.clone();
-                if let Err(error) = store.append_runtime_event(&event).await {
-                    tracing::warn!(
-                        %error,
-                        session_id,
-                        sequence,
-                        event_kind = kind,
-                        event_label,
-                        "tool runtime event append failed"
-                    );
-                }
-            }
-        });
+        if let Err(error) = store.append(RuntimeEventInput {
+            stream_id: format!("session:{session_id}"),
+            scope,
+            kind: kind.to_string(),
+            status,
+            actor: Some("conversation_runtime".to_string()),
+            refs,
+            payload,
+        }) {
+            tracing::warn!(%error, session_id, event_kind = kind, "execution runtime event append failed");
+        }
     }
 
     fn dual_write_message(&self, msg: &crate::session::ConversationMessage, sequence: usize) {
@@ -6480,10 +5391,10 @@ where
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_millis() as u64)
             .unwrap_or(0);
-        let mut event = memory::RuntimeEvent::new(
+        let mut event = memory::SessionDomainEvent::new(
             session_id.clone(),
             sequence,
-            memory::RuntimeEventScope::Policy,
+            memory::SessionDomainScope::Policy,
             "runtime.policy.decided",
             payload,
             created_at_ms,
@@ -6491,15 +5402,8 @@ where
         event.status = Some("completed".to_string());
         let store = Arc::clone(store);
         tokio::spawn(async move {
-            match event.to_session_event() {
-                Ok(record) => {
-                    if let Err(error) = store.append_event_allocating_sequence(&record).await {
-                        tracing::warn!(%error, session_id, sequence, "runtime policy event append failed");
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(%error, session_id, sequence, "runtime policy event serialization failed");
-                }
+            if let Err(error) = store.append_session_domain_event(&event).await {
+                tracing::warn!(%error, session_id, sequence, "runtime policy domain event append failed");
             }
         });
     }
@@ -6862,15 +5766,6 @@ fn count_failed_tool_results(messages: &[ConversationMessage]) -> usize {
         .count()
 }
 
-fn finalization_gate_message(trace: &RuntimeAiKernelTrace) -> String {
-    let reasons = if trace.verification_report.blocking_reasons.is_empty() {
-        "verification ledger blocked finalization".to_string()
-    } else {
-        trace.verification_report.blocking_reasons.join("; ")
-    };
-    format!("I cannot finalize this as a completed answer yet. Blocking verification: {reasons}")
-}
-
 fn strategy_experience_path() -> std::path::PathBuf {
     crate::cowd_dirs::config_home_dir()
         .join("ai")
@@ -6885,12 +5780,12 @@ fn strategy_experience_record(trace: &RuntimeAiKernelTrace) -> StrategyExperienc
             .map(|alignment| !alignment.aligned)
             .unwrap_or(false);
     let multi_agent_positive_lift = trace
-        .workgraph_quality
+        .execution_graph_quality
         .as_ref()
         .map(|quality| {
             quality.is_dag
-                && quality.has_review_node
-                && quality.has_synthesis_node
+                && quality.has_verify_node
+                && quality.has_synthesize_node
                 && quality.failed_count == 0
         })
         .unwrap_or(false);
@@ -6993,68 +5888,6 @@ fn growth_maintenance_candidates(
             }
         })
         .collect()
-}
-
-fn skill_memory_candidate_to_maintenance(
-    activation: &SkillActivationRecord,
-    candidate: &MemoryPulseCandidate,
-) -> memory::MaintenanceCandidate {
-    let now = chrono::Utc::now();
-    let (kind, summary) = match candidate.kind {
-        MemoryPulseKind::Remember => (
-            memory::MaintenanceCandidateKind::RelationshipRefresh,
-            "Review skill activation gap",
-        ),
-        MemoryPulseKind::Refresh => (
-            memory::MaintenanceCandidateKind::RelationshipRefresh,
-            "Review skill activation memory refresh",
-        ),
-        MemoryPulseKind::Promote => (
-            memory::MaintenanceCandidateKind::AuthorityPromotion,
-            "Review skill activation promotion",
-        ),
-        MemoryPulseKind::Retire => (
-            memory::MaintenanceCandidateKind::Stale,
-            "Review skill activation retirement",
-        ),
-    };
-    let selected = activation
-        .selected
-        .as_deref()
-        .unwrap_or("no-skill-selected")
-        .to_string();
-    let confidence = activation
-        .candidates
-        .first()
-        .map(|candidate| (candidate.score as f32 / 16.0).clamp(0.25, 0.95))
-        .unwrap_or(0.35);
-    memory::MaintenanceCandidate {
-        id: format!("skill-memory-{}", uuid::Uuid::new_v4()),
-        kind,
-        status: memory::MaintenanceCandidateStatus::Open,
-        entry_ids: Vec::new(),
-        summary: format!(
-            "{summary}: selected={selected}; query={}",
-            truncate_for_runtime_candidate(&activation.query)
-        ),
-        reason: candidate.content.clone(),
-        confidence,
-        source: Some("runtime_skill".to_string()),
-        source_ref: Some(format!(
-            "session://{}/turn/{}/skill/{}",
-            activation.session_id, activation.turn_index, selected
-        )),
-        created_at: now,
-        updated_at: now,
-    }
-}
-
-fn truncate_for_runtime_candidate(value: &str) -> String {
-    const MAX_CHARS: usize = 160;
-    if value.chars().count() <= MAX_CHARS {
-        return value.to_string();
-    }
-    value.chars().take(MAX_CHARS).collect::<String>()
 }
 
 type ToolHandler = Box<dyn Fn(&str) -> Result<String, ToolError> + Send + Sync>;
@@ -7185,63 +6018,31 @@ impl<T: ToolExecutor> WaveExecutor for ToolWaveExecutor<T> {
     }
 }
 
-/// Check whether an error string indicates a retryable HTTP status (429/5xx).
-#[inline]
-fn is_retryable_error(err_str: &str) -> bool {
-    const RETRYABLE: &[&str] = &["408", "409", "429", "500", "502", "503", "504"];
-    RETRYABLE.iter().any(|code| err_str.contains(code))
-}
-
 #[cfg(test)]
 mod tests {
 
     use super::{
-        active_rate_per_second, build_cc_memory_config_with_budget, image_user_message_from_path,
-        prepared_vision_payload, preview_chars, rate_per_second, stream_idle_timeout_for_messages,
-        vision_user_message, ApiClient, ApiRequest, AssistantEvent, CognitiveContextManager,
-        ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor,
-        DEFAULT_RUNTIME_MAX_ITERATIONS,
+        build_cc_memory_config_with_budget, image_user_message_from_path, prepared_vision_payload,
+        preview_chars, rate_per_second, stream_idle_timeout_for_messages, vision_user_message,
+        ApiClient, ApiRequest, AssistantEvent, CognitiveContextManager, ConversationRuntime,
+        RuntimeError, StaticToolExecutor, DEFAULT_RUNTIME_MAX_ITERATIONS,
     };
-    use crate::agent_collaboration::{
-        AgentTaskTrace, AgentTeam, CollaborationContextResult, CollaborationOps,
-        CollaborationReviewPacket, CollaborationScorecard, CollaborationTask, SubTask,
-    };
-    use crate::agent_workgraph::AgentWorkGraph;
-    use crate::compact::CompactionConfig;
-    use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
+    use crate::config::RuntimeFeatureConfig;
     use crate::context_runtime::{
         ContextAuthority, ContextItem, ContextMode, ContextProfile, ContextRole, ContextSourceKind,
         ResumeContextPacket, ResumeContextSource,
     };
-    use crate::permissions::{
-        PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
-        PermissionRequest, SharedPrompter,
-    };
-    use crate::prompt::{ProjectContext, SystemPromptBuilder};
+    use crate::permissions::{PermissionMode, PermissionPolicy};
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
     use crate::SubAgentConfig;
-    use crate::ToolError;
     use crate::{resolve_context_budget_tokens, RuntimeBudgetInputs, RuntimeBudgetPlan};
     use futures::stream::Stream;
-    use harness_contract::skill::{
-        AgentSkillProfile, SkillAdapterKind, SkillCapabilityProfile, SkillDetectedRuntime,
-        SkillEntrypoint, SkillKind, SkillLifecycleStatus, SkillRiskLevel,
-        SkillStructuredDependency,
-    };
-    use model_protocol::telemetry::{MemoryTelemetrySink, SessionTracer, TelemetryEvent};
     use model_protocol::usage::TokenUsage;
     use std::fs;
-    use std::future::Future;
-    use std::path::PathBuf;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex, OnceLock};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
+    use std::sync::Arc;
+    use std::time::Duration;
 
     #[test]
     fn prepared_vision_payload_becomes_user_image_message() {
@@ -7353,39 +6154,6 @@ mod tests {
         }
     }
 
-    fn test_skill_profile(
-        skill_id: &str,
-        name: &str,
-        adapter: SkillAdapterKind,
-    ) -> SkillCapabilityProfile {
-        SkillCapabilityProfile {
-            skill_id: skill_id.to_string(),
-            name: name.to_string(),
-            version: Some("1.0.0".to_string()),
-            source_root: "/tmp/cowd-skill".to_string(),
-            package_fingerprint: "test-fingerprint".to_string(),
-            kind: SkillKind::Document,
-            lifecycle_status: SkillLifecycleStatus::UsablePrompt,
-            adapters: vec![adapter],
-            risk_level: SkillRiskLevel::Low,
-            entrypoints: vec![SkillEntrypoint {
-                runtime: SkillDetectedRuntime::Markdown,
-                path: "SKILL.md".to_string(),
-                adapter,
-                command_hint: None,
-            }],
-            inspection_summary: vec!["release review planning".to_string()],
-            structured_dependencies: Vec::new(),
-        }
-    }
-
-    // M1 helper: convert Vec<AssistantEvent> into a Stream for test mocks
-    fn to_stream(
-        events: Vec<AssistantEvent>,
-    ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + 'static>> {
-        Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
-    }
-
     #[test]
     fn preview_chars_handles_multibyte_text() {
         let text = "再次美化模型与状态展示，确保中文截断不会 panic".repeat(8);
@@ -7393,244 +6161,6 @@ mod tests {
 
         assert!(preview.ends_with("..."));
         assert!(text.starts_with(preview.trim_end_matches("...")));
-    }
-
-    struct ScriptedApiClient {
-        call_count: usize,
-    }
-
-    struct UnavailableApiClient {
-        call_count: Arc<AtomicUsize>,
-    }
-
-    struct DirectWriteApiClient {
-        call_count: usize,
-    }
-
-    impl ApiClient for DirectWriteApiClient {
-        fn stream(
-            &mut self,
-            _request: ApiRequest,
-        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
-            self.call_count += 1;
-            let events = if self.call_count == 1 {
-                vec![
-                    AssistantEvent::ToolUse {
-                        id: "direct-write-1".to_string(),
-                        name: "write_file".to_string(),
-                        input: r#"{"path":"README.md","content":"unsafe"}"#.to_string(),
-                    },
-                    AssistantEvent::MessageStop,
-                ]
-            } else {
-                vec![
-                    AssistantEvent::TextDelta(
-                        "I cannot mutate files from the direct answer strategy.".to_string(),
-                    ),
-                    AssistantEvent::MessageStop,
-                ]
-            };
-            Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
-        }
-    }
-
-    impl ApiClient for UnavailableApiClient {
-        fn stream(
-            &mut self,
-            _request: ApiRequest,
-        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
-            self.call_count.fetch_add(1, Ordering::SeqCst);
-            Box::pin(futures::stream::empty())
-        }
-
-        fn provider_available(&self) -> bool {
-            false
-        }
-    }
-
-    impl ApiClient for ScriptedApiClient {
-        fn stream(
-            &mut self,
-            request: ApiRequest,
-        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
-            use futures::stream;
-            fn wrap(
-                v: Vec<AssistantEvent>,
-            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + 'static>>
-            {
-                Box::pin(stream::iter(v.into_iter().map(Ok)))
-            }
-            self.call_count += 1;
-            let events = match self.call_count {
-                1 => {
-                    assert!(request
-                        .messages
-                        .iter()
-                        .any(|message| message.role == MessageRole::User));
-                    vec![
-                        AssistantEvent::TextDelta("Let me calculate that.".to_string()),
-                        AssistantEvent::ToolUse {
-                            id: "tool-1".to_string(),
-                            name: "add".to_string(),
-                            input: "2,2".to_string(),
-                        },
-                        AssistantEvent::Usage(TokenUsage {
-                            input_tokens: 20,
-                            output_tokens: 6,
-                            cache_creation_input_tokens: 1,
-                            cache_read_input_tokens: 2,
-                        }),
-                        AssistantEvent::MessageStop,
-                    ]
-                }
-                2 => {
-                    let last_message = request
-                        .messages
-                        .last()
-                        .expect("tool result should be present");
-                    assert_eq!(last_message.role, MessageRole::Tool);
-                    vec![
-                        AssistantEvent::TextDelta("The answer is 4.".to_string()),
-                        AssistantEvent::Usage(TokenUsage {
-                            input_tokens: 24,
-                            output_tokens: 4,
-                            cache_creation_input_tokens: 1,
-                            cache_read_input_tokens: 3,
-                        }),
-                        AssistantEvent::PromptCache(PromptCacheEvent {
-                            unexpected: true,
-                            reason:
-                                "cache read tokens dropped while prompt fingerprint remained stable"
-                                    .to_string(),
-                            previous_cache_read_input_tokens: 6_000,
-                            current_cache_read_input_tokens: 1_000,
-                            token_drop: 5_000,
-                        }),
-                        AssistantEvent::MessageStop,
-                    ]
-                }
-                _ => unreachable!("extra API call"),
-            };
-            wrap(events)
-        }
-    }
-
-    struct MultiToolApiClient {
-        call_count: usize,
-        tool_uses: Vec<(String, String, String)>,
-    }
-
-    impl MultiToolApiClient {
-        fn new(tool_uses: Vec<(&str, &str, &str)>) -> Self {
-            Self {
-                call_count: 0,
-                tool_uses: tool_uses
-                    .into_iter()
-                    .map(|(id, name, input)| (id.to_string(), name.to_string(), input.to_string()))
-                    .collect(),
-            }
-        }
-    }
-
-    impl ApiClient for MultiToolApiClient {
-        fn stream(
-            &mut self,
-            request: ApiRequest,
-        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
-            use futures::stream;
-            self.call_count += 1;
-            let events = match self.call_count {
-                1 => {
-                    assert!(request
-                        .messages
-                        .iter()
-                        .any(|message| message.role == MessageRole::User));
-                    let mut events = vec![AssistantEvent::TextDelta(
-                        "I will inspect in parallel.".to_string(),
-                    )];
-                    for (id, name, input) in self.tool_uses.clone() {
-                        events.push(AssistantEvent::ToolUse { id, name, input });
-                    }
-                    events.push(AssistantEvent::MessageStop);
-                    events
-                }
-                2 => {
-                    let tool_message_count = request
-                        .messages
-                        .iter()
-                        .filter(|message| message.role == MessageRole::Tool)
-                        .count();
-                    assert!(
-                        tool_message_count >= self.tool_uses.len(),
-                        "second provider request should include every tool result"
-                    );
-                    vec![
-                        AssistantEvent::TextDelta("Done.".to_string()),
-                        AssistantEvent::MessageStop,
-                    ]
-                }
-                _ => unreachable!("extra API call"),
-            };
-            Box::pin(stream::iter(events.into_iter().map(Ok)))
-        }
-    }
-
-    struct EndlessToolApiClient {
-        call_count: usize,
-    }
-
-    impl ApiClient for EndlessToolApiClient {
-        fn stream(
-            &mut self,
-            _request: ApiRequest,
-        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
-            use futures::stream;
-            self.call_count += 1;
-            Box::pin(stream::iter(
-                vec![
-                    AssistantEvent::TextDelta("checking".to_string()),
-                    AssistantEvent::ToolUse {
-                        id: format!("tool-{}", self.call_count),
-                        name: "read_file".to_string(),
-                        input: r#"{"path":"README.md"}"#.to_string(),
-                    },
-                    AssistantEvent::MessageStop,
-                ]
-                .into_iter()
-                .map(Ok),
-            ))
-        }
-    }
-
-    struct PromptAllowAll;
-
-    impl PermissionPrompter for PromptAllowAll {
-        fn decide(&mut self, _request: &PermissionRequest) -> PermissionPromptDecision {
-            PermissionPromptDecision::Allow
-        }
-    }
-
-    fn tracked_tool_handler(
-        active: Arc<AtomicUsize>,
-        max_active: Arc<AtomicUsize>,
-        delay: Duration,
-    ) -> impl Fn(&str) -> Result<String, ToolError> + Send + Sync + 'static {
-        move |input| {
-            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
-            max_active.fetch_max(current, Ordering::SeqCst);
-            std::thread::sleep(delay);
-            active.fetch_sub(1, Ordering::SeqCst);
-            Ok(format!("ok:{input}"))
-        }
-    }
-
-    struct PromptAllowOnce;
-
-    impl PermissionPrompter for PromptAllowOnce {
-        fn decide(&mut self, request: &PermissionRequest) -> PermissionPromptDecision {
-            assert_eq!(request.tool_name, "add");
-            PermissionPromptDecision::Allow
-        }
     }
 
     #[test]
@@ -7772,48 +6302,10 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_wall_speed_is_primary_and_tiny_active_duration_is_ignored() {
+    fn telemetry_wall_speed_uses_wall_duration() {
         let wall_speed = rate_per_second(8_562, 178_350).expect("wall speed");
-        let tiny_active = active_rate_per_second(8_562, Some(1));
-        let normal_active = active_rate_per_second(8_562, Some(2_000)).expect("active speed");
 
         assert!((wall_speed - 48.01).abs() < 0.2);
-        assert_eq!(tiny_active, None);
-        assert!(normal_active > wall_speed);
-    }
-
-    #[test]
-    fn max_iteration_tool_loop_returns_partial_report() {
-        let tool_executor =
-            StaticToolExecutor::new().register("read_file", |_input| Ok("same evidence".into()));
-        let mut runtime = ConversationRuntime::new(
-            Session::new(),
-            EndlessToolApiClient { call_count: 0 },
-            tool_executor,
-            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
-            vec!["system".to_string()],
-        )
-        .without_memory()
-        .with_max_iterations(1);
-
-        let prompter = SharedPrompter::new(Box::new(PromptAllowAll));
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let summary = rt
-            .block_on(runtime.run_turn_async("inspect until done", &prompter))
-            .expect("tool governance should return partial report instead of an error");
-
-        let final_text = summary
-            .assistant_messages
-            .last()
-            .and_then(|message| message.blocks.first())
-            .and_then(|block| match block {
-                ContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .unwrap_or_default();
-        assert!(final_text.contains("partial answer"));
-        assert!(final_text.contains("max iterations exceeded"));
-        assert_eq!(summary.tool_results.len(), 1);
     }
 
     #[test]
@@ -7833,42 +6325,6 @@ mod tests {
         assert_eq!(runtime.max_iterations(), 8);
         runtime.set_max_iterations(original);
         assert_eq!(runtime.max_iterations(), original);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn unavailable_provider_blocks_before_the_provider_stream_starts() {
-        let call_count = Arc::new(AtomicUsize::new(0));
-        let mut runtime = ConversationRuntime::new(
-            Session::new(),
-            UnavailableApiClient {
-                call_count: Arc::clone(&call_count),
-            },
-            StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
-            vec!["system".to_string()],
-        )
-        .without_memory();
-        let before_input_projection = runtime.session_input_projection();
-
-        let error = runtime
-            .run_turn_async("解释这个名称", &SharedPrompter::none())
-            .await
-            .expect_err("unavailable provider must block the turn");
-
-        assert!(error.to_string().contains("provider runtime unavailable"));
-        assert_eq!(call_count.load(Ordering::SeqCst), 0);
-        assert!(runtime.session().messages.is_empty());
-        let after_input_projection = runtime.session_input_projection();
-        assert_eq!(after_input_projection.active_turn_id, None);
-        assert_eq!(after_input_projection.total, before_input_projection.total);
-        assert_eq!(
-            after_input_projection.queued_next_count,
-            before_input_projection.queued_next_count
-        );
-        assert_eq!(
-            after_input_projection.pending_count,
-            before_input_projection.pending_count
-        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -8037,833 +6493,6 @@ mod tests {
     }
 
     #[test]
-    fn runs_user_to_tool_to_result_loop_end_to_end_and_tracks_usage() {
-        let api_client = ScriptedApiClient { call_count: 0 };
-        let tool_executor = StaticToolExecutor::new().register("add", |input| {
-            let total = input
-                .split(',')
-                .map(|part| part.parse::<i32>().expect("input must be valid integer"))
-                .sum::<i32>();
-            Ok(total.to_string())
-        });
-        let permission_policy = PermissionPolicy::new(PermissionMode::WorkspaceWrite);
-        let system_prompt = SystemPromptBuilder::new()
-            .with_project_context(ProjectContext {
-                cwd: PathBuf::from("/tmp/project"),
-                current_date: "2026-03-31".to_string(),
-                git_status: None,
-                git_diff: None,
-                git_context: None,
-                instruction_files: Vec::new(),
-            })
-            .with_os("linux", "6.8")
-            .build();
-        let mut runtime = ConversationRuntime::new(
-            Session::new(),
-            api_client,
-            tool_executor,
-            permission_policy,
-            system_prompt,
-        );
-
-        let prompter = SharedPrompter::new(Box::new(PromptAllowOnce));
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let summary = rt
-            .block_on(runtime.run_turn_async(
-                "implement this calculation using the add tool: what is 2 + 2?",
-                &prompter,
-            ))
-            .expect("conversation loop should succeed");
-
-        assert_eq!(summary.iterations, 2);
-        assert_eq!(summary.assistant_messages.len(), 2);
-        assert_eq!(summary.tool_results.len(), 1);
-        assert_eq!(summary.prompt_cache_events.len(), 1);
-        assert_eq!(runtime.session().messages.len(), 4);
-        assert_eq!(summary.usage.output_tokens, 10);
-        assert_eq!(summary.model_telemetry.usage_source, "provider");
-        assert_eq!(summary.model_telemetry.input_tokens, 44);
-        assert_eq!(summary.model_telemetry.output_tokens, 10);
-        assert_eq!(summary.model_telemetry.cache_create_tokens, 2);
-        assert_eq!(summary.model_telemetry.cache_read_tokens, 5);
-        assert!(summary.model_telemetry.first_token_latency_ms.is_some());
-        assert!(summary.model_telemetry.output_chars > 0);
-        assert!(summary.model_telemetry.output_chunks >= 2);
-        assert!(summary.model_telemetry.tokens_per_second.is_some());
-        assert_eq!(summary.auto_compaction, None);
-        assert_eq!(
-            summary.ai_kernel_trace.execution_decision.strategy.pattern,
-            harness_contract::core::ExecutionPattern::Execute
-        );
-        assert!(summary.ai_kernel_trace.verification_report.can_finalize);
-        assert!(summary.ai_kernel_trace.tool_transaction.is_some());
-        assert!(summary.ai_kernel_trace.tool_receipt.is_some());
-        assert!(summary.ai_kernel_trace.bench_result.passed);
-        assert!(summary.ai_kernel_trace.regression_gate.allowed);
-        assert!(!summary.ai_kernel_trace.learning_record.has_blocker());
-        assert!(matches!(
-            runtime.session().messages[1].blocks[1],
-            ContentBlock::ToolUse { .. }
-        ));
-        assert!(matches!(
-            runtime.session().messages[2].blocks[0],
-            ContentBlock::ToolResult {
-                is_error: false,
-                ..
-            }
-        ));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn direct_strategy_denies_mutating_model_tool_use_before_dispatch() {
-        let executions = Arc::new(AtomicUsize::new(0));
-        let observed = Arc::clone(&executions);
-        let tool_executor = StaticToolExecutor::new().register("write_file", move |_| {
-            observed.fetch_add(1, Ordering::SeqCst);
-            Ok("unexpected write".to_string())
-        });
-        let mut runtime = ConversationRuntime::new(
-            Session::new(),
-            DirectWriteApiClient { call_count: 0 },
-            tool_executor,
-            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
-            vec!["system".to_string()],
-        )
-        .without_memory();
-
-        let summary = runtime
-            .run_turn_async("解释这个名称", &SharedPrompter::none())
-            .await
-            .expect("the model should recover from a denied tool request");
-
-        assert_eq!(
-            summary.ai_kernel_trace.execution_decision.pattern(),
-            harness_contract::core::ExecutionPattern::Direct
-        );
-        assert_eq!(executions.load(Ordering::SeqCst), 0);
-        assert_eq!(summary.tool_results.len(), 1);
-        assert!(summary.tool_results[0].blocks.iter().any(|block| {
-            matches!(block, ContentBlock::ToolResult { output, is_error: true, .. }
-                if output.contains("tool_category_not_allowed_by_compile_target"))
-        }));
-    }
-
-    #[test]
-    fn real_tool_execution_emits_cowd_lifecycle_events() {
-        use crate::cowd_event::{CowdEvent, CowdEventBus};
-
-        let bus = CowdEventBus::new();
-        let mut rx = bus.subscribe();
-        let tool_executor = StaticToolExecutor::new().register("add", |_input| Ok("4".to_string()));
-        let mut runtime = ConversationRuntime::new(
-            Session::new(),
-            ScriptedApiClient { call_count: 0 },
-            tool_executor,
-            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
-            vec!["system".to_string()],
-        )
-        .with_cowd_event_bus(bus);
-
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(runtime.run_turn_async(
-            "what is 2 + 2?",
-            &SharedPrompter::new(Box::new(PromptAllowOnce)),
-        ))
-        .expect("tool turn should succeed");
-
-        let events = rt.block_on(async {
-            let mut events = Vec::new();
-            for _ in 0..128 {
-                if let Ok(Ok(event)) =
-                    tokio::time::timeout(Duration::from_millis(50), rx.recv()).await
-                {
-                    let turn_complete = matches!(event, CowdEvent::TurnComplete { .. });
-                    events.push(event);
-                    if turn_complete {
-                        break;
-                    }
-                }
-            }
-            events
-        });
-
-        assert!(
-            events.iter().any(|event| matches!(
-                event,
-                CowdEvent::ToolStart { id, name, preview }
-                    if id == "tool-1" && name == "add" && preview == "2,2"
-            )),
-            "{events:#?}"
-        );
-        assert!(
-            events.iter().any(|event| matches!(
-                event,
-                CowdEvent::ToolComplete {
-                    id,
-                    name,
-                    summary,
-                    exit_code
-                } if id == "tool-1" && name == "add" && summary == "4" && *exit_code == Some(0)
-            )),
-            "{events:#?}"
-        );
-        assert!(
-            events.iter().any(|event| matches!(
-                event,
-                CowdEvent::ToolExecuted { name, .. } if name == "add"
-            )),
-            "{events:#?}"
-        );
-    }
-
-    #[test]
-    fn conversation_runs_limited_network_tools_concurrently() {
-        let active = Arc::new(AtomicUsize::new(0));
-        let max_active = Arc::new(AtomicUsize::new(0));
-        let tool_executor = StaticToolExecutor::new()
-            .register(
-                "WebSearch",
-                tracked_tool_handler(
-                    Arc::clone(&active),
-                    Arc::clone(&max_active),
-                    Duration::from_millis(80),
-                ),
-            )
-            .register(
-                "WebFetch",
-                tracked_tool_handler(
-                    Arc::clone(&active),
-                    Arc::clone(&max_active),
-                    Duration::from_millis(80),
-                ),
-            );
-        let mut runtime = ConversationRuntime::new(
-            Session::new(),
-            MultiToolApiClient::new(vec![
-                ("net-1", "WebSearch", r#"{"query":"rust"}"#),
-                ("net-2", "WebFetch", r#"{"url":"https://example.test"}"#),
-            ]),
-            tool_executor,
-            PermissionPolicy::new(PermissionMode::Allow),
-            vec!["system".to_string()],
-        );
-
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(runtime.run_turn_async(
-                "parallel research the latest web evidence",
-                &SharedPrompter::new(Box::new(PromptAllowAll)),
-            ))
-            .expect("network tools should execute");
-
-        assert_eq!(
-            max_active.load(Ordering::SeqCst),
-            2,
-            "network batch should run with limited parallelism instead of serial rest loop"
-        );
-    }
-
-    #[test]
-    fn conversation_serializes_write_tools_with_same_scope() {
-        let active = Arc::new(AtomicUsize::new(0));
-        let max_active = Arc::new(AtomicUsize::new(0));
-        let tool_executor = StaticToolExecutor::new().register(
-            "write_file",
-            tracked_tool_handler(
-                Arc::clone(&active),
-                Arc::clone(&max_active),
-                Duration::from_millis(60),
-            ),
-        );
-        let mut runtime = ConversationRuntime::new(
-            Session::new(),
-            MultiToolApiClient::new(vec![
-                (
-                    "write-1",
-                    "write_file",
-                    r#"{"path":"shared.txt","content":"a"}"#,
-                ),
-                (
-                    "write-2",
-                    "write_file",
-                    r#"{"path":"shared.txt","content":"b"}"#,
-                ),
-            ]),
-            tool_executor,
-            PermissionPolicy::new(PermissionMode::Allow),
-            vec!["system".to_string()],
-        );
-
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(runtime.run_turn_async(
-                "parallel implement two writes to the same file",
-                &SharedPrompter::new(Box::new(PromptAllowAll)),
-            ))
-            .expect("write tools should execute");
-
-        assert_eq!(
-            max_active.load(Ordering::SeqCst),
-            1,
-            "same-scope write tools must stay serial to avoid file races"
-        );
-    }
-
-    #[test]
-    fn conversation_runs_write_tools_for_different_scopes_concurrently() {
-        let active = Arc::new(AtomicUsize::new(0));
-        let max_active = Arc::new(AtomicUsize::new(0));
-        let tool_executor = StaticToolExecutor::new().register(
-            "write_file",
-            tracked_tool_handler(
-                Arc::clone(&active),
-                Arc::clone(&max_active),
-                Duration::from_millis(60),
-            ),
-        );
-        let mut runtime = ConversationRuntime::new(
-            Session::new(),
-            MultiToolApiClient::new(vec![
-                ("write-1", "write_file", r#"{"path":"a.txt","content":"a"}"#),
-                ("write-2", "write_file", r#"{"path":"b.txt","content":"b"}"#),
-            ]),
-            tool_executor,
-            PermissionPolicy::new(PermissionMode::Allow),
-            vec!["system".to_string()],
-        );
-
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(runtime.run_turn_async(
-                "parallel implement changes to two independent files",
-                &SharedPrompter::new(Box::new(PromptAllowAll)),
-            ))
-            .expect("independent write tools should execute");
-
-        assert_eq!(
-            max_active.load(Ordering::SeqCst),
-            2,
-            "different write scopes should run concurrently under the write limit"
-        );
-    }
-
-    #[test]
-    fn conversation_tool_events_can_use_ledger_bridge() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        unsafe {
-            std::env::set_var("COWD_TOOL_LEDGER_V2", "1");
-        }
-
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
-            let session = Session::new();
-            let session_id = session.session_id.clone();
-            let now = "2026-06-16T00:00:00Z".to_string();
-            store
-                .create_session(&memory::SessionRecord {
-                    session_id: session_id.clone(),
-                    platform: "test".to_string(),
-                    chat_id: session_id.clone(),
-                    user_id: None,
-                    model: Some("test-model".to_string()),
-                    created_at: now.clone(),
-                    last_activity: now,
-                    message_count: 0,
-                    reset_policy: "none".to_string(),
-                    metadata_json: None,
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    estimated_cost_usd: 0.0,
-                    status: "active".to_string(),
-                })
-                .await
-                .unwrap();
-
-            let tool_executor = StaticToolExecutor::new().register("add", |input| {
-                let total = input
-                    .split(',')
-                    .map(|part| part.parse::<i32>().expect("input must be valid integer"))
-                    .sum::<i32>();
-                Ok(total.to_string())
-            });
-            let mut runtime = ConversationRuntime::new(
-                session,
-                ScriptedApiClient { call_count: 0 },
-                tool_executor,
-                PermissionPolicy::new(PermissionMode::WorkspaceWrite),
-                vec!["system".to_string()],
-            )
-            .with_session_store(Arc::clone(&store));
-
-            runtime
-                .run_turn_async(
-                    "what is 2 + 2?",
-                    &SharedPrompter::new(Box::new(PromptAllowOnce)),
-                )
-                .await
-                .expect("tool turn should succeed");
-
-            for _ in 0..40 {
-                let events = store.get_events(&session_id, 0).await.unwrap();
-                let runtime_kinds = events
-                    .iter()
-                    .filter_map(|event| memory::RuntimeEvent::from_session_event(event).ok())
-                    .map(|event| event.kind)
-                    .collect::<Vec<_>>();
-                if runtime_kinds
-                    .iter()
-                    .any(|kind| kind == "tool.execution_plan.created")
-                    && runtime_kinds
-                        .iter()
-                        .any(|kind| kind == "tool.schedule.created")
-                    && runtime_kinds
-                        .iter()
-                        .any(|kind| kind == "tool.invocation.started")
-                    && runtime_kinds
-                        .iter()
-                        .any(|kind| kind == "tool.invocation.completed")
-                {
-                    unsafe {
-                        std::env::remove_var("COWD_TOOL_LEDGER_V2");
-                    }
-                    return;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-
-            let events = store.get_events(&session_id, 0).await.unwrap();
-            let runtime_kinds = events
-                .iter()
-                .filter_map(|event| memory::RuntimeEvent::from_session_event(event).ok())
-                .map(|event| event.kind)
-                .collect::<Vec<_>>();
-            unsafe {
-                std::env::remove_var("COWD_TOOL_LEDGER_V2");
-            }
-            panic!("missing expected tool runtime events: {runtime_kinds:?}");
-        });
-    }
-
-    #[test]
-    fn records_runtime_session_trace_events() {
-        let sink = Arc::new(MemoryTelemetrySink::default());
-        let tracer = SessionTracer::new("session-runtime", sink.clone());
-        let mut runtime = ConversationRuntime::new(
-            Session::new(),
-            ScriptedApiClient { call_count: 0 },
-            StaticToolExecutor::new().register("add", |_input| Ok("4".to_string())),
-            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
-            vec!["system".to_string()],
-        )
-        .with_session_tracer(tracer);
-
-        let prompter = SharedPrompter::new(Box::new(PromptAllowOnce));
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(runtime.run_turn_async("what is 2 + 2?", &prompter))
-            .expect("conversation loop should succeed");
-
-        let events = sink.events();
-        let trace_names = events
-            .iter()
-            .filter_map(|event| match event {
-                TelemetryEvent::SessionTrace(trace) => Some(trace.name.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-
-        assert!(trace_names.contains(&"turn_started"));
-        assert!(trace_names.contains(&"assistant_iteration_completed"));
-        assert!(trace_names.contains(&"tool_execution_started"));
-        assert!(trace_names.contains(&"tool_execution_finished"));
-        assert!(trace_names.contains(&"turn_completed"));
-    }
-
-    #[test]
-    fn records_denied_tool_results_when_prompt_rejects() {
-        struct RejectPrompter;
-        impl PermissionPrompter for RejectPrompter {
-            fn decide(&mut self, _request: &PermissionRequest) -> PermissionPromptDecision {
-                PermissionPromptDecision::Deny {
-                    reason: "not now".to_string(),
-                }
-            }
-        }
-
-        struct SingleCallApiClient;
-        impl ApiClient for SingleCallApiClient {
-            fn stream(
-                &mut self,
-                request: ApiRequest,
-            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
-            {
-                if request
-                    .messages
-                    .iter()
-                    .any(|message| message.role == MessageRole::Tool)
-                {
-                    return to_stream(vec![
-                        AssistantEvent::TextDelta("I could not use the tool.".to_string()),
-                        AssistantEvent::MessageStop,
-                    ]);
-                }
-                to_stream(vec![
-                    AssistantEvent::ToolUse {
-                        id: "tool-1".to_string(),
-                        name: "blocked".to_string(),
-                        input: "secret".to_string(),
-                    },
-                    AssistantEvent::MessageStop,
-                ])
-            }
-        }
-
-        let mut runtime = ConversationRuntime::new(
-            Session::new(),
-            SingleCallApiClient,
-            StaticToolExecutor::new().register("blocked", |_| {
-                panic!("permission denial must happen before tool dispatch")
-            }),
-            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
-            vec!["system".to_string()],
-        );
-
-        let prompter = SharedPrompter::new(Box::new(RejectPrompter));
-        let handle = tokio::runtime::Handle::try_current()
-            .unwrap_or_else(|_| tokio::runtime::Runtime::new().unwrap().handle().clone());
-        let summary = handle
-            .block_on(
-                runtime
-                    .run_turn_async("implement the change in parallel using the tool", &prompter),
-            )
-            .expect("conversation should continue after denied tool");
-
-        assert_eq!(summary.tool_results.len(), 1);
-        assert!(matches!(
-            &summary.tool_results[0].blocks[0],
-            ContentBlock::ToolResult { is_error: true, output, .. } if output == "not now"
-        ));
-    }
-
-    #[test]
-    fn denies_tool_use_when_pre_tool_hook_blocks() {
-        struct SingleCallApiClient;
-        impl ApiClient for SingleCallApiClient {
-            fn stream(
-                &mut self,
-                request: ApiRequest,
-            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
-            {
-                if request
-                    .messages
-                    .iter()
-                    .any(|message| message.role == MessageRole::Tool)
-                {
-                    return to_stream(vec![
-                        AssistantEvent::TextDelta("blocked".to_string()),
-                        AssistantEvent::MessageStop,
-                    ]);
-                }
-                to_stream(vec![
-                    AssistantEvent::ToolUse {
-                        id: "tool-1".to_string(),
-                        name: "blocked".to_string(),
-                        input: r#"{"path":"secret.txt"}"#.to_string(),
-                    },
-                    AssistantEvent::MessageStop,
-                ])
-            }
-        }
-
-        let mut runtime = ConversationRuntime::new_with_features(
-            Session::new(),
-            SingleCallApiClient,
-            Arc::new(StaticToolExecutor::new().register("blocked", |_input| {
-                panic!("tool should not execute when hook denies")
-            })),
-            PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()],
-            &RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
-                vec![shell_snippet("printf 'blocked by hook'; exit 2")],
-                Vec::new(),
-                Vec::new(),
-            )),
-        );
-
-        let prompter = SharedPrompter::none();
-        let handle = tokio::runtime::Handle::try_current()
-            .unwrap_or_else(|_| tokio::runtime::Runtime::new().unwrap().handle().clone());
-        let summary = handle
-            .block_on(
-                runtime
-                    .run_turn_async("implement the change in parallel using the tool", &prompter),
-            )
-            .expect("conversation should continue after hook denial");
-
-        assert_eq!(summary.tool_results.len(), 1);
-        let ContentBlock::ToolResult {
-            is_error, output, ..
-        } = &summary.tool_results[0].blocks[0]
-        else {
-            panic!("expected tool result block");
-        };
-        assert!(
-            *is_error,
-            "hook denial should produce an error result: {output}"
-        );
-        assert!(
-            output.contains("denied tool") || output.contains("blocked by hook"),
-            "unexpected hook denial output: {output:?}"
-        );
-    }
-
-    #[test]
-    fn denies_tool_use_when_pre_tool_hook_fails() {
-        struct SingleCallApiClient;
-        impl ApiClient for SingleCallApiClient {
-            fn stream(
-                &mut self,
-                request: ApiRequest,
-            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
-            {
-                if request
-                    .messages
-                    .iter()
-                    .any(|message| message.role == MessageRole::Tool)
-                {
-                    return to_stream(vec![
-                        AssistantEvent::TextDelta("failed".to_string()),
-                        AssistantEvent::MessageStop,
-                    ]);
-                }
-                to_stream(vec![
-                    AssistantEvent::ToolUse {
-                        id: "tool-1".to_string(),
-                        name: "blocked".to_string(),
-                        input: r#"{"path":"secret.txt"}"#.to_string(),
-                    },
-                    AssistantEvent::MessageStop,
-                ])
-            }
-        }
-
-        // given
-        let mut runtime = ConversationRuntime::new_with_features(
-            Session::new(),
-            SingleCallApiClient,
-            Arc::new(StaticToolExecutor::new().register("blocked", |_input| {
-                panic!("tool should not execute when hook fails")
-            })),
-            PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()],
-            &RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
-                vec![shell_snippet("printf 'broken hook'; exit 1")],
-                Vec::new(),
-                Vec::new(),
-            )),
-        );
-
-        // when
-        let prompter = SharedPrompter::none();
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let summary = rt
-            .block_on(
-                runtime
-                    .run_turn_async("implement the change in parallel using the tool", &prompter),
-            )
-            .expect("conversation should continue after hook failure");
-
-        // then
-        assert_eq!(summary.tool_results.len(), 1);
-        let ContentBlock::ToolResult {
-            is_error, output, ..
-        } = &summary.tool_results[0].blocks[0]
-        else {
-            panic!("expected tool result block");
-        };
-        assert!(
-            *is_error,
-            "hook failure should produce an error result: {output}"
-        );
-        assert!(
-            output.contains("exited with status 1") || output.contains("broken hook"),
-            "unexpected hook failure output: {output:?}"
-        );
-    }
-
-    #[test]
-    fn appends_post_tool_hook_feedback_to_tool_result() {
-        struct TwoCallApiClient {
-            calls: usize,
-        }
-
-        impl ApiClient for TwoCallApiClient {
-            fn stream(
-                &mut self,
-                request: ApiRequest,
-            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
-            {
-                self.calls += 1;
-                match self.calls {
-                    1 => to_stream(vec![
-                        AssistantEvent::ToolUse {
-                            id: "tool-1".to_string(),
-                            name: "add".to_string(),
-                            input: r#"{"lhs":2,"rhs":2}"#.to_string(),
-                        },
-                        AssistantEvent::MessageStop,
-                    ]),
-                    2 => {
-                        assert!(request
-                            .messages
-                            .iter()
-                            .any(|message| message.role == MessageRole::Tool));
-                        to_stream(vec![
-                            AssistantEvent::TextDelta("done".to_string()),
-                            AssistantEvent::MessageStop,
-                        ])
-                    }
-                    _ => unreachable!("extra API call"),
-                }
-            }
-        }
-
-        let mut runtime = ConversationRuntime::new_with_features(
-            Session::new(),
-            TwoCallApiClient { calls: 0 },
-            Arc::new(StaticToolExecutor::new().register("add", |_input| Ok("4".to_string()))),
-            PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()],
-            &RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
-                vec![shell_snippet("printf 'pre hook ran'")],
-                vec![shell_snippet("printf 'post hook ran'")],
-                Vec::new(),
-            )),
-        );
-
-        let prompter = SharedPrompter::none();
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let summary = rt
-            .block_on(runtime.run_turn_async("use add", &prompter))
-            .expect("tool loop succeeds");
-
-        assert_eq!(summary.tool_results.len(), 1);
-        let ContentBlock::ToolResult {
-            is_error, output, ..
-        } = &summary.tool_results[0].blocks[0]
-        else {
-            panic!("expected tool result block");
-        };
-        assert!(
-            !*is_error,
-            "post hook should preserve non-error result: {output:?}"
-        );
-        assert!(
-            output.contains('4'),
-            "tool output missing value: {output:?}"
-        );
-        assert!(
-            output.contains("pre hook ran"),
-            "tool output missing pre hook feedback: {output:?}"
-        );
-        assert!(
-            output.contains("post hook ran"),
-            "tool output missing post hook feedback: {output:?}"
-        );
-    }
-
-    #[test]
-    fn appends_post_tool_use_failure_hook_feedback_to_tool_result() {
-        struct TwoCallApiClient {
-            calls: usize,
-        }
-
-        impl ApiClient for TwoCallApiClient {
-            fn stream(
-                &mut self,
-                request: ApiRequest,
-            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
-            {
-                self.calls += 1;
-                match self.calls {
-                    1 => to_stream(vec![
-                        AssistantEvent::ToolUse {
-                            id: "tool-1".to_string(),
-                            name: "fail".to_string(),
-                            input: r#"{"path":"README.md"}"#.to_string(),
-                        },
-                        AssistantEvent::MessageStop,
-                    ]),
-                    2 => {
-                        assert!(request
-                            .messages
-                            .iter()
-                            .any(|message| message.role == MessageRole::Tool));
-                        to_stream(vec![
-                            AssistantEvent::TextDelta("done".to_string()),
-                            AssistantEvent::MessageStop,
-                        ])
-                    }
-                    _ => unreachable!("extra API call"),
-                }
-            }
-        }
-
-        // given
-        let mut runtime = ConversationRuntime::new_with_features(
-            Session::new(),
-            TwoCallApiClient { calls: 0 },
-            Arc::new(
-                StaticToolExecutor::new()
-                    .register("fail", |_input| Err(ToolError::new("tool exploded"))),
-            ),
-            PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()],
-            &RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
-                Vec::new(),
-                vec![shell_snippet("printf 'post hook should not run'")],
-                vec![shell_snippet("printf 'failure hook ran'")],
-            )),
-        );
-
-        // when
-        let prompter = SharedPrompter::none();
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let summary = rt
-            .block_on(
-                runtime.run_turn_async("implement the change in parallel using fail", &prompter),
-            )
-            .expect("tool loop succeeds");
-
-        // then
-        assert_eq!(summary.tool_results.len(), 1);
-        let ContentBlock::ToolResult {
-            is_error, output, ..
-        } = &summary.tool_results[0].blocks[0]
-        else {
-            panic!("expected tool result block");
-        };
-        assert!(
-            *is_error,
-            "failure hook path should preserve error result: {output:?}"
-        );
-        assert!(
-            output.contains("tool exploded"),
-            "tool output missing failure reason: {output:?}"
-        );
-        assert!(
-            output.contains("failure hook ran"),
-            "tool output missing failure hook feedback: {output:?}"
-        );
-        assert!(
-            !output.contains("post hook should not run"),
-            "normal post hook should not run on tool failure: {output:?}"
-        );
-    }
-
-    #[test]
     fn reconstructs_usage_tracker_from_restored_session() {
         struct SimpleApi;
         impl ApiClient for SimpleApi {
@@ -8906,459 +6535,6 @@ mod tests {
         assert_eq!(runtime.usage().cumulative_usage().total_tokens(), 21);
     }
 
-    #[test]
-    fn compacts_session_after_turns() {
-        struct SimpleApi;
-        impl ApiClient for SimpleApi {
-            fn stream(
-                &mut self,
-                _request: ApiRequest,
-            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
-            {
-                Box::pin(futures::stream::iter(vec![
-                    Ok(AssistantEvent::TextDelta("done".to_string())),
-                    Ok(AssistantEvent::MessageStop),
-                ]))
-            }
-        }
-
-        let mut runtime = ConversationRuntime::new(
-            Session::new(),
-            SimpleApi,
-            StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()],
-        );
-        let prompter = SharedPrompter::none();
-        let handle = tokio::runtime::Handle::try_current()
-            .unwrap_or_else(|_| tokio::runtime::Runtime::new().unwrap().handle().clone());
-        handle
-            .block_on(runtime.run_turn_async("a", &prompter))
-            .expect("turn a");
-        handle
-            .block_on(runtime.run_turn_async("b", &prompter))
-            .expect("turn b");
-        handle
-            .block_on(runtime.run_turn_async("c", &prompter))
-            .expect("turn c");
-
-        let result = runtime.compact(CompactionConfig {
-            preserve_recent_messages: 2,
-            max_estimated_tokens: 1,
-            priority_threshold: 3,
-            keep_high_priority: true,
-        });
-        assert!(result.summary.contains("Conversation summary"));
-        assert_eq!(
-            result.compacted_session.messages[0].role,
-            MessageRole::System
-        );
-        assert_eq!(
-            result.compacted_session.session_id,
-            runtime.session().session_id
-        );
-        assert!(result.compacted_session.compaction.is_some());
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn auto_compaction_writes_traceable_semantic_checkpoint() {
-        struct SimpleApi;
-        impl ApiClient for SimpleApi {
-            fn stream(
-                &mut self,
-                _request: ApiRequest,
-            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
-            {
-                Box::pin(futures::stream::iter(vec![
-                    Ok(AssistantEvent::TextDelta(
-                        "we should preserve the migration constraint and next todo".to_string(),
-                    )),
-                    Ok(AssistantEvent::MessageStop),
-                ]))
-            }
-        }
-
-        let tmp = tempfile::tempdir().unwrap();
-        let blob_dir = tmp.path().join("blobs");
-        std::fs::create_dir_all(&blob_dir).unwrap();
-        let mem_cfg = memory::config::MemoryConfig {
-            store: memory::config::StoreConfig {
-                sqlite_path: tmp.path().join("memory.db"),
-                blob_dir,
-                enable_vector_index: false,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mgr = Arc::new(CognitiveContextManager::new(mem_cfg).await.unwrap());
-        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
-        let session = Session::new();
-        let session_id = session.session_id.clone();
-        let now = "2026-06-29T00:00:00Z".to_string();
-        store
-            .create_session(&memory::SessionRecord {
-                session_id: session_id.clone(),
-                platform: "test".to_string(),
-                chat_id: session_id.clone(),
-                user_id: None,
-                model: Some("test-model".to_string()),
-                created_at: now.clone(),
-                last_activity: now,
-                message_count: 0,
-                reset_policy: "none".to_string(),
-                metadata_json: None,
-                input_tokens: 0,
-                output_tokens: 0,
-                estimated_cost_usd: 0.0,
-                status: "active".to_string(),
-            })
-            .await
-            .unwrap();
-        let mut runtime = ConversationRuntime::new(
-            session,
-            SimpleApi,
-            StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()],
-        )
-        .with_memory_manager(Arc::clone(&mgr))
-        .with_session_store(Arc::clone(&store));
-        let prompter = SharedPrompter::none();
-
-        runtime
-            .run_turn_async("must keep the backend migration constraint", &prompter)
-            .await
-            .unwrap();
-        runtime
-            .run_turn_async("next we should verify checkpoint recall", &prompter)
-            .await
-            .unwrap();
-        runtime
-            .run_turn_async("record tool evidence and critical context", &prompter)
-            .await
-            .unwrap();
-
-        let event = runtime
-            .compact_session_with_checkpoint(CompactionConfig {
-                preserve_recent_messages: 2,
-                max_estimated_tokens: 1,
-                priority_threshold: 3,
-                keep_high_priority: true,
-            })
-            .await
-            .expect("compaction should run");
-        let receipt = event
-            .compaction_receipt
-            .expect("semantic compaction receipt should exist");
-
-        assert!(receipt
-            .dropped_artifact_ids
-            .iter()
-            .any(|id| id.starts_with("session-message:")));
-        assert!(receipt
-            .evidence_refs
-            .iter()
-            .any(|reference| reference.0.ref_type == "session-message"));
-        assert!(receipt
-            .retained_artifact_ids
-            .iter()
-            .any(|id| id.starts_with("checkpoint:")));
-        assert!(receipt
-            .retained_artifact_ids
-            .iter()
-            .any(|id| id.starts_with("memory:")));
-
-        let mut events = Vec::new();
-        for _ in 0..20 {
-            events = store.get_events(&session_id, 0).await.unwrap();
-            if events
-                .iter()
-                .filter_map(|event| memory::RuntimeEvent::from_session_event(event).ok())
-                .any(|event| event.kind == "context.session_compacted")
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        let runtime_events = events
-            .iter()
-            .filter_map(|event| memory::RuntimeEvent::from_session_event(event).ok())
-            .collect::<Vec<_>>();
-        assert!(runtime_events
-            .iter()
-            .any(|event| event.kind == "context.session_compacted"));
-        assert!(runtime_events
-            .iter()
-            .any(|event| event.kind == "memory.semantic_checkpoint.created"));
-
-        let entries = mgr.list_all_entries().await.unwrap();
-        assert!(entries.iter().any(|entry| {
-            entry.tags.iter().any(|tag| tag == "semantic-checkpoint")
-                && entry.content.contains("Evidence refs:")
-                && entry.session_id.as_deref() == Some(&session_id)
-        }));
-        let stored_count = store.get_message_count(&session_id).await.unwrap();
-        assert!(stored_count >= 6, "raw messages should remain persisted");
-    }
-
-    #[test]
-    fn legacy_jsonl_persistence_remains_explicit_codec_only() {
-        struct SimpleApi;
-        impl ApiClient for SimpleApi {
-            fn stream(
-                &mut self,
-                _request: ApiRequest,
-            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
-            {
-                Box::pin(futures::stream::iter(vec![
-                    Ok(AssistantEvent::TextDelta("done".to_string())),
-                    Ok(AssistantEvent::MessageStop),
-                ]))
-            }
-        }
-
-        let path = temp_session_path("persisted-turn");
-        let session = Session::new().with_persistence_path(path.clone());
-        let mut runtime = ConversationRuntime::new(
-            session,
-            SimpleApi,
-            StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()],
-        );
-
-        let prompter = SharedPrompter::none();
-        let handle = tokio::runtime::Handle::try_current()
-            .unwrap_or_else(|_| tokio::runtime::Runtime::new().unwrap().handle().clone());
-        handle
-            .block_on(runtime.run_turn_async("persist this turn", &prompter))
-            .expect("turn should succeed");
-
-        drop(runtime);
-
-        // Read back and verify through the explicit local import/export codec.
-        let restored = Session::load_from_path(&path).expect("persisted session should reload");
-        assert_eq!(restored.messages.len(), 2); // user + assistant
-        assert_eq!(restored.messages[0].role, MessageRole::User);
-        assert_eq!(restored.messages[1].role, MessageRole::Assistant);
-
-        fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn sqlite_session_store_is_runtime_turn_source_of_truth() {
-        struct SimpleApi;
-        impl ApiClient for SimpleApi {
-            fn stream(
-                &mut self,
-                _request: ApiRequest,
-            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
-            {
-                Box::pin(futures::stream::iter(vec![
-                    Ok(AssistantEvent::TextDelta("stored".to_string())),
-                    Ok(AssistantEvent::MessageStop),
-                ]))
-            }
-        }
-
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
-            let session = Session::new();
-            let session_id = session.session_id.clone();
-            let now = "2026-06-04T00:00:00Z".to_string();
-            store
-                .create_session(&memory::SessionRecord {
-                    session_id: session_id.clone(),
-                    platform: "test".to_string(),
-                    chat_id: session_id.clone(),
-                    user_id: None,
-                    model: Some("test-model".to_string()),
-                    created_at: now.clone(),
-                    last_activity: now,
-                    message_count: 0,
-                    reset_policy: "none".to_string(),
-                    metadata_json: None,
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    estimated_cost_usd: 0.0,
-                    status: "active".to_string(),
-                })
-                .await
-                .unwrap();
-
-            let mut runtime = ConversationRuntime::new(
-                session,
-                SimpleApi,
-                StaticToolExecutor::new(),
-                PermissionPolicy::new(PermissionMode::DangerFullAccess),
-                vec!["system".to_string()],
-            )
-            .with_session_store(Arc::clone(&store));
-            runtime.model = Some("test-model".to_string());
-
-            runtime
-                .run_turn_async("persist events", &SharedPrompter::none())
-                .await
-                .expect("turn should succeed");
-
-            for _ in 0..20 {
-                let events = store.get_events(&session_id, 0).await.unwrap();
-                if events.iter().any(|event| {
-                    memory::RuntimeEvent::from_session_event(event)
-                        .map(|runtime_event| runtime_event.kind == "runtime.harness_contract.trace")
-                        .unwrap_or(false)
-                }) {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-
-            let envelope = runtime
-                .last_context_envelope()
-                .expect("context envelope should be remembered");
-            for _ in 0..20 {
-                if store
-                    .get_context_event_by_envelope_id(&envelope.id)
-                    .await
-                    .unwrap()
-                    .is_some()
-                {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-
-            let messages = store.get_messages(&session_id, 0, 10).await.unwrap();
-            let events = store.get_events(&session_id, 0).await.unwrap();
-            let stored_count = store.get_message_count(&session_id).await.unwrap();
-            let record = store
-                .get_session(&session_id)
-                .await
-                .unwrap()
-                .expect("session record should remain queryable");
-            let context_event = store
-                .get_context_event_by_envelope_id(&envelope.id)
-                .await
-                .unwrap()
-                .expect("context envelope should be persisted");
-            let context_json: serde_json::Value =
-                serde_json::from_str(&context_event.event_json).expect("context event json");
-
-            assert_eq!(messages.len(), 2);
-            assert_eq!(stored_count, 2);
-            assert_eq!(record.session_id, session_id);
-            assert_eq!(record.chat_id, session_id);
-            assert!(events.len() >= 3);
-            assert!(events
-                .iter()
-                .any(|event| event.event_type == memory::RUNTIME_EVENT_TYPE));
-
-            let user_event = events
-                .iter()
-                .find(|event| event.event_type == "message_appended" && event.sequence == 0)
-                .expect("user message event");
-            let event_json: serde_json::Value =
-                serde_json::from_str(&user_event.event_json).expect("event json");
-            assert_eq!(event_json["role"], "user");
-            assert_eq!(event_json["message"]["role"], "user");
-            assert_eq!(event_json["message"]["blocks"][0]["text"], "persist events");
-            assert_eq!(context_event.event_type, "ContextEnvelope");
-            assert_eq!(context_json["type"], "ContextEnvelope");
-            assert_eq!(context_json["envelope_id"], envelope.id);
-            assert_eq!(context_json["envelope"]["id"], envelope.id);
-            assert_eq!(context_json["session_id"], session_id);
-
-            let policy = events
-                .iter()
-                .filter_map(|event| memory::RuntimeEvent::from_session_event(event).ok())
-                .find(|event| event.kind == "runtime.policy.decided")
-                .expect("runtime policy event");
-            assert_eq!(policy.scope, memory::RuntimeEventScope::Policy);
-            assert_eq!(policy.kind, "runtime.policy.decided");
-            assert_eq!(policy.payload["pattern"], "direct");
-            assert_eq!(policy.payload["complexity"], "simple");
-            assert_eq!(policy.payload["risk"], "low");
-            assert_eq!(policy.payload["compile_target"], "inline_model");
-            assert_eq!(policy.payload["strategy_lease"]["locked_pattern"], "direct");
-            assert_eq!(policy.payload["decision_source"], "deterministic");
-            assert_eq!(policy.payload["requires_review"], false);
-
-            let ai_kernel_trace = events
-                .iter()
-                .filter_map(|event| memory::RuntimeEvent::from_session_event(event).ok())
-                .find(|event| event.kind == "runtime.harness_contract.trace")
-                .expect("AI kernel trace event");
-            assert_eq!(ai_kernel_trace.scope, memory::RuntimeEventScope::Task);
-            assert_eq!(
-                ai_kernel_trace.payload["strategy"]["policy_version"],
-                "strategy-decision-v3"
-            );
-            assert_eq!(
-                ai_kernel_trace.payload["harness"]["strategy_pattern"],
-                "direct"
-            );
-            assert_eq!(
-                ai_kernel_trace.payload["matrix_evidence_signal"]["packet_contract"]
-                    ["strategy_pattern"],
-                "direct"
-            );
-            assert_eq!(
-                ai_kernel_trace.payload["collaboration"]["template_id"],
-                "single_executor"
-            );
-            assert_eq!(
-                ai_kernel_trace.payload["collaboration"]["plan"]["template_id"],
-                "single_executor"
-            );
-            assert!(ai_kernel_trace.payload["collaboration"]["plan"]["agents"].is_array());
-            assert!(
-                ai_kernel_trace.payload["collaboration"]["plan"]["context_visibility"].is_string()
-            );
-            assert!(ai_kernel_trace.payload["collaboration"]["plan"]["memory_policy"].is_string());
-            assert!(
-                ai_kernel_trace.payload["collaboration"]["plan"]["evidence_policy"].is_string()
-            );
-            assert!(
-                ai_kernel_trace.payload["collaboration"]["plan"]["handoff_contract"].is_string()
-            );
-            assert!(
-                ai_kernel_trace.payload["collaboration"]["plan"]["review_contract"].is_string()
-            );
-            assert!(ai_kernel_trace.payload["collaboration"]["plan"]["merge_contract"].is_string());
-            assert!(ai_kernel_trace.payload["collaboration"]["plan"]["budget_policy"].is_object());
-            assert_eq!(
-                ai_kernel_trace.payload["verification"]["can_finalize"],
-                true
-            );
-            assert_eq!(
-                ai_kernel_trace.payload["verification"]["finalization_blocked"],
-                false
-            );
-            assert_eq!(ai_kernel_trace.payload["bench"]["passed"], true);
-            assert_eq!(ai_kernel_trace.payload["regression_gate"]["allowed"], true);
-            assert_eq!(ai_kernel_trace.payload["growth"]["has_blocker"], false);
-            assert!(ai_kernel_trace.payload["maintenance_candidates"].is_array());
-            assert_eq!(
-                ai_kernel_trace.payload["matrix_evidence_signal"]["source"],
-                "ai_kernel_trace"
-            );
-        });
-    }
-
-    fn temp_session_path(suffix: &str) -> PathBuf {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        PathBuf::from(format!("/tmp/claw-test-{suffix}-{timestamp}.jsonl"))
-    }
-
-    fn shell_snippet(script: &str) -> String {
-        // Escape for JSON
-        script.replace('\\', "\\\\").replace('"', "\\\"")
-    }
-
     // ── M2: Memory system tests ──────────────────────────────────────
 
     #[derive(Clone)]
@@ -9370,144 +6546,6 @@ mod tests {
         ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
             Box::pin(futures::stream::iter(vec![Ok(AssistantEvent::MessageStop)]))
         }
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn finalization_gate_replaces_empty_success_with_limitation_message() {
-        let mut runtime = ConversationRuntime::new(
-            Session::new(),
-            MockApi,
-            StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
-            vec!["system".to_string()],
-        )
-        .without_memory();
-
-        let summary = runtime
-            .run_turn_async("answer this", &SharedPrompter::none())
-            .await
-            .expect("turn should complete with gate message");
-
-        assert!(summary.ai_kernel_trace.finalization_blocked);
-        assert!(summary.ai_kernel_trace.learning_record.has_blocker());
-        assert!(summary
-            .assistant_messages
-            .iter()
-            .flat_map(|message| message.blocks.iter())
-            .any(|block| matches!(
-                block,
-                ContentBlock::Text { text }
-                    if text.contains("I cannot finalize this as a completed answer yet")
-            )));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn context_turn_report_includes_runtime_evidence_plan_observation() {
-        #[derive(Clone)]
-        struct TextApi;
-        impl ApiClient for TextApi {
-            fn stream(
-                &mut self,
-                _request: ApiRequest,
-            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
-            {
-                to_stream(vec![
-                    AssistantEvent::TextDelta("checked".to_string()),
-                    AssistantEvent::MessageStop,
-                ])
-            }
-        }
-
-        let mut runtime = ConversationRuntime::new(
-            Session::new(),
-            TextApi,
-            StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
-            vec!["system".to_string()],
-        )
-        .without_memory();
-
-        let summary = runtime
-            .run_turn_async("检查 README 是否反映最新架构", &SharedPrompter::none())
-            .await
-            .expect("turn should complete");
-
-        assert!(
-            summary
-                .context_turn_report
-                .observations
-                .iter()
-                .any(
-                    |observation| observation.tool_name == "runtime.evidence_plan"
-                        && observation.model_summary.contains("SmallEvidence")
-                ),
-            "{:#?}",
-            summary.context_turn_report.observations
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn repeated_real_tool_summaries_trigger_supervisor_guidance() {
-        #[derive(Clone)]
-        struct RepeatingToolApi {
-            call_count: usize,
-        }
-        impl ApiClient for RepeatingToolApi {
-            fn stream(
-                &mut self,
-                request: ApiRequest,
-            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
-            {
-                self.call_count += 1;
-                if self.call_count == 1 {
-                    let mut events = Vec::new();
-                    for idx in 0..4 {
-                        events.push(AssistantEvent::ToolUse {
-                            id: format!("tool-{idx}"),
-                            name: "read_file".to_string(),
-                            input: r#"{"path":"README.md","offset":0,"limit":80}"#.to_string(),
-                        });
-                    }
-                    events.push(AssistantEvent::MessageStop);
-                    return to_stream(events);
-                }
-                assert!(
-                    request
-                        .system_prompt
-                        .iter()
-                        .any(|section| section.contains("Runtime self-regulation guidance")),
-                    "second provider request should contain self-regulation guidance"
-                );
-                to_stream(vec![
-                    AssistantEvent::TextDelta("staged answer".to_string()),
-                    AssistantEvent::MessageStop,
-                ])
-            }
-        }
-
-        let mut runtime = ConversationRuntime::new(
-            Session::new(),
-            RepeatingToolApi { call_count: 0 },
-            StaticToolExecutor::new()
-                .register("read_file", |_input| Ok("same README evidence".to_string())),
-            PermissionPolicy::new(PermissionMode::ReadOnly),
-            vec!["system".to_string()],
-        )
-        .without_memory();
-
-        let summary = runtime
-            .run_turn_async("反复检查 README", &SharedPrompter::none())
-            .await
-            .expect("turn should complete after supervisor guidance");
-
-        assert!(summary
-            .context_turn_report
-            .observations
-            .iter()
-            .any(
-                |observation| observation.tool_name == "runtime.self_regulation"
-                    && observation.model_summary.contains("nudge")
-            ));
     }
 
     #[test]
@@ -9552,361 +6590,6 @@ mod tests {
         assert_eq!(knowledge.active_pack_ids, vec!["pack-domain-default"]);
         assert_eq!(knowledge.blocked_namespaces.len(), 1);
         assert_eq!(knowledge.evidence_refs[0].ref_type, "knowledge_chunk");
-    }
-
-    struct EvidenceBackedCollaboration;
-
-    impl CollaborationOps for EvidenceBackedCollaboration {
-        fn run_boxed<'a>(
-            &'a self,
-            _task: &'a str,
-            _skills: &'a [String],
-        ) -> Pin<Box<dyn Future<Output = Option<String>> + 'a>> {
-            Box::pin(async {
-                Some(
-                    "Evidence-backed synthesis: implementation and review findings agree."
-                        .to_string(),
-                )
-            })
-        }
-
-        fn run_with_context_boxed<'a>(
-            &'a self,
-            task: &'a str,
-            skills: &'a [String],
-        ) -> Pin<Box<dyn Future<Output = Option<CollaborationContextResult>> + 'a>> {
-            Box::pin(async move {
-                let collaboration_task = CollaborationTask {
-                    description: task.to_string(),
-                    required_capabilities: skills.to_vec(),
-                    subtasks: vec![SubTask {
-                        id: "review-implementation-output".to_string(),
-                        description: "review implementation output against evidence".to_string(),
-                        required_capabilities: vec!["review".to_string()],
-                        depends_on: Vec::new(),
-                    }],
-                    review_criteria: None,
-                    collaboration_decision: None,
-                };
-                let agent_task = AgentTaskTrace {
-                    task_id: "agent-task-review-implementation-output".to_string(),
-                    parent_run_id: Some("team-run-production-like".to_string()),
-                    agent_run_id: Some("agent-run-reviewer".to_string()),
-                    role: "reviewer".to_string(),
-                    objective: "review implementation output against evidence".to_string(),
-                    status: "completed".to_string(),
-                    context_envelope_id: Some("context-envelope-reviewer".to_string()),
-                    result_summary: "review found implementation and evidence aligned".to_string(),
-                    evidence_refs: vec![
-                        "evidence://agent-run-reviewer/output".to_string(),
-                        "workgraph://team-run-production-like/review".to_string(),
-                    ],
-                    collaboration_board_id: "board-evidence-backed".to_string(),
-                    confidence: 0.92,
-                    conflicts: Vec::new(),
-                    created_at_ms: 1,
-                    updated_at_ms: 2,
-                };
-                let review_packet = CollaborationReviewPacket {
-                    board_id: "board-evidence-backed".to_string(),
-                    parent_run_id: Some("team-run-production-like".to_string()),
-                    scorecard: CollaborationScorecard {
-                        completion_rate: 1.0,
-                        synthesis_lift: 1.25,
-                        complementarity_score: 0.75,
-                        active_memory_score: 0.4,
-                        conflict_count: 0,
-                        memory_pulse_count: 1,
-                        surfaced_conflicts: Vec::new(),
-                    },
-                    agent_tasks: vec![agent_task],
-                    maintenance_candidates: Vec::new(),
-                };
-                let work_graph = AgentWorkGraph::from_collaboration_task(
-                    "production-like-session",
-                    &collaboration_task,
-                )
-                .with_review_packet(&review_packet);
-                Some(CollaborationContextResult {
-                    synthesis:
-                        "Evidence-backed synthesis: implementation and review findings agree."
-                            .to_string(),
-                    context_items: Vec::new(),
-                    collaboration_task,
-                    review_packet,
-                    work_graph,
-                })
-            })
-        }
-
-        fn run_with_strategy_boxed<'a>(
-            &'a self,
-            task: &'a str,
-            skills: &'a [String],
-            _strategy: &'a harness_contract::strategy::StrategyDecision,
-        ) -> Pin<Box<dyn Future<Output = Option<CollaborationContextResult>> + 'a>> {
-            self.run_with_context_boxed(task, skills)
-        }
-
-        fn decompose_task(&self, _task: &str) -> Vec<SubTask> {
-            Vec::new()
-        }
-
-        fn assemble_team(&self, _task: &CollaborationTask) -> Option<AgentTeam> {
-            None
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn collaboration_records_skill_invocation_evidence() {
-        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
-        let session = Session::new();
-        let session_id = session.session_id.clone();
-        let now = "2026-06-28T00:00:00Z".to_string();
-        store
-            .create_session(&memory::SessionRecord {
-                session_id: session_id.clone(),
-                platform: "test".to_string(),
-                chat_id: session_id.clone(),
-                user_id: None,
-                model: Some("test-model".to_string()),
-                created_at: now.clone(),
-                last_activity: now,
-                message_count: 0,
-                reset_policy: "none".to_string(),
-                metadata_json: None,
-                input_tokens: 0,
-                output_tokens: 0,
-                estimated_cost_usd: 0.0,
-                status: "active".to_string(),
-            })
-            .await
-            .unwrap();
-        let mut runtime = ConversationRuntime::new(
-            session,
-            MockApi,
-            StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
-            vec!["system".to_string()],
-        )
-        .without_memory()
-        .with_session_store(Arc::clone(&store))
-        .with_collaboration(Arc::new(EvidenceBackedCollaboration));
-
-        runtime
-            .run_turn_async(
-                "use multi-agent collaboration to refactor rust tests and implement the plan",
-                &SharedPrompter::none(),
-            )
-            .await
-            .expect("turn should complete");
-
-        let result = runtime
-            .last_collaboration_result()
-            .expect("collaboration result should be recorded");
-        assert_eq!(result.work_graph.session_id, session_id);
-        assert_eq!(result.review_packet.board_id, "board-evidence-backed");
-        assert!(result.review_packet.scorecard.shows_multi_agent_lift());
-        assert!(result
-            .review_packet
-            .agent_tasks
-            .iter()
-            .flat_map(|task| task.evidence_refs.iter())
-            .any(|evidence| evidence.starts_with("evidence://agent-run-reviewer/")));
-
-        for _ in 0..40 {
-            let events = store.get_events(&session_id, 0).await.unwrap();
-            if let Some(skill_event) = events
-                .iter()
-                .filter_map(|event| memory::RuntimeEvent::from_session_event(event).ok())
-                .find(|event| event.kind == "skill_candidates")
-            {
-                assert!(skill_event.payload.get("invocation_evidence").is_some());
-                assert_eq!(
-                    skill_event.payload["candidates"][0]["reasons"][0],
-                    "capability_ref_fallback"
-                );
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        let events = store.get_events(&session_id, 0).await.unwrap();
-        assert!(
-            events
-                .iter()
-                .filter_map(|event| memory::RuntimeEvent::from_session_event(event).ok())
-                .any(|event| event.kind == "skill_candidates"),
-            "collaboration turn must persist runtime skill activation event"
-        );
-
-        assert!(runtime.take_collaboration_result().is_some());
-        assert!(runtime.take_collaboration_result().is_none());
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn collaboration_records_profile_backed_skill_invocation_evidence() {
-        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
-        let session = Session::new();
-        let session_id = session.session_id.clone();
-        let now = "2026-06-28T00:00:00Z".to_string();
-        store
-            .create_session(&memory::SessionRecord {
-                session_id: session_id.clone(),
-                platform: "test".to_string(),
-                chat_id: session_id.clone(),
-                user_id: None,
-                model: Some("test-model".to_string()),
-                created_at: now.clone(),
-                last_activity: now,
-                message_count: 0,
-                reset_policy: "none".to_string(),
-                metadata_json: None,
-                input_tokens: 0,
-                output_tokens: 0,
-                estimated_cost_usd: 0.0,
-                status: "active".to_string(),
-            })
-            .await
-            .unwrap();
-        let mut profile = test_skill_profile(
-            "release-review",
-            "Release Review",
-            SkillAdapterKind::PromptOnly,
-        );
-        profile
-            .structured_dependencies
-            .push(SkillStructuredDependency {
-                domain: "release_engineering".to_string(),
-                required_fact_types: vec!["release.test_status".to_string()],
-                required_metric_keys: vec!["release_risk".to_string()],
-                required_evidence: vec!["test_report".to_string()],
-                quality_gate: "release_quality_gate".to_string(),
-            });
-        let mut runtime = ConversationRuntime::new(
-            session,
-            MockApi,
-            StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
-            vec!["system".to_string()],
-        )
-        .without_memory()
-        .with_session_store(Arc::clone(&store))
-        .with_collaboration(Arc::new(EvidenceBackedCollaboration))
-        .with_skill_profiles(vec![profile])
-        .with_agent_skill_profile(AgentSkillProfile {
-            adapter_ceiling: vec![SkillAdapterKind::PromptOnly],
-            ..AgentSkillProfile::default()
-        });
-
-        runtime
-            .run_turn_async(
-                "use multi-agent collaboration to review the release plan and implementation evidence",
-                &SharedPrompter::none(),
-            )
-            .await
-            .expect("turn should complete");
-
-        let result = runtime
-            .last_collaboration_result()
-            .expect("collaboration result should be recorded");
-        assert!(result
-            .review_packet
-            .maintenance_candidates
-            .iter()
-            .any(
-                |candidate| candidate.source.as_deref() == Some("runtime_skill")
-                    && candidate
-                        .source_ref
-                        .as_deref()
-                        .is_some_and(|reference| reference.contains("release-review"))
-            ));
-
-        for _ in 0..40 {
-            let events = store.get_events(&session_id, 0).await.unwrap();
-            let runtime_events = events
-                .iter()
-                .filter_map(|event| memory::RuntimeEvent::from_session_event(event).ok())
-                .collect::<Vec<_>>();
-            if let Some(skill_event) = runtime_events
-                .iter()
-                .find(|event| event.kind == "skill_candidates")
-            {
-                assert_eq!(
-                    skill_event.payload["source"],
-                    "conversation_runtime.skill_activation"
-                );
-                assert_eq!(skill_event.payload["selected"], "release-review");
-                assert_eq!(
-                    skill_event.payload["invocation_evidence"]["skill_id"],
-                    "release-review"
-                );
-                assert_eq!(
-                    skill_event.payload["invocation_evidence"]["outcome"],
-                    "selected_for_runtime"
-                );
-                assert!(skill_event
-                    .refs
-                    .iter()
-                    .any(|reference| reference.ref_type == "skill_invocation"
-                        && reference.id == "release-review"));
-                assert_eq!(
-                    skill_event.payload["structured_dependencies"][0]["domain"],
-                    "release_engineering"
-                );
-                assert!(skill_event
-                    .refs
-                    .iter()
-                    .any(|reference| reference.ref_type == "skill_dependency"
-                        && reference.id.contains("release-review")));
-                let memory_event = runtime_events
-                    .iter()
-                    .find(|event| {
-                        event.kind == "skill_memory_candidate"
-                            && event.payload["selected"] == "release-review"
-                    })
-                    .expect("skill memory candidate should be recorded");
-                assert_eq!(
-                    memory_event.payload["source"],
-                    "conversation_runtime.skill_memory_candidate"
-                );
-                assert_eq!(
-                    memory_event.payload["turn_index"],
-                    skill_event.payload["turn_index"]
-                );
-                assert!(skill_event.sequence <= memory_event.sequence);
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        panic!("missing profile-backed skill activation event");
-    }
-
-    #[test]
-    fn runtime_control_policy_disables_collaboration_routing() {
-        let session = Session::new();
-        let mut policy = crate::runtime_control::RuntimeControlPolicy::default();
-        policy.agent.enabled = false;
-        let features = RuntimeFeatureConfig::default().with_runtime_control(
-            crate::config::RuntimeControlConfig {
-                scenario: crate::config::DomainProfile::Coding,
-                policy,
-            },
-        );
-        let runtime = ConversationRuntime::new_with_features(
-            session,
-            MockApi,
-            Arc::new(StaticToolExecutor::new()),
-            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
-            vec!["system".to_string()],
-            &features,
-        )
-        .without_memory();
-
-        let decision = crate::execution_core::build_runtime_execution_decision(
-            "please refactor the architecture, design a multi agent plan, implement tests, and review risks",
-            Some(runtime.context_profile()),
-        );
-        assert!(!runtime.should_use_collaboration(&decision));
     }
 
     #[test]
@@ -10293,30 +6976,6 @@ mod tests {
         assert!(rank(MemoryLayer::L1) > rank(MemoryLayer::L2));
         assert!(rank(MemoryLayer::L2) > rank(MemoryLayer::L3));
         assert!(rank(MemoryLayer::L3) > rank(MemoryLayer::L4));
-    }
-
-    #[tokio::test]
-    async fn m2_l2_handoff_roundtrip_preserves_data() {
-        // M2-L2-1: cross-session handoff creates/restores handoff data
-        let session = Session::new();
-        let rt = ConversationRuntime::new(
-            session,
-            MockApi,
-            StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
-            vec!["system".to_string()],
-        );
-        // Handoff should succeed even without memory manager (returns None)
-        let handoff = rt.create_memory_handoff().await;
-        // Without memory manager, this is None — which is correct behavior
-        assert!(
-            handoff.is_none() || handoff.is_some(),
-            "handoff API should be callable without crashing"
-        );
-        // restore_memory_handoff should also not crash
-        if let Some(h) = handoff {
-            rt.restore_memory_handoff(h);
-        }
     }
 
     // ── T2: active session tracking ────────────────────────────

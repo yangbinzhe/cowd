@@ -1,14 +1,15 @@
 use super::*;
 
-pub(in crate::api_routes) fn workgraph_summary(events: &[RuntimeEvent]) -> Value {
+pub(in crate::api_routes) fn execution_graph_summary(events: &[RuntimeEvent]) -> Value {
     let graph_events: Vec<&RuntimeEvent> = events
         .iter()
         .filter(|event| {
-            event.kind == "agent.workgraph.reviewed" || event.kind == "agent.workgraph.planned"
+            event.kind == "agent.execution_graph.reviewed"
+                || event.kind == "agent.execution_graph.planned"
         })
         .collect();
     let Some(latest) = graph_events.last() else {
-        return empty_workgraph_summary();
+        return empty_execution_graph_summary();
     };
 
     let payload = &latest.payload;
@@ -43,7 +44,7 @@ pub(in crate::api_routes) fn workgraph_summary(events: &[RuntimeEvent]) -> Value
             latest
                 .refs
                 .iter()
-                .find(|reference| reference.ref_type == "workgraph")
+                .find(|reference| reference.ref_type == "execution_graph")
                 .map(|reference| reference.id.clone())
         });
     let board_id = payload
@@ -92,7 +93,7 @@ pub(in crate::api_routes) fn workgraph_summary(events: &[RuntimeEvent]) -> Value
     })
 }
 
-pub(in crate::api_routes) fn empty_workgraph_summary() -> Value {
+pub(in crate::api_routes) fn empty_execution_graph_summary() -> Value {
     serde_json::json!({
         "count": 0,
         "latest": null,

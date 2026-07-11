@@ -1,4 +1,4 @@
-//! Runtime-owned binding between lifecycle agents and team task/workgraph nodes.
+//! Runtime-owned binding between lifecycle agents and team task/execution_graph nodes.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
@@ -24,7 +24,7 @@ pub struct AgentTaskBinding {
     pub session_id: String,
     pub role_id: String,
     pub task_id: String,
-    pub workgraph_node_id: String,
+    pub execution_graph_node_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_mode: Option<String>,
     pub status: AgentTaskBindingStatus,
@@ -47,7 +47,7 @@ impl AgentTaskBindingRegistry {
         &self,
         agent_id: impl Into<String>,
         task: &AgentTask,
-        workgraph_node_id: impl Into<String>,
+        execution_graph_node_id: impl Into<String>,
         backend_mode: Option<String>,
     ) -> AgentTaskBinding {
         let now = now_ms();
@@ -57,7 +57,7 @@ impl AgentTaskBindingRegistry {
             session_id: task.session_id.clone(),
             role_id: task.role_id.clone(),
             task_id: task.task_id.clone(),
-            workgraph_node_id: workgraph_node_id.into(),
+            execution_graph_node_id: execution_graph_node_id.into(),
             backend_mode,
             status: status_from_task(task.status),
             created_at_ms: now,

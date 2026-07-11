@@ -120,6 +120,10 @@ impl RuntimeEventReplayer {
 #[must_use]
 pub fn candidate_from_action(action: &RuntimeRecoveryAction) -> Option<RuntimeRecoveryCandidate> {
     let owner = match action.scope {
+        RuntimeEventScope::ExecutionGraph | RuntimeEventScope::ExecutionNode => {
+            "runtime.execution_graph"
+        }
+        RuntimeEventScope::Goal => "runtime.goal_runtime",
         RuntimeEventScope::Session | RuntimeEventScope::SessionCommand => "runtime.session",
         RuntimeEventScope::Team => "runtime.team_execution",
         RuntimeEventScope::Agent => "runtime.agent_lifecycle",
@@ -127,6 +131,7 @@ pub fn candidate_from_action(action: &RuntimeRecoveryAction) -> Option<RuntimeRe
         RuntimeEventScope::Steward => "runtime.steward_runtime",
         RuntimeEventScope::Tool => "runtime.tool_host",
         RuntimeEventScope::Recovery => "runtime.recovery",
+        RuntimeEventScope::CrossPlane => "runtime.cross_plane",
         RuntimeEventScope::Mission
         | RuntimeEventScope::Relation
         | RuntimeEventScope::Task
@@ -182,7 +187,12 @@ fn recovery_action(scope: RuntimeEventScope, status: &str) -> (RuntimeRecoveryAc
             "steward must pause for recovery review after restart".to_string(),
         ),
         (
-            RuntimeEventScope::Team | RuntimeEventScope::Agent | RuntimeEventScope::SessionCommand,
+            RuntimeEventScope::ExecutionGraph
+            | RuntimeEventScope::ExecutionNode
+            | RuntimeEventScope::Goal
+            | RuntimeEventScope::Team
+            | RuntimeEventScope::Agent
+            | RuntimeEventScope::SessionCommand,
             "running" | "claimed",
         ) => (
             RuntimeRecoveryActionKind::MarkInterrupted,

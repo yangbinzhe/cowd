@@ -16,7 +16,7 @@ use crate::{
     MfgActionFeedback, MfgCasePromotion, MfgCockpitProfile, MfgCockpitProjection,
     MfgCockpitReportDeliveryReceipt, MfgCockpitReportRequest, MfgCockpitReportSnapshot,
     MfgCockpitWidget, MfgCrossPlaneBridgeReceipt, MfgDomainSeedResult, MfgIncident, MfgMemoryCase,
-    MfgOperationalAnalysis, MfgPlaybook, MfgSkillRun,
+    MfgOperationalAnalysis, MfgPlaybook, MfgSkillRun, MfgWorkflowGraph, MfgWorkflowGraphError,
 };
 
 use matrix_core::{
@@ -42,6 +42,16 @@ pub enum MfgRepositoryError {
     Json(#[from] serde_json::Error),
     #[error("mfg record not found: {0}")]
     NotFound(String),
+    #[error(
+        "MFG workflow {workflow_id} revision conflict: expected {expected:?}, actual {actual:?}"
+    )]
+    WorkflowRevisionConflict {
+        workflow_id: String,
+        expected: Option<u64>,
+        actual: Option<u64>,
+    },
+    #[error("MFG workflow graph error: {0}")]
+    Workflow(#[from] MfgWorkflowGraphError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +83,7 @@ pub struct MfgHealth {
     pub entity_conflict_decision_count: u64,
     pub metric_snapshot_count: u64,
     pub skill_execution_count: u64,
+    pub workflow_graph_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -154,6 +165,7 @@ impl MfgRepository {
             )?,
             metric_snapshot_count: count_table(&connection, "matrix_metric_snapshot")?,
             skill_execution_count: count_table(&connection, "mfg_skill_execution")?,
+            workflow_graph_count: count_table(&connection, "mfg_workflow_graph")?,
         })
     }
 
@@ -1100,6 +1112,142 @@ impl MfgRepository {
         list_incidents(&connection, limit)
     }
 
+    pub fn save_workflow_graph(
+        &self,
+        graph: &MfgWorkflowGraph,
+        expected_revision: Option<u64>,
+    ) -> Result<MfgWorkflowGraph, MfgRepositoryError> {
+        graph.validate()?;
+        let mut connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let transaction = connection.transaction()?;
+        persist_workflow_graph(&transaction, graph, expected_revision)?;
+        transaction.commit()?;
+        Ok(graph.clone())
+    }
+
+    pub fn create_incident_workflow(
+        &self,
+        incident: &MfgIncident,
+        packet: &MatrixEvidencePacket,
+    ) -> Result<(MfgIncident, MfgWorkflowGraph), MfgRepositoryError> {
+        let mut incident = incident.clone();
+        let mut graph = MfgWorkflowGraph::for_incident(&incident)?;
+        graph.attach_evidence_packet(packet)?;
+        incident.workflow_graph_id = Some(graph.workflow_id.clone());
+        let mut connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let transaction = connection.transaction()?;
+        upsert_incident(&transaction, &incident)?;
+        persist_workflow_graph(&transaction, &graph, None)?;
+        transaction.commit()?;
+        Ok((incident, graph))
+    }
+
+    pub fn plan_incident_workflow_skills(
+        &self,
+        incident_id: &str,
+        plan: &crate::MfgSkillPlan,
+    ) -> Result<MfgWorkflowGraph, MfgRepositoryError> {
+        self.mutate_incident_workflow(incident_id, |graph| graph.plan_skills(plan))
+    }
+
+    pub fn complete_incident_workflow_skill(
+        &self,
+        incident_id: &str,
+        run: &MfgSkillRun,
+    ) -> Result<MfgWorkflowGraph, MfgRepositoryError> {
+        self.mutate_incident_workflow(incident_id, |graph| graph.complete_skill(run))
+    }
+
+    pub fn record_skill_run_and_complete_workflow(
+        &self,
+        run: &MfgSkillRun,
+    ) -> Result<(MfgSkillRun, MfgWorkflowGraph), MfgRepositoryError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let transaction = connection.transaction()?;
+        let run = insert_skill_execution(&transaction, run)?;
+        let mut graph = find_workflow_graph(&transaction, "incident_id", &run.incident_id)?
+            .ok_or_else(|| {
+                MfgRepositoryError::NotFound(format!("workflow for {}", run.incident_id))
+            })?;
+        let expected_revision = graph.revision;
+        graph.complete_skill(&run)?;
+        persist_workflow_graph(&transaction, &graph, Some(expected_revision))?;
+        transaction.commit()?;
+        Ok((run, graph))
+    }
+
+    fn mutate_incident_workflow(
+        &self,
+        incident_id: &str,
+        mutate: impl FnOnce(&mut MfgWorkflowGraph) -> Result<(), MfgWorkflowGraphError>,
+    ) -> Result<MfgWorkflowGraph, MfgRepositoryError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let transaction = connection.transaction()?;
+        let mut graph = find_workflow_graph(&transaction, "incident_id", incident_id)?
+            .ok_or_else(|| MfgRepositoryError::NotFound(format!("workflow for {incident_id}")))?;
+        let expected_revision = graph.revision;
+        mutate(&mut graph)?;
+        persist_workflow_graph(&transaction, &graph, Some(expected_revision))?;
+        transaction.commit()?;
+        Ok(graph)
+    }
+
+    pub fn get_workflow_graph(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Option<MfgWorkflowGraph>, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        find_workflow_graph(&connection, "workflow_id", workflow_id)
+    }
+
+    pub fn workflow_graph_for_incident(
+        &self,
+        incident_id: &str,
+    ) -> Result<Option<MfgWorkflowGraph>, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        find_workflow_graph(&connection, "incident_id", incident_id)
+    }
+
+    pub fn workflow_graph_for_task(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<MfgWorkflowGraph>, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        find_workflow_graph(&connection, "task_id", task_id)
+    }
+
+    pub fn list_workflow_graphs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<MfgWorkflowGraph>, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        list_workflow_graphs(&connection, limit)
+    }
+
     pub fn analyze_incident(
         &self,
         incident_id: &str,
@@ -1617,7 +1765,7 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             attention_id TEXT,
             evidence_packet_id TEXT,
             task_id TEXT,
-            agent_graph_id TEXT,
+            workflow_graph_id TEXT,
             status TEXT NOT NULL,
             incident_json TEXT NOT NULL,
             created_at TEXT NOT NULL,
@@ -1770,8 +1918,41 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_mfg_skill_execution_incident
             ON mfg_skill_execution(incident_id, updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_mfg_skill_execution_skill
-            ON mfg_skill_execution(skill_id, updated_at DESC);",
-    )
+            ON mfg_skill_execution(skill_id, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS mfg_workflow_graph (
+            workflow_id TEXT PRIMARY KEY,
+            incident_id TEXT NOT NULL UNIQUE,
+            task_id TEXT,
+            status TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            graph_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mfg_workflow_graph_incident
+            ON mfg_workflow_graph(incident_id);
+        CREATE INDEX IF NOT EXISTS idx_mfg_workflow_graph_task
+            ON mfg_workflow_graph(task_id) WHERE task_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_mfg_workflow_graph_status
+            ON mfg_workflow_graph(status, updated_at DESC);",
+    )?;
+    migrate_mfg_incident_workflow_column(connection)
+}
+
+fn migrate_mfg_incident_workflow_column(connection: &Connection) -> rusqlite::Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(mfg_incident)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if columns.iter().any(|column| column == "agent_graph_id")
+        && !columns.iter().any(|column| column == "workflow_graph_id")
+    {
+        connection.execute_batch(
+            "ALTER TABLE mfg_incident RENAME COLUMN agent_graph_id TO workflow_graph_id;",
+        )?;
+    }
+    Ok(())
 }
 
 fn schema_version(connection: &Connection) -> rusqlite::Result<i64> {
@@ -1787,6 +1968,109 @@ fn count_table(connection: &Connection, table: &str) -> rusqlite::Result<u64> {
     connection
         .query_row(&sql, [], |row| row.get::<_, i64>(0))
         .map(|value| value as u64)
+}
+
+fn workflow_graph_revision(
+    connection: &Connection,
+    workflow_id: &str,
+) -> rusqlite::Result<Option<u64>> {
+    connection
+        .query_row(
+            "SELECT revision FROM mfg_workflow_graph WHERE workflow_id = ?1",
+            params![workflow_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map(|revision| revision.map(|value| value as u64))
+}
+
+fn persist_workflow_graph(
+    connection: &Connection,
+    graph: &MfgWorkflowGraph,
+    expected_revision: Option<u64>,
+) -> Result<(), MfgRepositoryError> {
+    graph.validate()?;
+    let graph_json = serde_json::to_string(graph)?;
+    let changed = if let Some(expected_revision) = expected_revision {
+        connection.execute(
+            r"UPDATE mfg_workflow_graph SET
+                incident_id = ?2,
+                task_id = ?3,
+                status = ?4,
+                revision = ?5,
+                graph_json = ?6,
+                updated_at = ?7
+              WHERE workflow_id = ?1 AND revision = ?8",
+            params![
+                graph.workflow_id,
+                graph.incident_id,
+                graph.task_id,
+                graph.status.as_str(),
+                graph.revision as i64,
+                graph_json,
+                graph.updated_at.to_rfc3339(),
+                expected_revision as i64,
+            ],
+        )?
+    } else {
+        connection.execute(
+            r"INSERT OR IGNORE INTO mfg_workflow_graph (
+            workflow_id, incident_id, task_id, status, revision,
+            graph_json, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                graph.workflow_id,
+                graph.incident_id,
+                graph.task_id,
+                graph.status.as_str(),
+                graph.revision as i64,
+                graph_json,
+                graph.created_at.to_rfc3339(),
+                graph.updated_at.to_rfc3339(),
+            ],
+        )?
+    };
+    if changed == 1 {
+        return Ok(());
+    }
+    Err(MfgRepositoryError::WorkflowRevisionConflict {
+        workflow_id: graph.workflow_id.clone(),
+        expected: expected_revision,
+        actual: workflow_graph_revision(connection, &graph.workflow_id)?,
+    })
+}
+
+fn find_workflow_graph(
+    connection: &Connection,
+    column: &str,
+    value: &str,
+) -> Result<Option<MfgWorkflowGraph>, MfgRepositoryError> {
+    debug_assert!(matches!(column, "workflow_id" | "incident_id" | "task_id"));
+    let sql = format!("SELECT graph_json FROM mfg_workflow_graph WHERE {column} = ?1 LIMIT 1");
+    connection
+        .query_row(&sql, params![value], |row| row.get::<_, String>(0))
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(MfgRepositoryError::from))
+        .transpose()
+}
+
+fn list_workflow_graphs(
+    connection: &Connection,
+    limit: usize,
+) -> Result<Vec<MfgWorkflowGraph>, MfgRepositoryError> {
+    let mut statement = connection.prepare(
+        r"SELECT graph_json
+          FROM mfg_workflow_graph
+          ORDER BY updated_at DESC, workflow_id ASC
+          LIMIT ?1",
+    )?;
+    let rows = statement.query_map(params![limit.clamp(1, 500) as i64], |row| {
+        row.get::<_, String>(0)
+    })?;
+    rows.map(|row| {
+        serde_json::from_str::<MfgWorkflowGraph>(&row?).map_err(MfgRepositoryError::from)
+    })
+    .collect()
 }
 
 fn upsert_cockpit_profile(
@@ -3359,7 +3643,7 @@ fn upsert_incident(
 ) -> Result<(), MfgRepositoryError> {
     connection.execute(
         r"INSERT OR REPLACE INTO mfg_incident (
-            incident_id, attention_id, evidence_packet_id, task_id, agent_graph_id,
+            incident_id, attention_id, evidence_packet_id, task_id, workflow_graph_id,
             status, incident_json, created_at, updated_at
         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
@@ -3367,7 +3651,7 @@ fn upsert_incident(
             incident.attention_id,
             incident.evidence_packet_id,
             incident.task_id,
-            incident.agent_graph_id,
+            incident.workflow_graph_id,
             incident.status,
             serde_json::to_string(incident)?,
             incident.created_at.to_rfc3339(),
@@ -3952,6 +4236,84 @@ mod tests {
         MatrixComputeJobInput, MatrixEntityInput, MatrixFactInput, MatrixMetricStatus,
         MatrixRelationInput, MatrixSourceKey,
     };
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn legacy_incident_graph_column_is_renamed_without_dual_truth() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                r"CREATE TABLE mfg_incident (
+                    incident_id TEXT PRIMARY KEY,
+                    attention_id TEXT,
+                    evidence_packet_id TEXT,
+                    task_id TEXT,
+                    agent_graph_id TEXT,
+                    status TEXT NOT NULL,
+                    incident_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+        let repository = MfgRepository::from_connection(connection).unwrap();
+        let connection = repository.connection.lock().unwrap();
+        let mut statement = connection
+            .prepare("PRAGMA table_info(mfg_incident)")
+            .unwrap();
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(columns.iter().any(|column| column == "workflow_graph_id"));
+        assert!(!columns.iter().any(|column| column == "agent_graph_id"));
+    }
+
+    #[test]
+    fn workflow_revision_cas_allows_only_one_concurrent_writer() {
+        let path = std::env::temp_dir().join(format!("mfg-cas-{}.sqlite", uuid::Uuid::new_v4()));
+        let seed = MfgRepository::open(&path).unwrap();
+        let incident = MfgIncident::new("concurrent supplier recovery");
+        let graph = MfgWorkflowGraph::for_incident(&incident).unwrap();
+        seed.save_workflow_graph(&graph, None).unwrap();
+        drop(seed);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let writers = ["writer-a", "writer-b"].map(|writer| {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            let workflow_id = graph.workflow_id.clone();
+            std::thread::spawn(move || {
+                let repository = MfgRepository::open(path).unwrap();
+                let mut graph = repository
+                    .get_workflow_graph(&workflow_id)
+                    .unwrap()
+                    .unwrap();
+                let expected = graph.revision;
+                graph
+                    .add_evidence("planner", "decision", format!("mfg:{writer}"), "commit")
+                    .unwrap();
+                barrier.wait();
+                repository.save_workflow_graph(&graph, Some(expected))
+            })
+        });
+        let results = writers.map(|writer| writer.join().unwrap());
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(
+                    result,
+                    Err(MfgRepositoryError::WorkflowRevisionConflict { .. })
+                ))
+                .count(),
+            1
+        );
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn entity_source_keys_resolve_to_one_canonical_entity() {
@@ -4495,7 +4857,7 @@ mod tests {
         incident.attention_id = Some("attention-1".to_string());
         incident.evidence_packet_id = Some("packet-1".to_string());
         incident.task_id = Some("task-1".to_string());
-        incident.agent_graph_id = Some("agent-graph-task-1".to_string());
+        incident.workflow_graph_id = Some("mfg-workflow-task-1".to_string());
         store.create_incident(&incident).expect("incident saves");
 
         let loaded = store

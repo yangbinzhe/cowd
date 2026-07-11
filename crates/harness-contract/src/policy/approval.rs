@@ -27,7 +27,7 @@ pub enum PolicyScope {
     Connector,
     Memory,
     Matrix,
-    WorkGraph,
+    ExecutionGraph,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -46,7 +46,9 @@ fn mission_harness_quick_eval_covers_core_runtime_loop_and_writes_report() {
         })
         .expect("team runtime starts");
 
-    let approval = runtime::GlobalApprovalQueue::new()
+    let services = runtime::RuntimeServices::in_memory().expect("runtime services");
+    let approval = services
+        .approval_queue()
         .submit(runtime::SubmitGlobalApprovalRequest {
             source: ApprovalSource {
                 kind: ApprovalSourceKind::Session,
@@ -98,6 +100,7 @@ fn mission_harness_quick_eval_covers_core_runtime_loop_and_writes_report() {
                 requested_tool: Some("read_file".to_string()),
                 ..TickStewardRuntimeRequest::default()
             },
+            services.approval_queue(),
         )
         .expect("steward ticks");
     assert_eq!(steward_decision.status, StewardActionStatus::Delegated);
@@ -130,19 +133,19 @@ fn mission_harness_quick_eval_covers_core_runtime_loop_and_writes_report() {
     let scenario = ScenarioSpec::new("mission_harness_quick", prompt)
         .expect_mode(strategy.pattern)
         .require(ScenarioCheck::bool(
-            "workgraph.present",
-            ScenarioCheckKind::WorkgraphPresent,
+            "execution_graph.present",
+            ScenarioCheckKind::ExecutionGraphPresent,
             true,
             "mission-harness/team-runtime",
-            "complex mission harness eval must produce a workgraph",
+            "complex mission harness eval must produce a execution_graph",
         ));
     let observation = ScenarioObservation {
         scenario_id: "mission_harness_quick".to_string(),
         strategy_pattern: strategy.pattern,
         finalization_blocked: false,
         regression_allowed: true,
-        has_workgraph: true,
-        workgraph_quality_ok: true,
+        has_execution_graph: true,
+        execution_graph_quality_ok: true,
         growth_has_blocker: false,
         growth_signal_kinds: Vec::new(),
         memory_candidate_count: 0,

@@ -1,9 +1,11 @@
 use std::sync::Arc;
 
-use memory::store::session::SessionRecord;
-use runtime::AgentRunGraph;
+use harness_contract::execution_graph::{
+    validate_execution_graph, ExecutionEdge, ExecutionGraph, ExecutionGraphProjection,
+    ExecutionNodeSpec,
+};
 
-use super::{ServiceEnvelope, SessionService};
+use super::{RuntimeEventService, ServiceEnvelope};
 use crate::task_kernel::{TaskKernel, TaskRecord, TaskStatus};
 
 #[derive(Clone)]
@@ -11,6 +13,7 @@ pub(crate) struct TaskService {
     pub(crate) label: &'static str,
     pub(crate) owner: &'static str,
     kernel: Option<Arc<TaskKernel>>,
+    runtime_services: Option<Arc<runtime::RuntimeServices>>,
 }
 
 impl TaskService {
@@ -19,12 +22,24 @@ impl TaskService {
             label: "task",
             owner: "0.9.296 Task service boundary",
             kernel: None,
+            runtime_services: None,
         }
     }
 
     pub(crate) fn with_kernel(kernel: Arc<TaskKernel>) -> Self {
         Self {
             kernel: Some(kernel),
+            ..Self::new()
+        }
+    }
+
+    pub(crate) fn with_kernel_and_runtime(
+        kernel: Arc<TaskKernel>,
+        runtime_services: Arc<runtime::RuntimeServices>,
+    ) -> Self {
+        Self {
+            kernel: Some(kernel),
+            runtime_services: Some(runtime_services),
             ..Self::new()
         }
     }
@@ -57,12 +72,80 @@ impl TaskService {
         Ok(self.kernel()?.current())
     }
 
-    pub(crate) fn list_agent_graphs(&self) -> Result<Vec<runtime::AgentRunGraph>, String> {
-        Ok(self.kernel()?.list_agent_graphs())
+    fn runtime_services(&self) -> Result<&Arc<runtime::RuntimeServices>, String> {
+        self.runtime_services
+            .as_ref()
+            .ok_or_else(|| "runtime services not configured".to_string())
     }
 
-    pub(crate) fn agent_graph(&self, task_id: &str) -> Result<Option<AgentRunGraph>, String> {
-        Ok(self.kernel()?.agent_graph(task_id))
+    pub(crate) async fn execution_graphs(&self) -> Result<Vec<ExecutionGraphProjection>, String> {
+        let mut graphs = Vec::new();
+        for task in self.list_records()? {
+            if task.execution_graph.is_some() {
+                if let Some(projection) = self.execution_graph(&task.id).await? {
+                    graphs.push(projection);
+                }
+            }
+        }
+        Ok(graphs)
+    }
+
+    pub(crate) async fn execution_graph(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<ExecutionGraphProjection>, String> {
+        let Some(cached) = self.kernel()?.execution_graph(task_id) else {
+            return Ok(None);
+        };
+        let projection = self
+            .runtime_services()?
+            .graph_state_store()
+            .projection_async(cached.graph_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.record_execution_graph_projection(task_id, projection.clone())?;
+        Ok(Some(projection))
+    }
+
+    pub(crate) async fn register_execution_graph(
+        &self,
+        task_id: &str,
+        objective: Option<String>,
+        nodes: Vec<ExecutionNodeSpec>,
+        edges: Vec<ExecutionEdge>,
+    ) -> Result<ExecutionGraphProjection, String> {
+        if nodes.is_empty() {
+            return Err("execution graph requires at least one node".to_string());
+        }
+        if self.kernel()?.execution_graph(task_id).is_some() {
+            return Err(format!(
+                "task {task_id} already has an execution graph; use RuntimeHost commands"
+            ));
+        }
+        let task = self
+            .list_records()?
+            .into_iter()
+            .find(|task| task.id == task_id)
+            .ok_or_else(|| format!("task {task_id} not found"))?;
+        let mut graph = ExecutionGraph::new(objective.unwrap_or(task.objective));
+        graph.id = format!("execution-graph-task-{task_id}");
+        graph.nodes = nodes;
+        graph.edges = edges;
+        validate_execution_graph(&graph).map_err(|error| error.to_string())?;
+        let receipt = self
+            .runtime_services()?
+            .commit_service()
+            .register_graph_async(graph)
+            .await
+            .map_err(|error| error.to_string())?;
+        let projection = self
+            .runtime_services()?
+            .graph_state_store()
+            .projection_async(receipt.graph.id)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.record_execution_graph_projection(task_id, projection.clone())?;
+        Ok(projection)
     }
 
     pub(crate) fn start_goal(
@@ -126,23 +209,21 @@ impl TaskService {
         self.kernel()?.record_failure(id, reason)
     }
 
-    pub(crate) fn upsert_agent_graph(
+    pub(crate) fn record_execution_graph_projection(
         &self,
         task_id: &str,
-        graph: AgentRunGraph,
+        projection: ExecutionGraphProjection,
     ) -> Result<TaskRecord, String> {
-        self.kernel()?.upsert_agent_graph(task_id, graph)
+        self.kernel()?
+            .record_execution_graph_projection(task_id, projection)
     }
 
-    pub(crate) async fn append_runtime_event(
+    pub(crate) fn record_lifecycle_event(
         &self,
-        session_service: &SessionService,
+        runtime_events: &RuntimeEventService,
         task: &TaskRecord,
         kind: &'static str,
     ) -> Result<(), String> {
-        ensure_task_session_record(session_service, task)
-            .await
-            .map_err(|error| format!("failed to prepare task runtime session: {error}"))?;
         let latest_audit = task.audit.last();
         let payload = serde_json::json!({
             "task": task,
@@ -153,61 +234,9 @@ impl TaskService {
             "failure_count": task.failure_count,
             "latest_audit": latest_audit,
         });
-        session_service
-            .append_runtime_event(&task.id, memory::RuntimeEventScope::Task, kind, payload)
-            .await
+        runtime_events
+            .append(&task.id, runtime::RuntimeEventScope::Task, kind, payload)
             .map(|_| ())
             .map_err(|error| format!("failed to append task runtime event: {error}"))
     }
-}
-
-async fn ensure_task_session_record(
-    session_service: &SessionService,
-    task: &TaskRecord,
-) -> Result<(), String> {
-    let Some(store) = session_service.unified_store() else {
-        return Ok(());
-    };
-    let now = chrono::Utc::now().to_rfc3339();
-    let metadata_json = serde_json::json!({
-        "kind": "task",
-        "task_id": task.id,
-        "objective": task.objective,
-        "yolo_mode": task.yolo_mode,
-        "current_phase": task.current_phase,
-    })
-    .to_string();
-    let mut record = SessionRecord {
-        session_id: task.id.clone(),
-        platform: "task".to_string(),
-        chat_id: task.id.clone(),
-        user_id: None,
-        model: None,
-        created_at: now.clone(),
-        last_activity: now,
-        message_count: task.audit.len() as i64,
-        reset_policy: "none".to_string(),
-        metadata_json: Some(metadata_json),
-        input_tokens: 0,
-        output_tokens: 0,
-        estimated_cost_usd: 0.0,
-        status: task.status.as_str().to_string(),
-    };
-    if let Some(existing) = store
-        .get_session(&task.id)
-        .await
-        .map_err(|error| error.to_string())?
-    {
-        record.created_at = existing.created_at;
-        store
-            .update_session(&record)
-            .await
-            .map_err(|error| error.to_string())?;
-    } else {
-        store
-            .create_session(&record)
-            .await
-            .map_err(|error| error.to_string())?;
-    }
-    Ok(())
 }

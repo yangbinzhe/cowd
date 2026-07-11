@@ -134,6 +134,8 @@ pub(crate) struct RuntimeService {
     upgrade_coordinator: Arc<runtime::UpgradeCoordinator>,
     config_reload: Arc<crate::runtime_host::config_reload::ConfigReloadState>,
     tool_host: Arc<tools::ToolHost>,
+    runtime_services: Arc<runtime::RuntimeServices>,
+    session_input_router: Arc<runtime::SessionInputRouter>,
 }
 
 #[derive(Debug, Clone)]
@@ -152,8 +154,13 @@ impl RuntimeService {
         started_at: Instant,
         provider_registry: Arc<runtime::ProviderRegistry>,
         upgrade_coordinator: Arc<runtime::UpgradeCoordinator>,
-    ) -> Self {
-        Self {
+        runtime_services: Arc<runtime::RuntimeServices>,
+    ) -> Result<Self, String> {
+        let session_input_router = runtime_services
+            .session_input_router()
+            .cloned()
+            .ok_or_else(|| "durable SessionInputRouter is required".to_string())?;
+        Ok(Self {
             sessions,
             lease_registry,
             session_kernel,
@@ -172,7 +179,9 @@ impl RuntimeService {
                 "gateway-runtime",
                 std::env::current_dir().unwrap_or_default(),
             )),
-        }
+            runtime_services,
+            session_input_router,
+        })
     }
 
     #[must_use]
@@ -182,6 +191,80 @@ impl RuntimeService {
     ) -> Self {
         self.approval_gate = Some(approval_gate);
         self
+    }
+
+    pub(crate) fn session_input_router(&self) -> Arc<runtime::SessionInputRouter> {
+        Arc::clone(&self.session_input_router)
+    }
+
+    pub(crate) async fn execute_ingress_record(
+        &self,
+        record: &memory::SessionRuntimeOutboxRecord,
+        content: &str,
+    ) -> Result<runtime::SessionIngressExecutionReceipt, String> {
+        let terminal_id = format!("turn-terminal:{}", record.request_id);
+        let graph_id = runtime::session_ingress_graph_id(
+            &record.session_id,
+            &record.request_id,
+            &record.turn_id,
+        );
+        if let Some(terminal) = self
+            .runtime_services
+            .event_store()
+            .session_terminal(&terminal_id)
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(runtime::SessionIngressExecutionReceipt {
+                graph_id,
+                commit_cursor: terminal.commit_cursor,
+            });
+        }
+        if let Ok(projection) = self
+            .runtime_services
+            .graph_state_store()
+            .projection(&graph_id)
+        {
+            if projection
+                .nodes
+                .iter()
+                .all(|node| node.status.is_terminal())
+            {
+                return Err(format!(
+                    "ingress graph {graph_id} is terminal without its durable session receipt"
+                ));
+            }
+        }
+        let runtime_entry = self
+            .sessions
+            .get(&record.session_id)
+            .ok_or_else(|| format!("session {} has no active runtime", record.session_id))?;
+        let ingress = runtime::TurnIngressRef {
+            request_id: record.request_id.clone(),
+            turn_id: record.turn_id.clone(),
+            message_id: record.message_id.clone(),
+            session_id: record.session_id.clone(),
+        };
+        {
+            let mut runtime = runtime_entry.lock().await;
+            runtime
+                .submit_ingress_turn(
+                    content,
+                    &runtime::permissions::SharedPrompter::none(),
+                    ingress,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        let terminal = self
+            .runtime_services
+            .event_store()
+            .session_terminal(&terminal_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("runtime committed no terminal for {}", record.request_id))?;
+        Ok(runtime::SessionIngressExecutionReceipt {
+            graph_id,
+            commit_cursor: terminal.commit_cursor,
+        })
     }
 
     #[must_use]
@@ -232,6 +315,11 @@ impl RuntimeService {
     #[must_use]
     pub(crate) fn tool_host(&self) -> Arc<tools::ToolHost> {
         Arc::clone(&self.tool_host)
+    }
+
+    #[must_use]
+    pub(crate) fn runtime_services(&self) -> Arc<runtime::RuntimeServices> {
+        Arc::clone(&self.runtime_services)
     }
 
     #[must_use]
@@ -401,8 +489,9 @@ impl RuntimeService {
                 }),
         );
         carriers.extend(
-            runtime::global_mission_runtime()
-                .projection()
+            self.runtime_services
+                .mission_runtime()
+                .projection(self.runtime_services.session_relations())
                 .sessions
                 .into_iter()
                 .map(|snapshot| {
@@ -471,11 +560,7 @@ impl RuntimeService {
                 TurnId::from_string(turn_id.to_string()),
                 TurnStatus::Cancelled,
             ));
-            let aborted_run_id = turn
-                .session_id
-                .as_deref()
-                .and_then(crate::api_routes::abort_active_turn);
-            (turn.clone(), aborted_run_id)
+            (turn.clone(), None::<String>)
         };
         let journal_sequence = self
             .persist_turn_receipt_journal(&turn, TurnJournalPhase::Cancelled, None)
@@ -696,16 +781,44 @@ impl RuntimeService {
             .map(|admission| admission.receipt)
     }
 
+    pub(crate) async fn route_pending_session_inputs(
+        &self,
+        limit: usize,
+    ) -> Result<runtime::SessionInputRouteReport, RuntimeTurnExecutionError> {
+        self.session_input_router
+            .route_pending_with(self, limit.max(1))
+            .await
+            .map_err(|error| RuntimeTurnExecutionError::Runtime(error.to_string()))
+    }
+
     pub(crate) async fn admit_session_input_with_materialized(
         &self,
         envelope: SessionInputEnvelope,
     ) -> Result<SessionInputAdmission, RuntimeTurnExecutionError> {
         let session_id = envelope.session_id.clone();
         let content = envelope.content.clone();
+        let request = memory::SessionRuntimeOutboxRequest {
+            request_id: envelope.idempotency_key.clone(),
+            turn_id: envelope
+                .metadata
+                .get("turn_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| envelope.input_id.to_string()),
+            message_id: envelope
+                .source_message_id
+                .clone()
+                .unwrap_or_else(|| envelope.input_id.to_string()),
+            created_at_ms: envelope.created_at.timestamp_millis().max(0) as u64,
+        };
+        self.session_input_router
+            .persist_input(&session_id, &content, &request)
+            .await
+            .map_err(|error| RuntimeTurnExecutionError::Runtime(error.to_string()))?;
         let stream = self.session_input_stream_for(&session_id).await?;
         let receipt = stream.admit(envelope, stream.runtime_state());
         let materialized = self
-            .materialize_session_input_decision(&session_id, &receipt, &content)
+            .materialize_non_execution_session_input(&session_id, &receipt, &content)
             .await;
         let materialized_for_event = materialized.clone();
         let record_for_event = stream.record_snapshot(&receipt.input_id);
@@ -713,7 +826,7 @@ impl RuntimeService {
         if let Some(materialized) = materialized {
             self.emit_session_input_materialized(&session_id, materialized);
         }
-        self.persist_session_input_runtime_event(
+        self.persist_session_input_domain_event(
             &session_id,
             "SessionInputReceived",
             Some(&receipt),
@@ -740,7 +853,7 @@ impl RuntimeService {
             .map_err(|error| RuntimeTurnExecutionError::Runtime(error.to_string()))?;
         let receipt = record.to_receipt();
         self.emit_session_input_events(session_id, &stream, Some(receipt.clone()));
-        self.persist_session_input_runtime_event(
+        self.persist_session_input_domain_event(
             session_id,
             "SessionInputCancelled",
             Some(&receipt),
@@ -764,15 +877,25 @@ impl RuntimeService {
             .reclassify_input(&input_id, decision, reason)
             .map_err(|error| RuntimeTurnExecutionError::Runtime(error.to_string()))?;
         let receipt = record.to_receipt();
+        let graph_materialized = Some(
+            serde_json::to_value(
+                self.session_input_router
+                    .route_pending_with(self, 32)
+                    .await
+                    .map_err(|error| RuntimeTurnExecutionError::Runtime(error.to_string()))?,
+            )
+            .map_err(|error| RuntimeTurnExecutionError::Runtime(error.to_string()))?,
+        );
         let materialized = self
-            .materialize_session_input_decision(session_id, &receipt, &record.envelope.content)
-            .await;
+            .materialize_non_execution_session_input(session_id, &receipt, &record.envelope.content)
+            .await
+            .or(graph_materialized);
         let materialized_for_event = materialized.clone();
         self.emit_session_input_events(session_id, &stream, Some(receipt.clone()));
         if let Some(materialized) = materialized {
             self.emit_session_input_materialized(session_id, materialized);
         }
-        self.persist_session_input_runtime_event(
+        self.persist_session_input_domain_event(
             session_id,
             "SessionInputReclassified",
             Some(&receipt),
@@ -784,53 +907,13 @@ impl RuntimeService {
         Ok(receipt)
     }
 
-    async fn materialize_session_input_decision(
+    async fn materialize_non_execution_session_input(
         &self,
         session_id: &str,
         receipt: &SessionInputReceipt,
         content: &str,
     ) -> Option<serde_json::Value> {
         match receipt.decision {
-            InputRoutingDecision::SpawnSubtask => {
-                let task = runtime::AgentTask {
-                    task_id: String::new(),
-                    team_id: format!("session-input-team-{session_id}"),
-                    session_id: session_id.to_string(),
-                    role_id: "runtime-delegated-agent".to_string(),
-                    agent_id: None,
-                    objective: content.to_string(),
-                    expected_output:
-                        "Inspect the delegated request and report progress back to the parent session."
-                            .to_string(),
-                    context_refs: receipt.evidence_refs.clone(),
-                    evidence_refs: receipt.evidence_refs.clone(),
-                    status: runtime::AgentTaskStatus::Pending,
-                    outcome: None,
-                    created_at_ms: 0,
-                    updated_at_ms: 0,
-                };
-                let task_receipt = runtime::global_agent_task_mailbox().assign(task);
-                Some(serde_json::json!({
-                    "kind": "session_input.spawn_subtask",
-                    "input_id": receipt.input_id.to_string(),
-                    "task_receipt": task_receipt,
-                }))
-            }
-            InputRoutingDecision::RouteCrossSession => {
-                let target_ref = extract_session_target_ref(content).unwrap_or("active");
-                let bridge = runtime::SessionExecutionPlane::bridge(runtime::CrossSessionMessage {
-                    from_session_id: session_id.to_string(),
-                    target_ref: target_ref.to_string(),
-                    command: content.to_string(),
-                    actor: Some("session_input_stream".to_string()),
-                    evidence_refs: receipt.evidence_refs.clone(),
-                });
-                Some(serde_json::json!({
-                    "kind": "session_input.route_cross_session",
-                    "input_id": receipt.input_id.to_string(),
-                    "bridge": bridge,
-                }))
-            }
             InputRoutingDecision::CreateNewSession => {
                 let session = self
                     .create_session_from_input(session_id, receipt, content)
@@ -931,9 +1014,9 @@ impl RuntimeService {
 
         let event_sequence = self
             .session_kernel
-            .append_runtime_event(
+            .append_session_domain_event(
                 &session_id,
-                memory::RuntimeEventScope::Session,
+                memory::SessionDomainScope::Session,
                 "SessionInputCreatedSession",
                 serde_json::json!({
                     "parent_session_id": parent_session_id,
@@ -975,7 +1058,7 @@ impl RuntimeService {
             .map(|result| {
                 serde_json::json!({
                     "persisted": result.persisted,
-                    "runtime_event_sequence": result.runtime_event_sequence,
+                    "session_domain_event_sequence": result.session_domain_event_sequence,
                     "kind": result.kind,
                 })
             })
@@ -991,6 +1074,7 @@ impl RuntimeService {
         if let Some(store) = self.session_kernel.unified_store() {
             crate::runtime_factory::create_runtime_entry_with_session_store(
                 store,
+                self.runtime_services(),
                 self.provider_registry(),
                 self.tool_host(),
                 session,
@@ -1007,6 +1091,7 @@ impl RuntimeService {
             .map_err(|error| error.to_string())
         } else {
             crate::runtime_factory::create_runtime_entry(
+                self.runtime_services(),
                 self.provider_registry(),
                 self.tool_host(),
                 session,
@@ -1140,7 +1225,7 @@ impl RuntimeService {
         });
     }
 
-    async fn persist_session_input_runtime_event(
+    async fn persist_session_input_domain_event(
         &self,
         session_id: &str,
         kind: &str,
@@ -1149,7 +1234,7 @@ impl RuntimeService {
         stream: &runtime::SessionInputStream,
         materialized: Option<&serde_json::Value>,
     ) {
-        if let Err(error) = self.ensure_runtime_event_session(session_id).await {
+        if let Err(error) = self.ensure_session_domain_record(session_id).await {
             tracing::warn!(
                 %session_id,
                 %kind,
@@ -1160,9 +1245,9 @@ impl RuntimeService {
         }
         if let Err(error) = self
             .session_kernel
-            .append_runtime_event(
+            .append_session_domain_event(
                 session_id,
-                memory::RuntimeEventScope::Turn,
+                memory::SessionDomainScope::Turn,
                 kind,
                 serde_json::json!({
                     "input": receipt,
@@ -1183,7 +1268,7 @@ impl RuntimeService {
         }
     }
 
-    async fn ensure_runtime_event_session(
+    async fn ensure_session_domain_record(
         &self,
         session_id: &str,
     ) -> Result<(), memory::MemoryError> {
@@ -1346,7 +1431,7 @@ impl RuntimeService {
                 let result = timeout(
                     turn_timeout,
                     runtime_guard
-                        .run_turn_async(&content, &runtime::permissions::SharedPrompter::none()),
+                        .submit_turn(&content, &runtime::permissions::SharedPrompter::none()),
                 )
                 .await;
                 restore_scoped_max_iterations(&mut *runtime_guard, previous_max_iterations);
@@ -1951,23 +2036,115 @@ fn upgrade_mission_status(status: &runtime::MissionSessionStatus) -> runtime::Up
 mod tests {
     use super::*;
 
-    fn test_runtime_service(
+    fn test_runtime_service_with_services(
         active_sessions: Arc<ActiveSessions>,
-        store: Option<Arc<memory::UnifiedSessionStore>>,
+        store: Arc<memory::UnifiedSessionStore>,
+        runtime_services: Arc<runtime::RuntimeServices>,
     ) -> RuntimeService {
         RuntimeService::new(
             active_sessions.clone(),
             Arc::new(SessionLeaseRegistry::default()),
             Arc::new(SessionKernel::new(
                 active_sessions,
-                store,
+                Some(store),
                 crate::event_bus::SessionEventBus::new(),
             )),
             Arc::new(SessionLifecycleKernel::new()),
             Instant::now(),
             Arc::new(runtime::ProviderRegistry::empty()),
             Arc::new(runtime::UpgradeCoordinator::new()),
+            runtime_services,
         )
+        .expect("test runtime service")
+    }
+
+    fn test_runtime_service(
+        active_sessions: Arc<ActiveSessions>,
+        store: Option<Arc<memory::UnifiedSessionStore>>,
+    ) -> RuntimeService {
+        let store = store.unwrap_or_else(|| {
+            Arc::new(memory::UnifiedSessionStore::open_in_memory().expect("test session store"))
+        });
+        let runtime_services =
+            runtime::RuntimeServices::in_memory().expect("test runtime services");
+        runtime_services
+            .install_session_store(Arc::clone(&store))
+            .expect("test session router");
+        test_runtime_service_with_services(active_sessions, store, runtime_services)
+    }
+
+    #[tokio::test]
+    async fn restart_reuses_terminal_receipt_before_provider_runtime_lookup() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        let record = memory::SessionRuntimeOutboxRecord {
+            request_id: "restart-request".into(),
+            turn_id: "restart-turn".into(),
+            message_id: "restart-message".into(),
+            session_id: "restart-session".into(),
+            sequence: 0,
+            status: memory::OutboxStatus::Claimed,
+            runtime_commit_cursor: None,
+            attempts: 1,
+            next_attempt_at_ms: 0,
+            claim_owner: Some("worker-a".into()),
+            claim_expires_at_ms: Some(u64::MAX),
+            failure_class: None,
+            last_error: None,
+            revision: 1,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        let services = runtime::RuntimeServices::builder(&home, &workspace)
+            .session_store(Arc::clone(&store))
+            .build()
+            .unwrap();
+        services
+            .event_store()
+            .enqueue_session_terminal(
+                "turn-terminal:restart-request",
+                "assistant-restart-message",
+                "restart-session",
+                41,
+                "assistant_json:\"done\"",
+            )
+            .unwrap();
+        let first = test_runtime_service_with_services(
+            Arc::new(ActiveSessions::new()),
+            Arc::clone(&store),
+            services,
+        );
+        assert_eq!(
+            first
+                .execute_ingress_record(&record, "must not run")
+                .await
+                .unwrap()
+                .commit_cursor,
+            41
+        );
+        drop(first);
+
+        let restarted_services = runtime::RuntimeServices::builder(&home, &workspace)
+            .session_store(Arc::clone(&store))
+            .build()
+            .unwrap();
+        let restarted = test_runtime_service_with_services(
+            Arc::new(ActiveSessions::new()),
+            store,
+            restarted_services,
+        );
+        let receipt = restarted
+            .execute_ingress_record(&record, "must still not run")
+            .await
+            .unwrap();
+        assert_eq!(receipt.commit_cursor, 41);
+        assert_eq!(
+            receipt.graph_id,
+            runtime::session_ingress_graph_id("restart-session", "restart-request", "restart-turn")
+        );
     }
 
     #[test]
@@ -2105,6 +2282,26 @@ mod tests {
     #[tokio::test]
     async fn runtime_service_persists_session_input_runtime_event() {
         let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        let now = chrono::Utc::now().to_rfc3339();
+        store
+            .create_session(&memory::SessionRecord {
+                session_id: "input-session".to_string(),
+                platform: "test".to_string(),
+                chat_id: "input-session".to_string(),
+                user_id: None,
+                model: None,
+                created_at: now.clone(),
+                last_activity: now,
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .unwrap();
         let active_sessions = Arc::new(ActiveSessions::default());
         let service = test_runtime_service(active_sessions, Some(store.clone()));
         service
@@ -2127,7 +2324,7 @@ mod tests {
 
         assert_eq!(receipt.session_id, "input-session");
         let page = store
-            .runtime_events_page("input-session", 0, 10)
+            .session_domain_events_page("input-session", 0, 10)
             .await
             .expect("runtime events page");
         let event = page
@@ -2149,6 +2346,26 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn create_new_session_input_materializes_real_session() {
         let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        let now = chrono::Utc::now().to_rfc3339();
+        store
+            .create_session(&memory::SessionRecord {
+                session_id: "parent-session".to_string(),
+                platform: "test".to_string(),
+                chat_id: "parent-session".to_string(),
+                user_id: None,
+                model: Some("qwen3.6-plus".to_string()),
+                created_at: now.clone(),
+                last_activity: now,
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .unwrap();
         let active_sessions = Arc::new(ActiveSessions::default());
         let service = test_runtime_service(active_sessions, Some(store.clone()));
         service
@@ -2195,7 +2412,7 @@ mod tests {
         );
         assert_eq!(admission_materialized["session"]["model"], "qwen3.6-plus");
         let page = store
-            .runtime_events_page("parent-session", 0, 10)
+            .session_domain_events_page("parent-session", 0, 10)
             .await
             .expect("parent runtime events page");
         let session_input_event = page

@@ -64,6 +64,8 @@ mod services;
 mod session_kernel;
 #[path = "kernel/session_lifecycle_kernel.rs"]
 mod session_lifecycle_kernel;
+#[path = "runtime/session_runtime_bridge.rs"]
+mod session_runtime_bridge;
 #[path = "static/skill_static.rs"]
 mod skill_static;
 #[path = "core/suggestions.rs"]
@@ -3544,6 +3546,7 @@ fn workspace_git_snapshot(root: &Path, file_limit: usize) -> WorkspaceGitSnapsho
 
 fn git_current_branch(root: &Path) -> Option<String> {
     let output = Command::new("git")
+        .args(["-c", &format!("safe.directory={}", root.display())])
         .args(["-C"])
         .arg(root)
         .args(["branch", "--show-current"])
@@ -3558,6 +3561,7 @@ fn git_current_branch(root: &Path) -> Option<String> {
 
 fn git_changed_files(root: &Path, file_limit: usize) -> (Vec<String>, bool) {
     let output = match Command::new("git")
+        .args(["-c", &format!("safe.directory={}", root.display())])
         .args(["-C"])
         .arg(root)
         .args(["status", "--short", "--untracked-files=no"])
@@ -6387,7 +6391,7 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 1,
             audit: Vec::new(),
-            agent_graph: None,
+            execution_graph: None,
             strategy: None,
         };
 
@@ -6658,12 +6662,17 @@ mod tests {
         )
         .expect("tracked file");
         let git_add = Command::new("git")
+            .args(["-c", &format!("safe.directory={}", root.display())])
             .args(["-C"])
             .arg(&root)
             .args(["add", "src/lib.rs"])
             .output()
             .expect("run git add");
-        assert!(git_add.status.success());
+        assert!(
+            git_add.status.success(),
+            "git add failed: {}",
+            String::from_utf8_lossy(&git_add.stderr)
+        );
         let session = runtime::Session::new().with_workspace_root(root.clone());
 
         let item = workspace_context_item(&session, 200_000);
@@ -8177,12 +8186,13 @@ UU conflicted.rs",
         assert!(allowed.contains("mcp__alpha__echo"));
         assert!(allowed.contains("MCPTool"));
 
-        let executor = GatewayToolExecutor::new(
-            None,
-            false,
-            state.tool_registry.clone(),
-            state.mcp_state.clone(),
-        );
+        let tool_host = Arc::new(tools::ToolHost::new(
+            "bootstrap-mcp-test",
+            &workspace,
+            state.tool_host_snapshot(),
+        ));
+        let executor =
+            GatewayToolExecutor::from_tool_host(None, false, tool_host, state.mcp_state.clone());
 
         let tool_output = executor
             .execute("mcp__alpha__echo", r#"{"text":"hello"}"#)
@@ -8279,12 +8289,13 @@ UU conflicted.rs",
             &runtime_config,
         )
         .expect("runtime plugin state should load");
-        let executor = GatewayToolExecutor::new(
-            None,
-            false,
-            state.tool_registry.clone(),
-            state.mcp_state.clone(),
-        );
+        let tool_host = Arc::new(tools::ToolHost::new(
+            "bootstrap-mcp-unsupported-test",
+            &workspace,
+            state.tool_host_snapshot(),
+        ));
+        let executor =
+            GatewayToolExecutor::from_tool_host(None, false, tool_host, state.mcp_state.clone());
 
         let search_output = executor
             .execute("ToolSearch", r#"{"query":"remote","max_results":5}"#)
@@ -8350,6 +8361,7 @@ UU conflicted.rs",
         ));
         let mut runtime = create_runtime_entry_with_bootstrap_state(
             None,
+            runtime::RuntimeServices::in_memory().expect("test runtime services"),
             Arc::new(
                 runtime::ProviderRegistry::new(runtime_config.providers().clone())
                     .expect("provider registry"),

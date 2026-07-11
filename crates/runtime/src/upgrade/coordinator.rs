@@ -55,6 +55,8 @@ pub enum UpgradeError {
     },
     #[error("inventory collector `{collector}` failed: {message}")]
     Collector { collector: String, message: String },
+    #[error("upgrade disposition is invalid: {0}")]
+    InvalidDisposition(String),
     #[error("upgrade manifest IO failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("upgrade manifest serialization failed: {0}")]
@@ -131,6 +133,19 @@ impl UpgradeCoordinator {
         &self,
         receipt: UpgradeDispositionReceipt,
     ) -> Result<(), UpgradeError> {
+        if receipt.actor.trim().is_empty()
+            || receipt.reason.trim().is_empty()
+            || !matches!(receipt.action.as_str(), "cancel" | "drain")
+            || receipt
+                .result_refs
+                .iter()
+                .any(|reference| reference.trim().is_empty())
+            || (receipt.action == "drain" && receipt.result_refs.is_empty())
+        {
+            return Err(UpgradeError::InvalidDisposition(
+                "actor/reason/action/result_refs failed validation".to_string(),
+            ));
+        }
         let mut state = self
             .state
             .write()
@@ -187,18 +202,6 @@ impl UpgradeCoordinator {
             (&left.carrier_kind, &left.carrier_id).cmp(&(&right.carrier_kind, &right.carrier_id))
         });
         let dispositions = state.dispositions.clone();
-        for carrier in carriers.iter().filter(|carrier| carrier.status.is_active()) {
-            let disposed = dispositions.iter().any(|receipt| {
-                receipt.carrier_kind == carrier.carrier_kind
-                    && receipt.carrier_id == carrier.carrier_id
-            });
-            if !disposed {
-                return Err(UpgradeError::ActiveCarrierUndisposed {
-                    carrier_kind: carrier.carrier_kind.clone(),
-                    carrier_id: carrier.carrier_id.clone(),
-                });
-            }
-        }
         let source_binary_version = source_binary_version.into();
         let workspace_id = workspace_id.into();
         let workspace_root = workspace_root.into();
@@ -270,13 +273,13 @@ fn now_ms() -> u64 {
 mod tests {
     use std::sync::Arc;
 
-    use super::{ClosureUpgradeInventoryCollector, UpgradeCoordinator, UpgradeError};
+    use super::{ClosureUpgradeInventoryCollector, UpgradeCoordinator};
     use crate::upgrade::inventory::{
         UpgradeCarrierRecord, UpgradeCarrierStatus, UpgradeDispositionReceipt,
     };
 
     #[test]
-    fn active_carrier_requires_explicit_disposition_before_export() {
+    fn active_carrier_can_be_exported_for_canonical_import() {
         let coordinator = UpgradeCoordinator::new();
         coordinator.register_collector(Arc::new(ClosureUpgradeInventoryCollector::new(
             "turns",
@@ -293,10 +296,10 @@ mod tests {
             },
         )));
         coordinator.enter_maintenance("operator").unwrap();
-        assert!(matches!(
-            coordinator.collect_inventory("0.9.472", "workspace", "/tmp/workspace"),
-            Err(UpgradeError::ActiveCarrierUndisposed { .. })
-        ));
+        let importable = coordinator
+            .collect_inventory("0.9.472", "workspace", "/tmp/workspace")
+            .unwrap();
+        assert_eq!(importable.active_count, 1);
         coordinator
             .record_disposition(UpgradeDispositionReceipt {
                 carrier_kind: "active_turn".to_string(),

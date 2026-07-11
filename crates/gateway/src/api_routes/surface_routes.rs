@@ -80,6 +80,8 @@ struct SurfaceSendBody {
     thread: Option<String>,
     text: String,
     #[serde(default)]
+    idempotency_key: Option<String>,
+    #[serde(default)]
     metadata: serde_json::Value,
 }
 
@@ -330,6 +332,7 @@ async fn send_surface_handler(
             recipient: body.recipient,
             thread: body.thread,
             text: body.text,
+            idempotency_key: body.idempotency_key,
             metadata: body.metadata,
         })
         .await

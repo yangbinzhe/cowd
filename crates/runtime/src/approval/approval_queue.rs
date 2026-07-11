@@ -5,12 +5,12 @@
 //! decisions, timeout policy, and the source that should receive the result.
 
 use std::collections::BTreeMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use harness_contract::core::TaskRisk;
 use serde::{Deserialize, Serialize};
 
-use crate::{record_runtime_event, RuntimeEventInput, RuntimeEventRef, RuntimeEventScope};
+use crate::{RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -88,19 +88,43 @@ pub struct GlobalApprovalDecisionReceipt {
     pub message: String,
 }
 
-#[derive(Debug, Default)]
-pub struct GlobalApprovalQueue {
+#[derive(Debug)]
+pub struct ApprovalQueue {
     requests: Mutex<BTreeMap<String, GlobalApprovalRequest>>,
+    event_store: Arc<RuntimeEventStore>,
 }
 
-impl GlobalApprovalQueue {
+impl ApprovalQueue {
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(event_store: Arc<RuntimeEventStore>) -> Self {
+        let requests = restore_requests(&event_store);
+        Self {
+            requests: Mutex::new(requests),
+            event_store,
+        }
+    }
+
+    /// Rebuild the in-memory read model after another commit owner appended
+    /// approval events as part of a larger transaction.
+    pub fn refresh(&self) {
+        let restored = restore_requests(&self.event_store);
+        *self
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = restored;
     }
 
     pub fn submit(
         &self,
+        request: SubmitGlobalApprovalRequest,
+    ) -> Result<GlobalApprovalRequest, String> {
+        self.submit_scoped(format!("approval-{}", uuid::Uuid::new_v4()), request)
+    }
+
+    /// Submit an approval under a caller-owned stable idempotency key.
+    pub fn submit_scoped(
+        &self,
+        approval_id: impl Into<String>,
         request: SubmitGlobalApprovalRequest,
     ) -> Result<GlobalApprovalRequest, String> {
         if request.action.trim().is_empty() {
@@ -109,7 +133,19 @@ impl GlobalApprovalQueue {
         if request.summary.trim().is_empty() {
             return Err("approval summary must not be empty".to_string());
         }
-        let approval_id = format!("approval-{}", uuid::Uuid::new_v4());
+        let approval_id = approval_id.into();
+        if approval_id.trim().is_empty() {
+            return Err("approval id must not be empty".to_string());
+        }
+        if let Some(existing) = self.get(&approval_id) {
+            if existing.source == request.source
+                && existing.action == request.action
+                && existing.summary == request.summary
+            {
+                return Ok(existing);
+            }
+            return Err(format!("approval idempotency conflict: {approval_id}"));
+        }
         let approval = GlobalApprovalRequest {
             approval_id: approval_id.clone(),
             source: request.source,
@@ -122,24 +158,38 @@ impl GlobalApprovalQueue {
             created_at_ms: now_ms(),
             resolved_at_ms: None,
         };
+        let stream_id = format!("approval:{}", approval.approval_id);
+        let revision = self
+            .event_store
+            .stream_revision(&stream_id)
+            .map_err(|e| e.to_string())?;
+        self.event_store
+            .append_batch_if_revision(
+                stream_id.clone(),
+                revision,
+                format!("approval-submit:{}", approval.approval_id),
+                vec![RuntimeEventInput {
+                    stream_id,
+                    scope: RuntimeEventScope::Approval,
+                    kind: "approval.submitted".to_string(),
+                    status: Some(approval.status.as_str().to_string()),
+                    actor: Some("approval_queue".to_string()),
+                    refs: approval_source_refs(&approval.source),
+                    payload: serde_json::json!({
+                        "request": approval,
+                        "action": approval.action,
+                        "summary": approval.summary,
+                        "risk": approval.risk,
+                        "timeout_policy": approval.timeout_policy,
+                    }),
+                }
+                .into()],
+            )
+            .map_err(|e| e.to_string())?;
         self.requests
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(approval_id, approval.clone());
-        let _ = record_runtime_event(RuntimeEventInput {
-            stream_id: format!("approval:{}", approval.approval_id),
-            scope: RuntimeEventScope::Approval,
-            kind: "approval.submitted".to_string(),
-            status: Some(approval.status.as_str().to_string()),
-            actor: Some("global_approval_queue".to_string()),
-            refs: approval_source_refs(&approval.source),
-            payload: serde_json::json!({
-                "action": approval.action,
-                "summary": approval.summary,
-                "risk": approval.risk,
-                "timeout_policy": approval.timeout_policy,
-            }),
-        });
         Ok(approval)
     }
 
@@ -165,15 +215,15 @@ impl GlobalApprovalQueue {
                 message: format!("approval already {}", status_label(request.status)),
             });
         }
-        request.status = if decision.approved {
+        let next_status = if decision.approved {
             GlobalApprovalStatus::Approved
         } else {
             GlobalApprovalStatus::Denied
         };
-        request.resolved_at_ms = Some(now_ms());
+        let resolved_at_ms = now_ms();
         let receipt = GlobalApprovalDecisionReceipt {
             approval_id: request.approval_id.clone(),
-            status: request.status,
+            status: next_status,
             route_back: request.source.clone(),
             message: if decision.approved {
                 format!("approved by {}", decision.decided_by)
@@ -181,19 +231,35 @@ impl GlobalApprovalQueue {
                 format!("denied by {}: {}", decision.decided_by, decision.reason)
             },
         };
-        let _ = record_runtime_event(RuntimeEventInput {
-            stream_id: format!("approval:{}", request.approval_id),
-            scope: RuntimeEventScope::Approval,
-            kind: "approval.decided".to_string(),
-            status: Some(request.status.as_str().to_string()),
-            actor: Some(decision.decided_by),
-            refs: approval_source_refs(&request.source),
-            payload: serde_json::json!({
-                "approved": decision.approved,
-                "reason": decision.reason,
-                "message": receipt.message,
-            }),
-        });
+        let stream_id = format!("approval:{}", request.approval_id);
+        let revision = self
+            .event_store
+            .stream_revision(&stream_id)
+            .map_err(|e| e.to_string())?;
+        self.event_store
+            .append_batch_if_revision(
+                stream_id.clone(),
+                revision,
+                format!("approval-decision:{}", request.approval_id),
+                vec![RuntimeEventInput {
+                    stream_id,
+                    scope: RuntimeEventScope::Approval,
+                    kind: "approval.decided".to_string(),
+                    status: Some(next_status.as_str().to_string()),
+                    actor: Some(decision.decided_by),
+                    refs: approval_source_refs(&request.source),
+                    payload: serde_json::json!({
+                        "approved": decision.approved,
+                        "reason": decision.reason,
+                        "message": receipt.message,
+                        "resolved_at_ms": resolved_at_ms,
+                    }),
+                }
+                .into()],
+            )
+            .map_err(|e| e.to_string())?;
+        request.status = next_status;
+        request.resolved_at_ms = Some(resolved_at_ms);
         Ok(receipt)
     }
 
@@ -213,18 +279,16 @@ impl GlobalApprovalQueue {
                 message: format!("approval already {}", status_label(request.status)),
             });
         }
-        request.status = match request.timeout_policy {
+        let next_status = match request.timeout_policy {
             ApprovalTimeoutPolicy::Pending => GlobalApprovalStatus::Pending,
             ApprovalTimeoutPolicy::AutoDeny | ApprovalTimeoutPolicy::ContinueAlternative => {
                 GlobalApprovalStatus::TimedOut
             }
         };
-        if request.status == GlobalApprovalStatus::TimedOut {
-            request.resolved_at_ms = Some(now_ms());
-        }
+        let resolved_at_ms = (next_status == GlobalApprovalStatus::TimedOut).then(now_ms);
         let receipt = GlobalApprovalDecisionReceipt {
             approval_id: request.approval_id.clone(),
-            status: request.status,
+            status: next_status,
             route_back: request.source.clone(),
             message: match request.timeout_policy {
                 ApprovalTimeoutPolicy::Pending => "approval remains pending".to_string(),
@@ -234,18 +298,34 @@ impl GlobalApprovalQueue {
                 }
             },
         };
-        let _ = record_runtime_event(RuntimeEventInput {
-            stream_id: format!("approval:{}", request.approval_id),
-            scope: RuntimeEventScope::Approval,
-            kind: "approval.timed_out".to_string(),
-            status: Some(request.status.as_str().to_string()),
-            actor: Some("global_approval_queue".to_string()),
-            refs: approval_source_refs(&request.source),
-            payload: serde_json::json!({
-                "timeout_policy": request.timeout_policy,
-                "message": receipt.message,
-            }),
-        });
+        let stream_id = format!("approval:{}", request.approval_id);
+        let revision = self
+            .event_store
+            .stream_revision(&stream_id)
+            .map_err(|error| error.to_string())?;
+        self.event_store
+            .append_batch_if_revision(
+                stream_id.clone(),
+                revision,
+                format!("approval-timeout:{}", request.approval_id),
+                vec![RuntimeEventInput {
+                    stream_id,
+                    scope: RuntimeEventScope::Approval,
+                    kind: "approval.timed_out".to_string(),
+                    status: Some(next_status.as_str().to_string()),
+                    actor: Some("approval_queue".to_string()),
+                    refs: approval_source_refs(&request.source),
+                    payload: serde_json::json!({
+                        "timeout_policy": request.timeout_policy,
+                        "message": receipt.message,
+                        "resolved_at_ms": resolved_at_ms,
+                    }),
+                }
+                .into()],
+            )
+            .map_err(|error| error.to_string())?;
+        request.status = next_status;
+        request.resolved_at_ms = resolved_at_ms;
         Ok(receipt)
     }
 
@@ -292,11 +372,6 @@ impl GlobalApprovalQueue {
             "requests": requests,
         })
     }
-}
-
-pub fn global_approval_queue() -> &'static GlobalApprovalQueue {
-    static QUEUE: OnceLock<GlobalApprovalQueue> = OnceLock::new();
-    QUEUE.get_or_init(GlobalApprovalQueue::new)
 }
 
 fn status_label(status: GlobalApprovalStatus) -> &'static str {
@@ -351,9 +426,61 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn restore_requests(event_store: &RuntimeEventStore) -> BTreeMap<String, GlobalApprovalRequest> {
+    let mut requests = BTreeMap::new();
+    let Ok(events) = event_store.list_scope(RuntimeEventScope::Approval, 100_000) else {
+        return requests;
+    };
+    for event in events.into_iter().rev() {
+        match event.kind.as_str() {
+            "approval.submitted" => {
+                if let Some(request) = event
+                    .payload
+                    .get("request")
+                    .and_then(|value| serde_json::from_value(value.clone()).ok())
+                {
+                    let request: GlobalApprovalRequest = request;
+                    requests.insert(request.approval_id.clone(), request);
+                }
+            }
+            "approval.decided" | "approval.timed_out" => {
+                let Some(approval_id) = event.stream_id.strip_prefix("approval:") else {
+                    continue;
+                };
+                let Some(request) = requests.get_mut(approval_id) else {
+                    continue;
+                };
+                request.status = match event.status.as_deref() {
+                    Some("approved") => GlobalApprovalStatus::Approved,
+                    Some("denied") => GlobalApprovalStatus::Denied,
+                    Some("timed_out") => GlobalApprovalStatus::TimedOut,
+                    _ => request.status,
+                };
+                request.resolved_at_ms = if request.status == GlobalApprovalStatus::Pending {
+                    None
+                } else {
+                    event
+                        .payload
+                        .get("resolved_at_ms")
+                        .and_then(serde_json::Value::as_u64)
+                        .or(Some(event.created_at_ms))
+                };
+            }
+            _ => {}
+        }
+    }
+    requests
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn queue() -> ApprovalQueue {
+        ApprovalQueue::new(Arc::new(
+            RuntimeEventStore::try_open_in_memory().expect("event store"),
+        ))
+    }
 
     fn session_source() -> ApprovalSource {
         ApprovalSource {
@@ -366,8 +493,8 @@ mod tests {
     }
 
     #[test]
-    fn global_approval_queue_routes_decisions_back_to_source() {
-        let queue = GlobalApprovalQueue::new();
+    fn approval_queue_routes_decisions_back_to_source() {
+        let queue = queue();
         let request = queue
             .submit(SubmitGlobalApprovalRequest {
                 source: session_source(),
@@ -400,7 +527,7 @@ mod tests {
 
     #[test]
     fn timeout_policy_can_hold_or_release_pending_work() {
-        let queue = GlobalApprovalQueue::new();
+        let queue = queue();
         let held = queue
             .submit(SubmitGlobalApprovalRequest {
                 source: session_source(),
@@ -429,5 +556,39 @@ mod tests {
             .expect("timeout alternative");
         assert_eq!(receipt.status, GlobalApprovalStatus::TimedOut);
         assert!(receipt.message.contains("alternative"));
+    }
+
+    #[test]
+    fn decided_approval_is_restored_after_restart() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let queue = ApprovalQueue::new(Arc::clone(&store));
+        let request = queue
+            .submit_scoped(
+                "approval:graph:node",
+                SubmitGlobalApprovalRequest {
+                    source: session_source(),
+                    action: "send".to_string(),
+                    summary: "send after approval".to_string(),
+                    risk: TaskRisk::High,
+                    evidence_refs: Vec::new(),
+                    timeout_policy: ApprovalTimeoutPolicy::Pending,
+                },
+            )
+            .unwrap();
+        queue
+            .decide(GlobalApprovalDecision {
+                approval_id: request.approval_id.clone(),
+                approved: true,
+                decided_by: "human".to_string(),
+                reason: "approved".to_string(),
+            })
+            .unwrap();
+
+        let restarted = ApprovalQueue::new(store);
+        assert_eq!(
+            restarted.get(&request.approval_id).unwrap().status,
+            GlobalApprovalStatus::Approved
+        );
+        assert!(restarted.pending().is_empty());
     }
 }

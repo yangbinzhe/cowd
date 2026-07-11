@@ -6,7 +6,7 @@ use crate::orchestration::request::{RuntimeOrchestrationAction, RuntimeOrchestra
 use crate::orchestration::result::{
     RuntimeOrchestrationApprovalRequirement, RuntimeOrchestrationDecision,
 };
-use crate::{global_approval_queue, GlobalApprovalStatus};
+use crate::{ApprovalQueue, GlobalApprovalStatus};
 use harness_contract::strategy::StrategyProposal;
 
 #[must_use]
@@ -14,6 +14,7 @@ pub fn validate_request(
     request: &RuntimeOrchestrationRequest,
     execution: &RuntimeExecutionDecision,
     model_proposal: Option<&StrategyProposal>,
+    approval_queue: Option<&ApprovalQueue>,
 ) -> RuntimeOrchestrationDecision {
     let mut policy_gates = execution.gates().to_vec();
     let mut findings = Vec::new();
@@ -94,7 +95,13 @@ pub fn validate_request(
     }
     let required_approval = approval_requirement(request, execution);
     if let Some(requirement) = required_approval.as_ref() {
-        validate_global_approval(requirement, dispatch_status, &mut status, &mut findings);
+        validate_global_approval(
+            requirement,
+            dispatch_status,
+            &mut status,
+            &mut findings,
+            approval_queue,
+        );
     }
     policy_gates.sort_by_key(|gate| gate.as_str());
     policy_gates.dedup();
@@ -156,13 +163,14 @@ fn validate_global_approval(
     dispatch_status: &str,
     status: &mut String,
     findings: &mut Vec<String>,
+    approval_queue: Option<&ApprovalQueue>,
 ) {
     let Some(approval_id) = requirement.approval_id.as_deref() else {
         require_approval(status);
         findings.push("missing_global_approval_receipt".to_string());
         return;
     };
-    let Some(receipt) = global_approval_queue().get(approval_id) else {
+    let Some(receipt) = approval_queue.and_then(|queue| queue.get(approval_id)) else {
         require_approval(status);
         findings.push("global_approval_receipt_not_found".to_string());
         return;

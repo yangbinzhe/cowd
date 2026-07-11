@@ -218,7 +218,7 @@ Agent catalog、team profile、自动发现、组队、信誉和 runtime agent �
 | `GET` | `/api/agents/directory` | Agent 目录、组队与运行 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `agent_directory_handler` | `agent_routes.rs` | P2 |
 | `GET` | `/api/agents/discover` | Agent 目录、组队与运行 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `agent_discover_handler` | `agent_routes.rs` | P2 |
 | `GET` | `/api/agents/reputation` | Agent 目录、组队与运行 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `agent_reputation_handler` | `agent_routes.rs` | P2 |
-| `GET` | `/api/agents/runs` | Agent 目录、组队与运行 查询接口 | - | 支持 Query 参数，详见 handler Params struct | - | `agent_runs_handler` | `agent_routes.rs` | P2 |
+| `GET` | `/api/agents/execution-graphs` | Runtime 执行图投影查询接口 | - | - | - | `execution_graphs_handler` | `agent_routes.rs` | P2 |
 | `GET` | `/api/agents/team-profiles` | Agent 目录、组队与运行 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `agent_team_profiles_list_handler` | `agent_routes.rs` | P2 |
 | `POST` | `/api/agents/team-profiles` | Agent 目录、组队与运行 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `agent_team_profile_create_handler` | `agent_routes.rs` | P2 |
 | `DELETE` | `/api/agents/team-profiles/:id` | Agent 目录、组队与运行 删除接口 | id | - | 通常无 body 或仅 path/query | `agent_team_profile_delete_handler` | `agent_routes.rs` | P2 |
@@ -231,8 +231,8 @@ Agent catalog、team profile、自动发现、组队、信誉和 runtime agent �
 | `POST` | `/api/runtime/agents/:id/input` | Runtime 执行核心 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `runtime_agent_input_handler` | `agent_routes.rs` | P1 |
 | `POST` | `/api/runtime/agents/:id/interrupt` | Runtime 执行核心 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `runtime_agent_interrupt_handler` | `agent_routes.rs` | P1 |
 | `POST` | `/api/runtime/agents/:id/shutdown` | Runtime 执行核心 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `runtime_agent_shutdown_handler` | `agent_routes.rs` | P1 |
-| `GET` | `/api/tasks/:id/agent-graph` | Agent 目录、组队与运行 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `task_agent_graph_handler` | `agent_routes.rs` | P2 |
-| `POST` | `/api/tasks/:id/agent-graph` | Agent 目录、组队与运行 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `upsert_task_agent_graph_handler` | `agent_routes.rs` | P2 |
+| `GET` | `/api/tasks/:id/execution-graph` | 查询任务绑定的 canonical ExecutionGraph 投影 | id | - | - | `task_execution_graph_handler` | `agent_routes.rs` | P2 |
+| `POST` | `/api/tasks/:id/execution-graph` | 经 Runtime ExecutionCommitService 注册任务执行图 | id | - | `RegisterExecutionGraphRequest` | `register_task_execution_graph_handler` | `agent_routes.rs` | P2 |
 
 ## Task 阶段化执行
 

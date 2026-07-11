@@ -26,10 +26,11 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::runtime_event::{RuntimeEvent, RuntimeEventPage, RUNTIME_EVENT_TYPE};
+use crate::runtime_event::{SessionDomainEvent, SessionDomainEventPage, SESSION_DOMAIN_EVENT_TYPE};
 use crate::store::session::{
-    SessionEvent, SessionListOptions, SessionListPage, SessionMessage, SessionRecord,
-    SessionSearchResult, SessionSnapshot, SqliteSessionStore,
+    OutboxFailureClass, SessionEvent, SessionListOptions, SessionListPage, SessionMessage,
+    SessionRecord, SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord,
+    SessionRuntimeOutboxRequest, SessionSearchResult, SessionSnapshot, SqliteSessionStore,
 };
 use crate::store::Result;
 
@@ -279,17 +280,17 @@ impl UnifiedSessionStore {
             .append_context_envelope_event_if_absent_allocating_sequence(event)
     }
 
-    /// Append a canonical runtime event to the session event log.
-    pub async fn append_runtime_event(&self, event: &RuntimeEvent) -> Result<()> {
-        self.append_runtime_event_allocating_sequence(event)
+    /// Append a canonical session-domain event to the session event log.
+    pub async fn append_session_domain_event(&self, event: &SessionDomainEvent) -> Result<()> {
+        self.append_session_domain_event_allocating_sequence(event)
             .await
             .map(|_| ())
     }
 
-    /// Persist a runtime event using the store-owned sequence allocator.
-    pub async fn append_runtime_event_allocating_sequence(
+    /// Persist a domain event using the store-owned sequence allocator.
+    pub async fn append_session_domain_event_allocating_sequence(
         &self,
-        event: &RuntimeEvent,
+        event: &SessionDomainEvent,
     ) -> Result<SessionEvent> {
         let event = event.to_session_event()?;
         self.append_event_allocating_sequence(&event).await
@@ -311,6 +312,29 @@ impl UnifiedSessionStore {
             .lock()
             .await
             .get_events_limited(session_id, from_seq, limit)
+    }
+
+    async fn get_session_domain_timeline_limited(
+        &self,
+        session_id: &str,
+        from_seq: usize,
+        limit: usize,
+    ) -> Result<Vec<SessionEvent>> {
+        self.inner
+            .lock()
+            .await
+            .get_session_domain_timeline_limited(session_id, from_seq, limit)
+    }
+
+    async fn count_session_domain_timeline_from(
+        &self,
+        session_id: &str,
+        from_seq: usize,
+    ) -> Result<usize> {
+        self.inner
+            .lock()
+            .await
+            .count_session_domain_timeline_from(session_id, from_seq)
     }
 
     /// Retrieve at most `limit` events of one type for a session.
@@ -348,27 +372,27 @@ impl UnifiedSessionStore {
             .count_events_by_type_from(session_id, event_type, from_seq)
     }
 
-    /// Retrieve a page of canonical runtime events.
-    pub async fn runtime_events_page(
+    /// Retrieve a page of canonical session-domain events.
+    pub async fn session_domain_events_page(
         &self,
         session_id: &str,
         from_seq: usize,
         limit: usize,
-    ) -> Result<RuntimeEventPage> {
+    ) -> Result<SessionDomainEventPage> {
         let limit = clamp_event_page_limit(limit);
         let total = self
-            .count_events_by_type_from(session_id, RUNTIME_EVENT_TYPE, from_seq)
+            .count_events_by_type_from(session_id, SESSION_DOMAIN_EVENT_TYPE, from_seq)
             .await?;
         let events = self
-            .get_events_by_type_limited(session_id, RUNTIME_EVENT_TYPE, from_seq, limit)
+            .get_events_by_type_limited(session_id, SESSION_DOMAIN_EVENT_TYPE, from_seq, limit)
             .await?
             .into_iter()
-            .map(|event| RuntimeEvent::from_session_event_lossy(&event))
+            .map(|event| SessionDomainEvent::from_session_event_lossy(&event))
             .collect::<Vec<_>>();
         let next_seq = events.last().map(|event| event.sequence + 1);
         let has_more = events.len() < total;
 
-        Ok(RuntimeEventPage {
+        Ok(SessionDomainEventPage {
             total,
             events,
             next_seq,
@@ -376,25 +400,27 @@ impl UnifiedSessionStore {
         })
     }
 
-    /// Retrieve a runtime-shaped projection of every session event type.
+    /// Retrieve a domain-shaped projection of every session event type.
     pub async fn timeline_events_page(
         &self,
         session_id: &str,
         from_seq: usize,
         limit: usize,
-    ) -> Result<RuntimeEventPage> {
+    ) -> Result<SessionDomainEventPage> {
         let limit = clamp_event_page_limit(limit);
-        let total = self.count_events_from(session_id, from_seq).await?;
+        let total = self
+            .count_session_domain_timeline_from(session_id, from_seq)
+            .await?;
         let events = self
-            .get_events_limited(session_id, from_seq, limit)
+            .get_session_domain_timeline_limited(session_id, from_seq, limit)
             .await?
             .into_iter()
-            .map(|event| RuntimeEvent::from_session_event_lossy(&event))
+            .map(|event| SessionDomainEvent::from_session_event_lossy(&event))
             .collect::<Vec<_>>();
         let next_seq = events.last().map(|event| event.sequence + 1);
         let has_more = events.len() < total;
 
-        Ok(RuntimeEventPage {
+        Ok(SessionDomainEventPage {
             total,
             events,
             next_seq,
@@ -477,9 +503,170 @@ impl UnifiedSessionStore {
         self.inner.lock().await.insert_message(msg)
     }
 
+    pub async fn append_terminal_message_idempotent(
+        &self,
+        message_id: &str,
+        session_id: &str,
+        content_json: &str,
+        created_at_ms: u64,
+    ) -> Result<(SessionMessage, bool)> {
+        self.inner.lock().await.append_terminal_message_idempotent(
+            message_id,
+            session_id,
+            content_json,
+            created_at_ms,
+        )
+    }
+
     /// Insert multiple messages into a session in a single batch.
     pub async fn insert_messages_batch(&self, messages: &[SessionMessage]) -> Result<()> {
         self.inner.lock().await.insert_messages_batch(messages)
+    }
+
+    /// Persist a source message and Runtime ingress request atomically.
+    pub async fn append_message_with_runtime_outbox(
+        &self,
+        message: &SessionMessage,
+        request: &SessionRuntimeOutboxRequest,
+    ) -> Result<SessionRuntimeOutboxRecord> {
+        self.inner
+            .lock()
+            .await
+            .append_message_with_runtime_outbox(message, request)
+    }
+
+    /// Atomically allocate a message sequence and persist the Runtime ingress
+    /// work item. This is the canonical live-input API.
+    pub async fn append_ingress_with_runtime_outbox(
+        &self,
+        session_id: &str,
+        role: &str,
+        content_json: Option<&str>,
+        created_at_ms: u64,
+        request: &SessionRuntimeOutboxRequest,
+    ) -> Result<SessionRuntimeOutboxRecord> {
+        self.inner.lock().await.append_ingress_with_runtime_outbox(
+            session_id,
+            role,
+            content_json,
+            created_at_ms,
+            request,
+        )
+    }
+
+    pub async fn claim_session_runtime_outbox(
+        &self,
+        worker_id: &str,
+        now_ms: u64,
+        lease_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<SessionRuntimeOutboxRecord>> {
+        self.inner
+            .lock()
+            .await
+            .claim_session_runtime_outbox(worker_id, now_ms, lease_ms, limit)
+    }
+
+    pub async fn ack_session_runtime_outbox(
+        &self,
+        request_id: &str,
+        worker_id: &str,
+        expected_revision: u64,
+        runtime_commit_cursor: u64,
+        now_ms: u64,
+    ) -> Result<SessionRuntimeOutboxRecord> {
+        self.inner.lock().await.ack_session_runtime_outbox(
+            request_id,
+            worker_id,
+            expected_revision,
+            runtime_commit_cursor,
+            now_ms,
+        )
+    }
+
+    pub async fn renew_session_runtime_outbox_lease(
+        &self,
+        request_id: &str,
+        worker_id: &str,
+        expected_revision: u64,
+        now_ms: u64,
+        lease_ms: u64,
+    ) -> Result<SessionRuntimeOutboxRecord> {
+        self.inner.lock().await.renew_session_runtime_outbox_lease(
+            request_id,
+            worker_id,
+            expected_revision,
+            now_ms,
+            lease_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fail_session_runtime_outbox(
+        &self,
+        request_id: &str,
+        worker_id: &str,
+        expected_revision: u64,
+        failure_class: OutboxFailureClass,
+        error: &str,
+        retry_at_ms: u64,
+        max_attempts: u32,
+        now_ms: u64,
+    ) -> Result<SessionRuntimeOutboxRecord> {
+        self.inner.lock().await.fail_session_runtime_outbox(
+            request_id,
+            worker_id,
+            expected_revision,
+            failure_class,
+            error,
+            retry_at_ms,
+            max_attempts,
+            now_ms,
+        )
+    }
+
+    pub async fn retry_blocked_session_runtime_outbox(
+        &self,
+        request_id: &str,
+        expected_revision: u64,
+        actor: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<SessionRuntimeOutboxRecord> {
+        self.inner
+            .lock()
+            .await
+            .retry_blocked_session_runtime_outbox(
+                request_id,
+                expected_revision,
+                actor,
+                reason,
+                now_ms,
+            )
+    }
+
+    pub async fn get_session_runtime_outbox(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<SessionRuntimeOutboxRecord>> {
+        self.inner
+            .lock()
+            .await
+            .get_session_runtime_outbox(request_id)
+    }
+
+    pub async fn session_runtime_outbox_health(&self) -> Result<SessionRuntimeOutboxHealth> {
+        self.inner.lock().await.session_runtime_outbox_health()
+    }
+
+    pub async fn blocked_session_runtime_outbox(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<SessionRuntimeOutboxRecord>> {
+        self.inner
+            .lock()
+            .await
+            .blocked_session_runtime_outbox(limit)
     }
 
     /// Retrieve messages for a session with pagination.
@@ -555,7 +742,7 @@ fn clamp_event_page_limit(limit: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_event::RuntimeEventScope;
+    use crate::runtime_event::SessionDomainScope;
 
     fn make_record(id: &str) -> SessionRecord {
         SessionRecord {
@@ -577,7 +764,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_events_page_returns_only_canonical_events() {
+    async fn session_domain_events_page_returns_only_canonical_events() {
         let store = UnifiedSessionStore::open_in_memory().unwrap();
         store
             .create_session(&make_record("s-runtime-page"))
@@ -594,10 +781,10 @@ mod tests {
             .await
             .unwrap();
         store
-            .append_runtime_event(&RuntimeEvent::new(
+            .append_session_domain_event(&SessionDomainEvent::new(
                 "s-runtime-page",
                 1,
-                RuntimeEventScope::Turn,
+                SessionDomainScope::Turn,
                 "turn.completed",
                 serde_json::json!({"ok": true}),
                 2,
@@ -606,7 +793,7 @@ mod tests {
             .unwrap();
 
         let page = store
-            .runtime_events_page("s-runtime-page", 0, 50)
+            .session_domain_events_page("s-runtime-page", 0, 50)
             .await
             .unwrap();
         assert_eq!(page.total, 1);
@@ -617,17 +804,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_event_allocator_keeps_column_and_envelope_sequence_equal() {
+    async fn domain_event_allocator_keeps_column_and_envelope_sequence_equal() {
         let store = UnifiedSessionStore::open_in_memory().unwrap();
         store
             .create_session(&make_record("s-runtime-allocated"))
             .await
             .unwrap();
         let stored = store
-            .append_runtime_event_allocating_sequence(&RuntimeEvent::new(
+            .append_session_domain_event_allocating_sequence(&SessionDomainEvent::new(
                 "s-runtime-allocated",
                 9_999,
-                RuntimeEventScope::Turn,
+                SessionDomainScope::Turn,
                 "turn.completed",
                 serde_json::json!({"ok": true}),
                 2,
@@ -637,7 +824,7 @@ mod tests {
         assert_eq!(stored.sequence, 0);
 
         let page = store
-            .runtime_events_page("s-runtime-allocated", 0, 10)
+            .session_domain_events_page("s-runtime-allocated", 0, 10)
             .await
             .unwrap();
         assert_eq!(page.events[0].sequence, 0);
@@ -662,10 +849,10 @@ mod tests {
             .await
             .unwrap();
         store
-            .append_runtime_event(&RuntimeEvent::new(
+            .append_session_domain_event(&SessionDomainEvent::new(
                 "s-runtime-timeline",
                 1,
-                RuntimeEventScope::Memory,
+                SessionDomainScope::Memory,
                 "memory.pulse.created",
                 serde_json::json!({"candidates": 3}),
                 2,
@@ -680,7 +867,7 @@ mod tests {
         assert_eq!(page.total, 2);
         assert_eq!(page.events.len(), 1);
         assert_eq!(page.events[0].kind, "ToolStart");
-        assert_eq!(page.events[0].scope, RuntimeEventScope::Tool);
+        assert_eq!(page.events[0].scope, SessionDomainScope::Tool);
         assert_eq!(page.next_seq, Some(1));
         assert!(page.has_more);
     }

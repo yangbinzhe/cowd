@@ -10,6 +10,10 @@ use harness_contract::context::{
     ContextIdentity, ContextItem, ContextMode, ContextRole, ContextSourceKind, PromptAssemblyPlan,
 };
 use harness_contract::core::{ExecutionModifier, ExecutionPattern};
+use harness_contract::execution_graph::{
+    validate_execution_graph, ExecutionEdge, ExecutionEdgeKind, ExecutionGraph,
+    ExecutionGraphQualityReport, ExecutionNodeKind, ExecutionNodeSpec, ExecutionNodeStatus,
+};
 use harness_contract::growth::{
     GrowthEvent, GrowthEventInput, GrowthEvidenceRef, GrowthInput, GrowthSeverity, GrowthSignal,
     GrowthSignalKind, LearningRecord,
@@ -28,7 +32,6 @@ use harness_contract::tool::{
 use harness_contract::verification::{
     Claim, ClaimKind, Evidence, EvidenceKind, VerificationLedger, VerificationReport,
 };
-use harness_contract::workgraph::{WorkGraph, WorkGraphQualityReport, WorkNode, WorkNodeKind};
 use serde::{Deserialize, Serialize};
 
 use crate::collaboration_template::{CollaborationDecision, CollaborationTemplateMatcher};
@@ -54,8 +57,8 @@ pub struct RuntimeAiKernelTrace {
     pub regression_gate: RegressionGateVerdict,
     pub learning_record: LearningRecord,
     pub growth_event: GrowthEvent,
-    pub workgraph: Option<WorkGraph>,
-    pub workgraph_quality: Option<WorkGraphQualityReport>,
+    pub execution_graph: Option<ExecutionGraph>,
+    pub execution_graph_quality: Option<ExecutionGraphQualityReport>,
     pub harness_receipt: HarnessTurnReceipt,
     pub policy_receipts: Vec<PolicyReceipt>,
     pub behavior_policy: BehaviorPolicyDecision,
@@ -68,7 +71,7 @@ pub struct RuntimeAiKernel {
     collaboration_decision: CollaborationDecision,
     context_epoch: ContextEpoch,
     tool_transaction: Option<ToolTransactionPlan>,
-    workgraph: Option<WorkGraph>,
+    execution_graph: Option<ExecutionGraph>,
     verification: VerificationLedger,
     behavior_policy: BehaviorPolicyDecision,
     context_envelope_id: Option<String>,
@@ -129,15 +132,15 @@ impl RuntimeAiKernel {
         let behavior_policy = decide_behavior_policy(&user_input, strategy);
         let context_epoch =
             build_context_epoch(&session_id, &user_input, profile, system_prompt, strategy);
-        let workgraph =
-            build_initial_workgraph(&user_input, strategy, execution_decision.compile_target);
+        let execution_graph =
+            build_initial_execution_graph(&user_input, strategy, execution_decision.compile_target);
         Self {
             user_input,
             execution_decision,
             collaboration_decision,
             context_epoch,
             tool_transaction: None,
-            workgraph,
+            execution_graph,
             verification: VerificationLedger::new(),
             behavior_policy,
             context_envelope_id: None,
@@ -299,10 +302,7 @@ impl RuntimeAiKernel {
             .as_ref()
             .map(|plan| plan.requires_human_confirm)
             .unwrap_or(false);
-        let workgraph_quality = self
-            .workgraph
-            .as_ref()
-            .map(harness_contract::workgraph::WorkGraph::quality_report);
+        let execution_graph_quality = self.execution_graph.as_ref().map(execution_graph_quality);
         let agent_spec = harness_contract::agent::AgentSpec::for_turn(
             &self.user_input,
             self.execution_decision.strategy.pattern,
@@ -352,16 +352,16 @@ impl RuntimeAiKernel {
                 );
             }
         }
-        if let Some(quality) = &workgraph_quality {
-            if !quality.is_dag || !quality.has_review_node || !quality.has_synthesis_node {
+        if let Some(quality) = &execution_graph_quality {
+            if !quality.is_dag || !quality.has_verify_node || !quality.has_synthesize_node {
                 learning_record.signals.push(GrowthSignal::new(
                     GrowthSignalKind::MultiAgentValue,
                     GrowthSeverity::Improve,
-                    "workgraph quality report missed dag/review/synthesis requirements",
+                    "execution graph quality missed dag/verify/synthesis requirements",
                 ));
                 learning_record
                     .next_strategy_hints
-                    .push("repair workgraph before synthesizing complex tasks".to_string());
+                    .push("repair execution graph before synthesizing complex tasks".to_string());
             }
         }
         if self.behavior_policy.has_overengineering_risk() {
@@ -382,11 +382,11 @@ impl RuntimeAiKernel {
                 "AI kernel tool transaction plan",
             ));
         }
-        if let Some(graph) = &self.workgraph {
+        if let Some(graph) = &self.execution_graph {
             evidence_refs.push(GrowthEvidenceRef::new(
-                "workgraph",
+                "execution_graph",
                 graph.id.clone(),
-                "AI kernel workgraph",
+                "AI kernel execution graph",
             ));
         }
         let growth_event = GrowthEvent::from_input(GrowthEventInput {
@@ -448,8 +448,8 @@ impl RuntimeAiKernel {
             regression_gate,
             learning_record,
             growth_event,
-            workgraph: self.workgraph,
-            workgraph_quality,
+            execution_graph: self.execution_graph,
+            execution_graph_quality,
             harness_receipt,
             policy_receipts,
             behavior_policy: self.behavior_policy,
@@ -518,11 +518,11 @@ fn build_context_epoch(
     })
 }
 
-fn build_initial_workgraph(
+fn build_initial_execution_graph(
     user_input: &str,
     strategy: &StrategyDecision,
     compile_target: RuntimeCompileTarget,
-) -> Option<WorkGraph> {
+) -> Option<ExecutionGraph> {
     if compile_target == RuntimeCompileTarget::InlineModel
         && !strategy
             .modifiers
@@ -530,67 +530,95 @@ fn build_initial_workgraph(
     {
         return None;
     }
-    let mut graph = WorkGraph::new(user_input.to_string());
-    let (first_kind, first_label, first_objective) = match compile_target {
-        RuntimeCompileTarget::InlineModel => (
-            WorkNodeKind::AgentTask,
-            "respond",
-            "produce a bounded answer from current context",
-        ),
-        RuntimeCompileTarget::EvidenceGraph => (
-            WorkNodeKind::ReadOnlyFanout,
-            "gather-evidence",
-            "acquire independent checked evidence in parallel",
-        ),
-        RuntimeCompileTarget::ExecutionGraph => (
-            WorkNodeKind::ToolTask,
-            "execute",
-            "apply the bounded change through governed tools",
-        ),
-        RuntimeCompileTarget::DeliberationGraph => (
-            WorkNodeKind::AgentTask,
-            "generate-candidates",
-            "generate competing evidence-backed proposals",
-        ),
-        RuntimeCompileTarget::TeamGraph => (
-            WorkNodeKind::AgentTask,
-            "dispatch-team",
-            "dispatch independent workstreams to governed agents",
-        ),
-        RuntimeCompileTarget::MissionGraph => (
-            WorkNodeKind::AgentTask,
-            "mission-checkpoint",
-            "advance the mission through a resumable checkpoint",
-        ),
+    let mut graph = ExecutionGraph::new(user_input.to_string());
+    let (first_kind, first_label) = match compile_target {
+        RuntimeCompileTarget::InlineModel => (ExecutionNodeKind::InlineModel, "respond"),
+        RuntimeCompileTarget::EvidenceGraph => (ExecutionNodeKind::ToolBatch, "gather-evidence"),
+        RuntimeCompileTarget::ExecutionGraph => (ExecutionNodeKind::ToolBatch, "execute"),
+        RuntimeCompileTarget::DeliberationGraph => {
+            (ExecutionNodeKind::AgentTask, "generate-candidates")
+        }
+        RuntimeCompileTarget::TeamGraph => (ExecutionNodeKind::AgentTask, "dispatch-team"),
+        RuntimeCompileTarget::MissionGraph => (ExecutionNodeKind::AgentTask, "mission-checkpoint"),
     };
-    let first = graph
-        .add_node(WorkNode::new(first_kind, first_label, first_objective))
-        .ok()?;
-    let verify = graph
-        .add_node(WorkNode::new(
-            WorkNodeKind::Review,
-            "verify",
-            "verify the final response against evidence",
-        ))
-        .ok()?;
-    let synthesize = graph
-        .add_node(WorkNode::new(
-            WorkNodeKind::Synthesis,
-            "synthesize",
-            "synthesize verified evidence into the final response",
-        ))
-        .ok()?;
-    let _ = graph.add_edge(
-        &first,
-        &verify,
-        harness_contract::workgraph::WorkEdgeKind::DependsOn,
+    let mut first = ExecutionNodeSpec::new(first_kind, "runtime", first_label);
+    first.id = first_label.to_string();
+    first.idempotency_key = format!("{}:{first_label}", graph.id);
+    let mut verify = ExecutionNodeSpec::new(
+        ExecutionNodeKind::Verify,
+        "runtime.verify",
+        "verify-final-response",
     );
-    let _ = graph.add_edge(
-        &verify,
-        &synthesize,
-        harness_contract::workgraph::WorkEdgeKind::DependsOn,
+    verify.id = "verify".to_string();
+    verify.idempotency_key = format!("{}:verify", graph.id);
+    let mut synthesize = ExecutionNodeSpec::new(
+        ExecutionNodeKind::Synthesize,
+        "runtime.synthesize",
+        "synthesize-final-response",
     );
+    synthesize.id = "synthesize".to_string();
+    synthesize.idempotency_key = format!("{}:synthesize", graph.id);
+    graph.nodes = vec![first, verify, synthesize];
+    for id in [first_label, "verify", "synthesize"] {
+        graph
+            .node_statuses
+            .insert(id.to_string(), ExecutionNodeStatus::Planned);
+    }
+    graph.edges = vec![
+        ExecutionEdge {
+            from: first_label.to_string(),
+            to: "verify".to_string(),
+            kind: ExecutionEdgeKind::DependsOn,
+        },
+        ExecutionEdge {
+            from: "verify".to_string(),
+            to: "synthesize".to_string(),
+            kind: ExecutionEdgeKind::DependsOn,
+        },
+    ];
+    validate_execution_graph(&graph).ok()?;
     Some(graph)
+}
+
+fn execution_graph_quality(graph: &ExecutionGraph) -> ExecutionGraphQualityReport {
+    let validation = validate_execution_graph(graph);
+    ExecutionGraphQualityReport {
+        node_count: graph.nodes.len(),
+        edge_count: graph.edges.len(),
+        ready_count: graph
+            .node_statuses
+            .values()
+            .filter(|status| {
+                matches!(
+                    status,
+                    ExecutionNodeStatus::Ready | ExecutionNodeStatus::Planned
+                )
+            })
+            .count(),
+        blocked_count: graph_nodes_in_status(graph, ExecutionNodeStatus::Blocked),
+        failed_count: graph_nodes_in_status(graph, ExecutionNodeStatus::Failed),
+        has_verify_node: graph
+            .nodes
+            .iter()
+            .any(|node| node.kind == ExecutionNodeKind::Verify),
+        has_synthesize_node: graph
+            .nodes
+            .iter()
+            .any(|node| node.kind == ExecutionNodeKind::Synthesize),
+        is_dag: validation.is_ok(),
+        warnings: validation
+            .err()
+            .map(|error| vec![error.to_string()])
+            .unwrap_or_default(),
+    }
+}
+
+fn graph_nodes_in_status(graph: &ExecutionGraph, expected: ExecutionNodeStatus) -> usize {
+    graph
+        .node_statuses
+        .values()
+        .filter(|status| **status == expected)
+        .count()
 }
 
 fn operation_from_tool(name: &str, input: &str) -> ToolOperation {
@@ -656,7 +684,9 @@ fn bench_kind_for_mode(mode: ExecutionPattern) -> BenchCaseKind {
     match mode {
         ExecutionPattern::Direct => BenchCaseKind::SimpleAnswer,
         ExecutionPattern::Execute => BenchCaseKind::ArchitecturePlan,
-        ExecutionPattern::Explore | ExecutionPattern::Collaborate => BenchCaseKind::WorkGraphFanout,
+        ExecutionPattern::Explore | ExecutionPattern::Collaborate => {
+            BenchCaseKind::ExecutionGraphFanout
+        }
         ExecutionPattern::Deliberate | ExecutionPattern::Supervise => {
             BenchCaseKind::VerificationGuard
         }
@@ -743,14 +773,14 @@ mod tests {
             match expected_first_label {
                 Some(label) => assert_eq!(
                     trace
-                        .workgraph
+                        .execution_graph
                         .as_ref()
                         .and_then(|graph| graph.nodes.first())
-                        .map(|node| node.label.as_str()),
+                        .map(|node| node.id.as_str()),
                     Some(label),
                     "prompt: {prompt}"
                 ),
-                None => assert!(trace.workgraph.is_none(), "prompt: {prompt}"),
+                None => assert!(trace.execution_graph.is_none(), "prompt: {prompt}"),
             }
         }
     }
@@ -790,7 +820,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_kernel_reports_workgraph_quality_for_complex_turn() {
+    fn runtime_kernel_reports_execution_graph_quality_for_complex_turn() {
         let kernel = RuntimeAiKernel::begin_turn(
             "session-1",
             "全面规划 runtime gateway service crate 的复杂架构演进",
@@ -799,11 +829,13 @@ mod tests {
         );
 
         let trace = kernel.finalize("planned", 0, 0);
-        let quality = trace.workgraph_quality.expect("workgraph quality report");
+        let quality = trace
+            .execution_graph_quality
+            .expect("execution graph quality report");
 
         assert!(quality.is_dag);
-        assert!(quality.has_review_node);
-        assert!(quality.has_synthesis_node);
+        assert!(quality.has_verify_node);
+        assert!(quality.has_synthesize_node);
         assert_eq!(
             trace.collaboration_decision.template_id,
             CollaborationTemplateId::LongRunningProject

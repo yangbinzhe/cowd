@@ -5,8 +5,6 @@ use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{record_runtime_event, RuntimeEventInput, RuntimeEventRef, RuntimeEventScope};
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentTaskStatus {
@@ -126,7 +124,6 @@ impl AgentTaskMailboxService {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(task.task_id.clone(), task.clone());
-        record_task_event(&task, "agent_task.assigned");
         receipt
     }
 
@@ -148,7 +145,6 @@ impl AgentTaskMailboxService {
         task.updated_at_ms = now_ms();
         let task = task.clone();
         drop(tasks);
-        record_task_event(&task, format!("agent_task.{}", status_label(status)));
         Ok(AgentTaskReceipt {
             task_id: task.task_id,
             team_id: task.team_id,
@@ -278,7 +274,6 @@ impl AgentTaskMailboxService {
         }
         let task = task.clone();
         drop(tasks);
-        record_task_event(&task, format!("agent_task.{}", status_label(status)));
         Ok(AgentTaskCompletionReceipt {
             task_id: task.task_id,
             team_id: task.team_id,
@@ -296,38 +291,6 @@ impl AgentTaskMailboxService {
 pub fn global_agent_task_mailbox() -> &'static AgentTaskMailboxService {
     static SERVICE: OnceLock<AgentTaskMailboxService> = OnceLock::new();
     SERVICE.get_or_init(AgentTaskMailboxService::new)
-}
-
-fn record_task_event(task: &AgentTask, kind: impl Into<String>) {
-    let _ = record_runtime_event(RuntimeEventInput {
-        stream_id: format!("agent-task:{}", task.task_id),
-        scope: RuntimeEventScope::Agent,
-        kind: kind.into(),
-        status: Some(status_label(task.status).to_string()),
-        actor: Some("agent_task_mailbox".to_string()),
-        refs: vec![
-            RuntimeEventRef {
-                kind: "team".to_string(),
-                id: task.team_id.clone(),
-            },
-            RuntimeEventRef {
-                kind: "session".to_string(),
-                id: task.session_id.clone(),
-            },
-        ],
-        payload: serde_json::json!(task),
-    });
-}
-
-fn status_label(status: AgentTaskStatus) -> &'static str {
-    match status {
-        AgentTaskStatus::Pending => "pending",
-        AgentTaskStatus::Claimed => "claimed",
-        AgentTaskStatus::Running => "running",
-        AgentTaskStatus::Completed => "completed",
-        AgentTaskStatus::Failed => "failed",
-        AgentTaskStatus::Cancelled => "cancelled",
-    }
 }
 
 fn now_ms() -> u64 {

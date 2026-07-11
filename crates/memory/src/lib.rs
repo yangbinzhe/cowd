@@ -39,6 +39,7 @@ pub mod background_watcher;
 pub mod closet;
 #[path = "ingestion/code_indexer.rs"]
 pub mod code_indexer;
+#[allow(private_interfaces)]
 #[path = "kernel/cognitive.rs"]
 pub mod cognitive;
 #[path = "kernel/coherence.rs"]
@@ -88,6 +89,7 @@ pub mod maintenance;
 pub mod memory_authority;
 #[path = "kernel/memory_cluster.rs"]
 pub mod memory_cluster;
+#[allow(private_interfaces)]
 #[path = "kernel/memory_pulse.rs"]
 pub mod memory_pulse;
 #[path = "lifecycle/memory_sync.rs"]
@@ -105,7 +107,7 @@ pub mod project_scope;
 #[path = "graph/resolution.rs"]
 pub mod resolution;
 #[path = "session/runtime_event.rs"]
-pub mod runtime_event;
+pub(crate) mod runtime_event;
 pub mod search;
 #[path = "ingestion/seeds.rs"]
 pub mod seeds;
@@ -206,7 +208,8 @@ pub use memory_pulse::{
 pub use memory_usage::{summarize_usage, MemoryUsageSignal, MemoryUsageSummary};
 pub use orchestrator::MemoryOrchestrator;
 pub use runtime_event::{
-    RuntimeEvent, RuntimeEventPage, RuntimeEventScope, RuntimeRef, RUNTIME_EVENT_TYPE,
+    SessionDomainEvent, SessionDomainEventPage, SessionDomainRef, SessionDomainScope,
+    SESSION_DOMAIN_EVENT_TYPE,
 };
 pub use search::{BM25Scorer, HybridSearcher, SearchResult as HybridSearchResult};
 pub use session_resume::SessionResume;
@@ -216,7 +219,9 @@ pub use state_rebuilder::{
     StateItem, StateRebuilder, StateSource,
 };
 pub use store::session::{
-    SessionEvent, SessionMessage, SessionRecord, SessionSearchResult, SessionSnapshot,
+    OutboxFailureClass, OutboxStatus, SessionEvent, SessionMessage, SessionRecord,
+    SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest,
+    SessionSearchResult, SessionSnapshot,
 };
 pub use store::verbatim::{VerbatimEntry, VerbatimSink};
 pub use temporal_graph::{temporal_relation, TimeRange};

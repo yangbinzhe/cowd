@@ -8,7 +8,7 @@
 //   - Composite reputation scores (when available)
 //   - Keyboard navigation (j/k/↑/↓, Enter detail, Tab toggle)
 //
-// Data source: `App::delegate_tasks` and runtime workgraph summaries.
+// Data source: `App::delegate_tasks` and runtime execution graph summaries.
 // Reputation scores are read from each AgentInfo's optional field and
 // formatted via `ReputationScore::composite()`.
 
@@ -78,8 +78,8 @@ pub struct AgentTeamPanel {
     pub scroll_offset: u16,
     /// Index of the agent whose detail view is expanded (None = collapsed).
     pub detail_idx: Option<usize>,
-    /// Latest workgraph summary emitted by the runtime.
-    pub workgraph_summary: Option<crate::RuntimeWorkGraphSummary>,
+    /// Latest execution graph summary emitted by the runtime.
+    pub execution_graph_summary: Option<crate::RuntimeExecutionGraphSummary>,
     /// Delegated task summaries from the current App state.
     pub delegate_tasks: Vec<DelegateTask>,
     /// Last operator action status.
@@ -98,7 +98,7 @@ impl AgentTeamPanel {
             visible: false,
             scroll_offset: 0,
             detail_idx: None,
-            workgraph_summary: None,
+            execution_graph_summary: None,
             delegate_tasks: Vec::new(),
             last_action_status: None,
             last_action_receipt: None,
@@ -126,7 +126,7 @@ impl AgentTeamPanel {
             self.detail_idx = None;
         }
         self.sync();
-        self.workgraph_summary = app.latest_workgraph_summary.clone();
+        self.execution_graph_summary = app.latest_execution_graph_summary.clone();
         self.delegate_tasks = app.delegate_tasks.clone();
     }
 
@@ -354,9 +354,9 @@ impl AgentTeamPanel {
 
     fn render_collaboration_lines(&self) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-        if let Some(summary) = self.workgraph_summary.as_ref() {
+        if let Some(summary) = self.execution_graph_summary.as_ref() {
             lines.push(Line::from(vec![
-                Span::styled("Workgraph: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Execution graph: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(summary.status.clone(), Style::default().fg(Color::Yellow)),
                 Span::styled(
                     format!(
@@ -387,7 +387,7 @@ impl AgentTeamPanel {
             ]));
         } else {
             lines.push(Line::from(Span::styled(
-                "Workgraph: no collaboration summary yet",
+                "Execution graph: no collaboration summary yet",
                 Style::default().fg(Color::DarkGray),
             )));
         }
@@ -1149,7 +1149,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_from_app_renders_workgraph_and_delegate_tasks() {
+    fn sync_from_app_renders_execution_graph_and_delegate_tasks() {
         let _guard = agent_directory_test_guard();
         let dir = AgentDirectory::global();
         dir.clear_all();
@@ -1161,7 +1161,7 @@ mod tests {
         ));
 
         let mut app = App::new("m", "s");
-        app.latest_workgraph_summary = Some(crate::RuntimeWorkGraphSummary {
+        app.latest_execution_graph_summary = Some(crate::RuntimeExecutionGraphSummary {
             graph_id: Some("graph-1".to_string()),
             board_id: Some("board-1".to_string()),
             status: "running".to_string(),
@@ -1184,7 +1184,7 @@ mod tests {
 
         let lines = render_panel(&mut panel, 92, 20);
         let joined = lines.join("\n");
-        assert!(joined.contains("Workgraph:"), "{joined}");
+        assert!(joined.contains("Execution graph:"), "{joined}");
         assert!(joined.contains("tasks 3 memory 2 conflicts 1"), "{joined}");
         assert!(joined.contains("lift 1.25"), "{joined}");
         assert!(joined.contains("Delegates:"), "{joined}");

@@ -4,6 +4,57 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+#[test]
+fn mission_team_and_steward_entries_do_not_own_execution() {
+    let mission_service_source = read_repo("crates/gateway/src/services/mission_service.rs");
+    let mission_service = production_part(&mission_service_source);
+    for forbidden in [
+        "global_team_runtime_service().cancel(",
+        "global_team_runtime_service().handoff(",
+        ".finalize_execution_summary(",
+        ".tick_all_once(",
+    ] {
+        assert!(
+            !mission_service.contains(forbidden),
+            "MissionService must not execute through scoped globals: {forbidden}"
+        );
+    }
+    assert!(mission_service.contains(".command_graph("));
+    assert!(mission_service.contains("\"status\": \"capability_unavailable\""));
+    assert!(!mission_service.contains("global_agent_lifecycle_service().command("));
+
+    let steward_runtime_source = read_repo("crates/runtime/src/steward/steward_runtime.rs");
+    let steward_runtime = production_part(&steward_runtime_source);
+    assert!(
+        !steward_runtime.contains("pub fn tick_all_once"),
+        "scoped steward globals may retain state but must not expose a scheduler execution loop"
+    );
+
+    let scheduler_source = read_repo("crates/runtime/src/steward/steward_scheduler.rs");
+    let scheduler = production_part(&scheduler_source);
+    assert!(!scheduler.contains(".tick_all_once("));
+    assert!(scheduler.contains("capability_unavailable:steward_execution:V8"));
+
+    let mission_control_source = read_repo("crates/runtime/src/mission/mission_control.rs");
+    let mission_control = production_part(&mission_control_source);
+    assert!(!mission_control.contains("global_agent_lifecycle_service().command("));
+    assert!(!mission_control.contains("global_steward_runtime_service().start("));
+    assert!(mission_control.contains("\"capability\": \"agent_execution\""));
+
+    let team_runtime_source = read_repo("crates/runtime/src/team/team_runtime.rs");
+    let team_runtime = production_part(&team_runtime_source);
+    for forbidden in [
+        "pub fn cancel(&self, team_id:",
+        "pub fn handoff(",
+        "pub fn finalize_execution_summary(",
+    ] {
+        assert!(
+            !team_runtime.contains(forbidden),
+            "scoped team globals must not expose execution owner API: {forbidden}"
+        );
+    }
+}
+
 fn read_repo(path: &str) -> String {
     std::fs::read_to_string(repo_root().join(path)).expect("source file should read")
 }
@@ -23,6 +74,43 @@ fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
 
 fn manifest_dependencies(source: &str) -> &str {
     source.split("[dev-dependencies]").next().unwrap_or(source)
+}
+
+fn production_rust_sources(roots: &[&str]) -> Vec<(String, String)> {
+    fn visit(root: &std::path::Path, files: &mut Vec<PathBuf>) {
+        let mut entries = std::fs::read_dir(root)
+            .unwrap_or_else(|error| panic!("{} should be readable: {error}", root.display()))
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                visit(&path, files);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                files.push(path);
+            }
+        }
+    }
+
+    let root = repo_root();
+    let mut files = Vec::new();
+    for relative in roots {
+        visit(&root.join(relative), &mut files);
+    }
+    files
+        .into_iter()
+        .map(|path| {
+            let relative = path
+                .strip_prefix(&root)
+                .expect("source must be inside repository")
+                .to_string_lossy()
+                .to_string();
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("{relative} should read: {error}"));
+            (relative, production_part(&source).to_string())
+        })
+        .collect()
 }
 
 #[test]
@@ -59,7 +147,7 @@ fn removed_builtin_channel_document_operations_do_not_reappear() {
 fn macro_crates_keep_source_files_grouped_by_business_boundary() {
     assert_root_rs_files("crates/gateway/src", &["main.rs"]);
     assert_root_rs_files("crates/tui/src", &["lib.rs"]);
-    assert_root_rs_files("crates/tools/src", &["lib.rs"]);
+    assert_root_rs_files("crates/tools/src", &["host.rs", "lib.rs"]);
     assert_root_rs_files("crates/matrix/core/src", &["lib.rs"]);
 
     for (root, dirs) in [
@@ -195,6 +283,48 @@ fn production_code_does_not_depend_on_daemon_module() {
 }
 
 #[test]
+fn production_turns_enter_the_execution_graph_host_once() {
+    let gateway_entry_source = read_repo("crates/gateway/src/runtime/runtime_entry.rs");
+    let gateway_service_source = read_repo("crates/gateway/src/runtime/runtime_service.rs");
+    let subagent_source = read_repo("crates/runtime/src/agent/subagent_turn.rs");
+    let agent_source = read_repo("crates/runtime/src/agent/agent.rs");
+    let host_source = read_repo("crates/runtime/src/conversation/host.rs");
+    let gateway_entry = gateway_entry_source.as_str();
+    let gateway_service = production_part(&gateway_service_source);
+    let subagent = production_part(&subagent_source);
+    let agent = production_part(&agent_source);
+    let host = production_part(&host_source);
+
+    assert!(gateway_entry.contains(".submit_turn(content, prompter)"));
+    assert!(gateway_service.contains(".submit_turn(&content"));
+    assert!(subagent.contains("runtime.submit_turn(&prompt"));
+    assert!(agent.contains("submit_owned_conversation_turn("));
+    assert!(host.contains("services.graph_runner().start(graph).await"));
+    assert!(host.contains("ExecutionGraphCompiler"));
+    assert!(!host.contains("execute_model_tool_cycle"));
+
+    for (path, source) in [
+        ("gateway runtime entry", gateway_entry),
+        ("gateway runtime service", gateway_service),
+        ("provider subagent", subagent),
+        ("generic agent", agent),
+    ] {
+        assert!(
+            !source.contains("execute_model_tool_cycle"),
+            "{path} must not bypass StandardRuntimeHost/ExecutionGraphRunner"
+        );
+        assert!(
+            !source.contains("run_turn_async"),
+            "{path} must not restore the removed turn loop entry"
+        );
+        assert!(
+            !source.contains("assistant_messages.last()"),
+            "{path} must consume the synthesized terminal result"
+        );
+    }
+}
+
+#[test]
 fn socket_business_commands_are_removed_after_tui_gateway_migration() {
     let source = production_part(&read_repo("crates/gateway/src/runtime_host/mod.rs")).to_string();
     for forbidden in [
@@ -224,18 +354,18 @@ fn socket_business_commands_are_removed_after_tui_gateway_migration() {
 }
 
 #[test]
-fn approval_api_uses_global_queue_for_decisions() {
+fn approval_api_uses_workspace_runtime_queue_for_decisions() {
     let full_source = read_repo("crates/gateway/src/services/approval_service.rs");
     let source = production_part(&full_source);
-    assert!(
-        source.contains("runtime::global_approval_queue().pending()"),
-        "approval pending API must read the unified GlobalApprovalQueue"
-    );
-    assert!(
-        source.contains("runtime::global_approval_queue().decide("),
-        "approval respond API must decide through the unified GlobalApprovalQueue"
-    );
-    for forbidden in ["get_pending_requests", "resolve_approval"] {
+    assert!(source.contains("runtime_services"));
+    assert!(source.contains("approval_queue()"));
+    assert!(source.contains(".pending()"));
+    assert!(source.contains(".decide("));
+    for forbidden in [
+        "get_pending_requests",
+        "resolve_approval",
+        "runtime::global_",
+    ] {
         assert!(
             !source.contains(forbidden),
             "ApprovalService must not use SmartApprovalGate {forbidden} as a production decision path"
@@ -286,7 +416,6 @@ fn ai_kernel_is_pure_semantic_crate() {
         "ai-strategy",
         "ai-tool-transaction",
         "ai-verification",
-        "ai-workgraph",
     ];
     let workspace_manifest = read_repo("Cargo.toml");
     for absorbed in absorbed_crates {
@@ -331,7 +460,7 @@ fn ai_kernel_is_pure_semantic_crate() {
         "pub mod strategy",
         "pub mod context",
         "pub mod agent",
-        "pub mod workgraph",
+        "pub mod execution_graph",
         "pub mod tool",
         "pub mod verification",
         "pub mod policy",
@@ -592,7 +721,6 @@ fn message_connector_contracts_drive_gateway_surface_readiness() {
 
     for source_path in [
         "crates/gateway/src/api_routes/message_connector_routes.rs",
-        "crates/gateway/src/api_routes/cross_plane_routes.rs",
         "crates/gateway/src/api_routes/mfg_routes.rs",
         "crates/gateway/src/infrastructure/gateway_health.rs",
     ] {
@@ -820,15 +948,16 @@ fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
     let task_service =
         production_part(&read_repo("crates/gateway/src/services/task_service.rs")).to_string();
     assert!(
-        task_service.contains("pub(crate) async fn append_runtime_event")
-            && task_service.contains("ensure_task_session_record"),
-        "task service must own task lifecycle runtime-event projection"
+        task_service.contains("pub(crate) fn record_lifecycle_event")
+            && task_service.contains("runtime_events: &RuntimeEventService")
+            && !task_service.contains("ensure_task_session_record"),
+        "task service must write lifecycle state to the scoped runtime store without fake sessions"
     );
     let task_routes =
         production_part(&read_repo("crates/gateway/src/api_routes/task_routes.rs")).to_string();
     assert!(
         !task_routes.contains("async fn append_task_runtime_event")
-            && task_routes.contains(".append_runtime_event(&state.services.session"),
+            && task_routes.contains(".record_lifecycle_event(&state.services.runtime_events"),
         "task routes must delegate lifecycle projection to TaskService"
     );
     let context_routes = production_part(&read_repo(
@@ -1150,7 +1279,6 @@ fn runtime_uses_ai_kernel_as_harness_semantic_entrypoint() {
         "ai-strategy",
         "ai-tool-transaction",
         "ai-verification",
-        "ai-workgraph",
     ] {
         assert!(
             !dependencies.contains(forbidden),
@@ -1520,6 +1648,32 @@ fn surface_is_gateway_owned_and_runtime_host_uses_runtime_service_turns() {
 }
 
 #[test]
+fn cross_plane_state_and_execution_are_runtime_scoped() {
+    let gateway_service_source = read_repo("crates/gateway/src/services/cross_plane_service.rs");
+    let gateway_service = production_part(&gateway_service_source);
+    let gateway_routes_source = read_repo("crates/gateway/src/api_routes/cross_plane_routes.rs");
+    let gateway_routes = production_part(&gateway_routes_source);
+    let runtime_service_source =
+        read_repo("crates/runtime/src/execution_core/cross_plane/service.rs");
+    let runtime_service = production_part(&runtime_service_source);
+    for forbidden in [
+        "CROSS_PLANE_CONTROL",
+        "CROSS_PLANE_LOADED",
+        "control-state.json",
+        "save_to_path",
+        "load_from_path",
+    ] {
+        assert!(!gateway_service.contains(forbidden));
+        assert!(!runtime_service.contains(forbidden));
+    }
+    assert!(gateway_service.contains("runtime_services.cross_plane()"));
+    assert!(runtime_service.contains("RuntimeEventScope::CrossPlane"));
+    assert!(runtime_service.contains("compile_commit_graph"));
+    assert!(!gateway_routes.contains("dispatch_ready_target"));
+    assert!(!gateway_routes.contains("services.surface.send"));
+}
+
+#[test]
 fn production_gateway_entry_does_not_run_ai_turns_directly() {
     let main_source = read_repo("crates/gateway/src/main.rs");
     let production_main = production_part(&main_source);
@@ -1532,8 +1686,9 @@ fn production_gateway_entry_does_not_run_ai_turns_directly() {
     let runtime_service = production_part(&runtime_service_source);
     assert!(
         runtime_service.contains("run_turn_with_timeout")
-            && runtime_service.contains(".run_turn_async("),
-        "RuntimeService is the gateway-owned boundary allowed to call the runtime turn engine"
+            && runtime_service.contains(".submit_turn(&content")
+            && !runtime_service.contains(".run_turn_async("),
+        "RuntimeService must submit through StandardRuntimeHost and the canonical graph runner"
     );
 }
 
@@ -1580,7 +1735,7 @@ fn gateway_runtime_factory_owns_runtime_assembly_without_legacy_direct_ai_shell(
         runtime_factory.contains("pub(crate) fn create_runtime_entry(")
             && runtime_factory.contains("pub(crate) fn create_runtime_entry_with_session_store(")
             && runtime_factory.contains("runtime::StandardRuntimeHost::new")
-            && runtime_factory.contains("GatewayToolExecutor::new")
+            && runtime_factory.contains("GatewayToolExecutor::from_tool_host")
             && !runtime_factory.contains("ProviderRuntimeClient")
             && !runtime_factory.contains("ConversationRuntime::new"),
         "runtime_factory must delegate provider/conversation assembly to runtime::StandardRuntimeHost"
@@ -1604,6 +1759,270 @@ fn gateway_runtime_factory_owns_runtime_assembly_without_legacy_direct_ai_shell(
             && !session_routes.contains("crate::create_runtime_entry_with_session_store("),
         "session routes must call runtime_factory instead of gateway root factories"
     );
+}
+
+#[test]
+fn v3_removed_execution_owners_cannot_reappear_in_production() {
+    let sources = production_rust_sources(&[
+        "crates/runtime/src",
+        "crates/gateway/src",
+        "crates/harness-contract/src",
+        "crates/app-mfg/src",
+    ]);
+    let forbidden = [
+        ("WorkGraph", "legacy work graph contract"),
+        ("AgentWorkGraph", "legacy agent work graph"),
+        ("AgentRunGraph", "legacy agent run graph"),
+        ("workgraph::", "legacy workgraph module"),
+        ("agent_workgraph", "legacy agent workgraph module"),
+        ("run_turn_async(", "graph-bypassing turn loop"),
+        (
+            "assistant_messages.last()",
+            "transcript-tail result inference",
+        ),
+        ("TeamExecutionLoop::tick_ready", "second team scheduler"),
+        ("blocked_missing_executor", "late missing-executor fallback"),
+        ("agent.waiting_executor", "fake waiting executor state"),
+        (
+            "SessionExecutionPlane",
+            "graph-external session execution owner",
+        ),
+        (
+            "materialize_session_input_decision",
+            "gateway session materializer",
+        ),
+        ("CROSS_PLANE_CONTROL", "gateway cross-plane state singleton"),
+        ("CROSS_PLANE_LOADED", "gateway cross-plane load singleton"),
+        ("control-state.json", "cross-plane JSON truth source"),
+        ("global_runtime_event_store", "global runtime event store"),
+        ("global_approval_queue", "global approval truth source"),
+        ("global_conflict_arbiter", "global conflict truth source"),
+        (
+            "global_runtime_control_plane",
+            "global runtime control plane",
+        ),
+        ("global_task_registry", "global task registry"),
+    ];
+
+    for (path, source) in &sources {
+        if path.ends_with("/recovery/source_self_audit.rs") {
+            continue;
+        }
+        for (needle, owner) in forbidden {
+            assert!(
+                !source.contains(needle),
+                "{path} must not restore {owner}: `{needle}`"
+            );
+        }
+    }
+
+    assert!(
+        !repo_root().join("crates/runtime/src/persistence").exists(),
+        "dead runtime persistence facade must be deleted"
+    );
+    assert!(
+        !repo_root()
+            .join("crates/runtime/src/orchestration/executor.rs")
+            .exists(),
+        "orchestration must compile commands for the canonical Runner, not own an executor"
+    );
+}
+
+#[test]
+fn v3_turn_call_trace_has_one_compiler_runner_and_commit_owner() {
+    let gateway_service = read_repo("crates/gateway/src/runtime/runtime_service.rs");
+    let gateway_entry = read_repo("crates/gateway/src/runtime/runtime_entry.rs");
+    let host = read_repo("crates/runtime/src/conversation/host.rs");
+    let runner = read_repo("crates/runtime/src/execution_core/graph/runner.rs");
+    let commit = read_repo("crates/runtime/src/execution_core/graph/commit_service.rs");
+
+    assert!(production_part(&gateway_service).contains(".submit_turn(&content"));
+    assert!(gateway_entry.contains("self.runtime_mut().submit_turn"));
+    assert!(production_part(&host).contains("ExecutionGraphCompiler"));
+    assert!(production_part(&host).contains("services.graph_runner().start(graph).await"));
+    assert!(production_part(&runner).contains("self.commit_service.register_graph_async(graph)"));
+    assert!(production_part(&runner).contains("bind_and_start_node_async"));
+    assert!(production_part(&commit).contains("append_transaction"));
+}
+
+#[test]
+fn v3_runtime_services_are_scoped_and_executors_are_fixed_at_assembly() {
+    let services = read_repo("crates/runtime/src/execution_core/services.rs");
+    let host = read_repo("crates/runtime/src/conversation/host.rs");
+    let services = production_part(&services);
+    let host = production_part(&host);
+
+    for required in [
+        "pub struct RuntimeServices",
+        "pub fn builder(",
+        "pub fn in_memory()",
+        "workspace_key",
+        "event_store: Arc<RuntimeEventStore>",
+        "executor_registry: Arc<NodeExecutorRegistry>",
+        "graph_runner: Arc<ExecutionGraphRunner>",
+        "resource_manager: Arc<ExecutionResourceManager>",
+        "scope_locks: Arc<ScopeLockManager>",
+        "worktree_leases: Arc<WorktreeLeaseManager>",
+    ] {
+        assert!(
+            services.contains(required),
+            "RuntimeServices missing `{required}`"
+        );
+    }
+
+    assert!(
+        services.contains("register_builtin_executors")
+            || services.contains("install_builtin_executors"),
+        "RuntimeServices assembly must install the fixed canonical executor set"
+    );
+    assert!(
+        !host.contains("executor_registry().register(")
+            && !host.contains("executor_registry().unregister("),
+        "turn execution must not mutate the shared executor registry per request"
+    );
+
+    for (path, source) in production_rust_sources(&["crates/runtime/src", "crates/gateway/src"]) {
+        if path == "crates/runtime/src/execution_core/services.rs" {
+            continue;
+        }
+        assert!(
+            !source.contains("executor_registry().register(")
+                && !source.contains("executor_registry().unregister(")
+                && !source.contains(".unregister(&executor_kind)"),
+            "{path} must bind graph-scoped backends instead of mutating the executor registry"
+        );
+    }
+
+    let cross_plane = read_repo("crates/gateway/src/services/cross_plane_service.rs");
+    let cross_plane = production_part(&cross_plane);
+    assert!(cross_plane.contains("cross_plane_connector_executor()"));
+    assert!(cross_plane.contains(".install_resolver("));
+    assert!(!cross_plane.contains(".bind(") && !cross_plane.contains(".unbind("));
+    assert!(!cross_plane.contains("executor_registry()"));
+}
+
+#[test]
+fn v3_bidirectional_outboxes_have_started_production_pumps() {
+    let services = read_repo("crates/runtime/src/execution_core/services.rs");
+    let ingress_bridge = read_repo("crates/runtime/src/session/session_execution.rs");
+    let delivery_bridge = read_repo("crates/gateway/src/runtime/session_runtime_bridge.rs");
+    let gateway_host = read_repo("crates/gateway/src/runtime_host/mod.rs");
+    let services = production_part(&services);
+    let ingress_bridge = production_part(&ingress_bridge);
+    let delivery_bridge = production_part(&delivery_bridge);
+    let gateway_host = production_part(&gateway_host);
+
+    assert!(ingress_bridge.contains("claim_session_runtime_outbox"));
+    assert!(ingress_bridge.contains("ack_session_runtime_outbox"));
+    assert!(delivery_bridge.contains("claim_session_terminals"));
+    assert!(delivery_bridge.contains("ack_session_terminal"));
+    assert!(
+        services.contains("SessionRuntimeBridge") || services.contains("SessionInputRouter"),
+        "workspace RuntimeServices must own the durable session bridge"
+    );
+    assert!(
+        gateway_host.contains("SessionRuntimeBridge::start("),
+        "Gateway startup must start the bidirectional outbox pump; request-path polling is insufficient"
+    );
+}
+
+#[test]
+fn v3_gateway_startup_recovers_persistent_execution_graphs() {
+    let gateway_host = read_repo("crates/gateway/src/runtime_host/mod.rs");
+    let services = read_repo("crates/runtime/src/execution_core/services.rs");
+    let state_store = read_repo("crates/runtime/src/execution_core/graph/state_store.rs");
+    let gateway_host = production_part(&gateway_host);
+    let services = production_part(&services);
+    let state_store = production_part(&state_store);
+
+    assert!(
+        gateway_host.contains(".recover_execution_graphs_on_startup()"),
+        "Gateway startup must invoke runtime-owned startup recovery after executor resolvers are installed"
+    );
+    assert!(
+        gateway_host.contains("emit_execution_startup_recovery"),
+        "Gateway startup must emit structured recovery diagnostics"
+    );
+    assert!(
+        services.contains("pub async fn recover_execution_graphs_on_startup"),
+        "RuntimeServices must own the startup recovery coordinator"
+    );
+    assert!(
+        services.contains("ExecutionGraphRecovery::new"),
+        "RuntimeServices recovery must reuse the canonical graph recovery service"
+    );
+    assert!(
+        services.contains("self.graph_runner.run_until_quiescent"),
+        "RuntimeServices recovery must continue ready/planned graphs through the canonical runner"
+    );
+    assert!(
+        state_store.contains("pub fn nonterminal_graph_ids"),
+        "ExecutionGraphStateStore must enumerate persisted nonterminal graphs without Gateway SQL"
+    );
+}
+
+#[test]
+fn v3_approval_and_turn_boundaries_have_no_gateway_dual_write_state() {
+    let approval = read_repo("crates/gateway/src/services/approval_service.rs");
+    let commit = read_repo("crates/runtime/src/execution_core/graph/commit_service.rs");
+    let routes = production_rust_sources(&["crates/gateway/src/api_routes"]);
+
+    assert!(!approval.contains("reconcile_graph_decisions"));
+    assert!(commit.contains("ExecutionGraphCommand::SubmitApproval"));
+    assert!(commit.contains("\"approval.decided\""));
+    assert!(commit.contains("append_transaction(request)"));
+
+    for (path, source) in routes {
+        for forbidden in [
+            "ACTIVE_TURN_CONTROLS",
+            "ACTIVE_TURN_PARTIALS",
+            "register_active_turn_control",
+            "take_active_turn_partial",
+            "append_session_timeline_event",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{path} must not restore dead turn state or direct timeline writes: `{forbidden}`"
+            );
+        }
+    }
+}
+
+#[test]
+fn v3_executor_binding_is_committed_before_running_state() {
+    let runner = read_repo("crates/runtime/src/execution_core/graph/runner.rs");
+    let commit = read_repo("crates/runtime/src/execution_core/graph/commit_service.rs");
+    let runner = production_part(&runner);
+    let commit = production_part(&commit);
+    let ready_wave = source_between(
+        runner,
+        "async fn start_and_execute_node(",
+        "async fn acquire_node_resources(",
+    );
+
+    let start = ready_wave
+        .find("let ticket = executor")
+        .expect("executor must return a durable ticket before Running");
+    let bind = ready_wave
+        .find("bind_and_start_node_async")
+        .expect("Runner must atomically bind and start a node");
+    assert!(
+        start < bind,
+        "executor ticket/binding must exist before Running commit"
+    );
+    assert!(
+        !ready_wave[..bind].contains("ExecutionNodeStatus::Running"),
+        "Runner must not persist Running before executor binding"
+    );
+
+    let bind_commit = source_between(
+        commit,
+        "pub fn bind_and_start_node(",
+        "pub async fn bind_and_start_node_async",
+    );
+    assert!(bind_commit.contains("binding: Some(binding)"));
+    assert!(bind_commit.contains("ExecutionNodeStatus::Running"));
+    assert!(bind_commit.contains("append_graph_event("));
 }
 
 #[test]

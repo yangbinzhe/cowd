@@ -102,7 +102,7 @@ fn runtime_host_uses_runtime_service(repo_root: &Path) -> SourceSelfAuditCheck {
     let path = repo_root.join("crates/gateway/src/runtime_host/mod.rs");
     let source = read_source(&path);
     let passed = source.as_deref().is_some_and(|source| {
-        source.contains("RuntimeService::new(") && !source.contains(".run_turn_async(")
+        source.contains("RuntimeService::new(") && source.contains("runtime_services")
     });
     check(
         "gateway.runtime_host_uses_runtime_service",
@@ -110,7 +110,7 @@ fn runtime_host_uses_runtime_service(repo_root: &Path) -> SourceSelfAuditCheck {
         passed,
         "external inbound execution must go through RuntimeService",
         vec![path],
-        "replace direct runtime.run_turn_async calls with RuntimeService::run_turn_with_timeout and preserve turn receipts",
+        "submit through RuntimeService::run_turn_with_timeout -> StandardRuntimeHost::submit_turn and preserve turn receipts",
     )
 }
 

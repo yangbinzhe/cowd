@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RuntimeWorkGraphSummary {
+pub struct RuntimeExecutionGraphSummary {
     pub graph_id: Option<String>,
     pub board_id: Option<String>,
     pub status: String,
@@ -74,8 +74,8 @@ pub enum CowdEvent {
     RuntimePolicyDecision {
         summary: RuntimePolicyDecisionSummary,
     },
-    WorkGraphSummary {
-        summary: RuntimeWorkGraphSummary,
+    ExecutionGraphSummary {
+        summary: RuntimeExecutionGraphSummary,
     },
     Warning {
         message: String,

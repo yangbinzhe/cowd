@@ -238,13 +238,13 @@ pub fn run_eval_controlled(
             "capability": "mission_runtime_collaboration_closure",
             "status": mission_runtime.get("status").and_then(Value::as_str).unwrap_or("failed"),
             "evidence": format!(
-                "template={}, workgraph={}, conflicts={}, projection_v2={}",
+                "template={}, execution_graph={}, conflicts={}, projection_v2={}",
                 mission_runtime.pointer("/selected_strategy/template").and_then(Value::as_str).unwrap_or("none"),
-                mission_runtime.pointer("/workgraph/workgraph_id").and_then(Value::as_str).unwrap_or("none"),
+                mission_runtime.pointer("/execution_graph/execution_graph_id").and_then(Value::as_str).unwrap_or("none"),
                 mission_runtime.pointer("/conflicts/count").and_then(Value::as_u64).unwrap_or_default(),
                 mission_runtime.pointer("/mission_projection/schema_version").and_then(Value::as_u64).unwrap_or_default(),
             ),
-            "notes": "deterministic closure exercises Runtime capability catalog, team template, WorkGraph planning, agent capability binding, session command lifecycle, conflict arbitration, and MissionProjection v2"
+            "notes": "deterministic closure exercises Runtime capability catalog, team template, ExecutionGraph planning, agent capability binding, session command lifecycle, conflict arbitration, and MissionProjection v2"
         }),
         json!({
             "capability": "next_gen_harness_closure",
@@ -274,7 +274,7 @@ pub fn run_eval_controlled(
         json!({"index": 2, "action": "harness_capability_coverage", "evidence": "runtime module map coverage"}),
         json!({"index": 3, "action": "knowledge_fabric.evaluate", "evidence": "context governance activated and blocked namespaces"}),
         json!({"index": 4, "action": "reality_context_eval.evaluate", "evidence": "RecallReport and ContextEnvelope scenario matrix generated"}),
-        json!({"index": 5, "action": "mission_runtime_collaboration_closure", "evidence": "team/workgraph/session/conflict/projection closure generated"}),
+        json!({"index": 5, "action": "mission_runtime_collaboration_closure", "evidence": "team/execution_graph/session/conflict/projection closure generated"}),
         json!({"index": 6, "action": "evolution_closure", "evidence": "signal/proposal/sandbox/skill draft closure generated"}),
     ];
     if complex.is_some() {
@@ -525,7 +525,7 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
             collaboration_decision: collaboration.clone(),
         })
         .expect("team runtime");
-    let plan = runtime::TeamExecutionLoop::plan(&team.team_id).expect("team workgraph plan");
+    let plan = runtime::TeamExecutionLoop::plan(&team.team_id).expect("team execution_graph plan");
     let capability = runtime::resolve_agent_capability(runtime::AgentCapabilityRequest {
         role_id: "executor".to_string(),
         allowed_capabilities: vec![
@@ -556,20 +556,32 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
             Some(format!("harness-eval-result:{}", command.command_id)),
         )
         .expect("session command completed");
-    let relation = runtime::global_session_relation_graph()
+    let runtime_services = runtime::RuntimeServices::in_memory().expect("runtime services");
+    let relation = runtime_services
+        .session_relations()
         .add_relation(
             &session.session_id,
             format!("{}-review", session.session_id),
             runtime::SessionRelationKind::ConflictsWith,
             "review lane disputes unbounded execution",
-            vec![format!("workgraph:{}", plan.workgraph.id)],
+            vec![format!("execution_graph:{}", plan.execution_graph.id)],
         )
         .expect("conflict relation");
     let completed_result_ref = completed.result_ref.clone();
-    let conflict_count = runtime::global_conflict_arbiter().projection()["count"]
-        .as_u64()
-        .unwrap_or_default();
-    let projection = mission.projection();
+    runtime_services
+        .conflict_resolver()
+        .resolve(runtime::ConflictResolutionRequest {
+            source: runtime::ConflictSourceKind::SessionRelation,
+            severity: runtime::ConflictSeverity::Medium,
+            summary: relation.summary.clone(),
+            evidence_refs: relation.evidence_refs.clone(),
+            affected_scope: vec![
+                format!("session:{}", relation.from_session_id),
+                format!("session:{}", relation.to_session_id),
+            ],
+        });
+    let conflict_count = runtime_services.conflict_resolver().receipts().len() as u64;
+    let projection = mission.projection(runtime_services.session_relations());
     let checks = vec![
         (
             "simple_question_direct",
@@ -580,10 +592,27 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
             collaboration.template_id != runtime::CollaborationTemplateId::SingleExecutor,
         ),
         (
-            "workgraph_quality",
-            plan.workgraph_quality.is_dag
-                && plan.workgraph_quality.has_review_node
-                && plan.workgraph_quality.has_synthesis_node,
+            "execution_graph_quality",
+            plan.execution_graph_quality.is_dag
+                && plan.execution_graph_quality.has_verify_node
+                && plan.execution_graph_quality.has_synthesize_node,
+        ),
+        (
+            "collaboration_runner_gate",
+            matches!(
+                runtime::ExecutionGraphCompiler.compile(runtime::ExecutionCompileRequest {
+                    objective: objective.to_string(),
+                    payload_ref: format!("team:{}", team.team_id),
+                    target: runtime::RuntimeCompileTarget::TeamGraph,
+                    resource_scopes: Vec::new(),
+                }),
+                Err(
+                    runtime::execution_core::graph::ExecutionCompileError::CapabilityUnavailable {
+                        capability: "collaborate",
+                        available_in: "V5",
+                    }
+                )
+            ),
         ),
         (
             "capability_binding",
@@ -603,7 +632,6 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
         (
             "mission_projection_v2",
             projection.schema_version == 2
-                && projection.workgraph_projection["kind"] == "runtime.mission_workgraphs"
                 && projection.conflict_projection["kind"] == "runtime.conflicts"
                 && projection.capability_projection["name"] == "cowd-runtime-capability-catalog",
         ),
@@ -637,15 +665,15 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
             "simple_pattern": simple_decision.pattern().as_str(),
             "complex_pattern": strategy.pattern.as_str(),
             "template": collaboration.template_id.as_str(),
-            "runtime_actions": ["continue_single", "use_team_template", "build_workgraph", "dispatch_session", "request_arbiter", "parallel_tool_batch"],
+            "runtime_actions": ["continue_single", "use_team_template", "build_execution_graph", "dispatch_session", "request_arbiter", "parallel_tool_batch"],
         },
-        "workgraph": {
-            "workgraph_id": plan.workgraph.id,
-            "node_count": plan.workgraph_quality.node_count,
-            "edge_count": plan.workgraph_quality.edge_count,
-            "is_dag": plan.workgraph_quality.is_dag,
-            "has_review_node": plan.workgraph_quality.has_review_node,
-            "has_synthesis_node": plan.workgraph_quality.has_synthesis_node,
+        "execution_graph": {
+            "execution_graph_id": plan.execution_graph.id,
+            "node_count": plan.execution_graph_quality.node_count,
+            "edge_count": plan.execution_graph_quality.edge_count,
+            "is_dag": plan.execution_graph_quality.is_dag,
+            "has_verify_node": plan.execution_graph_quality.has_verify_node,
+            "has_synthesize_node": plan.execution_graph_quality.has_synthesize_node,
             "ready_node_ids": plan.ready_node_ids,
             "blocked_node_ids": plan.blocked_node_ids,
         },
@@ -680,16 +708,16 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
         },
         "evidence_refs": [
             format!("team:{}", team.team_id),
-            format!("workgraph:{}", plan.workgraph.id),
+            format!("execution_graph:{}", plan.execution_graph.id),
             format!("session-command:{}", command.command_id),
             format!("session-relation:{}", relation.relation_id),
             format!("session-command-result:{}", command.command_id),
-            format!("synthesis:{}", plan.workgraph.id)
+            format!("synthesis:{}", plan.execution_graph.id)
         ],
         "terminal_evidence": {
             "agent_terminal_count": team.agents.len(),
             "mailbox_completed_count": 1,
-            "synthesis_receipt_id": format!("synthesis:{}", plan.workgraph.id),
+            "synthesis_receipt_id": format!("synthesis:{}", plan.execution_graph.id),
             "session_relation_count": 1,
             "runtime_turn_result_count": 1,
             "recovery_applied_count": usize::from(conflict_count > 0),
@@ -720,7 +748,7 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
         },
         "mission_projection": {
             "schema_version": projection.schema_version,
-            "workgraph_kind": projection.workgraph_projection["kind"],
+            "execution_graph_kind": "harness.execution_graph",
             "conflict_kind": projection.conflict_projection["kind"],
             "evidence_kind": projection.evidence_projection["kind"],
             "capability_name": projection.capability_projection["name"],
@@ -934,11 +962,11 @@ fn fake_provider_scenario_report() -> crate::ScenarioSuiteReport {
             strategy_pattern: pattern_for_scenario(item.kind),
             finalization_blocked: item.kind == E2eScenarioKind::Recovery,
             regression_allowed: item.kind != E2eScenarioKind::Recovery,
-            has_workgraph: matches!(
+            has_execution_graph: matches!(
                 item.kind,
                 E2eScenarioKind::ComplexPlan | E2eScenarioKind::TeamParallel
             ),
-            workgraph_quality_ok: item.kind != E2eScenarioKind::SimpleOnce,
+            execution_graph_quality_ok: item.kind != E2eScenarioKind::SimpleOnce,
             growth_has_blocker: item.kind == E2eScenarioKind::Recovery,
             growth_signal_kinds: item.required_evidence.clone(),
             memory_candidate_count: usize::from(item.kind == E2eScenarioKind::RealityMemory),
@@ -1128,7 +1156,9 @@ mod tests {
                 .any(|item| item == "use_team_template"),
             true
         );
-        assert!(report["workgraph"]["is_dag"].as_bool().unwrap_or(false));
+        assert!(report["execution_graph"]["is_dag"]
+            .as_bool()
+            .unwrap_or(false));
         assert!(report["conflicts"]["count"].as_u64().unwrap_or_default() > 0);
         assert!(report["final_result_quality"]["failed_checks"]
             .as_array()

@@ -2,9 +2,8 @@
 // Core gateway routes shared between TUI and HTTP API.
 
 use std::{
-    collections::HashMap,
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -123,157 +122,6 @@ impl AppState {
                     .map(|value| self.services.system.redact_config_json(value))
             })
     }
-}
-
-#[derive(Clone)]
-struct ActiveTurnControl {
-    run_id: String,
-    cancellation_token: runtime::CancellationToken,
-    hook_abort_signal: runtime::HookAbortSignal,
-}
-
-impl ActiveTurnControl {
-    fn abort(&self) {
-        self.cancellation_token.cancel();
-        self.hook_abort_signal.abort();
-    }
-}
-
-static ACTIVE_TURN_CONTROLS: OnceLock<Mutex<HashMap<String, ActiveTurnControl>>> = OnceLock::new();
-static ACTIVE_TURN_PARTIALS: OnceLock<Mutex<HashMap<String, ActiveTurnPartial>>> = OnceLock::new();
-const ACTIVE_TURN_PARTIAL_MAX_CHARS: usize = 160_000;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ActiveTurnPartial {
-    pub(crate) run_id: String,
-    pub(crate) text: String,
-    pub(crate) updated_at_ms: u64,
-    truncated: bool,
-}
-
-fn active_turn_controls() -> &'static Mutex<HashMap<String, ActiveTurnControl>> {
-    ACTIVE_TURN_CONTROLS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn active_turn_partials() -> &'static Mutex<HashMap<String, ActiveTurnPartial>> {
-    ACTIVE_TURN_PARTIALS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn active_turn_now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-pub(crate) fn register_active_turn_control(
-    session_id: String,
-    run_id: String,
-    cancellation_token: runtime::CancellationToken,
-    hook_abort_signal: runtime::HookAbortSignal,
-) {
-    let control = ActiveTurnControl {
-        run_id,
-        cancellation_token,
-        hook_abort_signal,
-    };
-    active_turn_controls()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(session_id, control);
-}
-
-pub(crate) fn register_active_turn_partial(session_id: String, run_id: String) {
-    active_turn_partials()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            session_id,
-            ActiveTurnPartial {
-                run_id,
-                text: String::new(),
-                updated_at_ms: active_turn_now_ms(),
-                truncated: false,
-            },
-        );
-}
-
-pub(crate) fn record_active_turn_text_delta(session_id: &str, run_id: &str, text: &str) {
-    if text.is_empty() {
-        return;
-    }
-    let mut partials = active_turn_partials()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(partial) = partials
-        .get_mut(session_id)
-        .filter(|partial| partial.run_id == run_id)
-    else {
-        return;
-    };
-
-    let current_chars = partial.text.chars().count();
-    if current_chars < ACTIVE_TURN_PARTIAL_MAX_CHARS {
-        let remaining = ACTIVE_TURN_PARTIAL_MAX_CHARS.saturating_sub(current_chars);
-        partial.text.extend(text.chars().take(remaining));
-        if text.chars().count() > remaining && !partial.truncated {
-            partial
-                .text
-                .push_str("\n\n[partial output truncated by gateway buffer]");
-            partial.truncated = true;
-        }
-    } else if !partial.truncated {
-        partial
-            .text
-            .push_str("\n\n[partial output truncated by gateway buffer]");
-        partial.truncated = true;
-    }
-    partial.updated_at_ms = active_turn_now_ms();
-}
-
-pub(crate) fn take_active_turn_partial(
-    session_id: &str,
-    run_id: &str,
-) -> Option<ActiveTurnPartial> {
-    let mut partials = active_turn_partials()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if partials
-        .get(session_id)
-        .is_some_and(|partial| partial.run_id == run_id)
-    {
-        partials.remove(session_id)
-    } else {
-        None
-    }
-}
-
-pub(crate) fn discard_active_turn_partial(session_id: &str, run_id: &str) {
-    let _ = take_active_turn_partial(session_id, run_id);
-}
-
-pub(crate) fn clear_active_turn_control(session_id: &str, run_id: &str) {
-    let mut controls = active_turn_controls()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if controls
-        .get(session_id)
-        .is_some_and(|control| control.run_id == run_id)
-    {
-        controls.remove(session_id);
-    }
-}
-
-pub(crate) fn abort_active_turn(session_id: &str) -> Option<String> {
-    let control = active_turn_controls()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(session_id)
-        .cloned();
-    control.map(|control| {
-        control.abort();
-        control.run_id
-    })
 }
 
 impl AppState {
@@ -508,25 +356,6 @@ pub(crate) async fn sync_runtime_session_metadata_to_store(
     Ok(())
 }
 
-async fn append_session_timeline_event(
-    store: &UnifiedSessionStore,
-    session_id: &str,
-    event_type: &str,
-    payload: serde_json::Value,
-) {
-    let created_at_ms = current_time_ms();
-    let event = memory::SessionEvent {
-        session_id: session_id.to_string(),
-        event_type: event_type.to_string(),
-        event_json: payload.to_string(),
-        sequence: 0,
-        created_at_ms,
-    };
-    if let Err(error) = store.append_event_allocating_sequence(&event).await {
-        tracing::warn!(%session_id, %event_type, error = %error, "failed to append session event");
-    }
-}
-
 fn current_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -559,6 +388,85 @@ pub(crate) mod tests {
     use std::sync::Arc;
     use std::time::Instant;
     use tower::ServiceExt;
+
+    struct ApprovalResumeTestExecutor;
+
+    struct CrossPlaneApprovalTestBackend {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl runtime::execution_core::ScopedNodeBackend for CrossPlaneApprovalTestBackend {
+        async fn execute(
+            &self,
+            ticket: &runtime::execution_core::NodeExecutionTicket,
+        ) -> Result<
+            runtime::execution_core::NodeExecutionOutcome,
+            runtime::execution_core::NodeExecutorError,
+        > {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(runtime::execution_core::NodeExecutionOutcome::new(
+                harness_contract::execution_graph::ExecutionNodeResult {
+                    status: harness_contract::execution_graph::ExecutionNodeStatus::Completed,
+                    result_ref: Some(format!("cross-plane-sent:{}", ticket.node_id)),
+                    evidence_refs: Vec::new(),
+                    failure: None,
+                    usage: Default::default(),
+                    finished_at_ms: 1,
+                },
+            ))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl runtime::execution_core::NodeExecutor for ApprovalResumeTestExecutor {
+        fn kind(&self) -> &str {
+            "approval_resume_test_tool"
+        }
+
+        fn validate(
+            &self,
+            _node: &harness_contract::execution_graph::ExecutionNodeSpec,
+        ) -> Result<(), runtime::execution_core::NodeExecutorError> {
+            Ok(())
+        }
+
+        async fn start(
+            &self,
+            context: runtime::execution_core::NodeExecutionContext,
+        ) -> Result<
+            runtime::execution_core::NodeExecutionTicket,
+            runtime::execution_core::NodeExecutorError,
+        > {
+            Ok(runtime::execution_core::NodeExecutionTicket {
+                graph_id: context.graph.id.clone(),
+                node_id: context.node.id,
+                executor_kind: self.kind().to_string(),
+                attempt: context.attempt,
+                idempotency_key: context.node.idempotency_key,
+                payload_ref: context.node.payload_ref,
+            })
+        }
+
+        async fn poll_or_await(
+            &self,
+            ticket: &runtime::execution_core::NodeExecutionTicket,
+        ) -> Result<
+            runtime::execution_core::NodeExecutionOutcome,
+            runtime::execution_core::NodeExecutorError,
+        > {
+            Ok(runtime::execution_core::NodeExecutionOutcome::new(
+                harness_contract::execution_graph::ExecutionNodeResult {
+                    status: harness_contract::execution_graph::ExecutionNodeStatus::Completed,
+                    result_ref: Some(format!("tool-result:{}", ticket.node_id)),
+                    evidence_refs: Vec::new(),
+                    failure: None,
+                    usage: Default::default(),
+                    finished_at_ms: 1,
+                },
+            ))
+        }
+    }
 
     #[derive(Clone, Default)]
     struct CapturedTraceEvents {
@@ -658,28 +566,41 @@ pub(crate) mod tests {
         let sessions = Arc::new(ActiveSessions::new());
         let lifecycle_kernel =
             Arc::new(crate::session_lifecycle_kernel::SessionLifecycleKernel::new());
-        let runtime = Arc::new(crate::runtime_service::RuntimeService::new(
-            sessions,
-            Arc::new(session::SessionLeaseRegistry::default()),
-            session_kernel,
-            lifecycle_kernel,
-            Instant::now(),
-            Arc::new(runtime::ProviderRegistry::empty()),
-            Arc::new(runtime::UpgradeCoordinator::new()),
-        ));
+        let runtime_services =
+            runtime::RuntimeServices::in_memory().expect("test runtime services");
+        let runtime_store = session_kernel.unified_store().unwrap_or_else(|| {
+            Arc::new(UnifiedSessionStore::open_in_memory().expect("test session store"))
+        });
+        runtime_services
+            .install_session_store(runtime_store)
+            .expect("test session router");
+        let runtime = Arc::new(
+            crate::runtime_service::RuntimeService::new(
+                sessions,
+                Arc::new(session::SessionLeaseRegistry::default()),
+                session_kernel,
+                lifecycle_kernel,
+                Instant::now(),
+                Arc::new(runtime::ProviderRegistry::empty()),
+                Arc::new(runtime::UpgradeCoordinator::new()),
+                runtime_services,
+            )
+            .expect("test runtime service"),
+        );
         let approval_dir =
             std::env::temp_dir().join(format!("cowd-api-approval-{}", uuid::Uuid::new_v4()));
         let approval_repository = approval::FileApprovalRepository::new(
             approval_dir.join("approval_history.json"),
             approval_dir.join("always_approved.json"),
         );
-        Arc::new(crate::services::GatewayServices::new(
+        Arc::new(crate::services::GatewayServices::new_with_config_home(
             runtime,
             task_kernel,
             surface_host.unwrap_or_else(|| Arc::new(crate::surface_host::SurfaceHost::default())),
             None,
             test_approval_gate(),
             approval_repository,
+            isolated_test_config_home(),
         ))
     }
 
@@ -981,6 +902,127 @@ pub(crate) mod tests {
                 .unified_store()
                 .expect("service store should exist")
         ));
+    }
+
+    #[tokio::test]
+    async fn runtime_outbox_management_reports_poison_and_retries_both_directions() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        store
+            .create_session(&new_api_session_record("outbox-session", None))
+            .await
+            .unwrap();
+        let state = test_state_with_store(Arc::clone(&store));
+        let request = memory::SessionRuntimeOutboxRequest {
+            request_id: "ingress-poison".to_string(),
+            turn_id: "turn-1".to_string(),
+            message_id: "user-1".to_string(),
+            created_at_ms: 1,
+        };
+        store
+            .append_ingress_with_runtime_outbox(
+                "outbox-session",
+                "user",
+                Some("[{\"type\":\"text\",\"text\":\"hello\"}]"),
+                1,
+                &request,
+            )
+            .await
+            .unwrap();
+        let ingress_claim = store
+            .claim_session_runtime_outbox("test-worker", 1, 10, 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        store
+            .fail_session_runtime_outbox(
+                "ingress-poison",
+                "test-worker",
+                ingress_claim.revision,
+                memory::OutboxFailureClass::CorruptPayload,
+                "bad payload",
+                2,
+                1,
+                2,
+            )
+            .await
+            .unwrap();
+        let event_store = state
+            .services
+            .runtime
+            .as_ref()
+            .unwrap()
+            .runtime_services()
+            .event_store()
+            .clone();
+        event_store
+            .enqueue_session_terminal(
+                "terminal-poison",
+                "assistant-1",
+                "outbox-session",
+                9,
+                "bad payload",
+            )
+            .unwrap();
+        let terminal_claim = event_store
+            .claim_session_terminals("test-worker", 1, 10, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        event_store
+            .fail_session_terminal(
+                "terminal-poison",
+                "test-worker",
+                terminal_claim.revision,
+                runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+                "bad payload",
+                2,
+                1,
+                2,
+            )
+            .unwrap();
+
+        let app = api_router(state);
+        let status = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/runtime/outbox")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        let body = to_bytes(status.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["healthy"], false);
+        assert_eq!(json["ingress"]["poison"][0]["request_id"], "ingress-poison");
+        assert_eq!(
+            json["terminal"]["poison"][0]["terminal_id"],
+            "terminal-poison"
+        );
+
+        for (direction, id) in [
+            ("ingress", "ingress-poison"),
+            ("terminal", "terminal-poison"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/runtime/outbox/{direction}/{id}/retry"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({"actor":"operator","reason":"repaired"}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
     }
 
     fn test_temp_dir(label: &str) -> PathBuf {
@@ -2262,14 +2304,21 @@ pub(crate) mod tests {
         let dispatch: serde_json::Value =
             serde_json::from_slice(&to_bytes(dispatch.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        assert_eq!(dispatch["kind"], "mission_control.session_dispatch_result");
+        assert_eq!(
+            dispatch["kind"],
+            "mission_control.session_dispatch_submission"
+        );
         assert_eq!(dispatch["ok"], true);
-        assert!(dispatch["report"]["dispatched"]
+        let dispatch_report = dispatch["result"].get("Ok").unwrap_or(&dispatch["result"]);
+        assert!(dispatch_report["claimed"].as_u64().is_some());
+        assert!(dispatch_report["receipts"]
             .as_array()
-            .expect("dispatch receipts")
+            .expect("execution graph submission receipts")
             .iter()
-            .any(|receipt| receipt["status_after"].as_str() == Some("claimed")));
+            .all(|receipt| receipt["graph_id"].as_str().is_some()
+                && receipt["commit_cursor"].as_u64().is_some()));
 
+        let stewards_before = runtime::global_steward_runtime_service().projection();
         let steward_started = app
             .clone()
             .oneshot(
@@ -2298,71 +2347,19 @@ pub(crate) mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(steward_started["receipt"]["status"], "executed");
-
-        let approval_required = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/mission/control/command")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "target": { "session": { "session_id": session_a } },
-                            "action": "route_to_agent",
-                            "actor": "test-human",
-                            "payload": {
-                                "agent_id": "agent-for-stage-i",
-                                "command": "perform sensitive intervention",
-                                "require_approval": true
-                            }
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let approval_required: serde_json::Value = serde_json::from_slice(
-            &to_bytes(approval_required.into_body(), usize::MAX)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(approval_required["receipt"]["status"], "approval_required");
-        let approval_id = approval_required["receipt"]["result"]["approval"]["approval_id"]
-            .as_str()
-            .expect("approval id")
-            .to_string();
-
-        let decided = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/mission/control/command")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "target": { "approval": { "approval_id": approval_id } },
-                            "action": "decide_approval",
-                            "actor": "test-human",
-                            "payload": {
-                                "approved": true,
-                                "reason": "stage i route test"
-                            }
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let decided: serde_json::Value =
-            serde_json::from_slice(&to_bytes(decided.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
-        assert_eq!(decided["receipt"]["status"], "executed");
+        assert_eq!(steward_started["receipt"]["status"], "failed");
+        assert_eq!(
+            steward_started["receipt"]["result"]["status"],
+            "capability_unavailable"
+        );
+        assert_eq!(
+            steward_started["receipt"]["result"]["capability"],
+            "steward_execution"
+        );
+        assert_eq!(
+            runtime::global_steward_runtime_service().projection(),
+            stewards_before
+        );
 
         let control = app
             .oneshot(
@@ -2420,10 +2417,8 @@ pub(crate) mod tests {
             assert_eq!(created.status(), StatusCode::CREATED);
         }
 
-        let original_config_home = std::env::var_os("COWD_CONFIG_HOME");
-        let team_agent_home =
-            std::env::temp_dir().join(format!("cowd-mission-team-agents-{}", uuid::Uuid::new_v4()));
-        std::env::set_var("COWD_CONFIG_HOME", &team_agent_home);
+        let teams_before = runtime::global_team_runtime_service().projection();
+        let agents_before = runtime::global_agent_lifecycle_service().projection();
         let team = app
             .clone()
             .oneshot(
@@ -2445,118 +2440,19 @@ pub(crate) mod tests {
         assert_eq!(team.status(), StatusCode::OK);
         let team_json: serde_json::Value =
             serde_json::from_slice(&to_bytes(team.into_body(), usize::MAX).await.unwrap()).unwrap();
-        assert_eq!(team_json["ok"], true);
-        assert!(!team_json["team"]["team_id"]
-            .as_str()
-            .expect("team id")
-            .is_empty());
-        assert!(team_json["team"]["agents"]
-            .as_array()
-            .expect("team agents")
-            .iter()
-            .all(|agent| agent["agent_id"].as_str().is_some_and(|id| !id.is_empty())));
-        let team_id = team_json["team"]["team_id"].as_str().unwrap().to_string();
-        let runs = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/mission/control/teams")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(runs.status(), StatusCode::OK);
-        let runs_json: serde_json::Value =
-            serde_json::from_slice(&to_bytes(runs.into_body(), usize::MAX).await.unwrap()).unwrap();
-        assert!(runs_json["projection"]["runs"]
-            .as_array()
-            .expect("collaboration runs")
-            .iter()
-            .any(|run| run["team"]["team_id"] == team_id));
-
-        let run = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/api/mission/control/teams/{team_id}/run"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(run.status(), StatusCode::OK);
-        let run_json: serde_json::Value =
-            serde_json::from_slice(&to_bytes(run.into_body(), usize::MAX).await.unwrap()).unwrap();
-        assert_eq!(run_json["run"]["kind"], "runtime.collaboration_run");
-        assert!(
-            run_json["run"]["agent_runs"]
-                .as_array()
-                .expect("agent runs")
-                .len()
-                >= 2
+        assert_eq!(team_json["ok"], false);
+        assert_eq!(team_json["status"], "capability_unavailable");
+        assert_eq!(team_json["capability"], "collaborate");
+        assert_eq!(team_json["available_in"], "V5");
+        assert_eq!(team_json["side_effects_started"], false);
+        assert_eq!(
+            runtime::global_team_runtime_service().projection(),
+            teams_before
         );
-
-        let handoff = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/mission/control/teams/{team_id}/handoff"))
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "target": "human-agent",
-                            "note": "review before final synthesis"
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(handoff.status(), StatusCode::OK);
-        let handoff_json: serde_json::Value =
-            serde_json::from_slice(&to_bytes(handoff.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
-        assert_eq!(handoff_json["receipt"]["command"], "handoff");
-        assert_eq!(handoff_json["receipt"]["status"], "accepted");
-        assert!(handoff_json["run"]["team"]["review_notes"]
-            .as_array()
-            .expect("review notes")
-            .iter()
-            .any(|note| note.as_str().is_some_and(|value| value.contains("review"))));
-
-        let synthesis = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/mission/control/teams/{team_id}/synthesis"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(synthesis.status(), StatusCode::OK);
-        let synthesis_json: serde_json::Value =
-            serde_json::from_slice(&to_bytes(synthesis.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
-        assert_eq!(synthesis_json["summary"]["team_id"], team_id);
-        assert!(synthesis_json["summary"]["role_summaries"]
-            .as_array()
-            .expect("role summaries")
-            .iter()
-            .flat_map(|role| role["evidence_refs"].as_array().into_iter().flatten())
-            .any(|reference| reference
-                .as_str()
-                .is_some_and(|value| value.starts_with("team:"))));
-        if let Some(value) = original_config_home {
-            std::env::set_var("COWD_CONFIG_HOME", value);
-        } else {
-            std::env::remove_var("COWD_CONFIG_HOME");
-        }
-        let _ = std::fs::remove_dir_all(team_agent_home);
+        assert_eq!(
+            runtime::global_agent_lifecycle_service().projection(),
+            agents_before
+        );
 
         let approval = app
             .clone()
@@ -2787,6 +2683,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(created.status(), StatusCode::CREATED);
+        let stewards_before = runtime::global_steward_runtime_service().projection();
 
         let started = app
             .clone()
@@ -2812,11 +2709,11 @@ pub(crate) mod tests {
         let started_json: serde_json::Value =
             serde_json::from_slice(&to_bytes(started.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        let steward_id = started_json["steward"]["steward_id"]
-            .as_str()
-            .expect("steward id")
-            .to_string();
-        assert_eq!(started_json["steward"]["status"], "running");
+        assert_eq!(started_json["ok"], false);
+        assert_eq!(started_json["status"], "capability_unavailable");
+        assert_eq!(started_json["capability"], "steward_execution");
+        assert_eq!(started_json["available_in"], "V8");
+        assert_eq!(started_json["side_effects_started"], false);
 
         let tick_all = app
             .clone()
@@ -2833,70 +2730,18 @@ pub(crate) mod tests {
         let tick_all_json: serde_json::Value =
             serde_json::from_slice(&to_bytes(tick_all.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
+        assert_eq!(tick_all_json["ok"], false);
+        assert_eq!(tick_all_json["status"], "capability_unavailable");
+        assert_eq!(tick_all_json["capability"], "steward_execution");
+        assert_eq!(tick_all_json["side_effects_started"], false);
         assert_eq!(
-            tick_all_json["report"]["kind"],
-            "runtime.steward_loop_report"
-        );
-
-        let tick = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/mission/stewards/{steward_id}/tick"))
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "action": "apply patch",
-                            "summary": "write runtime changes",
-                            "risk": "high",
-                            "requested_tool": "apply_patch",
-                            "requires_write": true,
-                            "timeout_policy": "continue_alternative"
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(tick.status(), StatusCode::OK);
-        let tick_json: serde_json::Value =
-            serde_json::from_slice(&to_bytes(tick.into_body(), usize::MAX).await.unwrap()).unwrap();
-        assert_eq!(tick_json["decision"]["status"], "approval_submitted");
-        assert!(
-            tick_json["approvals"]["pending_count"]
-                .as_u64()
-                .expect("pending approvals")
-                >= 1
-        );
-
-        let takeover = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/mission/stewards/{steward_id}/takeover"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(takeover.status(), StatusCode::OK);
-        let takeover_json: serde_json::Value =
-            serde_json::from_slice(&to_bytes(takeover.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
-        assert_eq!(takeover_json["report"]["status"], "handed_off");
-        assert!(
-            takeover_json["report"]["decisions"]
-                .as_array()
-                .unwrap()
-                .len()
-                >= 2
+            runtime::global_steward_runtime_service().projection(),
+            stewards_before
         );
     }
 
     #[tokio::test]
-    async fn runtime_events_api_exposes_durable_mission_events() {
+    async fn mission_projection_exposes_durable_mission_events() {
         let _guard = mission_route_lock().lock().await;
         let app = api_router(test_state());
         let session_id = format!("runtime-events-session-{}", uuid::Uuid::new_v4());
@@ -2923,9 +2768,7 @@ pub(crate) mod tests {
         let events = app
             .oneshot(
                 Request::builder()
-                    .uri(format!(
-                        "/api/runtime/events?stream_id=session:{session_id}"
-                    ))
+                    .uri("/api/mission/projection")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2935,18 +2778,20 @@ pub(crate) mod tests {
         let events_json: serde_json::Value =
             serde_json::from_slice(&to_bytes(events.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        assert_eq!(events_json["kind"], "runtime.events");
+        assert_eq!(events_json["mission"]["kind"], "mission.runtime");
         assert!(events_json["events"]
             .as_array()
+            .or_else(|| events_json["mission"]["events"].as_array())
             .expect("events")
             .iter()
-            .any(|event| event["kind"].as_str() == Some("mission.session.started")));
+            .any(|event| event["event_type"].as_str() == Some("mission.session.started")));
     }
 
     #[tokio::test]
-    async fn runtime_event_replay_report_and_recover_marks_steward_review() {
+    async fn runtime_event_replay_does_not_gain_steward_work_from_unavailable_start() {
         let _guard = mission_route_lock().lock().await;
         let app = api_router(test_state());
+        let stewards_before = runtime::global_steward_runtime_service().projection();
         let steward_response = app
             .clone()
             .oneshot(
@@ -2968,6 +2813,20 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(steward_response.status(), StatusCode::CREATED);
+        let steward_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(steward_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(steward_json["ok"], false);
+        assert_eq!(steward_json["status"], "capability_unavailable");
+        assert_eq!(steward_json["capability"], "steward_execution");
+        assert_eq!(steward_json["side_effects_started"], false);
+        assert_eq!(
+            runtime::global_steward_runtime_service().projection(),
+            stewards_before
+        );
 
         let report = app
             .clone()
@@ -2984,32 +2843,11 @@ pub(crate) mod tests {
             serde_json::from_slice(&to_bytes(report.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(report_json["kind"], "runtime.events.replay_report");
-        assert!(report_json["report"]["actions"]
+        assert!(!report_json["report"]["actions"]
             .as_array()
             .expect("actions")
             .iter()
             .any(|action| action["action"] == "pause_recovery_required"));
-
-        let recover = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/runtime/events/recover?limit=2000")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(recover.status(), StatusCode::OK);
-        let recover_json: serde_json::Value =
-            serde_json::from_slice(&to_bytes(recover.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
-        assert_eq!(recover_json["kind"], "runtime.recovery_result");
-        assert!(recover_json["applied"]
-            .as_array()
-            .expect("applied")
-            .iter()
-            .any(|item| item["action"] == "pause_recovery_required"));
     }
 
     #[tokio::test]
@@ -3774,20 +3612,20 @@ pub(crate) mod tests {
             .await
             .unwrap();
         store
-            .append_runtime_event(&memory::RuntimeEvent::new(
+            .append_session_domain_event(&memory::SessionDomainEvent::new(
                 session_id,
                 0,
-                memory::RuntimeEventScope::Turn,
+                memory::SessionDomainScope::Turn,
                 "execution.outcome",
                 serde_json::json!({"status": "ok", "title": "full loop outcome"}),
                 current_time_ms(),
             ))
             .await
             .unwrap();
-        let mut skill_activation_event = memory::RuntimeEvent::new(
+        let mut skill_activation_event = memory::SessionDomainEvent::new(
             session_id,
             1,
-            memory::RuntimeEventScope::Context,
+            memory::SessionDomainScope::Context,
             "skill_candidates",
             serde_json::json!({
                 "source": "conversation_runtime.skill_activation",
@@ -3812,24 +3650,24 @@ pub(crate) mod tests {
             }),
             current_time_ms(),
         );
-        skill_activation_event.refs.push(memory::RuntimeRef {
+        skill_activation_event.refs.push(memory::SessionDomainRef {
             ref_type: "skill".to_string(),
             id: "supply-risk-analyst".to_string(),
             label: Some("selected".to_string()),
         });
-        skill_activation_event.refs.push(memory::RuntimeRef {
+        skill_activation_event.refs.push(memory::SessionDomainRef {
             ref_type: "skill_invocation".to_string(),
             id: "supply-risk-analyst".to_string(),
             label: Some("selected_for_runtime".to_string()),
         });
         store
-            .append_runtime_event(&skill_activation_event)
+            .append_session_domain_event(&skill_activation_event)
             .await
             .unwrap();
-        let mut skill_memory_event = memory::RuntimeEvent::new(
+        let mut skill_memory_event = memory::SessionDomainEvent::new(
             session_id,
             2,
-            memory::RuntimeEventScope::Context,
+            memory::SessionDomainScope::Context,
             "skill_memory_candidate",
             serde_json::json!({
                 "source": "conversation_runtime.skill_memory_candidate",
@@ -3844,13 +3682,13 @@ pub(crate) mod tests {
             }),
             current_time_ms(),
         );
-        skill_memory_event.refs.push(memory::RuntimeRef {
+        skill_memory_event.refs.push(memory::SessionDomainRef {
             ref_type: "skill".to_string(),
             id: "supply-risk-analyst".to_string(),
             label: Some("memory_candidate_source".to_string()),
         });
         store
-            .append_runtime_event(&skill_memory_event)
+            .append_session_domain_event(&skill_memory_event)
             .await
             .unwrap();
         let app = api_router(test_state_with_store_and_workspace(
@@ -4661,7 +4499,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn matrix_evidence_context_and_mfg_incident_create_agent_graph() {
+    async fn matrix_evidence_context_and_mfg_incident_create_workflow_graph() {
         let workspace = test_temp_dir("matrix-mfg-agent");
         let config_home = test_temp_dir("matrix-mfg-agent-config");
         let app = api_router(test_state_with_workspace(workspace.clone(), config_home));
@@ -4781,17 +4619,89 @@ pub(crate) mod tests {
         let body = to_bytes(incident.into_body(), usize::MAX).await.unwrap();
         let incident_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(incident_json["incident"]["evidence_packet_id"], packet_id);
-        assert!(incident_json["agent_graph"]["nodes"]
+        assert!(incident_json["workflow_graph"]["nodes"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|node| node["id"] == "mfg_researcher"));
-        assert!(incident_json["agent_graph"]["evidence"]
+            .any(|node| node["node_id"] == "mfg_researcher"));
+        assert!(incident_json["workflow_graph"]["evidence"]
             .as_array()
             .unwrap()
             .iter()
             .any(|evidence| evidence["reference"] == format!("mfg:evidence:{packet_id}")));
         let incident_id = incident_json["incident"]["incident_id"].as_str().unwrap();
+
+        let room = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/apps/mfg/incidents/{incident_id}/room"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(room.status(), StatusCode::OK);
+        let room_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(room.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(
+            room_json["workflow_graph"]["workflow_id"],
+            incident_json["workflow_graph"]["workflow_id"]
+        );
+        assert!(room_json.get("agent_graph").is_none());
+
+        let skill_plan = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/apps/mfg/incidents/{incident_id}/skills/plan"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"limit":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(skill_plan.status(), StatusCode::OK);
+        let skill_plan_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(skill_plan.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let skill_id = skill_plan_json["plan"]["selected_skills"][0]["skill_id"]
+            .as_str()
+            .unwrap();
+        let skill_node_id = app_mfg::skill_agent_node_id(skill_id);
+        assert!(skill_plan_json["workflow_graph"]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["node_id"] == skill_node_id));
+        assert!(skill_plan_json.get("agent_graph").is_none());
+
+        let skill_run = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/apps/mfg/incidents/{incident_id}/skills/{skill_id}/run"
+                    ))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(skill_run.status(), StatusCode::OK);
+        let skill_run_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(skill_run.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(skill_run_json["skill_run"]["status"], "completed");
+        assert!(skill_run_json["workflow_graph"]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["node_id"] == skill_node_id && node["status"] == "completed"));
+        assert!(skill_run_json.get("agent_graph").is_none());
 
         let analysis = app
             .clone()
@@ -4920,7 +4830,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn agent_run_persists_evidence_to_session_event() {
+    async fn task_execution_graph_is_committed_and_projected() {
         let app = api_router(test_state());
         let started = app
             .clone()
@@ -4949,7 +4859,7 @@ pub(crate) mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/agents/runs")
+                    .uri("/api/agents/execution-graphs")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -4958,15 +4868,15 @@ pub(crate) mod tests {
         assert_eq!(runs.status(), StatusCode::OK);
         let body = to_bytes(runs.into_body(), usize::MAX).await.unwrap();
         let runs_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(runs_json["kind"], "agent_run_graphs");
-        assert_eq!(runs_json["runs"][0]["session_id"], task_id);
+        assert_eq!(runs_json["kind"], "execution_graphs");
+        assert_eq!(runs_json["graphs"].as_array().unwrap().len(), 0);
 
         let upsert = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri(format!("/api/tasks/{task_id}/agent-graph"))
+                    .uri(format!("/api/tasks/{task_id}/execution-graph"))
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
@@ -4974,25 +4884,28 @@ pub(crate) mod tests {
                             "nodes": [
                                 {
                                     "id": "planner",
-                                    "role": "planner",
-                                    "title": "Plan",
-                                    "objective": "split work",
-                                    "depends_on": [],
-                                    "status": "ready",
-                                    "created_at_ms": 1,
-                                    "updated_at_ms": 1
+                                    "kind": "agent_task",
+                                    "payload_ref": "task:planner",
+                                    "executor_kind": "agent_task",
+                                    "idempotency_key": "task:planner:1",
+                                    "lease_ref": null,
+                                    "acceptance": {"criteria": [], "required_evidence": [], "minimum_score_basis_points": null},
+                                    "retry_policy": {"max_attempts": 1, "retryable_failure_kinds": [], "base_backoff_ms": 500, "maximum_backoff_ms": 30000},
+                                    "resource_scopes": []
                                 },
                                 {
                                     "id": "review",
-                                    "role": "reviewer",
-                                    "title": "Review",
-                                    "objective": "challenge result",
-                                    "depends_on": ["planner"],
-                                    "status": "pending",
-                                    "created_at_ms": 1,
-                                    "updated_at_ms": 1
+                                    "kind": "verify",
+                                    "payload_ref": "task:review",
+                                    "executor_kind": "verify",
+                                    "idempotency_key": "task:review:1",
+                                    "lease_ref": null,
+                                    "acceptance": {"criteria": [], "required_evidence": [], "minimum_score_basis_points": null},
+                                    "retry_policy": {"max_attempts": 1, "retryable_failure_kinds": [], "base_backoff_ms": 500, "maximum_backoff_ms": 30000},
+                                    "resource_scopes": []
                                 }
-                            ]
+                            ],
+                            "edges": [{"from": "planner", "to": "review", "kind": "depends_on"}]
                         })
                         .to_string(),
                     ))
@@ -5004,11 +4917,12 @@ pub(crate) mod tests {
         let body = to_bytes(upsert.into_body(), usize::MAX).await.unwrap();
         let graph: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(graph["nodes"].as_array().unwrap().len(), 2);
+        assert_eq!(graph["revision"], 1);
 
         let fetched = app
             .oneshot(
                 Request::builder()
-                    .uri(format!("/api/tasks/{task_id}/agent-graph"))
+                    .uri(format!("/api/tasks/{task_id}/execution-graph"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -5017,7 +4931,7 @@ pub(crate) mod tests {
         assert_eq!(fetched.status(), StatusCode::OK);
         let body = to_bytes(fetched.into_body(), usize::MAX).await.unwrap();
         let fetched_graph: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(fetched_graph["nodes"][1]["id"], "review");
+        assert_eq!(fetched_graph["nodes"][1]["node_id"], "review");
     }
 
     #[tokio::test]
@@ -5049,6 +4963,10 @@ pub(crate) mod tests {
         };
         runtime::global_agent_lifecycle_service()
             .register_started(snapshot, runtime::CancellationToken::new());
+        assert!(!manifest_file.exists());
+        let events_before = runtime::global_agent_lifecycle_service()
+            .events(&agent_id)
+            .expect("agent events");
 
         let detail = app
             .clone()
@@ -5076,7 +4994,10 @@ pub(crate) mod tests {
         assert_eq!(cancel.status(), StatusCode::OK);
         let body = to_bytes(cancel.into_body(), usize::MAX).await.unwrap();
         let cancel_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(cancel_json["receipt"]["status"], "accepted");
+        assert_eq!(cancel_json["status"], "capability_unavailable");
+        assert_eq!(cancel_json["capability"], "agent_execution");
+        assert_eq!(cancel_json["available_in"], "V5");
+        assert_eq!(cancel_json["side_effects_started"], false);
 
         let events = app
             .clone()
@@ -5091,13 +5012,9 @@ pub(crate) mod tests {
         assert_eq!(events.status(), StatusCode::OK);
         let body = to_bytes(events.into_body(), usize::MAX).await.unwrap();
         let events_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            events_json["events"][1]["eventType"],
-            "agent.cancel_requested"
-        );
+        assert_eq!(events_json["events"], serde_json::json!(events_before));
 
-        let manifest = std::fs::read_to_string(&manifest_file).unwrap();
-        assert!(manifest.contains("\"status\": \"cancel_requested\""));
+        assert!(!manifest_file.exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -5134,6 +5051,7 @@ pub(crate) mod tests {
         runtime::global_agent_lifecycle_service()
             .attach_command_channel(&agent_id, tx)
             .expect("command channel");
+        assert!(!manifest_file.exists());
 
         for (path, expected) in [
             ("input", runtime::AgentExecutionCommandKind::Input),
@@ -5157,16 +5075,22 @@ pub(crate) mod tests {
             assert_eq!(response.status(), StatusCode::OK);
             let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(json["receipt"]["status"], "accepted");
-            let delivered = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
-            assert_eq!(delivered.command, expected);
-            assert_eq!(delivered.agent_id, agent_id);
+            assert_eq!(json["status"], "capability_unavailable");
+            assert_eq!(json["capability"], "agent_execution");
+            assert_eq!(json["available_in"], "V5");
+            assert_eq!(json["side_effects_started"], false);
+            assert_eq!(json["command"], serde_json::json!(expected));
+            assert!(matches!(
+                rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
         }
+        assert!(!manifest_file.exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
-    async fn runtime_agent_command_reports_backend_without_channel_as_conflict() {
+    async fn runtime_agent_command_reports_unavailable_without_requiring_channel() {
         let app = api_router(test_state());
         let agent_id = format!("agent-no-command-channel-{}", uuid::Uuid::new_v4());
         let dir = std::env::temp_dir().join(format!(
@@ -5212,7 +5136,12 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "capability_unavailable");
+        assert_eq!(json["capability"], "agent_execution");
+        assert_eq!(json["side_effects_started"], false);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -6421,44 +6350,16 @@ pub(crate) mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "user");
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].sequence, 0);
-        assert_eq!(events[1].event_type, "TextDelta");
-    }
-
-    #[tokio::test]
-    async fn append_session_timeline_event_persists_stream_events_in_order() {
-        let store = UnifiedSessionStore::open_in_memory().unwrap();
-        let session_id = "timeline-session";
-        store
-            .create_session(&new_api_session_record(
-                session_id,
-                Some("test-model".into()),
-            ))
-            .await
-            .unwrap();
-
-        append_session_timeline_event(
-            &store,
-            session_id,
-            "TurnStarted",
-            serde_json::json!({"type":"TurnStarted"}),
-        )
-        .await;
-        append_session_timeline_event(
-            &store,
-            session_id,
-            "TextDelta",
-            serde_json::json!({"type":"TextDelta","content":"hello"}),
-        )
-        .await;
-
-        let events = store.get_events(session_id, 0).await.unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].event_type, "TurnStarted");
-        assert_eq!(events[0].sequence, 0);
-        assert_eq!(events[1].event_type, "TextDelta");
-        assert_eq!(events[1].sequence, 1);
-        assert!(events[1].event_json.contains("hello"));
+        let text_delta = events
+            .iter()
+            .find(|event| event.event_type == "TextDelta")
+            .expect("non-message timeline events must survive transcript sync");
+        assert_eq!(text_delta.sequence, 99);
+        let message_event = events
+            .iter()
+            .find(|event| event.event_type == "message_appended")
+            .expect("current transcript must have one message projection");
+        assert!(message_event.sequence > text_delta.sequence);
     }
 
     #[tokio::test]
@@ -6637,65 +6538,6 @@ pub(crate) mod tests {
         assert_eq!(json["actor_id"], "tui:test");
         assert_eq!(json["aborted"], false);
         assert_eq!(json["run_id"], serde_json::Value::Null);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/api/sessions/{session_id}/events"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["events"][0]["type"], "TurnCancelRequested");
-        assert_eq!(json["events"][0]["payload"]["actor_id"], "tui:test");
-        assert_eq!(json["events"][0]["payload"]["reason"], "test_cancel");
-        assert_eq!(json["events"][0]["payload"]["aborted"], false);
-        assert_eq!(
-            json["events"][0]["payload"]["run_id"],
-            serde_json::Value::Null
-        );
-    }
-
-    #[test]
-    fn active_turn_registry_aborts_runtime_control_signals() {
-        let session_id = format!("cancel-active-{}", uuid::Uuid::new_v4());
-        let run_id = "run-active-cancel".to_string();
-        let cancellation_token = runtime::CancellationToken::new();
-        let hook_abort_signal = runtime::HookAbortSignal::new();
-
-        register_active_turn_control(
-            session_id.clone(),
-            run_id.clone(),
-            cancellation_token.clone(),
-            hook_abort_signal.clone(),
-        );
-
-        assert_eq!(abort_active_turn(&session_id), Some(run_id.clone()));
-        assert!(cancellation_token.is_cancelled());
-        assert!(hook_abort_signal.is_aborted());
-
-        clear_active_turn_control(&session_id, &run_id);
-        assert_eq!(abort_active_turn(&session_id), None);
-    }
-
-    #[test]
-    fn active_turn_partial_buffer_is_run_scoped_and_take_clears_it() {
-        let session_id = format!("partial-active-{}", uuid::Uuid::new_v4());
-        let run_id = "run-partial".to_string();
-
-        register_active_turn_partial(session_id.clone(), run_id.clone());
-        record_active_turn_text_delta(&session_id, "other-run", "ignored");
-        record_active_turn_text_delta(&session_id, &run_id, "hello ");
-        record_active_turn_text_delta(&session_id, &run_id, "world");
-
-        let partial = take_active_turn_partial(&session_id, &run_id).unwrap();
-        assert_eq!(partial.run_id, run_id);
-        assert_eq!(partial.text, "hello world");
-        assert!(take_active_turn_partial(&session_id, "run-partial").is_none());
     }
 
     #[tokio::test]
@@ -6720,10 +6562,10 @@ pub(crate) mod tests {
             .await
             .unwrap();
         store
-            .append_runtime_event(&memory::RuntimeEvent::new(
+            .append_session_domain_event(&memory::SessionDomainEvent::new(
                 session_id,
                 1,
-                memory::RuntimeEventScope::Memory,
+                memory::SessionDomainScope::Memory,
                 "memory.pulse.created",
                 serde_json::json!({"candidates": 2}),
                 11,
@@ -6759,9 +6601,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_timeline_projects_workgraph_summary() {
+    async fn runtime_timeline_projects_execution_graph_summary() {
         let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
-        let session_id = "runtime-workgraph-summary-session";
+        let session_id = "runtime-execution_graph-summary-session";
         store
             .create_session(&new_api_session_record(
                 session_id,
@@ -6769,12 +6611,23 @@ pub(crate) mod tests {
             ))
             .await
             .unwrap();
-        let mut event = memory::RuntimeEvent::new(
-            session_id,
-            0,
-            memory::RuntimeEventScope::Workgraph,
-            "agent.workgraph.reviewed",
-            serde_json::json!({
+        let event = runtime::RuntimeEventInput {
+            stream_id: session_id.to_string(),
+            scope: runtime::RuntimeEventScope::ExecutionGraph,
+            kind: "agent.execution_graph.reviewed".to_string(),
+            status: Some("completed".to_string()),
+            actor: Some("gateway-test".to_string()),
+            refs: vec![
+                runtime::RuntimeEventRef {
+                    kind: "execution_graph".to_string(),
+                    id: "graph-summary".to_string(),
+                },
+                runtime::RuntimeEventRef {
+                    kind: "collaboration_board".to_string(),
+                    id: "board-summary".to_string(),
+                },
+            ],
+            payload: serde_json::json!({
                 "board_id": "board-summary",
                 "graph": {
                     "graph_id": "graph-summary",
@@ -6798,23 +6651,10 @@ pub(crate) mod tests {
                 },
                 "maintenance_candidates": [{"id": "candidate-summary"}]
             }),
-            10,
-        );
-        event.refs = vec![
-            memory::RuntimeRef {
-                ref_type: "workgraph".to_string(),
-                id: "graph-summary".to_string(),
-                label: None,
-            },
-            memory::RuntimeRef {
-                ref_type: "collaboration_board".to_string(),
-                id: "board-summary".to_string(),
-                label: None,
-            },
-        ];
-        store.append_runtime_event(&event).await.unwrap();
+        };
 
         let state = test_state_with_store(store);
+        state.services.runtime_events.store().append(event).unwrap();
         let app = api_router(state);
         let response = app
             .oneshot(
@@ -6831,23 +6671,26 @@ pub(crate) mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["workgraph_summary"]["count"], 1);
+        assert_eq!(json["execution_graph_summary"]["count"], 1);
         assert_eq!(
-            json["workgraph_summary"]["latest"]["graph_id"],
+            json["execution_graph_summary"]["latest"]["graph_id"],
             "graph-summary"
         );
         assert_eq!(
-            json["workgraph_summary"]["latest"]["board_id"],
+            json["execution_graph_summary"]["latest"]["board_id"],
             "board-summary"
         );
-        assert_eq!(json["workgraph_summary"]["latest"]["completion_rate"], 1.0);
         assert_eq!(
-            json["workgraph_summary"]["latest"]["value_verdict"]["positive_lift"],
+            json["execution_graph_summary"]["latest"]["completion_rate"],
+            1.0
+        );
+        assert_eq!(
+            json["execution_graph_summary"]["latest"]["value_verdict"]["positive_lift"],
             true
         );
-        assert_eq!(json["workgraph_summary"]["agent_tasks"], 1);
-        assert_eq!(json["workgraph_summary"]["memory_candidates"], 1);
-        assert_eq!(json["workgraph_summary"]["conflicts"], 1);
+        assert_eq!(json["execution_graph_summary"]["agent_tasks"], 1);
+        assert_eq!(json["execution_graph_summary"]["memory_candidates"], 1);
+        assert_eq!(json["execution_graph_summary"]["conflicts"], 1);
         assert_eq!(json["agent_value"]["status"], "review_required");
         assert_eq!(json["agent_value"]["recommendation"], "review_conflicts");
         assert_eq!(json["agent_value"]["policy_passed"], false);
@@ -6866,11 +6709,12 @@ pub(crate) mod tests {
             ))
             .await
             .unwrap();
+        let state = test_state_with_store(store.clone());
         store
-            .append_runtime_event(&memory::RuntimeEvent::new(
+            .append_session_domain_event(&memory::SessionDomainEvent::new(
                 session_id,
                 0,
-                memory::RuntimeEventScope::Task,
+                memory::SessionDomainScope::ApplicationTask,
                 "task.started",
                 serde_json::json!({"task_id": "task-health"}),
                 10,
@@ -6878,10 +6722,10 @@ pub(crate) mod tests {
             .await
             .unwrap();
         store
-            .append_runtime_event(&memory::RuntimeEvent::new(
+            .append_session_domain_event(&memory::SessionDomainEvent::new(
                 session_id,
                 1,
-                memory::RuntimeEventScope::Policy,
+                memory::SessionDomainScope::Policy,
                 "runtime.policy.decided",
                 serde_json::json!({
                     "agent_mode": "Parallel",
@@ -6896,12 +6740,13 @@ pub(crate) mod tests {
             ))
             .await
             .unwrap();
-        store
-            .append_runtime_event(&memory::RuntimeEvent::new(
+        state
+            .services
+            .runtime_events
+            .append(
                 session_id,
-                2,
-                memory::RuntimeEventScope::Workgraph,
-                "agent.workgraph.reviewed",
+                runtime::RuntimeEventScope::ExecutionGraph,
+                "agent.execution_graph.reviewed",
                 serde_json::json!({
                     "value_verdict": {
                         "positive_lift": true,
@@ -6910,15 +6755,13 @@ pub(crate) mod tests {
                         "reasons": ["positive_multi_agent_lift"]
                     }
                 }),
-                12,
-            ))
-            .await
+            )
             .unwrap();
         store
-            .append_runtime_event(&memory::RuntimeEvent::new(
+            .append_session_domain_event(&memory::SessionDomainEvent::new(
                 session_id,
                 3,
-                memory::RuntimeEventScope::Task,
+                memory::SessionDomainScope::ApplicationTask,
                 "task.completed",
                 serde_json::json!({"task_id": "task-health"}),
                 13,
@@ -6926,7 +6769,6 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        let state = test_state_with_store(store);
         let app = api_router(state);
         let response = app
             .oneshot(
@@ -6956,7 +6798,7 @@ pub(crate) mod tests {
         );
         assert_eq!(json["health_summary"]["scope_counts"]["task"], 2);
         assert_eq!(json["health_summary"]["scope_counts"]["policy"], 1);
-        assert_eq!(json["health_summary"]["scope_counts"]["workgraph"], 1);
+        assert_eq!(json["health_summary"]["scope_counts"]["execution_graph"], 1);
         assert_eq!(json["value_loop"]["status"], "incomplete");
         assert_eq!(json["value_loop"]["required_observed"], 3);
         assert_eq!(json["value_loop"]["missing_required_count"], 4);
@@ -6981,7 +6823,7 @@ pub(crate) mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["degraded"], true);
         assert_eq!(json["events"].as_array().unwrap().len(), 0);
-        assert_eq!(json["workgraph_summary"]["count"], 0);
+        assert_eq!(json["execution_graph_summary"]["count"], 0);
         assert_eq!(json["health_summary"]["status"], "degraded");
         assert_eq!(json["health_summary"]["score"], 35);
         assert_eq!(json["health_summary"]["degraded_events"], 0);
@@ -6998,7 +6840,7 @@ pub(crate) mod tests {
         assert_eq!(json["agent_value"]["status"], "degraded");
         assert_eq!(
             json["agent_value"]["recommendation"],
-            "collect_workgraph_review"
+            "collect_execution_graph_review"
         );
     }
 
@@ -8736,8 +8578,15 @@ providers:
     #[tokio::test]
     async fn approval_routes_resolve_global_queue_request() {
         let state = test_state();
+        let runtime_services = state
+            .services
+            .runtime
+            .as_ref()
+            .expect("test runtime service")
+            .runtime_services();
         let app = api_router(state);
-        let approval = runtime::global_approval_queue()
+        let approval = runtime_services
+            .approval_queue()
             .submit(runtime::SubmitGlobalApprovalRequest {
                 source: runtime::ApprovalSource {
                     kind: runtime::ApprovalSourceKind::Session,
@@ -8795,12 +8644,250 @@ providers:
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            runtime::global_approval_queue()
+            runtime_services
+                .approval_queue()
                 .get(&approval.approval_id)
                 .expect("approval exists")
                 .status,
             runtime::GlobalApprovalStatus::Approved
         );
+    }
+
+    #[tokio::test]
+    async fn approval_api_resumes_the_same_execution_graph_and_rejects_stale_decisions() {
+        use harness_contract::execution_graph::{
+            ExecutionEdge, ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec,
+            ExecutionNodeStatus,
+        };
+
+        let state = test_state();
+        let runtime_services = state
+            .services
+            .runtime
+            .as_ref()
+            .expect("test runtime service")
+            .runtime_services();
+        runtime_services
+            .executor_registry()
+            .register(Arc::new(ApprovalResumeTestExecutor))
+            .expect("test tool executor");
+
+        let mut graph = ExecutionGraph::new("gateway approval resume");
+        let approval = ExecutionNodeSpec::new(
+            ExecutionNodeKind::Approval,
+            "approval",
+            serde_json::json!({
+                "action": "write",
+                "summary": "approve graph continuation",
+                "session_id": "approval-api-session"
+            })
+            .to_string(),
+        );
+        let tool = ExecutionNodeSpec::new(
+            ExecutionNodeKind::ToolBatch,
+            "approval_resume_test_tool",
+            "tool:after-approval",
+        );
+        graph.edges.push(ExecutionEdge {
+            from: approval.id.clone(),
+            to: tool.id.clone(),
+            kind: ExecutionEdgeKind::DependsOn,
+        });
+        graph.nodes = vec![approval.clone(), tool.clone()];
+        let graph_id = graph.id.clone();
+        let report = runtime_services
+            .graph_runner()
+            .start(graph)
+            .await
+            .expect("graph reaches approval wait");
+        assert_eq!(report.waiting, 1);
+        let waiting = runtime_services
+            .graph_state_store()
+            .load(&graph_id)
+            .expect("waiting graph");
+        assert_eq!(
+            waiting.node_statuses[&approval.id],
+            ExecutionNodeStatus::WaitingApproval
+        );
+        assert_eq!(
+            waiting.node_statuses[&tool.id],
+            ExecutionNodeStatus::Planned
+        );
+        assert!(matches!(
+            runtime_services
+                .graph_runner()
+                .command(
+                    &graph_id,
+                    harness_contract::execution_graph::ExecutionGraphCommand::SubmitApproval {
+                        expected_revision: waiting.revision.saturating_sub(1),
+                        node_id: approval.id.clone(),
+                        approved: true,
+                        decision_ref: "stale-test-decision".to_string(),
+                    },
+                )
+                .await,
+            Err(runtime::execution_core::ExecutionRunnerError::Commit(
+                runtime::execution_core::graph::ExecutionCommitError::StaleRevision { .. }
+            ))
+        ));
+
+        let approval_id = format!("approval:{graph_id}:{}", approval.id);
+        let app = api_router(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/approval/respond")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "id": approval_id,
+                            "approved": true,
+                            "reason": "verified by operator"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["execution_graph"]["graph_id"], graph_id);
+        assert_eq!(body["execution_graph"]["node_status"], "completed");
+
+        let terminal = runtime_services
+            .graph_state_store()
+            .load(&graph_id)
+            .expect("terminal graph");
+        assert_eq!(
+            terminal.node_statuses[&approval.id],
+            ExecutionNodeStatus::Completed
+        );
+        assert_eq!(
+            terminal.node_statuses[&tool.id],
+            ExecutionNodeStatus::Completed
+        );
+        assert_eq!(
+            terminal.node_results[&tool.id].result_ref.as_deref(),
+            Some(format!("tool-result:{}", tool.id).as_str())
+        );
+
+        let duplicate = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/approval/respond")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"id": approval_id, "approved": true}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate.status(), StatusCode::OK);
+        let duplicate_body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(duplicate.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(duplicate_body["status"], "already_applied");
+
+        let conflicting = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/approval/respond")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"id": approval_id, "approved": false}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(conflicting.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn cross_plane_waiting_approval_resumes_tool_and_reaches_terminal_graph() {
+        let state = test_state();
+        let runtime_services = state
+            .services
+            .runtime
+            .as_ref()
+            .expect("test runtime service")
+            .runtime_services();
+        let action = runtime::CrossPlaneAction::new("operator", "channel.send");
+        let decision = runtime::CrossPlanePolicyDecision {
+            decision: runtime::PolicyDecisionKind::RequireSingleApproval,
+            reason: "operator approval required".to_string(),
+            matched_grant: None,
+            required_approval: Some(runtime::GrantType::SingleUse),
+            degrade_to: None,
+        };
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let projection = state
+            .services
+            .cross_plane
+            .execute_commit_graph(
+                &action,
+                &decision,
+                &format!("cross-plane-approval-{}", uuid::Uuid::new_v4()),
+                Arc::new(CrossPlaneApprovalTestBackend {
+                    calls: Arc::clone(&calls),
+                }),
+            )
+            .await
+            .expect("cross-plane graph reaches approval wait");
+        let approval = projection
+            .nodes
+            .iter()
+            .find(|node| {
+                node.kind == harness_contract::execution_graph::ExecutionNodeKind::Approval
+            })
+            .expect("approval node");
+        assert_eq!(
+            approval.status,
+            harness_contract::execution_graph::ExecutionNodeStatus::WaitingApproval
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let approval_id = format!("approval:{}:{}", projection.graph_id, approval.node_id);
+        let response = api_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/approval/respond")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"id": approval_id, "approved": true}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let terminal = runtime_services
+            .graph_runner()
+            .projection(&projection.graph_id)
+            .await
+            .expect("terminal cross-plane graph");
+        let tool = terminal
+            .nodes
+            .iter()
+            .find(|node| {
+                node.kind == harness_contract::execution_graph::ExecutionNodeKind::ToolBatch
+            })
+            .expect("tool node");
+        assert_eq!(
+            tool.status,
+            harness_contract::execution_graph::ExecutionNodeStatus::Completed
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -9614,7 +9701,7 @@ providers:
     }
 
     #[tokio::test]
-    async fn connector_service_commit_consumes_single_use_grant_and_audits() {
+    async fn connector_service_commit_queues_graph_without_consuming_grant() {
         let app = api_router(test_state());
         let suffix = uuid::Uuid::new_v4().to_string();
         let principal = format!("user:service-commit-{suffix}");
@@ -9673,7 +9760,13 @@ providers:
         assert_eq!(executed.status(), StatusCode::OK);
         let body = to_bytes(executed.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["result"]["status"], "ok");
+        assert_eq!(json["result"]["status"], "executed");
+        assert_eq!(json["receipt"]["dispatch_status"], "service_executed");
+        assert!(json["execution_graph"]["graph_id"].as_str().is_some());
+        assert_eq!(
+            json["receipt"]["execution_graph_id"],
+            json["execution_graph"]["graph_id"]
+        );
         assert_eq!(json["receipt"]["audit_record_id"].as_str().is_some(), true);
 
         let audit = app
@@ -9688,15 +9781,13 @@ providers:
             .unwrap();
         let audit_body = to_bytes(audit.into_body(), usize::MAX).await.unwrap();
         let audit_json: serde_json::Value = serde_json::from_slice(&audit_body).unwrap();
-        let consumed = audit_json["records"]
+        let planned = audit_json["records"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|record| {
-                record["evidence"]["consumed_grant_id"].as_str() == Some(grant_id.as_str())
-            })
-            .expect("commit audit should include single-use grant consumption");
-        assert_eq!(consumed["evidence"]["remaining_uses_after"], 0);
+            .find(|record| record["action"]["actor_principal"] == principal)
+            .expect("commit planning must be audited");
+        assert!(planned["evidence"]["consumed_grant_id"].is_null());
 
         let action = serde_json::json!({
             "actor_principal": principal,
@@ -10075,7 +10166,7 @@ providers:
         assert_eq!(json["kind"], "cross_plane_action_execution");
         assert_eq!(json["status"], "planned");
         assert_eq!(json["dispatch_status"], "dry_run");
-        assert_eq!(json["executable"], true);
+        assert_eq!(json["executable"], false);
         assert_eq!(json["dispatched"], false);
         assert!(json["audit_record_id"]
             .as_str()
@@ -10313,14 +10404,17 @@ providers:
         let body = to_bytes(executed.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "blocked");
-        assert_eq!(json["dispatch_status"], "adapter_not_bound");
+        assert_eq!(json["dispatch_status"], "execution_graph_rejected");
         assert_eq!(json["executable"], false);
         assert_eq!(json["adapter_capability"]["live_supported"], true);
         assert_eq!(json["adapter_capability"]["adapter_bound"], false);
-        assert!(json["blockers"]
-            .as_array()
-            .unwrap()
-            .contains(&serde_json::json!("dispatch:adapter_not_bound")));
+        assert!(json["blockers"].as_array().unwrap().iter().any(|value| {
+            value
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("execution_graph:")
+        }));
+        assert!(json["execution_graph"].is_null());
 
         let first = app
             .clone()
@@ -10659,16 +10753,12 @@ providers:
         let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
 
         assert_eq!(executed_json["status"], "blocked");
-        assert_eq!(executed_json["dispatch_status"], "adapter_not_bound");
+        assert_eq!(executed_json["dispatch_status"], "dispatch_failed");
         assert_eq!(executed_json["dispatched"], false);
-        assert!(executed_json["blockers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|blocker| blocker
-                .as_str()
-                .unwrap_or_default()
-                .contains("adapter_not_bound")));
+        assert!(executed_json["blockers"].as_array().unwrap().is_empty());
+        assert!(executed_json["execution_graph"]["graph_id"]
+            .as_str()
+            .is_some());
     }
 
     #[tokio::test]
@@ -10750,7 +10840,7 @@ providers:
         let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
 
         assert_eq!(executed_json["status"], "blocked");
-        assert_eq!(executed_json["dispatch_status"], "adapter_not_bound");
+        assert_eq!(executed_json["dispatch_status"], "dispatch_failed");
         assert_eq!(
             executed_json["execution_receipt"]["dispatch_target"]["outbound_message"]
                 ["payload_kind"],
@@ -10844,7 +10934,7 @@ providers:
         let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
 
         assert_eq!(executed_json["status"], "blocked");
-        assert_eq!(executed_json["dispatch_status"], "adapter_not_bound");
+        assert_eq!(executed_json["dispatch_status"], "dispatch_failed");
         assert_eq!(
             executed_json["execution_receipt"]["dispatch_target"]["outbound_message"]
                 ["payload_kind"],
@@ -10944,7 +11034,7 @@ providers:
         let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
 
         assert_eq!(executed_json["status"], "blocked");
-        assert_eq!(executed_json["dispatch_status"], "adapter_not_bound");
+        assert_eq!(executed_json["dispatch_status"], "not_started");
         assert!(executed_json["blockers"]
             .as_array()
             .unwrap()
@@ -10952,7 +11042,7 @@ providers:
             .any(|blocker| blocker
                 .as_str()
                 .unwrap_or_default()
-                .contains("adapter_not_bound")));
+                .contains("payload_blocked")));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -11463,10 +11553,10 @@ providers:
             .await
             .unwrap();
         store
-            .append_runtime_event(&memory::RuntimeEvent::new(
+            .append_session_domain_event(&memory::SessionDomainEvent::new(
                 session_id,
                 3,
-                memory::RuntimeEventScope::Policy,
+                memory::SessionDomainScope::Policy,
                 "runtime.policy.decided",
                 serde_json::json!({
                     "agent_mode": "Solo",
@@ -11500,13 +11590,15 @@ providers:
         assert_eq!(timeline["total"], 4);
         assert_eq!(timeline["events"][0]["kind"], "message_appended");
         assert_eq!(timeline["events"][1]["kind"], "ContextEnvelope");
-        assert_eq!(timeline["events"][2]["kind"], "RuntimeRun");
-        assert_eq!(timeline["events"][2]["status"], "completed");
-        assert_eq!(timeline["events"][2]["refs"][0]["type"], "context_envelope");
-        assert_eq!(
-            timeline["events"][2]["refs"][0]["id"],
-            "ctx-runtime-timeline"
-        );
+        let runtime_run = timeline["events"]
+            .as_array()
+            .expect("timeline events")
+            .iter()
+            .find(|event| event["kind"] == "RuntimeRun")
+            .expect("runtime run projection");
+        assert_eq!(runtime_run["status"], "completed");
+        assert_eq!(runtime_run["refs"][0]["type"], "context_envelope");
+        assert_eq!(runtime_run["refs"][0]["id"], "ctx-runtime-timeline");
         assert_eq!(
             timeline["health_summary"]["latest_policy"]["agent_mode"],
             "Solo"

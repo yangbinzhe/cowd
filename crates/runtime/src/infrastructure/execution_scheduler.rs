@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use harness_contract::core::ExecutionModifier;
-use memory::{RuntimeEvent, RuntimeEventScope, RuntimeRef};
+use memory::{SessionDomainEvent, SessionDomainRef, SessionDomainScope};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -69,16 +69,16 @@ impl ToolSchedule {
         sequence: usize,
         created_at_ms: u64,
         requests: &[ToolRequest],
-    ) -> RuntimeEvent {
+    ) -> SessionDomainEvent {
         let payload = serde_json::json!({
             "batch_count": self.batches.len(),
             "batches": self.batches,
             "tool_count": requests.len(),
         });
-        let mut event = RuntimeEvent::new(
+        let mut event = SessionDomainEvent::new(
             session_id,
             sequence,
-            RuntimeEventScope::Tool,
+            SessionDomainScope::Tool,
             "tool.schedule.created",
             payload,
             created_at_ms,
@@ -86,7 +86,7 @@ impl ToolSchedule {
         event.status = Some("planned".to_string());
         event.refs = requests
             .iter()
-            .map(|request| RuntimeRef {
+            .map(|request| SessionDomainRef {
                 ref_type: "tool_call".to_string(),
                 id: request.tool_use_id.clone(),
                 label: Some(request.tool_name.clone()),
@@ -372,7 +372,7 @@ mod tests {
         let schedule = schedule_tool_requests(&requests);
         let event = schedule.to_runtime_event("session-1", 9, 123, &requests);
 
-        assert_eq!(event.scope, RuntimeEventScope::Tool);
+        assert_eq!(event.scope, SessionDomainScope::Tool);
         assert_eq!(event.kind, "tool.schedule.created");
         assert_eq!(event.refs.len(), 2);
         assert_eq!(event.payload["batch_count"], 2);

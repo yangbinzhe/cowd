@@ -109,8 +109,8 @@ const ROUTE_SOURCES: &[GatewayRouteSource] = &[
         include_str!("runtime_routes/control/value_loop.rs"),
     ),
     source(
-        "runtime_routes/control/workgraph.rs",
-        include_str!("runtime_routes/control/workgraph.rs"),
+        "runtime_routes/control/execution_graph.rs",
+        include_str!("runtime_routes/control/execution_graph.rs"),
     ),
     source("session_routes.rs", include_str!("session_routes.rs")),
     source("skill_routes.rs", include_str!("skill_routes.rs")),

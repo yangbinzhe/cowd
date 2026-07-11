@@ -8,7 +8,7 @@ use harness_contract::core::TaskRisk;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    global_approval_queue, ApprovalSource, ApprovalTimeoutPolicy, AutonomyDecisionInput,
+    ApprovalQueue, ApprovalSource, ApprovalTimeoutPolicy, AutonomyDecisionInput,
     AutonomyDecisionKind, AutonomyProfileCatalog, AutonomyProfileId, CollaborationTemplateId,
     GlobalApprovalRequest, SubmitGlobalApprovalRequest,
 };
@@ -62,6 +62,7 @@ impl StewardAgent {
     pub fn evaluate_action(
         &self,
         request: StewardActionRequest,
+        approval_queue: &ApprovalQueue,
     ) -> Result<StewardDecisionRecord, String> {
         if request.steward_id.trim().is_empty() {
             return Err("steward_id must not be empty".to_string());
@@ -101,7 +102,7 @@ impl StewardAgent {
                 created_at_ms: now_ms(),
             }),
             AutonomyDecisionKind::RequireApproval | AutonomyDecisionKind::EscalateToHuman => {
-                let approval = global_approval_queue().submit(SubmitGlobalApprovalRequest {
+                let approval = approval_queue.submit(SubmitGlobalApprovalRequest {
                     source: request.source.clone(),
                     action: request.action.clone(),
                     summary: request.summary.clone(),
@@ -163,21 +164,25 @@ mod tests {
 
     #[test]
     fn steward_delegates_low_risk_actions_allowed_by_profile() {
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
         let record = StewardAgent::new()
-            .evaluate_action(StewardActionRequest {
-                steward_id: "steward-1".to_string(),
-                profile_id: AutonomyProfileId::Stewarded,
-                source: source(),
-                action: "read evidence".to_string(),
-                summary: "read local evidence".to_string(),
-                risk: TaskRisk::Low,
-                requested_tool: Some("read_file".to_string()),
-                template_id: Some(CollaborationTemplateId::ExecuteReview),
-                requires_write: false,
-                is_critical_operation: false,
-                evidence_refs: vec!["trace:low".to_string()],
-                timeout_policy: ApprovalTimeoutPolicy::Pending,
-            })
+            .evaluate_action(
+                StewardActionRequest {
+                    steward_id: "steward-1".to_string(),
+                    profile_id: AutonomyProfileId::Stewarded,
+                    source: source(),
+                    action: "read evidence".to_string(),
+                    summary: "read local evidence".to_string(),
+                    risk: TaskRisk::Low,
+                    requested_tool: Some("read_file".to_string()),
+                    template_id: Some(CollaborationTemplateId::ExecuteReview),
+                    requires_write: false,
+                    is_critical_operation: false,
+                    evidence_refs: vec!["trace:low".to_string()],
+                    timeout_policy: ApprovalTimeoutPolicy::Pending,
+                },
+                services.approval_queue(),
+            )
             .expect("steward action");
 
         assert_eq!(record.status, StewardActionStatus::Delegated);
@@ -186,21 +191,25 @@ mod tests {
 
     #[test]
     fn steward_submits_global_approval_for_risky_actions() {
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
         let record = StewardAgent::new()
-            .evaluate_action(StewardActionRequest {
-                steward_id: "steward-2".to_string(),
-                profile_id: AutonomyProfileId::Stewarded,
-                source: source(),
-                action: "apply patch".to_string(),
-                summary: "write runtime changes".to_string(),
-                risk: TaskRisk::High,
-                requested_tool: Some("apply_patch".to_string()),
-                template_id: Some(CollaborationTemplateId::ImplementationReviewFix),
-                requires_write: true,
-                is_critical_operation: false,
-                evidence_refs: vec!["trace:risky".to_string()],
-                timeout_policy: ApprovalTimeoutPolicy::ContinueAlternative,
-            })
+            .evaluate_action(
+                StewardActionRequest {
+                    steward_id: "steward-2".to_string(),
+                    profile_id: AutonomyProfileId::Stewarded,
+                    source: source(),
+                    action: "apply patch".to_string(),
+                    summary: "write runtime changes".to_string(),
+                    risk: TaskRisk::High,
+                    requested_tool: Some("apply_patch".to_string()),
+                    template_id: Some(CollaborationTemplateId::ImplementationReviewFix),
+                    requires_write: true,
+                    is_critical_operation: false,
+                    evidence_refs: vec!["trace:risky".to_string()],
+                    timeout_policy: ApprovalTimeoutPolicy::ContinueAlternative,
+                },
+                services.approval_queue(),
+            )
             .expect("steward approval action");
 
         assert_eq!(record.status, StewardActionStatus::ApprovalSubmitted);

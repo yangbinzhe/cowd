@@ -2,14 +2,14 @@ use super::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod agent_value;
+mod execution_graph;
 mod health;
 mod value_loop;
-mod workgraph;
 
 pub(in crate::api_routes) use agent_value::*;
+pub(in crate::api_routes) use execution_graph::*;
 pub(in crate::api_routes) use health::*;
 pub(in crate::api_routes) use value_loop::*;
-pub(in crate::api_routes) use workgraph::*;
 
 pub(in crate::api_routes) async fn get_runtime_control_plane(
     AxumState(state): AxumState<Arc<AppState>>,

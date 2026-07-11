@@ -1,10 +1,14 @@
 //! Mission command interpreter for model-visible cross-session control.
 
+use harness_contract::execution_graph::{
+    ExecutionGraph, ExecutionGraphCommand, ExecutionNodeKind, ExecutionNodeSpec,
+    ExecutionNodeStatus,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CrossSessionMessage, SessionDispatchMode, SessionExecutionPlane, SessionExecutionPolicy,
-    StewardAutomationPolicy, StewardScheduler, StewardSchedulerConfig, TeamExecutionLoop,
+    CrossSessionMessage, SessionDispatchMode, SessionExecutionPolicy, StewardAutomationPolicy,
+    TeamExecutionLoop,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,15 +53,16 @@ pub enum MissionCommandTargetKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MissionInterpretedCommand {
-    BridgeSession { message: CrossSessionMessage },
-    RouteAgent { message: CrossSessionMessage },
-    TickTeam { team_id: String },
-    TickStewardScheduler { config: StewardSchedulerConfig },
-    DispatchPendingSessions { policy: SessionExecutionPolicy },
-    Blocked { reason: String },
+    SubmitExecutionGraph {
+        graph: ExecutionGraph,
+        graph_command: ExecutionGraphCommand,
+    },
+    Blocked {
+        reason: String,
+    },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MissionCommandExecutionReceipt {
     pub kind: String,
     pub ok: bool,
@@ -107,41 +112,33 @@ impl MissionCommandInterpreter {
                 ),
                 MissionCommandTargetKind::Team => {
                     let team_id = target_ref.trim_start_matches('@').to_string();
-                    MissionCommandInterpretation {
-                        kind: "runtime.mission_command_interpretation".to_string(),
-                        status: "interpreted".to_string(),
-                        target_kind,
-                        target_ref: Some(target_ref),
-                        command_text,
-                        command: MissionInterpretedCommand::TickTeam { team_id },
-                        blocked_reason: None,
-                        execution_plan: vec![
-                            "plan team workgraph".to_string(),
-                            "tick ready agent tasks".to_string(),
-                            "collect team execution report".to_string(),
-                        ],
+                    match TeamExecutionLoop::plan(&team_id) {
+                        Ok(plan) => graph_interpretation(
+                            command_text,
+                            Some(target_ref),
+                            target_kind,
+                            plan.execution_graph,
+                            vec![
+                                "submit canonical team execution graph".to_string(),
+                                "let ExecutionGraphRunner advance ready nodes".to_string(),
+                            ],
+                        ),
+                        Err(error) => blocked(command_text, Some(target_ref), error),
                     }
                 }
                 MissionCommandTargetKind::Steward => MissionCommandInterpretation {
                     kind: "runtime.mission_command_interpretation".to_string(),
-                    status: "interpreted".to_string(),
+                    status: "blocked".to_string(),
                     target_kind,
                     target_ref: Some(target_ref),
                     command_text,
-                    command: MissionInterpretedCommand::TickStewardScheduler {
-                        config: StewardSchedulerConfig {
-                            policy,
-                            dispatch_mode,
-                            allow_background_sessions: allow_background,
-                            ..StewardSchedulerConfig::default()
-                        },
+                    command: MissionInterpretedCommand::Blocked {
+                        reason: "supervise execution graphs become available in V8".to_string(),
                     },
-                    blocked_reason: None,
-                    execution_plan: vec![
-                        "tick steward runtime".to_string(),
-                        "dispatch session commands by policy".to_string(),
-                        "tick team workgraphs".to_string(),
-                    ],
+                    blocked_reason: Some(
+                        "supervise execution graphs become available in V8".to_string(),
+                    ),
+                    execution_plan: vec!["capability_unavailable:supervise:V8".to_string()],
                 },
                 MissionCommandTargetKind::Dispatch | MissionCommandTargetKind::Unknown => blocked(
                     command_text,
@@ -151,48 +148,80 @@ impl MissionCommandInterpreter {
             };
         }
 
-        MissionCommandInterpretation {
-            kind: "runtime.mission_command_interpretation".to_string(),
-            status: "interpreted".to_string(),
-            target_kind: MissionCommandTargetKind::Dispatch,
-            target_ref: None,
+        let policy = SessionExecutionPolicy {
+            max_commands: policy.default_max_session_commands(),
+            dispatch_mode,
+            allow_background,
+        };
+        graph_interpretation(
             command_text,
-            command: MissionInterpretedCommand::DispatchPendingSessions {
-                policy: SessionExecutionPolicy {
-                    max_commands: policy.default_max_session_commands(),
-                    dispatch_mode,
-                    allow_background,
-                },
-            },
-            blocked_reason: None,
-            execution_plan: vec![
-                "inspect pending mission session commands".to_string(),
-                "apply lease/background policy".to_string(),
-                "emit turn requests or control-plane receipts".to_string(),
+            None,
+            MissionCommandTargetKind::Dispatch,
+            session_dispatch_graph(
+                "dispatch pending mission session inputs",
+                format!(
+                    "session_dispatch_policy:{}",
+                    serde_json::to_string(&policy).unwrap_or_default()
+                ),
+            ),
+            vec![
+                "submit SessionDispatch node".to_string(),
+                "let Runtime SessionInputRouter materialize commands".to_string(),
             ],
-        }
+        )
     }
 
-    pub fn execute(interpretation: MissionCommandInterpretation) -> MissionCommandExecutionReceipt {
+    #[must_use]
+    pub fn interpret_session_message(message: CrossSessionMessage) -> MissionCommandInterpretation {
+        let target_kind = classify_target_ref(&message.target_ref);
+        bridge_interpretation(
+            message.from_session_id.clone(),
+            message.target_ref.clone(),
+            message.command.clone(),
+            target_kind,
+            target_kind == MissionCommandTargetKind::Session,
+        )
+    }
+
+    #[must_use]
+    pub fn interpret_session_policy(
+        policy: SessionExecutionPolicy,
+    ) -> MissionCommandInterpretation {
+        graph_interpretation(
+            "dispatch pending mission session inputs".to_string(),
+            None,
+            MissionCommandTargetKind::Dispatch,
+            session_dispatch_graph(
+                "dispatch pending mission session inputs",
+                format!(
+                    "session_dispatch_policy:{}",
+                    serde_json::to_string(&policy).unwrap_or_default()
+                ),
+            ),
+            vec![
+                "submit SessionDispatch node".to_string(),
+                "let Runtime SessionInputRouter materialize commands".to_string(),
+            ],
+        )
+    }
+
+    /// Prepare a canonical submission for the injected RuntimeHost.
+    ///
+    /// This method is deliberately side-effect free. Gateway or a background
+    /// supervisor must pass the returned graph and command to ExecutionGraphHost.
+    pub fn prepare_submission(
+        interpretation: MissionCommandInterpretation,
+    ) -> MissionCommandExecutionReceipt {
         let result = match &interpretation.command {
-            MissionInterpretedCommand::BridgeSession { message }
-            | MissionInterpretedCommand::RouteAgent { message } => {
-                serde_json::json!(SessionExecutionPlane::bridge(message.clone()))
-            }
-            MissionInterpretedCommand::TickTeam { team_id } => {
-                match TeamExecutionLoop::tick_ready(team_id) {
-                    Ok(report) => {
-                        serde_json::json!({ "ok": report.errors.is_empty(), "report": report })
-                    }
-                    Err(error) => serde_json::json!({ "ok": false, "error": error }),
-                }
-            }
-            MissionInterpretedCommand::TickStewardScheduler { config } => {
-                serde_json::json!(StewardScheduler::tick(config.clone()))
-            }
-            MissionInterpretedCommand::DispatchPendingSessions { policy } => {
-                serde_json::json!(SessionExecutionPlane::dispatch_pending(policy.clone()))
-            }
+            MissionInterpretedCommand::SubmitExecutionGraph {
+                graph,
+                graph_command,
+            } => serde_json::json!({
+                "ok": true,
+                "status": "pending_runtime_host",
+                "graph": graph,
+                "command": graph_command,
+            }),
             MissionInterpretedCommand::Blocked { reason } => {
                 serde_json::json!({ "ok": false, "error": reason })
             }
@@ -229,32 +258,61 @@ fn bridge_interpretation(
         actor: Some("mission_command_interpreter".to_string()),
         evidence_refs: Vec::new(),
     };
+    let payload = serde_json::to_string(&message).unwrap_or_default();
+    graph_interpretation(
+        command_text,
+        Some(target_ref),
+        target_kind,
+        session_dispatch_graph(
+            if session_target {
+                "bridge session input"
+            } else {
+                "route agent input"
+            },
+            format!("session_input:{payload}"),
+        ),
+        vec![
+            "submit SessionDispatch node".to_string(),
+            "let Runtime SessionInputRouter resolve and enqueue the target".to_string(),
+        ],
+    )
+}
+
+fn graph_interpretation(
+    command_text: String,
+    target_ref: Option<String>,
+    target_kind: MissionCommandTargetKind,
+    graph: ExecutionGraph,
+    execution_plan: Vec<String>,
+) -> MissionCommandInterpretation {
+    let expected_revision = graph.revision;
     MissionCommandInterpretation {
         kind: "runtime.mission_command_interpretation".to_string(),
         status: "interpreted".to_string(),
         target_kind,
-        target_ref: Some(target_ref),
+        target_ref,
         command_text,
-        command: if session_target {
-            MissionInterpretedCommand::BridgeSession { message }
-        } else {
-            MissionInterpretedCommand::RouteAgent { message }
+        command: MissionInterpretedCommand::SubmitExecutionGraph {
+            graph,
+            graph_command: ExecutionGraphCommand::Start { expected_revision },
         },
         blocked_reason: None,
-        execution_plan: if session_target {
-            vec![
-                "resolve session proxy or relation target".to_string(),
-                "enqueue command into target session inbox".to_string(),
-                "dispatch according to steward/session policy".to_string(),
-            ]
-        } else {
-            vec![
-                "resolve agent lifecycle and team binding".to_string(),
-                "deliver runtime input if backend supports it".to_string(),
-                "surface recovery candidate if agent is unavailable".to_string(),
-            ]
-        },
+        execution_plan,
     }
+}
+
+fn session_dispatch_graph(objective: impl Into<String>, payload_ref: String) -> ExecutionGraph {
+    let mut graph = ExecutionGraph::new(objective);
+    let node = ExecutionNodeSpec::new(
+        ExecutionNodeKind::SessionDispatch,
+        "session_dispatch",
+        payload_ref,
+    );
+    graph
+        .node_statuses
+        .insert(node.id.clone(), ExecutionNodeStatus::Planned);
+    graph.nodes.push(node);
+    graph
 }
 
 fn blocked(

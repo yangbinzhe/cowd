@@ -11,9 +11,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::agent::{SubAgentConfig, SubAgentExecutor, SubAgentResult};
-use crate::agent_workgraph::AgentWorkGraph;
 use crate::collaboration_template::{CollaborationDecision, CollaborationTemplateMatcher};
 use crate::context_runtime::ContextItem;
+use crate::execution_graph::{
+    execution_graph_from_collaboration_task, project_collaboration_review,
+};
 use crate::team_discovery::TeamDiscoveryProtocol;
 use crate::wave::{TaskId, WaveConfig, WaveOrchestrator, WaveTask};
 use harness_contract::strategy::StrategyDecision;
@@ -57,7 +59,7 @@ pub struct CollaborationContextResult {
     pub context_items: Vec<ContextItem>,
     pub collaboration_task: CollaborationTask,
     pub review_packet: CollaborationReviewPacket,
-    pub work_graph: AgentWorkGraph,
+    pub execution_graph: harness_contract::execution_graph::ExecutionGraph,
 }
 
 // ── Shared Board / Synthesis Scoring ───────────────────────────────────────────
@@ -780,8 +782,10 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
         let board = self.build_shared_board(&results);
         let agent_tasks = agent_task_traces_from_results(&subtasks, &results, &board.board_id);
         let review_packet = board.review_packet(None, agent_tasks);
-        let work_graph = AgentWorkGraph::from_collaboration_task("runtime-session", &collab_task)
-            .with_review_packet(&review_packet);
+        let execution_graph = project_collaboration_review(
+            &execution_graph_from_collaboration_task("runtime-session", &collab_task),
+            &review_packet,
+        );
 
         // 5. Finalize
         self.finalize(&synthesis, task).await;
@@ -791,7 +795,7 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
             context_items,
             collaboration_task: collab_task,
             review_packet,
-            work_graph,
+            execution_graph,
         })
     }
 }
@@ -1253,19 +1257,19 @@ pub trait CollaborationOps: Send + Sync {
         &'a self,
         task: &'a str,
         capabilities: &'a [String],
-    ) -> Pin<Box<dyn Future<Output = Option<String>> + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>>;
     #[cfg(test)]
     fn run_with_context_boxed<'a>(
         &'a self,
         task: &'a str,
         capabilities: &'a [String],
-    ) -> Pin<Box<dyn Future<Output = Option<CollaborationContextResult>> + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Option<CollaborationContextResult>> + Send + 'a>>;
     fn run_with_strategy_boxed<'a>(
         &'a self,
         task: &'a str,
         capabilities: &'a [String],
         strategy: &'a StrategyDecision,
-    ) -> Pin<Box<dyn Future<Output = Option<CollaborationContextResult>> + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Option<CollaborationContextResult>> + Send + 'a>>;
     fn decompose_task(&self, task: &str) -> Vec<SubTask>;
     fn assemble_team(&self, task: &CollaborationTask) -> Option<AgentTeam>;
 }
@@ -1275,7 +1279,7 @@ impl<E: SubAgentExecutor + 'static> CollaborationOps for CollaborationOrchestrat
         &'a self,
         task: &'a str,
         capabilities: &'a [String],
-    ) -> Pin<Box<dyn Future<Output = Option<String>> + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>> {
         Box::pin(self.run(task, capabilities))
     }
     #[cfg(test)]
@@ -1283,7 +1287,7 @@ impl<E: SubAgentExecutor + 'static> CollaborationOps for CollaborationOrchestrat
         &'a self,
         task: &'a str,
         capabilities: &'a [String],
-    ) -> Pin<Box<dyn Future<Output = Option<CollaborationContextResult>> + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Option<CollaborationContextResult>> + Send + 'a>> {
         Box::pin(async move {
             let decision = crate::execution_core::StrategyDecisionEngine.decide(task, None);
             self.run_with_context_and_strategy(task, capabilities, &decision.strategy)
@@ -1295,7 +1299,7 @@ impl<E: SubAgentExecutor + 'static> CollaborationOps for CollaborationOrchestrat
         task: &'a str,
         capabilities: &'a [String],
         strategy: &'a StrategyDecision,
-    ) -> Pin<Box<dyn Future<Output = Option<CollaborationContextResult>> + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Option<CollaborationContextResult>> + Send + 'a>> {
         Box::pin(self.run_with_context_and_strategy(task, capabilities, strategy))
     }
     fn decompose_task(&self, task: &str) -> Vec<SubTask> {

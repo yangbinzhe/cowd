@@ -11,7 +11,7 @@ pub enum BenchCaseKind {
     ArchitecturePlan,
     ContextAssembly,
     VerificationGuard,
-    WorkGraphFanout,
+    ExecutionGraphFanout,
     ToolTransaction,
     BehaviorMinimalScope,
     MemoryGrowthLoop,
@@ -237,8 +237,8 @@ impl ScenarioSpec {
 pub enum ScenarioCheckKind {
     FinalizationBlocked,
     RegressionAllowed,
-    WorkgraphPresent,
-    WorkgraphQualityOk,
+    ExecutionGraphPresent,
+    ExecutionGraphQualityOk,
     GrowthBlocker,
     GrowthSignal,
     MemoryCandidateCount,
@@ -339,8 +339,8 @@ pub struct ScenarioObservation {
     pub strategy_pattern: ExecutionPattern,
     pub finalization_blocked: bool,
     pub regression_allowed: bool,
-    pub has_workgraph: bool,
-    pub workgraph_quality_ok: bool,
+    pub has_execution_graph: bool,
+    pub execution_graph_quality_ok: bool,
     pub growth_has_blocker: bool,
     pub growth_signal_kinds: Vec<String>,
     pub memory_candidate_count: usize,
@@ -473,9 +473,11 @@ fn evaluate_check(
             compare_bool(check, observation.finalization_blocked)
         }
         ScenarioCheckKind::RegressionAllowed => compare_bool(check, observation.regression_allowed),
-        ScenarioCheckKind::WorkgraphPresent => compare_bool(check, observation.has_workgraph),
-        ScenarioCheckKind::WorkgraphQualityOk => {
-            compare_bool(check, observation.workgraph_quality_ok)
+        ScenarioCheckKind::ExecutionGraphPresent => {
+            compare_bool(check, observation.has_execution_graph)
+        }
+        ScenarioCheckKind::ExecutionGraphQualityOk => {
+            compare_bool(check, observation.execution_graph_quality_ok)
         }
         ScenarioCheckKind::GrowthBlocker => compare_bool(check, observation.growth_has_blocker),
         ScenarioCheckKind::GrowthSignal => match check.expected_text.as_ref() {
@@ -612,7 +614,7 @@ impl CowdBenchSmokeSuite {
             "strategy".to_string(),
             "context".to_string(),
             "verification".to_string(),
-            "workgraph".to_string(),
+            "execution_graph".to_string(),
             "tool_transaction".to_string(),
             "policy".to_string(),
             "behavior".to_string(),
@@ -661,7 +663,7 @@ pub fn cowdbench_smoke_cases() -> Vec<CowdBenchCase> {
             BenchCaseKind::ArchitecturePlan,
             "plan a multi-crate architecture change",
             ExecutionPattern::Execute,
-            "workgraph",
+            "execution_graph",
         ),
         (
             BenchCaseKind::ContextAssembly,
@@ -676,7 +678,7 @@ pub fn cowdbench_smoke_cases() -> Vec<CowdBenchCase> {
             "verification_report",
         ),
         (
-            BenchCaseKind::WorkGraphFanout,
+            BenchCaseKind::ExecutionGraphFanout,
             "parallel multi-agent implementation",
             ExecutionPattern::Collaborate,
             "value_verdict",
@@ -726,7 +728,7 @@ fn capability_for_check(check: &str) -> Option<&'static str> {
     match check {
         "answered" => Some("strategy"),
         "guardrails" => Some("policy"),
-        "workgraph" | "value_verdict" => Some("workgraph"),
+        "execution_graph" | "value_verdict" => Some("execution_graph"),
         "context_epoch" => Some("context"),
         "verification_report" => Some("verification"),
         "tool_transaction" => Some("tool_transaction"),
@@ -918,8 +920,8 @@ mod tests {
             strategy_pattern: ExecutionPattern::Direct,
             finalization_blocked: false,
             regression_allowed: true,
-            has_workgraph: false,
-            workgraph_quality_ok: false,
+            has_execution_graph: false,
+            execution_graph_quality_ok: false,
             growth_has_blocker: false,
             growth_signal_kinds: Vec::new(),
             memory_candidate_count: 0,
@@ -955,8 +957,8 @@ mod tests {
             strategy_pattern: ExecutionPattern::Execute,
             finalization_blocked: false,
             regression_allowed: false,
-            has_workgraph: false,
-            workgraph_quality_ok: false,
+            has_execution_graph: false,
+            execution_graph_quality_ok: false,
             growth_has_blocker: true,
             growth_signal_kinds: vec!["MatrixQualityGate".to_string()],
             memory_candidate_count: 1,

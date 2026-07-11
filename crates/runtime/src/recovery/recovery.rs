@@ -4,11 +4,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     candidate_from_action, global_agent_lifecycle_service, global_agent_task_mailbox,
-    global_mission_runtime, global_runtime_event_store, global_steward_runtime_service,
-    global_team_runtime_service, record_runtime_event, AgentExecutionCommandKind, AgentTaskStatus,
-    MissionSessionCommandStatus, RuntimeEventInput, RuntimeEventRef, RuntimeEventReplayer,
-    RuntimeEventScope, RuntimeRecoveryAction, RuntimeRecoveryActionKind, RuntimeRecoveryCandidate,
-    RuntimeReplayReport,
+    global_steward_runtime_service, global_team_runtime_service, AgentExecutionCommandKind,
+    AgentTaskStatus, MissionSessionCommandStatus, RuntimeEventInput, RuntimeEventRef,
+    RuntimeEventReplayer, RuntimeEventScope, RuntimeRecoveryAction, RuntimeRecoveryActionKind,
+    RuntimeRecoveryCandidate, RuntimeReplayReport, RuntimeServices,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,9 +53,9 @@ pub struct RecoveryFailedAction {
 pub struct RecoveryPlanner;
 
 impl RecoveryPlanner {
-    pub fn plan(limit: usize) -> Result<RecoveryPlan, String> {
-        let mut report = RuntimeEventReplayer::report(global_runtime_event_store(), limit)?;
-        let candidates = augmented_candidates(&report);
+    pub fn plan(limit: usize, services: &RuntimeServices) -> Result<RecoveryPlan, String> {
+        let mut report = RuntimeEventReplayer::report(services.event_store(), limit)?;
+        let candidates = augmented_candidates(&report, services);
         report.candidates = candidates.clone();
         Ok(RecoveryPlan {
             kind: "runtime.recovery_plan".to_string(),
@@ -67,13 +66,20 @@ impl RecoveryPlanner {
     }
 }
 
-fn augmented_candidates(report: &RuntimeReplayReport) -> Vec<RuntimeRecoveryCandidate> {
+fn augmented_candidates(
+    report: &RuntimeReplayReport,
+    services: &RuntimeServices,
+) -> Vec<RuntimeRecoveryCandidate> {
     let mut candidates = report
         .actions
         .iter()
         .filter_map(candidate_from_action)
         .collect::<Vec<_>>();
-    for command in global_mission_runtime().projection().session_commands {
+    for command in services
+        .mission_runtime()
+        .projection(services.session_relations())
+        .session_commands
+    {
         let (action, risk, precondition) = match command.status {
             MissionSessionCommandStatus::Pending => (
                 RuntimeRecoveryActionKind::PreservePending,
@@ -154,15 +160,18 @@ fn dedupe_candidates(candidates: Vec<RuntimeRecoveryCandidate>) -> Vec<RuntimeRe
 pub struct RecoveryExecutor;
 
 impl RecoveryExecutor {
-    pub fn execute(limit: usize) -> Result<RecoveryExecutionReport, String> {
-        let plan = RecoveryPlanner::plan(limit)?;
+    pub fn execute(
+        limit: usize,
+        services: &RuntimeServices,
+    ) -> Result<RecoveryExecutionReport, String> {
+        let plan = RecoveryPlanner::plan(limit, services)?;
         let mut applied = Vec::new();
         let mut skipped = Vec::new();
         let mut failed = Vec::new();
 
         let actions = executable_recovery_actions(&plan);
         for action in &actions {
-            match apply_action(action) {
+            match apply_action(action, services) {
                 RecoveryApplyOutcome::Applied(summary) => {
                     applied.push(RecoveryAppliedAction {
                         stream_id: action.stream_id.clone(),
@@ -195,7 +204,7 @@ impl RecoveryExecutor {
             failed,
             plan,
         };
-        record_recovery_event(&report);
+        record_recovery_event(&report, services);
         Ok(report)
     }
 }
@@ -235,7 +244,10 @@ enum RecoveryApplyOutcome {
     Failed(String),
 }
 
-fn apply_action(action: &RuntimeRecoveryAction) -> RecoveryApplyOutcome {
+fn apply_action(
+    action: &RuntimeRecoveryAction,
+    services: &RuntimeServices,
+) -> RecoveryApplyOutcome {
     match action.action {
         RuntimeRecoveryActionKind::PreservePending => {
             RecoveryApplyOutcome::Applied("pending work preserved".to_string())
@@ -258,8 +270,8 @@ fn apply_action(action: &RuntimeRecoveryAction) -> RecoveryApplyOutcome {
             if action.stream_id.starts_with("session-command:") =>
         {
             let command_id = action.stream_id.trim_start_matches("session-command:");
-            match global_mission_runtime().get_session_command(command_id) {
-                Some(command) => match global_mission_runtime().interrupt_session_command(
+            match services.mission_runtime().get_session_command(command_id) {
+                Some(command) => match services.mission_runtime().interrupt_session_command(
                     &command.target_session_id,
                     command_id,
                     action.reason.clone(),
@@ -298,8 +310,8 @@ fn apply_action(action: &RuntimeRecoveryAction) -> RecoveryApplyOutcome {
     }
 }
 
-fn record_recovery_event(report: &RecoveryExecutionReport) {
-    let _ = record_runtime_event(RuntimeEventInput {
+fn record_recovery_event(report: &RecoveryExecutionReport, services: &RuntimeServices) {
+    let _ = services.event_store().append(RuntimeEventInput {
         stream_id: "runtime:recovery".to_string(),
         scope: RuntimeEventScope::Recovery,
         kind: "runtime.recovery.executed".to_string(),
@@ -325,21 +337,26 @@ mod tests {
     #[test]
     fn recovery_executor_marks_session_command_and_steward() {
         let _guard = crate::test_env_lock();
+        let services = RuntimeServices::in_memory().expect("runtime services");
         let suffix = uuid::Uuid::new_v4();
         let session_id = format!("recovery-session-{suffix}");
-        global_mission_runtime()
+        services
+            .mission_runtime()
             .start_session(StartMissionSessionRequest {
                 title: "recovery session".to_string(),
                 session_id: Some(session_id.clone()),
             })
             .expect("session");
-        let command = global_mission_runtime()
+        let command = services
+            .mission_runtime()
             .enqueue_session_command(&session_id, &session_id, "recover me")
             .expect("command");
-        global_mission_runtime()
+        services
+            .mission_runtime()
             .mark_session_command_running(&session_id, &command.command_id)
             .expect("running");
-        global_runtime_event_store()
+        services
+            .event_store()
             .append(RuntimeEventInput {
                 stream_id: format!("session-command:{}", command.command_id),
                 scope: RuntimeEventScope::SessionCommand,
@@ -358,7 +375,8 @@ mod tests {
                 objective: "recover steward".to_string(),
             })
             .expect("steward");
-        global_runtime_event_store()
+        services
+            .event_store()
             .append(RuntimeEventInput {
                 stream_id: format!("steward:{}", steward.steward_id),
                 scope: RuntimeEventScope::Steward,
@@ -370,7 +388,7 @@ mod tests {
             })
             .expect("append steward event");
 
-        let report = RecoveryExecutor::execute(1_000).expect("recover");
+        let report = RecoveryExecutor::execute(1_000, &services).expect("recover");
         assert!(report
             .plan
             .candidates
@@ -395,7 +413,8 @@ mod tests {
             .iter()
             .any(|action| action.stream_id == format!("steward:{}", steward.steward_id)));
         assert_eq!(
-            global_mission_runtime()
+            services
+                .mission_runtime()
                 .get_session_command(&command.command_id)
                 .expect("command after")
                 .status,

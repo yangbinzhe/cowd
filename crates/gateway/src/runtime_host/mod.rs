@@ -385,6 +385,26 @@ fn emit_startup_diagnostics(diagnostics: &StartupDiagnostics) {
     );
 }
 
+fn emit_execution_startup_recovery(report: &runtime::ExecutionStartupRecoveryReport) {
+    tracing::info!(
+        examined_graphs = report.examined_graphs,
+        recovered_graphs = report.recovered_graphs,
+        advanced_graphs = report.advanced_graphs,
+        terminal_graphs = report.terminal_graphs,
+        waiting_graphs = report.waiting_graphs,
+        blocked_graphs = report.blocked_graphs,
+        error_count = report.errors.len(),
+        "execution graph startup recovery completed"
+    );
+    for error in &report.errors {
+        tracing::warn!(
+            graph_id = %error.graph_id,
+            error = %error.error,
+            "execution graph startup recovery reported an error"
+        );
+    }
+}
+
 // ── PID file guard ──────────────────────────────────────────────
 
 struct PidFileGuard;
@@ -696,6 +716,35 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             Some(runtime_mcp_service),
         ),
     ));
+    let gateway_runtime_tool_host = Arc::new(
+        crate::gateway_tool_executor::GatewayToolExecutor::from_tool_host(
+            None,
+            false,
+            Arc::clone(&tool_host),
+            None,
+        ),
+    );
+    let runtime_tool_host: Arc<dyn runtime::RuntimeExecutionHost> =
+        gateway_runtime_tool_host.clone();
+    let mut runtime_services_builder =
+        runtime::RuntimeServices::builder(&approval_dir, &workspace_root)
+            .provider_registry(Arc::clone(&provider_registry))
+            .tool_execution_host(runtime_tool_host);
+    if let Some(store) = unified_store.as_ref() {
+        runtime_services_builder = runtime_services_builder.session_store(Arc::clone(store));
+    }
+    let runtime_services = runtime_services_builder
+        .build()
+        .map_err(|error| format!("failed to initialize runtime services: {error}"))?;
+    run_legacy_execution_startup_migration(&runtime_services, &approval_dir)?;
+    gateway_runtime_tool_host
+        .bind_runtime_services(Arc::clone(&runtime_services))
+        .map_err(|error| format!("failed to bind runtime services: {error}"))?;
+    let startup_recovery = runtime_services
+        .recover_execution_graphs_on_startup()
+        .await
+        .map_err(|error| format!("failed to recover execution graphs on startup: {error}"))?;
+    emit_execution_startup_recovery(&startup_recovery);
     let runtime_service = Arc::new(
         RuntimeService::new(
             sessions.clone(),
@@ -705,10 +754,20 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             started_at,
             Arc::clone(&provider_registry),
             Arc::clone(&upgrade_coordinator),
+            runtime_services,
         )
+        .map_err(|error| format!("failed to initialize runtime session bridge: {error}"))?
         .with_tool_host(tool_host)
         .with_approval_gate(approval_gate.clone()),
     );
+    let session_bridge_store = unified_store.clone().ok_or_else(|| {
+        "durable UnifiedSessionStore is required for the Runtime session bridge".to_string()
+    })?;
+    let session_runtime_bridge = crate::session_runtime_bridge::SessionRuntimeBridge::start(
+        Arc::clone(&runtime_service),
+        session_bridge_store,
+        Arc::clone(&event_bus),
+    )?;
     let weak_runtime_service = Arc::downgrade(&runtime_service);
     upgrade_coordinator.register_collector(Arc::new(
         runtime::ClosureUpgradeInventoryCollector::new("active_turns", move || {
@@ -848,11 +907,34 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     // ── Cleanup after shutdown ──
     tracing::info!("cleaning up runtime host resources...");
 
+    session_runtime_bridge.shutdown().await;
+
     tracing::info!("surface host shutdown complete");
 
     // PID file is cleaned up by PidFileGuard drop
     tracing::info!("runtime host shutdown complete");
     Ok(())
+}
+
+fn run_legacy_execution_startup_migration(
+    runtime_services: &Arc<runtime::RuntimeServices>,
+    config_home: &std::path::Path,
+) -> Result<(), String> {
+    let migration_root = config_home.join("migrations");
+    let legacy_inventory = migration_root.join("v3-active-inventory.json");
+    let legacy_receipt = migration_root.join("v3-clean-shutdown-receipt.json");
+    if !legacy_inventory.exists() && !legacy_receipt.exists() {
+        return Ok(());
+    }
+    runtime::LegacyExecutionImporter::new(
+        Arc::clone(runtime_services.event_store()),
+        runtime_services.workspace_key(),
+        runtime_services.workspace_root(),
+        env!("CARGO_PKG_VERSION"),
+    )
+    .import_receipt_file(&legacy_receipt)
+    .map(|_| ())
+    .map_err(|error| format!("legacy execution migration failed; startup blocked: {error}"))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -894,6 +976,34 @@ mod tests {
         assert!(config.memory_config.is_none());
         assert!(config.surface_configs.is_empty());
         assert!(config.auth_token.is_none());
+    }
+
+    #[test]
+    fn startup_migration_missing_receipt_fails_and_blocks_runtime_mutation() {
+        let root = temp_webui_dir("migration-missing-receipt");
+        let workspace = root.join("workspace");
+        let config_home = root.join("home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(config_home.join("migrations")).unwrap();
+        fs::write(
+            config_home
+                .join("migrations")
+                .join("v3-active-inventory.json"),
+            b"{}",
+        )
+        .unwrap();
+        let services = runtime::RuntimeServices::builder(&config_home, &workspace)
+            .build()
+            .unwrap();
+
+        let result = run_legacy_execution_startup_migration(&services, &config_home);
+
+        assert!(result.unwrap_err().contains("startup blocked"));
+        assert!(matches!(
+            services.ensure_mutation_allowed(),
+            Err(runtime::RuntimeServicesError::UpgradeRecoveryRequired)
+        ));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]

@@ -295,6 +295,7 @@ mod tests {
                 recipient: "room-1".to_string(),
                 thread: None,
                 text: "hello".to_string(),
+                idempotency_key: None,
                 metadata: serde_json::Value::Null,
             })
             .await
@@ -466,6 +467,7 @@ done
                 recipient: "room-1".to_string(),
                 thread: None,
                 text: "hello".to_string(),
+                idempotency_key: None,
                 metadata: serde_json::Value::Null,
             })
             .await

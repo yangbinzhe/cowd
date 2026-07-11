@@ -102,7 +102,7 @@ pub(super) async fn mfg_cockpit_report_deliver_handler(
         .get_cockpit_report(&state.config_home, &id)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG cockpit report not found"))?;
-    let outcome = deliver_mfg_cockpit_report(&state, report, request)?;
+    let outcome = deliver_mfg_cockpit_report(&state, report, request).await?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.cockpit.report_delivery",
         "mode": outcome.mode,
@@ -155,7 +155,7 @@ pub(super) async fn mfg_cockpit_report_delivery_retry_handler(
         ));
     }
     let delivery_request = mfg_retry_delivery_request(&report, &before_state, request);
-    let outcome = deliver_mfg_cockpit_report(&state, report, delivery_request)?;
+    let outcome = deliver_mfg_cockpit_report(&state, report, delivery_request).await?;
     let after_state = MfgCockpitReportDeliveryState::from_report(&outcome.report);
     Ok(Json(serde_json::json!({
         "kind": "mfg.cockpit.report_delivery_retry",
@@ -213,7 +213,7 @@ pub(super) async fn mfg_cockpit_report_schedule_run_handler(
         if request.deliver {
             let delivery_request =
                 mfg_schedule_delivery_request(&profile, &report, &request, delivery_count);
-            let outcome = deliver_mfg_cockpit_report(&state, report, delivery_request)?;
+            let outcome = deliver_mfg_cockpit_report(&state, report, delivery_request).await?;
             delivery_count += 1;
             items.push(serde_json::json!({
                 "profile_id": profile.profile_id,
@@ -245,12 +245,11 @@ pub(super) async fn mfg_cockpit_report_schedule_run_handler(
     })))
 }
 
-pub(super) fn deliver_mfg_cockpit_report(
+pub(super) async fn deliver_mfg_cockpit_report(
     state: &AppState,
     report: MfgCockpitReportSnapshot,
     request: MfgCockpitReportDeliveryRequest,
 ) -> Result<MfgCockpitReportDeliveryOutcome, (StatusCode, Json<ErrorResponse>)> {
-    state.services.cross_plane.ensure_loaded(&state.config_home);
     let mode = state.services.mfg.normalize_bridge_mode(&request.mode);
     let idempotency_key = request
         .idempotency_key
@@ -306,15 +305,44 @@ pub(super) fn deliver_mfg_cockpit_report(
         .services
         .cross_plane
         .decide_connector_action(&snapshot, action, &mode, now);
-    let receipt = state.services.mfg.record_cross_plane_bridge_receipt(
-        &state.services.cross_plane,
-        idempotency_key,
-        mode.clone(),
-        action,
-        decision,
-        evidence,
-    );
-    state.services.cross_plane.save_state(&state.config_home);
+    let receipt = if mode == "commit" && decision.decision == runtime::PolicyDecisionKind::Allow {
+        let graph_key = idempotency_key
+            .clone()
+            .unwrap_or_else(|| format!("mfg-report-{}", uuid::Uuid::new_v4()));
+        let target = runtime::CrossPlaneDispatchTarget::from_action(
+            &action,
+            Some("feishu"),
+            Some("send_text"),
+        )
+        .unwrap_or_default();
+        let executor = std::sync::Arc::new(crate::services::GatewayCrossPlaneExecutor::new(
+            state.services.surface.clone(),
+            target,
+            state.services.cross_plane.runtime_control(),
+        ));
+        state
+            .services
+            .cross_plane
+            .execute_commit_graph(&action, &decision, &graph_key, executor)
+            .await
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+        state
+            .services
+            .cross_plane
+            .find_execution_by_idempotency_key(&graph_key)
+            .ok_or_else(|| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "canonical cross-plane graph receipt is missing",
+                )
+            })?
+    } else {
+        state
+            .services
+            .cross_plane
+            .record_non_commit_action(idempotency_key, mode.clone(), action, decision, evidence)
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+    };
     let report = state
         .services
         .mfg

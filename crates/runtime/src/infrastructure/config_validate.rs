@@ -619,7 +619,7 @@ const RUNTIME_CONTROL_CONTEXT_FIELDS: &[FieldSpec] = &[
 
 const RUNTIME_CONTROL_MEMORY_FIELDS: &[FieldSpec] = &[
     FieldSpec {
-        name: "emit_pulses_from_workgraph",
+        name: "emit_pulses_from_execution_graph",
         expected: FieldType::Bool,
     },
     FieldSpec {
@@ -1061,7 +1061,7 @@ mod tests {
               "agent": {"enabled": true, "max_parallel_agents": 4, "min_collaboration_score": 50},
               "task": {"auto_phase_for_yolo": true, "max_failures_before_review": 2},
               "context": {"preserve_stable_head": true, "yolo_budget_tokens": 12000},
-              "memory": {"emit_pulses_from_workgraph": true, "max_candidates_per_turn": 8},
+              "memory": {"emit_pulses_from_execution_graph": true, "max_candidates_per_turn": 8},
               "permission": {"solo_honor_critical": true, "review_critical_actions": true}
             }
           }

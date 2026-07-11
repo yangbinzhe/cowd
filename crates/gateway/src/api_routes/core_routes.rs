@@ -364,7 +364,7 @@ async fn memory_context_bridge_available(state: &AppState) -> bool {
     false
 }
 
-fn runtime_skill_memory_bridge_session(events: &[memory::RuntimeEvent]) -> bool {
+fn runtime_skill_memory_bridge_session(events: &[memory::SessionDomainEvent]) -> bool {
     let invocations = events
         .iter()
         .filter_map(runtime_skill_invocation)
@@ -393,7 +393,7 @@ struct RuntimeSkillBridgeKey {
     sequence: usize,
 }
 
-fn runtime_skill_invocation(event: &memory::RuntimeEvent) -> Option<RuntimeSkillBridgeKey> {
+fn runtime_skill_invocation(event: &memory::SessionDomainEvent) -> Option<RuntimeSkillBridgeKey> {
     if event.kind != "skill_candidates" {
         return None;
     }
@@ -438,7 +438,9 @@ fn runtime_skill_invocation(event: &memory::RuntimeEvent) -> Option<RuntimeSkill
     })
 }
 
-fn runtime_skill_memory_candidate(event: &memory::RuntimeEvent) -> Option<RuntimeSkillBridgeKey> {
+fn runtime_skill_memory_candidate(
+    event: &memory::SessionDomainEvent,
+) -> Option<RuntimeSkillBridgeKey> {
     if event.kind != "skill_memory_candidate" {
         return None;
     }
@@ -523,11 +525,11 @@ fn graph_skill_quality_contract_smoke(state: &AppState) -> bool {
 mod tests {
     use super::*;
 
-    fn skill_activation_event(sequence: usize, source: &str) -> memory::RuntimeEvent {
-        let mut event = memory::RuntimeEvent::new(
+    fn skill_activation_event(sequence: usize, source: &str) -> memory::SessionDomainEvent {
+        let mut event = memory::SessionDomainEvent::new(
             "session-1",
             sequence,
-            memory::RuntimeEventScope::Context,
+            memory::SessionDomainScope::Context,
             "skill_candidates",
             serde_json::json!({
                 "source": source,
@@ -540,7 +542,7 @@ mod tests {
             }),
             sequence as u64,
         );
-        event.refs.push(memory::RuntimeRef {
+        event.refs.push(memory::SessionDomainRef {
             ref_type: "skill_invocation".to_string(),
             id: "release-review".to_string(),
             label: Some("selected_for_runtime".to_string()),
@@ -548,11 +550,11 @@ mod tests {
         event
     }
 
-    fn skill_memory_event(sequence: usize, source: &str) -> memory::RuntimeEvent {
-        let mut event = memory::RuntimeEvent::new(
+    fn skill_memory_event(sequence: usize, source: &str) -> memory::SessionDomainEvent {
+        let mut event = memory::SessionDomainEvent::new(
             "session-1",
             sequence,
-            memory::RuntimeEventScope::Context,
+            memory::SessionDomainScope::Context,
             "skill_memory_candidate",
             serde_json::json!({
                 "source": source,
@@ -565,7 +567,7 @@ mod tests {
             }),
             sequence as u64,
         );
-        event.refs.push(memory::RuntimeRef {
+        event.refs.push(memory::SessionDomainRef {
             ref_type: "skill".to_string(),
             id: "release-review".to_string(),
             label: Some("memory_candidate_source".to_string()),

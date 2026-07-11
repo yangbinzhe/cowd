@@ -41,16 +41,23 @@ impl GatewayServices {
         config_home: impl AsRef<std::path::Path>,
     ) -> Self {
         let command_host_runtime = Arc::clone(&runtime);
+        let runtime_services = runtime.runtime_services();
+        let runtime_events =
+            RuntimeEventService::from_store(Arc::clone(runtime_services.event_store()));
         let session_kernel = runtime.session_kernel();
         let lifecycle_kernel = runtime.lifecycle_kernel();
         Self {
             runtime: Some(runtime),
+            runtime_events,
             surface: SurfaceService::with_host(surface_host),
             slash: SlashController::new(Some(command_host_runtime)),
             session: SessionService::with_runtime_boundaries(session_kernel, lifecycle_kernel),
-            task: TaskService::with_kernel(task_kernel),
+            task: TaskService::with_kernel_and_runtime(task_kernel, Arc::clone(&runtime_services)),
             memory: MemoryService::with_manager(memory_manager),
-            approval: ApprovalService::with_gate_and_repository(approval_gate, approval_repository),
+            approval: ApprovalService::with_gate_and_repository(approval_gate, approval_repository)
+                .with_runtime_services(Arc::clone(&runtime_services)),
+            cross_plane: CrossPlaneService::new(Arc::clone(&runtime_services)),
+            mission: MissionService::new().with_runtime_services(runtime_services),
             ..Self::baseline_with_config_home(config_home)
         }
     }
@@ -60,8 +67,10 @@ impl GatewayServices {
     }
 
     pub(crate) fn baseline_with_config_home(config_home: impl AsRef<std::path::Path>) -> Self {
+        let config_home = config_home.as_ref();
         Self {
             runtime: None,
+            runtime_events: RuntimeEventService::open(config_home),
             surface: SurfaceService::new(),
             slash: SlashController::new(None),
             session: SessionService::new(),
@@ -70,7 +79,9 @@ impl GatewayServices {
             memory: MemoryService::new(),
             context: ContextService::new(),
             connector: ConnectorService::new(),
-            cross_plane: CrossPlaneService::new(),
+            cross_plane: CrossPlaneService::new(
+                runtime::RuntimeServices::in_memory().expect("baseline cross-plane runtime"),
+            ),
             tool: ToolService::new(),
             system: SystemService::new(),
             audit: AuditService::new(),

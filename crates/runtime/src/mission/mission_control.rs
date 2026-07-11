@@ -6,19 +6,13 @@
 
 use std::collections::BTreeMap;
 
-use harness_contract::core::TaskRisk;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    global_agent_event_bus, global_agent_lifecycle_service, global_agent_task_mailbox,
-    global_approval_queue, global_mission_evidence_bus, global_mission_runtime,
-    global_runtime_event_store, global_session_relation_graph, global_steward_runtime_service,
-    global_team_runtime_service, record_runtime_event, AgentExecutionCommandKind,
-    AgentProgressEvent, AgentTask, AgentTaskStatus, ApprovalSource, ApprovalSourceKind,
-    ApprovalTimeoutPolicy, AutonomyProfileId, GlobalApprovalDecision, MissionEvent,
-    MissionEvidenceRef, MissionProjection, MissionSessionCommandSummary, MissionSessionSnapshot,
-    RuntimeEventInput, RuntimeEventScope, StartMissionSessionRequest, StartStewardRuntimeRequest,
-    SubmitGlobalApprovalRequest,
+    global_agent_lifecycle_service, global_steward_runtime_service, global_team_runtime_service,
+    GlobalApprovalDecision, MissionEvent, MissionProjection, MissionSessionCommandSummary,
+    MissionSessionSnapshot, RuntimeEventInput, RuntimeEventScope, RuntimeServices,
+    StartMissionSessionRequest,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,7 +124,7 @@ pub struct MissionControlProjection {
     pub approvals: Vec<MissionControlApprovalNode>,
     pub stewards: Vec<MissionControlStewardNode>,
     pub relations: serde_json::Value,
-    pub workgraphs: serde_json::Value,
+    pub execution_graphs: serde_json::Value,
     pub conflicts: serde_json::Value,
     pub evidence: serde_json::Value,
     pub capabilities: serde_json::Value,
@@ -225,18 +219,21 @@ pub struct MissionControlRuntime;
 
 impl MissionControlRuntime {
     #[must_use]
-    pub fn projection() -> MissionControlProjection {
-        build_projection()
+    pub fn projection(services: &RuntimeServices) -> MissionControlProjection {
+        build_projection(services)
     }
 
-    pub fn execute(command: MissionControlCommand) -> MissionControlCommandReceipt {
+    pub fn execute(
+        command: MissionControlCommand,
+        services: &RuntimeServices,
+    ) -> MissionControlCommandReceipt {
         let actor = command
             .actor
             .clone()
             .filter(|actor| !actor.trim().is_empty())
             .unwrap_or_else(|| "mission_control".to_string());
         let command_id = format!("mission-control-command-{}", uuid::Uuid::new_v4());
-        let outcome = execute_command(&command);
+        let outcome = execute_command(&command, services);
         let (status, message, result) = match outcome {
             Ok((status, message, result)) => (status, message, result),
             Err(error) => (
@@ -256,19 +253,21 @@ impl MissionControlRuntime {
             result,
             evidence_refs: command.evidence_refs,
         };
-        record_command_event(&receipt);
+        record_command_event(&receipt, services);
         receipt
     }
 }
 
-fn build_projection() -> MissionControlProjection {
-    let mission = global_mission_runtime().projection();
+fn build_projection(services: &RuntimeServices) -> MissionControlProjection {
+    let mission = services
+        .mission_runtime()
+        .projection(services.session_relations());
     let team_projection = global_team_runtime_service().projection();
     let agent_projection = global_agent_lifecycle_service().projection();
-    let approval_projection = global_approval_queue().projection();
+    let approval_projection = services.approval_queue().projection();
     let steward_projection = global_steward_runtime_service().projection();
-    let relations = global_session_relation_graph().projection();
-    let event_digest = event_digest(50);
+    let relations = services.session_relations().projection();
+    let event_digest = event_digest(50, services);
 
     let sessions = mission
         .sessions
@@ -279,9 +278,9 @@ fn build_projection() -> MissionControlProjection {
     let agents = agent_nodes(&agent_projection, &mission);
     let approvals = approval_nodes(&approval_projection);
     let stewards = steward_nodes(&serde_json::to_value(&steward_projection).unwrap_or_default());
-    let workgraphs = mission.workgraph_projection.clone();
-    let conflicts = mission.conflict_projection.clone();
-    let evidence = mission.evidence_projection.clone();
+    let execution_graphs = mission.execution_graph_projection.clone();
+    let conflicts = services.conflict_resolver().projection();
+    let evidence = services.mission_evidence().projection();
     let capabilities = mission.capability_projection.clone();
     let steward_scheduler = mission.steward_projection.clone();
     let mission_health = mission.health_projection.clone();
@@ -332,7 +331,7 @@ fn build_projection() -> MissionControlProjection {
         approvals,
         stewards,
         relations,
-        workgraphs,
+        execution_graphs,
         conflicts,
         evidence,
         capabilities,
@@ -449,7 +448,7 @@ fn control_readiness(
                 "no pending approval request"
             },
             true,
-            Some("runtime.global_approval_queue"),
+            Some("runtime.approval_queue"),
             pending_approvals,
         ),
         readiness(
@@ -761,10 +760,8 @@ fn steward_nodes(steward_projection: &serde_json::Value) -> Vec<MissionControlSt
         .collect()
 }
 
-fn event_digest(limit: usize) -> MissionControlEventDigest {
-    let events = global_runtime_event_store()
-        .all_events(limit)
-        .unwrap_or_default();
+fn event_digest(limit: usize, services: &RuntimeServices) -> MissionControlEventDigest {
+    let events = services.event_store().all_events(limit).unwrap_or_default();
     let mut scope_counts = BTreeMap::new();
     for event in &events {
         *scope_counts
@@ -814,14 +811,17 @@ fn event_digest(limit: usize) -> MissionControlEventDigest {
 
 fn execute_command(
     command: &MissionControlCommand,
+    services: &RuntimeServices,
 ) -> Result<(MissionControlCommandStatus, String, serde_json::Value), String> {
     match (&command.target, &command.action) {
         (MissionControlCommandTarget::Mission, MissionControlAction::StartSession) => {
             let title = payload_string(&command.payload, "title")?;
-            let session = global_mission_runtime().start_session(StartMissionSessionRequest {
-                title,
-                session_id: payload_optional_string(&command.payload, "session_id"),
-            })?;
+            let session = services
+                .mission_runtime()
+                .start_session(StartMissionSessionRequest {
+                    title,
+                    session_id: payload_optional_string(&command.payload, "session_id"),
+                })?;
             Ok((
                 MissionControlCommandStatus::Executed,
                 "mission session started".to_string(),
@@ -831,44 +831,46 @@ fn execute_command(
         (MissionControlCommandTarget::Mission, MissionControlAction::StartSteward) => {
             let mission_id = payload_string(&command.payload, "mission_id")?;
             let objective = payload_string(&command.payload, "objective")?;
-            let profile_id = payload_optional_string(&command.payload, "profile_id")
-                .and_then(|profile| serde_json::from_value(serde_json::Value::String(profile)).ok())
-                .unwrap_or(AutonomyProfileId::Stewarded);
-            let steward = global_steward_runtime_service().start(StartStewardRuntimeRequest {
-                mission_id,
-                root_session_id: payload_optional_string(&command.payload, "root_session_id"),
-                profile_id,
-                objective,
-            })?;
             Ok((
-                MissionControlCommandStatus::Executed,
-                "steward started".to_string(),
-                serde_json::json!({ "steward": steward }),
+                MissionControlCommandStatus::Failed,
+                "steward execution capability is unavailable until V8".to_string(),
+                serde_json::json!({
+                    "ok": false,
+                    "status": "capability_unavailable",
+                    "capability": "steward_execution",
+                    "available_in": "V8",
+                    "request": {
+                        "mission_id": mission_id,
+                        "root_session_id": payload_optional_string(&command.payload, "root_session_id"),
+                        "profile_id": payload_optional_string(&command.payload, "profile_id"),
+                        "objective": objective,
+                    },
+                }),
             ))
         }
         (
             MissionControlCommandTarget::Session { session_id },
             MissionControlAction::SwitchSession,
-        ) => command_receipt_result(global_mission_runtime().switch_session(session_id)),
+        ) => command_receipt_result(services.mission_runtime().switch_session(session_id)),
         (
             MissionControlCommandTarget::Session { session_id },
             MissionControlAction::BackgroundSession,
-        ) => command_receipt_result(global_mission_runtime().background_session(session_id)),
+        ) => command_receipt_result(services.mission_runtime().background_session(session_id)),
         (
             MissionControlCommandTarget::Session { session_id },
             MissionControlAction::PauseSession,
-        ) => command_receipt_result(global_mission_runtime().pause_session(session_id)),
+        ) => command_receipt_result(services.mission_runtime().pause_session(session_id)),
         (
             MissionControlCommandTarget::Session { session_id },
             MissionControlAction::CloseSession,
-        ) => command_receipt_result(global_mission_runtime().close_session(session_id)),
+        ) => command_receipt_result(services.mission_runtime().close_session(session_id)),
         (
             MissionControlCommandTarget::Session { session_id },
             MissionControlAction::RouteToSession,
         ) => {
             let target_session_id = payload_string(&command.payload, "target_session_id")?;
             let command_text = payload_string(&command.payload, "command")?;
-            let routed = global_mission_runtime().enqueue_session_command(
+            let routed = services.mission_runtime().enqueue_session_command(
                 session_id,
                 &target_session_id,
                 command_text,
@@ -883,19 +885,21 @@ fn execute_command(
             MissionControlCommandTarget::Session { session_id },
             MissionControlAction::StartSteward,
         ) => {
-            let mission_id = payload_optional_string(&command.payload, "mission_id")
-                .unwrap_or_else(|| "mission-control".to_string());
             let objective = payload_string(&command.payload, "objective")?;
-            let steward = global_steward_runtime_service().start(StartStewardRuntimeRequest {
-                mission_id,
-                root_session_id: Some(session_id.clone()),
-                profile_id: AutonomyProfileId::Stewarded,
-                objective,
-            })?;
             Ok((
-                MissionControlCommandStatus::Executed,
-                "steward started for session".to_string(),
-                serde_json::json!({ "steward": steward }),
+                MissionControlCommandStatus::Failed,
+                "steward execution capability is unavailable until V8".to_string(),
+                serde_json::json!({
+                    "ok": false,
+                    "status": "capability_unavailable",
+                    "capability": "steward_execution",
+                    "available_in": "V8",
+                    "request": {
+                        "mission_id": payload_optional_string(&command.payload, "mission_id"),
+                        "root_session_id": session_id,
+                        "objective": objective,
+                    },
+                }),
             ))
         }
         (
@@ -933,7 +937,7 @@ fn execute_command(
                 .or_else(|| command.actor.clone())
                 .unwrap_or_else(|| "mission_control".to_string());
             let reason = payload_optional_string(&command.payload, "reason").unwrap_or_default();
-            let receipt = global_approval_queue().decide(GlobalApprovalDecision {
+            let receipt = services.approval_queue().decide(GlobalApprovalDecision {
                 approval_id: approval_id.clone(),
                 approved,
                 decided_by,
@@ -948,7 +952,7 @@ fn execute_command(
         (
             MissionControlCommandTarget::Session { session_id },
             MissionControlAction::RouteToAgent,
-        ) => route_to_agent(session_id, command),
+        ) => route_to_agent(session_id, command, services),
         _ => Err(format!(
             "unsupported mission control command target/action: {:?} {:?}",
             command.target, command.action
@@ -975,148 +979,30 @@ fn command_receipt_result(
 fn route_to_agent(
     session_id: &str,
     command: &MissionControlCommand,
+    _services: &RuntimeServices,
 ) -> Result<(MissionControlCommandStatus, String, serde_json::Value), String> {
     let agent_id = payload_string(&command.payload, "agent_id")?;
     let command_text = payload_string(&command.payload, "command")?;
-    let require_approval = command
-        .payload
-        .get("require_approval")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let team_id = payload_optional_string(&command.payload, "team_id")
-        .unwrap_or_else(|| format!("session:{session_id}:direct-agent-routes"));
-    let role_id = payload_optional_string(&command.payload, "role_id")
-        .unwrap_or_else(|| "direct_route".to_string());
-    let objective = payload_optional_string(&command.payload, "objective")
-        .unwrap_or_else(|| command_text.clone());
-    let expected_output = payload_optional_string(&command.payload, "expected_output")
-        .unwrap_or_else(|| {
-            "Handle the routed Mission Control input and report progress".to_string()
-        });
-    let context_refs = payload_string_array(&command.payload, "context_refs")
-        .filter(|refs| !refs.is_empty())
-        .unwrap_or_else(|| vec![format!("session:{session_id}")]);
-
-    if require_approval {
-        let approval = global_approval_queue().submit(SubmitGlobalApprovalRequest {
-            source: ApprovalSource {
-                kind: ApprovalSourceKind::Session,
-                session_id: Some(session_id.to_string()),
-                agent_id: Some(agent_id),
-                team_id: Some(team_id),
-                mission_id: Some("mission-control".to_string()),
-            },
-            action: "route_to_agent".to_string(),
-            summary: command_text,
-            risk: TaskRisk::High,
-            evidence_refs: command.evidence_refs.clone(),
-            timeout_policy: ApprovalTimeoutPolicy::Pending,
-        })?;
-        return Ok((
-            MissionControlCommandStatus::ApprovalRequired,
-            "agent route requires approval by request policy".to_string(),
-            serde_json::json!({ "approval": approval }),
-        ));
-    }
-
     if global_agent_lifecycle_service().get(&agent_id).is_none() {
         return Err(format!("agent not found: {agent_id}"));
     }
-
-    let task = AgentTask {
-        task_id: format!("agent-task-{}", uuid::Uuid::new_v4()),
-        team_id: team_id.clone(),
-        session_id: session_id.to_string(),
-        role_id: role_id.clone(),
-        agent_id: Some(agent_id.clone()),
-        objective,
-        expected_output,
-        context_refs,
-        evidence_refs: command.evidence_refs.clone(),
-        status: AgentTaskStatus::Pending,
-        outcome: None,
-        created_at_ms: 0,
-        updated_at_ms: 0,
-    };
-    let task_receipt = global_agent_task_mailbox().assign(task.clone());
-    let progress = global_agent_event_bus().push(AgentProgressEvent {
-        event_id: String::new(),
-        team_id: team_id.clone(),
-        session_id: session_id.to_string(),
-        agent_id: Some(agent_id.clone()),
-        role_id: role_id.clone(),
-        task_id: Some(task_receipt.task_id.clone()),
-        event_type: "agent.task.routed".to_string(),
-        message: "Mission Control routed input to agent".to_string(),
-        evidence_refs: command.evidence_refs.clone(),
-        created_at_ms: 0,
-    });
-    let evidence = global_mission_evidence_bus().record(MissionEvidenceRef {
-        evidence_id: String::new(),
-        mission_id: Some("mission-control".to_string()),
-        session_id: session_id.to_string(),
-        team_id: Some(team_id.clone()),
-        agent_id: Some(agent_id.clone()),
-        kind: "agent_route".to_string(),
-        summary: format!("Mission Control routed command to agent {agent_id}"),
-        source_ref: Some(task_receipt.task_id.clone()),
-        created_at_ms: 0,
-    });
-
-    let mut evidence_refs = command.evidence_refs.clone();
-    evidence_refs.push(evidence.evidence_id.clone());
-    let payload = serde_json::json!({
-        "source": "mission_control",
-        "session_id": session_id,
-        "team_id": team_id,
-        "role_id": role_id,
-        "task_id": task_receipt.task_id,
-        "command": command_text,
-        "objective": task.objective,
-        "expected_output": task.expected_output,
-        "context_refs": task.context_refs,
-        "evidence_refs": evidence_refs,
-    });
-    let delivery = global_agent_lifecycle_service().command(
-        &agent_id,
-        AgentExecutionCommandKind::Input,
-        Some(payload),
-    );
-    let (status, message, delivery_json) = match delivery {
-        Ok(receipt) => {
-            let _ = global_agent_task_mailbox().set_status(
-                &task_receipt.task_id,
-                AgentTaskStatus::Running,
-                "mission-control route delivered to agent",
-            );
-            (
-                MissionControlCommandStatus::Executed,
-                "agent route delivered".to_string(),
-                serde_json::json!({ "receipt": receipt }),
-            )
-        }
-        Err(error) => (
-            MissionControlCommandStatus::Queued,
-            format!("agent route queued; delivery pending: {error}"),
-            serde_json::json!({ "error": error }),
-        ),
-    };
-
     Ok((
-        status,
-        message,
+        MissionControlCommandStatus::Failed,
+        "agent execution capability is unavailable until V4".to_string(),
         serde_json::json!({
+            "ok": false,
+            "status": "capability_unavailable",
+            "capability": "agent_execution",
+            "available_in": "V4",
             "agent_id": agent_id,
-            "task": task_receipt,
-            "progress": progress,
-            "evidence": evidence,
-            "delivery": delivery_json,
+            "session_id": session_id,
+            "command": command_text,
         }),
     ))
 }
 
-fn record_command_event(receipt: &MissionControlCommandReceipt) {
-    let _ = record_runtime_event(RuntimeEventInput {
+fn record_command_event(receipt: &MissionControlCommandReceipt, services: &RuntimeServices) {
+    let _ = services.event_store().append(RuntimeEventInput {
         stream_id: "mission-control:default".to_string(),
         scope: RuntimeEventScope::Mission,
         kind: "mission_control.command".to_string(),
@@ -1160,88 +1046,91 @@ fn payload_optional_string(payload: &serde_json::Value, key: &str) -> Option<Str
         .map(ToString::to_string)
 }
 
-fn payload_string_array(payload: &serde_json::Value, key: &str) -> Option<Vec<String>> {
-    payload.get(key).and_then(|value| {
-        value.as_array().map(|items| {
-            items
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .filter(|item| !item.trim().is_empty())
-                .map(ToString::to_string)
-                .collect()
-        })
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        global_conflict_arbiter, AgentExecutionBackendKind, AgentSnapshot, CancellationToken,
-        ConflictResolutionRequest, ConflictSeverity, ConflictSourceKind, DEFAULT_AGENT_MODEL,
+        global_agent_task_mailbox, AgentExecutionBackendKind, AgentSnapshot, ApprovalSource,
+        ApprovalSourceKind, ApprovalTimeoutPolicy, CancellationToken, ConflictResolutionRequest,
+        ConflictSeverity, ConflictSourceKind, SubmitGlobalApprovalRequest, DEFAULT_AGENT_MODEL,
     };
+    use harness_contract::core::TaskRisk;
 
     #[test]
     fn mission_control_projection_and_command_cover_runtime_state() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
         let suffix = uuid::Uuid::new_v4();
         let session_a = format!("mission-control-stage-i-a-{suffix}");
         let session_b = format!("mission-control-stage-i-b-{suffix}");
-        let first = MissionControlRuntime::execute(MissionControlCommand {
-            target: MissionControlCommandTarget::Mission,
-            action: MissionControlAction::StartSession,
-            actor: Some("test-human".to_string()),
-            payload: serde_json::json!({
-                "title": "mission control stage i",
-                "session_id": session_a,
-            }),
-            evidence_refs: vec!["plan:stage-i".to_string()],
-        });
+        let first = MissionControlRuntime::execute(
+            MissionControlCommand {
+                target: MissionControlCommandTarget::Mission,
+                action: MissionControlAction::StartSession,
+                actor: Some("test-human".to_string()),
+                payload: serde_json::json!({
+                    "title": "mission control stage i",
+                    "session_id": session_a,
+                }),
+                evidence_refs: vec!["plan:stage-i".to_string()],
+            },
+            &services,
+        );
         assert_eq!(first.status, MissionControlCommandStatus::Executed);
-        let second = MissionControlRuntime::execute(MissionControlCommand {
-            target: MissionControlCommandTarget::Mission,
-            action: MissionControlAction::StartSession,
-            actor: Some("test-human".to_string()),
-            payload: serde_json::json!({
-                "title": "mission control stage i b",
-                "session_id": session_b,
-            }),
-            evidence_refs: Vec::new(),
-        });
+        let second = MissionControlRuntime::execute(
+            MissionControlCommand {
+                target: MissionControlCommandTarget::Mission,
+                action: MissionControlAction::StartSession,
+                actor: Some("test-human".to_string()),
+                payload: serde_json::json!({
+                    "title": "mission control stage i b",
+                    "session_id": session_b,
+                }),
+                evidence_refs: Vec::new(),
+            },
+            &services,
+        );
         assert_eq!(second.status, MissionControlCommandStatus::Executed);
-        let routed = MissionControlRuntime::execute(MissionControlCommand {
-            target: MissionControlCommandTarget::Session {
-                session_id: session_a.clone(),
+        let routed = MissionControlRuntime::execute(
+            MissionControlCommand {
+                target: MissionControlCommandTarget::Session {
+                    session_id: session_a.clone(),
+                },
+                action: MissionControlAction::RouteToSession,
+                actor: Some("test-human".to_string()),
+                payload: serde_json::json!({
+                    "target_session_id": session_b.clone(),
+                    "command": "review routed command",
+                }),
+                evidence_refs: Vec::new(),
             },
-            action: MissionControlAction::RouteToSession,
-            actor: Some("test-human".to_string()),
-            payload: serde_json::json!({
-                "target_session_id": session_b.clone(),
-                "command": "review routed command",
-            }),
-            evidence_refs: Vec::new(),
-        });
+            &services,
+        );
         assert_eq!(routed.status, MissionControlCommandStatus::Queued);
-        let steward = MissionControlRuntime::execute(MissionControlCommand {
-            target: MissionControlCommandTarget::Session {
-                session_id: session_a.clone(),
+        let steward = MissionControlRuntime::execute(
+            MissionControlCommand {
+                target: MissionControlCommandTarget::Session {
+                    session_id: session_a.clone(),
+                },
+                action: MissionControlAction::StartSteward,
+                actor: Some("test-human".to_string()),
+                payload: serde_json::json!({
+                    "objective": "supervise stage i",
+                }),
+                evidence_refs: Vec::new(),
             },
-            action: MissionControlAction::StartSteward,
-            actor: Some("test-human".to_string()),
-            payload: serde_json::json!({
-                "objective": "supervise stage i",
-            }),
-            evidence_refs: Vec::new(),
-        });
-        assert_eq!(steward.status, MissionControlCommandStatus::Executed);
+            &services,
+        );
+        assert_eq!(steward.status, MissionControlCommandStatus::Failed);
+        assert_eq!(steward.result["status"], "capability_unavailable");
+        assert_eq!(steward.result["available_in"], "V4");
 
-        let projection = MissionControlRuntime::projection();
+        let projection = MissionControlRuntime::projection(&services);
         assert_eq!(projection.kind, "mission_control.projection");
         assert!(projection.summary.session_count >= 2);
         assert!(projection.summary.background_session_count >= 1);
         assert!(projection.sessions.iter().any(|session| {
             session.session.session_id == session_b && session.routed_command_count >= 1
         }));
-        assert!(projection.summary.steward_count >= 1);
         assert!(projection
             .sessions
             .iter()
@@ -1269,20 +1158,24 @@ mod tests {
     }
 
     #[test]
-    fn mission_control_route_to_agent_assigns_task_and_evidence() {
+    fn mission_control_route_to_agent_reports_capability_unavailable_without_side_effects() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
         let suffix = uuid::Uuid::new_v4();
         let session_id = format!("mission-control-route-session-{suffix}");
         let agent_id = format!("mission-control-route-agent-{suffix}");
-        let session = MissionControlRuntime::execute(MissionControlCommand {
-            target: MissionControlCommandTarget::Mission,
-            action: MissionControlAction::StartSession,
-            actor: Some("test-human".to_string()),
-            payload: serde_json::json!({
-                "title": "route to agent",
-                "session_id": session_id,
-            }),
-            evidence_refs: Vec::new(),
-        });
+        let session = MissionControlRuntime::execute(
+            MissionControlCommand {
+                target: MissionControlCommandTarget::Mission,
+                action: MissionControlAction::StartSession,
+                actor: Some("test-human".to_string()),
+                payload: serde_json::json!({
+                    "title": "route to agent",
+                    "session_id": session_id,
+                }),
+                evidence_refs: Vec::new(),
+            },
+            &services,
+        );
         assert_eq!(session.status, MissionControlCommandStatus::Executed);
         global_agent_lifecycle_service().register_started(
             AgentSnapshot {
@@ -1306,55 +1199,57 @@ mod tests {
             CancellationToken::new(),
         );
 
-        let routed = MissionControlRuntime::execute(MissionControlCommand {
-            target: MissionControlCommandTarget::Session {
-                session_id: session_id.clone(),
+        let routed = MissionControlRuntime::execute(
+            MissionControlCommand {
+                target: MissionControlCommandTarget::Session {
+                    session_id: session_id.clone(),
+                },
+                action: MissionControlAction::RouteToAgent,
+                actor: Some("test-human".to_string()),
+                payload: serde_json::json!({
+                    "agent_id": agent_id,
+                    "command": "inspect routed work",
+                    "team_id": "route-team",
+                    "role_id": "reviewer",
+                }),
+                evidence_refs: vec!["manual:evidence".to_string()],
             },
-            action: MissionControlAction::RouteToAgent,
-            actor: Some("test-human".to_string()),
-            payload: serde_json::json!({
-                "agent_id": agent_id,
-                "command": "inspect routed work",
-                "team_id": "route-team",
-                "role_id": "reviewer",
-            }),
-            evidence_refs: vec!["manual:evidence".to_string()],
-        });
+            &services,
+        );
 
-        assert_eq!(routed.status, MissionControlCommandStatus::Queued);
-        assert!(routed.message.contains("queued"));
-        assert!(routed.result["task"]["task_id"].as_str().is_some());
-        assert_eq!(
-            routed.result["progress"]["event_type"].as_str(),
-            Some("agent.task.routed")
-        );
-        assert_eq!(
-            routed.result["evidence"]["kind"].as_str(),
-            Some("agent_route")
-        );
-        assert!(!global_agent_task_mailbox()
+        assert_eq!(routed.status, MissionControlCommandStatus::Failed);
+        assert_eq!(routed.result["status"], "capability_unavailable");
+        assert_eq!(routed.result["capability"], "agent_execution");
+        assert_eq!(routed.result["available_in"], "V5");
+        assert!(global_agent_task_mailbox()
             .list_for_team("route-team")
             .is_empty());
-        assert!(!global_mission_evidence_bus()
+        assert!(services
+            .mission_evidence()
             .list_for_team("route-team")
             .is_empty());
     }
 
     #[test]
     fn mission_control_readiness_surfaces_conflict_and_approval_actions() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
         let suffix = uuid::Uuid::new_v4();
         let session_id = format!("mission-control-readiness-{suffix}");
-        MissionControlRuntime::execute(MissionControlCommand {
-            target: MissionControlCommandTarget::Mission,
-            action: MissionControlAction::StartSession,
-            actor: Some("test-human".to_string()),
-            payload: serde_json::json!({
-                "title": "readiness",
-                "session_id": session_id,
-            }),
-            evidence_refs: Vec::new(),
-        });
-        let approval = global_approval_queue()
+        MissionControlRuntime::execute(
+            MissionControlCommand {
+                target: MissionControlCommandTarget::Mission,
+                action: MissionControlAction::StartSession,
+                actor: Some("test-human".to_string()),
+                payload: serde_json::json!({
+                    "title": "readiness",
+                    "session_id": session_id,
+                }),
+                evidence_refs: Vec::new(),
+            },
+            &services,
+        );
+        let approval = services
+            .approval_queue()
             .submit(SubmitGlobalApprovalRequest {
                 source: ApprovalSource {
                     kind: ApprovalSourceKind::Session,
@@ -1370,15 +1265,17 @@ mod tests {
                 timeout_policy: ApprovalTimeoutPolicy::Pending,
             })
             .expect("approval");
-        let conflict = global_conflict_arbiter().resolve(ConflictResolutionRequest {
-            source: ConflictSourceKind::SessionRelation,
-            severity: ConflictSeverity::Critical,
-            summary: "critical readiness conflict".to_string(),
-            evidence_refs: vec![approval.approval_id.clone()],
-            affected_scope: vec![format!("session:{session_id}")],
-        });
+        let conflict = services
+            .conflict_resolver()
+            .resolve(ConflictResolutionRequest {
+                source: ConflictSourceKind::SessionRelation,
+                severity: ConflictSeverity::Critical,
+                summary: "critical readiness conflict".to_string(),
+                evidence_refs: vec![approval.approval_id.clone()],
+                affected_scope: vec![format!("session:{session_id}")],
+            });
 
-        let projection = MissionControlRuntime::projection();
+        let projection = MissionControlRuntime::projection(&services);
         assert!(projection
             .control_readiness
             .actions

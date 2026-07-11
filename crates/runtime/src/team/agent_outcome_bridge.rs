@@ -4,9 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     global_agent_event_bus, global_agent_task_binding_registry, global_agent_task_mailbox,
-    global_mission_evidence_bus, global_team_runtime_service, AgentProgressEvent, AgentSnapshot,
-    AgentTaskCompletionReceipt, AgentTaskOutcome, AgentTaskQualityStatus, AgentTaskStatus,
-    MissionEvidenceRef,
+    global_team_runtime_service, AgentProgressEvent, AgentSnapshot, AgentTaskCompletionReceipt,
+    AgentTaskOutcome, AgentTaskQualityStatus, AgentTaskStatus,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,7 +73,7 @@ pub fn bridge_agent_terminal_snapshot(
         AgentTaskStatus::Completed => {
             let outcome = AgentTaskOutcome {
                 result_summary: terminal_result_summary(snapshot, &message),
-                evidence_refs: terminal_evidence_refs(snapshot, &binding.workgraph_node_id),
+                evidence_refs: terminal_evidence_refs(snapshot, &binding.execution_graph_node_id),
                 conflicts: Vec::new(),
                 suggested_next_actions: vec!["synthesize".to_string()],
                 quality_status: AgentTaskQualityStatus::Accepted,
@@ -88,7 +87,7 @@ pub fn bridge_agent_terminal_snapshot(
             .fail(
                 &binding.task_id,
                 terminal_result_summary(snapshot, &message),
-                terminal_evidence_refs(snapshot, &binding.workgraph_node_id),
+                terminal_evidence_refs(snapshot, &binding.execution_graph_node_id),
                 snapshot.error.clone().into_iter().collect(),
             )
             .ok()?,
@@ -156,10 +155,10 @@ fn terminal_result_summary(snapshot: &AgentSnapshot, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_string())
 }
 
-fn terminal_evidence_refs(snapshot: &AgentSnapshot, workgraph_node_id: &str) -> Vec<String> {
+fn terminal_evidence_refs(snapshot: &AgentSnapshot, execution_graph_node_id: &str) -> Vec<String> {
     let mut refs = vec![
         format!("agent:{}", snapshot.agent_id),
-        format!("workgraph_node:{workgraph_node_id}"),
+        format!("execution_graph_node:{execution_graph_node_id}"),
     ];
     if !snapshot.output_file.trim().is_empty() {
         refs.push(format!("agent_output:{}", snapshot.output_file));
@@ -190,17 +189,7 @@ fn record_bridge_progress(snapshot: &AgentSnapshot, receipt: &AgentTaskCompletio
         evidence_refs: receipt.evidence_refs.clone(),
         created_at_ms: 0,
     });
-    let _ = global_mission_evidence_bus().record(MissionEvidenceRef {
-        evidence_id: String::new(),
-        mission_id: Some("mission-control".to_string()),
-        session_id: receipt.session_id.clone(),
-        team_id: Some(receipt.team_id.clone()),
-        agent_id: Some(snapshot.agent_id.clone()),
-        kind: "agent_task_outcome".to_string(),
-        summary: progress.message,
-        source_ref: Some(receipt.task_id.clone()),
-        created_at_ms: 0,
-    });
+    let _ = progress;
 }
 
 fn task_status_label(status: AgentTaskStatus) -> &'static str {

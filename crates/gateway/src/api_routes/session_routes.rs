@@ -13,7 +13,7 @@ use axum::{
 use memory::store::session::{SessionEvent, SessionListOptions, SessionRecord};
 use serde::{Deserialize, Serialize};
 
-use super::{abort_active_turn, new_api_session_record, AppState, ErrorResponse};
+use super::{new_api_session_record, AppState, ErrorResponse};
 use crate::services::{
     SessionMessageCounts, SessionStatsSnapshot, SessionTokenCounts, SessionUpdateRequest,
 };
@@ -142,6 +142,24 @@ fn session_tool_host(
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorResponse {
                     error: "runtime tool host unavailable".to_string(),
+                }),
+            )
+        })
+}
+
+fn session_runtime_services(
+    state: &AppState,
+) -> Result<Arc<runtime::RuntimeServices>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .runtime
+        .as_ref()
+        .map(|service| service.runtime_services())
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "runtime services unavailable".to_string(),
                 }),
             )
         })
@@ -420,6 +438,7 @@ async fn create_session(
     let runtime = if let Some(store) = state.services.session.unified_store() {
         crate::runtime_factory::create_runtime_entry_with_session_store(
             store.clone(),
+            session_runtime_services(&state)?,
             Arc::clone(&provider_registry),
             Arc::clone(&tool_host),
             session,
@@ -435,6 +454,7 @@ async fn create_session(
         )
     } else {
         crate::runtime_factory::create_runtime_entry(
+            session_runtime_services(&state)?,
             Arc::clone(&provider_registry),
             Arc::clone(&tool_host),
             session,
@@ -559,6 +579,7 @@ async fn branch_session_handler(
     let runtime = if let Some(store) = state.services.session.unified_store() {
         crate::runtime_factory::create_runtime_entry_with_session_store(
             store.clone(),
+            session_runtime_services(&state)?,
             Arc::clone(&provider_registry),
             Arc::clone(&tool_host),
             session,
@@ -574,6 +595,7 @@ async fn branch_session_handler(
         )
     } else {
         crate::runtime_factory::create_runtime_entry(
+            session_runtime_services(&state)?,
             Arc::clone(&provider_registry),
             Arc::clone(&tool_host),
             session,
@@ -733,6 +755,7 @@ async fn ensure_session_handler(
         let runtime = if let Some(store) = state.services.session.unified_store() {
             crate::runtime_factory::create_runtime_entry_with_session_store(
                 store.clone(),
+                session_runtime_services(&state)?,
                 Arc::clone(&provider_registry),
                 Arc::clone(&tool_host),
                 session,
@@ -748,6 +771,7 @@ async fn ensure_session_handler(
             )
         } else {
             crate::runtime_factory::create_runtime_entry(
+                session_runtime_services(&state)?,
                 Arc::clone(&provider_registry),
                 Arc::clone(&tool_host),
                 session,
@@ -907,7 +931,7 @@ async fn cancel_session_turn_handler(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("user_requested");
-    let aborted_run_id = abort_active_turn(&id);
+    let aborted_run_id: Option<String> = None;
     let event = serde_json::json!({
         "type": "TurnCancelRequested",
         "session_id": id,
@@ -918,19 +942,6 @@ async fn cancel_session_turn_handler(
         "run_id": aborted_run_id,
     });
     state.event_bus().broadcast(&id, &event.to_string()).await;
-    state
-        .services
-        .session
-        .append_timeline_event(&id, "TurnCancelRequested", event.clone())
-        .await
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("failed to persist cancel request: {error}"),
-                }),
-            )
-        })?;
 
     Ok(Json(serde_json::json!({
         "ok": true,
@@ -1608,8 +1619,14 @@ fn session_run_projection_from_events(
         .filter(|event| {
             payload_type_contains(
                 event.get("payload").unwrap_or(&serde_json::Value::Null),
-                &["agent", "team", "mission", "workgraph", "collaboration"],
-            ) || payload_type_contains(event, &["agent", "team", "mission", "workgraph"])
+                &[
+                    "agent",
+                    "team",
+                    "mission",
+                    "execution_graph",
+                    "collaboration",
+                ],
+            ) || payload_type_contains(event, &["agent", "team", "mission", "execution_graph"])
         })
         .take(50)
         .cloned()

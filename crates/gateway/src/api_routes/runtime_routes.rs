@@ -13,13 +13,136 @@ use serde_json::Value;
 mod control;
 use super::{connector_routes, AppState, ErrorResponse};
 pub(super) use control::{
-    agent_value_summary, degraded_agent_value_summary, degraded_health_summary,
-    degraded_value_loop_summary, empty_workgraph_summary, get_runtime_control_plane,
-    health_summary, session_lease_projection, value_loop_summary, workgraph_summary,
+    agent_value_summary, execution_graph_summary, get_runtime_control_plane, health_summary,
+    session_lease_projection, value_loop_summary,
 };
 use memory::store::session::SessionListOptions;
-use memory::RuntimeEvent;
 use runtime::{AgentControlPolicy, RuntimeConfig};
+
+#[derive(Clone, serde::Serialize)]
+struct RuntimeTimelineRef {
+    #[serde(rename = "type")]
+    ref_type: String,
+    id: String,
+    label: Option<String>,
+}
+
+#[derive(Clone, serde::Serialize)]
+pub(in crate::api_routes) struct RuntimeEvent {
+    sequence: u64,
+    scope: String,
+    kind: String,
+    status: Option<String>,
+    refs: Vec<RuntimeTimelineRef>,
+    payload: Value,
+    created_at_ms: u64,
+    source: &'static str,
+}
+
+impl From<memory::SessionDomainEvent> for RuntimeEvent {
+    fn from(event: memory::SessionDomainEvent) -> Self {
+        let payload_refs = runtime_timeline_refs_from_payload(&event.payload);
+        let refs = if event.refs.is_empty() {
+            payload_refs
+        } else {
+            event
+                .refs
+                .into_iter()
+                .map(|reference| RuntimeTimelineRef {
+                    ref_type: reference.ref_type,
+                    id: reference.id,
+                    label: reference.label,
+                })
+                .collect()
+        };
+        let status = event.status.or_else(|| {
+            event
+                .payload
+                .get("status")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        });
+        let kind = if matches!(
+            event.kind.as_str(),
+            "matrix.execution_outcome" | "mfg.execution_outcome"
+        ) {
+            "execution.outcome".to_string()
+        } else {
+            event.kind
+        };
+        Self {
+            sequence: event.sequence as u64,
+            scope: session_domain_scope_label(event.scope).to_string(),
+            kind,
+            status,
+            refs,
+            payload: event.payload,
+            created_at_ms: event.created_at_ms,
+            source: "session_domain",
+        }
+    }
+}
+
+fn session_domain_scope_label(scope: memory::SessionDomainScope) -> &'static str {
+    match scope {
+        memory::SessionDomainScope::Session => "session",
+        memory::SessionDomainScope::Message => "message",
+        memory::SessionDomainScope::Turn => "turn",
+        memory::SessionDomainScope::Context => "context",
+        memory::SessionDomainScope::Tool => "tool",
+        memory::SessionDomainScope::Memory => "memory",
+        memory::SessionDomainScope::Policy => "policy",
+        memory::SessionDomainScope::ApplicationTask => "task",
+        memory::SessionDomainScope::Mfg => "mfg",
+    }
+}
+
+fn runtime_timeline_refs_from_payload(payload: &Value) -> Vec<RuntimeTimelineRef> {
+    payload
+        .get("refs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|reference| {
+            let ref_type = reference
+                .get("type")
+                .or_else(|| reference.get("ref_type"))?
+                .as_str()?;
+            let id = reference.get("id")?.as_str()?;
+            Some(RuntimeTimelineRef {
+                ref_type: ref_type.to_string(),
+                id: id.to_string(),
+                label: reference
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+            })
+        })
+        .collect()
+}
+
+impl From<runtime::DurableRuntimeEvent> for RuntimeEvent {
+    fn from(event: runtime::DurableRuntimeEvent) -> Self {
+        Self {
+            sequence: event.sequence,
+            scope: event.scope.as_str().to_string(),
+            kind: event.kind,
+            status: event.status,
+            refs: event
+                .refs
+                .into_iter()
+                .map(|reference| RuntimeTimelineRef {
+                    ref_type: reference.kind,
+                    id: reference.id,
+                    label: None,
+                })
+                .collect(),
+            payload: event.payload,
+            created_at_ms: event.created_at_ms,
+            source: "runtime_lifecycle",
+        }
+    }
+}
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -48,6 +171,11 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             get(get_runtime_config_reload_status),
         )
         .route("/api/runtime/status", get(get_runtime_status))
+        .route("/api/runtime/outbox", get(get_runtime_outbox_status))
+        .route(
+            "/api/runtime/outbox/:direction/:id/retry",
+            post(retry_runtime_outbox),
+        )
         .route("/api/runtime/events", get(get_runtime_events))
         .route(
             "/api/runtime/events/replay-report",
@@ -80,6 +208,143 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/runtime/session-leases/release",
             post(release_runtime_session_lease),
         )
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeOutboxQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeOutboxRetryRequest {
+    actor: String,
+    reason: String,
+    expected_revision: Option<u64>,
+}
+
+async fn get_runtime_outbox_status(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Query(params): Query<RuntimeOutboxQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    let limit = params.limit.unwrap_or(100).clamp(1, 500);
+    let session_store = state.services.session.unified_store().ok_or_else(|| {
+        runtime_event_error(StatusCode::SERVICE_UNAVAILABLE, "session store unavailable")
+    })?;
+    let ingress_health = session_store
+        .session_runtime_outbox_health()
+        .await
+        .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let ingress_poison = session_store
+        .blocked_session_runtime_outbox(limit)
+        .await
+        .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let runtime = state.services.runtime.as_ref().ok_or_else(|| {
+        runtime_event_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime service unavailable",
+        )
+    })?;
+    let event_store = Arc::clone(runtime.runtime_services().event_store());
+    let (terminal_health, terminal_poison) = tokio::task::spawn_blocking(move || {
+        Ok::<_, runtime::RuntimeEventStoreError>((
+            event_store.session_terminal_health()?,
+            event_store.blocked_session_terminals(limit)?,
+        ))
+    })
+    .await
+    .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
+    .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(serde_json::json!({
+        "kind": "runtime.outbox.status",
+        "healthy": ingress_health.blocked == 0 && terminal_health.blocked == 0,
+        "ingress": { "health": ingress_health, "poison": ingress_poison },
+        "terminal": { "health": terminal_health, "poison": terminal_poison },
+    })))
+}
+
+async fn retry_runtime_outbox(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path((direction, id)): Path<(String, String)>,
+    Json(request): Json<RuntimeOutboxRetryRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    if request.actor.trim().is_empty() || request.reason.trim().is_empty() {
+        return Err(runtime_event_error(
+            StatusCode::BAD_REQUEST,
+            "actor and reason are required",
+        ));
+    }
+    let record = match direction.as_str() {
+        "ingress" => {
+            let store = state.services.session.unified_store().ok_or_else(|| {
+                runtime_event_error(StatusCode::SERVICE_UNAVAILABLE, "session store unavailable")
+            })?;
+            let current = store
+                .get_session_runtime_outbox(&id)
+                .await
+                .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
+                .ok_or_else(|| {
+                    runtime_event_error(StatusCode::NOT_FOUND, "outbox item not found")
+                })?;
+            let expected_revision = request.expected_revision.unwrap_or(current.revision);
+            serde_json::to_value(
+                store
+                    .retry_blocked_session_runtime_outbox(
+                        &id,
+                        expected_revision,
+                        request.actor.trim(),
+                        request.reason.trim(),
+                        now_ms(),
+                    )
+                    .await
+                    .map_err(|error| runtime_event_error(StatusCode::CONFLICT, error))?,
+            )
+        }
+        "terminal" => {
+            let runtime = state.services.runtime.as_ref().ok_or_else(|| {
+                runtime_event_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "runtime service unavailable",
+                )
+            })?;
+            let event_store = Arc::clone(runtime.runtime_services().event_store());
+            let actor = request.actor;
+            let reason = request.reason;
+            let terminal_id = id.clone();
+            serde_json::to_value(
+                tokio::task::spawn_blocking(move || {
+                    event_store.retry_session_terminal(
+                        &terminal_id,
+                        actor.trim(),
+                        reason.trim(),
+                        now_ms(),
+                    )
+                })
+                .await
+                .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
+                .map_err(|error| runtime_event_error(StatusCode::CONFLICT, error))?,
+            )
+        }
+        _ => {
+            return Err(runtime_event_error(
+                StatusCode::BAD_REQUEST,
+                "direction must be ingress or terminal",
+            ));
+        }
+    }
+    .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(serde_json::json!({
+        "kind": "runtime.outbox.manual_retry",
+        "direction": direction,
+        "id": id,
+        "record": record,
+    })))
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 async fn get_runtime_source_audit(AxumState(state): AxumState<Arc<AppState>>) -> Json<Value> {
@@ -238,10 +503,15 @@ async fn record_upgrade_disposition(
             "agent" => runtime::global_agent_lifecycle_service()
                 .cancel(&request.carrier_id)
                 .map(|_| ()),
-            "team" => runtime::global_team_runtime_service()
-                .cancel(&request.carrier_id)
+            "team" => state
+                .services
+                .mission
+                .cancel_team_runtime(&request.carrier_id)
+                .await
                 .map(|_| ()),
-            "mission_session" => runtime::global_mission_runtime()
+            "mission_session" => runtime_service
+                .runtime_services()
+                .mission_runtime()
                 .close_session(&request.carrier_id)
                 .map(|_| ()),
             "cross_plane_execution" => Err(
@@ -300,17 +570,13 @@ async fn export_upgrade_manifest(
     })?;
     let coordinator = runtime_service.upgrade_coordinator();
     register_gateway_upgrade_collectors(&state, runtime_service);
-    let workspace_id = format!(
-        "{:016x}",
-        model_protocol::prompt_cache::stable_hash_bytes(
-            state.workspace_root.to_string_lossy().as_bytes()
-        )
-    );
+    let runtime_services = runtime_service.runtime_services();
+    let workspace_id = runtime_services.workspace_key().to_string();
     let inventory = coordinator
         .collect_inventory(
             env!("CARGO_PKG_VERSION"),
             workspace_id,
-            state.workspace_root.clone(),
+            runtime_services.workspace_root().to_path_buf(),
         )
         .map_err(|error| runtime_event_error(StatusCode::CONFLICT, error))?;
     let path = state
@@ -319,6 +585,16 @@ async fn export_upgrade_manifest(
         .join("v3-active-inventory.json");
     let receipt = coordinator
         .export_clean_shutdown_manifest(&inventory, &path)
+        .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let receipt_path = state
+        .config_home
+        .join("migrations")
+        .join("v3-clean-shutdown-receipt.json");
+    let receipt_bytes = serde_json::to_vec_pretty(&receipt)
+        .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let temporary = receipt_path.with_extension("json.tmp");
+    std::fs::write(&temporary, receipt_bytes)
+        .and_then(|_| std::fs::rename(&temporary, &receipt_path))
         .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(Json(serde_json::json!({
         "ok": true,
@@ -481,17 +757,20 @@ struct RuntimeReplayParams {
 }
 
 async fn get_runtime_events(
+    AxumState(state): AxumState<Arc<AppState>>,
     Query(params): Query<RuntimeEventsParams>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
     let limit = params.limit.unwrap_or(100).min(500);
-    let store = runtime::global_runtime_event_store();
+    let store = state.services.runtime_events.store();
     let events = if let Some(stream_id) = params.stream_id {
         store
             .list_stream(&stream_id)
             .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
     } else if let Some(scope) = params.scope {
+        let scope = parse_runtime_event_scope(&scope)
+            .map_err(|error| runtime_event_error(StatusCode::BAD_REQUEST, error))?;
         store
-            .list_scope(parse_runtime_event_scope(&scope), limit)
+            .list_scope(scope, limit)
             .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
     } else {
         store
@@ -507,16 +786,28 @@ async fn get_runtime_events(
 }
 
 async fn get_runtime_events_replay_report(
+    AxumState(state): AxumState<Arc<AppState>>,
     Query(params): Query<RuntimeReplayParams>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
-    runtime_replay_report(params.limit.unwrap_or(500).min(2_000)).map(Json)
+    runtime_replay_report(&state, params.limit.unwrap_or(500).min(2_000)).map(Json)
 }
 
 async fn recover_runtime_events(
+    AxumState(state): AxumState<Arc<AppState>>,
     Query(params): Query<RuntimeReplayParams>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
-    let report = runtime::RecoveryExecutor::execute(params.limit.unwrap_or(500).min(2_000))
-        .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let services = state.services.runtime.as_ref().ok_or_else(|| {
+        runtime_event_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime service unavailable",
+        )
+    })?;
+    let runtime_services = services.runtime_services();
+    let report = runtime::RecoveryExecutor::execute(
+        params.limit.unwrap_or(500).min(2_000),
+        runtime_services.as_ref(),
+    )
+    .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(Json(serde_json::json!({
         "kind": "runtime.recovery_result",
         "ok": report.ok,
@@ -527,17 +818,19 @@ async fn recover_runtime_events(
     })))
 }
 
-fn runtime_replay_report(limit: usize) -> Result<Value, (StatusCode, Json<ErrorResponse>)> {
-    let store = runtime::global_runtime_event_store();
-    let plan = runtime::RecoveryPlanner::plan(limit)
+fn runtime_replay_report(
+    state: &AppState,
+    limit: usize,
+) -> Result<Value, (StatusCode, Json<ErrorResponse>)> {
+    let store = state.services.runtime_events.store();
+    let report = runtime::RuntimeEventReplayer::report(store, limit)
         .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(serde_json::json!({
         "kind": "runtime.events.replay_report",
         "store_path": store.path(),
-        "report": plan.report,
-        "actions": plan.actions,
-        "candidates": plan.candidates,
-        "plan": plan,
+        "actions": &report.actions,
+        "candidates": &report.candidates,
+        "report": report,
     }))
 }
 
@@ -553,22 +846,8 @@ fn runtime_event_error(
     )
 }
 
-fn parse_runtime_event_scope(scope: &str) -> runtime::RuntimeEventScope {
-    match scope {
-        "session" => runtime::RuntimeEventScope::Session,
-        "session_command" => runtime::RuntimeEventScope::SessionCommand,
-        "team" => runtime::RuntimeEventScope::Team,
-        "agent" => runtime::RuntimeEventScope::Agent,
-        "approval" => runtime::RuntimeEventScope::Approval,
-        "relation" => runtime::RuntimeEventScope::Relation,
-        "steward" => runtime::RuntimeEventScope::Steward,
-        "task" => runtime::RuntimeEventScope::Task,
-        "worker" => runtime::RuntimeEventScope::Worker,
-        "schedule" => runtime::RuntimeEventScope::Schedule,
-        "tool" => runtime::RuntimeEventScope::Tool,
-        "recovery" => runtime::RuntimeEventScope::Recovery,
-        _ => runtime::RuntimeEventScope::Mission,
-    }
+fn parse_runtime_event_scope(scope: &str) -> Result<runtime::RuntimeEventScope, String> {
+    runtime::RuntimeEventScope::parse(scope).map_err(|error| error.to_string())
 }
 
 async fn submit_runtime_turn(
@@ -667,40 +946,54 @@ pub(super) async fn get_runtime_timeline(
             )
         })?;
 
-    let Some(page) = page else {
-        return Ok(Json(serde_json::json!({
-            "session_id": params.session_id,
-            "events": [],
-            "total": 0,
-            "from_seq": from_seq,
-            "next_seq": null,
-            "limit": limit,
-            "has_more": false,
-            "degraded": true,
-            "degraded_reason": "session store not available",
-            "workgraph_summary": empty_workgraph_summary(),
-            "health_summary": degraded_health_summary("session store not available"),
-            "value_loop": degraded_value_loop_summary("session store not available"),
-            "agent_value": degraded_agent_value_summary(&agent_policy, "session store not available"),
-        })));
-    };
+    let session_store_available = page.is_some();
+    let (domain_total, domain_next_seq, domain_has_more, mut events) = page
+        .map(|page| {
+            (
+                page.total,
+                page.next_seq,
+                page.has_more,
+                page.events
+                    .into_iter()
+                    .map(RuntimeEvent::from)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .unwrap_or((0, None, false, Vec::new()));
+    let lifecycle_events = state
+        .services
+        .runtime_events
+        .store()
+        .list_stream(&params.session_id)
+        .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .into_iter()
+        .filter(|event| event.sequence >= from_seq as u64)
+        .collect::<Vec<_>>();
+    let lifecycle_total = lifecycle_events.len();
+    events.extend(lifecycle_events.into_iter().map(RuntimeEvent::from));
+    events.sort_by_key(|event| (event.created_at_ms, event.sequence));
+    let combined_total = domain_total + lifecycle_total;
+    let combined_has_more = domain_has_more || events.len() > limit;
+    events.truncate(limit);
 
-    let workgraph_summary = workgraph_summary(&page.events);
-    let health_summary = health_summary(&page.events, false, None);
-    let value_loop = value_loop_summary(&page.events, false, None);
-    let agent_value = agent_value_summary(&page.events, &agent_policy, false, None);
+    let execution_graph_summary = execution_graph_summary(&events);
+    let degraded_reason = (!session_store_available).then_some("session store not available");
+    let degraded = degraded_reason.is_some();
+    let health_summary = health_summary(&events, degraded, degraded_reason);
+    let value_loop = value_loop_summary(&events, degraded, degraded_reason);
+    let agent_value = agent_value_summary(&events, &agent_policy, degraded, degraded_reason);
 
     Ok(Json(serde_json::json!({
         "session_id": params.session_id,
-        "events": page.events,
-        "total": page.total,
+        "events": events,
+        "total": combined_total,
         "from_seq": from_seq,
-        "next_seq": page.next_seq,
+        "next_seq": domain_next_seq,
         "limit": limit,
-        "has_more": page.has_more,
-        "degraded": false,
-        "degraded_reason": null,
-        "workgraph_summary": workgraph_summary,
+        "has_more": combined_has_more,
+        "degraded": !session_store_available,
+        "degraded_reason": degraded_reason,
+        "execution_graph_summary": execution_graph_summary,
         "health_summary": health_summary,
         "value_loop": value_loop,
         "agent_value": agent_value,

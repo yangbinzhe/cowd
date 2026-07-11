@@ -25,8 +25,8 @@ struct HarnessObservation {
     strategy_pattern: ExecutionPattern,
     finalization_blocked: bool,
     regression_allowed: bool,
-    has_workgraph: bool,
-    workgraph_quality_ok: bool,
+    has_execution_graph: bool,
+    execution_graph_quality_ok: bool,
     growth_has_blocker: bool,
     growth_signal_kinds: Vec<String>,
     memory_candidate_count: usize,
@@ -40,18 +40,18 @@ impl HarnessObservation {
         trace: &RuntimeAiKernelTrace,
         assistant_text: impl Into<String>,
     ) -> Self {
-        let workgraph_quality_ok = trace
-            .workgraph_quality
+        let execution_graph_quality_ok = trace
+            .execution_graph_quality
             .as_ref()
-            .map(|quality| quality.is_dag && quality.has_review_node && quality.has_synthesis_node)
+            .map(|quality| quality.is_dag && quality.has_verify_node && quality.has_synthesize_node)
             .unwrap_or(false);
         Self {
             scenario_id: scenario_id.into(),
             strategy_pattern: trace.execution_decision.strategy.pattern,
             finalization_blocked: trace.finalization_blocked,
             regression_allowed: trace.regression_gate.allowed,
-            has_workgraph: trace.workgraph.is_some(),
-            workgraph_quality_ok,
+            has_execution_graph: trace.execution_graph.is_some(),
+            execution_graph_quality_ok,
             growth_has_blocker: trace.learning_record.has_blocker(),
             growth_signal_kinds: trace
                 .learning_record
@@ -88,8 +88,8 @@ impl HarnessObservation {
             strategy_pattern: self.strategy_pattern,
             finalization_blocked: self.finalization_blocked,
             regression_allowed: self.regression_allowed,
-            has_workgraph: self.has_workgraph,
-            workgraph_quality_ok: self.workgraph_quality_ok,
+            has_execution_graph: self.has_execution_graph,
+            execution_graph_quality_ok: self.execution_graph_quality_ok,
             growth_has_blocker: self.growth_has_blocker,
             growth_signal_kinds: self.growth_signal_kinds,
             memory_candidate_count: self.memory_candidate_count,
@@ -111,11 +111,11 @@ fn simple_question_stays_direct_and_clean() {
             "simple successful answers must finalize without the gate",
         ))
         .require(ScenarioCheck::bool(
-            "workgraph.present",
-            ScenarioCheckKind::WorkgraphPresent,
+            "execution_graph.present",
+            ScenarioCheckKind::ExecutionGraphPresent,
             false,
             "ai-strategy/runtime-harness-contract",
-            "simple direct answers should not allocate workgraph",
+            "simple direct answers should not allocate execution_graph",
         ))
         .require(ScenarioCheck::bool(
             "growth.blocker",
@@ -148,25 +148,25 @@ fn simple_question_stays_direct_and_clean() {
 }
 
 #[test]
-fn complex_task_builds_execution_workgraph() {
+fn complex_task_builds_execution_execution_graph() {
     let spec = ScenarioSpec::new(
-        "complex_workgraph",
+        "complex_execution_graph",
         "全面规划 runtime gateway service crate 的复杂架构演进",
     )
     .expect_mode(ExecutionPattern::Execute)
     .require(ScenarioCheck::bool(
-        "workgraph.present",
-        ScenarioCheckKind::WorkgraphPresent,
+        "execution_graph.present",
+        ScenarioCheckKind::ExecutionGraphPresent,
         true,
         "ai-strategy/runtime-harness-contract",
-        "complex tasks must allocate a workgraph",
+        "complex tasks must allocate a execution_graph",
     ))
     .require(ScenarioCheck::bool(
-        "workgraph.quality",
-        ScenarioCheckKind::WorkgraphQualityOk,
+        "execution_graph.quality",
+        ScenarioCheckKind::ExecutionGraphQualityOk,
         true,
-        "ai-workgraph",
-        "complex workgraph must be DAG with review and synthesis nodes",
+        "ai-execution_graph",
+        "complex execution_graph must be DAG with review and synthesis nodes",
     ))
     .require(ScenarioCheck::bool(
         "regression.allowed",
@@ -183,7 +183,7 @@ fn complex_task_builds_execution_workgraph() {
     );
 
     let trace = kernel.finalize("planned", 0, 0);
-    let observation = HarnessObservation::from_trace("complex_workgraph", &trace, "planned")
+    let observation = HarnessObservation::from_trace("complex_execution_graph", &trace, "planned")
         .into_scenario_observation();
     let report = ScenarioSuite::new(vec![spec]).evaluate(&[observation]);
 
@@ -238,10 +238,15 @@ async fn empty_answer_is_blocked_by_finalization_gate() {
     .without_memory();
     runtime.set_active_model("test-model");
 
-    let summary = runtime
-        .run_turn_async("answer this", &SharedPrompter::none())
-        .await
-        .expect("turn should complete with a gate message");
+    let services = runtime::RuntimeServices::in_memory().expect("runtime services");
+    let (_runtime, summary) = runtime::submit_owned_conversation_turn(
+        runtime,
+        services,
+        "answer this",
+        &SharedPrompter::none(),
+    )
+    .await;
+    let summary = summary.expect("turn should complete with a gate message");
     let observation =
         HarnessObservation::from_summary("empty_answer_gate", &summary).into_scenario_observation();
     let report = ScenarioSuite::new(vec![spec]).evaluate(&[observation]);
@@ -344,8 +349,8 @@ fn matrix_quality_failure_becomes_growth_signal() {
         strategy_pattern: event.strategy_pattern,
         finalization_blocked: false,
         regression_allowed: false,
-        has_workgraph: false,
-        workgraph_quality_ok: false,
+        has_execution_graph: false,
+        execution_graph_quality_ok: false,
         growth_has_blocker: event
             .signals
             .iter()

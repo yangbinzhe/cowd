@@ -1,16 +1,20 @@
-//! Runtime-owned orchestration contract.
+//! Runtime orchestration is a pure intent-to-graph compiler.
+//!
+//! Stateful execution is owned exclusively by `ExecutionGraphRunner` through
+//! `RuntimeServices`. This module must never dispatch tools, agents, teams,
+//! sessions, missions, or approvals directly.
 
-pub mod executor;
+pub mod compiler;
 pub mod planner;
 pub mod request;
 pub mod result;
 pub mod validator;
 
+use crate::execution_core::RuntimeExecutionDecision;
+use crate::RuntimeServices;
 use serde_json::{json, Value};
 
-use crate::tool_host::RuntimeExecutionHost;
-use crate::{global_mission_evidence_bus, MissionEvidenceRef};
-
+pub use compiler::CompiledOrchestration;
 pub use planner::RuntimeOrchestrationPlan;
 pub use request::{
     RuntimeOrchestrationAction, RuntimeOrchestrationConstraints, RuntimeOrchestrationRequest,
@@ -24,31 +28,48 @@ pub use result::{
 pub fn handle_runtime_orchestration_request(
     request: RuntimeOrchestrationRequest,
 ) -> RuntimeOrchestrationResult {
-    handle_runtime_orchestration_request_with_host(request, None)
+    compile_runtime_orchestration_request(request, None, None)
 }
 
 #[must_use]
-pub fn handle_runtime_orchestration_request_with_host(
+pub fn handle_runtime_orchestration_request_with_decision(
     request: RuntimeOrchestrationRequest,
-    execution_host: Option<&dyn RuntimeExecutionHost>,
+    leased_decision: Option<&RuntimeExecutionDecision>,
 ) -> RuntimeOrchestrationResult {
-    handle_runtime_orchestration_request_with_host_and_decision(request, execution_host, None)
+    compile_runtime_orchestration_request(request, leased_decision, None)
 }
 
-#[must_use]
-pub fn handle_runtime_orchestration_request_with_host_and_decision(
+/// Compile against workspace policy. Execution is owned by the active session
+/// runtime, which binds provider, tool, agent, and session backends to its graph.
+pub async fn submit_runtime_orchestration_request(
     request: RuntimeOrchestrationRequest,
-    execution_host: Option<&dyn RuntimeExecutionHost>,
-    leased_decision: Option<&crate::execution_core::RuntimeExecutionDecision>,
+    leased_decision: Option<&RuntimeExecutionDecision>,
+    services: &RuntimeServices,
 ) -> RuntimeOrchestrationResult {
-    let tool_host_required = matches!(
-        request.action,
-        RuntimeOrchestrationAction::RequestParallelTools
-            | RuntimeOrchestrationAction::RequestRewooEvidence
-    );
+    compile_runtime_orchestration_request(request, leased_decision, Some(services))
+}
+
+fn compile_runtime_orchestration_request(
+    request: RuntimeOrchestrationRequest,
+    leased_decision: Option<&RuntimeExecutionDecision>,
+    services: Option<&RuntimeServices>,
+) -> RuntimeOrchestrationResult {
+    compile_runtime_orchestration(request, leased_decision, services)
+        .map(|(result, _)| result)
+        .unwrap_or_else(|result| result)
+}
+
+fn compile_runtime_orchestration(
+    request: RuntimeOrchestrationRequest,
+    leased_decision: Option<&RuntimeExecutionDecision>,
+    services: Option<&RuntimeServices>,
+) -> Result<(RuntimeOrchestrationResult, Option<CompiledOrchestration>), RuntimeOrchestrationResult>
+{
     let resource_health = crate::execution_core::StrategyResourceHealth {
         provider_available: true,
-        tools_available: !tool_host_required || execution_host.is_some(),
+        // Compilation describes required capabilities. Executor availability is
+        // validated by the Runner registry before any state transition.
+        tools_available: true,
         collaboration_available: true,
         mission_available: true,
         observed: true,
@@ -62,69 +83,82 @@ pub fn handle_runtime_orchestration_request_with_host_and_decision(
         &request,
         &plan.execution_decision,
         plan.model_proposal.as_ref(),
+        services.map(|services| services.approval_queue().as_ref()),
     );
-    let can_dispatch = decision.status != "rejected"
-        && (decision.status != "needs_approval"
-            || request.action == RuntimeOrchestrationAction::RequestRiskGate);
-    let (status_override, detail) = if can_dispatch {
-        executor::execute_orchestration_request(&request, &plan, &decision.status, execution_host)
-    } else {
-        (
-            None,
-            json!({
-                "type": "orchestration_blocked",
-                "status": decision.status,
-                "action": request.action,
-                "validation_findings": decision.validation_findings,
-                "required_approval": &decision.required_approval,
-                "side_effects_started": false,
-            }),
-        )
-    };
-    if let Some(status) = status_override {
-        decision.status = status;
-    }
     let request_id = format!("runtime-orch-{}", uuid::Uuid::new_v4());
-    let evidence = orchestration_evidence(&request_id, &request, &plan, &decision);
-    RuntimeOrchestrationResult {
-        request_id,
-        status: decision.status.clone(),
-        decision,
-        execution: detail,
-        evidence,
-        next_model_guidance: executor::guidance_for(&request.action),
-    }
+    let compiled = if decision.status == "rejected" || decision.status == "needs_approval" {
+        None
+    } else {
+        match compiler::compile_orchestration(&request_id, &request, &plan) {
+            Ok(compiled) => Some(compiled),
+            Err(error) => {
+                decision.status = "unavailable".to_string();
+                decision
+                    .validation_findings
+                    .push(format!("execution_capability_unavailable:{error}"));
+                None
+            }
+        }
+    };
+    let compiled_ok = compiled.is_some();
+    let status = if decision.status == "rejected" || decision.status == "needs_approval" {
+        decision.status.clone()
+    } else if compiled_ok {
+        "compiled".to_string()
+    } else {
+        "unavailable".to_string()
+    };
+    decision.status = status.clone();
+    let execution = compiled.as_ref().map_or_else(
+        || {
+            json!({
+                "type": "orchestration_not_submitted",
+                "status": status,
+                "findings": decision.validation_findings,
+            })
+        },
+        |compiled| {
+            json!({
+                "type": "execution_graph_compilation",
+                "status": "compiled",
+                "graph": compiled.graph,
+                "command": compiled.command,
+            })
+        },
+    );
+    let evidence = orchestration_evidence(&request_id, &request, &plan, &decision, compiled_ok);
+    Ok((
+        RuntimeOrchestrationResult {
+            request_id,
+            status,
+            decision,
+            execution,
+            evidence,
+            next_model_guidance: compiler::guidance_for_compile_result(compiled_ok),
+        },
+        compiled,
+    ))
 }
 
 #[must_use]
 pub fn runtime_orchestration_response(value: Value) -> Value {
-    runtime_orchestration_response_with_host(value, None)
+    runtime_orchestration_response_with_decision(value, None)
 }
 
 #[must_use]
-pub fn runtime_orchestration_response_with_host(
+pub fn runtime_orchestration_response_with_decision(
     value: Value,
-    execution_host: Option<&dyn RuntimeExecutionHost>,
-) -> Value {
-    runtime_orchestration_response_with_host_and_decision(value, execution_host, None)
-}
-
-#[must_use]
-pub fn runtime_orchestration_response_with_host_and_decision(
-    value: Value,
-    execution_host: Option<&dyn RuntimeExecutionHost>,
-    leased_decision: Option<&crate::execution_core::RuntimeExecutionDecision>,
+    leased_decision: Option<&RuntimeExecutionDecision>,
 ) -> Value {
     match serde_json::from_value::<RuntimeOrchestrationRequest>(value) {
-        Ok(request) => serde_json::to_value(handle_runtime_orchestration_request_with_host_and_decision(request, execution_host, leased_decision))
-            .unwrap_or_else(|error| {
-                json!({"type":"runtime_orchestration_result","status":"rejected","error": error.to_string()})
-            }),
-        Err(error) => json!({
-            "type": "runtime_orchestration_result",
-            "status": "rejected",
-            "error": format!("invalid runtime_orchestrate input: {error}")
-        }),
+        Ok(request) => serde_json::to_value(handle_runtime_orchestration_request_with_decision(
+            request,
+            leased_decision,
+        ))
+        .unwrap_or_else(|error| json!({"status":"rejected","error":error.to_string()})),
+        Err(error) => {
+            json!({"status":"rejected","error":format!("invalid runtime_orchestrate input: {error}")})
+        }
     }
 }
 
@@ -133,837 +167,81 @@ fn orchestration_evidence(
     request: &RuntimeOrchestrationRequest,
     plan: &RuntimeOrchestrationPlan,
     decision: &RuntimeOrchestrationDecision,
+    compiled: bool,
 ) -> Value {
-    let mut evidence = json!({
+    json!({
         "type": "runtime_orchestration_evidence",
         "request_id": request_id,
-        "runtime_action": runtime_action_alias(request.action),
-        "tool_action": request.action,
-        "status": &decision.status,
-        "model_intent": &request.intent,
-        "model_reason": &request.reason,
-        "model_proposal": &plan.model_proposal,
-        "template_hint": &request.template_hint,
+        "action": request.action,
+        "status": decision.status,
+        "model_intent": request.intent,
         "selected_pattern": decision.selected_pattern.as_str(),
-        "decision_source": plan.execution_decision.strategy.source,
         "compile_target": plan.execution_decision.compile_target,
-        "modifiers": plan.execution_decision.modifiers(),
-        "recommended_template": plan.execution_decision.recommended_template.map(|template| template.as_str()),
-        "policy_gates": &decision.policy_gates,
-        "validation_findings": &decision.validation_findings,
-        "required_approval": &decision.required_approval,
-        "strategy_lease": &plan.execution_decision.lease,
-        "resource_health": &plan.execution_decision.resource_health,
-        "executable": plan.execution_decision.executable,
-        "blocked_reasons": &plan.execution_decision.blocked_reasons,
-        "accepted": matches!(decision.status.as_str(), "accepted" | "running" | "ready" | "planned" | "executed"),
-        "degraded": !matches!(decision.status.as_str(), "accepted" | "running" | "ready" | "planned" | "executed"),
-        "evidence_refs": &request.evidence_refs,
-        "runtime_owner": "runtime.orchestration",
-    });
-    if persists_execution_evidence(&decision.status) {
-        if let Some(recorded) = record_orchestration_evidence(request_id, request, decision) {
-            if let Some(object) = evidence.as_object_mut() {
-                object.insert("mission_evidence".to_string(), json!(recorded));
-            }
-        }
-    }
-    evidence
-}
-
-fn persists_execution_evidence(status: &str) -> bool {
-    matches!(
-        status,
-        "accepted" | "running" | "running_degraded" | "ready" | "executed" | "routed"
-    )
-}
-
-fn record_orchestration_evidence(
-    request_id: &str,
-    request: &RuntimeOrchestrationRequest,
-    decision: &RuntimeOrchestrationDecision,
-) -> Option<MissionEvidenceRef> {
-    let session_id = request
-        .session_id
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())?;
-    Some(global_mission_evidence_bus().record(MissionEvidenceRef {
-        evidence_id: String::new(),
-        mission_id: None,
-        session_id: session_id.to_string(),
-        team_id: None,
-        agent_id: None,
-        kind: "runtime_orchestration".to_string(),
-        summary: format!(
-            "runtime action `{}` resolved as `{}`",
-            runtime_action_alias(request.action),
-            decision.status
-        ),
-        source_ref: Some(request_id.to_string()),
-        created_at_ms: 0,
-    }))
-}
-
-fn runtime_action_alias(action: RuntimeOrchestrationAction) -> &'static str {
-    match action {
-        RuntimeOrchestrationAction::PlanOnly => "continue_single",
-        RuntimeOrchestrationAction::RequestTeam => "use_team_template",
-        RuntimeOrchestrationAction::RequestSubagent
-        | RuntimeOrchestrationAction::RequestVerification
-        | RuntimeOrchestrationAction::RequestBackgroundReview => "use_team_template",
-        RuntimeOrchestrationAction::RequestParallelTools => "parallel_tool_batch",
-        RuntimeOrchestrationAction::RequestRewooEvidence => "parallel_tool_batch",
-        RuntimeOrchestrationAction::RequestDeliberation => "use_team_template",
-        RuntimeOrchestrationAction::RequestReflexionRetry => "request_arbiter",
-        RuntimeOrchestrationAction::RequestRiskGate => "ask_approval",
-        RuntimeOrchestrationAction::RequestSessionLink => "dispatch_session",
-    }
+        "strategy_lease": plan.execution_decision.lease,
+        "policy_gates": decision.policy_gates,
+        "validation_findings": decision.validation_findings,
+        "accepted": false,
+        "compiled": compiled,
+        "runtime_owner": "runtime.execution_graph_compiler",
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    #[test]
-    fn plan_only_has_no_side_effect_and_returns_candidates() {
-        let result = handle_runtime_orchestration_request(RuntimeOrchestrationRequest {
-            intent: "检查 README 是否反映最新架构".to_string(),
-            session_id: None,
-            action: RuntimeOrchestrationAction::PlanOnly,
-            reason: None,
-            template_hint: None,
-            capabilities: Vec::new(),
-            evidence_refs: Vec::new(),
-            constraints: Default::default(),
-            surface: None,
-        });
-        assert_eq!(result.status, "planned");
-        assert_eq!(result.execution["type"], "plan_only");
-        assert_eq!(result.evidence["runtime_action"], "continue_single");
-        assert_eq!(result.evidence["tool_action"], "plan_only");
-    }
-
-    #[test]
-    fn request_team_without_session_id_is_rejected_not_fake_accepted() {
-        let result = handle_runtime_orchestration_request(RuntimeOrchestrationRequest {
-            intent: "需要多 Agent 协同审查架构".to_string(),
-            session_id: None,
-            action: RuntimeOrchestrationAction::RequestTeam,
-            reason: None,
-            template_hint: None,
-            capabilities: Vec::new(),
-            evidence_refs: Vec::new(),
-            constraints: Default::default(),
-            surface: None,
-        });
-        assert_eq!(result.status, "rejected");
-        assert_eq!(result.evidence["runtime_action"], "use_team_template");
-        assert_eq!(result.evidence["accepted"], false);
-        assert!(result
-            .decision
-            .validation_findings
-            .contains(&"missing_session_id_for_team_runtime".to_string()));
-    }
-
-    struct FakeRuntimeToolHost;
-
-    impl crate::RuntimeExecutionHost for FakeRuntimeToolHost {
-        fn execute_runtime_tool(
-            &self,
-            request: &crate::RuntimeToolExecutionRequest,
-        ) -> crate::RuntimeToolExecutionOutcome {
-            crate::RuntimeToolExecutionOutcome {
-                tool_use_id: request.tool_use_id.clone(),
-                tool_name: request.tool_name.clone(),
-                status: crate::RuntimeToolExecutionStatus::Executed,
-                category: request.category,
-                output: Some(format!("executed {}", request.tool_name)),
-                error: None,
-                evidence_ref: format!("fake-evidence:{}", request.tool_use_id),
-            }
-        }
-
-        fn start_runtime_team(
-            &self,
-            request: &RuntimeOrchestrationRequest,
-            decision: &crate::CollaborationDecision,
-        ) -> Option<Result<serde_json::Value, String>> {
-            Some(Ok(json!({
-                "type": "team_runtime",
-                "status": "running",
-                "execution_fidelity": "fake_runtime_adapter",
-                "session_id": request.session_id,
-                "template": decision.template_id,
-            })))
-        }
-    }
-
-    struct CountingRuntimeHost {
-        executions: AtomicUsize,
-    }
-
-    impl crate::RuntimeExecutionHost for CountingRuntimeHost {
-        fn execute_runtime_tool(
-            &self,
-            request: &crate::RuntimeToolExecutionRequest,
-        ) -> crate::RuntimeToolExecutionOutcome {
-            self.executions.fetch_add(1, Ordering::SeqCst);
-            crate::RuntimeToolExecutionOutcome {
-                tool_use_id: request.tool_use_id.clone(),
-                tool_name: request.tool_name.clone(),
-                status: crate::RuntimeToolExecutionStatus::Executed,
-                category: request.category,
-                output: Some("unexpected execution".to_string()),
-                error: None,
-                evidence_ref: "unexpected".to_string(),
-            }
-        }
-    }
-
-    fn approval_gated_parallel_request(session_id: &str) -> RuntimeOrchestrationRequest {
+    fn request(action: RuntimeOrchestrationAction) -> RuntimeOrchestrationRequest {
         RuntimeOrchestrationRequest {
-            intent: "并行检查 runtime orchestration 审批闭环并汇总证据".to_string(),
-            session_id: Some(session_id.to_string()),
-            action: RuntimeOrchestrationAction::RequestParallelTools,
+            intent: "inspect the workspace".to_string(),
+            session_id: Some("session-1".to_string()),
+            action,
             reason: None,
             template_hint: None,
-            capabilities: vec!["read".to_string(), "search".to_string()],
+            capabilities: Vec::new(),
             evidence_refs: Vec::new(),
             constraints: Default::default(),
             surface: None,
         }
     }
 
-    fn approval_gated_parallel_decision(
-        request: &RuntimeOrchestrationRequest,
-    ) -> crate::RuntimeExecutionDecision {
-        let mut leased = planner::plan_runtime_orchestration(request).execution_decision;
+    #[test]
+    fn sync_orchestration_compiles_without_side_effects() {
+        let result =
+            handle_runtime_orchestration_request(request(RuntimeOrchestrationAction::PlanOnly));
         assert_eq!(
-            leased.pattern(),
-            harness_contract::core::ExecutionPattern::Explore
+            result.status, "compiled",
+            "findings={:?}",
+            result.decision.validation_findings
         );
-        assert!(leased
-            .modifiers()
-            .contains(&harness_contract::core::ExecutionModifier::Parallel));
-        if !leased
-            .gates()
-            .contains(&harness_contract::core::ExecutionPolicyGate::Approval)
-        {
-            leased
-                .strategy
-                .gates
-                .push(harness_contract::core::ExecutionPolicyGate::Approval);
-        }
-        leased
-    }
-
-    fn submit_orchestration_approval(
-        session_id: Option<&str>,
-        action: &str,
-    ) -> crate::GlobalApprovalRequest {
-        crate::global_approval_queue()
-            .submit(crate::SubmitGlobalApprovalRequest {
-                source: crate::ApprovalSource {
-                    kind: crate::ApprovalSourceKind::Session,
-                    session_id: session_id.map(str::to_string),
-                    agent_id: None,
-                    team_id: None,
-                    mission_id: None,
-                },
-                action: action.to_string(),
-                summary: "authorize approval-gated runtime orchestration".to_string(),
-                risk: harness_contract::core::TaskRisk::Critical,
-                evidence_refs: Vec::new(),
-                timeout_policy: crate::ApprovalTimeoutPolicy::AutoDeny,
-            })
-            .expect("submit orchestration approval")
-    }
-
-    fn decide_orchestration_approval(approval_id: &str, approved: bool) {
-        crate::global_approval_queue()
-            .decide(crate::GlobalApprovalDecision {
-                approval_id: approval_id.to_string(),
-                approved,
-                decided_by: "orchestration-test-operator".to_string(),
-                reason: if approved {
-                    "approved for matching runtime action".to_string()
-                } else {
-                    "denied for test".to_string()
-                },
-            })
-            .expect("decide orchestration approval");
+        assert_eq!(result.execution["type"], "execution_graph_compilation");
+        assert_eq!(result.evidence["accepted"], false);
     }
 
     #[test]
-    fn approval_gated_action_without_approved_receipt_does_not_call_host() {
-        let session_id = format!("session-approval-missing-{}", uuid::Uuid::new_v4());
-        let mut request = approval_gated_parallel_request(&session_id);
-        let leased = approval_gated_parallel_decision(&request);
-        let expected_action = format!("runtime_orchestrate:{}", request.action.as_str());
-        let host = CountingRuntimeHost {
-            executions: AtomicUsize::new(0),
-        };
-
-        let missing = handle_runtime_orchestration_request_with_host_and_decision(
-            request.clone(),
-            Some(&host),
-            Some(&leased),
-        );
-        assert_eq!(missing.status, "needs_approval");
-        assert_eq!(host.executions.load(Ordering::SeqCst), 0);
-        assert_eq!(missing.execution["side_effects_started"], false);
-        assert_eq!(
-            missing.execution["required_approval"]["action"],
-            expected_action
-        );
-        assert_eq!(
-            missing.execution["required_approval"]["session_id"],
-            session_id
-        );
-        assert!(missing
-            .decision
-            .validation_findings
-            .contains(&"missing_global_approval_receipt".to_string()));
-
-        let pending = submit_orchestration_approval(Some(&session_id), &expected_action);
-        request.constraints.approval_id = Some(pending.approval_id);
-        let pending_result = handle_runtime_orchestration_request_with_host_and_decision(
-            request,
-            Some(&host),
-            Some(&leased),
-        );
-        assert_eq!(pending_result.status, "needs_approval");
-        assert_eq!(host.executions.load(Ordering::SeqCst), 0);
-        assert_eq!(pending_result.execution["side_effects_started"], false);
-        assert!(pending_result
-            .decision
-            .validation_findings
-            .contains(&"global_approval_pending".to_string()));
+    fn future_capability_is_typed_unavailable_not_fake_running() {
+        let result =
+            handle_runtime_orchestration_request(request(RuntimeOrchestrationAction::RequestTeam));
+        assert_ne!(result.status, "running");
+        assert_eq!(result.evidence["accepted"], false);
     }
 
-    #[test]
-    fn matching_approved_receipt_dispatches_approval_gated_action() {
-        let session_id = format!("session-approval-approved-{}", uuid::Uuid::new_v4());
-        let mut request = approval_gated_parallel_request(&session_id);
-        let leased = approval_gated_parallel_decision(&request);
-        let expected_action = format!("runtime_orchestrate:{}", request.action.as_str());
-        let approval = submit_orchestration_approval(Some(&session_id), &expected_action);
-        decide_orchestration_approval(&approval.approval_id, true);
-        request.constraints.approval_id = Some(approval.approval_id.clone());
-        let host = CountingRuntimeHost {
-            executions: AtomicUsize::new(0),
-        };
-
-        let result = handle_runtime_orchestration_request_with_host_and_decision(
-            request,
-            Some(&host),
-            Some(&leased),
-        );
-
-        assert_eq!(result.status, "executed");
-        assert!(host.executions.load(Ordering::SeqCst) > 0);
-        assert_eq!(result.execution["receipt"]["status"], "executed");
-        assert_eq!(
-            result
-                .decision
-                .required_approval
-                .as_ref()
-                .and_then(|requirement| requirement.approval_id.as_deref()),
-            Some(approval.approval_id.as_str())
-        );
-        assert!(result
-            .decision
-            .validation_findings
-            .contains(&"global_approval_receipt_validated".to_string()));
-    }
-
-    #[test]
-    fn unrelated_approved_receipt_is_rejected_without_calling_host() {
-        let session_id = format!("session-approval-mismatch-{}", uuid::Uuid::new_v4());
-        let request = approval_gated_parallel_request(&session_id);
-        let leased = approval_gated_parallel_decision(&request);
-        let expected_action = format!("runtime_orchestrate:{}", request.action.as_str());
-        let unrelated = [
-            (
-                format!("{session_id}-other"),
-                expected_action.clone(),
-                "global_approval_session_mismatch",
-            ),
-            (
-                session_id.clone(),
-                "runtime_orchestrate:request_rewoo_evidence".to_string(),
-                "global_approval_action_mismatch",
-            ),
-        ];
-        let host = CountingRuntimeHost {
-            executions: AtomicUsize::new(0),
-        };
-
-        for (approval_session, approval_action, expected_finding) in unrelated {
-            let approval = submit_orchestration_approval(Some(&approval_session), &approval_action);
-            decide_orchestration_approval(&approval.approval_id, true);
-            let mut request = request.clone();
-            request.constraints.approval_id = Some(approval.approval_id);
-            let result = handle_runtime_orchestration_request_with_host_and_decision(
-                request,
-                Some(&host),
-                Some(&leased),
-            );
-
-            assert_eq!(result.status, "rejected");
-            assert_eq!(result.execution["side_effects_started"], false);
-            assert!(result
-                .decision
-                .validation_findings
-                .contains(&expected_finding.to_string()));
-        }
-        assert_eq!(host.executions.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn denied_and_timed_out_receipts_are_rejected_without_calling_host() {
-        let session_id = format!("session-approval-terminal-{}", uuid::Uuid::new_v4());
-        let request = approval_gated_parallel_request(&session_id);
-        let leased = approval_gated_parallel_decision(&request);
-        let expected_action = format!("runtime_orchestrate:{}", request.action.as_str());
-        let denied = submit_orchestration_approval(Some(&session_id), &expected_action);
-        decide_orchestration_approval(&denied.approval_id, false);
-        let timed_out = submit_orchestration_approval(Some(&session_id), &expected_action);
-        crate::global_approval_queue()
-            .timeout(&timed_out.approval_id)
-            .expect("time out orchestration approval");
-        let host = CountingRuntimeHost {
-            executions: AtomicUsize::new(0),
-        };
-
-        for (approval_id, expected_finding) in [
-            (denied.approval_id, "global_approval_denied"),
-            (timed_out.approval_id, "global_approval_timed_out"),
-        ] {
-            let mut request = request.clone();
-            request.constraints.approval_id = Some(approval_id);
-            let result = handle_runtime_orchestration_request_with_host_and_decision(
-                request,
-                Some(&host),
-                Some(&leased),
-            );
-
-            assert_eq!(result.status, "rejected");
-            assert_eq!(result.execution["side_effects_started"], false);
-            assert!(result
-                .decision
-                .validation_findings
-                .contains(&expected_finding.to_string()));
-        }
-        assert_eq!(host.executions.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn tool_dag_actions_without_host_are_blocked_not_fake_ready() {
-        for action in [
-            RuntimeOrchestrationAction::RequestParallelTools,
-            RuntimeOrchestrationAction::RequestRewooEvidence,
-        ] {
-            let result = handle_runtime_orchestration_request(RuntimeOrchestrationRequest {
-                intent: "检查 README 是否反映最新架构".to_string(),
-                session_id: Some("session-runtime-orchestrate-test".to_string()),
-                action,
-                reason: None,
-                template_hint: None,
-                capabilities: Vec::new(),
-                evidence_refs: Vec::new(),
-                constraints: Default::default(),
-                surface: None,
-            });
-            assert_eq!(result.status, "rejected");
-            assert_eq!(result.execution["type"], "orchestration_blocked");
-            assert_eq!(result.execution["side_effects_started"], false);
-            assert_eq!(
-                result.decision.selected_pattern,
-                harness_contract::core::ExecutionPattern::Direct
-            );
-            assert!(result
-                .decision
-                .validation_findings
-                .contains(&"action_not_authorized_by_strategy".to_string()));
-        }
-    }
-
-    #[test]
-    fn rejected_model_action_has_zero_execution_side_effects() {
-        let leased = crate::build_runtime_execution_decision("解释这个名称", None);
-        let host = CountingRuntimeHost {
-            executions: AtomicUsize::new(0),
-        };
-        let result = handle_runtime_orchestration_request_with_host_and_decision(
-            RuntimeOrchestrationRequest {
-                intent: "解释这个名称".to_string(),
-                session_id: Some("session-lease-guard".to_string()),
-                action: RuntimeOrchestrationAction::RequestParallelTools,
-                reason: Some("try a different pattern".to_string()),
-                template_hint: None,
-                capabilities: Vec::new(),
-                evidence_refs: Vec::new(),
-                constraints: Default::default(),
-                surface: None,
-            },
-            Some(&host),
-            Some(&leased),
-        );
-
-        assert_eq!(result.status, "rejected");
-        assert_eq!(host.executions.load(Ordering::SeqCst), 0);
-        assert_eq!(result.execution["side_effects_started"], false);
-        assert!(result.evidence.get("mission_evidence").is_none());
-        assert!(result
-            .decision
-            .validation_findings
-            .contains(&"model_proposal_conflicts_with_strategy_lease".to_string()));
-    }
-
-    #[test]
-    fn unavailable_strategy_resources_have_zero_execution_side_effects() {
-        let leased = crate::StrategyDecisionEngine.decide_with_input(
-            harness_contract::strategy::StrategyInput::from_prompt(
-                "并行修改 runtime 高风险权限实现并验证",
-            )
-            .with_explicit_write(true)
-            .with_risk_override(harness_contract::core::TaskRisk::Critical),
+    #[tokio::test]
+    async fn async_orchestration_does_not_install_placeholder_executors() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        let result = submit_runtime_orchestration_request(
+            request(RuntimeOrchestrationAction::PlanOnly),
             None,
-            crate::StrategyResourceHealth {
-                tools_available: false,
-                observed: true,
-                ..crate::StrategyResourceHealth::default()
-            },
-        );
-        assert_eq!(
-            leased.pattern(),
-            harness_contract::core::ExecutionPattern::Execute
-        );
-        assert!(!leased.executable);
-        let host = CountingRuntimeHost {
-            executions: AtomicUsize::new(0),
-        };
-        let result = handle_runtime_orchestration_request_with_host_and_decision(
-            RuntimeOrchestrationRequest {
-                intent: "并行修改 runtime 高风险权限实现并验证".to_string(),
-                session_id: Some("session-resource-guard".to_string()),
-                action: RuntimeOrchestrationAction::RequestParallelTools,
-                reason: Some("independent read-only evidence".to_string()),
-                template_hint: None,
-                capabilities: Vec::new(),
-                evidence_refs: Vec::new(),
-                constraints: Default::default(),
-                surface: None,
-            },
-            Some(&host),
-            Some(&leased),
-        );
+            services.as_ref(),
+        )
+        .await;
 
-        assert_eq!(result.status, "rejected");
-        assert_eq!(host.executions.load(Ordering::SeqCst), 0);
-        assert_eq!(result.execution["side_effects_started"], false);
-        assert_eq!(result.evidence["executable"], false);
-        assert!(result
-            .decision
-            .validation_findings
-            .contains(&"strategy_resources_unavailable".to_string()));
-    }
-
-    #[test]
-    fn tool_dag_actions_with_host_execute_and_emit_receipt() {
-        let host = FakeRuntimeToolHost;
-        for action in [
-            RuntimeOrchestrationAction::RequestParallelTools,
-            RuntimeOrchestrationAction::RequestRewooEvidence,
-        ] {
-            let result = handle_runtime_orchestration_request_with_host(
-                RuntimeOrchestrationRequest {
-                    intent: "检查 README 是否反映最新架构".to_string(),
-                    session_id: Some("session-runtime-orchestrate-test".to_string()),
-                    action,
-                    reason: None,
-                    template_hint: None,
-                    capabilities: Vec::new(),
-                    evidence_refs: Vec::new(),
-                    constraints: Default::default(),
-                    surface: None,
-                },
-                Some(&host),
-            );
-            assert_eq!(result.status, "executed");
-            assert_eq!(result.execution["receipt"]["status"], "executed");
-            assert!(result.execution["receipt"]["tool_results"]
-                .as_array()
-                .is_some_and(|items| !items.is_empty()));
-            assert_eq!(
-                result.execution["receipt"]["events"][0]["kind"],
-                "runtime.tool_dag.executed"
-            );
-            assert!(result.evidence["accepted"].as_bool().unwrap_or(false));
-        }
-    }
-
-    #[test]
-    fn deliberation_and_reflexion_return_runtime_owned_ready_packets() {
-        for action in [
-            RuntimeOrchestrationAction::RequestDeliberation,
-            RuntimeOrchestrationAction::RequestReflexionRetry,
-        ] {
-            let result = handle_runtime_orchestration_request(RuntimeOrchestrationRequest {
-                intent: "检查 README 是否反映最新架构".to_string(),
-                session_id: Some("session-runtime-orchestrate-test".to_string()),
-                action,
-                reason: None,
-                template_hint: None,
-                capabilities: Vec::new(),
-                evidence_refs: Vec::new(),
-                constraints: Default::default(),
-                surface: None,
-            });
-            assert_eq!(result.status, "ready");
-            assert_eq!(result.execution["status"], "ready");
-            let fidelity = result.execution["execution_fidelity"]
-                .as_str()
-                .expect("execution fidelity");
-            assert!(fidelity.starts_with("runtime_owned_"), "{fidelity}");
-            assert!(result.execution["engine"]["owned_by"] == "runtime");
-        }
-    }
-
-    #[test]
-    fn runtime_orchestrate_request_subagent_starts_agent_lifecycle() {
-        let session_id = format!("session-subagent-{}", uuid::Uuid::new_v4());
-        let _ = crate::global_mission_runtime().start_session(crate::StartMissionSessionRequest {
-            title: "subagent orchestration test".to_string(),
-            session_id: Some(session_id.clone()),
-        });
-        let result = handle_runtime_orchestration_request(RuntimeOrchestrationRequest {
-            intent: "分析 Runtime 编排链路".to_string(),
-            session_id: Some(session_id),
-            action: RuntimeOrchestrationAction::RequestSubagent,
-            reason: None,
-            template_hint: Some("explorer".to_string()),
-            capabilities: Vec::new(),
-            evidence_refs: vec!["evidence:runtime".to_string()],
-            constraints: Default::default(),
-            surface: None,
-        });
-
-        assert!(matches!(
-            result.status.as_str(),
-            "running" | "running_degraded"
-        ));
-        assert_eq!(result.execution["type"], "runtime_orchestration_result");
-        assert_eq!(
-            result.execution["execution_fidelity"],
-            "runtime_owned_agent_lifecycle"
-        );
-        assert!(result.execution["agent_id"].is_string());
-        assert!(result.execution["event_refs"]
-            .as_array()
-            .is_some_and(|items| !items.is_empty()));
-        let obsolete_gate = ["planning_only_until", "_runtime_context_attached"].concat();
-        assert!(!result.decision.validation_findings.contains(&obsolete_gate));
-    }
-
-    #[test]
-    fn runtime_orchestrate_request_verification_starts_verifier() {
-        let result = handle_runtime_orchestration_request(RuntimeOrchestrationRequest {
-            intent: "验证 V15 是否真的接线".to_string(),
-            session_id: None,
-            action: RuntimeOrchestrationAction::RequestVerification,
-            reason: None,
-            template_hint: None,
-            capabilities: Vec::new(),
-            evidence_refs: vec!["plan:v15".to_string()],
-            constraints: Default::default(),
-            surface: None,
-        });
-
-        assert_eq!(result.status, "running");
-        assert_eq!(
-            result.execution["execution_fidelity"],
-            "runtime_owned_verification_lifecycle"
-        );
-        assert_eq!(result.execution["agent"]["subagentType"], "Verification");
-    }
-
-    #[test]
-    fn runtime_orchestrate_background_review_starts_steward() {
-        let result = handle_runtime_orchestration_request(RuntimeOrchestrationRequest {
-            intent: "持续监督复杂重构风险".to_string(),
-            session_id: Some(format!("session-review-{}", uuid::Uuid::new_v4())),
-            action: RuntimeOrchestrationAction::RequestBackgroundReview,
-            reason: None,
-            template_hint: None,
-            capabilities: Vec::new(),
-            evidence_refs: vec!["risk:architecture".to_string()],
-            constraints: Default::default(),
-            surface: None,
-        });
-
-        assert_eq!(result.status, "running");
-        assert_eq!(
-            result.execution["execution_fidelity"],
-            "runtime_owned_steward_lifecycle"
-        );
-        assert!(result.execution["steward_id"].is_string());
-        assert!(result.execution["control_actions"]
-            .as_array()
-            .is_some_and(|items| items.iter().any(|item| item == "pause")));
-    }
-
-    #[test]
-    fn runtime_orchestrate_session_link_generic_path_routes_command() {
-        let from_session = format!("session-link-from-{}", uuid::Uuid::new_v4());
-        let target_session = format!("session-link-target-{}", uuid::Uuid::new_v4());
-        let _ = crate::global_mission_runtime().start_session(crate::StartMissionSessionRequest {
-            title: "source session".to_string(),
-            session_id: Some(from_session.clone()),
-        });
-        let _ = crate::global_mission_runtime().start_session(crate::StartMissionSessionRequest {
-            title: "target session".to_string(),
-            session_id: Some(target_session.clone()),
-        });
-        let result = handle_runtime_orchestration_request(RuntimeOrchestrationRequest {
-            intent: "同步检查结果".to_string(),
-            session_id: Some(from_session),
-            action: RuntimeOrchestrationAction::RequestSessionLink,
-            reason: None,
-            template_hint: Some(target_session),
-            capabilities: Vec::new(),
-            evidence_refs: Vec::new(),
-            constraints: Default::default(),
-            surface: None,
-        });
-
-        assert!(matches!(result.status.as_str(), "routed" | "rejected"));
-        assert_eq!(
-            result.execution["execution_fidelity"],
-            "runtime_owned_session_bridge"
-        );
-        assert_eq!(
-            result.execution["bridge"]["kind"],
-            "runtime.cross_session_bridge_receipt"
-        );
-    }
-
-    #[test]
-    fn strategy_orchestration_records_model_visible_evidence() {
-        let result = handle_runtime_orchestration_request(RuntimeOrchestrationRequest {
-            intent: "复杂代码审计需要并行证据和团队审查".to_string(),
-            session_id: Some("session-strategy-orchestration-evidence".to_string()),
-            action: RuntimeOrchestrationAction::RequestParallelTools,
-            reason: Some("independent files can be inspected together".to_string()),
-            template_hint: Some("fanout_research_synthesis".to_string()),
-            capabilities: vec!["read".to_string(), "search".to_string()],
-            evidence_refs: vec!["source:readme".to_string()],
-            constraints: Default::default(),
-            surface: Some("webui".to_string()),
-        });
-
-        assert_eq!(result.status, "rejected");
-        assert_eq!(result.evidence["runtime_action"], "parallel_tool_batch");
-        assert_eq!(
-            result.evidence["model_reason"],
-            "independent files can be inspected together"
-        );
-        assert_eq!(
-            result.evidence["template_hint"],
-            "fanout_research_synthesis"
-        );
-        assert_eq!(result.execution["type"], "orchestration_blocked");
-        assert_eq!(result.execution["side_effects_started"], false);
-        assert!(result.evidence.get("mission_evidence").is_none());
-    }
-
-    #[test]
-    fn risk_gate_requires_approval_not_execution() {
-        let result = handle_runtime_orchestration_request(RuntimeOrchestrationRequest {
-            intent: "执行高风险生产操作".to_string(),
-            session_id: Some("session-runtime-orchestrate-test".to_string()),
-            action: RuntimeOrchestrationAction::RequestRiskGate,
-            reason: None,
-            template_hint: None,
-            capabilities: Vec::new(),
-            evidence_refs: Vec::new(),
-            constraints: Default::default(),
-            surface: None,
-        });
-        assert_eq!(result.status, "needs_approval");
-        assert_eq!(result.execution["type"], "risk_gate");
-        assert!(result
-            .decision
-            .validation_findings
-            .contains(&"risk_gate_requested".to_string()));
-        assert!(result
-            .decision
-            .policy_gates
-            .contains(&harness_contract::core::ExecutionPolicyGate::Approval));
-    }
-
-    #[test]
-    fn request_team_with_session_id_starts_real_team_runtime() {
-        let result = handle_runtime_orchestration_request(RuntimeOrchestrationRequest {
-            intent: "需要多 Agent 协同审查架构".to_string(),
-            session_id: Some("session-runtime-orchestrate-test".to_string()),
-            action: RuntimeOrchestrationAction::RequestTeam,
-            reason: None,
-            template_hint: None,
-            capabilities: Vec::new(),
-            evidence_refs: Vec::new(),
-            constraints: Default::default(),
-            surface: None,
-        });
-        assert_eq!(result.status, "running");
-        assert_eq!(result.evidence["runtime_action"], "use_team_template");
-        assert_eq!(
-            result.evidence["mission_evidence"]["kind"],
-            "runtime_orchestration"
-        );
-        assert_eq!(result.execution["type"], "team_runtime");
-        assert!(result.execution["team"]["team_id"].is_string());
-        assert_eq!(
-            result.execution["collaboration_run"]["kind"],
-            "runtime.collaboration_run"
-        );
-        assert!(result.execution["control_actions"]
-            .as_array()
-            .is_some_and(|items| items.iter().any(|item| item == "cancel")));
-        assert!(result.execution["event_refs"]
-            .as_array()
-            .is_some_and(|items| !items.is_empty()));
-    }
-
-    #[test]
-    fn runtime_validates_strategy_before_delegating_team_start_to_host() {
-        let result = handle_runtime_orchestration_request_with_host(
-            RuntimeOrchestrationRequest {
-                intent: "需要多 Agent 协同审查 runtime gateway memory".to_string(),
-                session_id: Some("session-runtime-host-test".to_string()),
-                action: RuntimeOrchestrationAction::RequestTeam,
-                reason: Some("parallel independent domains".to_string()),
-                template_hint: None,
-                capabilities: Vec::new(),
-                evidence_refs: Vec::new(),
-                constraints: Default::default(),
-                surface: None,
-            },
-            Some(&FakeRuntimeToolHost),
-        );
-
-        assert_eq!(result.status, "running");
-        assert_eq!(
-            result.execution["execution_fidelity"],
-            "fake_runtime_adapter"
-        );
-        assert_eq!(result.evidence["decision_source"], "model_validated");
-        assert_eq!(result.evidence["compile_target"], "team_graph");
-        assert_eq!(
-            result.decision.selected_pattern,
-            harness_contract::core::ExecutionPattern::Collaborate
-        );
+        assert_eq!(result.status, "compiled", "{result:?}");
+        assert_eq!(result.evidence["accepted"], false);
+        assert!(!services
+            .event_store()
+            .all_events(100)
+            .expect("runtime events")
+            .iter()
+            .any(|event| event.kind == "execution_graph.planned"));
     }
 }

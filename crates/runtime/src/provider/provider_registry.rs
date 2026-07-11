@@ -40,6 +40,17 @@ impl ProviderRegistrySnapshot {
     }
 
     #[must_use]
+    pub fn provider_name_for_model(&self, model: &str) -> Option<String> {
+        self.config.providers.iter().find_map(|(name, provider)| {
+            provider
+                .models
+                .iter()
+                .any(|candidate| candidate == model)
+                .then(|| name.clone())
+        })
+    }
+
+    #[must_use]
     pub fn models_for_provider(&self, provider_name: &str) -> Vec<String> {
         self.config
             .providers

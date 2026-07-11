@@ -19,6 +19,7 @@ use crate::{
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_runtime_entry(
+    runtime_services: Arc<runtime::RuntimeServices>,
     provider_registry: Arc<runtime::ProviderRegistry>,
     tool_host: Arc<tools::ToolHost>,
     session: Session,
@@ -35,6 +36,7 @@ pub(crate) fn create_runtime_entry(
     let runtime_plugin_state = crate::runtime_bootstrap::assemble_runtime_state()?;
     create_runtime_entry_with_bootstrap_state(
         None,
+        runtime_services,
         provider_registry,
         tool_host,
         session,
@@ -55,6 +57,7 @@ pub(crate) fn create_runtime_entry(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_runtime_entry_with_session_store(
     session_store: Arc<memory::session_store::UnifiedSessionStore>,
+    runtime_services: Arc<runtime::RuntimeServices>,
     provider_registry: Arc<runtime::ProviderRegistry>,
     tool_host: Arc<tools::ToolHost>,
     session: Session,
@@ -71,6 +74,7 @@ pub(crate) fn create_runtime_entry_with_session_store(
     let runtime_plugin_state = crate::runtime_bootstrap::assemble_runtime_state()?;
     create_runtime_entry_with_bootstrap_state(
         Some(session_store),
+        runtime_services,
         provider_registry,
         tool_host,
         session,
@@ -91,6 +95,7 @@ pub(crate) fn create_runtime_entry_with_session_store(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_runtime_entry_with_bootstrap_state(
     session_store: Option<Arc<memory::session_store::UnifiedSessionStore>>,
+    runtime_services: Arc<runtime::RuntimeServices>,
     provider_registry: Arc<runtime::ProviderRegistry>,
     tool_host: Arc<tools::ToolHost>,
     mut session: Session,
@@ -147,6 +152,9 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
         )
         .with_runtime_session_id(runtime_session_id),
     );
+    tool_executor
+        .bind_runtime_services(Arc::clone(&runtime_services))
+        .map_err(std::io::Error::other)?;
     let runtime = runtime::StandardRuntimeHost::new(runtime::StandardRuntimeHostConfig {
         session,
         provider_registry,
@@ -171,6 +179,7 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
         subagent_model,
         subagent_tool_definitions,
         subagent_tool_executor: tool_executor,
+        runtime_services,
     })
     .map_err(std::io::Error::other)?;
     if let Some(ref tx) = stream_callback {

@@ -3,9 +3,71 @@
 //! This crate describes what an agent is allowed and expected to do. It does
 //! not execute tools, spawn processes, or own runtime orchestration.
 
+use crate::context::{ContextBudgetLeaseRef, EvidenceAccessRef};
 use crate::core::{ExecutionPattern, TaskRisk};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTerminalStatus {
+    Completed,
+    Failed,
+    Cancelled,
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTaskPacket {
+    pub run_id: String,
+    pub agent_id: String,
+    pub task_id: String,
+    pub session_id: String,
+    pub mission_id: Option<String>,
+    pub team_id: Option<String>,
+    pub graph_id: String,
+    pub node_id: String,
+    pub attempt: u32,
+    pub expected_graph_revision: u64,
+    pub objective: String,
+    pub acceptance: Vec<String>,
+    pub constraints: Vec<String>,
+    pub context_refs: Vec<String>,
+    pub evidence_refs: Vec<EvidenceAccessRef>,
+    pub allowed_tools: Vec<String>,
+    pub allowed_skills: Vec<String>,
+    pub permission_lease: String,
+    pub model_lease: String,
+    pub budget_lease: ContextBudgetLeaseRef,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentReturnPacket {
+    pub run_id: String,
+    pub agent_id: String,
+    pub task_id: String,
+    pub session_id: String,
+    pub mission_id: Option<String>,
+    pub team_id: Option<String>,
+    pub graph_id: String,
+    pub node_id: String,
+    pub attempt: u32,
+    pub expected_graph_revision: u64,
+    pub status: AgentTerminalStatus,
+    pub outcome: String,
+    pub acceptance: Vec<String>,
+    pub evidence_refs: Vec<EvidenceAccessRef>,
+    pub changes: Vec<String>,
+    pub conflicts: Vec<String>,
+    pub unresolved: Vec<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub model: String,
+    pub provider: String,
+    pub tool_calls: u64,
+    pub failure: Option<String>,
+}
 
 #[derive(Debug, Error, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "message", rename_all = "snake_case")]
@@ -170,14 +232,14 @@ impl AgentSpec {
             .with_policy(AgentPolicyRequirement::RequiresHumanReview)
             .with_matrix_requirement("deliberation_evidence"),
             ExecutionPattern::Collaborate | ExecutionPattern::Supervise => Self::cowd_native(
-                "agent-spec-workgraph",
-                "workgraph",
+                "agent-spec-execution_graph",
+                "execution_graph",
                 "Coordinate decomposed work with review and synthesis evidence.",
             )
             .with_tool(AgentToolPermission::WriteWorkspace)
             .with_policy(AgentPolicyRequirement::RequiresMatrixEvidence)
             .with_policy(AgentPolicyRequirement::RequiresHumanReview)
-            .with_matrix_requirement("workgraph_quality")
+            .with_matrix_requirement("execution_graph_quality")
             .with_matrix_requirement("synthesis_evidence"),
         };
         spec.context_profile = mode.as_str().to_string();

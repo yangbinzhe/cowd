@@ -139,7 +139,7 @@ async fn test_integration_no_injection_on_non_code_query() {
 }
 
 #[tokio::test]
-async fn test_integration_tool_sandbox_recall_in_prepare_context() {
+async fn test_integration_tool_sandbox_rejects_raw_without_durable_evidence() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("e2e_sandbox.db");
 
@@ -165,12 +165,10 @@ async fn test_integration_tool_sandbox_recall_in_prepare_context() {
         .unwrap();
 
     assert!(
-        ctx.entries.iter().any(|entry| {
-            entry.tags.iter().any(|tag| tag == "tool_output")
-                && entry.content.contains(needle)
-                && entry.content.contains("[TOOL OUTPUT]")
-        }),
-        "prepare_context should recall matching chunks from ToolOutputSandbox"
+        ctx.entries
+            .iter()
+            .all(|entry| !entry.tags.iter().any(|tag| tag == "tool_output")),
+        "raw tool output without durable evidence must not create an orphan sandbox index"
     );
 }
 

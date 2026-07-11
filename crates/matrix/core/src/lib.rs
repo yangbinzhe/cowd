@@ -49,9 +49,9 @@ pub use data_plane::{
 pub use entity::{normalize_key, MatrixEntity, MatrixEntityInput, MatrixSourceKey};
 pub use evidence::{MatrixEvidencePacket, MatrixEvidenceSourceRef};
 pub use fact::{
-    MatrixFact, MatrixFactInput, AI_EVAL_RESULT_FACT, AI_GROWTH_SIGNAL_FACT,
-    AI_STRATEGY_DECISION_FACT, AI_TOOL_TRANSACTION_RESULT_FACT, AI_VERIFICATION_RESULT_FACT,
-    AI_WORKGRAPH_QUALITY_FACT, KNOWLEDGE_CANON_RULE_FACT, KNOWLEDGE_CONFLICT_FACT,
+    MatrixFact, MatrixFactInput, AI_EVAL_RESULT_FACT, AI_EXECUTION_GRAPH_QUALITY_FACT,
+    AI_GROWTH_SIGNAL_FACT, AI_STRATEGY_DECISION_FACT, AI_TOOL_TRANSACTION_RESULT_FACT,
+    AI_VERIFICATION_RESULT_FACT, KNOWLEDGE_CANON_RULE_FACT, KNOWLEDGE_CONFLICT_FACT,
     KNOWLEDGE_CONSTRAINT_FACT, KNOWLEDGE_PROCESS_STEP_FACT,
 };
 pub use metric::{MatrixMetricDefinition, MatrixMetricState, MatrixMetricStatus};

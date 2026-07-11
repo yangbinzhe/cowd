@@ -27,6 +27,7 @@ struct ProviderEntry {
     client: ProviderClient,
 }
 
+#[derive(Clone)]
 pub struct ProviderRuntimeClient {
     registry: Arc<ProviderRegistry>,
     chain_models: Vec<String>,
