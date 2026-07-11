@@ -125,10 +125,6 @@ pub mod agent;
 pub mod agent_capability;
 #[path = "agent/catalog.rs"]
 pub mod agent_catalog;
-#[path = "agent/agent_collaboration.rs"]
-pub mod agent_collaboration;
-#[path = "agent/agent_discussion.rs"]
-pub mod agent_discussion;
 #[path = "agent/in_process_worker.rs"]
 pub mod agent_in_process_worker;
 #[path = "agent/model_selector.rs"]
@@ -173,8 +169,6 @@ pub mod fact_extraction;
 pub mod input_classifier;
 #[path = "agent/intent_planner.rs"]
 pub mod intent_planner;
-#[path = "agent/joint_problem_solving.rs"]
-pub mod joint_problem_solving;
 #[path = "infrastructure/lane_completion.rs"]
 pub mod lane_completion;
 #[path = "session/mission_command_interpreter.rs"]
@@ -291,14 +285,6 @@ pub use agent_capability::{
     resolve_agent_capability, AgentCapabilityRequest, ResolvedAgentCapability,
 };
 pub use agent_catalog::{AgentCatalog, AgentCatalogEntry};
-pub use agent_collaboration::{
-    AgentTaskTrace, AgentTeam, CollaborationBoard, CollaborationContextResult, CollaborationOps,
-    CollaborationOrchestrator, CollaborationReviewPacket, CollaborationScorecard,
-    CollaborationTask, MemoryPulseCandidate, MemoryPulseKind, SharedBoardEntry, SubTask,
-};
-pub use agent_discussion::{
-    ConsensusMethod, ConsensusResult, Contribution, Discussion, DiscussionEngine, DiscussionPhase,
-};
 pub use agent_in_process_worker::InProcessAgentWorker;
 pub use agent_model_selector::{AgentModelSelection, AgentModelSelectionError, AgentModelSelector};
 pub use agent_process_jsonl_adapter::{ProcessJsonlAdapter, ProcessJsonlSpec};
@@ -337,9 +323,8 @@ pub use checkpoint::{
     CheckpointSummary,
 };
 pub use collaboration_template::{
-    BudgetPolicy, CollaborationContextVisibility, CollaborationDecision, CollaborationPlan,
-    CollaborationPlanAgent, CollaborationRoleSpec, CollaborationTemplate,
-    CollaborationTemplateCatalog, CollaborationTemplateId, CollaborationTemplateMatcher,
+    protocol_id as collaboration_protocol_id, CollaborationDecision, CollaborationTemplateId,
+    CollaborationTemplateMatcher,
 };
 pub use compact::{
     compact_session, estimate_session_tokens, format_compact_summary,
@@ -433,10 +418,6 @@ pub use host::{
 };
 pub use input_classifier::{classify_session_input, RuntimeInputState};
 pub use intent_planner::{classify_intent, IntentPlan, TaskIntent};
-pub use joint_problem_solving::{
-    AgentDiscussion, DiscussionTurn, PhaseStatus, PipelineResult, ProblemSolvingConfig,
-    ProblemSolvingPipeline, ProblemStatement, Solution, SolutionEvaluation, SolutionScore,
-};
 pub use lane_events::{
     dedupe_superseded_commit_events, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
     LaneEventName, LaneEventStatus, LaneFailureClass,

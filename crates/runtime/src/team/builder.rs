@@ -53,6 +53,17 @@ impl TeamBuilder {
         if !request.verdict.accepted {
             return Err("team build requires an accepted collaboration lift verdict".into());
         }
+        if matches!(
+            request.template_id,
+            TeamTemplateId::DebateConsensus
+                | TeamTemplateId::ImplementationReviewFix
+                | TeamTemplateId::IncidentResponse
+        ) {
+            return Err(
+                "protocol templates must be compiled by TeamRuntime through execution_core::protocols"
+                    .into(),
+            );
+        }
         TeamTemplateRegistry::validate(
             request.template_id,
             &request.roles,

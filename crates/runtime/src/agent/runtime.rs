@@ -6,6 +6,7 @@ use harness_contract::agent::{
     AgentCommand, AgentCommandReceipt, AgentCommandRejectReason, AgentCommandRequest, AgentInput,
     AgentLifecycleEvent, AgentReturnPacket, AgentStatus, AgentTaskPacket, AgentTerminalStatus,
 };
+use harness_contract::execution_graph::{ExecutionEdgeKind, ExecutionNodeKind};
 use serde::{Deserialize, Serialize};
 
 use crate::execution_core::graph::executors::{AgentTaskBackend, AgentTaskBackendResolver};
@@ -442,6 +443,7 @@ impl AgentRuntime {
                 ));
             }
         }
+        let packet = self.attach_predecessor_context(packet).await?;
         let backend_kind = backend_from_packet(&packet);
         let selection = match self.selector.select(nonempty(&packet.model_lease)) {
             Ok(selection) => selection,
@@ -543,6 +545,102 @@ impl AgentRuntime {
             Some(returned.clone()),
         )?;
         Ok(returned)
+    }
+
+    /// Derive bounded peer context from the canonical graph projection before a
+    /// dependent AgentTask starts. Graph edges remain the scheduling truth;
+    /// this method only makes already-committed predecessor results visible to
+    /// the next Agent. It has no graph mutation authority and is shared by
+    /// protocol and generic Team graphs.
+    async fn attach_predecessor_context(
+        &self,
+        mut packet: AgentTaskPacket,
+    ) -> Result<AgentTaskPacket, String> {
+        let Some(services) = self.services() else {
+            return Ok(packet);
+        };
+        let Ok(graph) = services
+            .graph_state_store()
+            .load_async(packet.graph_id.clone())
+            .await
+        else {
+            // Isolated AgentRuntime tests and external adapters may execute
+            // standalone packets. They have no graph peer context to attach.
+            return Ok(packet);
+        };
+        let predecessors = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.to == packet.node_id
+                    && matches!(
+                        edge.kind,
+                        ExecutionEdgeKind::DependsOn
+                            | ExecutionEdgeKind::Produces
+                            | ExecutionEdgeKind::Verifies
+                    )
+            })
+            .filter_map(|edge| {
+                graph
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == edge.from && node.kind == ExecutionNodeKind::AgentTask)
+            })
+            .collect::<Vec<_>>();
+        if predecessors.is_empty() {
+            return Ok(packet);
+        }
+
+        let max_chars = predecessor_context_limit(packet.budget_lease.max_tokens);
+        let mut remaining = max_chars;
+        let mut sections = Vec::new();
+        for predecessor in predecessors {
+            let predecessor_packet: AgentTaskPacket =
+                serde_json::from_str(&predecessor.payload_ref).map_err(|error| {
+                    format!(
+                        "predecessor AgentTask packet {} is invalid: {error}",
+                        predecessor.id
+                    )
+                })?;
+            let returned = self
+                .terminal_return(&predecessor_packet.agent_id)
+                .ok_or_else(|| {
+                    format!(
+                        "completed predecessor {} has no AgentRuntime terminal return",
+                        predecessor.id
+                    )
+                })?;
+            if returned.run_id != predecessor_packet.run_id
+                || returned.graph_id != graph.id
+                || returned.node_id != predecessor.id
+                || returned.attempt != predecessor_packet.attempt
+                || returned.expected_graph_revision != predecessor_packet.expected_graph_revision
+            {
+                return Err(format!(
+                    "predecessor AgentRuntime binding mismatch for {}",
+                    predecessor_packet.agent_id
+                ));
+            }
+            let role = predecessor_packet
+                .constraints
+                .iter()
+                .find_map(|constraint| constraint.strip_prefix("protocol_role:"))
+                .unwrap_or(predecessor_packet.agent_id.as_str());
+            let available = remaining.saturating_sub(96);
+            if available == 0 {
+                break;
+            }
+            let outcome = truncate_context_text(&returned.outcome, available);
+            remaining = remaining.saturating_sub(outcome.len().saturating_add(96));
+            sections.push(format!("### Upstream {role}\n{outcome}"));
+        }
+        if !sections.is_empty() {
+            packet.objective.push_str(
+                "\n\n## Canonical upstream results\nUse these completed peer results as evidence. Reconcile contradictions explicitly; do not assume they are independently verified.\n\n",
+            );
+            packet.objective.push_str(&sections.join("\n\n"));
+        }
+        Ok(packet)
     }
 
     pub async fn command(&self, request: AgentCommandRequest) -> AgentCommandReceipt {
@@ -865,6 +963,25 @@ fn backend_from_packet(packet: &AgentTaskPacket) -> AgentBackendKind {
         .any(|constraint| constraint == "backend:process_jsonl")
         .then_some(AgentBackendKind::ProcessJsonl)
         .unwrap_or(AgentBackendKind::InProcess)
+}
+
+fn predecessor_context_limit(budget_tokens: u64) -> usize {
+    let derived = budget_tokens.saturating_div(5).saturating_mul(4) as usize;
+    if derived == 0 {
+        12_000
+    } else {
+        derived.clamp(1_024, 16_384)
+    }
+}
+
+fn truncate_context_text(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let retained = max_chars.saturating_sub(48);
+    let mut output = value.chars().take(retained).collect::<String>();
+    output.push_str("\n[upstream result truncated; canonical result remains in graph evidence]");
+    output
 }
 
 fn terminal_status(status: AgentTerminalStatus) -> AgentStatus {

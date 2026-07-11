@@ -136,7 +136,7 @@ mod tests {
     fn task_kernel_persists_domain_state_without_owning_execution() {
         let path = temp_path("persist");
         let kernel = TaskKernel::open(path.clone()).unwrap();
-        let task = kernel.start_goal("Ship v0.9.475", true).unwrap();
+        let task = kernel.start_goal("Ship v0.9.476", true).unwrap();
 
         let restored = TaskKernel::open(path.clone()).unwrap();
         let current = restored.current().expect("current task should restore");

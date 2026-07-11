@@ -2,6 +2,8 @@ use harness_contract::core::{ExecutionPattern, ExecutionPolicyGate};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::execution_core::ProtocolRef;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeOrchestrationApprovalRequirement {
     pub action: String,
@@ -13,6 +15,8 @@ pub struct RuntimeOrchestrationApprovalRequirement {
 pub struct RuntimeOrchestrationDecision {
     pub selected_pattern: ExecutionPattern,
     pub selected_template: Option<String>,
+    #[serde(default)]
+    pub selected_protocol: Option<ProtocolRef>,
     pub reason: String,
     pub policy_gates: Vec<ExecutionPolicyGate>,
     pub validation_findings: Vec<String>,
@@ -27,6 +31,8 @@ pub struct RuntimeOrchestrationDecision {
 pub struct RuntimeOrchestrationResult {
     pub request_id: String,
     pub status: String,
+    #[serde(default)]
+    pub protocol: Option<ProtocolRef>,
     pub decision: RuntimeOrchestrationDecision,
     pub execution: Value,
     pub evidence: Value,

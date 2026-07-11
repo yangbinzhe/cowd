@@ -43,6 +43,37 @@ impl MaintenanceCandidateKind {
     }
 }
 
+/// Semantic intent for a reviewable memory maintenance candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceCandidateAction {
+    Remember,
+    Refresh,
+    Promote,
+    Retire,
+}
+
+impl MaintenanceCandidateAction {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Remember => "remember",
+            Self::Refresh => "refresh",
+            Self::Promote => "promote",
+            Self::Retire => "retire",
+        }
+    }
+
+    #[must_use]
+    pub const fn candidate_kind(self) -> MaintenanceCandidateKind {
+        match self {
+            Self::Remember | Self::Refresh => MaintenanceCandidateKind::RelationshipRefresh,
+            Self::Promote => MaintenanceCandidateKind::AuthorityPromotion,
+            Self::Retire => MaintenanceCandidateKind::Stale,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MaintenanceCandidateStatus {
@@ -622,6 +653,26 @@ mod tests {
         assert_eq!(candidates[0].kind, MaintenanceCandidateKind::Stale);
         assert_eq!(candidates[0].entry_ids, vec![stale.id]);
         assert!(candidates[0].reason.contains("remains recoverable"));
+    }
+
+    #[test]
+    fn candidate_actions_map_to_existing_review_kinds() {
+        assert_eq!(
+            MaintenanceCandidateAction::Remember.candidate_kind(),
+            MaintenanceCandidateKind::RelationshipRefresh
+        );
+        assert_eq!(
+            MaintenanceCandidateAction::Refresh.candidate_kind(),
+            MaintenanceCandidateKind::RelationshipRefresh
+        );
+        assert_eq!(
+            MaintenanceCandidateAction::Promote.candidate_kind(),
+            MaintenanceCandidateKind::AuthorityPromotion
+        );
+        assert_eq!(
+            MaintenanceCandidateAction::Retire.candidate_kind(),
+            MaintenanceCandidateKind::Stale
+        );
     }
 
     #[test]

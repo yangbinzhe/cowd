@@ -196,61 +196,6 @@ fn obsolete_telemetry_crate_is_not_present() {
 }
 
 #[test]
-fn v5_freezes_legacy_collaboration_protocol_callers_until_v6_removal() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let allowed = [
-        "src/agent/agent_collaboration.rs",
-        "src/agent/joint_problem_solving.rs",
-        "src/lib.rs",
-        "tests/integration_tests.rs",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect::<BTreeSet<_>>();
-    let legacy_contract = format!("{}{}", "Collaboration", "Task");
-    let mut actual = BTreeSet::new();
-    for relative in ["src", "tests"] {
-        collect_matching_files(
-            &manifest_dir.join(relative),
-            manifest_dir,
-            &legacy_contract,
-            &mut actual,
-        );
-    }
-    assert_eq!(
-        actual, allowed,
-        "V5 must not add production callers for the V6-owned legacy collaboration protocol"
-    );
-}
-
-fn collect_matching_files(
-    directory: &Path,
-    manifest_dir: &Path,
-    needle: &str,
-    matches: &mut BTreeSet<String>,
-) {
-    let entries = fs::read_dir(directory).expect("read architecture directory");
-    for entry in entries {
-        let entry = entry.expect("read architecture entry");
-        let path = entry.path();
-        if path.is_dir() {
-            collect_matching_files(&path, manifest_dir, needle, matches);
-        } else if path.extension().is_some_and(|extension| extension == "rs")
-            && fs::read_to_string(&path)
-                .expect("read Rust source")
-                .contains(needle)
-        {
-            matches.insert(
-                path.strip_prefix(manifest_dir)
-                    .expect("source is inside runtime crate")
-                    .to_string_lossy()
-                    .to_string(),
-            );
-        }
-    }
-}
-
-#[test]
 fn runtime_does_not_depend_on_surface_or_connector_contracts() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let cargo_toml = fs::read_to_string(manifest_dir.join("Cargo.toml")).expect("read Cargo.toml");

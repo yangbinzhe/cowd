@@ -193,8 +193,9 @@ pub use knowledge::{
 };
 pub use layers::shared::{L4Event, L4EventBus, L4Operation};
 pub use maintenance::{
-    scan_maintenance_candidates, MaintenanceCandidate, MaintenanceCandidateFilter,
-    MaintenanceCandidateKind, MaintenanceCandidateStatus, MaintenanceQueue, MaintenanceScanConfig,
+    scan_maintenance_candidates, MaintenanceCandidate, MaintenanceCandidateAction,
+    MaintenanceCandidateFilter, MaintenanceCandidateKind, MaintenanceCandidateStatus,
+    MaintenanceQueue, MaintenanceScanConfig,
 };
 pub use memory_authority::{
     authority_decision, authority_level, MemoryAuthorityAction, MemoryAuthorityDecision,

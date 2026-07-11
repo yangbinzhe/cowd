@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use harness_contract::team::{TeamRoleSpec, TeamTemplateId};
 
+use crate::execution_core::{ProtocolCompileRequest, ProtocolId, ProtocolRef, ProtocolRegistry};
 use crate::{
     AgentRuntime, AgentSelector, CollaborationLiftGate, CollaborationLiftInput,
     ExecutionGraphRunner, ExecutionGraphStateStore, LegacyTeamImportReport, RuntimeEventStore,
@@ -62,6 +63,39 @@ impl TeamRuntime {
                 "team lift rejected: {}",
                 verdict.reasons.join("; ")
             ));
+        }
+        if let Some(protocol) = protocol_for_template(request.template_id) {
+            let mut protocol_request = ProtocolCompileRequest::new(
+                ProtocolRef::new(protocol, 1),
+                format!("protocol-team-graph:{}", request.team_id),
+                request.session_id.clone(),
+                request.objective.clone(),
+            );
+            protocol_request.team_id = Some(request.team_id.clone());
+            protocol_request.permission_lease = request.permission_lease.clone();
+            protocol_request.model_lease = request.model_lease.clone();
+            protocol_request.allowed_tools = request
+                .roles
+                .iter()
+                .flat_map(|role| role.allowed_tools.iter().cloned())
+                .collect();
+            protocol_request.allowed_tools.sort();
+            protocol_request.allowed_tools.dedup();
+            protocol_request.budget_lease_id = format!("team-protocol:{}", request.team_id);
+            protocol_request.budget_tokens = 0;
+            protocol_request.budget_revision = 1;
+            protocol_request.fanout = verdict.max_parallel_agents.clamp(2, 4);
+            protocol_request.backend_constraint = request.backend_constraint.clone();
+            ProtocolRegistry::resolve(&protocol_request.protocol)
+                .map_err(|error| error.to_string())?;
+            let graph =
+                ProtocolRegistry::compile(&protocol_request).map_err(|error| error.to_string())?;
+            let graph_id = graph.id.clone();
+            self.runner
+                .start(graph)
+                .await
+                .map_err(|error| error.to_string())?;
+            return self.projection.project(&graph_id);
         }
         let selected_agent_profiles = request
             .roles
@@ -131,5 +165,17 @@ impl TeamRuntime {
                 "terminal_result": team.terminal_result,
             })).collect::<Vec<_>>(),
         })
+    }
+}
+
+fn protocol_for_template(template_id: TeamTemplateId) -> Option<ProtocolId> {
+    match template_id {
+        TeamTemplateId::DebateConsensus => Some(ProtocolId::Debate),
+        TeamTemplateId::ImplementationReviewFix => Some(ProtocolId::ReviewFix),
+        TeamTemplateId::IncidentResponse => Some(ProtocolId::Incident),
+        TeamTemplateId::SingleExecutor
+        | TeamTemplateId::ExecuteReview
+        | TeamTemplateId::FanoutResearchSynthesis
+        | TeamTemplateId::LongRunningProject => None,
     }
 }

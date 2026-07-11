@@ -19,6 +19,7 @@ use super::graph::{
     ExecutionStateStoreError, NodeExecutor, NodeExecutorError, NodeExecutorRegistry, ResourceQuota,
     ScopeLockError, ScopeLockManager, WorktreeLeaseError, WorktreeLeaseManager,
 };
+use super::protocols::ProtocolResultReducer;
 use crate::runtime_event_store::RuntimeEventStoreError;
 use crate::{
     AgentRuntime, AgentRuntimeResolver, ApprovalQueue, ConflictArbiter, InProcessAgentWorker,
@@ -299,6 +300,10 @@ impl RuntimeServices {
         let verify_executor = Arc::new(VerifyNodeExecutor::new(graph_state_store.clone()));
         let synthesize_executor = Arc::new(SynthesizeNodeExecutor::new());
         synthesize_executor.install_resolver(Arc::new(TeamResultReducer::new(
+            graph_state_store.clone(),
+            Arc::clone(&agent_runtime),
+        )));
+        synthesize_executor.install_resolver(Arc::new(ProtocolResultReducer::new(
             graph_state_store.clone(),
             Arc::clone(&agent_runtime),
         )));

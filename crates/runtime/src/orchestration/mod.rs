@@ -46,7 +46,68 @@ pub async fn submit_runtime_orchestration_request(
     leased_decision: Option<&RuntimeExecutionDecision>,
     services: &RuntimeServices,
 ) -> RuntimeOrchestrationResult {
-    compile_runtime_orchestration_request(request, leased_decision, Some(services))
+    let (mut result, compiled) =
+        match compile_runtime_orchestration(request, leased_decision, Some(services)) {
+            Ok(compiled) => compiled,
+            Err(result) => return result,
+        };
+    let Some(compiled) = compiled else {
+        return result;
+    };
+    if !should_execute(&result, &compiled) {
+        return result;
+    }
+
+    let graph_id = compiled.graph.id.clone();
+    match services.graph_runner().start(compiled.graph).await {
+        Ok(report) => match services.graph_runner().projection(&graph_id).await {
+            Ok(projection) => {
+                let terminal = projection.terminal_result_ref.clone();
+                result.status = if report.failed > 0 || report.blocked > 0 {
+                    "blocked".to_string()
+                } else if report.waiting > 0 {
+                    "waiting".to_string()
+                } else {
+                    "completed".to_string()
+                };
+                result.decision.status = result.status.clone();
+                result.execution = json!({
+                    "type": "execution_graph_run",
+                    "status": result.status,
+                    "protocol": compiled.protocol,
+                    "report": report,
+                    "projection": projection,
+                    "terminal_result_ref": terminal,
+                });
+                result.evidence["accepted"] = Value::Bool(true);
+                result.evidence["executed"] = Value::Bool(true);
+                result.evidence["graph_id"] = Value::String(graph_id);
+            }
+            Err(error) => {
+                result.status = "blocked".to_string();
+                result.decision.status = result.status.clone();
+                result
+                    .decision
+                    .validation_findings
+                    .push(format!("execution_projection_unavailable:{error}"));
+            }
+        },
+        Err(error) => {
+            result.status = "blocked".to_string();
+            result.decision.status = result.status.clone();
+            result
+                .decision
+                .validation_findings
+                .push(format!("execution_graph_run_failed:{error}"));
+        }
+    }
+    result
+}
+
+fn should_execute(result: &RuntimeOrchestrationResult, compiled: &CompiledOrchestration) -> bool {
+    result.status == "compiled"
+        && compiled.protocol.is_some()
+        && result.decision.status == "compiled"
 }
 
 fn compile_runtime_orchestration_request(
@@ -101,6 +162,9 @@ fn compile_runtime_orchestration(
         }
     };
     let compiled_ok = compiled.is_some();
+    decision.selected_protocol = compiled
+        .as_ref()
+        .and_then(|compiled| compiled.protocol.clone());
     let status = if decision.status == "rejected" || decision.status == "needs_approval" {
         decision.status.clone()
     } else if compiled_ok {
@@ -123,6 +187,7 @@ fn compile_runtime_orchestration(
                 "status": "compiled",
                 "graph": compiled.graph,
                 "command": compiled.command,
+                "protocol": compiled.protocol,
             })
         },
     );
@@ -131,6 +196,9 @@ fn compile_runtime_orchestration(
         RuntimeOrchestrationResult {
             request_id,
             status,
+            protocol: compiled
+                .as_ref()
+                .and_then(|compiled| compiled.protocol.clone()),
             decision,
             execution,
             evidence,
@@ -188,7 +256,64 @@ fn orchestration_evidence(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use harness_contract::agent::{AgentReturnPacket, AgentTaskPacket, AgentTerminalStatus};
+
     use super::*;
+
+    struct CompletedProtocolBackend {
+        objectives: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl crate::AgentRuntimeBackend for CompletedProtocolBackend {
+        fn kind(&self) -> crate::AgentBackendKind {
+            crate::AgentBackendKind::InProcess
+        }
+
+        fn capabilities(&self) -> crate::AgentBackendCapabilities {
+            crate::AgentBackendCapabilities::in_process()
+        }
+
+        async fn execute(
+            &self,
+            packet: AgentTaskPacket,
+            selection: crate::AgentModelSelection,
+        ) -> Result<AgentReturnPacket, String> {
+            self.objectives
+                .lock()
+                .expect("objectives")
+                .push(packet.objective.clone());
+            Ok(AgentReturnPacket {
+                run_id: packet.run_id,
+                agent_id: packet.agent_id,
+                task_id: packet.task_id,
+                session_id: packet.session_id,
+                mission_id: packet.mission_id,
+                team_id: packet.team_id,
+                graph_id: packet.graph_id,
+                node_id: packet.node_id,
+                attempt: packet.attempt,
+                expected_graph_revision: packet.expected_graph_revision,
+                status: AgentTerminalStatus::Completed,
+                outcome: "protocol agent completed with evidence-aware output".to_string(),
+                acceptance: vec!["completed".to_string()],
+                evidence_refs: Vec::new(),
+                changes: Vec::new(),
+                conflicts: Vec::new(),
+                unresolved: Vec::new(),
+                input_tokens: 11,
+                output_tokens: 7,
+                model: selection.model,
+                provider: selection.provider,
+                tool_calls: 0,
+                failure: None,
+            })
+        }
+    }
 
     fn request(action: RuntimeOrchestrationAction) -> RuntimeOrchestrationRequest {
         RuntimeOrchestrationRequest {
@@ -197,6 +322,7 @@ mod tests {
             action,
             reason: None,
             template_hint: None,
+            protocol: None,
             capabilities: Vec::new(),
             evidence_refs: Vec::new(),
             constraints: Default::default(),
@@ -243,5 +369,68 @@ mod tests {
             .expect("runtime events")
             .iter()
             .any(|event| event.kind == "execution_graph.planned"));
+    }
+
+    #[tokio::test]
+    async fn deliberation_runs_the_protocol_graph_and_returns_one_terminal_result() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let providers = crate::config::ProvidersConfig {
+            providers: HashMap::from([(
+                "test".to_string(),
+                crate::config::ProviderConfig {
+                    name: "test".to_string(),
+                    base_url: "https://example.test/v1".to_string(),
+                    api_key: "test".to_string(),
+                    models: vec!["fast".to_string()],
+                    protocol: Some("responses".to_string()),
+                },
+            )]),
+        };
+        let services = RuntimeServices::builder(temp.path(), &workspace)
+            .provider_registry(Arc::new(
+                crate::ProviderRegistry::new(providers).expect("provider registry"),
+            ))
+            .build()
+            .expect("runtime services");
+        let objectives = Arc::new(Mutex::new(Vec::new()));
+        services
+            .agent_runtime()
+            .register_backend(Arc::new(CompletedProtocolBackend {
+                objectives: Arc::clone(&objectives),
+            }));
+
+        let result = submit_runtime_orchestration_request(
+            request(RuntimeOrchestrationAction::RequestDeliberation),
+            None,
+            services.as_ref(),
+        )
+        .await;
+
+        assert_eq!(result.status, "completed", "{result:?}");
+        assert_eq!(
+            result.protocol.as_ref().map(|item| item.id),
+            Some(crate::execution_core::ProtocolId::Debate)
+        );
+        assert_eq!(result.execution["type"], "execution_graph_run");
+        assert!(result.execution["terminal_result_ref"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("assistant_json:")));
+        assert_eq!(result.evidence["accepted"], true);
+        assert!(services
+            .event_store()
+            .all_events(200)
+            .expect("runtime events")
+            .iter()
+            .any(|event| event.kind == "agent.terminal"));
+        assert!(objectives
+            .lock()
+            .expect("objectives")
+            .iter()
+            .any(|objective| {
+                objective.contains("## Canonical upstream results")
+                    && objective.contains("### Upstream proposer")
+            }));
     }
 }

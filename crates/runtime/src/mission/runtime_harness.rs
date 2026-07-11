@@ -523,6 +523,17 @@ fn build_initial_execution_graph(
     strategy: &StrategyDecision,
     compile_target: RuntimeCompileTarget,
 ) -> Option<ExecutionGraph> {
+    // Protocol, team, and mission graphs require canonical runtime identities,
+    // leases, and an active Runner. This trace-only facade must not fabricate
+    // look-alike AgentTask graphs; runtime_orchestrate owns their compilation.
+    if matches!(
+        compile_target,
+        RuntimeCompileTarget::DeliberationGraph
+            | RuntimeCompileTarget::TeamGraph
+            | RuntimeCompileTarget::MissionGraph
+    ) {
+        return None;
+    }
     if compile_target == RuntimeCompileTarget::InlineModel
         && !strategy
             .modifiers
@@ -535,11 +546,9 @@ fn build_initial_execution_graph(
         RuntimeCompileTarget::InlineModel => (ExecutionNodeKind::InlineModel, "respond"),
         RuntimeCompileTarget::EvidenceGraph => (ExecutionNodeKind::ToolBatch, "gather-evidence"),
         RuntimeCompileTarget::ExecutionGraph => (ExecutionNodeKind::ToolBatch, "execute"),
-        RuntimeCompileTarget::DeliberationGraph => {
-            (ExecutionNodeKind::AgentTask, "generate-candidates")
-        }
-        RuntimeCompileTarget::TeamGraph => (ExecutionNodeKind::AgentTask, "dispatch-team"),
-        RuntimeCompileTarget::MissionGraph => (ExecutionNodeKind::AgentTask, "mission-checkpoint"),
+        RuntimeCompileTarget::DeliberationGraph
+        | RuntimeCompileTarget::TeamGraph
+        | RuntimeCompileTarget::MissionGraph => unreachable!("handled before trace graph build"),
     };
     let mut first = ExecutionNodeSpec::new(first_kind, "runtime", first_label);
     first.id = first_label.to_string();
@@ -742,17 +751,17 @@ mod tests {
             (
                 "权衡两个架构方案并解决冲突",
                 RuntimeCompileTarget::DeliberationGraph,
-                Some("generate-candidates"),
+                None,
             ),
             (
                 "使用多 Agent 并行审查 runtime gateway memory",
                 RuntimeCompileTarget::TeamGraph,
-                Some("dispatch-team"),
+                None,
             ),
             (
                 "后台持续推进这项长期 mission 任务",
                 RuntimeCompileTarget::MissionGraph,
-                Some("mission-checkpoint"),
+                None,
             ),
         ];
 
@@ -840,7 +849,7 @@ mod tests {
             trace.collaboration_decision.template_id,
             CollaborationTemplateId::LongRunningProject
         );
-        assert!(trace.collaboration_decision.plan.agents.len() >= 3);
+        assert!(trace.collaboration_decision.protocol_id.is_none());
     }
 
     #[test]
@@ -858,11 +867,9 @@ mod tests {
             trace.collaboration_decision.template_id,
             CollaborationTemplateId::DebateConsensus
         );
-        assert!(trace
-            .collaboration_decision
-            .plan
-            .agents
-            .iter()
-            .any(|agent| agent.role_id == "skeptic"));
+        assert_eq!(
+            trace.collaboration_decision.protocol_id.as_deref(),
+            Some("debate@1")
+        );
     }
 }

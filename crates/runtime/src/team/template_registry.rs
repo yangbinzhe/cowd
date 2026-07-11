@@ -1,7 +1,8 @@
 //! Versioned Team template availability and structural validation.
 //!
 //! The registry is a pure compiler input. It owns no mutable state, scheduler,
-//! or fallback role loop: unavailable protocols fail before graph registration.
+//! or fallback role loop. Protocol templates are available through TeamRuntime,
+//! while the generic TeamBuilder remains restricted to V5 graph templates.
 
 use harness_contract::team::{TeamRoleSpec, TeamTemplateAvailability, TeamTemplateId};
 
@@ -76,9 +77,9 @@ impl TeamTemplateRegistry {
             TeamTemplateId::FanoutResearchSynthesis => {
                 ("fanout_research_synthesis@1", Available, false)
             }
-            TeamTemplateId::DebateConsensus => ("debate@1", Unavailable, true),
-            TeamTemplateId::ImplementationReviewFix => ("review_fix@1", Unavailable, true),
-            TeamTemplateId::IncidentResponse => ("incident@1", Unavailable, true),
+            TeamTemplateId::DebateConsensus => ("debate@1", Available, true),
+            TeamTemplateId::ImplementationReviewFix => ("review_fix@1", Available, true),
+            TeamTemplateId::IncidentResponse => ("incident@1", Available, true),
             TeamTemplateId::LongRunningProject => ("mission_schedule@1", Unavailable, true),
         };
         TeamTemplateSpec {
@@ -178,12 +179,12 @@ mod tests {
                 .iter()
                 .filter(|spec| spec.availability == TeamTemplateAvailability::Available)
                 .count(),
-            3
+            6
         );
     }
 
     #[test]
-    fn available_templates_validate_and_future_templates_fail_before_graph_creation() {
+    fn available_templates_validate_when_their_runtime_owner_is_installed() {
         let roles = vec![role("executor"), role("reviewer")];
         assert!(TeamTemplateRegistry::validate(
             TeamTemplateId::ExecuteReview,
@@ -194,12 +195,8 @@ mod tests {
             }],
         )
         .is_ok());
-        assert!(matches!(
-            TeamTemplateRegistry::validate(TeamTemplateId::DebateConsensus, &roles, &[]),
-            Err(TeamTemplateValidationError::Unavailable {
-                available_in: "V6",
-                ..
-            })
-        ));
+        assert!(
+            TeamTemplateRegistry::validate(TeamTemplateId::DebateConsensus, &roles, &[]).is_ok()
+        );
     }
 }

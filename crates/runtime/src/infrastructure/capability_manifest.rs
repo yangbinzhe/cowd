@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 
 use crate::context_runtime::ContextProfile;
 use crate::evidence_planner::EvidencePlan;
+use crate::execution_core::ProtocolRegistry;
 use crate::execution_core::{
     action_selection_report_for_decision, build_runtime_execution_decision,
     execution_pattern_catalog_response, rewoo_plan_for_intent_with_evidence_plan,
@@ -35,8 +36,19 @@ pub struct RuntimeCapabilityManifest {
 pub struct RuntimeCapabilityCatalog {
     pub name: String,
     pub templates: Vec<RuntimeTemplateSummary>,
+    pub protocols: Vec<RuntimeProtocolSummary>,
     pub operation_groups: Vec<RuntimeOperationGroup>,
     pub action_contracts: Vec<RuntimeActionContract>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeProtocolSummary {
+    pub protocol_id: String,
+    pub version: u32,
+    pub availability: String,
+    pub summary: String,
+    pub role_ids: Vec<String>,
+    pub supports_bounded_repair: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,9 +179,25 @@ impl RuntimeCapabilityCatalog {
                 best_for: template_best_for(template.template_id),
             })
             .collect();
+        let protocols = ProtocolRegistry::all()
+            .into_iter()
+            .map(|protocol| RuntimeProtocolSummary {
+                protocol_id: protocol.id.to_string(),
+                version: protocol.version,
+                availability: if protocol.availability.is_available() {
+                    "available".to_string()
+                } else {
+                    "unavailable".to_string()
+                },
+                summary: protocol.summary,
+                role_ids: protocol.roles.into_iter().map(|role| role.id).collect(),
+                supports_bounded_repair: protocol.repair_policy.max_revisions > 0,
+            })
+            .collect();
         Self {
             name: "cowd-runtime-capability-catalog".to_string(),
             templates,
+            protocols,
             operation_groups: vec![
                 operation_group(
                     "execution_graph",
@@ -284,6 +312,20 @@ impl RuntimeCapabilityCatalog {
             ],
             action_contracts: vec![
                 action_contract(
+                    "run_deliberation_protocol",
+                    "request_deliberation",
+                    "Conflicting options, evidence quality, or material tradeoffs need proposer/critic/arbitration rather than a string consensus.",
+                    &["intent", "session_id", "protocol optional"],
+                    &["execution_graph", "graph_projection", "terminal_result_ref"],
+                ),
+                action_contract(
+                    "run_review_fix_protocol",
+                    "request_reflexion_retry",
+                    "A bounded implementation or answer needs independent review and exactly one explicit remediation pass.",
+                    &["intent", "session_id", "reason optional"],
+                    &["execution_graph", "graph_projection", "terminal_result_ref"],
+                ),
+                action_contract(
                     "use_team_template",
                     "request_team",
                     "Complex implementation, audit, research, debate, incident, or long-running work benefits from role split.",
@@ -377,7 +419,7 @@ impl RuntimeCapabilityManifest {
                     ],
                 ),
                 capability(
-                    "agent_collaboration",
+                    "agent_team_protocols",
                     "Runtime owns subagent, team, collaboration, mission/session, and verification affordances for complex tasks; these are orchestration affordances, not always direct provider tools.",
                     &["runtime_capabilities"],
                     &[
@@ -757,9 +799,23 @@ fn backend_capabilities(
             })
         })
         .collect::<Vec<_>>();
+    let protocols = catalog
+        .protocols
+        .iter()
+        .map(|protocol| {
+            json!({
+                "id": protocol.protocol_id,
+                "version": protocol.version,
+                "availability": protocol.availability,
+                "summary": protocol.summary,
+                "roles": protocol.role_ids,
+                "supports_bounded_repair": protocol.supports_bounded_repair,
+            })
+        })
+        .collect::<Vec<_>>();
     match detail {
         "execution_patterns" => execution_pattern_catalog_response(),
-        "team_templates" => json!({ "collaboration_templates": templates }),
+        "team_templates" => json!({ "collaboration_templates": templates, "protocols": protocols }),
         "agent_catalog" => json!({
             "role_intents": ["planner", "researcher", "executor", "reviewer", "merger", "memory_curator", "human"],
             "execution_profiles": [
@@ -774,6 +830,7 @@ fn backend_capabilities(
             "action_selection": action_selection,
             "execution_patterns": execution_pattern_catalog_response(),
             "collaboration_templates": templates,
+            "protocols": protocols,
             "runtime_action_contract": catalog.action_contracts,
         }),
         "action_selection" => json!(action_selection),

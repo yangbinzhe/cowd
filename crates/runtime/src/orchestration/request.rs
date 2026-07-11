@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::execution_core::ProtocolRef;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeOrchestrationRequest {
     pub intent: String,
@@ -11,6 +13,10 @@ pub struct RuntimeOrchestrationRequest {
     pub reason: Option<String>,
     #[serde(default)]
     pub template_hint: Option<String>,
+    /// Optional explicit protocol contract. When omitted, runtime selects a
+    /// compatible protocol from the requested action and template semantics.
+    #[serde(default)]
+    pub protocol: Option<ProtocolRef>,
     #[serde(default)]
     pub capabilities: Vec<String>,
     #[serde(default)]

@@ -56,7 +56,6 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use tracing;
 
-use crate::agent_discussion::DiscussionEngine;
 use crate::budget_policy::{
     clamp_context_budget_ratio_bp, resolve_compact_threshold, RuntimeBudgetInputs,
     RuntimeBudgetPlan,
@@ -833,8 +832,6 @@ pub struct ConversationRuntime<C, T> {
     destructive_semaphore: Arc<Semaphore>,
     /// T4: Semaphore for default/ReadOnly tool concurrency (permits: 8).
     default_semaphore: Arc<Semaphore>,
-    /// Optional discussion engine for multi-agent debate and conflict resolution.
-    discussion_engine: Option<Arc<std::sync::Mutex<DiscussionEngine>>>,
     /// Maximum duration for a single tool execution. `None` means no timeout.
     tool_timeout: Option<Duration>,
 }
@@ -1054,7 +1051,6 @@ where
                 crate::tool_orchestrator::ToolSafetyCategory::Destructive.max_concurrency(),
             )),
             default_semaphore: Arc::new(Semaphore::new(8)),
-            discussion_engine: None,
             tool_timeout: Some(Duration::from_secs(120)),
         }
     }
@@ -1845,11 +1841,6 @@ where
     #[must_use]
     pub fn with_cowd_event_bus(mut self, bus: crate::cowd_event::CowdEventBus) -> Self {
         self.cowd_bus = Some(Arc::new(bus.clone()));
-        if let Some(ref mem) = self.memory_manager {
-            let engine = DiscussionEngine::new(Arc::new(bus), Arc::clone(mem));
-            // Watcher is started lazily on first turn (L1409) to ensure tokio context
-            self.discussion_engine = Some(Arc::new(std::sync::Mutex::new(engine)));
-        }
         self
     }
 
@@ -5058,7 +5049,7 @@ where
             "collaboration": {
                 "template_id": trace.collaboration_decision.template_id.as_str(),
                 "rationale": trace.collaboration_decision.rationale,
-                "plan": trace.collaboration_decision.plan,
+                "protocol_id": trace.collaboration_decision.protocol_id,
             },
             "context": {
                 "epoch_id": trace.context_epoch.epoch_id,

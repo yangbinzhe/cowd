@@ -113,6 +113,7 @@ pub fn validate_request(
                 .recommended_template
                 .map(|template| template.as_str().to_string())
         }),
+        selected_protocol: request.protocol.clone(),
         reason: request.reason.clone().unwrap_or_else(|| {
             "runtime compiled model intent through the leased strategy decision".to_string()
         }),

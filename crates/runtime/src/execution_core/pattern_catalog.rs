@@ -92,7 +92,7 @@ impl ExecutionPatternCatalog {
                     "Compare competing proposals and resolve material evidence conflicts.",
                     &["architecture tradeoff", "what-if", "conflicting evidence"],
                     &["straightforward factual answer", "no material uncertainty"],
-                    &["debate_consensus", "joint_problem_solving"],
+                    &["debate@1", "jps@1"],
                     &["agent_runtime", "evidence_ledger", "verification"],
                     RuntimeCompileTarget::DeliberationGraph,
                 ),

@@ -12,6 +12,7 @@ pub mod graph;
 pub mod model_affordance;
 pub mod orchestration_binding;
 pub mod pattern_catalog;
+pub mod protocols;
 pub mod reflexion;
 pub mod report;
 pub mod rewoo_plan;
@@ -36,6 +37,15 @@ pub use orchestration_binding::{
 pub use pattern_catalog::{
     execution_pattern_catalog_response, ExecutionPatternCatalog, RuntimeCompileTarget,
     RuntimeExecutionPatternSpec,
+};
+pub use protocols::{
+    compile_debate, compile_incident, compile_jps, compile_review_fix, validate_protocol_graph,
+    validate_protocol_registry, validate_protocol_request, validate_protocol_spec,
+    DebateProtocolCompiler, IncidentProtocolCompiler, JpsProtocolCompiler, OutputSpec,
+    ProtocolAvailability, ProtocolCompileError, ProtocolCompileRequest, ProtocolExecutorKind,
+    ProtocolId, ProtocolRef, ProtocolRegistry, ProtocolResultReducer, ProtocolSpec,
+    ProtocolValidationError, RepairPolicy, RepairTrigger, ReviewFixProtocolCompiler,
+    RoleDependencyKind, RoleDependencySpec, RoleSpec, StopPolicy,
 };
 pub use reflexion::{ReflexionRecord, ReflexionTrigger};
 pub use report::RuntimeExecutionReportSpec;
