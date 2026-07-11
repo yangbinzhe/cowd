@@ -20,7 +20,6 @@ use harness_contract::{
         TurnJournalPhase, TurnReceipt, TurnStatus,
     },
 };
-use runtime::agent_collaboration::CollaborationContextResult;
 use session::SessionLeaseRegistry;
 use tokio::time::timeout;
 
@@ -471,17 +470,22 @@ impl RuntimeService {
                 }),
         );
         carriers.extend(
-            runtime::global_team_runtime_service()
+            self.runtime_services()
+                .team_runtime()
                 .list()
+                .unwrap_or_default()
                 .into_iter()
                 .map(|snapshot| {
-                    let status = upgrade_team_status(&snapshot.status);
+                    let status = upgrade_team_status(snapshot.status.as_str());
                     upgrade_carrier_record(
                         "team",
                         snapshot.team_id.clone(),
                         status,
-                        snapshot.updated_at_ms,
-                        snapshot.result_artifact_file.clone(),
+                        snapshot.graph_revision,
+                        snapshot
+                            .terminal_result
+                            .as_ref()
+                            .map(|result| result.result_ref.clone()),
                         Some(format!(
                             "mission://session/{}/team/{}",
                             snapshot.session_id, snapshot.team_id
@@ -496,6 +500,7 @@ impl RuntimeService {
                 .projection(
                     self.runtime_services.session_relations(),
                     self.runtime_services.agent_runtime(),
+                    self.runtime_services.team_runtime(),
                 )
                 .sessions
                 .into_iter()
@@ -1910,15 +1915,6 @@ impl RuntimeService {
         runtime_guard.last_context_turn_report()
     }
 
-    pub(crate) async fn take_collaboration_result(
-        &self,
-        session_id: &str,
-    ) -> Option<CollaborationContextResult> {
-        let runtime_entry = self.sessions.get(session_id)?;
-        let runtime_guard = runtime_entry.lock().await;
-        runtime_guard.take_collaboration_result()
-    }
-
     pub(crate) async fn snapshot(&self) -> RuntimeBoundarySnapshot {
         let mut session_ids = self.sessions.list();
         session_ids.sort();
@@ -2022,15 +2018,17 @@ fn upgrade_agent_status(
     }
 }
 
-fn upgrade_team_status(status: &runtime::TeamRuntimeStatus) -> runtime::UpgradeCarrierStatus {
+fn upgrade_team_status(status: &str) -> runtime::UpgradeCarrierStatus {
     match status {
-        runtime::TeamRuntimeStatus::Planned => runtime::UpgradeCarrierStatus::Ready,
-        runtime::TeamRuntimeStatus::Running => runtime::UpgradeCarrierStatus::Running,
-        runtime::TeamRuntimeStatus::Paused => runtime::UpgradeCarrierStatus::Paused,
-        runtime::TeamRuntimeStatus::ReviewRequested => runtime::UpgradeCarrierStatus::Waiting,
-        runtime::TeamRuntimeStatus::Completed => runtime::UpgradeCarrierStatus::Completed,
-        runtime::TeamRuntimeStatus::Cancelled => runtime::UpgradeCarrierStatus::Cancelled,
-        runtime::TeamRuntimeStatus::Failed => runtime::UpgradeCarrierStatus::Failed,
+        "planned" => runtime::UpgradeCarrierStatus::Ready,
+        "running" => runtime::UpgradeCarrierStatus::Running,
+        "paused" => runtime::UpgradeCarrierStatus::Paused,
+        "waiting" | "review_required" => runtime::UpgradeCarrierStatus::Waiting,
+        "completed" => runtime::UpgradeCarrierStatus::Completed,
+        "cancelled" => runtime::UpgradeCarrierStatus::Cancelled,
+        "failed" => runtime::UpgradeCarrierStatus::Failed,
+        "blocked" => runtime::UpgradeCarrierStatus::Blocked,
+        _ => runtime::UpgradeCarrierStatus::Blocked,
     }
 }
 
@@ -2199,7 +2197,7 @@ mod tests {
             runtime::UpgradeCarrierStatus::Completed
         );
         assert_eq!(
-            upgrade_team_status(&runtime::TeamRuntimeStatus::ReviewRequested),
+            upgrade_team_status("review_required"),
             runtime::UpgradeCarrierStatus::Waiting
         );
         assert_eq!(

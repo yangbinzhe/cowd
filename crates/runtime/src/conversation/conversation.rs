@@ -56,7 +56,6 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use tracing;
 
-use crate::agent_collaboration::{CollaborationContextResult, CollaborationOps};
 use crate::agent_discussion::DiscussionEngine;
 use crate::budget_policy::{
     clamp_context_budget_ratio_bp, resolve_compact_threshold, RuntimeBudgetInputs,
@@ -788,8 +787,6 @@ pub struct ConversationRuntime<C, T> {
     memory_callback: Option<Arc<dyn MemoryCallback>>,
     /// Optional smart approval gate for intelligent command approval (P0-1).
     approval_gate: Option<Arc<crate::approval_gate::SmartApprovalGate>>,
-    /// Type-erased collaboration orchestrator for multi-agent task dispatch.
-    collaboration: Option<Arc<dyn CollaborationOps>>,
     /// Skill capability profiles already inspected by the Skill asset layer and
     /// visible to this runtime.
     skill_profiles: Vec<SkillCapabilityProfile>,
@@ -813,8 +810,6 @@ pub struct ConversationRuntime<C, T> {
     runtime_control_policy: RuntimeControlPolicy,
     /// Runtime-owned context supplied by outer orchestration layers.
     external_context_items: std::sync::Mutex<Vec<ContextItem>>,
-    /// Latest multi-agent collaboration packet for outer persistence.
-    last_collaboration_result: std::sync::Mutex<Option<CollaborationContextResult>>,
     /// Bounded short-term tool trace context for subsequent turns.
     tool_trace_context_items: std::sync::Mutex<Vec<ContextItem>>,
     /// Governance observations produced by tool calls in the active turn.
@@ -1026,7 +1021,6 @@ where
             sse_callback: None,
             memory_callback: None,
             approval_gate: None,
-            collaboration: None,
             skill_profiles: Vec::new(),
             agent_skill_profile: AgentSkillProfile::default(),
             project_phase: "Discovery".to_string(),
@@ -1040,7 +1034,6 @@ where
             context_profile: std::sync::Mutex::new(ContextProfile::MainTurn),
             runtime_control_policy,
             external_context_items: std::sync::Mutex::new(Vec::new()),
-            last_collaboration_result: std::sync::Mutex::new(None),
             tool_trace_context_items: std::sync::Mutex::new(Vec::new()),
             turn_tool_observations: std::sync::Mutex::new(Vec::new()),
             tool_exposure_state: std::sync::Mutex::new(None),
@@ -1116,22 +1109,6 @@ where
             .lock()
             .ok()
             .and_then(|guard| guard.clone())
-    }
-
-    /// Return the latest collaboration result emitted during a runtime turn.
-    pub fn last_collaboration_result(&self) -> Option<CollaborationContextResult> {
-        self.last_collaboration_result
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
-    }
-
-    /// Take the latest collaboration result so outer layers can persist it once.
-    pub fn take_collaboration_result(&self) -> Option<CollaborationContextResult> {
-        self.last_collaboration_result
-            .lock()
-            .ok()
-            .and_then(|mut guard| guard.take())
     }
 
     /// Return the active context profile used for the next envelope.
@@ -1714,12 +1691,6 @@ where
         prompt
     }
 
-    fn clear_collaboration_result(&self) {
-        if let Ok(mut guard) = self.last_collaboration_result.lock() {
-            *guard = None;
-        }
-    }
-
     #[must_use]
     pub fn with_auto_compaction_input_tokens_threshold(mut self, threshold: u32) -> Self {
         self.auto_compaction_input_tokens_threshold = threshold;
@@ -1837,17 +1808,6 @@ where
         gate: Arc<crate::approval_gate::SmartApprovalGate>,
     ) -> Self {
         self.approval_gate = Some(gate);
-        self
-    }
-
-    /// Inject a type-erased [`CollaborationOrchestrator`] for multi-agent dispatch.
-    ///
-    /// # Safety
-    /// The orchestrator MUST NOT capture an `Arc` to the `ConversationRuntime`
-    /// itself, as this would create a reference cycle and leak memory.
-    #[must_use]
-    pub fn with_collaboration(mut self, c: Arc<dyn CollaborationOps>) -> Self {
-        self.collaboration = Some(c);
         self
     }
 
@@ -2182,7 +2142,6 @@ where
         }
         let started_at = Instant::now();
         if first_step {
-            self.clear_collaboration_result();
             self.clear_turn_tool_observations();
             let budget = self.runtime_budget_plan();
             if let Ok(mut ledger) = self.turn_context_ledger.lock() {
@@ -2210,8 +2169,7 @@ where
             tools_available: self.tool_executor.has_registered_tools(),
             collaboration_available: self.runtime_control_policy.enabled
                 && self.runtime_control_policy.agent.enabled
-                && (self.collaboration.is_some()
-                    || self.tool_executor.collaboration_runtime_available()),
+                && self.tool_executor.collaboration_runtime_available(),
             mission_available: self.runtime_control_policy.enabled
                 && self.tool_executor.mission_runtime_available(),
             observed: true,

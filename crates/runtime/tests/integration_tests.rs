@@ -363,13 +363,11 @@ fn provider_failure_flows_through_recovery_to_policy() {
     );
 }
 
-/// TeamDiscovery + AgentDirectory integration:
-/// TeamDiscoveryProtocol correctly discovers and ranks agents from the
-/// global AgentDirectory by skill overlap.
+/// AgentDirectory remains a scoped catalog for collaboration planning; it is
+/// not a persisted Team registry.
 #[test]
-fn team_discovery_ranks_by_skill_overlap_from_directory() {
+fn agent_directory_filters_by_skill_overlap() {
     use memory::agent_directory::{AgentDirectory, AgentInfo, AgentStatus};
-    use runtime::team_discovery::TeamDiscoveryProtocol;
 
     let rust_skill = "rust-td-rank-unique";
     let testing_skill = "testing-td-rank-unique";
@@ -418,11 +416,25 @@ fn team_discovery_ranks_by_skill_overlap_from_directory() {
         directory.register(a.clone());
     }
 
-    let discovery = TeamDiscoveryProtocol::new().with_directory(std::sync::Arc::clone(&directory));
-    let ranked = discovery.discover_team(
-        "Build a Rust microservice with tests",
-        &[rust_skill.into(), testing_skill.into()],
-    );
+    let mut ranked = directory.discover(&[rust_skill.into(), testing_skill.into()]);
+    ranked.sort_by(|left, right| {
+        right
+            .capabilities
+            .iter()
+            .filter(|capability| {
+                capability.as_str() == rust_skill || capability.as_str() == testing_skill
+            })
+            .count()
+            .cmp(
+                &left
+                    .capabilities
+                    .iter()
+                    .filter(|capability| {
+                        capability.as_str() == rust_skill || capability.as_str() == testing_skill
+                    })
+                    .count(),
+            )
+    });
 
     assert_eq!(ranked.len(), 2);
     assert_eq!(ranked[0].agent_id, "rust-expert"); // 2 matches (rust+testing)
@@ -437,11 +449,10 @@ fn team_discovery_ranks_by_skill_overlap_from_directory() {
     }
 }
 
-/// TeamDiscovery + CollaborationOrchestrator integration:
-/// The orchestrator's assemble_team() uses reputation-aware discovery
+/// Collaboration planning uses the scoped AgentDirectory directly and
 /// and produces a valid AgentTeam with leader and workers.
 #[test]
-fn orchestrator_assemble_team_uses_discovery_protocol() {
+fn orchestrator_assemble_team_uses_scoped_agent_directory() {
     use memory::agent_directory::{AgentDirectory, AgentInfo, AgentStatus, ReputationScore};
     use runtime::agent::{SubAgentConfig, SubAgentError, SubAgentExecutor, SubAgentResult};
     use runtime::agent_collaboration::{CollaborationOrchestrator, CollaborationTask};
@@ -526,14 +537,35 @@ fn orchestrator_assemble_team_uses_discovery_protocol() {
     }
 }
 
-/// TeamDiscovery auto_assemble + empty directory returns None.
+/// Empty scoped catalog produces no team.
 #[test]
-fn auto_assemble_returns_none_when_directory_empty() {
-    use runtime::team_discovery::TeamDiscoveryProtocol;
+fn collaboration_assembly_returns_none_when_directory_empty() {
+    use memory::agent_directory::AgentDirectory;
+    use runtime::agent::{SubAgentConfig, SubAgentError, SubAgentExecutor, SubAgentResult};
+    use runtime::agent_collaboration::{CollaborationOrchestrator, CollaborationTask};
 
-    let discovery = TeamDiscoveryProtocol::new();
-    let result = discovery.auto_assemble("any task", &["rust".into()]);
-    assert!(result.is_none());
+    struct NoopExecutor;
+    impl SubAgentExecutor for NoopExecutor {
+        fn execute(
+            &self,
+            _config: SubAgentConfig,
+            _task: &str,
+        ) -> impl std::future::Future<Output = Result<SubAgentResult, SubAgentError>> {
+            async { Ok(SubAgentResult::default()) }
+        }
+    }
+
+    let orchestrator = CollaborationOrchestrator::new(std::sync::Arc::new(NoopExecutor))
+        .with_directory(std::sync::Arc::new(AgentDirectory::new()));
+    assert!(orchestrator
+        .assemble_team(&CollaborationTask {
+            description: "any task".to_string(),
+            required_capabilities: vec!["rust".to_string()],
+            subtasks: Vec::new(),
+            review_criteria: None,
+            collaboration_decision: None,
+        })
+        .is_none());
 }
 
 /// AgentReputation + AgentDirectory integration:

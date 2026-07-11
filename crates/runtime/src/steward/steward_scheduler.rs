@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use crate::{
     global_steward_runtime_service, MissionCommandExecutionReceipt, MissionCommandInterpreter,
     MissionControlRuntime, SessionDispatchMode, SessionExecutionPolicy, StewardLoopReport,
-    TeamExecutionLoop,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -276,9 +275,9 @@ impl StewardScheduler {
         let mut team_submissions = Vec::new();
         let mut errors = steward_loop.errors.clone();
         for team in projection.teams.iter().take(config.max_team_ticks) {
-            match TeamExecutionLoop::plan(&team.team_id) {
-                Ok(plan) => {
-                    let expected_revision = plan.execution_graph.revision;
+            match services.graph_state_store().load(&team.graph_id) {
+                Ok(graph) => {
+                    let expected_revision = graph.revision;
                     ledger_records.push(global_steward_decision_ledger().push(
                         StewardDecisionLedgerRecord {
                             record_id: String::new(),
@@ -286,20 +285,20 @@ impl StewardScheduler {
                             action: "team_execution_graph_submission".to_string(),
                             status: "capability_unavailable".to_string(),
                             summary: format!(
-                                "prepared team {} graph; collaborate executor activates in V5",
+                                "observed canonical team {} graph; ExecutionGraphRunner owns advancement",
                                 team.team_id
                             ),
                             evidence_refs: vec![format!(
                                 "execution-graph:{}",
-                                plan.execution_graph.id
+                                graph.id
                             )],
                             created_at_ms: 0,
                         },
                     ));
                     team_submissions.push(StewardGraphSubmission {
                         team_id: team.team_id.clone(),
-                        status: "capability_unavailable:collaborate:V5".to_string(),
-                        graph: plan.execution_graph,
+                        status: "runner_owned".to_string(),
+                        graph,
                         command: ExecutionGraphCommand::Start { expected_revision },
                     });
                 }

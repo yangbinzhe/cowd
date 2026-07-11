@@ -3,9 +3,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    candidate_from_action, global_steward_runtime_service, global_team_runtime_service,
-    MissionSessionCommandStatus, RuntimeEventInput, RuntimeEventRef, RuntimeEventReplayer,
-    RuntimeEventScope, RuntimeRecoveryAction, RuntimeRecoveryActionKind, RuntimeRecoveryCandidate,
+    candidate_from_action, global_steward_runtime_service, MissionSessionCommandStatus,
+    RuntimeEventInput, RuntimeEventRef, RuntimeEventReplayer, RuntimeEventScope,
+    RuntimeRecoveryAction, RuntimeRecoveryActionKind, RuntimeRecoveryCandidate,
     RuntimeReplayReport, RuntimeServices,
 };
 
@@ -76,7 +76,11 @@ fn augmented_candidates(
         .collect::<Vec<_>>();
     for command in services
         .mission_runtime()
-        .projection(services.session_relations(), services.agent_runtime())
+        .projection(
+            services.session_relations(),
+            services.agent_runtime(),
+            services.team_runtime(),
+        )
         .session_commands
     {
         let (action, risk, precondition) = match command.status {
@@ -287,13 +291,10 @@ fn apply_action(
             }
         }
         RuntimeRecoveryActionKind::MarkInterrupted if action.stream_id.starts_with("team:") => {
-            let team_id = action.stream_id.trim_start_matches("team:");
-            match global_team_runtime_service()
-                .request_review(team_id, "recovery required after interrupted runtime event")
-            {
-                Ok(_) => RecoveryApplyOutcome::Applied("team marked review_required".to_string()),
-                Err(error) => RecoveryApplyOutcome::Failed(error),
-            }
+            RecoveryApplyOutcome::Skipped(
+                "team recovery is derived from the durable ExecutionGraph; no mutable team state exists"
+                    .to_string(),
+            )
         }
         RuntimeRecoveryActionKind::MarkInterrupted if action.stream_id.starts_with("agent:") => {
             RecoveryApplyOutcome::Skipped(

@@ -345,7 +345,7 @@ pub struct ResumeContextPacket {
 pub enum ResumeContextSource {
     SessionDb,
     Handoff,
-    TaskRegistry,
+    ExecutionGraph,
     Mixed,
 }
 
@@ -1794,7 +1794,7 @@ impl ContextRuntimeKernel {
         let source = match packet.source {
             ResumeContextSource::SessionDb => ContextSourceKind::Conversation,
             ResumeContextSource::Handoff | ResumeContextSource::Mixed => ContextSourceKind::Handoff,
-            ResumeContextSource::TaskRegistry => ContextSourceKind::Task,
+            ResumeContextSource::ExecutionGraph => ContextSourceKind::Task,
         };
         let mut item = ContextItem::new(
             format!("resume:{}", packet.session_id),
@@ -2970,7 +2970,7 @@ mod tests {
             .contains(&"session://session-1/resume/Mixed".to_string()));
 
         let mut task_resume = resume.clone();
-        task_resume.source = ResumeContextSource::TaskRegistry;
+        task_resume.source = ResumeContextSource::ExecutionGraph;
         let task_item = ContextRuntimeKernel::resume_item(&task_resume);
         assert_eq!(task_item.source, ContextSourceKind::Task);
         assert!(task_item.content.contains("phase 6"));

@@ -125,7 +125,7 @@ pub fn candidate_from_action(action: &RuntimeRecoveryAction) -> Option<RuntimeRe
         }
         RuntimeEventScope::Goal => "runtime.goal_runtime",
         RuntimeEventScope::Session | RuntimeEventScope::SessionCommand => "runtime.session",
-        RuntimeEventScope::Team => "runtime.team_execution",
+        RuntimeEventScope::Team => "runtime.team_projection",
         RuntimeEventScope::Agent => "runtime.agent_lifecycle",
         RuntimeEventScope::Approval => "runtime.approval_queue",
         RuntimeEventScope::Steward => "runtime.steward_runtime",

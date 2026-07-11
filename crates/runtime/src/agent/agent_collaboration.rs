@@ -13,11 +13,11 @@ use uuid::Uuid;
 use crate::agent::{SubAgentConfig, SubAgentExecutor, SubAgentResult};
 use crate::collaboration_template::{CollaborationDecision, CollaborationTemplateMatcher};
 use crate::context_runtime::ContextItem;
-use crate::execution_graph::{
-    execution_graph_from_collaboration_task, project_collaboration_review,
-};
-use crate::team_discovery::TeamDiscoveryProtocol;
 use crate::wave::{TaskId, WaveConfig, WaveOrchestrator, WaveTask};
+use harness_contract::execution_graph::{
+    ExecutionEdge, ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec,
+    ExecutionNodeStatus,
+};
 use harness_contract::strategy::StrategyDecision;
 
 use memory::agent_directory::{AgentDirectory, AgentInfo};
@@ -60,6 +60,117 @@ pub struct CollaborationContextResult {
     pub collaboration_task: CollaborationTask,
     pub review_packet: CollaborationReviewPacket,
     pub execution_graph: harness_contract::execution_graph::ExecutionGraph,
+}
+
+// V6 removes this legacy protocol as a whole. Until then its graph-shaped
+// evaluation fixture stays private to this module: it must not become a second
+// executable Team entry point beside TeamRuntime.
+fn legacy_execution_graph_from_collaboration_task(
+    session_id: &str,
+    task: &CollaborationTask,
+) -> ExecutionGraph {
+    let mut graph = ExecutionGraph::new(task.description.clone());
+    graph.id = format!("legacy-collaboration-graph-{}", Uuid::new_v4());
+
+    for subtask in &task.subtasks {
+        let mut node = ExecutionNodeSpec::new(
+            ExecutionNodeKind::AgentTask,
+            "legacy.collaboration_fixture",
+            format!("collaboration-task:{}", subtask.id),
+        );
+        node.id = subtask.id.clone();
+        node.idempotency_key = format!("{}:{}", graph.id, subtask.id);
+        node.resource_scopes = vec![format!("session:{session_id}")];
+        graph
+            .node_statuses
+            .insert(node.id.clone(), ExecutionNodeStatus::Planned);
+        graph.nodes.push(node);
+    }
+    graph.edges = task
+        .subtasks
+        .iter()
+        .flat_map(|subtask| {
+            subtask.depends_on.iter().map(|dependency| ExecutionEdge {
+                from: dependency.clone(),
+                to: subtask.id.clone(),
+                kind: ExecutionEdgeKind::DependsOn,
+            })
+        })
+        .collect();
+    graph
+}
+
+fn legacy_project_collaboration_review(
+    graph: &ExecutionGraph,
+    packet: &CollaborationReviewPacket,
+) -> ExecutionGraph {
+    let mut projected = graph.clone();
+    let traces = packet
+        .agent_tasks
+        .iter()
+        .map(|trace| (trace.task_id.as_str(), trace))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    for node in &projected.nodes {
+        let Some(trace) = traces.get(node.id.as_str()) else {
+            continue;
+        };
+        let status = if trace.status.eq_ignore_ascii_case("failed") {
+            ExecutionNodeStatus::Failed
+        } else {
+            ExecutionNodeStatus::Completed
+        };
+        projected.node_statuses.insert(node.id.clone(), status);
+    }
+
+    for trace in &packet.agent_tasks {
+        if projected.nodes.iter().any(|node| node.id == trace.task_id) {
+            continue;
+        }
+        let mut node = ExecutionNodeSpec::new(
+            ExecutionNodeKind::AgentTask,
+            "legacy.collaboration_fixture",
+            format!("agent-trace:{}", trace.task_id),
+        );
+        node.id = trace.task_id.clone();
+        node.idempotency_key = format!("{}:{}", projected.id, trace.task_id);
+        projected.node_statuses.insert(
+            node.id.clone(),
+            if trace.status.eq_ignore_ascii_case("failed") {
+                ExecutionNodeStatus::Failed
+            } else {
+                ExecutionNodeStatus::Completed
+            },
+        );
+        projected.nodes.push(node);
+    }
+
+    let synthesis_id = format!("synthesis-{}", packet.board_id);
+    if !projected.nodes.iter().any(|node| node.id == synthesis_id) {
+        let mut synthesis = ExecutionNodeSpec::new(
+            ExecutionNodeKind::Synthesize,
+            "legacy.collaboration_fixture",
+            format!("collaboration-board:{}", packet.board_id),
+        );
+        synthesis.id = synthesis_id.clone();
+        synthesis.idempotency_key = format!("{}:{synthesis_id}", projected.id);
+        projected
+            .node_statuses
+            .insert(synthesis_id.clone(), ExecutionNodeStatus::Completed);
+        for node in projected
+            .nodes
+            .iter()
+            .filter(|node| node.kind == ExecutionNodeKind::AgentTask)
+        {
+            projected.edges.push(ExecutionEdge {
+                from: node.id.clone(),
+                to: synthesis_id.clone(),
+                kind: ExecutionEdgeKind::Produces,
+            });
+        }
+        projected.nodes.push(synthesis);
+    }
+    projected
 }
 
 // ── Shared Board / Synthesis Scoring ───────────────────────────────────────────
@@ -284,7 +395,6 @@ pub struct AgentTeam {
 pub struct CollaborationOrchestrator<E: SubAgentExecutor> {
     executor: Arc<E>,
     parent_memory: Option<Arc<memory::CognitiveContextManager>>,
-    discovery: TeamDiscoveryProtocol,
     directory: Arc<AgentDirectory>,
 }
 
@@ -294,7 +404,6 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
         Self {
             executor,
             parent_memory: None,
-            discovery: TeamDiscoveryProtocol::new().with_directory(Arc::clone(&directory)),
             directory,
         }
     }
@@ -304,17 +413,9 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
         self
     }
 
-    /// Inject a `TeamDiscoveryProtocol` for reputation-aware team assembly.
-    pub fn with_discovery(mut self, discovery: TeamDiscoveryProtocol) -> Self {
-        self.directory = Arc::clone(discovery.directory());
-        self.discovery = discovery;
-        self
-    }
-
-    /// Inject the scoped directory used by fallback discovery. The directory is
-    /// owned by the runtime scope, never a process-global singleton.
+    /// Inject the scoped directory used for role selection. Lifecycle truth is
+    /// not stored here; this is only a catalog used while compiling a team.
     pub fn with_directory(mut self, directory: Arc<AgentDirectory>) -> Self {
-        self.discovery = TeamDiscoveryProtocol::new().with_directory(Arc::clone(&directory));
         self.directory = directory;
         self
     }
@@ -353,26 +454,10 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
 
     // ── assemble_team ──────────────────────────────────────────────────────
 
-    /// Query the `TeamDiscoveryProtocol` for agents matching required capabilities,
-    /// ranked by capability-overlap * reputation composite.
-    ///
-    /// Falls back to the basic `AgentDirectory::discover()` if the discovery
-    /// protocol produces no results but raw candidates exist.
-    ///
-    /// The highest-ranked agent is elected leader; the rest become workers.
+    /// Query the scoped directory and rank by capability overlap and optional
+    /// reputation. The selection is metadata only; AgentRuntime owns a chosen
+    /// agent's actual lifecycle once a graph starts it.
     pub fn assemble_team(&self, task: &CollaborationTask) -> Option<AgentTeam> {
-        // Try reputation-aware discovery first.
-        if let Some(discovered) = self
-            .discovery
-            .auto_assemble(&task.description, &task.required_capabilities)
-        {
-            return Some(AgentTeam {
-                leader: discovered.leader,
-                workers: discovered.workers,
-            });
-        }
-
-        // Fallback: simple discovery in this runtime scope.
         let candidates = self.directory.discover(&task.required_capabilities);
         if candidates.is_empty() {
             return None;
@@ -380,19 +465,29 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
         let mut scored: Vec<_> = candidates
             .into_iter()
             .map(|a| {
-                let score = a
+                let overlap = a
                     .capabilities
                     .iter()
                     .filter(|c| task.required_capabilities.contains(c))
                     .count();
-                (score, a)
+                let reputation = a
+                    .reputation
+                    .map(|score| (score.composite() * 100.0) as i64)
+                    .unwrap_or_default();
+                (overlap, reputation, a)
             })
             .collect();
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| right.1.cmp(&left.1))
+                .then_with(|| left.2.agent_id.cmp(&right.2.agent_id))
+        });
 
         let mut iter = scored.into_iter();
-        let leader = iter.next().map(|(_, a)| a).expect("non-empty");
-        let workers: Vec<AgentInfo> = iter.map(|(_, a)| a).collect();
+        let leader = iter.next().map(|(_, _, a)| a).expect("non-empty");
+        let workers: Vec<AgentInfo> = iter.map(|(_, _, a)| a).collect();
 
         Some(AgentTeam { leader, workers })
     }
@@ -794,8 +889,8 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
         let board = self.build_shared_board(&results);
         let agent_tasks = agent_task_traces_from_results(&subtasks, &results, &board.board_id);
         let review_packet = board.review_packet(None, agent_tasks);
-        let execution_graph = project_collaboration_review(
-            &execution_graph_from_collaboration_task("runtime-session", &collab_task),
+        let execution_graph = legacy_project_collaboration_review(
+            &legacy_execution_graph_from_collaboration_task("runtime-session", &collab_task),
             &review_packet,
         );
 
@@ -820,9 +915,9 @@ impl<E: SubAgentExecutor + Default + 'static> Default for CollaborationOrchestra
 
 /// Factory: create a type-erased `Arc<dyn CollaborationOps>`.
 ///
-/// Produces a boxed orchestrator that can be passed to
-/// `ConversationRuntime::with_collaboration()` without propagating the
-/// `E` type parameter.
+/// Produces a boxed legacy orchestrator for isolated evaluation fixtures.
+/// Production conversation execution is graph-owned and never injects this
+/// object into `ConversationRuntime`.
 pub fn new_boxed<E>(executor: Arc<E>) -> Arc<dyn CollaborationOps>
 where
     E: SubAgentExecutor + 'static,

@@ -9,9 +9,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    global_steward_runtime_service, global_team_runtime_service, GlobalApprovalDecision,
-    MissionEvent, MissionProjection, MissionSessionCommandSummary, MissionSessionSnapshot,
-    RuntimeEventInput, RuntimeEventScope, RuntimeServices, StartMissionSessionRequest,
+    global_steward_runtime_service, GlobalApprovalDecision, MissionEvent, MissionProjection,
+    MissionSessionCommandSummary, MissionSessionSnapshot, RuntimeEventInput, RuntimeEventScope,
+    RuntimeServices, StartMissionSessionRequest,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +56,7 @@ pub struct MissionControlSessionNode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MissionControlTeamNode {
     pub team_id: String,
+    pub graph_id: String,
     pub session_id: Option<String>,
     pub status: Option<String>,
     pub agent_count: usize,
@@ -258,10 +259,12 @@ impl MissionControlRuntime {
 }
 
 fn build_projection(services: &RuntimeServices) -> MissionControlProjection {
-    let mission = services
-        .mission_runtime()
-        .projection(services.session_relations(), services.agent_runtime());
-    let team_projection = global_team_runtime_service().projection();
+    let mission = services.mission_runtime().projection(
+        services.session_relations(),
+        services.agent_runtime(),
+        services.team_runtime(),
+    );
+    let team_projection = services.team_runtime().projection_json();
     let agent_projection = serde_json::json!({
         "kind": "runtime.agents",
         "agents": services.agent_runtime().list(),
@@ -426,7 +429,7 @@ fn control_readiness(
                 "no team runtime is available"
             },
             false,
-            Some("runtime.team_execution_loop"),
+            Some("runtime.execution_graph_runner"),
             runnable_teams,
         ),
         readiness(
@@ -674,6 +677,7 @@ fn team_nodes(
         .flatten()
         .filter_map(|team| {
             let team_id = value_string(team, "team_id")?;
+            let graph_id = value_string(team, "graph_id")?;
             let session_id = value_string(team, "session_id").or_else(|| {
                 mission
                     .sessions
@@ -684,6 +688,7 @@ fn team_nodes(
             let agent_count = team["agents"].as_array().map_or(0, Vec::len);
             Some(MissionControlTeamNode {
                 team_id,
+                graph_id,
                 session_id,
                 status: value_string(team, "status"),
                 agent_count,

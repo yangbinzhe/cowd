@@ -192,10 +192,6 @@ impl GatewayRuntimeEntry {
         self.runtime_ref().last_context_envelope()
     }
 
-    pub(crate) fn take_collaboration_result(&self) -> Option<runtime::CollaborationContextResult> {
-        self.runtime_ref().take_collaboration_result()
-    }
-
     fn runtime_ref(&self) -> &runtime::StandardRuntimeHost<GatewayToolExecutor> {
         self.runtime
             .as_ref()

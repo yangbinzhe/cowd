@@ -6,7 +6,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::collaboration_template::CollaborationTemplateCatalog;
 use crate::context_runtime::ContextProfile;
 use crate::evidence_planner::EvidencePlan;
 use crate::execution_core::{
@@ -16,6 +15,7 @@ use crate::execution_core::{
     RuntimeExecutionDecision,
 };
 use crate::EvolutionAppliedCapabilityRecord;
+use crate::TeamTemplateRegistry;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeCapability {
@@ -42,9 +42,10 @@ pub struct RuntimeCapabilityCatalog {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeTemplateSummary {
     pub template_id: String,
-    pub label: String,
-    pub role_count: usize,
-    pub max_parallelism: usize,
+    pub protocol_id: String,
+    pub protocol_version: u32,
+    pub availability: String,
+    pub requires_review: bool,
     pub best_for: Vec<String>,
 }
 
@@ -151,20 +152,19 @@ impl ActiveEvolutionCapabilityOverlay {
 impl RuntimeCapabilityCatalog {
     #[must_use]
     pub fn current() -> Self {
-        let templates = CollaborationTemplateCatalog::built_in()
-            .templates()
-            .iter()
+        let templates = TeamTemplateRegistry::all()
+            .into_iter()
             .map(|template| RuntimeTemplateSummary {
                 template_id: template.template_id.as_str().to_string(),
-                label: template.label.clone(),
-                role_count: template.agent_roles.len(),
-                max_parallelism: template.max_parallelism,
-                best_for: template
-                    .agent_roles
-                    .iter()
-                    .map(|role| role.responsibility.clone())
-                    .take(3)
-                    .collect(),
+                protocol_id: template.protocol_id.to_string(),
+                protocol_version: template.version,
+                availability: match template.availability {
+                    harness_contract::team::TeamTemplateAvailability::Available => "available",
+                    harness_contract::team::TeamTemplateAvailability::Unavailable => "unavailable",
+                }
+                .to_string(),
+                requires_review: template.requires_review,
+                best_for: template_best_for(template.template_id),
             })
             .collect();
         Self {
@@ -177,19 +177,19 @@ impl RuntimeCapabilityCatalog {
                     vec![
                         operation(
                             "build_execution_graph",
-                            "runtime.team_execution",
+                            "runtime.team_builder",
                             "Convert a collaboration template into a validated ExecutionGraph with verify and synthesis nodes.",
                             "I need ordered or parallel team work with visible dependencies.",
                             "ExecutionGraph quality must be DAG-valid and policy-approved before dispatch.",
-                            &["execution_graph_id", "ready_node_ids", "blocked_node_ids"],
+                            &["execution_graph_id", "team_id", "agent_task_bindings"],
                         ),
                         operation(
-                            "tick_ready_nodes",
-                            "runtime.team_execution",
-                            "Dispatch only ready ExecutionGraph nodes under max_parallelism.",
-                            "The team already exists and the next ready work should run.",
-                            "Paused/cancelled teams and blocked nodes are rejected.",
-                            &["ready_node_ids", "running_node_ids", "mission_evidence"],
+                            "inspect_execution_graph",
+                            "runtime.execution_graph_runner",
+                            "Read canonical team progress; ExecutionGraphRunner alone advances ready nodes.",
+                            "The team already exists and progress or terminal evidence is needed.",
+                            "No second team scheduler may mutate graph state.",
+                            &["execution_graph_id", "node_statuses", "terminal_result_ref"],
                         ),
                     ],
                 ),
@@ -743,23 +743,17 @@ fn backend_capabilities(
     action_selection: &crate::execution_core::RuntimeActionSelectionReport,
 ) -> Value {
     let catalog = RuntimeCapabilityCatalog::current();
-    let templates = CollaborationTemplateCatalog::built_in()
-        .templates()
+    let templates = catalog
+        .templates
         .iter()
         .map(|template| {
             json!({
-                "id": template.template_id.as_str(),
-                "name": template.label,
-                "agent_roles": template.agent_roles.iter().map(|role| json!({
-                    "role_id": role.role_id,
-                    "responsibility": role.responsibility,
-                    "allowed_tools": role.allowed_tools,
-                    "evidence_duties": role.evidence_duties,
-                })).collect::<Vec<_>>(),
-                "max_parallelism": template.max_parallelism,
-                "review_contract": template.review_contract,
-                "merge_contract": template.merge_contract,
-                "human_approval_points": template.human_approval_points,
+                "id": template.template_id,
+                "protocol_id": template.protocol_id,
+                "protocol_version": template.protocol_version,
+                "availability": template.availability,
+                "requires_review": template.requires_review,
+                "best_for": template.best_for,
             })
         })
         .collect::<Vec<_>>();
@@ -911,6 +905,32 @@ fn capability(
             .map(|item| item.to_string())
             .collect(),
         when_to_use: when_to_use.iter().map(|item| item.to_string()).collect(),
+    }
+}
+
+fn template_best_for(template_id: harness_contract::team::TeamTemplateId) -> Vec<String> {
+    match template_id {
+        harness_contract::team::TeamTemplateId::SingleExecutor => {
+            vec!["direct bounded work".into()]
+        }
+        harness_contract::team::TeamTemplateId::ExecuteReview => {
+            vec!["execution with independent review".into()]
+        }
+        harness_contract::team::TeamTemplateId::FanoutResearchSynthesis => {
+            vec!["independent evidence gathering".into(), "synthesis".into()]
+        }
+        harness_contract::team::TeamTemplateId::DebateConsensus => {
+            vec!["competing proposals".into()]
+        }
+        harness_contract::team::TeamTemplateId::ImplementationReviewFix => {
+            vec!["implementation, review, and repair".into()]
+        }
+        harness_contract::team::TeamTemplateId::IncidentResponse => {
+            vec!["incident triage and remediation".into()]
+        }
+        harness_contract::team::TeamTemplateId::LongRunningProject => {
+            vec!["durable mission execution".into()]
+        }
     }
 }
 

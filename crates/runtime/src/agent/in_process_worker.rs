@@ -118,10 +118,6 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             external_context_items: Vec::new(),
             skill_profiles: Vec::new(),
             agent_skill_profile: harness_contract::skill::AgentSkillProfile::default(),
-            enable_collaboration: false,
-            subagent_model: selection.model.clone(),
-            subagent_tool_definitions: tool_definitions,
-            subagent_tool_executor: tool_executor,
         });
         let mut runtime = match host {
             Ok(runtime) => runtime,

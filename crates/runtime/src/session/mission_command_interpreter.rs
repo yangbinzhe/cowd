@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     CrossSessionMessage, SessionDispatchMode, SessionExecutionPolicy, StewardAutomationPolicy,
-    TeamExecutionLoop,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,22 +109,11 @@ impl MissionCommandInterpreter {
                     MissionCommandTargetKind::Agent,
                     false,
                 ),
-                MissionCommandTargetKind::Team => {
-                    let team_id = target_ref.trim_start_matches('@').to_string();
-                    match TeamExecutionLoop::plan(&team_id) {
-                        Ok(plan) => graph_interpretation(
-                            command_text,
-                            Some(target_ref),
-                            target_kind,
-                            plan.execution_graph,
-                            vec![
-                                "submit canonical team execution graph".to_string(),
-                                "let ExecutionGraphRunner advance ready nodes".to_string(),
-                            ],
-                        ),
-                        Err(error) => blocked(command_text, Some(target_ref), error),
-                    }
-                }
+                MissionCommandTargetKind::Team => blocked(
+                    command_text,
+                    Some(target_ref),
+                    "team commands require the scoped TeamRuntime command adapter",
+                ),
                 MissionCommandTargetKind::Steward => MissionCommandInterpretation {
                     kind: "runtime.mission_command_interpretation".to_string(),
                     status: "blocked".to_string(),

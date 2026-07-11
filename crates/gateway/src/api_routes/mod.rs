@@ -2417,7 +2417,6 @@ pub(crate) mod tests {
             assert_eq!(created.status(), StatusCode::CREATED);
         }
 
-        let teams_before = runtime::global_team_runtime_service().projection();
         let team = app
             .clone()
             .oneshot(
@@ -2428,7 +2427,7 @@ pub(crate) mod tests {
                     .body(Body::from(
                         serde_json::json!({
                             "objective": "research architecture and review implementation",
-                            "execution_mode": "manual_mailbox"
+                            "backend": "in_process"
                         })
                         .to_string(),
                     ))
@@ -2439,15 +2438,12 @@ pub(crate) mod tests {
         assert_eq!(team.status(), StatusCode::OK);
         let team_json: serde_json::Value =
             serde_json::from_slice(&to_bytes(team.into_body(), usize::MAX).await.unwrap()).unwrap();
-        assert_eq!(team_json["ok"], false);
-        assert_eq!(team_json["status"], "capability_unavailable");
-        assert_eq!(team_json["capability"], "collaborate");
-        assert_eq!(team_json["available_in"], "V5");
-        assert_eq!(team_json["side_effects_started"], false);
-        assert_eq!(
-            runtime::global_team_runtime_service().projection(),
-            teams_before
-        );
+        assert_eq!(team_json["ok"], true);
+        assert!(team_json["team"]["graph_id"].as_str().is_some());
+        assert!(matches!(
+            team_json["status"].as_str(),
+            Some("completed" | "blocked" | "failed" | "running")
+        ));
 
         let approval = app
             .clone()
@@ -8468,7 +8464,7 @@ providers:
         let packet = message_routes::task_resume_context_packet("session-task", &task);
 
         assert_eq!(packet.session_id, "session-task");
-        assert_eq!(packet.source, ResumeContextSource::TaskRegistry);
+        assert_eq!(packet.source, ResumeContextSource::ExecutionGraph);
         assert!(packet
             .active_task
             .as_deref()

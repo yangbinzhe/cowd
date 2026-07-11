@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use crate::agent_collaboration::CollaborationContextResult;
 use crate::conversation::ApiClient;
 use crate::conversation::{ModelStepIntent, ModelToolCall};
 use crate::execution_core::graph::executors::ScopedNodeBackend;
@@ -74,10 +73,6 @@ where
     pub external_context_items: Vec<ContextItem>,
     pub skill_profiles: Vec<SkillCapabilityProfile>,
     pub agent_skill_profile: AgentSkillProfile,
-    pub enable_collaboration: bool,
-    pub subagent_model: String,
-    pub subagent_tool_definitions: Vec<ProviderToolDefinition>,
-    pub subagent_tool_executor: Arc<T>,
 }
 
 impl<T> StandardRuntimeHost<T>
@@ -124,13 +119,6 @@ where
         runtime = runtime.with_cowd_event_bus(CowdEventBus::new());
         for item in config.external_context_items {
             runtime.push_external_context_item(item);
-        }
-
-        if config.enable_collaboration {
-            return Err(
-                "collaboration must be compiled into AgentTask nodes and executed by AgentRuntime"
-                    .to_string(),
-            );
         }
 
         Ok(Self {
@@ -330,10 +318,6 @@ where
 
     pub fn last_context_turn_report(&self) -> Option<harness_contract::context::ContextTurnReport> {
         self.runtime_ref().last_context_turn_report()
-    }
-
-    pub fn take_collaboration_result(&self) -> Option<CollaborationContextResult> {
-        self.runtime_ref().take_collaboration_result()
     }
 
     fn runtime_ref(&self) -> &crate::ConversationRuntime<ProviderRuntimeClient, T> {

@@ -43,10 +43,10 @@ fn runtime_module_map_covers_core_harness_lifecycle_domains() {
         "tool_dispatch",
         "mission_runtime",
         "session_execution",
-        "agent_lifecycle",
-        "team_execution",
+        "agent_runtime",
+        "team_builder",
         "steward_runtime",
-        "global_approval_queue",
+        "approval_queue",
         "runtime_event_store",
         "recovery",
     ] {
@@ -144,7 +144,7 @@ fn runtime_source_files_are_grouped_by_architecture_domain() {
         "mission",
         "policy",
         "provider",
-        "reality_bridge",
+        "structured_data",
         "recovery",
         "session",
         "skill",
@@ -193,6 +193,61 @@ fn obsolete_telemetry_crate_is_not_present() {
         !crates_dir.join("telemetry").exists(),
         "telemetry must remain owned by model-protocol; obsolete crates/telemetry must not return"
     );
+}
+
+#[test]
+fn v5_freezes_legacy_collaboration_protocol_callers_until_v6_removal() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let allowed = [
+        "src/agent/agent_collaboration.rs",
+        "src/agent/joint_problem_solving.rs",
+        "src/lib.rs",
+        "tests/integration_tests.rs",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<BTreeSet<_>>();
+    let legacy_contract = format!("{}{}", "Collaboration", "Task");
+    let mut actual = BTreeSet::new();
+    for relative in ["src", "tests"] {
+        collect_matching_files(
+            &manifest_dir.join(relative),
+            manifest_dir,
+            &legacy_contract,
+            &mut actual,
+        );
+    }
+    assert_eq!(
+        actual, allowed,
+        "V5 must not add production callers for the V6-owned legacy collaboration protocol"
+    );
+}
+
+fn collect_matching_files(
+    directory: &Path,
+    manifest_dir: &Path,
+    needle: &str,
+    matches: &mut BTreeSet<String>,
+) {
+    let entries = fs::read_dir(directory).expect("read architecture directory");
+    for entry in entries {
+        let entry = entry.expect("read architecture entry");
+        let path = entry.path();
+        if path.is_dir() {
+            collect_matching_files(&path, manifest_dir, needle, matches);
+        } else if path.extension().is_some_and(|extension| extension == "rs")
+            && fs::read_to_string(&path)
+                .expect("read Rust source")
+                .contains(needle)
+        {
+            matches.insert(
+                path.strip_prefix(manifest_dir)
+                    .expect("source is inside runtime crate")
+                    .to_string_lossy()
+                    .to_string(),
+            );
+        }
+    }
 }
 
 #[test]

@@ -240,7 +240,7 @@ pub(super) fn task_resume_context_packet(
         active_task,
         recent_decisions,
         blockers,
-        source: ResumeContextSource::TaskRegistry,
+        source: ResumeContextSource::ExecutionGraph,
     }
 }
 

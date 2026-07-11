@@ -23,7 +23,7 @@ use crate::runtime_event_store::RuntimeEventStoreError;
 use crate::{
     AgentRuntime, AgentRuntimeResolver, ApprovalQueue, ConflictArbiter, InProcessAgentWorker,
     MissionEvidenceBus, MissionRuntime, ProcessJsonlAdapter, RuntimeEventStore, SessionInputRouter,
-    SessionRelationGraph,
+    SessionRelationGraph, TeamResultReducer, TeamRuntime,
 };
 
 #[derive(Debug, Error)]
@@ -127,6 +127,11 @@ impl RuntimeServicesBuilder {
         if self.cowd_home.as_os_str().is_empty() || self.workspace_root.as_os_str().is_empty() {
             return Err(RuntimeServicesError::EmptyRoot);
         }
+        let legacy_team_state_path = self
+            .cowd_home
+            .join("agents")
+            .join("team-runtime")
+            .join("state.json");
         let workspace_root = canonical_workspace_root(&self.workspace_root)?;
         let workspace_key = workspace_key(&workspace_root);
         let state_root = self
@@ -172,6 +177,10 @@ impl RuntimeServicesBuilder {
             .agent_runtime
             .block_unrecoverable_replayed_runs()
             .map_err(RuntimeServicesError::AgentRuntime)?;
+        services
+            .team_runtime()
+            .import_legacy_state_file(&legacy_team_state_path)
+            .map_err(RuntimeServicesError::Mission)?;
         if let Some(store) = self.session_store {
             services.install_session_store(store)?;
         }
@@ -189,6 +198,7 @@ pub struct RuntimeServices {
     cross_plane_connector_executor: Arc<ScopedNodeExecutor>,
     agent_task_executor: Arc<AgentTaskExecutor>,
     agent_runtime: Arc<AgentRuntime>,
+    team_runtime: Arc<TeamRuntime>,
     verify_executor: Arc<VerifyNodeExecutor>,
     synthesize_executor: Arc<SynthesizeNodeExecutor>,
     graph_state_store: ExecutionGraphStateStore,
@@ -288,6 +298,10 @@ impl RuntimeServices {
         ))));
         let verify_executor = Arc::new(VerifyNodeExecutor::new(graph_state_store.clone()));
         let synthesize_executor = Arc::new(SynthesizeNodeExecutor::new());
+        synthesize_executor.install_resolver(Arc::new(TeamResultReducer::new(
+            graph_state_store.clone(),
+            Arc::clone(&agent_runtime),
+        )));
         let session_dispatch_executor =
             Arc::new(crate::session_execution::SessionDispatchNodeExecutor::new());
         let approval_queue = Arc::new(ApprovalQueue::new(Arc::clone(&event_store)));
@@ -316,6 +330,12 @@ impl RuntimeServices {
             Arc::clone(&worktree_leases),
             workspace_key.clone(),
             workspace_root.clone(),
+        ));
+        let team_runtime = Arc::new(TeamRuntime::new(
+            Arc::clone(&graph_runner),
+            graph_state_store.clone(),
+            Arc::clone(&agent_runtime),
+            Arc::clone(&event_store),
         ));
         let gate_store = Arc::clone(&event_store);
         let gate_workspace = workspace_key.clone();
@@ -354,6 +374,7 @@ impl RuntimeServices {
             cross_plane_connector_executor,
             agent_task_executor,
             agent_runtime,
+            team_runtime,
             verify_executor,
             synthesize_executor,
             graph_state_store,
@@ -418,6 +439,9 @@ impl RuntimeServices {
     }
     pub fn agent_runtime(&self) -> &Arc<AgentRuntime> {
         &self.agent_runtime
+    }
+    pub fn team_runtime(&self) -> &Arc<TeamRuntime> {
+        &self.team_runtime
     }
     pub fn verify_executor(&self) -> &Arc<VerifyNodeExecutor> {
         &self.verify_executor
@@ -744,6 +768,11 @@ mod tests {
 
     struct CompletedAgentBackend;
 
+    struct ParallelTrackingAgentBackend {
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+    }
+
     #[async_trait::async_trait]
     impl crate::AgentRuntimeBackend for CompletedAgentBackend {
         fn kind(&self) -> crate::AgentBackendKind {
@@ -772,6 +801,53 @@ mod tests {
                 expected_graph_revision: packet.expected_graph_revision,
                 status: AgentTerminalStatus::Completed,
                 outcome: "verified agent result".into(),
+                acceptance: vec!["completed".into()],
+                evidence_refs: Vec::new(),
+                changes: Vec::new(),
+                conflicts: Vec::new(),
+                unresolved: Vec::new(),
+                input_tokens: 5,
+                output_tokens: 3,
+                model: selection.model,
+                provider: selection.provider,
+                tool_calls: 0,
+                failure: None,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::AgentRuntimeBackend for ParallelTrackingAgentBackend {
+        fn kind(&self) -> crate::AgentBackendKind {
+            crate::AgentBackendKind::InProcess
+        }
+
+        fn capabilities(&self) -> crate::AgentBackendCapabilities {
+            crate::AgentBackendCapabilities::in_process()
+        }
+
+        async fn execute(
+            &self,
+            packet: AgentTaskPacket,
+            selection: crate::AgentModelSelection,
+        ) -> Result<AgentReturnPacket, String> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(AgentReturnPacket {
+                run_id: packet.run_id,
+                agent_id: packet.agent_id,
+                task_id: packet.task_id,
+                session_id: packet.session_id,
+                mission_id: packet.mission_id,
+                team_id: packet.team_id,
+                graph_id: packet.graph_id,
+                node_id: packet.node_id,
+                attempt: packet.attempt,
+                expected_graph_revision: packet.expected_graph_revision,
+                status: AgentTerminalStatus::Completed,
+                outcome: "parallel agent result".into(),
                 acceptance: vec!["completed".into()],
                 evidence_refs: Vec::new(),
                 changes: Vec::new(),
@@ -1222,5 +1298,196 @@ mod tests {
             harness_contract::agent::AgentStatus::Completed
         );
         assert_eq!(services.agent_runtime().events(&packet.agent_id).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn team_runtime_compiles_parallel_agents_and_emits_one_verified_terminal_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let providers = crate::config::ProvidersConfig {
+            providers: std::collections::HashMap::from([(
+                "test".into(),
+                crate::config::ProviderConfig {
+                    name: "test".into(),
+                    base_url: "https://example.test/v1".into(),
+                    api_key: "test".into(),
+                    models: vec!["fast".into()],
+                    protocol: Some("responses".into()),
+                },
+            )]),
+        };
+        let services = RuntimeServices::builder(temp.path(), &workspace)
+            .provider_registry(Arc::new(crate::ProviderRegistry::new(providers).unwrap()))
+            .build()
+            .unwrap();
+        services
+            .agent_runtime()
+            .register_backend(Arc::new(CompletedAgentBackend));
+
+        let projection = services
+            .team_runtime()
+            .start(crate::StartTeamRequest {
+                team_id: "team-runtime-integration".into(),
+                session_id: "team-runtime-session".into(),
+                objective: "independently analyse and review the runtime boundary".into(),
+                template_id: harness_contract::team::TeamTemplateId::ExecuteReview,
+                roles: vec![
+                    harness_contract::team::TeamRoleSpec {
+                        role_id: "analysis".into(),
+                        responsibility: "analyse the boundary".into(),
+                        required_capabilities: vec!["analysis".into()],
+                        allowed_tools: vec!["read_file".into()],
+                        acceptance: vec!["evidence".into()],
+                        evidence_duties: vec!["source".into()],
+                    },
+                    harness_contract::team::TeamRoleSpec {
+                        role_id: "review".into(),
+                        responsibility: "review the conclusion".into(),
+                        required_capabilities: vec!["review".into()],
+                        allowed_tools: vec!["read_file".into()],
+                        acceptance: vec!["risks".into()],
+                        evidence_duties: vec!["review".into()],
+                    },
+                ],
+                role_dependencies: vec![crate::TeamRoleDependency {
+                    from_role_id: "analysis".into(),
+                    to_role_id: "review".into(),
+                }],
+                lift_input: crate::CollaborationLiftInput {
+                    independent_work_items: 2,
+                    domain_count: 2,
+                    shared_write_scope: false,
+                    review_required: true,
+                    provider_healthy: true,
+                    budget_allows_parallelism: true,
+                    requested_parallelism: 2,
+                },
+                permission_lease: "read_only".into(),
+                model_lease: "fast".into(),
+                backend_constraint: None,
+            })
+            .await
+            .expect("team execution");
+
+        assert_eq!(projection.status, "completed");
+        assert_eq!(projection.tasks.len(), 2);
+        let terminal = projection.terminal_result.expect("one terminal result");
+        let encoded = terminal
+            .result_ref
+            .strip_prefix("assistant_json:")
+            .expect("terminal team result carries the synthesized answer");
+        let final_answer = serde_json::from_str::<String>(encoded).unwrap();
+        assert!(final_answer.contains("verified agent result"));
+        let graph = services
+            .graph_state_store()
+            .load(&projection.graph_id)
+            .expect("canonical graph");
+        assert!(graph
+            .node_statuses
+            .values()
+            .all(|status| *status == ExecutionNodeStatus::Completed));
+        assert!(services.team_runtime().projection_json()["teams"]
+            .as_array()
+            .is_some_and(|teams| teams.len() == 1));
+    }
+
+    #[tokio::test]
+    async fn fanout_team_uses_runner_parallelism_without_a_team_scheduler() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let providers = crate::config::ProvidersConfig {
+            providers: std::collections::HashMap::from([(
+                "test".into(),
+                crate::config::ProviderConfig {
+                    name: "test".into(),
+                    base_url: "https://example.test/v1".into(),
+                    api_key: "test".into(),
+                    models: vec!["fast".into()],
+                    protocol: Some("responses".into()),
+                },
+            )]),
+        };
+        let services = RuntimeServices::builder(temp.path(), &workspace)
+            .provider_registry(Arc::new(crate::ProviderRegistry::new(providers).unwrap()))
+            .build()
+            .unwrap();
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        services
+            .agent_runtime()
+            .register_backend(Arc::new(ParallelTrackingAgentBackend {
+                active: Arc::clone(&active),
+                max_active: Arc::clone(&max_active),
+            }));
+        let role = |role_id: &str| harness_contract::team::TeamRoleSpec {
+            role_id: role_id.into(),
+            responsibility: format!("independent {role_id} analysis"),
+            required_capabilities: vec!["analysis".into()],
+            allowed_tools: vec!["read_file".into()],
+            acceptance: vec!["evidence".into()],
+            evidence_duties: vec!["source".into()],
+        };
+        let projection = services
+            .team_runtime()
+            .start(crate::StartTeamRequest {
+                team_id: "team-runtime-fanout".into(),
+                session_id: "team-runtime-session".into(),
+                objective: "compare three independent architecture choices".into(),
+                template_id: harness_contract::team::TeamTemplateId::FanoutResearchSynthesis,
+                roles: vec![role("a"), role("b"), role("c")],
+                role_dependencies: Vec::new(),
+                lift_input: crate::CollaborationLiftInput {
+                    independent_work_items: 3,
+                    domain_count: 3,
+                    shared_write_scope: false,
+                    review_required: false,
+                    provider_healthy: true,
+                    budget_allows_parallelism: true,
+                    requested_parallelism: 2,
+                },
+                permission_lease: "read_only".into(),
+                model_lease: "fast".into(),
+                backend_constraint: None,
+            })
+            .await
+            .expect("fanout team execution");
+        assert_eq!(projection.status, "completed");
+        assert!(max_active.load(Ordering::SeqCst) >= 2);
+        assert!(max_active.load(Ordering::SeqCst) <= 2);
+    }
+
+    #[test]
+    fn services_builder_imports_and_retires_unbound_legacy_team_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let legacy_path = temp
+            .path()
+            .join("agents")
+            .join("team-runtime")
+            .join("state.json");
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &legacy_path,
+            r#"{"runs":{"legacy":{"snapshot":{"team_id":"legacy","status":"running"}}}}"#,
+        )
+        .unwrap();
+
+        let services = RuntimeServices::builder(temp.path(), &workspace)
+            .build()
+            .unwrap();
+        assert!(!legacy_path.exists());
+        let imported = services
+            .event_store()
+            .all_events(20)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.kind == "team.legacy_imported")
+            .expect("legacy team audit event");
+        assert_eq!(imported.status.as_deref(), Some("blocked"));
+        assert_eq!(imported.payload["team_id"], "legacy");
+        assert_eq!(imported.payload["disposition"], "blocked_unbound");
     }
 }

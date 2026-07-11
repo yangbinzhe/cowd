@@ -1,1070 +1,135 @@
-//! Runtime-owned team lifecycle service.
+//! Graph-owned Team facade.
 //!
-//! TeamRuntime consumes a `CollaborationDecision` and turns it into a concrete
-//! runtime team projection. It owns team status, role agents, events, and human
-//! control commands; execution backends can attach to this service without
-//! redefining team state.
+//! TeamRuntime compiles collaboration semantics and reads projections. It owns
+//! no scheduler, worker, state file, or process-global registry.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use harness_contract::team::{TeamRoleSpec, TeamTemplateId};
 
 use crate::{
-    cowd_dirs, AgentLifecycleEvent, AgentRunSnapshot, AgentTask, AgentTaskCompletionReceipt,
-    AgentTaskStatus, CollaborationDecision, CollaborationPlan, CollaborationTemplateId,
-    MissionEvidenceRef,
+    AgentRuntime, AgentSelector, CollaborationLiftGate, CollaborationLiftInput,
+    ExecutionGraphRunner, ExecutionGraphStateStore, LegacyTeamImportReport, RuntimeEventStore,
+    TeamBuildRequest, TeamBuilder, TeamProjection, TeamProjectionReader, TeamRoleDependency,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TeamRuntimeStatus {
-    Planned,
-    Running,
-    Paused,
-    ReviewRequested,
-    Completed,
-    Cancelled,
-    Failed,
-}
-
-impl TeamRuntimeStatus {
-    #[must_use]
-    pub const fn is_terminal(&self) -> bool {
-        matches!(self, Self::Completed | Self::Cancelled | Self::Failed)
-    }
-
-    #[must_use]
-    pub const fn as_str(&self) -> &'static str {
-        match self {
-            Self::Planned => "planned",
-            Self::Running => "running",
-            Self::Paused => "paused",
-            Self::ReviewRequested => "review_requested",
-            Self::Completed => "completed",
-            Self::Cancelled => "cancelled",
-            Self::Failed => "failed",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TeamRuntimeAgent {
-    pub role_id: String,
-    pub responsibility: String,
-    pub allowed_tools: Vec<String>,
-    pub evidence_duties: Vec<String>,
-    pub status: TeamRuntimeStatus,
-    pub agent_id: Option<String>,
-    pub latest_summary: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TeamRuntimeSynthesisStatus {
-    NotStarted,
-    Deterministic,
-    ModelAssistedPending,
-    ModelAssistedCompleted,
-    Failed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TeamRuntimeRoleSummary {
-    pub role_id: String,
-    pub agent_id: Option<String>,
-    pub status: TeamRuntimeStatus,
-    pub summary: Option<String>,
-    pub output_file: Option<String>,
-    pub evidence_refs: Vec<String>,
-    pub blocker: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TeamRuntimeExecutionSummary {
+#[derive(Debug, Clone)]
+pub struct StartTeamRequest {
     pub team_id: String,
     pub session_id: String,
     pub objective: String,
-    pub status: TeamRuntimeStatus,
-    pub role_summaries: Vec<TeamRuntimeRoleSummary>,
-    pub completed_agents: Vec<String>,
-    pub failed_agents: Vec<String>,
-    pub cancelled_agents: Vec<String>,
-    pub output_files: Vec<String>,
-    pub evidence_refs: Vec<String>,
-    pub blocker_summary: Option<String>,
-    pub failed_reasons: Vec<String>,
-    pub synthesis_status: TeamRuntimeSynthesisStatus,
-    pub synthesis_output_file: Option<String>,
-    pub review_required: bool,
-    pub review_reason: Option<String>,
-    pub created_at_ms: u64,
+    pub template_id: TeamTemplateId,
+    pub roles: Vec<TeamRoleSpec>,
+    pub role_dependencies: Vec<TeamRoleDependency>,
+    pub lift_input: CollaborationLiftInput,
+    pub permission_lease: String,
+    pub model_lease: String,
+    pub backend_constraint: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TeamRuntimeEvent {
-    pub team_id: String,
-    pub event_type: String,
-    pub message: String,
-    pub sequence: u64,
-    pub emitted_at_ms: u64,
+pub struct TeamRuntime {
+    runner: Arc<ExecutionGraphRunner>,
+    builder: TeamBuilder,
+    selector: AgentSelector,
+    lift_gate: CollaborationLiftGate,
+    projection: TeamProjectionReader,
+    event_store: Arc<RuntimeEventStore>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TeamRuntimeSnapshot {
-    pub team_id: String,
-    pub session_id: String,
-    pub task_id: String,
-    pub objective: String,
-    pub template_id: CollaborationTemplateId,
-    pub status: TeamRuntimeStatus,
-    pub plan: CollaborationPlan,
-    pub agents: Vec<TeamRuntimeAgent>,
-    pub pending_inputs: Vec<String>,
-    pub review_notes: Vec<String>,
-    pub merge_summary: Option<String>,
-    pub execution_summary: Option<TeamRuntimeExecutionSummary>,
-    pub result_artifact_file: Option<String>,
-    pub created_at_ms: u64,
-    pub updated_at_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StartTeamRuntimeRequest {
-    pub session_id: String,
-    pub objective: String,
-    pub collaboration_decision: CollaborationDecision,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StartTeamRuntimeAgentRequest {
-    pub team_id: String,
-    pub session_id: String,
-    pub objective: String,
-    pub role_id: String,
-    pub responsibility: String,
-    pub allowed_tools: Vec<String>,
-    pub evidence_duties: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TeamRuntimeCommandReceipt {
-    pub team_id: String,
-    pub command: String,
-    pub status: String,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CollaborationAgentRunProjection {
-    pub role_id: String,
-    pub agent_id: Option<String>,
-    pub status: TeamRuntimeStatus,
-    pub latest_summary: Option<String>,
-    pub output_file: Option<String>,
-    pub evidence_refs: Vec<String>,
-    pub lifecycle_events: Vec<AgentLifecycleEvent>,
-    pub tasks: Vec<AgentTask>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CollaborationRunProjection {
-    pub kind: String,
-    pub team: TeamRuntimeSnapshot,
-    pub team_events: Vec<TeamRuntimeEvent>,
-    pub agent_runs: Vec<CollaborationAgentRunProjection>,
-    pub mission_evidence: Vec<MissionEvidenceRef>,
-    pub execution_summary: Option<TeamRuntimeExecutionSummary>,
-    pub synthesis_ready: bool,
-    pub control_actions: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TeamRuntimeRecord {
-    snapshot: TeamRuntimeSnapshot,
-    events: Vec<TeamRuntimeEvent>,
-    next_sequence: u64,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct TeamRuntimePersistedState {
-    runs: BTreeMap<String, TeamRuntimeRecord>,
-}
-
-#[derive(Debug, Default)]
-pub struct TeamRuntimeService {
-    runs: Mutex<BTreeMap<String, TeamRuntimeRecord>>,
-    state_path: Option<PathBuf>,
-}
-
-impl TeamRuntimeService {
+impl TeamRuntime {
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    #[must_use]
-    pub fn persistent() -> Self {
-        Self::persistent_at(team_runtime_state_path())
-    }
-
-    #[must_use]
-    fn persistent_at(state_path: PathBuf) -> Self {
-        let runs = load_team_runtime_state(&state_path)
-            .map(|state| state.runs)
-            .unwrap_or_default();
+    pub fn new(
+        runner: Arc<ExecutionGraphRunner>,
+        graphs: ExecutionGraphStateStore,
+        agents: Arc<AgentRuntime>,
+        event_store: Arc<RuntimeEventStore>,
+    ) -> Self {
         Self {
-            runs: Mutex::new(runs),
-            state_path: Some(state_path),
+            runner,
+            builder: TeamBuilder,
+            selector: AgentSelector::new(Arc::clone(agents.catalog()), Arc::clone(&agents)),
+            lift_gate: CollaborationLiftGate,
+            projection: TeamProjectionReader::new(graphs, agents),
+            event_store,
         }
     }
 
-    pub fn start(&self, request: StartTeamRuntimeRequest) -> Result<TeamRuntimeSnapshot, String> {
-        if request.session_id.trim().is_empty() {
-            return Err("session_id must not be empty".to_string());
+    pub async fn start(&self, request: StartTeamRequest) -> Result<TeamProjection, String> {
+        let verdict = self.lift_gate.decide(&request.lift_input);
+        if !verdict.accepted {
+            return Err(format!(
+                "team lift rejected: {}",
+                verdict.reasons.join("; ")
+            ));
         }
-        if request.objective.trim().is_empty() {
-            return Err("objective must not be empty".to_string());
-        }
-        let task_id = format!("team-task-{}", uuid::Uuid::new_v4());
-        let team_id = format!("team-{}", uuid::Uuid::new_v4());
-        let now = now_ms();
-        let agents = request
-            .collaboration_decision
-            .plan
-            .agents
+        let selected_agent_profiles = request
+            .roles
             .iter()
-            .map(|agent| TeamRuntimeAgent {
-                role_id: agent.role_id.clone(),
-                responsibility: agent.responsibility.clone(),
-                allowed_tools: agent.allowed_tools.clone(),
-                evidence_duties: agent.evidence_duties.clone(),
-                status: TeamRuntimeStatus::Planned,
-                agent_id: None,
-                latest_summary: None,
+            .filter_map(|role| {
+                self.selector
+                    .select(&role.required_capabilities)
+                    .map(|agent| (role.role_id.clone(), agent.agent_id))
             })
-            .collect::<Vec<_>>();
-        let mut snapshot = TeamRuntimeSnapshot {
-            team_id,
+            .collect::<BTreeMap<_, _>>();
+        let build = self.builder.build(TeamBuildRequest {
+            team_id: request.team_id,
             session_id: request.session_id,
-            task_id,
             objective: request.objective,
-            template_id: request.collaboration_decision.template_id,
-            status: TeamRuntimeStatus::Running,
-            plan: request.collaboration_decision.plan,
-            agents,
-            pending_inputs: Vec::new(),
-            review_notes: Vec::new(),
-            merge_summary: None,
-            execution_summary: None,
-            result_artifact_file: None,
-            created_at_ms: now,
-            updated_at_ms: now,
-        };
-        for agent in &mut snapshot.agents {
-            agent.status = TeamRuntimeStatus::Running;
-        }
-        let team_id = snapshot.team_id.clone();
-        let mut record = TeamRuntimeRecord {
-            snapshot: snapshot.clone(),
-            events: Vec::new(),
-            next_sequence: 0,
-        };
-        record.push_event("team.started", "team runtime started");
-        let mut runs = self
-            .runs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        runs.insert(team_id, record);
-        self.persist_runs(&runs)?;
-        Ok(snapshot)
-    }
-
-    pub fn start_with_agent_spawner<F>(
-        &self,
-        request: StartTeamRuntimeRequest,
-        mut spawner: F,
-    ) -> Result<TeamRuntimeSnapshot, String>
-    where
-        F: FnMut(StartTeamRuntimeAgentRequest) -> Result<AgentRunSnapshot, String>,
-    {
-        let snapshot = self.start(request)?;
-        let mut bindings: Vec<(String, String)> = Vec::new();
-        for agent in &snapshot.agents {
-            let spawn_request = StartTeamRuntimeAgentRequest {
-                team_id: snapshot.team_id.clone(),
-                session_id: snapshot.session_id.clone(),
-                objective: snapshot.objective.clone(),
-                role_id: agent.role_id.clone(),
-                responsibility: agent.responsibility.clone(),
-                allowed_tools: agent.allowed_tools.clone(),
-                evidence_duties: agent.evidence_duties.clone(),
-            };
-            let spawned = match spawner(spawn_request) {
-                Ok(spawned) => spawned,
-                Err(error) => {
-                    let _ = self.with_record(&snapshot.team_id, "bind_agents_failed", |record| {
-                        record.snapshot.status = TeamRuntimeStatus::Failed;
-                        for (role_id, agent_id) in bindings {
-                            if let Some(agent) = record
-                                .snapshot
-                                .agents
-                                .iter_mut()
-                                .find(|agent| agent.role_id == role_id)
-                            {
-                                agent.agent_id = Some(agent_id);
-                                agent.status = TeamRuntimeStatus::Cancelled;
-                            }
-                        }
-                        for agent in &mut record.snapshot.agents {
-                            if !agent.status.is_terminal() {
-                                agent.status = TeamRuntimeStatus::Failed;
-                            }
-                        }
-                        record.touch();
-                        record.push_event(
-                            "team.agents_bind_failed",
-                            format!("team runtime agent binding failed: {error}"),
-                        );
-                        "agent binding failed".to_string()
-                    });
-                    return Err(error);
-                }
-            };
-            bindings.push((agent.role_id.clone(), spawned.agent_id));
-        }
-        self.with_record(&snapshot.team_id, "bind_agents", |record| {
-            for (role_id, agent_id) in bindings {
-                if let Some(agent) = record
-                    .snapshot
-                    .agents
-                    .iter_mut()
-                    .find(|agent| agent.role_id == role_id)
-                {
-                    agent.agent_id = Some(agent_id);
-                    agent.status = TeamRuntimeStatus::Running;
-                }
-            }
-            record.touch();
-            record.push_event(
-                "team.agents_bound",
-                "team runtime agents bound to lifecycle",
-            );
-            "agents bound".to_string()
+            template_id: request.template_id,
+            roles: request.roles,
+            role_dependencies: request.role_dependencies,
+            selected_agent_profiles,
+            verdict,
+            permission_lease: request.permission_lease,
+            model_lease: request.model_lease,
+            backend_constraint: request.backend_constraint,
         })?;
-        self.get(&snapshot.team_id)
-            .ok_or_else(|| format!("team runtime not found: {}", snapshot.team_id))
+        let graph_id = build.graph.id.clone();
+        self.runner
+            .start(build.graph)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.projection.project(&graph_id)
     }
 
-    #[must_use]
-    pub fn get(&self, team_id: &str) -> Option<TeamRuntimeSnapshot> {
-        let _ = self.refresh_from_agent_lifecycle(team_id);
-        self.runs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(team_id)
-            .map(|record| record.snapshot.clone())
+    pub fn project(&self, graph_id: &str) -> Result<TeamProjection, String> {
+        self.projection.project(graph_id)
     }
 
-    #[must_use]
-    pub fn list(&self) -> Vec<TeamRuntimeSnapshot> {
-        let team_ids = self
-            .runs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
-        for team_id in team_ids {
-            let _ = self.refresh_from_agent_lifecycle(&team_id);
-        }
-        self.runs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-            .map(|record| record.snapshot.clone())
-            .collect()
-    }
-
-    #[must_use]
-    pub fn events(&self, team_id: &str) -> Option<Vec<TeamRuntimeEvent>> {
-        self.runs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(team_id)
-            .map(|record| record.events.clone())
-    }
-
-    pub fn collaboration_run(&self, team_id: &str) -> Result<CollaborationRunProjection, String> {
-        let team = self
-            .get(team_id)
-            .ok_or_else(|| format!("team runtime not found: {team_id}"))?;
-        let team_events = self.events(team_id).unwrap_or_default();
-        let mission_evidence = Vec::new();
-        let agent_runs = team
-            .agents
-            .iter()
-            .map(|agent| {
-                CollaborationAgentRunProjection {
-                    role_id: agent.role_id.clone(),
-                    agent_id: agent.agent_id.clone(),
-                    status: agent.status.clone(),
-                    // V4 establishes AgentRuntime as the sole lifecycle owner. TeamRuntime
-                    // remains a declarative plan/status projection until V5 binds graph nodes
-                    // to AgentRuntime run handles.
-                    latest_summary: agent.latest_summary.clone(),
-                    output_file: None,
-                    evidence_refs: agent.evidence_duties.clone(),
-                    lifecycle_events: Vec::new(),
-                    tasks: Vec::new(),
-                }
-            })
-            .collect::<Vec<_>>();
-        let synthesis_ready = false;
-        let mut control_actions = vec![
-            "inspect".to_string(),
-            "synthesis".to_string(),
-            "handoff".to_string(),
-            "cancel".to_string(),
-        ];
-        if team.status == TeamRuntimeStatus::Paused {
-            control_actions.push("resume".to_string());
-        } else if !team.status.is_terminal() {
-            control_actions.push("pause".to_string());
-        }
-        Ok(CollaborationRunProjection {
-            kind: "runtime.collaboration_run".to_string(),
-            execution_summary: team.execution_summary.clone(),
-            team,
-            team_events,
-            agent_runs,
-            mission_evidence,
-            synthesis_ready,
-            control_actions,
-        })
-    }
-
-    #[must_use]
-    pub fn collaboration_projection(&self) -> serde_json::Value {
-        let runs = self
-            .list()
-            .into_iter()
-            .filter_map(|team| self.collaboration_run(&team.team_id).ok())
-            .collect::<Vec<_>>();
-        serde_json::json!({
-            "kind": "runtime.collaboration_runs",
-            "count": runs.len(),
-            "runs": runs,
-        })
-    }
-
-    pub fn append_input(
+    /// Import and retire the removed pre-V5 Team state file. Unbound active
+    /// records are kept as durable blocked audit events rather than resumed.
+    pub fn import_legacy_state_file(
         &self,
-        team_id: &str,
-        input: impl Into<String>,
-    ) -> Result<TeamRuntimeCommandReceipt, String> {
-        let input = input.into();
-        if input.trim().is_empty() {
-            return Err("input must not be empty".to_string());
-        }
-        self.with_record(team_id, "append_input", |record| {
-            record.snapshot.pending_inputs.push(input);
-            record.touch();
-            record.push_event("team.input_appended", "input appended to team runtime");
-            "input accepted".to_string()
-        })
-    }
-
-    pub fn pause(&self, team_id: &str) -> Result<TeamRuntimeCommandReceipt, String> {
-        self.transition(team_id, "pause", TeamRuntimeStatus::Paused, "team paused")
-    }
-
-    pub fn resume(&self, team_id: &str) -> Result<TeamRuntimeCommandReceipt, String> {
-        self.transition(
-            team_id,
-            "resume",
-            TeamRuntimeStatus::Running,
-            "team resumed",
+        path: &std::path::Path,
+    ) -> Result<Option<LegacyTeamImportReport>, String> {
+        crate::team_legacy_import::import_legacy_team_state_file(
+            Arc::clone(&self.event_store),
+            path,
         )
     }
 
-    pub fn request_review(
-        &self,
-        team_id: &str,
-        note: impl Into<String>,
-    ) -> Result<TeamRuntimeCommandReceipt, String> {
-        let note = note.into();
-        self.with_record(team_id, "request_review", |record| {
-            record.snapshot.status = TeamRuntimeStatus::ReviewRequested;
-            record.snapshot.review_notes.push(note);
-            record.touch();
-            record.push_event("team.review_requested", "team review requested");
-            "review requested".to_string()
-        })
+    /// Enumerate canonical team graphs. A team is recognized strictly by the
+    /// typed AgentTask payload, so unrelated ExecutionGraphs never leak into
+    /// Team projections.
+    pub fn list(&self) -> Result<Vec<TeamProjection>, String> {
+        self.projection.list()
     }
 
-    pub fn complete_merge(
-        &self,
-        team_id: &str,
-        summary: impl Into<String>,
-    ) -> Result<TeamRuntimeCommandReceipt, String> {
-        let summary = summary.into();
-        if summary.trim().is_empty() {
-            return Err("summary must not be empty".to_string());
-        }
-        self.with_record(team_id, "complete_merge", |record| {
-            record.snapshot.status = TeamRuntimeStatus::Completed;
-            record.snapshot.merge_summary = Some(summary);
-            for agent in &mut record.snapshot.agents {
-                if !agent.status.is_terminal() {
-                    agent.status = TeamRuntimeStatus::Completed;
-                }
-            }
-            let execution_summary = build_execution_summary(&record.snapshot);
-            match write_execution_summary_artifact(&execution_summary) {
-                Ok(path) => {
-                    record.snapshot.result_artifact_file = Some(path.display().to_string());
-                    record.snapshot.execution_summary = Some(TeamRuntimeExecutionSummary {
-                        synthesis_output_file: Some(path.display().to_string()),
-                        ..execution_summary
-                    });
-                }
-                Err(error) => {
-                    record.snapshot.execution_summary = Some(TeamRuntimeExecutionSummary {
-                        synthesis_status: TeamRuntimeSynthesisStatus::Failed,
-                        review_required: true,
-                        review_reason: Some(format!("team summary artifact write failed: {error}")),
-                        ..execution_summary
-                    });
-                }
-            }
-            record.touch();
-            record.push_event("team.completed", "team merge completed");
-            "merge completed".to_string()
-        })
-    }
-
-    pub fn apply_agent_task_outcome(
-        &self,
-        receipt: &AgentTaskCompletionReceipt,
-    ) -> Result<TeamRuntimeCommandReceipt, String> {
-        self.with_record(&receipt.team_id, "agent_task_outcome", |record| {
-            if let Some(agent) = record
-                .snapshot
-                .agents
-                .iter_mut()
-                .find(|agent| agent.role_id == receipt.role_id)
-            {
-                agent.status = team_status_from_task_status(receipt.status);
-                if let Some(outcome) = &receipt.outcome {
-                    agent.latest_summary = Some(outcome.result_summary.clone());
-                }
-            }
-            if receipt.status == AgentTaskStatus::Failed {
-                let message = receipt
-                    .outcome
-                    .as_ref()
-                    .map(|outcome| outcome.result_summary.clone())
-                    .unwrap_or_else(|| receipt.message.clone());
-                record
-                    .snapshot
-                    .review_notes
-                    .push(format!("{} failed: {message}", receipt.role_id));
-            }
-            record.touch();
-            record.push_event(
-                "team.agent_task_outcome",
-                format!(
-                    "agent task {} recorded as {}",
-                    receipt.task_id,
-                    task_status_label(receipt.status)
-                ),
-            );
-            "agent task outcome applied to team runtime".to_string()
-        })
-    }
-
-    pub fn refresh_from_agent_lifecycle(
-        &self,
-        team_id: &str,
-    ) -> Result<TeamRuntimeSnapshot, String> {
-        let runs = self
-            .runs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let record = runs
-            .get(team_id)
-            .ok_or_else(|| format!("team runtime not found: {team_id}"))?;
-        // Agent lifecycle state is owned by RuntimeServices::agent_runtime. The V5
-        // collaboration compiler will supply a graph-backed projection explicitly;
-        // this legacy plan store must never infer terminal state from a second global
-        // lifecycle cache.
-        Ok(record.snapshot.clone())
-    }
-
-    pub fn projection(&self) -> serde_json::Value {
-        let teams = self.list();
+    #[must_use]
+    pub fn projection_json(&self) -> serde_json::Value {
+        let teams = self.list().unwrap_or_default();
         serde_json::json!({
             "kind": "runtime.teams",
-            "count": teams.len(),
-            "teams": teams,
-            "collaboration_runs": self.collaboration_projection(),
+            "teams": teams.into_iter().map(|team| serde_json::json!({
+                "team_id": team.team_id,
+                "session_id": team.session_id,
+                "graph_id": team.graph_id,
+                "graph_revision": team.graph_revision,
+                "status": team.status,
+                "agents": team.tasks,
+                "terminal_result": team.terminal_result,
+            })).collect::<Vec<_>>(),
         })
-    }
-
-    fn transition(
-        &self,
-        team_id: &str,
-        command: &str,
-        status: TeamRuntimeStatus,
-        message: &str,
-    ) -> Result<TeamRuntimeCommandReceipt, String> {
-        self.with_record(team_id, command, |record| {
-            record.snapshot.status = status.clone();
-            record.touch();
-            record.push_event(format!("team.{}", status.as_str()), message);
-            message.to_string()
-        })
-    }
-
-    fn with_record(
-        &self,
-        team_id: &str,
-        command: &str,
-        update: impl FnOnce(&mut TeamRuntimeRecord) -> String,
-    ) -> Result<TeamRuntimeCommandReceipt, String> {
-        let mut runs = self
-            .runs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let record = runs
-            .get_mut(team_id)
-            .ok_or_else(|| format!("team runtime not found: {team_id}"))?;
-        if record.snapshot.status.is_terminal() && command != "complete_merge" {
-            return Ok(TeamRuntimeCommandReceipt {
-                team_id: team_id.to_string(),
-                command: command.to_string(),
-                status: "noop".to_string(),
-                message: format!("team is already {}", record.snapshot.status.as_str()),
-            });
-        }
-        let message = update(record);
-        self.persist_runs(&runs)?;
-        Ok(TeamRuntimeCommandReceipt {
-            team_id: team_id.to_string(),
-            command: command.to_string(),
-            status: "accepted".to_string(),
-            message,
-        })
-    }
-
-    fn persist_runs(&self, runs: &BTreeMap<String, TeamRuntimeRecord>) -> Result<(), String> {
-        let Some(state_path) = &self.state_path else {
-            return Ok(());
-        };
-        let payload = serde_json::to_vec_pretty(&TeamRuntimePersistedState { runs: runs.clone() })
-            .map_err(|error| error.to_string())?;
-        if let Err(error) = write_team_runtime_state_file(state_path, &payload) {
-            tracing::warn!(
-                path = %state_path.display(),
-                error = %error,
-                "team runtime state persistence failed; continuing with in-memory state"
-            );
-        }
-        Ok(())
-    }
-}
-
-impl TeamRuntimeRecord {
-    fn touch(&mut self) {
-        self.snapshot.updated_at_ms = now_ms();
-    }
-
-    fn push_event(&mut self, event_type: impl Into<String>, message: impl Into<String>) {
-        let event = TeamRuntimeEvent {
-            team_id: self.snapshot.team_id.clone(),
-            event_type: event_type.into(),
-            message: message.into(),
-            sequence: self.next_sequence,
-            emitted_at_ms: now_ms(),
-        };
-        self.next_sequence += 1;
-        self.events.push(event);
-    }
-}
-
-pub fn global_team_runtime_service() -> &'static TeamRuntimeService {
-    static SERVICE: OnceLock<TeamRuntimeService> = OnceLock::new();
-    #[cfg(test)]
-    {
-        return SERVICE.get_or_init(TeamRuntimeService::new);
-    }
-    #[cfg(not(test))]
-    SERVICE.get_or_init(TeamRuntimeService::persistent)
-}
-
-fn team_runtime_state_path() -> PathBuf {
-    cowd_dirs::user_agents_dir()
-        .join("team-runtime")
-        .join("state.json")
-}
-
-fn load_team_runtime_state(path: &Path) -> Result<TeamRuntimePersistedState, String> {
-    if !path.exists() {
-        return Ok(TeamRuntimePersistedState::default());
-    }
-    let payload = std::fs::read(path).map_err(|error| error.to_string())?;
-    serde_json::from_slice(&payload).map_err(|error| error.to_string())
-}
-
-fn write_team_runtime_state_file(path: &Path, payload: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, payload)
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-fn build_execution_summary(snapshot: &TeamRuntimeSnapshot) -> TeamRuntimeExecutionSummary {
-    let role_summaries = snapshot
-        .agents
-        .iter()
-        .map(|agent| TeamRuntimeRoleSummary {
-            role_id: agent.role_id.clone(),
-            agent_id: agent.agent_id.clone(),
-            status: agent.status.clone(),
-            summary: agent.latest_summary.clone(),
-            output_file: None,
-            evidence_refs: agent
-                .evidence_duties
-                .iter()
-                .map(|duty| {
-                    format!(
-                        "team:{}:role:{}:evidence:{duty}",
-                        snapshot.team_id, agent.role_id
-                    )
-                })
-                .collect(),
-            blocker: if agent.status == TeamRuntimeStatus::Failed {
-                Some(format!(
-                    "role {} failed or did not produce terminal output",
-                    agent.role_id
-                ))
-            } else {
-                None
-            },
-        })
-        .collect::<Vec<_>>();
-    let output_files = role_summaries
-        .iter()
-        .filter_map(|role| role.output_file.clone())
-        .collect::<Vec<_>>();
-    let evidence_refs = role_summaries
-        .iter()
-        .flat_map(|role| role.evidence_refs.clone())
-        .collect::<Vec<_>>();
-    let failed_reasons = role_summaries
-        .iter()
-        .filter_map(|role| role.blocker.clone())
-        .collect::<Vec<_>>();
-    let review_required = snapshot.status == TeamRuntimeStatus::ReviewRequested
-        || !failed_reasons.is_empty()
-        || snapshot
-            .agents
-            .iter()
-            .any(|agent| !agent.status.is_terminal() && agent.status != TeamRuntimeStatus::Running);
-    TeamRuntimeExecutionSummary {
-        team_id: snapshot.team_id.clone(),
-        session_id: snapshot.session_id.clone(),
-        objective: snapshot.objective.clone(),
-        status: snapshot.status.clone(),
-        role_summaries,
-        completed_agents: snapshot
-            .agents
-            .iter()
-            .filter(|agent| agent.status == TeamRuntimeStatus::Completed)
-            .filter_map(|agent| agent.agent_id.clone())
-            .collect(),
-        failed_agents: snapshot
-            .agents
-            .iter()
-            .filter(|agent| agent.status == TeamRuntimeStatus::Failed)
-            .filter_map(|agent| agent.agent_id.clone())
-            .collect(),
-        cancelled_agents: snapshot
-            .agents
-            .iter()
-            .filter(|agent| agent.status == TeamRuntimeStatus::Cancelled)
-            .filter_map(|agent| agent.agent_id.clone())
-            .collect(),
-        output_files,
-        evidence_refs,
-        blocker_summary: if failed_reasons.is_empty() {
-            None
-        } else {
-            Some(failed_reasons.join("; "))
-        },
-        failed_reasons,
-        synthesis_status: TeamRuntimeSynthesisStatus::Deterministic,
-        synthesis_output_file: None,
-        review_required,
-        review_reason: if review_required {
-            Some("deterministic summary requires human or model-assisted review".to_string())
-        } else {
-            None
-        },
-        created_at_ms: now_ms(),
-    }
-}
-
-fn team_status_from_task_status(status: AgentTaskStatus) -> TeamRuntimeStatus {
-    match status {
-        AgentTaskStatus::Pending => TeamRuntimeStatus::Planned,
-        AgentTaskStatus::Claimed | AgentTaskStatus::Running => TeamRuntimeStatus::Running,
-        AgentTaskStatus::Completed => TeamRuntimeStatus::Completed,
-        AgentTaskStatus::Failed => TeamRuntimeStatus::Failed,
-        AgentTaskStatus::Cancelled => TeamRuntimeStatus::Cancelled,
-    }
-}
-
-fn task_status_label(status: AgentTaskStatus) -> &'static str {
-    match status {
-        AgentTaskStatus::Pending => "pending",
-        AgentTaskStatus::Claimed => "claimed",
-        AgentTaskStatus::Running => "running",
-        AgentTaskStatus::Completed => "completed",
-        AgentTaskStatus::Failed => "failed",
-        AgentTaskStatus::Cancelled => "cancelled",
-    }
-}
-
-fn write_execution_summary_artifact(
-    summary: &TeamRuntimeExecutionSummary,
-) -> Result<PathBuf, String> {
-    let dir = cowd_dirs::user_agents_dir().join("team-results");
-    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
-    let path = dir.join(format!("{}-summary.json", summary.team_id));
-    let payload = serde_json::to_string_pretty(summary).map_err(|error| error.to_string())?;
-    std::fs::write(&path, payload).map_err(|error| error.to_string())?;
-    Ok(path)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::CollaborationTemplateMatcher;
-    use harness_contract::strategy::{decide_strategy, StrategyInput};
-
-    #[test]
-    fn persistent_team_runtime_restores_snapshot_and_events() {
-        let temp_dir = tempfile::TempDir::new().expect("temp dir");
-        let state_path = temp_dir.path().join("team-runtime-state.json");
-        let prompt = "coordinate implementation and review across runtime agents";
-        let strategy = decide_strategy(&StrategyInput::from_prompt(prompt));
-        let decision = CollaborationTemplateMatcher::default().decide(prompt, &strategy);
-
-        let service = TeamRuntimeService::persistent_at(state_path.clone());
-        let snapshot = service
-            .start(StartTeamRuntimeRequest {
-                session_id: "session-persisted-team-runtime".to_string(),
-                objective: prompt.to_string(),
-                collaboration_decision: decision,
-            })
-            .expect("team runtime starts");
-        service
-            .append_input(&snapshot.team_id, "persist this operator input")
-            .expect("input appended");
-
-        let restored = TeamRuntimeService::persistent_at(state_path);
-        let restored_snapshot = restored.get(&snapshot.team_id).expect("restored snapshot");
-        assert_eq!(
-            restored_snapshot.session_id,
-            "session-persisted-team-runtime"
-        );
-        assert_eq!(restored_snapshot.pending_inputs.len(), 1);
-        assert!(restored
-            .events(&snapshot.team_id)
-            .expect("events")
-            .iter()
-            .any(|event| event.event_type == "team.input_appended"));
-    }
-
-    #[test]
-    fn team_runtime_starts_from_collaboration_template_and_tracks_commands() {
-        let service = TeamRuntimeService::new();
-        let prompt = "implement runtime refactor then compile and test";
-        let strategy = decide_strategy(&StrategyInput::from_prompt(prompt));
-        let decision = CollaborationTemplateMatcher::default().decide(prompt, &strategy);
-
-        let snapshot = service
-            .start(StartTeamRuntimeRequest {
-                session_id: "session-team-runtime".to_string(),
-                objective: prompt.to_string(),
-                collaboration_decision: decision,
-            })
-            .expect("team runtime starts");
-
-        assert_eq!(snapshot.status, TeamRuntimeStatus::Running);
-        assert_eq!(
-            snapshot.template_id,
-            CollaborationTemplateId::ImplementationReviewFix
-        );
-        assert!(snapshot
-            .agents
-            .iter()
-            .any(|agent| agent.role_id == "reviewer"));
-        assert!(!snapshot.task_id.is_empty());
-        assert!(!snapshot.team_id.is_empty());
-
-        service
-            .append_input(&snapshot.team_id, "focus reviewer on boundary regressions")
-            .expect("input appended");
-        service
-            .request_review(&snapshot.team_id, "review before merge")
-            .expect("review requested");
-        let reviewed = service.get(&snapshot.team_id).expect("team snapshot");
-        assert_eq!(reviewed.status, TeamRuntimeStatus::ReviewRequested);
-        assert_eq!(reviewed.pending_inputs.len(), 1);
-        assert_eq!(reviewed.review_notes.len(), 1);
-
-        service
-            .complete_merge(&snapshot.team_id, "implemented and reviewed")
-            .expect("merge completed");
-        let completed = service.get(&snapshot.team_id).expect("completed snapshot");
-        assert_eq!(completed.status, TeamRuntimeStatus::Completed);
-        assert!(completed
-            .agents
-            .iter()
-            .all(|agent| agent.status == TeamRuntimeStatus::Completed));
-        assert!(service.events(&snapshot.team_id).unwrap().len() >= 4);
-    }
-
-    #[test]
-    fn team_runtime_binds_spawned_agents_to_roles() {
-        let service = TeamRuntimeService::new();
-        let prompt = "research alternatives and synthesize a decision";
-        let strategy = decide_strategy(&StrategyInput::from_prompt(prompt));
-        let decision = CollaborationTemplateMatcher::default().decide(prompt, &strategy);
-        let mut spawned_roles = Vec::new();
-
-        let snapshot = service
-            .start_with_agent_spawner(
-                StartTeamRuntimeRequest {
-                    session_id: "session-team-bind".to_string(),
-                    objective: prompt.to_string(),
-                    collaboration_decision: decision,
-                },
-                |request| {
-                    spawned_roles.push(request.role_id.clone());
-                    Ok(fake_agent_snapshot(&request.role_id))
-                },
-            )
-            .expect("team starts and binds agents");
-
-        assert!(!spawned_roles.is_empty());
-        assert!(snapshot.agents.iter().all(|agent| agent
-            .agent_id
-            .as_deref()
-            .is_some_and(|id| id.starts_with("agent-"))));
-        assert!(service
-            .events(&snapshot.team_id)
-            .expect("events")
-            .iter()
-            .any(|event| event.event_type == "team.agents_bound"));
-    }
-
-    #[test]
-    fn team_runtime_marks_failed_when_agent_binding_fails() {
-        let service = TeamRuntimeService::new();
-        let prompt = "research and review a complex architecture";
-        let strategy = decide_strategy(&StrategyInput::from_prompt(prompt));
-        let decision = CollaborationTemplateMatcher::default().decide(prompt, &strategy);
-
-        let result = service.start_with_agent_spawner(
-            StartTeamRuntimeRequest {
-                session_id: "session-team-bind-fails".to_string(),
-                objective: prompt.to_string(),
-                collaboration_decision: decision,
-            },
-            |_request| Err("spawner unavailable".to_string()),
-        );
-
-        assert!(result.is_err());
-        let failed = service.projection()["teams"]
-            .as_array()
-            .expect("teams")
-            .iter()
-            .find(|team| team["session_id"] == "session-team-bind-fails")
-            .cloned()
-            .expect("failed team");
-        assert_eq!(failed["status"], "failed");
-    }
-
-    #[test]
-    fn collaboration_run_projection_exposes_agent_events() {
-        let service = TeamRuntimeService::new();
-        let prompt = "research architecture, implement, review, and synthesize evidence";
-        let strategy = decide_strategy(&StrategyInput::from_prompt(prompt));
-        let decision = CollaborationTemplateMatcher::default().decide(prompt, &strategy);
-        let temp_root = std::env::temp_dir().join(format!(
-            "cowd-collaboration-run-agents-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&temp_root).expect("temp root");
-
-        let team = service
-            .start_with_agent_spawner(
-                StartTeamRuntimeRequest {
-                    session_id: "session-collaboration-run".to_string(),
-                    objective: prompt.to_string(),
-                    collaboration_decision: decision,
-                },
-                |request| Ok(fake_registered_agent_snapshot(&temp_root, &request.role_id)),
-            )
-            .expect("team starts");
-
-        let run = service.collaboration_run(&team.team_id).expect("run");
-        assert_eq!(run.kind, "runtime.collaboration_run");
-        assert_eq!(run.team.team_id, team.team_id);
-        assert_eq!(run.agent_runs.len(), team.agents.len());
-        assert!(run
-            .agent_runs
-            .iter()
-            .all(|agent| agent.lifecycle_events.is_empty()));
-        assert!(run.control_actions.contains(&"synthesis".to_string()));
-
-        let _ = std::fs::remove_dir_all(temp_root);
-    }
-
-    fn fake_agent_snapshot(role_id: &str) -> AgentRunSnapshot {
-        AgentRunSnapshot {
-            run_id: format!("run-{role_id}-{}", uuid::Uuid::new_v4()),
-            agent_id: format!("agent-{role_id}-{}", uuid::Uuid::new_v4()),
-            task_id: format!("task-{role_id}"),
-            session_id: "session-team-runtime".to_string(),
-            graph_id: "graph-team-runtime".to_string(),
-            node_id: format!("node-{role_id}"),
-            attempt: 1,
-            expected_graph_revision: 0,
-            backend: crate::AgentBackendKind::InProcess,
-            status: harness_contract::agent::AgentStatus::Running,
-            revision: 1,
-            model: None,
-            provider: None,
-            started_at_ms: 1,
-            updated_at_ms: 1,
-            failure: None,
-        }
-    }
-
-    fn fake_registered_agent_snapshot(_root: &std::path::Path, role_id: &str) -> AgentRunSnapshot {
-        fake_agent_snapshot(role_id)
     }
 }

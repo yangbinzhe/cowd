@@ -4,10 +4,10 @@ use runtime::eval_gate::{
     ScenarioCheck, ScenarioCheckKind, ScenarioObservation, ScenarioSpec, ScenarioSuite,
 };
 use runtime::{
-    ApprovalSource, ApprovalSourceKind, ApprovalTimeoutPolicy, AutonomyProfileId,
-    CollaborationTemplateMatcher, MissionRuntime, RuntimeEventInput, RuntimeEventScope,
-    RuntimeEventStore, StartMissionSessionRequest, StartStewardRuntimeRequest,
-    StartTeamRuntimeRequest, StewardActionStatus, StewardRuntimeService, TickStewardRuntimeRequest,
+    ApprovalSource, ApprovalSourceKind, ApprovalTimeoutPolicy, AutonomyProfileId, MissionRuntime,
+    RuntimeEventInput, RuntimeEventScope, RuntimeEventStore, StartMissionSessionRequest,
+    StartStewardRuntimeRequest, StewardActionStatus, StewardRuntimeService,
+    TickStewardRuntimeRequest,
 };
 use serde::Serialize;
 
@@ -37,16 +37,8 @@ fn mission_harness_quick_eval_covers_core_runtime_loop_and_writes_report() {
 
     let prompt = "implement mission harness event store, approval governance, and team review";
     let strategy = decide_strategy(&StrategyInput::from_prompt(prompt));
-    let decision = CollaborationTemplateMatcher::default().decide(prompt, &strategy);
-    let team = runtime::TeamRuntimeService::new()
-        .start(StartTeamRuntimeRequest {
-            session_id: session.session_id.clone(),
-            objective: prompt.to_string(),
-            collaboration_decision: decision,
-        })
-        .expect("team runtime starts");
-
     let services = runtime::RuntimeServices::in_memory().expect("runtime services");
+    let team_id = format!("mission-eval-team-{}", uuid::Uuid::new_v4());
     let approval = services
         .approval_queue()
         .submit(runtime::SubmitGlobalApprovalRequest {
@@ -54,13 +46,13 @@ fn mission_harness_quick_eval_covers_core_runtime_loop_and_writes_report() {
                 kind: ApprovalSourceKind::Session,
                 session_id: Some(session.session_id.clone()),
                 agent_id: None,
-                team_id: Some(team.team_id.clone()),
+                team_id: Some(team_id.clone()),
                 mission_id: Some("mission-eval".to_string()),
             },
             action: "apply_patch".to_string(),
             summary: "write runtime changes".to_string(),
             risk: TaskRisk::High,
-            evidence_refs: vec![format!("team:{}", team.team_id)],
+            evidence_refs: vec![format!("team:{team_id}")],
             timeout_policy: ApprovalTimeoutPolicy::Pending,
         })
         .expect("approval submitted");
@@ -115,7 +107,7 @@ fn mission_harness_quick_eval_covers_core_runtime_loop_and_writes_report() {
             actor: Some("mission_harness_eval".to_string()),
             refs: Vec::new(),
             payload: serde_json::json!({
-                "team_id": team.team_id,
+                "team_id": team_id,
                 "approval_id": approval.approval_id,
                 "command_id": command.command_id,
                 "steward_id": steward.steward_id,
@@ -167,7 +159,7 @@ fn mission_harness_quick_eval_covers_core_runtime_loop_and_writes_report() {
             CapabilityResult {
                 capability: "team_runtime",
                 status: "passed",
-                evidence: team.team_id,
+                evidence: team_id,
             },
             CapabilityResult {
                 capability: "approval_queue",

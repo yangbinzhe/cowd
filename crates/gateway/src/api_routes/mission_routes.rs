@@ -953,6 +953,7 @@ async fn start_mission_team_runtime_handler(
         .services
         .mission
         .start_team_runtime(&id, body)
+        .await
         .map(Json)
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))
 }

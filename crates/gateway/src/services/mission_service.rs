@@ -26,7 +26,7 @@ pub(crate) struct StartMissionTeamRuntimeHttpRequest {
     #[serde(default)]
     pub(crate) model: Option<String>,
     #[serde(default)]
-    pub(crate) execution_mode: MissionTeamExecutionMode,
+    pub(crate) backend: Option<runtime::AgentBackendKind>,
     #[serde(default)]
     pub(crate) approval_id: Option<String>,
 }
@@ -50,15 +50,6 @@ pub(crate) struct SubmitAgentTaskOutcomeHttpRequest {
     pub(crate) suggested_next_actions: Vec<String>,
     #[serde(default)]
     pub(crate) quality_status: runtime::AgentTaskQualityStatus,
-}
-
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum MissionTeamExecutionMode {
-    #[default]
-    ProviderInProcess,
-    ProcessJsonl,
-    ManualMailbox,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -213,7 +204,28 @@ impl MissionService {
         self.mission().projection(
             self.relation_graph(),
             self.runtime_services().agent_runtime(),
+            self.runtime_services().team_runtime(),
         )
+    }
+
+    fn team_projection(&self, team_id: &str) -> Result<runtime::TeamProjection, String> {
+        self.runtime_services()
+            .team_runtime()
+            .list()?
+            .into_iter()
+            .find(|team| team.team_id == team_id)
+            .ok_or_else(|| format!("team not found: {team_id}"))
+    }
+
+    fn team_graph(
+        &self,
+        team_id: &str,
+    ) -> Result<harness_contract::execution_graph::ExecutionGraph, String> {
+        let team = self.team_projection(team_id)?;
+        self.runtime_services()
+            .graph_state_store()
+            .load(&team.graph_id)
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn envelope(&self, operation: &'static str) -> ServiceEnvelope {
@@ -355,29 +367,28 @@ impl MissionService {
     }
 
     pub(crate) fn team_execution_plan(&self, team_id: &str) -> Result<serde_json::Value, String> {
-        let plan = runtime::TeamExecutionLoop::plan(team_id)?;
+        let team = self.team_projection(team_id)?;
+        let graph = self.team_graph(team_id)?;
         Ok(serde_json::json!({
             "envelope": self.session_control_contract(),
             "kind": "mission_control.team_execution_plan",
             "ok": true,
-            "plan": plan,
+            "team": team,
+            "graph": graph,
         }))
     }
 
     pub(crate) fn tick_team_execution(&self, team_id: &str) -> Result<serde_json::Value, String> {
-        let plan = runtime::TeamExecutionLoop::plan(team_id)?;
-        let command = harness_contract::execution_graph::ExecutionGraphCommand::Start {
-            expected_revision: plan.execution_graph.revision,
-        };
+        let team = self.team_projection(team_id)?;
+        let graph = self.team_graph(team_id)?;
         Ok(serde_json::json!({
             "envelope": self.session_control_contract(),
             "kind": "mission_control.team_execution_graph_submission",
-            "ok": false,
-            "status": "capability_unavailable",
-            "capability": "collaborate",
-            "available_in": "V5",
-            "graph": plan.execution_graph,
-            "command": command,
+            "ok": true,
+            "status": "runner_owned",
+            "message": "the ExecutionGraphRunner starts and advances team work; no second team scheduler exists",
+            "team": team,
+            "graph": graph,
             "projection": runtime::MissionControlRuntime::projection(self.runtime_services()),
         }))
     }
@@ -388,15 +399,13 @@ impl MissionService {
         task_id: &str,
         request: SubmitAgentTaskOutcomeHttpRequest,
     ) -> Result<serde_json::Value, String> {
-        let plan = runtime::TeamExecutionLoop::plan(team_id)?;
-        if !plan.tasks.iter().any(|task| task.task_id == task_id) {
+        let team = self.team_projection(team_id)?;
+        if !team.tasks.iter().any(|task| task.task_id == task_id) {
             return Err(format!(
                 "agent task not found in team execution plan: {task_id}"
             ));
         }
-        let command = harness_contract::execution_graph::ExecutionGraphCommand::Advance {
-            expected_revision: plan.execution_graph.revision,
-        };
+        let graph = self.team_graph(team_id)?;
         Ok(serde_json::json!({
             "envelope": self.session_control_contract(),
             "kind": "mission_control.agent_task_outcome_submission",
@@ -411,9 +420,8 @@ impl MissionService {
                 "suggested_next_actions": request.suggested_next_actions,
                 "quality_status": request.quality_status,
             },
-            "graph": plan.execution_graph,
-            "command": command,
-            "run": runtime::global_team_runtime_service().collaboration_run(team_id).ok(),
+            "graph": graph,
+            "team": team,
             "projection": runtime::MissionControlRuntime::projection(self.runtime_services()),
         }))
     }
@@ -423,12 +431,12 @@ impl MissionService {
             "envelope": self.session_control_contract(),
             "kind": "mission_control.collaboration_runs",
             "ok": true,
-            "projection": runtime::global_team_runtime_service().collaboration_projection(),
+            "projection": self.runtime_services().team_runtime().projection_json(),
         })
     }
 
     pub(crate) fn collaboration_run(&self, team_id: &str) -> Result<serde_json::Value, String> {
-        let run = runtime::global_team_runtime_service().collaboration_run(team_id)?;
+        let run = self.team_projection(team_id)?;
         Ok(serde_json::json!({
             "envelope": self.session_control_contract(),
             "kind": "mission_control.collaboration_run",
@@ -443,11 +451,11 @@ impl MissionService {
     ) -> Result<serde_json::Value, String> {
         use runtime::ExecutionGraphHost;
 
-        let plan = runtime::TeamExecutionLoop::plan(team_id)?;
+        let team = self.team_projection(team_id)?;
         let projection = match self
             .runtime_services()
             .graph_runner()
-            .graph_projection(&plan.execution_graph.id)
+            .graph_projection(&team.graph_id)
             .await
         {
             Ok(projection) => projection,
@@ -486,7 +494,7 @@ impl MissionService {
         team_id: &str,
         request: MissionTeamHandoffHttpRequest,
     ) -> Result<serde_json::Value, String> {
-        runtime::TeamExecutionLoop::plan(team_id)?;
+        self.team_projection(team_id)?;
         let mut response = team_capability_unavailable(
             self,
             "mission_control.team_handoff",
@@ -503,7 +511,7 @@ impl MissionService {
         &self,
         team_id: &str,
     ) -> Result<serde_json::Value, String> {
-        runtime::TeamExecutionLoop::plan(team_id)?;
+        self.team_projection(team_id)?;
         Ok(team_capability_unavailable(
             self,
             "mission_control.team_synthesis",
@@ -525,20 +533,23 @@ impl MissionService {
     }
 
     pub(crate) fn team_mission_evidence(&self, team_id: &str) -> serde_json::Value {
-        let team = runtime::global_team_runtime_service().get(team_id);
+        let team = self.team_projection(team_id).ok();
         let agent_events = team
             .as_ref()
             .map(|team| {
-                team.agents
+                team.tasks
                     .iter()
-                    .filter_map(|agent| agent.agent_id.as_deref())
-                    .map(|agent_id| self.runtime_services().agent_runtime().events(agent_id))
-                    .flatten()
+                    .flat_map(|task| {
+                        self.runtime_services()
+                            .agent_runtime()
+                            .events(&task.agent_id)
+                    })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let planned_tasks = runtime::TeamExecutionLoop::plan(team_id)
-            .map(|plan| plan.tasks)
+        let planned_tasks = team
+            .as_ref()
+            .map(|team| team.tasks.clone())
             .unwrap_or_default();
         serde_json::json!({
             "envelope": self.session_control_contract(),
@@ -547,6 +558,7 @@ impl MissionService {
             "team_id": team_id,
             "events": agent_events,
             "tasks": planned_tasks,
+            "team": team,
             "evidence": self.runtime_services().mission_evidence().list_for_team(team_id),
         })
     }
@@ -724,7 +736,7 @@ impl MissionService {
         self.command_value(self.mission().attach_agent(session_id, request.agent_id)?)
     }
 
-    pub(crate) fn start_team_runtime(
+    pub(crate) async fn start_team_runtime(
         &self,
         session_id: &str,
         request: StartMissionTeamRuntimeHttpRequest,
@@ -735,21 +747,67 @@ impl MissionService {
         if request.objective.trim().is_empty() {
             return Err("team objective must not be empty".to_string());
         }
-        let compile = runtime::ExecutionGraphCompiler.compile(runtime::ExecutionCompileRequest {
-            objective: request.objective,
-            payload_ref: format!("mission_session:{session_id}"),
-            target: runtime::RuntimeCompileTarget::TeamGraph,
-            resource_scopes: vec![format!("session:{session_id}")],
+        let team_id = format!("team-{}", uuid::Uuid::new_v4());
+        let model_lease = request.model.unwrap_or_default();
+        let backend_constraint = request.backend.map(|backend| match backend {
+            runtime::AgentBackendKind::InProcess => "backend:in_process".to_string(),
+            runtime::AgentBackendKind::ProcessJsonl => "backend:process_jsonl".to_string(),
         });
+        let roles = vec![
+            harness_contract::team::TeamRoleSpec {
+                role_id: "executor".to_string(),
+                responsibility: "produce an evidence-backed solution for the requested objective"
+                    .to_string(),
+                required_capabilities: vec!["analysis".to_string()],
+                allowed_tools: vec!["read_file".to_string(), "search".to_string()],
+                acceptance: vec!["propose a complete result with evidence".to_string()],
+                evidence_duties: vec!["source evidence".to_string()],
+            },
+            harness_contract::team::TeamRoleSpec {
+                role_id: "reviewer".to_string(),
+                responsibility: "independently review the solution for gaps, conflicts, and risks"
+                    .to_string(),
+                required_capabilities: vec!["review".to_string()],
+                allowed_tools: vec!["read_file".to_string(), "search".to_string()],
+                acceptance: vec!["report verified risks and unresolved issues".to_string()],
+                evidence_duties: vec!["review evidence".to_string()],
+            },
+        ];
+        let team = self
+            .runtime_services()
+            .team_runtime()
+            .start(runtime::StartTeamRequest {
+                team_id,
+                session_id: session_id.to_string(),
+                objective: request.objective,
+                template_id: harness_contract::team::TeamTemplateId::ExecuteReview,
+                roles,
+                role_dependencies: vec![runtime::TeamRoleDependency {
+                    from_role_id: "executor".to_string(),
+                    to_role_id: "reviewer".to_string(),
+                }],
+                lift_input: runtime::CollaborationLiftInput {
+                    independent_work_items: 2,
+                    domain_count: 2,
+                    shared_write_scope: false,
+                    review_required: true,
+                    provider_healthy: true,
+                    budget_allows_parallelism: true,
+                    requested_parallelism: 2,
+                },
+                permission_lease: "read_only".to_string(),
+                model_lease,
+                backend_constraint,
+            })
+            .await?;
+        self.mission()
+            .attach_team(session_id, team.team_id.clone())?;
         Ok(serde_json::json!({
             "envelope": self.session_control_contract(),
-            "ok": false,
-            "status": "capability_unavailable",
-            "capability": "collaborate",
-            "available_in": "V4",
-            "compile_error": compile.err().map(|error| error.to_string()),
-            "requested_model": request.model,
-            "requested_execution_mode": request.execution_mode,
+            "ok": true,
+            "status": team.status,
+            "team": team,
+            "requested_backend": request.backend,
             "approval_id": request.approval_id,
             "mission": self.mission_projection(),
         }))
@@ -1148,7 +1206,7 @@ mod tests {
         let error =
             serde_json::from_value::<StartMissionTeamRuntimeHttpRequest>(serde_json::json!({
                 "objective": "review the implementation",
-                "execution_mode": "manual_mailbox",
+                "backend": "in_process",
                 "execution_pattern": "manual_mailbox",
             }))
             .expect_err("unknown fields must be rejected");
@@ -1215,8 +1273,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn mission_service_rejects_team_execution_until_runner_executor_is_available() {
+    #[tokio::test]
+    async fn mission_service_creates_a_runner_owned_team_graph() {
         let service = scoped_mission_service();
         let session_id = format!("mission-task-outcome-{}", uuid::Uuid::new_v4());
         service
@@ -1231,15 +1289,17 @@ mod tests {
                 StartMissionTeamRuntimeHttpRequest {
                     objective: "answer one delegated question".to_string(),
                     model: None,
-                    execution_mode: MissionTeamExecutionMode::ManualMailbox,
+                    backend: Some(runtime::AgentBackendKind::InProcess),
                     approval_id: None,
                 },
             )
+            .await
             .expect("team");
-        assert_eq!(started["ok"], false);
-        assert_eq!(started["status"], "capability_unavailable");
-        assert_eq!(started["capability"], "collaborate");
-        assert_eq!(started["available_in"], "V5");
+        assert_eq!(started["ok"], true);
+        assert!(started["team"]["graph_id"].as_str().is_some());
+        assert!(started["mission"]["team_projection"]["teams"]
+            .as_array()
+            .is_some_and(|teams| !teams.is_empty()));
     }
 
     #[test]

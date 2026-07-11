@@ -10,10 +10,9 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{global_team_runtime_service, AgentRuntime};
 use crate::{
-    RuntimeCapabilityCatalog, SessionRecoveryCandidate, SessionRelationGraph, StewardScheduler,
-    TeamExecutionLoop,
+    AgentRuntime, RuntimeCapabilityCatalog, SessionRecoveryCandidate, SessionRelationGraph,
+    StewardScheduler, TeamRuntime,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -660,6 +659,7 @@ impl MissionRuntime {
         &self,
         relations: &SessionRelationGraph,
         agent_runtime: &AgentRuntime,
+        team_runtime: &TeamRuntime,
     ) -> MissionProjection {
         let state = self
             .state
@@ -674,14 +674,14 @@ impl MissionRuntime {
             routed_commands: state.routed_commands.clone(),
             session_command_summary: session_command_summary(&state.session_commands),
             session_commands: state.session_commands.values().cloned().collect(),
-            team_projection: global_team_runtime_service().projection(),
+            team_projection: team_runtime.projection_json(),
             agent_projection: serde_json::json!({
                 "kind": "runtime.agents",
                 "agents": agent_runtime.list(),
             }),
             approval_projection: serde_json::Value::Null,
             relation_projection: relations.projection(),
-            execution_graph_projection: mission_execution_graph_projection(),
+            execution_graph_projection: mission_execution_graph_projection(team_runtime),
             conflict_projection: serde_json::Value::Null,
             evidence_projection: serde_json::Value::Null,
             steward_projection: serde_json::json!(StewardScheduler::projection()),
@@ -887,28 +887,21 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn mission_execution_graph_projection() -> serde_json::Value {
-    let execution_graphs = global_team_runtime_service()
+fn mission_execution_graph_projection(team_runtime: &TeamRuntime) -> serde_json::Value {
+    let execution_graphs = team_runtime
         .list()
+        .unwrap_or_default()
         .into_iter()
-        .map(|team| match TeamExecutionLoop::plan(&team.team_id) {
-            Ok(plan) => serde_json::json!({
-                "team_id": plan.team_id,
-                "session_id": plan.session_id,
-                "objective": plan.objective,
-                "execution_graph_id": plan.execution_graph.id,
-                "node_count": plan.execution_graph.nodes.len(),
-                "edge_count": plan.execution_graph.edges.len(),
-                "quality": plan.execution_graph_quality,
-                "ready_node_ids": plan.ready_node_ids,
-                "blocked_node_ids": plan.blocked_node_ids,
-                "max_parallelism": plan.spec.max_parallelism,
-            }),
-            Err(error) => serde_json::json!({
-                "team_id": team.team_id,
-                "session_id": team.session_id,
-                "error": error,
-            }),
+        .map(|team| {
+            serde_json::json!({
+            "team_id": team.team_id,
+            "session_id": team.session_id,
+                "execution_graph_id": team.graph_id,
+                "graph_revision": team.graph_revision,
+                "status": team.status,
+                "agent_count": team.tasks.len(),
+                "terminal_result": team.terminal_result,
+            })
         })
         .collect::<Vec<_>>();
     serde_json::json!({
@@ -1121,7 +1114,11 @@ mod tests {
         assert_eq!(routed.status, "queued");
         assert_eq!(routed.target_session_id, "mission-session-b");
 
-        let projection = runtime.projection(&SessionRelationGraph::new(), services.agent_runtime());
+        let projection = runtime.projection(
+            &SessionRelationGraph::new(),
+            services.agent_runtime(),
+            services.team_runtime(),
+        );
         assert_eq!(projection.active_session_id, None);
         assert_eq!(projection.routed_commands.len(), 1);
         let session = projection
@@ -1158,7 +1155,11 @@ mod tests {
             })
             .expect("session");
 
-        let projection = runtime.projection(&SessionRelationGraph::new(), services.agent_runtime());
+        let projection = runtime.projection(
+            &SessionRelationGraph::new(),
+            services.agent_runtime(),
+            services.team_runtime(),
+        );
 
         assert_eq!(projection.schema_version, 2);
         assert_eq!(

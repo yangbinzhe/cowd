@@ -141,8 +141,6 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
         &active_evolution,
     );
     let runtime_session_id = session.session_id.clone();
-    let subagent_model = model.clone();
-    let subagent_tool_definitions = tool_definitions.clone();
     let tool_executor = std::sync::Arc::new(
         GatewayToolExecutor::from_tool_host(
             allowed_tools.clone(),
@@ -175,10 +173,6 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
         external_context_items: vec![workspace_item, capability_item],
         skill_profiles,
         agent_skill_profile: default_runtime_agent_skill_profile(),
-        enable_collaboration: true,
-        subagent_model,
-        subagent_tool_definitions,
-        subagent_tool_executor: tool_executor,
         runtime_services,
     })
     .map_err(std::io::Error::other)?;

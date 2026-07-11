@@ -17,43 +17,6 @@ pub struct RuntimeExecutionGraphSummary {
     pub complementarity_score: Option<f32>,
 }
 
-impl RuntimeExecutionGraphSummary {
-    #[must_use]
-    pub fn from_review(
-        graph: &harness_contract::execution_graph::ExecutionGraph,
-        packet: &crate::agent_collaboration::CollaborationReviewPacket,
-    ) -> Self {
-        let agent_tasks = graph
-            .nodes
-            .iter()
-            .filter(|node| {
-                node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask
-            })
-            .count();
-        Self {
-            graph_id: Some(graph.id.clone()),
-            board_id: Some(packet.board_id.clone()),
-            status: if graph.node_statuses.values().any(|status| {
-                matches!(
-                    status,
-                    harness_contract::execution_graph::ExecutionNodeStatus::Failed
-                )
-            }) {
-                "failed"
-            } else {
-                "completed"
-            }
-            .to_string(),
-            agent_tasks,
-            memory_candidates: packet.maintenance_candidates.len(),
-            conflicts: packet.scorecard.conflict_count,
-            completion_rate: Some(packet.scorecard.completion_rate),
-            synthesis_lift: Some(packet.scorecard.synthesis_lift),
-            complementarity_score: Some(packet.scorecard.complementarity_score),
-        }
-    }
-}
-
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RuntimePolicyDecisionSummary {
     pub level: String,

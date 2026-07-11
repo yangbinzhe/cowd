@@ -165,8 +165,6 @@ pub mod evidence_planner;
 pub mod evolution;
 #[path = "execution_core/mod.rs"]
 pub mod execution_core;
-#[path = "agent/execution_graph.rs"]
-pub mod execution_graph;
 #[path = "infrastructure/execution_scheduler.rs"]
 pub mod execution_scheduler;
 #[path = "context/fact_extraction.rs"]
@@ -242,18 +240,24 @@ pub mod surface_contract;
 pub mod task;
 #[path = "mission/task_packet.rs"]
 pub mod task_packet;
-#[path = "mission/task_registry.rs"]
-pub mod task_registry;
+#[path = "team/agent_selector.rs"]
+pub mod team_agent_selector;
 #[path = "team/agent_task.rs"]
 pub mod team_agent_task;
-#[path = "team/team_cron_registry.rs"]
-pub mod team_cron_registry;
-#[path = "team/team_discovery.rs"]
-pub mod team_discovery;
-#[path = "team/team_execution.rs"]
-pub mod team_execution;
+#[path = "team/builder.rs"]
+pub mod team_builder;
+#[path = "team/legacy_import.rs"]
+pub mod team_legacy_import;
+#[path = "team/lift_gate.rs"]
+pub mod team_lift_gate;
+#[path = "team/projection.rs"]
+pub mod team_projection;
+#[path = "team/result_reducer.rs"]
+pub mod team_result_reducer;
 #[path = "team/team_runtime.rs"]
 pub mod team_runtime;
+#[path = "team/template_registry.rs"]
+pub mod team_template_registry;
 #[path = "tooling/tool_dispatch.rs"]
 pub mod tool_dispatch;
 #[path = "tooling/tool_execution_plan.rs"]
@@ -402,7 +406,6 @@ pub use execution_core::{
     StrategyLease, StrategyResourceHealth, ToolDagEdge, ToolDagEdgeKind, ToolDagPlan,
     ToolDagSafetySummary, ToolDagTask,
 };
-pub use execution_graph::{execution_graph_from_collaboration_task, project_collaboration_review};
 pub use file_ops::{
     edit_file, glob_search, grep_search, read_file, write_file, EditFileOutput, GlobSearchOutput,
     GrepSearchInput, GrepSearchOutput, ReadFileOutput, StructuredPatchHunk, TextFilePayload,
@@ -629,18 +632,15 @@ pub use steward_scheduler::{
 pub use task_packet::{
     validate_packet, TaskPacket, TaskPacketValidationError, TaskScope, ValidatedPacket,
 };
-pub use task_registry::{Task, TaskMessage, TaskRegistry, TaskStatus as RegistryTaskStatus};
-pub use team_cron_registry::{CronEntry, CronRegistry, Team, TeamRegistry};
-pub use team_discovery::{DiscoveredTeam, PersistedTeam, TeamDiscoveryProtocol};
-pub use team_execution::{
-    CollaborationTemplateRuntimeSpec, TeamExecutionDependency, TeamExecutionLoop,
-    TeamExecutionPlan, TeamExecutionRoleSpec,
-};
-pub use team_runtime::{
-    global_team_runtime_service, CollaborationAgentRunProjection, CollaborationRunProjection,
-    StartTeamRuntimeAgentRequest, StartTeamRuntimeRequest, TeamRuntimeAgent,
-    TeamRuntimeCommandReceipt, TeamRuntimeEvent, TeamRuntimeService, TeamRuntimeSnapshot,
-    TeamRuntimeStatus,
+pub use team_agent_selector::AgentSelector;
+pub use team_builder::{TeamBuild, TeamBuildRequest, TeamBuilder};
+pub use team_legacy_import::LegacyTeamImportReport;
+pub use team_lift_gate::{CollaborationLiftGate, CollaborationLiftInput};
+pub use team_projection::{TeamProjection, TeamProjectionReader};
+pub use team_result_reducer::TeamResultReducer;
+pub use team_runtime::{StartTeamRequest, TeamRuntime};
+pub use team_template_registry::{
+    TeamRoleDependency, TeamTemplateRegistry, TeamTemplateSpec, TeamTemplateValidationError,
 };
 pub use tool_execution_plan::{ToolExecutionMode, ToolExecutionPlan, ToolExecutionPlanTask};
 pub use tool_host::{

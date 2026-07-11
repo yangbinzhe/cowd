@@ -194,6 +194,18 @@ impl AgentRuntime {
             .and_then(|record| record.snapshot.clone())
     }
 
+    /// Return the canonical terminal packet retained with an Agent lifecycle
+    /// event. Consumers may project it, but cannot mutate graph state through
+    /// this read API.
+    #[must_use]
+    pub fn terminal_return(&self, agent_id: &str) -> Option<AgentReturnPacket> {
+        self.records
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(agent_id)
+            .and_then(|record| record.returned.clone())
+    }
+
     /// Restore a verified durable run projection during Runtime recovery.
     ///
     /// This is intentionally a projection recovery API, not an execution API:
