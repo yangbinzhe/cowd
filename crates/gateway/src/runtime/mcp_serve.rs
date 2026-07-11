@@ -1,6 +1,6 @@
 use crate::{CliOutputFormat, VERSION};
 use runtime::{McpServer, McpServerSpec, McpTool};
-use tools::{execute_tool, mvp_tool_specs};
+use tools::mvp_tool_specs;
 /// Starts a minimal Model Context Protocol server that exposes cowd's
 /// built-in tools over stdio.
 ///
@@ -51,11 +51,27 @@ pub(crate) fn run_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
 
+    let workspace_root = std::env::current_dir()?;
+    let tool_host = std::sync::Arc::new(tools::ToolHost::builtin("mcp-stdio", workspace_root));
     let spec = McpServerSpec {
         server_name: "cowd".to_string(),
         server_version: VERSION.to_string(),
         tools,
-        tool_handler: Box::new(execute_tool),
+        tool_handler: Box::new(move |name, input| {
+            let lease = tool_host.pin_snapshot();
+            let effect = lease.describe_effect(name, input);
+            let decision = runtime::ToolPolicy
+                .authorize(
+                    &effect,
+                    format!("mcp-stdio:{name}"),
+                    runtime::PermissionMode::DangerFullAccess,
+                    300,
+                )
+                .map_err(|error| error.to_string())?;
+            lease
+                .execute(&decision.authorization, name, input)
+                .map_err(|error| error.to_string())
+        }),
     };
 
     let runtime = tokio::runtime::Builder::new_current_thread()

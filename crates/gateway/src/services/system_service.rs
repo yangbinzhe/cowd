@@ -5,8 +5,8 @@ use std::{
 };
 
 use runtime::{
-    classify_intent, plan_context_fanout, tool_cache::tool_cache_stats, tool_execution_profile,
-    ConfigLoader, JsonValue, RuntimeConfig, ToolSafetyCategory,
+    classify_intent, plan_context_fanout, tool_execution_profile, ConfigLoader, JsonValue,
+    RuntimeConfig, ToolSafetyCategory,
 };
 use serde::Serialize;
 use tools::{
@@ -14,8 +14,7 @@ use tools::{
         checkpoint_create_in, checkpoint_diff_in, checkpoint_list_in, checkpoint_restore_in,
         CheckpointCreateInput, CheckpointDiffInput, CheckpointRestoreInput,
     },
-    tool_cache::invalidate_tool_cache,
-    GlobalToolRegistry, ToolDefinition,
+    ToolDefinition, ToolHost,
 };
 
 use super::SystemService;
@@ -70,7 +69,7 @@ impl SystemService {
 
     pub(crate) fn execute_tool_receipt(
         &self,
-        registry: &GlobalToolRegistry,
+        host: &ToolHost,
         workspace_root: &Path,
         tool_name: &str,
         input: serde_json::Value,
@@ -79,8 +78,7 @@ impl SystemService {
     ) -> Result<ToolOperationReceipt, String> {
         let mode = mode.into();
         let risk = risk.into();
-        let output =
-            self.execute_tool_with_workspace(registry, workspace_root, tool_name, input)?;
+        let output = self.execute_tool_with_workspace(host, workspace_root, tool_name, input)?;
         let data = serde_json::from_str::<serde_json::Value>(&output)
             .unwrap_or_else(|_| serde_json::json!({ "text": output }));
         let changed_refs = changed_refs_for_tool(tool_name, &data);
@@ -106,8 +104,8 @@ impl SystemService {
         })
     }
 
-    pub(crate) fn tool_cache_receipt(&self) -> ToolOperationReceipt {
-        let data = serde_json::to_value(tool_cache_stats()).unwrap_or_else(|_| {
+    pub(crate) fn tool_cache_receipt(&self, host: &ToolHost) -> ToolOperationReceipt {
+        let data = serde_json::to_value(host.cache_stats()).unwrap_or_else(|_| {
             serde_json::json!({
                 "hits": 0,
                 "misses": 0,
@@ -199,7 +197,7 @@ impl SystemService {
 
     fn execute_tool_with_workspace(
         &self,
-        registry: &GlobalToolRegistry,
+        host: &ToolHost,
         workspace_root: &Path,
         tool_name: &str,
         input: serde_json::Value,
@@ -235,12 +233,21 @@ impl SystemService {
                         .map_err(|error| error.to_string())?,
                 )
                 .map_err(|error| error.to_string())?;
-                invalidate_tool_cache();
                 Ok(output)
             }
             _ => self.with_workspace_root(workspace_root, || {
-                registry
-                    .execute(tool_name, &input)
+                let lease = host.pin_snapshot();
+                let effect = lease.describe_effect(tool_name, &input);
+                let decision = runtime::ToolPolicy
+                    .authorize(
+                        &effect,
+                        format!("system-api:{tool_name}"),
+                        runtime::PermissionMode::DangerFullAccess,
+                        300,
+                    )
+                    .map_err(|error| error.to_string())?;
+                lease
+                    .execute(&decision.authorization, tool_name, &input)
                     .map_err(|error| error.to_string())
             }),
         }

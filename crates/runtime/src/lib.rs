@@ -63,6 +63,8 @@ pub mod context_ledger;
 pub mod context_profiler;
 #[path = "context/context_runtime.rs"]
 pub mod context_runtime;
+#[path = "context/tool_exposure.rs"]
+pub mod context_tool_exposure;
 #[path = "infrastructure/execution_outcome.rs"]
 pub mod execution_outcome;
 #[path = "context/knowledge_activation.rs"]
@@ -256,8 +258,6 @@ pub mod team_discovery;
 pub mod team_execution;
 #[path = "team/team_runtime.rs"]
 pub mod team_runtime;
-#[path = "tooling/tool_cache.rs"]
-pub mod tool_cache;
 #[path = "tooling/tool_dispatch.rs"]
 pub mod tool_dispatch;
 #[path = "tooling/tool_execution_plan.rs"]
@@ -272,12 +272,16 @@ pub mod tool_ledger;
 pub mod tool_memory;
 #[path = "tooling/tool_orchestrator.rs"]
 pub mod tool_orchestrator;
+#[path = "tooling/tool_policy.rs"]
+pub mod tool_policy;
 #[path = "policy/trust_resolver.rs"]
 pub mod trust_resolver;
 #[path = "conversation/turn_inbox.rs"]
 pub mod turn_inbox;
 #[path = "conversation/turn_supervisor.rs"]
 pub mod turn_supervisor;
+#[path = "upgrade/mod.rs"]
+pub mod upgrade;
 #[path = "provider/usage.rs"]
 mod usage;
 #[path = "infrastructure/worker_boot.rs"]
@@ -363,8 +367,9 @@ pub use compact::{
     get_compact_continuation_message, should_compact, CompactionConfig, CompactionResult,
 };
 pub use config::{
-    ApprovalConfig, CompressionConfig, ConfigEntry, ConfigError, ConfigLoader, ConfigSource,
-    DomainProfile, GateAutoFixConfig, GatewayConfig, McpConfigCollection,
+    ApprovalConfig, CompressionConfig, ConfigDiagnostic as RuntimeConfigDiagnostic,
+    ConfigDiagnosticSeverity, ConfigEntry, ConfigError, ConfigLoadResult, ConfigLoader,
+    ConfigSource, DomainProfile, GateAutoFixConfig, GatewayConfig, McpConfigCollection,
     McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
     McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, MemoryConfig,
     PlatformConfig as GatewayPlatformConfig, ResolvedPermissionMode, RuntimeConfig,
@@ -379,13 +384,17 @@ pub use conflict_arbiter::{
     global_conflict_arbiter, ConflictArbiter, ConflictDecisionKind, ConflictResolutionReceipt,
     ConflictResolutionRequest, ConflictSeverity, ConflictSourceKind,
 };
+pub use context_evidence::{
+    audit_projection as project_evidence_audit, AuditProjection, ModelReceipt,
+};
 pub use context_fanout::{plan_context_fanout, ContextFanoutPlan, FanoutToolCall};
+pub use context_tool_exposure::{ToolExposurePlanner, ToolExposurePolicy, ToolExposureState};
 pub use control_plane::{global_runtime_control_plane, global_task_registry, RuntimeControlPlane};
 pub use conversation::{
     auto_compaction_threshold_from_env, build_cc_memory_config, image_user_message_from_path,
     ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent, CancellationToken,
     ConversationRuntime, MemoryCallback, PromptCacheEvent, ProviderContextInventory, RuntimeError,
-    StaticToolExecutor, ToolCallback, ToolContractScope, ToolError, ToolExecutor, TurnSummary,
+    StaticToolExecutor, ToolCallback, ToolError, ToolExecutor, TurnSummary,
 };
 pub use cowd_event::{
     CowdEvent, CowdEventBus, RunModelTelemetry, RuntimePolicyDecisionSummary,
@@ -544,8 +553,8 @@ pub use prompt::{
 };
 pub use provider::{detect_provider_kind, model_context_window_with_overrides, ProviderKind};
 pub use provider_registry::{
-    init_global_providers, list_all_models, list_all_providers, list_models_for_provider,
-    resolve_global_provider,
+    ProviderRegistry, ProviderRegistryDiagnostics, ProviderRegistryRejected,
+    ProviderRegistrySnapshot, ProviderRegistryUpdate,
 };
 pub use provider_runtime_client::{
     push_provider_output_block, ProviderOutputContentBlock, ProviderRuntimeClient,
@@ -665,12 +674,19 @@ pub use tool_invocation::{
 };
 pub use tool_memory::{memory_candidate_from_tool_invocation, ToolMemoryCandidatePolicy};
 pub use tool_orchestrator::{
-    tool_execution_profile, ToolCachePolicy, ToolExecutionProfile, ToolSafetyCategory,
+    classify_tool_request, tool_execution_profile, ToolCachePolicy, ToolExecutionProfile,
+    ToolSafetyCategory,
 };
+pub use tool_policy::{ToolExecutionPolicyDecision, ToolPolicy, ToolPolicyError};
 pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};
 pub use turn_supervisor::{
     fingerprint_tool_call, SupervisorDecision, ToolCallFingerprint, ToolProgressObservation,
     TurnSupervisor,
+};
+pub use upgrade::{
+    ClosureUpgradeInventoryCollector, UpgradeCarrierRecord, UpgradeCarrierStatus,
+    UpgradeCleanShutdownReceipt, UpgradeCoordinator, UpgradeDispositionReceipt, UpgradeError,
+    UpgradeInventory, UpgradeInventoryCollector, UpgradeMaintenanceSnapshot,
 };
 pub use usage::{
     pricing_for_model, ModelPerformanceRegistry, ModelPerformanceStats, ModelRouteCandidate,
@@ -691,7 +707,7 @@ pub mod cached_prompt;
 pub use budget_policy::{
     clamp_context_budget_ratio_bp, resolve_compact_threshold, resolve_context_budget_tokens,
     MemoryBudgetLease, RuntimeBudgetInputs, RuntimeBudgetPlan, RuntimeControlBudgetLease,
-    ToolResultBudgetLease, DEFAULT_CONTEXT_BUDGET_RATIO_BP, DEFAULT_SUBAGENT_BUDGET_TOKENS,
+    ToolOutputBudgetLease, DEFAULT_CONTEXT_BUDGET_RATIO_BP, DEFAULT_SUBAGENT_BUDGET_TOKENS,
 };
 pub use cached_prompt::CachedSystemPrompt;
 pub use context_runtime::{

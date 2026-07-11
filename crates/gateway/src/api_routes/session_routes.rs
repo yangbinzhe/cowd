@@ -111,6 +111,42 @@ fn default_session_model(state: &AppState) -> String {
         .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string())
 }
 
+fn session_provider_registry(
+    state: &AppState,
+) -> Result<Arc<runtime::ProviderRegistry>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .runtime
+        .as_ref()
+        .map(|service| service.provider_registry())
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "runtime provider registry unavailable".to_string(),
+                }),
+            )
+        })
+}
+
+fn session_tool_host(
+    state: &AppState,
+) -> Result<Arc<tools::ToolHost>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .runtime
+        .as_ref()
+        .map(|service| service.tool_host())
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "runtime tool host unavailable".to_string(),
+                }),
+            )
+        })
+}
+
 #[derive(Deserialize)]
 struct GetEventsParams {
     #[serde(default)]
@@ -371,6 +407,8 @@ async fn create_session(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(body): Json<CreateSessionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let provider_registry = session_provider_registry(&state)?;
+    let tool_host = session_tool_host(&state)?;
     let session_id = uuid::Uuid::new_v4().to_string();
     tracing::info!(%session_id, "API session create requested");
 
@@ -382,6 +420,8 @@ async fn create_session(
     let runtime = if let Some(store) = state.services.session.unified_store() {
         crate::runtime_factory::create_runtime_entry_with_session_store(
             store.clone(),
+            Arc::clone(&provider_registry),
+            Arc::clone(&tool_host),
             session,
             &session_id,
             model.clone(),
@@ -395,6 +435,8 @@ async fn create_session(
         )
     } else {
         crate::runtime_factory::create_runtime_entry(
+            Arc::clone(&provider_registry),
+            Arc::clone(&tool_host),
             session,
             &session_id,
             model.clone(),
@@ -459,6 +501,8 @@ async fn branch_session_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let provider_registry = session_provider_registry(&state)?;
+    let tool_host = session_tool_host(&state)?;
     if id.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -515,6 +559,8 @@ async fn branch_session_handler(
     let runtime = if let Some(store) = state.services.session.unified_store() {
         crate::runtime_factory::create_runtime_entry_with_session_store(
             store.clone(),
+            Arc::clone(&provider_registry),
+            Arc::clone(&tool_host),
             session,
             &branch_id,
             model.clone(),
@@ -528,6 +574,8 @@ async fn branch_session_handler(
         )
     } else {
         crate::runtime_factory::create_runtime_entry(
+            Arc::clone(&provider_registry),
+            Arc::clone(&tool_host),
             session,
             &branch_id,
             model.clone(),
@@ -659,6 +707,8 @@ async fn ensure_session_handler(
     Path(id): Path<String>,
     Json(body): Json<CreateSessionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let provider_registry = session_provider_registry(&state)?;
+    let tool_host = session_tool_host(&state)?;
     if id.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -683,6 +733,8 @@ async fn ensure_session_handler(
         let runtime = if let Some(store) = state.services.session.unified_store() {
             crate::runtime_factory::create_runtime_entry_with_session_store(
                 store.clone(),
+                Arc::clone(&provider_registry),
+                Arc::clone(&tool_host),
                 session,
                 &id,
                 model.clone(),
@@ -696,6 +748,8 @@ async fn ensure_session_handler(
             )
         } else {
             crate::runtime_factory::create_runtime_entry(
+                Arc::clone(&provider_registry),
+                Arc::clone(&tool_host),
                 session,
                 &id,
                 model.clone(),

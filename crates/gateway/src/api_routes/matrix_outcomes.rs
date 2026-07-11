@@ -21,14 +21,11 @@ pub(super) async fn append_matrix_execution_outcome(
     ensure_matrix_outcome_session_record(state, session_id)
         .await
         .map_err(|error| format!("failed to prepare Matrix outcome session: {error}"))?;
-    let sequence = store
-        .next_event_sequence(session_id)
-        .await
-        .map_err(|error| error.to_string())?;
-    let event = outcome.to_runtime_event(session_id.to_string(), sequence);
+    let event = outcome.to_runtime_event(session_id.to_string(), 0);
     store
-        .append_runtime_event(&event)
+        .append_runtime_event_allocating_sequence(&event)
         .await
+        .map(|_| ())
         .map_err(|error| error.to_string())
 }
 

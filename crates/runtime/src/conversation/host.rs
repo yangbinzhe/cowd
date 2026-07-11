@@ -33,6 +33,7 @@ where
     T: ToolExecutor,
 {
     pub session: Session,
+    pub provider_registry: Arc<crate::ProviderRegistry>,
     pub model: String,
     pub tool_definitions: Vec<ProviderToolDefinition>,
     pub tool_executor: Arc<T>,
@@ -67,9 +68,13 @@ where
         });
         let mut runtime = crate::ConversationRuntime::new_with_features(
             config.session,
-            ProviderRuntimeClient::new(active_model.clone(), config.tool_definitions)?
-                .with_emit_output(config.emit_output)
-                .with_stream_callback(config.stream_callback.clone()),
+            ProviderRuntimeClient::new(
+                Arc::clone(&config.provider_registry),
+                active_model.clone(),
+                config.tool_definitions,
+            )?
+            .with_emit_output(config.emit_output)
+            .with_stream_callback(config.stream_callback.clone()),
             config.tool_executor.clone(),
             config.permission_policy,
             config.system_prompt,
@@ -97,9 +102,11 @@ where
         if config.enable_collaboration {
             let subagent_model = config.subagent_model;
             let subagent_tool_definitions = config.subagent_tool_definitions;
+            let provider_registry = Arc::clone(&config.provider_registry);
             let executor = agent::ProductionExecutor::new(
                 move || {
                     ProviderRuntimeClient::new(
+                        Arc::clone(&provider_registry),
                         subagent_model.clone(),
                         subagent_tool_definitions.clone(),
                     )

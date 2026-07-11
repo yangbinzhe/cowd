@@ -1,55 +1,19 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, OnceLock, RwLock};
 
 use harness_contract::tool::{
-    ToolDefinition as KernelToolDefinition, ToolPermissionMode as KernelToolPermissionMode,
+    ToolDefinition as KernelToolDefinition, ToolDescriptorHealth, ToolDescriptorRef,
+    ToolPermissionMode as KernelToolPermissionMode,
 };
-use mcp::McpService;
 use plugins::PluginTool;
 use serde_json::Value;
 
-use crate::lsp_client::LspRegistry;
-use crate::permissions::{PermissionEnforcer, PermissionMode};
+use crate::permissions::PermissionMode;
 
 // Re-exports from split modules
 pub(crate) use tool_specs::{
     deferred_tool_specs, normalize_tool_name, permission_mode_from_plugin,
 };
 pub use tool_specs::{mvp_tool_specs, ToolSpec};
-
-/// Global task registry shared across tool invocations within a session.
-fn global_lsp_registry() -> &'static LspRegistry {
-    static REGISTRY: OnceLock<LspRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(LspRegistry::new)
-}
-
-fn global_mcp_service() -> &'static RwLock<Option<Arc<dyn McpService>>> {
-    static SERVICE: OnceLock<RwLock<Option<Arc<dyn McpService>>>> = OnceLock::new();
-    SERVICE.get_or_init(|| RwLock::new(None))
-}
-
-pub fn set_mcp_service(service: Arc<dyn McpService>) -> Result<(), &'static str> {
-    let mut configured = global_mcp_service()
-        .write()
-        .map_err(|_| "mcp service registry poisoned")?;
-    *configured = Some(service);
-    Ok(())
-}
-
-pub fn clear_mcp_service() -> Result<(), &'static str> {
-    let mut configured = global_mcp_service()
-        .write()
-        .map_err(|_| "mcp service registry poisoned")?;
-    *configured = None;
-    Ok(())
-}
-
-fn configured_mcp_service() -> Option<Arc<dyn McpService>> {
-    global_mcp_service()
-        .read()
-        .ok()
-        .and_then(|configured| configured.clone())
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolManifestEntry {
@@ -81,10 +45,11 @@ impl ToolRegistry {
 }
 
 #[derive(Debug, Clone)]
-pub struct GlobalToolRegistry {
+pub struct ToolCatalog {
     plugin_tools: Vec<PluginTool>,
     runtime_tools: Vec<RuntimeToolDefinition>,
-    enforcer: Option<PermissionEnforcer>,
+    #[cfg(test)]
+    enforcer: Option<crate::permissions::PermissionEnforcer>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -102,41 +67,13 @@ pub struct ToolDefinition {
     pub input_schema: Value,
 }
 
-/// M4: Global registry for self-registered tools (populated via register_tool! macro)
-pub static REGISTERED_TOOLS: std::sync::LazyLock<
-    std::sync::Mutex<
-        Vec<(
-            String,
-            String,
-            std::sync::Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>,
-        )>,
-    >,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
-
-/// M4: Self-registering tool macro. Usage: `register_tool!("my_tool", "Does X", my_handler);`
-#[macro_export]
-macro_rules! register_tool {
-    ($name:expr, $description:expr, $handler:expr) => {
-        #[ctor::ctor]
-        fn __register_tool() {
-            $crate::REGISTERED_TOOLS
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push((
-                    $name.to_string(),
-                    $description.to_string(),
-                    std::sync::Arc::new($handler),
-                ));
-        }
-    };
-}
-
-impl GlobalToolRegistry {
+impl ToolCatalog {
     #[must_use]
     pub fn builtin() -> Self {
         Self {
             plugin_tools: Vec::new(),
             runtime_tools: Vec::new(),
+            #[cfg(test)]
             enforcer: None,
         }
     }
@@ -163,6 +100,7 @@ impl GlobalToolRegistry {
         Ok(Self {
             plugin_tools,
             runtime_tools: Vec::new(),
+            #[cfg(test)]
             enforcer: None,
         })
     }
@@ -194,10 +132,16 @@ impl GlobalToolRegistry {
         Ok(self)
     }
 
+    #[cfg(test)]
     #[must_use]
-    pub fn with_enforcer(mut self, enforcer: PermissionEnforcer) -> Self {
-        self.set_enforcer(enforcer);
+    pub fn with_enforcer(mut self, enforcer: crate::permissions::PermissionEnforcer) -> Self {
+        self.enforcer = Some(enforcer);
         self
+    }
+
+    #[cfg(test)]
+    pub fn set_enforcer(&mut self, enforcer: crate::permissions::PermissionEnforcer) {
+        self.enforcer = Some(enforcer);
     }
 
     pub fn normalize_allowed_tools(
@@ -361,46 +305,75 @@ impl GlobalToolRegistry {
     }
 
     #[must_use]
+    pub fn required_permission(&self, name: &str) -> Option<KernelToolPermissionMode> {
+        self.permission_specs(None)
+            .ok()?
+            .into_iter()
+            .find_map(|(candidate, permission)| {
+                (candidate == name).then_some(kernel_permission_mode(permission))
+            })
+    }
+
+    #[must_use]
     pub fn has_runtime_tool(&self, name: &str) -> bool {
         self.runtime_tools.iter().any(|tool| tool.name == name)
     }
 
     #[must_use]
-    pub fn search(
-        &self,
-        query: &str,
-        max_results: usize,
-        pending_mcp_servers: Option<Vec<String>>,
-        mcp_degraded: Option<Value>,
-    ) -> ToolSearchOutput {
-        let query = query.trim().to_string();
-        let normalized_query = normalize_tool_search_query(&query);
-        let matches = search_tool_specs(&query, max_results.max(1), &self.searchable_tool_specs());
-
-        ToolSearchOutput {
-            matches,
-            query,
-            normalized_query,
-            total_deferred_tools: self.searchable_tool_specs().len(),
-            pending_mcp_servers,
-            mcp_degraded,
-        }
+    pub(crate) fn search_ids(&self, query: &str, max_results: usize) -> Vec<String> {
+        search_tool_specs(query, max_results.max(1), &self.searchable_tool_specs())
     }
 
-    pub fn set_enforcer(&mut self, enforcer: PermissionEnforcer) {
-        self.enforcer = Some(enforcer);
+    #[must_use]
+    pub(crate) fn descriptor_ref(&self, name: &str) -> Option<ToolDescriptorRef> {
+        let definition = self
+            .definitions(None)
+            .into_iter()
+            .find(|item| item.name == name)?;
+        let source = if self.runtime_tools.iter().any(|tool| tool.name == name) {
+            "runtime"
+        } else if self
+            .plugin_tools
+            .iter()
+            .any(|tool| tool.definition().name == name)
+        {
+            "plugin"
+        } else {
+            "builtin"
+        };
+        Some(ToolDescriptorRef {
+            canonical_id: definition.name.clone(),
+            display_name: definition.name,
+            source: source.to_string(),
+            schema_hash: value_hash(&definition.input_schema),
+            required_permission: self.required_permission(name)?,
+            permission_source: format!("{source}_manifest"),
+            health: ToolDescriptorHealth::Healthy,
+        })
     }
 
-    pub fn execute(&self, name: &str, input: &Value) -> Result<String, String> {
-        if mvp_tool_specs().iter().any(|spec| spec.name == name) {
-            return execute_tool_with_enforcer(self.enforcer.as_ref(), None, name, input);
-        }
+    pub(crate) fn execute_plugin(&self, name: &str, input: &Value) -> Result<String, String> {
         self.plugin_tools
             .iter()
             .find(|tool| tool.definition().name == name)
             .ok_or_else(|| format!("unsupported tool: {name}"))?
             .execute(input)
             .map_err(|error| error.to_string())
+    }
+
+    #[cfg(test)]
+    pub fn execute(&self, name: &str, input: &Value) -> Result<String, String> {
+        if mvp_tool_specs().iter().any(|spec| spec.name == name) {
+            let host = ToolHost::builtin("tools-catalog-test", std::env::current_dir().unwrap());
+            return executor::execute_tool_with_enforcer(
+                &host.pin_snapshot(),
+                self.enforcer.as_ref(),
+                None,
+                name,
+                input,
+            );
+        }
+        self.execute_plugin(name, input)
     }
 
     fn searchable_tool_specs(&self) -> Vec<SearchableToolSpec> {
@@ -420,6 +393,24 @@ impl GlobalToolRegistry {
         });
         builtin.chain(runtime).chain(plugin).collect()
     }
+
+    #[must_use]
+    pub fn contains(&self, name: &str) -> bool {
+        mvp_tool_specs().iter().any(|spec| spec.name == name)
+            || self.runtime_tools.iter().any(|tool| tool.name == name)
+            || self
+                .plugin_tools
+                .iter()
+                .any(|tool| tool.definition().name == name)
+    }
+
+    #[must_use]
+    pub fn tool_ids(&self) -> BTreeSet<String> {
+        self.definitions(None)
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect()
+    }
 }
 
 fn kernel_permission_mode(permission: PermissionMode) -> KernelToolPermissionMode {
@@ -431,11 +422,21 @@ fn kernel_permission_mode(permission: PermissionMode) -> KernelToolPermissionMod
         }
     }
 }
+
+fn value_hash(value: &Value) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(value)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
 #[path = "execution/executor.rs"]
 pub mod executor;
 pub(crate) use executor::*;
-// Re-export public items needed by downstream crates
-pub use executor::{execute_tool, ToolSearchOutput};
+#[path = "host.rs"]
+pub mod host;
+pub use host::{ToolHost, ToolHostError, ToolHostLease, ToolHostSnapshot};
 #[path = "execution/bash.rs"]
 pub mod bash;
 #[path = "state/checkpoint.rs"]
@@ -474,6 +475,8 @@ pub mod web_tools;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mcp::McpService;
+    use std::sync::Arc;
 
     #[derive(Debug)]
     struct FakeMcpService {
@@ -545,25 +548,35 @@ mod tests {
     }
 
     #[test]
-    fn mcp_service_can_be_replaced_for_gateway_config_reload() {
-        clear_mcp_service().expect("clear service");
-        set_mcp_service(Arc::new(FakeMcpService { name: "first" })).expect("set first");
+    fn mcp_service_is_replaced_by_snapshot_without_changing_pinned_request() {
+        let host = ToolHost::new(
+            "workspace",
+            "/tmp/workspace",
+            ToolHostSnapshot::new(
+                Arc::new(ToolCatalog::builtin()),
+                Arc::new(lsp_client::LspRegistry::new()),
+                Some(Arc::new(FakeMcpService { name: "first" })),
+            ),
+        );
+        let pinned = host.pin_snapshot();
+        host.replace_snapshot(ToolHostSnapshot::new(
+            Arc::new(ToolCatalog::builtin()),
+            Arc::new(lsp_client::LspRegistry::new()),
+            Some(Arc::new(FakeMcpService { name: "second" })),
+        ));
         assert_eq!(
-            configured_mcp_service()
-                .expect("first service")
-                .health()
-                .unwrap()["name"],
+            pinned.snapshot().mcp.as_ref().unwrap().health().unwrap()["name"],
             "first"
         );
-
-        set_mcp_service(Arc::new(FakeMcpService { name: "second" })).expect("replace service");
         assert_eq!(
-            configured_mcp_service()
-                .expect("second service")
+            host.pin_snapshot()
+                .snapshot()
+                .mcp
+                .as_ref()
+                .unwrap()
                 .health()
                 .unwrap()["name"],
             "second"
         );
-        clear_mcp_service().expect("clear service");
     }
 }

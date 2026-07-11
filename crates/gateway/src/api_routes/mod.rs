@@ -27,7 +27,7 @@ use runtime::{
 use serde::Serialize;
 
 use runtime::ProfileManager;
-use tools::GlobalToolRegistry;
+use tools::ToolCatalog;
 
 use crate::event_bus::SessionEventBus;
 #[cfg(test)]
@@ -85,7 +85,7 @@ mod workspace_routes;
 // ── Shared application state ───────────────────────────────────
 
 pub struct AppState {
-    pub tool_registry: Arc<GlobalToolRegistry>,
+    pub tool_registry: Arc<ToolCatalog>,
     pub config: Option<serde_json::Value>,
     pub event_bus: Arc<SessionEventBus>,
     pub static_webui: crate::gateway_static::StaticWebUiSource,
@@ -477,6 +477,7 @@ pub(crate) async fn sync_runtime_session_metadata_to_store(
         .await
         .map_err(|e| e.to_string())?;
 
+    let mut message_events = Vec::with_capacity(session.messages.len());
     for (sequence, message) in session.messages.iter().enumerate() {
         let message_record = message.to_session_message(session_id, sequence);
         store
@@ -486,7 +487,7 @@ pub(crate) async fn sync_runtime_session_metadata_to_store(
 
         let message_json = serde_json::from_str::<serde_json::Value>(&message.to_json().render())
             .unwrap_or(serde_json::Value::Null);
-        let event = memory::SessionEvent {
+        message_events.push(memory::SessionEvent {
             session_id: session_id.to_string(),
             event_type: "message_appended".to_string(),
             event_json: serde_json::json!({
@@ -498,12 +499,12 @@ pub(crate) async fn sync_runtime_session_metadata_to_store(
             .to_string(),
             sequence,
             created_at_ms: message_record.created_at_ms,
-        };
-        store
-            .append_event(&event)
-            .await
-            .map_err(|e| e.to_string())?;
+        });
     }
+    store
+        .append_events_allocating_sequence(&message_events)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -513,22 +514,15 @@ async fn append_session_timeline_event(
     event_type: &str,
     payload: serde_json::Value,
 ) {
-    let sequence = match store.next_event_sequence(session_id).await {
-        Ok(sequence) => sequence,
-        Err(error) => {
-            tracing::warn!(%session_id, %event_type, error = %error, "failed to allocate session event sequence");
-            return;
-        }
-    };
     let created_at_ms = current_time_ms();
     let event = memory::SessionEvent {
         session_id: session_id.to_string(),
         event_type: event_type.to_string(),
         event_json: payload.to_string(),
-        sequence,
+        sequence: 0,
         created_at_ms,
     };
-    if let Err(error) = store.append_event(&event).await {
+    if let Err(error) = store.append_event_allocating_sequence(&event).await {
         tracing::warn!(%session_id, %event_type, error = %error, "failed to append session event");
     }
 }
@@ -670,6 +664,8 @@ pub(crate) mod tests {
             session_kernel,
             lifecycle_kernel,
             Instant::now(),
+            Arc::new(runtime::ProviderRegistry::empty()),
+            Arc::new(runtime::UpgradeCoordinator::new()),
         ));
         let approval_dir =
             std::env::temp_dir().join(format!("cowd-api-approval-{}", uuid::Uuid::new_v4()));
@@ -689,7 +685,7 @@ pub(crate) mod tests {
 
     pub(crate) fn test_state() -> Arc<AppState> {
         let sessions = Arc::new(ActiveSessions::new());
-        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionEventBus::new(); // returns Arc<Self>
         let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
         let task_kernel = test_task_kernel();
@@ -717,7 +713,7 @@ pub(crate) mod tests {
         registry: Arc<session::SessionLeaseRegistry>,
     ) -> Arc<AppState> {
         let sessions = Arc::new(ActiveSessions::new());
-        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionEventBus::new();
         let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
         let task_kernel = test_task_kernel();
@@ -754,7 +750,7 @@ pub(crate) mod tests {
         workspace_root: PathBuf,
     ) -> Arc<AppState> {
         let sessions = Arc::new(ActiveSessions::new());
-        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionEventBus::new();
         let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
         let task_kernel = test_task_kernel();
@@ -794,7 +790,7 @@ pub(crate) mod tests {
 
     fn test_state_with_store(store: Arc<UnifiedSessionStore>) -> Arc<AppState> {
         let sessions = Arc::new(ActiveSessions::new());
-        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionEventBus::new();
         let session_kernel =
             test_session_kernel(sessions.clone(), Some(store.clone()), event_bus.clone());
@@ -821,7 +817,7 @@ pub(crate) mod tests {
         config_home: PathBuf,
     ) -> Arc<AppState> {
         let sessions = Arc::new(ActiveSessions::new());
-        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionEventBus::new();
         let session_kernel =
             test_session_kernel(sessions.clone(), Some(store.clone()), event_bus.clone());
@@ -860,7 +856,7 @@ pub(crate) mod tests {
     }
 
     fn test_state_with_memory(memory_manager: Arc<CognitiveContextManager>) -> Arc<AppState> {
-        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionEventBus::new();
         let task_kernel = test_task_kernel();
         Arc::new(AppState {
@@ -886,7 +882,7 @@ pub(crate) mod tests {
         memory_manager: Arc<CognitiveContextManager>,
         workspace_root: PathBuf,
     ) -> Arc<AppState> {
-        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionEventBus::new();
         let task_kernel = test_task_kernel();
         Arc::new(AppState {
@@ -917,7 +913,7 @@ pub(crate) mod tests {
     }
 
     fn test_state_with_approval_gate(gate: Arc<SmartApprovalGate>) -> Arc<AppState> {
-        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionEventBus::new();
         let task_kernel = test_task_kernel();
         Arc::new(AppState {
@@ -941,7 +937,7 @@ pub(crate) mod tests {
 
     fn test_state_with_workspace(workspace_root: PathBuf, config_home: PathBuf) -> Arc<AppState> {
         let sessions = Arc::new(ActiveSessions::new());
-        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionEventBus::new();
         let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
         let task_kernel = test_task_kernel();
@@ -7786,9 +7782,7 @@ providers:
     }
 
     #[tokio::test]
-    #[serial_test::serial(provider_registry)]
-    async fn runtime_provider_reload_replaces_global_registry_from_config() {
-        runtime::init_global_providers(model_protocol::provider_config::ProvidersConfig::default());
+    async fn runtime_provider_reload_replaces_runtime_registry_from_config() {
         let root = test_temp_dir("runtime-provider-reload");
         let workspace = root.join("workspace");
         let config_home = root.join("home");
@@ -7808,7 +7802,9 @@ providers:
         )
         .unwrap();
 
-        let app = api_router(test_state_with_workspace(workspace, config_home));
+        let state = test_state_with_workspace(workspace, config_home);
+        let provider_registry = state.services.runtime.as_ref().unwrap().provider_registry();
+        let app = api_router(state);
         let response = app
             .oneshot(
                 Request::builder()
@@ -7832,7 +7828,9 @@ providers:
         assert_eq!(json["configured_model_provider"], "reload");
         assert_eq!(json["configured_model_resolved"], true);
         assert!(!json.to_string().contains("reload-secret-key"));
-        let provider = runtime::resolve_global_provider("reload-model")
+        let provider_snapshot = provider_registry.pin();
+        let provider = provider_snapshot
+            .resolve("reload-model")
             .expect("reloaded provider should resolve model");
         assert_eq!(provider.name, "reload");
         assert_eq!(provider.models, vec!["reload-model", "reload-fast"]);
@@ -7856,10 +7854,14 @@ providers:
         )
         .unwrap();
 
-        let app = api_router(test_state_with_workspace(
-            invalid_workspace,
-            invalid_config_home,
-        ));
+        let invalid_state = test_state_with_workspace(invalid_workspace, invalid_config_home);
+        let invalid_registry = invalid_state
+            .services
+            .runtime
+            .as_ref()
+            .unwrap()
+            .provider_registry();
+        let app = api_router(invalid_state);
         let response = app
             .oneshot(
                 Request::builder()
@@ -7882,23 +7884,22 @@ providers:
             .to_string()
             .contains("unsupported-protocol"));
         assert!(!json.to_string().contains("broken-secret-key"));
-        assert!(runtime::resolve_global_provider("broken-model").is_none());
+        assert!(invalid_registry.pin().resolve("broken-model").is_none());
+        let retained_snapshot = provider_registry.pin();
         assert_eq!(
-            runtime::resolve_global_provider("reload-model")
+            retained_snapshot
+                .resolve("reload-model")
                 .expect("existing provider should remain after failed reload")
                 .name,
             "reload"
         );
 
-        runtime::init_global_providers(model_protocol::provider_config::ProvidersConfig::default());
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(invalid_root);
     }
 
     #[tokio::test]
-    #[serial_test::serial(provider_registry)]
     async fn runtime_config_reload_applies_gateway_runtime_dependencies() {
-        runtime::init_global_providers(model_protocol::provider_config::ProvidersConfig::default());
         let root = test_temp_dir("runtime-config-reload");
         let workspace = root.join("workspace");
         let config_home = root.join("home");
@@ -7980,14 +7981,11 @@ gateway:
             .expect("feishu message connector should be projected from reloaded config");
         assert_eq!(feishu["configured"], true);
 
-        runtime::init_global_providers(model_protocol::provider_config::ProvidersConfig::default());
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test(flavor = "current_thread")]
-    #[serial_test::serial(provider_registry)]
     async fn runtime_config_reload_rejects_invalid_config_without_replacing_running_state() {
-        runtime::init_global_providers(model_protocol::provider_config::ProvidersConfig::default());
         let root = test_temp_dir("runtime-config-reload-invalid-preserve");
         let workspace = root.join("workspace");
         let config_home = root.join("home");
@@ -8008,7 +8006,9 @@ providers:
         )
         .unwrap();
 
-        let app = api_router(test_state_with_workspace(workspace, config_home));
+        let state = test_state_with_workspace(workspace, config_home);
+        let provider_registry = state.services.runtime.as_ref().unwrap().provider_registry();
+        let app = api_router(state);
         let response = app
             .clone()
             .oneshot(
@@ -8024,7 +8024,7 @@ providers:
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["applied"], true);
-        assert!(runtime::resolve_global_provider("stable-model").is_some());
+        assert!(provider_registry.pin().resolve("stable-model").is_some());
 
         std::fs::write(&config_path, "model: [\n").unwrap();
         let response = app
@@ -8043,7 +8043,7 @@ providers:
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "invalid");
         assert_eq!(json["applied"], false);
-        assert!(runtime::resolve_global_provider("stable-model").is_some());
+        assert!(provider_registry.pin().resolve("stable-model").is_some());
 
         let response = app
             .oneshot(
@@ -8061,7 +8061,6 @@ providers:
         assert_eq!(status["status"], "invalid");
         assert_eq!(status["applied"], false);
 
-        runtime::init_global_providers(model_protocol::provider_config::ProvidersConfig::default());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -12566,7 +12565,7 @@ providers:
     #[tokio::test]
     async fn auth_required_when_token_set() {
         let sessions = Arc::new(ActiveSessions::new());
-        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionEventBus::new();
         let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
         let task_kernel = test_task_kernel();
@@ -12601,7 +12600,7 @@ providers:
     #[tokio::test]
     async fn system_routes_stay_protected_when_auth_token_set() {
         let sessions = Arc::new(ActiveSessions::new());
-        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionEventBus::new();
         let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
         let task_kernel = test_task_kernel();
@@ -12636,7 +12635,7 @@ providers:
     #[tokio::test]
     async fn webui_same_origin_requests_bypass_browser_token_handling() {
         let sessions = Arc::new(ActiveSessions::new());
-        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionEventBus::new();
         let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
         let task_kernel = test_task_kernel();
@@ -12673,7 +12672,7 @@ providers:
     #[tokio::test]
     async fn cross_site_requests_still_require_bearer_auth() {
         let sessions = Arc::new(ActiveSessions::new());
-        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionEventBus::new();
         let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
         let task_kernel = test_task_kernel();
@@ -12710,7 +12709,7 @@ providers:
     #[tokio::test]
     async fn profile_and_workspace_routes_stay_protected_when_auth_token_set() {
         let sessions = Arc::new(ActiveSessions::new());
-        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionEventBus::new();
         let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
         let task_kernel = test_task_kernel();
@@ -12754,7 +12753,7 @@ providers:
     #[tokio::test]
     async fn auth_passes_with_valid_token() {
         let sessions = Arc::new(ActiveSessions::new());
-        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionEventBus::new();
         let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
         let task_kernel = test_task_kernel();

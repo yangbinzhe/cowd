@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use runtime::{ToolError, ToolExecutor};
 use serde::Deserialize;
 use tools::permissions::PermissionMode as ToolPermissionMode;
+use tools::{ToolHost, ToolHostSnapshot};
 
 use crate::runtime_bootstrap::{GatewayToolRegistry, RuntimeMcpState};
 use crate::services::{start_team_runtime_with_spawner_decision, MissionTeamExecutionMode};
@@ -41,10 +42,21 @@ struct RuntimeCapabilitiesRequest {
     detail: Option<String>,
 }
 
+fn is_gateway_runtime_control_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "runtime_capabilities"
+            | "runtime_orchestrate"
+            | "MCPTool"
+            | "ListMcpResourcesTool"
+            | "ReadMcpResourceTool"
+    )
+}
+
 pub(crate) struct GatewayToolExecutor {
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
-    tool_registry: GatewayToolRegistry,
+    tool_host: Arc<ToolHost>,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     runtime_session_id: Option<String>,
     runtime_execution_decision: Arc<Mutex<Option<runtime::RuntimeExecutionDecision>>>,
@@ -57,10 +69,37 @@ impl GatewayToolExecutor {
         tool_registry: GatewayToolRegistry,
         mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     ) -> Self {
+        let workspace_root =
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let tool_host = Arc::new(ToolHost::new(
+            "gateway",
+            workspace_root,
+            ToolHostSnapshot::new(
+                Arc::new(tool_registry),
+                Arc::new(tools::lsp_client::LspRegistry::new()),
+                None,
+            ),
+        ));
         Self {
             emit_output,
             allowed_tools,
-            tool_registry,
+            tool_host,
+            mcp_state,
+            runtime_session_id: None,
+            runtime_execution_decision: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub(crate) fn from_tool_host(
+        allowed_tools: Option<AllowedToolSet>,
+        emit_output: bool,
+        tool_host: Arc<ToolHost>,
+        mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+    ) -> Self {
+        Self {
+            emit_output,
+            allowed_tools,
+            tool_host,
             mcp_state,
             runtime_session_id: None,
             runtime_execution_decision: Arc::new(Mutex::new(None)),
@@ -91,13 +130,14 @@ impl GatewayToolExecutor {
                         .and_then(|report| serde_json::to_value(report).ok()),
                 )
             });
-        serde_json::to_string_pretty(&self.tool_registry.search(
-            &input.query,
-            input.max_results.unwrap_or(5),
-            pending_mcp_servers,
-            mcp_degraded,
-        ))
-        .map_err(|error| ToolError::new(error.to_string()))
+        let mut receipt = self
+            .tool_host
+            .pin_snapshot()
+            .search(&input.query, input.max_results.unwrap_or(5));
+        if pending_mcp_servers.is_some() || mcp_degraded.is_some() {
+            receipt.query = format!("{} [mcp state available]", receipt.query);
+        }
+        serde_json::to_string_pretty(&receipt).map_err(|error| ToolError::new(error.to_string()))
     }
 
     fn execute_runtime_tool(
@@ -195,7 +235,10 @@ impl GatewayToolExecutor {
     }
 
     fn available_tool_names(&self) -> Vec<String> {
-        self.tool_registry
+        self.tool_host
+            .pin_snapshot()
+            .snapshot()
+            .catalog
             .definitions(self.allowed_tools.as_ref())
             .into_iter()
             .map(|definition| definition.name)
@@ -203,7 +246,10 @@ impl GatewayToolExecutor {
     }
 
     fn tool_permission_mode(&self, tool_name: &str) -> Option<ToolPermissionMode> {
-        self.tool_registry
+        self.tool_host
+            .pin_snapshot()
+            .snapshot()
+            .catalog
             .permission_specs(self.allowed_tools.as_ref())
             .ok()?
             .into_iter()
@@ -245,12 +291,27 @@ impl ToolExecutor for GatewayToolExecutor {
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
         let result = if tool_name == "ToolSearch" {
             self.execute_search_tool(value)
-        } else if self.tool_registry.has_runtime_tool(tool_name) {
+        } else if is_gateway_runtime_control_tool(tool_name) {
             self.execute_runtime_tool(tool_name, value)
         } else {
-            self.tool_registry
-                .execute(tool_name, &value)
-                .map_err(ToolError::new)
+            let lease = self.tool_host.pin_snapshot();
+            let effect = lease.describe_effect(tool_name, &value);
+            runtime::ToolPolicy
+                .authorize(
+                    &effect,
+                    format!(
+                        "gateway:{tool_name}:{}",
+                        chrono::Utc::now().timestamp_micros()
+                    ),
+                    runtime::PermissionMode::DangerFullAccess,
+                    300,
+                )
+                .map_err(|error| ToolError::new(error.to_string()))
+                .and_then(|decision| {
+                    lease
+                        .execute(&decision.authorization, tool_name, &value)
+                        .map_err(|error| ToolError::new(error.to_string()))
+                })
         };
         match result {
             Ok(output) => {
@@ -272,6 +333,35 @@ impl ToolExecutor for GatewayToolExecutor {
 
     fn has_registered_tools(&self) -> bool {
         !self.available_tool_names().is_empty()
+    }
+
+    fn describe_tool_effect(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
+        Some(
+            self.tool_host
+                .pin_snapshot()
+                .describe_effect(tool_name, input),
+        )
+    }
+
+    fn execute_authorized(
+        &self,
+        authorization: &harness_contract::tool::ToolExecutionAuthorization,
+        tool_name: &str,
+        input: &str,
+    ) -> Result<String, ToolError> {
+        let value = serde_json::from_str(input)
+            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+        if tool_name == "ToolSearch" || is_gateway_runtime_control_tool(tool_name) {
+            return self.execute(tool_name, input);
+        }
+        self.tool_host
+            .pin_snapshot()
+            .execute(authorization, tool_name, &value)
+            .map_err(|error| ToolError::new(error.to_string()))
     }
 
     fn available_tool_names(&self) -> Vec<String> {

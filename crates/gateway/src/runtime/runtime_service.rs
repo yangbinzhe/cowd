@@ -130,6 +130,10 @@ pub(crate) struct RuntimeService {
     session_event_buses: Arc<Mutex<BTreeMap<String, runtime::CowdEventBus>>>,
     session_models: Arc<Mutex<BTreeMap<String, String>>>,
     approval_gate: Option<Arc<runtime::approval_gate::SmartApprovalGate>>,
+    provider_registry: Arc<runtime::ProviderRegistry>,
+    upgrade_coordinator: Arc<runtime::UpgradeCoordinator>,
+    config_reload: Arc<crate::runtime_host::config_reload::ConfigReloadState>,
+    tool_host: Arc<tools::ToolHost>,
 }
 
 #[derive(Debug, Clone)]
@@ -146,6 +150,8 @@ impl RuntimeService {
         session_kernel: Arc<SessionKernel>,
         lifecycle_kernel: Arc<SessionLifecycleKernel>,
         started_at: Instant,
+        provider_registry: Arc<runtime::ProviderRegistry>,
+        upgrade_coordinator: Arc<runtime::UpgradeCoordinator>,
     ) -> Self {
         Self {
             sessions,
@@ -159,6 +165,13 @@ impl RuntimeService {
             session_event_buses: Arc::new(Mutex::new(BTreeMap::new())),
             session_models: Arc::new(Mutex::new(BTreeMap::new())),
             approval_gate: None,
+            provider_registry,
+            upgrade_coordinator,
+            config_reload: Arc::new(crate::runtime_host::config_reload::ConfigReloadState::new()),
+            tool_host: Arc::new(tools::ToolHost::builtin(
+                "gateway-runtime",
+                std::env::current_dir().unwrap_or_default(),
+            )),
         }
     }
 
@@ -168,6 +181,12 @@ impl RuntimeService {
         approval_gate: Arc<runtime::approval_gate::SmartApprovalGate>,
     ) -> Self {
         self.approval_gate = Some(approval_gate);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_tool_host(mut self, tool_host: Arc<tools::ToolHost>) -> Self {
+        self.tool_host = tool_host;
         self
     }
 
@@ -191,6 +210,28 @@ impl RuntimeService {
     #[must_use]
     pub(crate) fn lifecycle_kernel(&self) -> Arc<SessionLifecycleKernel> {
         self.lifecycle_kernel.clone()
+    }
+
+    #[must_use]
+    pub(crate) fn provider_registry(&self) -> Arc<runtime::ProviderRegistry> {
+        Arc::clone(&self.provider_registry)
+    }
+
+    #[must_use]
+    pub(crate) fn upgrade_coordinator(&self) -> Arc<runtime::UpgradeCoordinator> {
+        Arc::clone(&self.upgrade_coordinator)
+    }
+
+    #[must_use]
+    pub(crate) fn config_reload(
+        &self,
+    ) -> Arc<crate::runtime_host::config_reload::ConfigReloadState> {
+        Arc::clone(&self.config_reload)
+    }
+
+    #[must_use]
+    pub(crate) fn tool_host(&self) -> Arc<tools::ToolHost> {
+        Arc::clone(&self.tool_host)
     }
 
     #[must_use]
@@ -236,6 +277,13 @@ impl RuntimeService {
         task_id: Option<String>,
         prompt: String,
     ) -> serde_json::Value {
+        if !self.upgrade_coordinator.accepts_new_work() {
+            return serde_json::json!({
+                "ok": false,
+                "error": "runtime_maintenance",
+                "message": "runtime is in upgrade maintenance mode and rejects new turns",
+            });
+        }
         if prompt.trim().is_empty() {
             return serde_json::json!({
                 "ok": false,
@@ -269,6 +317,115 @@ impl RuntimeService {
             "journal_sequence": journal_sequence,
             "turn": receipt,
         })
+    }
+
+    pub(crate) fn upgrade_runtime_carriers(&self) -> Vec<runtime::UpgradeCarrierRecord> {
+        let mut carriers = self
+            .turns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .filter(|receipt| {
+                matches!(
+                    receipt.status,
+                    TurnStatus::Pending
+                        | TurnStatus::Running
+                        | TurnStatus::PendingApproval
+                        | TurnStatus::Resuming
+                )
+            })
+            .map(|receipt| {
+                let payload = serde_json::to_vec(receipt).unwrap_or_default();
+                runtime::UpgradeCarrierRecord {
+                    carrier_kind: "active_turn".to_string(),
+                    carrier_id: receipt.turn_id.to_string(),
+                    status: match receipt.status {
+                        TurnStatus::Pending => runtime::UpgradeCarrierStatus::Ready,
+                        TurnStatus::Running | TurnStatus::Resuming => {
+                            runtime::UpgradeCarrierStatus::Running
+                        }
+                        TurnStatus::PendingApproval => runtime::UpgradeCarrierStatus::Waiting,
+                        _ => runtime::UpgradeCarrierStatus::Completed,
+                    },
+                    revision: receipt.events.len() as u64,
+                    result_ref: receipt.context_report_id.clone(),
+                    state_ref: receipt
+                        .session_id
+                        .as_ref()
+                        .map(|session_id| format!("session://{session_id}")),
+                    state_hash: format!(
+                        "{:016x}",
+                        model_protocol::prompt_cache::stable_hash_bytes(&payload)
+                    ),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        carriers.extend(
+            runtime::global_agent_lifecycle_service()
+                .list()
+                .into_iter()
+                .map(|snapshot| {
+                    let status = upgrade_agent_status(&snapshot.status);
+                    upgrade_carrier_record(
+                        "agent",
+                        snapshot.agent_id.clone(),
+                        status,
+                        snapshot.lane_events.len() as u64,
+                        (!snapshot.output_file.trim().is_empty())
+                            .then_some(snapshot.output_file.clone()),
+                        (!snapshot.manifest_file.trim().is_empty())
+                            .then_some(snapshot.manifest_file.clone()),
+                        &snapshot,
+                    )
+                }),
+        );
+        carriers.extend(
+            runtime::global_team_runtime_service()
+                .list()
+                .into_iter()
+                .map(|snapshot| {
+                    let status = upgrade_team_status(&snapshot.status);
+                    upgrade_carrier_record(
+                        "team",
+                        snapshot.team_id.clone(),
+                        status,
+                        snapshot.updated_at_ms,
+                        snapshot.result_artifact_file.clone(),
+                        Some(format!(
+                            "mission://session/{}/team/{}",
+                            snapshot.session_id, snapshot.team_id
+                        )),
+                        &snapshot,
+                    )
+                }),
+        );
+        carriers.extend(
+            runtime::global_mission_runtime()
+                .projection()
+                .sessions
+                .into_iter()
+                .map(|snapshot| {
+                    let status = upgrade_mission_status(&snapshot.status);
+                    upgrade_carrier_record(
+                        "mission_session",
+                        snapshot.session_id.clone(),
+                        status,
+                        snapshot.updated_at_ms,
+                        None,
+                        Some(format!("mission://session/{}", snapshot.session_id)),
+                        &snapshot,
+                    )
+                }),
+        );
+        carriers.sort_by(|left, right| {
+            (&left.carrier_kind, &left.carrier_id).cmp(&(&right.carrier_kind, &right.carrier_id))
+        });
+        carriers
+    }
+
+    pub(crate) fn upgrade_turn_carriers(&self) -> Vec<runtime::UpgradeCarrierRecord> {
+        self.upgrade_runtime_carriers()
     }
 
     pub(crate) fn turn_value(&self, turn_id: &str) -> serde_json::Value {
@@ -834,6 +991,8 @@ impl RuntimeService {
         if let Some(store) = self.session_kernel.unified_store() {
             crate::runtime_factory::create_runtime_entry_with_session_store(
                 store,
+                self.provider_registry(),
+                self.tool_host(),
                 session,
                 session_id,
                 model.to_string(),
@@ -848,6 +1007,8 @@ impl RuntimeService {
             .map_err(|error| error.to_string())
         } else {
             crate::runtime_factory::create_runtime_entry(
+                self.provider_registry(),
+                self.tool_host(),
                 session,
                 session_id,
                 model.to_string(),
@@ -1728,9 +1889,86 @@ impl RuntimeService {
     }
 }
 
+fn upgrade_carrier_record(
+    carrier_kind: &str,
+    carrier_id: String,
+    status: runtime::UpgradeCarrierStatus,
+    revision: u64,
+    result_ref: Option<String>,
+    state_ref: Option<String>,
+    state: &impl serde::Serialize,
+) -> runtime::UpgradeCarrierRecord {
+    let payload = serde_json::to_vec(state).unwrap_or_default();
+    runtime::UpgradeCarrierRecord {
+        carrier_kind: carrier_kind.to_string(),
+        carrier_id,
+        status,
+        revision,
+        result_ref,
+        state_ref,
+        state_hash: format!(
+            "{:016x}",
+            model_protocol::prompt_cache::stable_hash_bytes(&payload)
+        ),
+    }
+}
+
+fn upgrade_agent_status(status: &str) -> runtime::UpgradeCarrierStatus {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "pending" | "ready" | "created" => runtime::UpgradeCarrierStatus::Ready,
+        "running" | "active" => runtime::UpgradeCarrierStatus::Running,
+        "waiting" | "pending_approval" => runtime::UpgradeCarrierStatus::Waiting,
+        "paused" | "interrupted" => runtime::UpgradeCarrierStatus::Paused,
+        "completed" | "succeeded" => runtime::UpgradeCarrierStatus::Completed,
+        "failed" | "error" => runtime::UpgradeCarrierStatus::Failed,
+        "cancelled" | "canceled" | "shutdown" => runtime::UpgradeCarrierStatus::Cancelled,
+        _ => runtime::UpgradeCarrierStatus::Blocked,
+    }
+}
+
+fn upgrade_team_status(status: &runtime::TeamRuntimeStatus) -> runtime::UpgradeCarrierStatus {
+    match status {
+        runtime::TeamRuntimeStatus::Planned => runtime::UpgradeCarrierStatus::Ready,
+        runtime::TeamRuntimeStatus::Running => runtime::UpgradeCarrierStatus::Running,
+        runtime::TeamRuntimeStatus::Paused => runtime::UpgradeCarrierStatus::Paused,
+        runtime::TeamRuntimeStatus::ReviewRequested => runtime::UpgradeCarrierStatus::Waiting,
+        runtime::TeamRuntimeStatus::Completed => runtime::UpgradeCarrierStatus::Completed,
+        runtime::TeamRuntimeStatus::Cancelled => runtime::UpgradeCarrierStatus::Cancelled,
+        runtime::TeamRuntimeStatus::Failed => runtime::UpgradeCarrierStatus::Failed,
+    }
+}
+
+fn upgrade_mission_status(status: &runtime::MissionSessionStatus) -> runtime::UpgradeCarrierStatus {
+    match status {
+        runtime::MissionSessionStatus::Active => runtime::UpgradeCarrierStatus::Running,
+        runtime::MissionSessionStatus::Background => runtime::UpgradeCarrierStatus::Waiting,
+        runtime::MissionSessionStatus::Paused => runtime::UpgradeCarrierStatus::Paused,
+        runtime::MissionSessionStatus::Closed => runtime::UpgradeCarrierStatus::Completed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_runtime_service(
+        active_sessions: Arc<ActiveSessions>,
+        store: Option<Arc<memory::UnifiedSessionStore>>,
+    ) -> RuntimeService {
+        RuntimeService::new(
+            active_sessions.clone(),
+            Arc::new(SessionLeaseRegistry::default()),
+            Arc::new(SessionKernel::new(
+                active_sessions,
+                store,
+                crate::event_bus::SessionEventBus::new(),
+            )),
+            Arc::new(SessionLifecycleKernel::new()),
+            Instant::now(),
+            Arc::new(runtime::ProviderRegistry::empty()),
+            Arc::new(runtime::UpgradeCoordinator::new()),
+        )
+    }
 
     #[test]
     fn scoped_max_iterations_restores_previous_runtime_budget() {
@@ -1762,19 +2000,53 @@ mod tests {
         assert_eq!(probe.max_iterations(), 64);
     }
 
+    #[test]
+    fn upgrade_status_mapping_preserves_active_and_terminal_boundaries() {
+        assert_eq!(
+            upgrade_agent_status("running"),
+            runtime::UpgradeCarrierStatus::Running
+        );
+        assert_eq!(
+            upgrade_agent_status("completed"),
+            runtime::UpgradeCarrierStatus::Completed
+        );
+        assert_eq!(
+            upgrade_team_status(&runtime::TeamRuntimeStatus::ReviewRequested),
+            runtime::UpgradeCarrierStatus::Waiting
+        );
+        assert_eq!(
+            upgrade_mission_status(&runtime::MissionSessionStatus::Paused),
+            runtime::UpgradeCarrierStatus::Paused
+        );
+    }
+
+    #[test]
+    fn upgrade_carrier_hash_is_stable_for_same_projection() {
+        let state = serde_json::json!({"status": "running", "revision": 3});
+        let first = upgrade_carrier_record(
+            "agent",
+            "agent-1".to_string(),
+            runtime::UpgradeCarrierStatus::Running,
+            3,
+            None,
+            None,
+            &state,
+        );
+        let second = upgrade_carrier_record(
+            "agent",
+            "agent-1".to_string(),
+            runtime::UpgradeCarrierStatus::Running,
+            3,
+            None,
+            None,
+            &state,
+        );
+        assert_eq!(first.state_hash, second.state_hash);
+    }
+
     #[tokio::test]
     async fn runtime_service_status_does_not_initialize_model_provider() {
-        let service = RuntimeService::new(
-            Arc::new(ActiveSessions::default()),
-            Arc::new(SessionLeaseRegistry::default()),
-            Arc::new(SessionKernel::new(
-                Arc::new(ActiveSessions::default()),
-                None,
-                crate::event_bus::SessionEventBus::new(),
-            )),
-            Arc::new(SessionLifecycleKernel::new()),
-            Instant::now(),
-        );
+        let service = test_runtime_service(Arc::new(ActiveSessions::default()), None);
 
         let value = service.status_value();
         assert_eq!(value["ok"], true);
@@ -1786,17 +2058,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_service_snapshot_reports_lease_projection() {
-        let service = RuntimeService::new(
-            Arc::new(ActiveSessions::default()),
-            Arc::new(SessionLeaseRegistry::default()),
-            Arc::new(SessionKernel::new(
-                Arc::new(ActiveSessions::default()),
-                None,
-                crate::event_bus::SessionEventBus::new(),
-            )),
-            Arc::new(SessionLifecycleKernel::new()),
-            Instant::now(),
-        );
+        let service = test_runtime_service(Arc::new(ActiveSessions::default()), None);
 
         let lease = service
             .acquire_session_lease_value("session-1", "tui:test", "collaborative")
@@ -1815,18 +2077,8 @@ mod tests {
     #[tokio::test]
     async fn runtime_service_records_durable_turn_journal() {
         let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
-        let session_kernel = Arc::new(SessionKernel::new(
-            Arc::new(ActiveSessions::default()),
-            Some(store.clone()),
-            crate::event_bus::SessionEventBus::new(),
-        ));
-        let service = RuntimeService::new(
-            Arc::new(ActiveSessions::default()),
-            Arc::new(SessionLeaseRegistry::default()),
-            session_kernel,
-            Arc::new(SessionLifecycleKernel::new()),
-            Instant::now(),
-        );
+        let service =
+            test_runtime_service(Arc::new(ActiveSessions::default()), Some(store.clone()));
 
         let submitted = service
             .submit_turn_value(
@@ -1854,17 +2106,7 @@ mod tests {
     async fn runtime_service_persists_session_input_runtime_event() {
         let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
         let active_sessions = Arc::new(ActiveSessions::default());
-        let service = RuntimeService::new(
-            active_sessions.clone(),
-            Arc::new(SessionLeaseRegistry::default()),
-            Arc::new(SessionKernel::new(
-                active_sessions,
-                Some(store.clone()),
-                crate::event_bus::SessionEventBus::new(),
-            )),
-            Arc::new(SessionLifecycleKernel::new()),
-            Instant::now(),
-        );
+        let service = test_runtime_service(active_sessions, Some(store.clone()));
         service
             .session_inputs
             .lock()
@@ -1908,17 +2150,7 @@ mod tests {
     async fn create_new_session_input_materializes_real_session() {
         let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
         let active_sessions = Arc::new(ActiveSessions::default());
-        let service = RuntimeService::new(
-            active_sessions.clone(),
-            Arc::new(SessionLeaseRegistry::default()),
-            Arc::new(SessionKernel::new(
-                active_sessions,
-                Some(store.clone()),
-                crate::event_bus::SessionEventBus::new(),
-            )),
-            Arc::new(SessionLifecycleKernel::new()),
-            Instant::now(),
-        );
+        let service = test_runtime_service(active_sessions, Some(store.clone()));
         service
             .session_inputs
             .lock()
@@ -2016,17 +2248,7 @@ mod tests {
 
     #[test]
     fn runtime_service_records_executing_turn_lifecycle() {
-        let service = RuntimeService::new(
-            Arc::new(ActiveSessions::default()),
-            Arc::new(SessionLeaseRegistry::default()),
-            Arc::new(SessionKernel::new(
-                Arc::new(ActiveSessions::default()),
-                None,
-                crate::event_bus::SessionEventBus::new(),
-            )),
-            Arc::new(SessionLifecycleKernel::new()),
-            Instant::now(),
-        );
+        let service = test_runtime_service(Arc::new(ActiveSessions::default()), None);
 
         let running = service.start_running_turn(
             Some("session-turn".to_string()),

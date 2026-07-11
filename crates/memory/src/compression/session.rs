@@ -238,8 +238,17 @@ pub struct SessionCheckpointFact {
     pub evidence_refs: Vec<EvidenceRef>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionResumeCursor {
+    pub message_index: usize,
+    pub event_sequence: Option<usize>,
+    pub checkpoint_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSemanticCheckpoint {
+    #[serde(default = "legacy_session_checkpoint_schema_version")]
+    pub schema_version: u32,
     pub checkpoint_id: String,
     pub session_id: String,
     pub agent_id: String,
@@ -247,9 +256,31 @@ pub struct SessionSemanticCheckpoint {
     pub task_id: Option<String>,
     pub team_id: Option<String>,
     pub summary: String,
+    #[serde(default)]
+    pub user_rules: Vec<String>,
+    #[serde(default)]
+    pub goal: Option<String>,
+    #[serde(default)]
+    pub constraints: Vec<String>,
+    #[serde(default)]
+    pub decisions: Vec<String>,
+    #[serde(default)]
+    pub evidence_refs: Vec<EvidenceRef>,
+    #[serde(default)]
+    pub unresolved: Vec<String>,
+    #[serde(default)]
+    pub file_changes: Vec<String>,
+    #[serde(default)]
+    pub resume_cursor: SessionResumeCursor,
     pub token_stats: CheckpointTokenStats,
     pub source_range: CompactionSourceRange,
     pub facts: Vec<SessionCheckpointFact>,
+}
+
+const SESSION_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
+
+const fn legacy_session_checkpoint_schema_version() -> u32 {
+    1
 }
 
 impl SessionSemanticCheckpoint {
@@ -350,8 +381,9 @@ impl SessionCheckpointFact {
         .with_confidence(Confidence::from_basis_points(
             (self.confidence.clamp(0.0, 1.0) * 10_000.0).round() as u16,
         ))
-        .with_method(ExtractionMethod::Checkpoint, "memory-session-checkpoint:v1")
+        .with_method(ExtractionMethod::Checkpoint, "memory-session-checkpoint:v2")
         .with_payload(json!({
+            "schema_version": checkpoint.schema_version,
             "checkpoint_id": checkpoint.checkpoint_id,
             "session_id": checkpoint.session_id,
             "agent_id": checkpoint.agent_id,
@@ -365,6 +397,14 @@ impl SessionCheckpointFact {
             "layer": self.layer,
             "source_range": checkpoint.source_range,
             "token_stats": checkpoint.token_stats,
+            "user_rules": checkpoint.user_rules,
+            "goal": checkpoint.goal,
+            "constraints": checkpoint.constraints,
+            "decisions": checkpoint.decisions,
+            "evidence_refs": checkpoint.evidence_refs,
+            "unresolved": checkpoint.unresolved,
+            "file_changes": checkpoint.file_changes,
+            "resume_cursor": checkpoint.resume_cursor,
         }))
         .with_tags(tags);
         candidate.candidate_id = checkpoint.fact_candidate_id(fact_index);
@@ -501,13 +541,14 @@ impl SessionCompactor {
         let input_tokens = self.estimate_tokens(messages);
         let mut facts = Vec::new();
         let evidence_refs = build_context.source_range.raw_refs.clone();
+        let decisions = self.extract_decisions(messages);
 
-        for decision in self.extract_decisions(messages) {
+        for decision in &decisions {
             let decision_title: String = decision.chars().take(80).collect();
             facts.push(checkpoint_fact(
                 CheckpointFactKind::Decision,
                 format!("Decision: {decision_title}"),
-                decision,
+                decision.clone(),
                 MemoryCategory::Decision,
                 MemoryLayer::L2,
                 vec!["decision"],
@@ -535,7 +576,7 @@ impl SessionCompactor {
             facts.push(checkpoint_fact(
                 CheckpointFactKind::Constraint,
                 "Session constraints checkpoint",
-                constraints,
+                constraints.clone(),
                 MemoryCategory::ProjectConvention,
                 MemoryLayer::L2,
                 vec!["constraint"],
@@ -549,7 +590,7 @@ impl SessionCompactor {
             facts.push(checkpoint_fact(
                 CheckpointFactKind::PendingWork,
                 "Session pending work checkpoint",
-                pending_work,
+                pending_work.clone(),
                 MemoryCategory::ProjectKnowledge,
                 MemoryLayer::L2,
                 vec!["pending-work"],
@@ -563,7 +604,7 @@ impl SessionCompactor {
             facts.push(checkpoint_fact(
                 CheckpointFactKind::CodeChange,
                 "Session code changes checkpoint",
-                code_changes,
+                code_changes.clone(),
                 MemoryCategory::ProjectKnowledge,
                 MemoryLayer::L2,
                 vec!["code-change"],
@@ -615,7 +656,28 @@ impl SessionCompactor {
             &evidence_refs,
         ));
 
+        let user_rules = self.extract_user_rules(messages);
+        let goal = messages
+            .iter()
+            .rev()
+            .find(|message| matches!(message.role, MessageRole::User))
+            .map(|message| message.content.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let unresolved = checkpoint_lines(&self.extract_questions(messages))
+            .into_iter()
+            .chain(checkpoint_lines(&pending_work))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let file_changes = checkpoint_lines(&code_changes);
+        let resume_cursor = SessionResumeCursor {
+            message_index: build_context.source_range.message_end_exclusive,
+            event_sequence: build_context.source_range.event_end_exclusive,
+            checkpoint_id: build_context.checkpoint_id.clone(),
+        };
+
         Ok(SessionSemanticCheckpoint {
+            schema_version: SESSION_CHECKPOINT_SCHEMA_VERSION,
             checkpoint_id: build_context.checkpoint_id,
             session_id: build_context.session_id,
             agent_id: build_context.agent_id,
@@ -623,6 +685,14 @@ impl SessionCompactor {
             task_id: build_context.task_id,
             team_id: build_context.team_id,
             summary,
+            user_rules,
+            goal,
+            constraints: checkpoint_lines(&constraints),
+            decisions,
+            evidence_refs,
+            unresolved,
+            file_changes,
+            resume_cursor,
             token_stats: CheckpointTokenStats {
                 before: u64::from(input_tokens),
                 after: u64::from(summary_tokens),
@@ -907,6 +977,7 @@ None
             "decided",
             "chosen",
             "agreed",
+            "decision:",
             "will use",
             "we should",
             "let's use",
@@ -957,23 +1028,52 @@ None
     }
 
     fn extract_code_changes(&self, messages: &[Message]) -> String {
-        // Count tool calls that look like file writes.
-        let write_ops = messages
+        const CHANGE_MARKERS: &[&str] = &[
+            "modified",
+            "created",
+            "deleted",
+            "renamed",
+            "wrote",
+            "edited",
+            "changed",
+            "修改",
+            "新增",
+            "删除",
+            "重命名",
+        ];
+        let mut changes = messages
             .iter()
-            .filter(|m| {
-                m.is_tool_result()
-                    && m.tool_name.as_deref().is_some_and(|n| {
-                        n.contains("write")
-                            || n.contains("edit")
-                            || n.contains("create")
-                            || n.contains("replace")
+            .flat_map(|message| {
+                let tool_is_write = message.is_tool_result()
+                    && message.tool_name.as_deref().is_some_and(|name| {
+                        ["write", "edit", "create", "replace", "delete", "rename"]
+                            .iter()
+                            .any(|marker| name.contains(marker))
+                    });
+                message
+                    .content
+                    .lines()
+                    .filter(move |line| {
+                        tool_is_write
+                            || CHANGE_MARKERS
+                                .iter()
+                                .any(|marker| line.to_lowercase().contains(marker))
                     })
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string)
             })
-            .count();
-        if write_ops == 0 {
+            .collect::<Vec<_>>();
+        changes.sort();
+        changes.dedup();
+        if changes.is_empty() {
             "No file changes detected.".into()
         } else {
-            format!("{write_ops} file write/edit operation(s) performed.")
+            changes
+                .into_iter()
+                .map(|change| format!("- {change}"))
+                .collect::<Vec<_>>()
+                .join("\n")
         }
     }
 
@@ -1088,13 +1188,51 @@ None
         }
     }
 
+    fn extract_user_rules(&self, messages: &[Message]) -> Vec<String> {
+        const RULE_MARKERS: &[&str] = &[
+            "must",
+            "must not",
+            "always",
+            "never",
+            "do not",
+            "don't",
+            "required",
+            "必须",
+            "务必",
+            "不要",
+            "禁止",
+            "始终",
+            "一定要",
+        ];
+        let mut rules = messages
+            .iter()
+            .filter(|message| matches!(message.role, MessageRole::User))
+            .flat_map(|message| message.content.lines())
+            .map(str::trim)
+            .filter(|line| {
+                let normalized = line.to_lowercase();
+                !line.is_empty()
+                    && RULE_MARKERS
+                        .iter()
+                        .any(|marker| normalized.contains(marker))
+            })
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        rules.sort();
+        rules.dedup();
+        rules
+    }
+
     fn extract_questions(&self, messages: &[Message]) -> String {
         let questions: Vec<_> = messages
             .iter()
             .filter_map(|m| {
                 m.content
                     .lines()
-                    .find(|l| l.trim_end().ends_with('?'))
+                    .find(|l| {
+                        let line = l.trim_end();
+                        line.ends_with('?') || line.ends_with('？')
+                    })
                     .map(|l| format!("- {}", l.trim()))
             })
             .take(5)
@@ -1203,6 +1341,22 @@ fn is_negative_checkpoint_text(text: &str) -> bool {
         || trimmed.starts_with("No next")
 }
 
+fn checkpoint_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|line| {
+            line.trim()
+                .trim_start_matches(['-', '*'])
+                .trim()
+                .to_string()
+        })
+        .filter(|line| {
+            !line.is_empty()
+                && !line.eq_ignore_ascii_case("none")
+                && !line.to_lowercase().starts_with("no ")
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Legacy MemoryEntry-based API (kept for backward compatibility)
 // ---------------------------------------------------------------------------
@@ -1303,12 +1457,61 @@ mod tests {
         assert!(compactor.should_compact(&messages));
     }
 
+    #[tokio::test]
+    async fn semantic_checkpoint_preserves_resume_critical_fields() {
+        let messages = vec![
+            msg(
+                MessageRole::User,
+                "Goal: finish V2. Never discard canonical evidence. Constraint: memory files only.",
+            ),
+            msg(
+                MessageRole::Assistant,
+                "Decision: use one transaction. TODO migrate external callers. Modified crates/memory/src/store/session.rs",
+            ),
+        ];
+        let raw_ref = EvidenceRef::durable("raw-checkpoint");
+        let context = SessionCheckpointBuildContext::new(
+            "session-checkpoint",
+            "agent-checkpoint",
+            CompactionSourceRange {
+                session_id: "session-checkpoint".to_string(),
+                message_start: 0,
+                message_end_exclusive: 2,
+                event_start: Some(4),
+                event_end_exclusive: Some(8),
+                raw_refs: vec![raw_ref.clone()],
+            },
+        );
+
+        let checkpoint = SessionCompactor::new()
+            .build_checkpoint(&messages, None, context)
+            .await
+            .unwrap();
+        assert_eq!(checkpoint.schema_version, SESSION_CHECKPOINT_SCHEMA_VERSION);
+        assert!(checkpoint
+            .goal
+            .as_deref()
+            .is_some_and(|goal| goal.contains("finish V2")));
+        assert!(checkpoint
+            .user_rules
+            .iter()
+            .any(|rule| rule.contains("Never discard")));
+        assert!(!checkpoint.constraints.is_empty());
+        assert!(!checkpoint.decisions.is_empty());
+        assert_eq!(checkpoint.evidence_refs, vec![raw_ref]);
+        assert!(!checkpoint.unresolved.is_empty());
+        assert!(!checkpoint.file_changes.is_empty());
+        assert_eq!(checkpoint.resume_cursor.message_index, 2);
+        assert_eq!(checkpoint.resume_cursor.event_sequence, Some(8));
+    }
+
     #[test]
     fn semantic_checkpoint_exports_fact_extraction_batch_with_stable_scope() {
         let evidence_ref = EvidenceRef(
             KernelRef::new("session-message", "session-a:0").with_label("source message"),
         );
         let checkpoint = SessionSemanticCheckpoint {
+            schema_version: SESSION_CHECKPOINT_SCHEMA_VERSION,
             checkpoint_id: "checkpoint-a".to_string(),
             session_id: "session-a".to_string(),
             agent_id: "agent-a".to_string(),
@@ -1316,6 +1519,18 @@ mod tests {
             task_id: Some("task-a".to_string()),
             team_id: Some("team-a".to_string()),
             summary: "summary".to_string(),
+            user_rules: vec!["Never lose durable evidence".to_string()],
+            goal: Some("finish V2".to_string()),
+            constraints: vec!["memory scope only".to_string()],
+            decisions: vec!["use atomic sequence allocation".to_string()],
+            evidence_refs: vec![evidence_ref.clone()],
+            unresolved: vec!["migrate external callers".to_string()],
+            file_changes: vec!["memory session store".to_string()],
+            resume_cursor: SessionResumeCursor {
+                message_index: 2,
+                event_sequence: Some(2),
+                checkpoint_id: "checkpoint-a".to_string(),
+            },
             token_stats: CheckpointTokenStats {
                 before: 120,
                 after: 30,

@@ -823,7 +823,23 @@ fn run_eval_tool_call(
     input: Value,
 ) -> ToolCallDetail {
     let started = Instant::now();
-    let result = tools::execute_tool(name, &input);
+    let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let host = tools::ToolHost::builtin("harness-eval", workspace_root);
+    let lease = host.pin_snapshot();
+    let effect = lease.describe_effect(name, &input);
+    let result = runtime::ToolPolicy
+        .authorize(
+            &effect,
+            format!("harness-eval:{scenario_id}:{call_index}"),
+            runtime::PermissionMode::ReadOnly,
+            30,
+        )
+        .map_err(|error| error.to_string())
+        .and_then(|decision| {
+            lease
+                .execute(&decision.authorization, name, &input)
+                .map_err(|error| error.to_string())
+        });
     let elapsed_ms = started.elapsed().as_millis();
     let (status, output, error) = match result {
         Ok(output) => ("passed".to_string(), Some(output), None),

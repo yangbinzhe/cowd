@@ -34,6 +34,16 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         )
         .route("/api/runtime/config/reload", post(reload_runtime_config))
         .route(
+            "/api/runtime/upgrade/maintenance",
+            get(get_upgrade_maintenance).post(enter_upgrade_maintenance),
+        )
+        .route(
+            "/api/runtime/upgrade/dispositions",
+            post(record_upgrade_disposition),
+        )
+        .route("/api/runtime/upgrade/inventory", get(get_upgrade_inventory))
+        .route("/api/runtime/upgrade/export", post(export_upgrade_manifest))
+        .route(
             "/api/runtime/config/reload/status",
             get(get_runtime_config_reload_status),
         )
@@ -119,6 +129,311 @@ struct RuntimeTurnSubmitRequest {
     session_id: Option<String>,
     #[serde(default)]
     task_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UpgradeMaintenanceRequest {
+    actor: String,
+}
+
+#[derive(Deserialize)]
+struct UpgradeDispositionRequest {
+    carrier_kind: String,
+    carrier_id: String,
+    action: String,
+    actor: String,
+    reason: String,
+    #[serde(default)]
+    result_refs: Vec<String>,
+}
+
+async fn get_upgrade_maintenance(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
+        runtime_event_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime service unavailable",
+        )
+    })?;
+    register_gateway_upgrade_collectors(&state, runtime_service);
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "kind": "runtime.upgrade.maintenance",
+        "snapshot": runtime_service.upgrade_coordinator().snapshot(),
+    })))
+}
+
+async fn enter_upgrade_maintenance(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(request): Json<UpgradeMaintenanceRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    if request.actor.trim().is_empty() {
+        return Err(runtime_event_error(
+            StatusCode::BAD_REQUEST,
+            "actor is required",
+        ));
+    }
+    let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
+        runtime_event_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime service unavailable",
+        )
+    })?;
+    let coordinator = runtime_service.upgrade_coordinator();
+    register_gateway_upgrade_collectors(&state, runtime_service);
+    coordinator
+        .enter_maintenance(request.actor)
+        .map_err(|error| runtime_event_error(StatusCode::CONFLICT, error))?;
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "kind": "runtime.upgrade.maintenance",
+        "snapshot": coordinator.snapshot(),
+    })))
+}
+
+async fn record_upgrade_disposition(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(request): Json<UpgradeDispositionRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    if request.carrier_kind.trim().is_empty()
+        || request.carrier_id.trim().is_empty()
+        || request.actor.trim().is_empty()
+        || request.reason.trim().is_empty()
+    {
+        return Err(runtime_event_error(
+            StatusCode::BAD_REQUEST,
+            "carrier_kind, carrier_id, actor and reason are required",
+        ));
+    }
+    let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
+        runtime_event_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime service unavailable",
+        )
+    })?;
+    if !matches!(request.action.as_str(), "cancel" | "drain") {
+        return Err(runtime_event_error(
+            StatusCode::BAD_REQUEST,
+            "upgrade disposition action must be cancel or drain",
+        ));
+    }
+    if request.action == "cancel" {
+        let cancellation = match request.carrier_kind.as_str() {
+            "active_turn" => {
+                let value = runtime_service.cancel_turn_value(&request.carrier_id).await;
+                value
+                    .get("ok")
+                    .and_then(Value::as_bool)
+                    .filter(|ok| *ok)
+                    .map(|_| ())
+                    .ok_or_else(|| {
+                        value
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("turn cancellation failed")
+                            .to_string()
+                    })
+            }
+            "agent" => runtime::global_agent_lifecycle_service()
+                .cancel(&request.carrier_id)
+                .map(|_| ()),
+            "team" => runtime::global_team_runtime_service()
+                .cancel(&request.carrier_id)
+                .map(|_| ()),
+            "mission_session" => runtime::global_mission_runtime()
+                .close_session(&request.carrier_id)
+                .map(|_| ()),
+            "cross_plane_execution" => Err(
+                "cross-plane executions have no safe cancellation adapter; wait for terminal state before recording drain"
+                    .to_string(),
+            ),
+            kind => Err(format!("unsupported upgrade carrier kind `{kind}`")),
+        };
+        cancellation.map_err(|error| runtime_event_error(StatusCode::CONFLICT, error))?;
+    } else {
+        register_gateway_upgrade_collectors(&state, runtime_service);
+        let active = runtime_service
+            .upgrade_runtime_carriers()
+            .into_iter()
+            .chain(cross_plane_upgrade_carriers(&state.services.cross_plane))
+            .any(|carrier| {
+                carrier.carrier_kind == request.carrier_kind
+                    && carrier.carrier_id == request.carrier_id
+                    && carrier.status.is_active()
+            });
+        if active {
+            return Err(runtime_event_error(
+                StatusCode::CONFLICT,
+                "carrier is still active; drain disposition can be recorded only after it reaches a terminal state",
+            ));
+        }
+    }
+    let receipt = runtime::UpgradeDispositionReceipt {
+        carrier_kind: request.carrier_kind,
+        carrier_id: request.carrier_id,
+        action: request.action,
+        actor: request.actor,
+        reason: request.reason,
+        result_refs: request.result_refs,
+        created_at_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
+    };
+    runtime_service
+        .upgrade_coordinator()
+        .record_disposition(receipt.clone())
+        .map_err(|error| runtime_event_error(StatusCode::CONFLICT, error))?;
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "kind": "runtime.upgrade.disposition",
+        "receipt": receipt,
+    })))
+}
+
+async fn export_upgrade_manifest(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
+        runtime_event_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime service unavailable",
+        )
+    })?;
+    let coordinator = runtime_service.upgrade_coordinator();
+    register_gateway_upgrade_collectors(&state, runtime_service);
+    let workspace_id = format!(
+        "{:016x}",
+        model_protocol::prompt_cache::stable_hash_bytes(
+            state.workspace_root.to_string_lossy().as_bytes()
+        )
+    );
+    let inventory = coordinator
+        .collect_inventory(
+            env!("CARGO_PKG_VERSION"),
+            workspace_id,
+            state.workspace_root.clone(),
+        )
+        .map_err(|error| runtime_event_error(StatusCode::CONFLICT, error))?;
+    let path = state
+        .config_home
+        .join("migrations")
+        .join("v3-active-inventory.json");
+    let receipt = coordinator
+        .export_clean_shutdown_manifest(&inventory, &path)
+        .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "kind": "runtime.upgrade.manifest",
+        "inventory": inventory,
+        "receipt": receipt,
+    })))
+}
+
+async fn get_upgrade_inventory(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
+        runtime_event_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime service unavailable",
+        )
+    })?;
+    register_gateway_upgrade_collectors(&state, runtime_service);
+    let mut carriers = runtime_service.upgrade_runtime_carriers();
+    carriers.extend(cross_plane_upgrade_carriers(&state.services.cross_plane));
+    carriers.sort_by(|left, right| {
+        (&left.carrier_kind, &left.carrier_id).cmp(&(&right.carrier_kind, &right.carrier_id))
+    });
+    let active_count = carriers
+        .iter()
+        .filter(|carrier| carrier.status.is_active())
+        .count();
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "kind": "runtime.upgrade.inventory_preview",
+        "maintenance": !runtime_service.upgrade_coordinator().accepts_new_work(),
+        "carrier_count": carriers.len(),
+        "active_count": active_count,
+        "carriers": carriers,
+    })))
+}
+
+fn register_gateway_upgrade_collectors(
+    state: &AppState,
+    runtime_service: &crate::runtime_service::RuntimeService,
+) {
+    let cross_plane = state.services.cross_plane.clone();
+    runtime_service
+        .upgrade_coordinator()
+        .register_collector(Arc::new(runtime::ClosureUpgradeInventoryCollector::new(
+            "cross_plane_executions",
+            move || Ok(cross_plane_upgrade_carriers(&cross_plane)),
+        )));
+}
+
+fn cross_plane_upgrade_carriers(
+    cross_plane: &crate::services::CrossPlaneService,
+) -> Vec<runtime::UpgradeCarrierRecord> {
+    cross_plane
+        .control()
+        .snapshot()
+        .executions
+        .into_iter()
+        .map(|receipt| {
+            let payload = serde_json::to_vec(&receipt).unwrap_or_default();
+            runtime::UpgradeCarrierRecord {
+                carrier_kind: "cross_plane_execution".to_string(),
+                carrier_id: receipt.id,
+                status: upgrade_cross_plane_status(&receipt.status),
+                revision: receipt.timestamp.timestamp_millis().max(0) as u64,
+                result_ref: receipt
+                    .audit_record_id
+                    .map(|id| format!("cross-plane://audit/{id}")),
+                state_ref: receipt.action.resource_ref.clone().or_else(|| {
+                    Some(format!(
+                        "cross-plane://capability/{}",
+                        receipt.action.requested_capability
+                    ))
+                }),
+                state_hash: format!(
+                    "{:016x}",
+                    model_protocol::prompt_cache::stable_hash_bytes(&payload)
+                ),
+            }
+        })
+        .collect()
+}
+
+fn upgrade_cross_plane_status(status: &str) -> runtime::UpgradeCarrierStatus {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "pending" | "ready" | "accepted" => runtime::UpgradeCarrierStatus::Ready,
+        "running" | "dispatching" | "executing" => runtime::UpgradeCarrierStatus::Running,
+        "waiting" | "approval_required" => runtime::UpgradeCarrierStatus::Waiting,
+        "paused" => runtime::UpgradeCarrierStatus::Paused,
+        "failed" | "error" | "dispatch_failed" => runtime::UpgradeCarrierStatus::Failed,
+        "cancelled" | "canceled" => runtime::UpgradeCarrierStatus::Cancelled,
+        _ => runtime::UpgradeCarrierStatus::Completed,
+    }
+}
+
+#[cfg(test)]
+mod v2_upgrade_tests {
+    use super::upgrade_cross_plane_status;
+
+    #[test]
+    fn cross_plane_inventory_distinguishes_active_and_terminal_executions() {
+        assert_eq!(
+            upgrade_cross_plane_status("dispatching"),
+            runtime::UpgradeCarrierStatus::Running
+        );
+        assert_eq!(
+            upgrade_cross_plane_status("dispatch_failed"),
+            runtime::UpgradeCarrierStatus::Failed
+        );
+        assert_eq!(
+            upgrade_cross_plane_status("sent"),
+            runtime::UpgradeCarrierStatus::Completed
+        );
+    }
 }
 
 #[derive(Deserialize)]
@@ -226,8 +541,16 @@ fn runtime_replay_report(limit: usize) -> Result<Value, (StatusCode, Json<ErrorR
     }))
 }
 
-fn runtime_event_error(status: StatusCode, error: String) -> (StatusCode, Json<ErrorResponse>) {
-    (status, Json(ErrorResponse { error }))
+fn runtime_event_error(
+    status: StatusCode,
+    error: impl ToString,
+) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        status,
+        Json(ErrorResponse {
+            error: error.to_string(),
+        }),
+    )
 }
 
 fn parse_runtime_event_scope(scope: &str) -> runtime::RuntimeEventScope {
@@ -436,17 +759,37 @@ pub(super) async fn get_runtime_effective_config(
 pub(super) async fn reload_runtime_providers(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Json<Value> {
-    Json(crate::runtime_host::config_reload::reload_runtime_providers_from_disk(&state).await)
+    let Some(runtime) = state.services.runtime.as_ref() else {
+        return Json(serde_json::json!({"ok": false, "error": "runtime service unavailable"}));
+    };
+    let reload = runtime.config_reload();
+    Json(
+        crate::runtime_host::config_reload::reload_runtime_providers_from_disk(&reload, &state)
+            .await,
+    )
 }
 
 pub(super) async fn reload_runtime_config(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Json<Value> {
-    Json(crate::runtime_host::config_reload::force_gateway_config_reload(&state, "manual").await)
+    let Some(runtime) = state.services.runtime.as_ref() else {
+        return Json(serde_json::json!({"ok": false, "error": "runtime service unavailable"}));
+    };
+    let reload = runtime.config_reload();
+    Json(
+        crate::runtime_host::config_reload::force_gateway_config_reload(&reload, &state, "manual")
+            .await,
+    )
 }
 
-pub(super) async fn get_runtime_config_reload_status() -> Json<Value> {
-    Json(crate::runtime_host::config_reload::status_value())
+pub(super) async fn get_runtime_config_reload_status(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Json<Value> {
+    let Some(runtime) = state.services.runtime.as_ref() else {
+        return Json(serde_json::json!({"ok": false, "error": "runtime service unavailable"}));
+    };
+    let reload = runtime.config_reload();
+    Json(crate::runtime_host::config_reload::status_value(&reload))
 }
 
 async fn get_runtime_session_leases(AxumState(state): AxumState<Arc<AppState>>) -> Json<Value> {

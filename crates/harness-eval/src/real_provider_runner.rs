@@ -78,19 +78,40 @@ pub(crate) fn run_deep_real_provider_review(
         model: model.clone(),
     };
 
-    let events = match runtime::ProviderRuntimeClient::new(model.clone(), Vec::new()).and_then(
-        |mut client| {
-            use runtime::ApiClient;
-            client
-                .stream_collect(request)
+    let provider_registry = std::env::current_dir()
+        .map_err(|error| error.to_string())
+        .and_then(|cwd| {
+            runtime::ConfigLoader::default_for(cwd)
+                .load()
                 .map_err(|error| error.to_string())
-        },
-    ) {
-        Ok(events) => events,
+        })
+        .and_then(|config| {
+            runtime::ProviderRegistry::new(config.providers().clone())
+                .map(std::sync::Arc::new)
+                .map_err(|rejected| rejected.diagnostics.errors.join("; "))
+        });
+    let provider_registry = match provider_registry {
+        Ok(registry) => registry,
         Err(error) => {
-            return RealProviderEvalReport::blocked(format!("provider round failed: {error}"));
+            return RealProviderEvalReport::blocked(format!(
+                "provider registry initialization failed: {error}"
+            ));
         }
     };
+
+    let events =
+        match runtime::ProviderRuntimeClient::new(provider_registry, model.clone(), Vec::new())
+            .and_then(|mut client| {
+                use runtime::ApiClient;
+                client
+                    .stream_collect(request)
+                    .map_err(|error| error.to_string())
+            }) {
+            Ok(events) => events,
+            Err(error) => {
+                return RealProviderEvalReport::blocked(format!("provider round failed: {error}"));
+            }
+        };
     let detail = build_provider_round_detail(
         1,
         "ai_reviewer_full_analysis",

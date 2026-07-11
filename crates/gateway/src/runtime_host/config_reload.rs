@@ -3,18 +3,52 @@ use std::{
     fs,
     hash::{Hash, Hasher},
     path::Path,
-    sync::{Arc, OnceLock, RwLock},
+    sync::{Arc, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use runtime::{init_global_providers, ConfigLoader, RuntimeConfig};
+use runtime::{ConfigLoader, RuntimeConfig};
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::api_routes::AppState;
 
-static CONFIG_RELOAD_STATUS: OnceLock<RwLock<ConfigReloadSnapshot>> = OnceLock::new();
-static CONFIG_RELOAD_APPLY_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+/// Per-RuntimeHost config reload owner.
+///
+/// Mainline wiring must store one `Arc<ConfigReloadState>` in `RuntimeHost` or
+/// `AppState` and pass that same instance to all watcher/API operations.
+pub(crate) struct ConfigReloadState {
+    status: RwLock<ConfigReloadSnapshot>,
+    apply_lock: tokio::sync::Mutex<()>,
+}
+
+impl ConfigReloadState {
+    pub(crate) fn new() -> Self {
+        Self {
+            status: RwLock::new(ConfigReloadSnapshot::default()),
+            apply_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    fn read_status(&self) -> ConfigReloadSnapshot {
+        self.status
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_else(|_| ConfigReloadSnapshot::default())
+    }
+
+    fn write_status(&self, snapshot: ConfigReloadSnapshot) {
+        if let Ok(mut guard) = self.status.write() {
+            *guard = snapshot;
+        }
+    }
+}
+
+impl Default for ConfigReloadState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 struct ConfigFingerprintEntry {
@@ -77,9 +111,9 @@ impl Default for ConfigReloadSnapshot {
     }
 }
 
-pub(crate) fn initialize_config_reload_status(state: &Arc<AppState>) {
+pub(crate) fn initialize_config_reload_status(reload: &ConfigReloadState, state: &Arc<AppState>) {
     let fingerprint = config_fingerprint(&state.workspace_root, &state.config_home);
-    write_status(ConfigReloadSnapshot {
+    reload.write_status(ConfigReloadSnapshot {
         status: "pending_initial_check".to_string(),
         trigger: "startup".to_string(),
         last_checked_at_ms: now_ms(),
@@ -100,22 +134,23 @@ pub(crate) fn initialize_config_reload_status(state: &Arc<AppState>) {
 }
 
 pub(crate) fn spawn_config_reload_watcher(
+    reload: Arc<ConfigReloadState>,
     state: Arc<AppState>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        poll_config_reload_once(state.clone(), "initial").await;
+        poll_config_reload_once(&reload, state.clone(), "initial").await;
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            poll_config_reload_once(state.clone(), "auto").await;
+            poll_config_reload_once(&reload, state.clone(), "auto").await;
         }
     })
 }
 
-pub(crate) fn status_value() -> Value {
-    serde_json::to_value(read_status()).unwrap_or_else(|_| {
+pub(crate) fn status_value(reload: &ConfigReloadState) -> Value {
+    serde_json::to_value(reload.read_status()).unwrap_or_else(|_| {
         serde_json::json!({
             "kind": "gateway.config.reload.status",
             "status": "unavailable",
@@ -124,29 +159,40 @@ pub(crate) fn status_value() -> Value {
     })
 }
 
-pub(crate) async fn poll_config_reload_once(state: Arc<AppState>, trigger: &str) -> Value {
+pub(crate) async fn poll_config_reload_once(
+    reload: &ConfigReloadState,
+    state: Arc<AppState>,
+    trigger: &str,
+) -> Value {
     let fingerprint = config_fingerprint(&state.workspace_root, &state.config_home);
     let digest = fingerprint.digest.clone();
-    let previous = read_status();
+    let previous = reload.read_status();
     if previous.last_seen_digest.as_deref() == Some(digest.as_str()) {
         let mut next = previous;
         next.last_checked_at_ms = now_ms();
         next.fingerprint = Some(fingerprint);
-        write_status(next);
-        return status_value();
+        reload.write_status(next);
+        return status_value(reload);
     }
-    reload_gateway_config_with_fingerprint(&state, trigger, fingerprint).await
+    reload_gateway_config_with_fingerprint(reload, &state, trigger, fingerprint).await
 }
 
-pub(crate) async fn force_gateway_config_reload(state: &Arc<AppState>, trigger: &str) -> Value {
+pub(crate) async fn force_gateway_config_reload(
+    reload: &ConfigReloadState,
+    state: &Arc<AppState>,
+    trigger: &str,
+) -> Value {
     let fingerprint = config_fingerprint(&state.workspace_root, &state.config_home);
-    reload_gateway_config_with_fingerprint(state, trigger, fingerprint).await
+    reload_gateway_config_with_fingerprint(reload, state, trigger, fingerprint).await
 }
 
-pub(crate) async fn reload_runtime_providers_from_disk(state: &Arc<AppState>) -> Value {
-    let _guard = apply_lock().lock().await;
+pub(crate) async fn reload_runtime_providers_from_disk(
+    reload: &ConfigReloadState,
+    state: &Arc<AppState>,
+) -> Value {
+    let _guard = reload.apply_lock.lock().await;
     match ConfigLoader::new(&state.workspace_root, &state.config_home).load() {
-        Ok(runtime_config) => apply_runtime_providers(&runtime_config),
+        Ok(runtime_config) => apply_runtime_providers(state, &runtime_config),
         Err(error) => {
             let message = format!("failed to load runtime config: {error}");
             tracing::warn!(
@@ -173,13 +219,14 @@ pub(crate) async fn reload_runtime_providers_from_disk(state: &Arc<AppState>) ->
 }
 
 async fn reload_gateway_config_with_fingerprint(
+    reload: &ConfigReloadState,
     state: &Arc<AppState>,
     trigger: &str,
     fingerprint: ConfigFingerprint,
 ) -> Value {
-    let _guard = apply_lock().lock().await;
+    let _guard = reload.apply_lock.lock().await;
     let changed_at = now_ms();
-    let previous = read_status();
+    let previous = reload.read_status();
     let loaded = ConfigLoader::new(&state.workspace_root, &state.config_home).load();
     let runtime_config = match loaded {
         Ok(config) => config,
@@ -196,7 +243,7 @@ async fn reload_gateway_config_with_fingerprint(
                 "previous_applied_digest": previous.last_applied_digest,
                 "warnings": [message.clone()],
             });
-            write_status(ConfigReloadSnapshot {
+            reload.write_status(ConfigReloadSnapshot {
                 status: "invalid".to_string(),
                 applied: false,
                 trigger: trigger.to_string(),
@@ -222,7 +269,11 @@ async fn reload_gateway_config_with_fingerprint(
         }
     };
 
-    let report = apply_runtime_config(state, &runtime_config, trigger, &fingerprint).await;
+    let report = apply_runtime_config(reload, state, &runtime_config, trigger, &fingerprint).await;
+    let applied = report
+        .get("applied")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let status = report
         .get("status")
         .and_then(Value::as_str)
@@ -239,16 +290,24 @@ async fn reload_gateway_config_with_fingerprint(
                 .collect()
         })
         .unwrap_or_default();
-    write_status(ConfigReloadSnapshot {
+    reload.write_status(ConfigReloadSnapshot {
         status,
-        applied: true,
+        applied,
         trigger: trigger.to_string(),
         last_checked_at_ms: changed_at,
         last_changed_at_ms: Some(changed_at),
-        last_applied_at_ms: Some(changed_at),
+        last_applied_at_ms: if applied {
+            Some(changed_at)
+        } else {
+            previous.last_applied_at_ms
+        },
         last_seen_digest: Some(fingerprint.digest.clone()),
-        last_applied_digest: Some(fingerprint.digest.clone()),
-        last_error: None,
+        last_applied_digest: if applied {
+            Some(fingerprint.digest.clone())
+        } else {
+            previous.last_applied_digest
+        },
+        last_error: (!applied).then(|| "configuration validation failed".to_string()),
         fingerprint: Some(fingerprint),
         restart_required: report
             .get("restart_required")
@@ -262,22 +321,58 @@ async fn reload_gateway_config_with_fingerprint(
 }
 
 async fn apply_runtime_config(
+    _reload: &ConfigReloadState,
     state: &Arc<AppState>,
     runtime_config: &RuntimeConfig,
     trigger: &str,
     fingerprint: &ConfigFingerprint,
 ) -> Value {
     let config_json = runtime_config_json_value(runtime_config);
-    let provider_report = apply_runtime_providers(runtime_config);
-    let mcp_report =
-        match crate::runtime_host::install_runtime_mcp_service_from_config(runtime_config).await {
-            Ok(report) => report,
-            Err(error) => serde_json::json!({
-                "ok": false,
-                "status": "failed",
-                "error": error,
-            }),
-        };
+    let provider_report = apply_runtime_providers(state, runtime_config);
+    if !provider_report
+        .get("applied")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return serde_json::json!({
+            "kind": "gateway.config.reload",
+            "status": "invalid",
+            "applied": false,
+            "trigger": trigger,
+            "source": if runtime_config.loaded_entries().is_empty() { "default" } else { "config" },
+            "config_entries": runtime_config.loaded_entries(),
+            "fingerprint": fingerprint.digest,
+            "applied_sections": {
+                "providers": provider_report,
+            },
+            "restart_required": {
+                "required": false,
+                "unknown": false,
+                "fields": [],
+                "reason": "reload rejected before mutable sections were applied",
+            },
+            "warnings": ["provider configuration validation failed; retained the last valid runtime snapshot"],
+        });
+    }
+    let tool_host_report = match build_and_apply_tool_host_snapshot(state, runtime_config).await {
+        Ok(report) => report,
+        Err(error) => {
+            return serde_json::json!({
+                "kind": "gateway.config.reload",
+                "status": "invalid",
+                "applied": false,
+                "trigger": trigger,
+                "fingerprint": fingerprint.digest,
+                "applied_sections": { "providers": provider_report },
+                "restart_required": { "required": false, "fields": [] },
+                "warnings": [format!("tool host snapshot validation failed; retained prior revision: {error}")],
+            });
+        }
+    };
+    let mcp_report = tool_host_report
+        .get("mcp")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({"status": "unavailable"}));
 
     let surface_configs = build_surface_runtime_configs(runtime_config.gateway());
     let surface_config_count = surface_configs.len();
@@ -333,6 +428,7 @@ async fn apply_runtime_config(
         "fingerprint": fingerprint.digest,
         "applied_sections": {
             "providers": provider_report,
+            "tool_host": tool_host_report,
             "mcp": mcp_report,
             "surface_runtime_configs": {
                 "status": "applied",
@@ -346,7 +442,54 @@ async fn apply_runtime_config(
     })
 }
 
-pub(crate) fn apply_runtime_providers(runtime_config: &RuntimeConfig) -> Value {
+async fn build_and_apply_tool_host_snapshot(
+    state: &Arc<AppState>,
+    runtime_config: &RuntimeConfig,
+) -> Result<Value, String> {
+    let loader = ConfigLoader::new(&state.workspace_root, &state.config_home);
+    let bootstrap = crate::runtime_bootstrap::assemble_runtime_state_with_loader(
+        &state.workspace_root,
+        &loader,
+        runtime_config,
+    )
+    .map_err(|error| error.to_string())?;
+    let catalog = Arc::new(bootstrap.tool_registry);
+    if let Some(mcp_state) = bootstrap.mcp_state {
+        let _ = mcp_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .shutdown();
+    }
+    let mcp_service =
+        Arc::new(super::RuntimeMcpServiceAdapter::from_runtime_config(runtime_config).await);
+    let mcp_health = mcp::McpService::health(mcp_service.as_ref())
+        .map_err(|error| format!("failed to validate MCP snapshot: {error}"))?;
+    let Some(runtime) = state.services.runtime.as_ref() else {
+        return Err("runtime service unavailable".to_string());
+    };
+    let tool_host = runtime.tool_host();
+    let previous_revision = tool_host.revision();
+    let revision = tool_host.replace_snapshot(tools::ToolHostSnapshot::new(
+        catalog,
+        Arc::new(tools::lsp_client::LspRegistry::new()),
+        Some(mcp_service),
+    ));
+    Ok(serde_json::json!({
+        "status": "applied",
+        "previous_revision": previous_revision,
+        "revision": revision,
+        "cache": tool_host.cache_stats(),
+        "mcp": {
+            "status": "applied",
+            "health": mcp_health,
+        },
+    }))
+}
+
+pub(crate) fn apply_runtime_providers(
+    state: &Arc<AppState>,
+    runtime_config: &RuntimeConfig,
+) -> Value {
     let source = if runtime_config.loaded_entries().is_empty() {
         "default"
     } else {
@@ -383,7 +526,62 @@ pub(crate) fn apply_runtime_providers(runtime_config: &RuntimeConfig) -> Value {
     let mut provider_names: Vec<String> = providers.providers.keys().cloned().collect();
     provider_names.sort();
 
-    init_global_providers(providers);
+    let catalog_report = serde_json::json!({
+        "generation": catalog.generation,
+        "sources": catalog.sources,
+        "transforms": catalog.transforms,
+        "provider_count": catalog.providers.len(),
+        "model_count": catalog.models.len(),
+        "profile_count": catalog.profiles.len(),
+        "warnings": catalog.warnings,
+    });
+    let Some(runtime_service) = state.services.runtime.as_ref() else {
+        return serde_json::json!({
+            "kind": "runtime_provider_reload",
+            "status": "unavailable",
+            "applied": false,
+            "source": source,
+            "retained_revision": null,
+            "diagnostics": {
+                "errors": ["RuntimeService is not attached; provider registry cannot be reloaded"],
+                "warnings": [],
+            },
+        });
+    };
+    let provider_registry = runtime_service.provider_registry();
+    let update = match provider_registry.replace(providers) {
+        Ok(update) => update,
+        Err(rejected) => {
+            tracing::warn!(
+                target: "cowd.runtime.provider",
+                applied = false,
+                source,
+                retained_revision = rejected.retained_revision,
+                errors = ?rejected.diagnostics.errors,
+                "runtime provider reload rejected; retaining last valid snapshot"
+            );
+            return serde_json::json!({
+                "kind": "runtime_provider_reload",
+                "status": "invalid",
+                "applied": false,
+                "source": source,
+                "retained_revision": rejected.retained_revision,
+                "catalog_generation": catalog_generation,
+                "catalog_updated": catalog_updated,
+                "catalog": catalog_report,
+                "provider_count": provider_count,
+                "provider_model_count": provider_model_count,
+                "provider_names": provider_names,
+                "configured_model": configured_model,
+                "configured_model_provider": configured_model_provider,
+                "configured_model_resolved": configured_model_resolved,
+                "diagnostics": {
+                    "errors": rejected.diagnostics.errors,
+                    "warnings": rejected.diagnostics.warnings,
+                },
+            });
+        }
+    };
 
     tracing::info!(
         target: "cowd.runtime.provider",
@@ -391,6 +589,7 @@ pub(crate) fn apply_runtime_providers(runtime_config: &RuntimeConfig) -> Value {
         source,
         provider_count,
         provider_model_count,
+        provider_revision = update.revision,
         configured_model = configured_model.as_deref().unwrap_or(""),
         configured_model_provider = configured_model_provider.as_deref().unwrap_or(""),
         configured_model_resolved,
@@ -402,17 +601,12 @@ pub(crate) fn apply_runtime_providers(runtime_config: &RuntimeConfig) -> Value {
         "status": if provider_count == 0 { "unconfigured" } else if configured_model_resolved { "applied" } else { "attention" },
         "applied": true,
         "source": source,
+        "changed": update.changed,
+        "previous_revision": update.previous_revision,
+        "revision": update.revision,
         "catalog_generation": catalog_generation,
         "catalog_updated": catalog_updated,
-        "catalog": {
-            "generation": catalog.generation,
-            "sources": catalog.sources,
-            "transforms": catalog.transforms,
-            "provider_count": catalog.providers.len(),
-            "model_count": catalog.models.len(),
-            "profile_count": catalog.profiles.len(),
-            "warnings": catalog.warnings,
-        },
+        "catalog": catalog_report,
         "provider_count": provider_count,
         "provider_model_count": provider_model_count,
         "provider_names": provider_names,
@@ -424,7 +618,7 @@ pub(crate) fn apply_runtime_providers(runtime_config: &RuntimeConfig) -> Value {
         } else if !configured_model_resolved {
             serde_json::json!(["configured default model is not declared by any provider"])
         } else {
-            serde_json::json!([])
+            serde_json::json!(update.diagnostics.warnings)
         }
     })
 }
@@ -656,30 +850,13 @@ fn now_ms() -> u64 {
     system_time_ms(SystemTime::now()).unwrap_or(0)
 }
 
-fn status_lock() -> &'static RwLock<ConfigReloadSnapshot> {
-    CONFIG_RELOAD_STATUS.get_or_init(|| RwLock::new(ConfigReloadSnapshot::default()))
-}
-
-fn apply_lock() -> &'static tokio::sync::Mutex<()> {
-    CONFIG_RELOAD_APPLY_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-}
-
-fn read_status() -> ConfigReloadSnapshot {
-    status_lock()
-        .read()
-        .map(|guard| guard.clone())
-        .unwrap_or_else(|_| ConfigReloadSnapshot::default())
-}
-
-fn write_status(snapshot: ConfigReloadSnapshot) {
-    if let Ok(mut guard) = status_lock().write() {
-        *guard = snapshot;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reload_state() -> ConfigReloadState {
+        ConfigReloadState::new()
+    }
 
     fn temp_root(label: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -706,5 +883,19 @@ mod tests {
 
         assert_ne!(first.digest, second.digest);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reload_status_is_scoped_to_its_runtime_host() {
+        let first = reload_state();
+        let second = reload_state();
+        let mut first_status = first.read_status();
+        first_status.status = "invalid".to_string();
+        first_status.last_error = Some("broken provider config".to_string());
+        first.write_status(first_status);
+
+        assert_eq!(first.read_status().status, "invalid");
+        assert_eq!(second.read_status().status, "uninitialized");
+        assert!(second.read_status().last_error.is_none());
     }
 }

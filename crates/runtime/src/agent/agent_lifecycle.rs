@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -54,6 +54,7 @@ pub struct AgentSnapshot {
 
 #[derive(Debug, Clone)]
 pub struct SpawnAgentRequest {
+    pub provider_registry: std::sync::Arc<crate::ProviderRegistry>,
     pub description: String,
     pub prompt: String,
     pub subagent_type: Option<String>,
@@ -71,6 +72,7 @@ pub struct SpawnAgentRequest {
 
 #[derive(Debug, Clone)]
 pub struct AgentJob {
+    pub provider_registry: std::sync::Arc<crate::ProviderRegistry>,
     pub manifest: AgentSnapshot,
     pub prompt: String,
     pub system_prompt: Vec<String>,
@@ -462,6 +464,7 @@ pub fn prepare_agent_job(request: SpawnAgentRequest) -> Result<AgentJob, String>
     write_agent_manifest(&manifest)?;
 
     Ok(AgentJob {
+        provider_registry: request.provider_registry,
         manifest,
         prompt: request.prompt,
         system_prompt: request.system_prompt,
@@ -803,6 +806,7 @@ where
         .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string());
     let summary = run_provider_subagent_turn(
         ProviderSubAgentTurnConfig {
+            provider_registry: Arc::clone(&job.provider_registry),
             model,
             system_prompt: job.system_prompt.clone(),
             tool_definitions: job.tool_definitions.clone(),
@@ -1580,6 +1584,7 @@ printf '{"agentId":"%s","backend":"process-jsonl","eventType":"agent.heartbeat",
 printf '{"agentId":"%s","backend":"process-jsonl","eventType":"agent.completed","emittedAt":"2","payload":{"result":"completed from jsonl backend"}}\n' "$COWD_AGENT_ID"
 "#;
         let request = SpawnAgentRequest {
+            provider_registry: Arc::new(crate::ProviderRegistry::empty()),
             description: "Run external JSONL agent".to_string(),
             prompt: "Finish through a process backend.".to_string(),
             subagent_type: Some("Explore".to_string()),
@@ -1633,6 +1638,7 @@ printf '{"agentId":"%s","backend":"process-jsonl","eventType":"agent.completed",
     fn process_jsonl_backend_records_crash_failure_reason() {
         let dir = std::env::temp_dir().join(format!("cowd-agent-jsonl-crash-{}", make_agent_id()));
         let request = SpawnAgentRequest {
+            provider_registry: Arc::new(crate::ProviderRegistry::empty()),
             description: "Run crashing JSONL agent".to_string(),
             prompt: "Crash before a terminal event.".to_string(),
             subagent_type: Some("Explore".to_string()),
@@ -1678,6 +1684,7 @@ escaped=$(printf '%s' "$input" | sed 's/\\/\\\\/g; s/"/\\"/g')
 printf '{"agentId":"%s","backend":"process-jsonl","eventType":"agent.completed","emittedAt":"2","payload":{"result":"received command: %s"}}\n' "$COWD_AGENT_ID" "$escaped"
 "#;
         let request = SpawnAgentRequest {
+            provider_registry: Arc::new(crate::ProviderRegistry::empty()),
             description: "Run input-aware JSONL agent".to_string(),
             prompt: "Wait for input.".to_string(),
             subagent_type: Some("Explore".to_string()),
@@ -1719,6 +1726,7 @@ printf '{"agentId":"%s","backend":"process-jsonl","eventType":"agent.completed",
     fn process_jsonl_backend_cancel_kills_external_agent() {
         let dir = std::env::temp_dir().join(format!("cowd-agent-jsonl-cancel-{}", make_agent_id()));
         let request = SpawnAgentRequest {
+            provider_registry: Arc::new(crate::ProviderRegistry::empty()),
             description: "Run cancellable JSONL agent".to_string(),
             prompt: "Wait until cancelled.".to_string(),
             subagent_type: Some("Explore".to_string()),

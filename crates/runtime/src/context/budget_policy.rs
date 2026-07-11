@@ -7,8 +7,6 @@
 use serde::{Deserialize, Serialize};
 
 use crate::context_runtime::ContextProfile;
-use crate::tool_orchestrator::{ToolResultBudget, TruncationStrategy};
-
 pub const DEFAULT_CONTEXT_BUDGET_RATIO_BP: u32 = 7_000;
 pub const MIN_CONTEXT_BUDGET_RATIO_BP: u32 = 1_000;
 pub const MAX_CONTEXT_BUDGET_RATIO_BP: u32 = 9_500;
@@ -55,24 +53,11 @@ pub struct MemoryBudgetLease {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolResultBudgetLease {
+pub struct ToolOutputBudgetLease {
     pub max_total_tokens: usize,
     pub per_tool_max_tokens: usize,
     pub head_chars: usize,
     pub tail_chars: usize,
-}
-
-impl ToolResultBudgetLease {
-    #[must_use]
-    pub fn to_tool_result_budget(&self) -> ToolResultBudget {
-        ToolResultBudget {
-            max_total_tokens: self.max_total_tokens,
-            per_tool_max_tokens: self.per_tool_max_tokens,
-            truncation_strategy: TruncationStrategy::HeadAndTail,
-            head_chars: self.head_chars,
-            tail_chars: self.tail_chars,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,7 +74,7 @@ pub struct RuntimeBudgetPlan {
     pub effective_context_budget: u64,
     pub compaction_threshold_tokens: u64,
     pub memory_retrieval_budget: MemoryBudgetLease,
-    pub tool_result_budget: ToolResultBudgetLease,
+    pub tool_result_budget: ToolOutputBudgetLease,
     pub subagent_default_budget: u64,
     pub team_total_budget: u64,
     pub runtime_control_budget: RuntimeControlBudgetLease,
@@ -155,7 +140,7 @@ impl RuntimeBudgetPlan {
                 l4_shared,
                 selected_item_limit,
             },
-            tool_result_budget: ToolResultBudgetLease {
+            tool_result_budget: ToolOutputBudgetLease {
                 max_total_tokens: tool_total,
                 per_tool_max_tokens: tool_single,
                 head_chars: 3_000,

@@ -687,6 +687,8 @@ async fn ensure_surface_runtime_session(
     let runtime = if let Some(store) = state.services.session.unified_store() {
         crate::runtime_factory::create_runtime_entry_with_session_store(
             store,
+            runtime_service.provider_registry(),
+            runtime_service.tool_host(),
             session,
             session_id,
             model.clone(),
@@ -700,6 +702,8 @@ async fn ensure_surface_runtime_session(
         )
     } else {
         crate::runtime_factory::create_runtime_entry(
+            runtime_service.provider_registry(),
+            runtime_service.tool_host(),
             session,
             session_id,
             model.clone(),

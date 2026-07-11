@@ -2,7 +2,7 @@
 // Gateway foreground mode is a gateway process with an internal runtime host providing:
 //   - HTTP API (0.0.0.0:8642) + SSE streaming
 //   - Surface registry (builtin TUI/WebUI plus external JSONL sidecars)
-// Shared state: ActiveSessions, CognitiveContextManager, GlobalToolRegistry, SessionEventBus
+// Shared state: ActiveSessions, CognitiveContextManager, ToolCatalog, SessionEventBus
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -30,7 +30,6 @@ use memory::UnifiedSessionStore;
 use runtime::mcp_tool_bridge::{McpConnectionStatus, McpToolInfo, McpToolRegistry};
 use runtime::{McpServerManager, RuntimeConfig};
 use surface::SurfaceManifest;
-use tools::GlobalToolRegistry;
 
 use runtime::session_lifecycle::{
     EvictionPolicy, SessionLifecycleConfig, SessionLifecycleManager, SessionStatus,
@@ -228,21 +227,6 @@ impl mcp::McpService for RuntimeMcpServiceAdapter {
             output,
         })
     }
-}
-
-pub(crate) async fn install_runtime_mcp_service_from_config(
-    config: &RuntimeConfig,
-) -> Result<serde_json::Value, String> {
-    let service = Arc::new(RuntimeMcpServiceAdapter::from_runtime_config(config).await);
-    let health = mcp::McpService::health(service.as_ref())
-        .map_err(|error| format!("failed to project MCP service health: {error}"))?;
-    tools::set_mcp_service(service).map_err(|error| error.to_string())?;
-    Ok(serde_json::json!({
-        "ok": true,
-        "status": "applied",
-        "source": "runtime_mcp_service_adapter",
-        "health": health,
-    }))
 }
 
 // ── Background session cleanup task ────────────────────────────
@@ -548,7 +532,6 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
 
     // 1. Initialise shared state
     let sessions = Arc::new(ActiveSessions::default());
-    let tools = Arc::new(GlobalToolRegistry::builtin());
 
     let cognitive: Option<Arc<CognitiveContextManager>> = match &config.memory_config {
         Some(mem_cfg) => {
@@ -583,13 +566,42 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         })
         .unwrap_or_else(|| std::path::PathBuf::from(".cowd"));
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let runtime_config = runtime::ConfigLoader::new(&workspace_root, &approval_dir)
-        .load()
-        .unwrap_or_else(|error| {
+    let config_load =
+        runtime::ConfigLoader::new(&workspace_root, &approval_dir).load_with_diagnostics();
+    let (runtime_config, config_diagnostics) = config_load.map_or_else(
+        |error| {
             tracing::warn!(%error, "failed to load runtime config for MCP service");
-            RuntimeConfig::empty()
-        });
-    let _ = install_runtime_mcp_service_from_config(&runtime_config).await;
+            (RuntimeConfig::empty(), Vec::new())
+        },
+        |loaded| (loaded.config, loaded.diagnostics),
+    );
+    for diagnostic in &config_diagnostics {
+        tracing::warn!(code = %diagnostic.code, message = %diagnostic.message, "runtime config diagnostic");
+    }
+    let provider_registry = Arc::new(
+        runtime::ProviderRegistry::new(runtime_config.providers().clone()).map_err(|rejected| {
+            format!(
+                "failed to initialize provider registry: {}",
+                rejected.diagnostics.errors.join("; ")
+            )
+        })?,
+    );
+    let upgrade_coordinator = Arc::new(runtime::UpgradeCoordinator::new());
+    let runtime_bootstrap = crate::runtime_bootstrap::assemble_runtime_state_with_loader(
+        &workspace_root,
+        &runtime::ConfigLoader::new(&workspace_root, &approval_dir),
+        &runtime_config,
+    )
+    .map_err(|error| format!("failed to build tool catalog: {error}"))?;
+    let tools = Arc::new(runtime_bootstrap.tool_registry.clone());
+    if let Some(mcp_state) = runtime_bootstrap.mcp_state {
+        let _ = mcp_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .shutdown();
+    }
+    let runtime_mcp_service =
+        Arc::new(RuntimeMcpServiceAdapter::from_runtime_config(&runtime_config).await);
     let storage_config = storage::StorageConfig::default_for_config_home(&approval_dir);
     storage_config
         .layout
@@ -675,17 +687,40 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         roots = ?surface_discovery.roots,
         "surface host discovery completed"
     );
-    let services = Arc::new(crate::services::GatewayServices::new_with_config_home(
-        Arc::new(
-            RuntimeService::new(
-                sessions.clone(),
-                lease_registry.clone(),
-                session_kernel.clone(),
-                lifecycle_kernel.clone(),
-                started_at,
-            )
-            .with_approval_gate(approval_gate.clone()),
+    let tool_host = Arc::new(tools::ToolHost::new(
+        format!("workspace:{}", workspace_root.display()),
+        &workspace_root,
+        tools::ToolHostSnapshot::new(
+            Arc::clone(&tools),
+            Arc::new(tools::lsp_client::LspRegistry::new()),
+            Some(runtime_mcp_service),
         ),
+    ));
+    let runtime_service = Arc::new(
+        RuntimeService::new(
+            sessions.clone(),
+            lease_registry.clone(),
+            session_kernel.clone(),
+            lifecycle_kernel.clone(),
+            started_at,
+            Arc::clone(&provider_registry),
+            Arc::clone(&upgrade_coordinator),
+        )
+        .with_tool_host(tool_host)
+        .with_approval_gate(approval_gate.clone()),
+    );
+    let weak_runtime_service = Arc::downgrade(&runtime_service);
+    upgrade_coordinator.register_collector(Arc::new(
+        runtime::ClosureUpgradeInventoryCollector::new("active_turns", move || {
+            weak_runtime_service.upgrade().map_or_else(
+                || Ok(Vec::new()),
+                |service| Ok(service.upgrade_turn_carriers()),
+            )
+        }),
+    ));
+    let config_reload = runtime_service.config_reload();
+    let services = Arc::new(crate::services::GatewayServices::new_with_config_home(
+        runtime_service,
         task_kernel.clone(),
         surface_host.clone(),
         cognitive.clone(),
@@ -708,9 +743,12 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         services: services,
         session_lease_registry: Some(lease_registry.clone()),
     });
-    config_reload::initialize_config_reload_status(&app_state);
-    let _config_reload_watcher =
-        config_reload::spawn_config_reload_watcher(app_state.clone(), Duration::from_secs(2));
+    config_reload::initialize_config_reload_status(&config_reload, &app_state);
+    let _config_reload_watcher = config_reload::spawn_config_reload_watcher(
+        config_reload,
+        app_state.clone(),
+        Duration::from_secs(2),
+    );
     crate::surface_host::spawn_surface_ingress_dispatcher(app_state.clone());
 
     // 2. Build HTTP router (reuse api_routes + SSE)

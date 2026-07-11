@@ -383,6 +383,7 @@ fn execute_agent_lifecycle_request(
     };
     let prompt = agent_prompt_for(action, request);
     let job = match prepare_agent_job(SpawnAgentRequest {
+        provider_registry: std::sync::Arc::new(crate::ProviderRegistry::empty()),
         description,
         prompt,
         subagent_type: template,

@@ -4,7 +4,7 @@ use chrono::Utc;
 use harness_contract::core::{EvidenceRef, KernelRef};
 use memory::compression::session::{
     CheckpointFactKind, CheckpointTokenStats, CompactionSourceRange, SessionCheckpointFact,
-    SessionSemanticCheckpoint,
+    SessionResumeCursor, SessionSemanticCheckpoint,
 };
 use memory::config::{BudgetConfig, StoreConfig};
 use memory::{
@@ -178,6 +178,7 @@ async fn checkpoint_compaction_promotes_only_reviewed_candidates() {
         KernelRef::new("session-message", "session-checkpoint:0").with_label("source message"),
     );
     let checkpoint = SessionSemanticCheckpoint {
+        schema_version: 2,
         checkpoint_id: "checkpoint-review".to_string(),
         session_id: "session-checkpoint".to_string(),
         agent_id: "agent-primary".to_string(),
@@ -185,6 +186,18 @@ async fn checkpoint_compaction_promotes_only_reviewed_candidates() {
         task_id: ctx.task_id.clone(),
         team_id: None,
         summary: "checkpoint summary".to_string(),
+        user_rules: Vec::new(),
+        goal: None,
+        constraints: Vec::new(),
+        decisions: Vec::new(),
+        evidence_refs: Vec::new(),
+        unresolved: Vec::new(),
+        file_changes: Vec::new(),
+        resume_cursor: SessionResumeCursor {
+            message_index: 1,
+            event_sequence: Some(1),
+            checkpoint_id: "checkpoint-review".to_string(),
+        },
         token_stats: CheckpointTokenStats {
             before: 100,
             after: 25,

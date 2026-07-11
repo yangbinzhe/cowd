@@ -28,6 +28,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             get(get_context_recommendation_stats).post(record_context_recommendation_action),
         )
         .route("/api/evidence/resolve", get(resolve_evidence_ref_handler))
+        .route(
+            "/api/evidence/projections",
+            get(list_evidence_audit_projections),
+        )
 }
 
 #[derive(Deserialize)]
@@ -192,17 +196,55 @@ async fn resolve_evidence_ref_handler(
         .get("session_id")
         .cloned()
         .or_else(|| state.list_active_session_ids().into_iter().next());
+    let snippet_bytes = params
+        .get("snippet_bytes")
+        .and_then(|value| value.parse::<usize>().ok());
 
     state
         .services
         .context
-        .resolve_evidence_ref(
+        .resolve_evidence_ref_with_snippet(
             &state.services.session,
             &state.services.connector,
             &state.workspace_root,
             reference,
             session_id.as_deref(),
+            snippet_bytes,
         )
+        .await
+        .map(Json)
+        .map_err(context_service_error)
+}
+
+async fn list_evidence_audit_projections(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let Some(session_id) = params
+        .get("session_id")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "session_id query parameter is required".to_string(),
+            }),
+        ));
+    };
+    let from_sequence = params
+        .get("from_seq")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let limit = params
+        .get("limit")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(100)
+        .min(500);
+    state
+        .services
+        .context
+        .evidence_audit_projections(&state.services.session, session_id, from_sequence, limit)
         .await
         .map(Json)
         .map_err(context_service_error)

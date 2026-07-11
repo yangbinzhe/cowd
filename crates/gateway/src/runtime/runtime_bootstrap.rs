@@ -9,7 +9,7 @@ use runtime::{ConfigLoader, McpServerManager, ToolError};
 use serde_json::json;
 use tools::{permissions::PermissionMode as ToolPermissionMode, RuntimeToolDefinition};
 
-pub(crate) type GatewayToolRegistry = tools::GlobalToolRegistry;
+pub(crate) type GatewayToolRegistry = tools::ToolCatalog;
 pub(crate) type RuntimePluginStateBuildOutput = (
     Option<Arc<Mutex<RuntimeMcpState>>>,
     Vec<RuntimeToolDefinition>,

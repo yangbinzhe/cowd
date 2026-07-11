@@ -19,6 +19,8 @@ use crate::{
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_runtime_entry(
+    provider_registry: Arc<runtime::ProviderRegistry>,
+    tool_host: Arc<tools::ToolHost>,
     session: Session,
     session_id: &str,
     model: String,
@@ -33,6 +35,8 @@ pub(crate) fn create_runtime_entry(
     let runtime_plugin_state = crate::runtime_bootstrap::assemble_runtime_state()?;
     create_runtime_entry_with_bootstrap_state(
         None,
+        provider_registry,
+        tool_host,
         session,
         session_id,
         model,
@@ -51,6 +55,8 @@ pub(crate) fn create_runtime_entry(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_runtime_entry_with_session_store(
     session_store: Arc<memory::session_store::UnifiedSessionStore>,
+    provider_registry: Arc<runtime::ProviderRegistry>,
+    tool_host: Arc<tools::ToolHost>,
     session: Session,
     session_id: &str,
     model: String,
@@ -65,6 +71,8 @@ pub(crate) fn create_runtime_entry_with_session_store(
     let runtime_plugin_state = crate::runtime_bootstrap::assemble_runtime_state()?;
     create_runtime_entry_with_bootstrap_state(
         Some(session_store),
+        provider_registry,
+        tool_host,
         session,
         session_id,
         model,
@@ -83,6 +91,8 @@ pub(crate) fn create_runtime_entry_with_session_store(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_runtime_entry_with_bootstrap_state(
     session_store: Option<Arc<memory::session_store::UnifiedSessionStore>>,
+    provider_registry: Arc<runtime::ProviderRegistry>,
+    tool_host: Arc<tools::ToolHost>,
     mut session: Session,
     session_id: &str,
     model: String,
@@ -129,16 +139,17 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
     let subagent_model = model.clone();
     let subagent_tool_definitions = tool_definitions.clone();
     let tool_executor = std::sync::Arc::new(
-        GatewayToolExecutor::new(
+        GatewayToolExecutor::from_tool_host(
             allowed_tools.clone(),
             emit_output,
-            tool_registry.clone(),
+            tool_host,
             mcp_state.clone(),
         )
         .with_runtime_session_id(runtime_session_id),
     );
     let runtime = runtime::StandardRuntimeHost::new(runtime::StandardRuntimeHostConfig {
         session,
+        provider_registry,
         model: model.clone(),
         tool_definitions,
         tool_executor: tool_executor.clone(),

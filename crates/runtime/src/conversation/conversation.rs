@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
@@ -33,7 +33,7 @@ use futures::stream::Stream;
 use harness_contract::{
     context::{
         CompactionReceipt, ContextGovernanceDecision, ContextPressureState, ContextTurnReport,
-        EvidenceRef, ToolObservation,
+        EvidenceAccessRef, EvidenceAuditProjection, EvidenceRef, ToolObservation,
     },
     core::KernelRef,
     knowledge::KnowledgeTurnReport,
@@ -53,6 +53,7 @@ use memory::types::{Message as MemMessage, MessageRole as MemMessageRole};
 use memory::{MemoryKernel, MemoryTurnContext};
 use model_protocol::telemetry::SessionTracer;
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use tracing;
 
 use crate::agent::{SubAgentConfig, SubAgentRuntime};
@@ -74,6 +75,7 @@ use crate::context_runtime::{
     ContextVisibility, ResumeContextPacket, RuntimeContextFactDecision,
     RuntimeContextGovernanceReport, ToolTracePacket, ToolTraceStatus,
 };
+use crate::context_tool_exposure::{ToolExposurePlanner, ToolExposurePolicy, ToolExposureState};
 use crate::fact_extraction::{
     FactExtractionRuntimeEvent, RuleFactExtractor, RuntimeFactExtractionInput,
     RuntimeFactExtractionPolicy, RuntimeFactExtractionScheduler, RuntimeFactExtractionTrigger,
@@ -193,13 +195,6 @@ pub struct ApiRequest {
     pub model: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolContractScope {
-    Minimal,
-    ReadOnly,
-    Full,
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProviderContextInventory {
     pub tool_count: usize,
@@ -288,16 +283,51 @@ fn active_rate_per_second(count: u64, active_duration_ms: Option<u64>) -> Option
         .and_then(|duration| rate_per_second(count, duration))
 }
 
-fn tool_contract_scope_for_pattern(
+fn tool_exposure_for_pattern(
     pattern: harness_contract::core::ExecutionPattern,
-) -> ToolContractScope {
-    match pattern {
-        harness_contract::core::ExecutionPattern::Direct => ToolContractScope::Minimal,
-        harness_contract::core::ExecutionPattern::Explore
-        | harness_contract::core::ExecutionPattern::Deliberate => ToolContractScope::ReadOnly,
-        harness_contract::core::ExecutionPattern::Execute
-        | harness_contract::core::ExecutionPattern::Collaborate
-        | harness_contract::core::ExecutionPattern::Supervise => ToolContractScope::Full,
+    available_ids: Vec<String>,
+    _schema_tokens: u64,
+) -> ToolExposureState {
+    let active_ids = match pattern {
+        harness_contract::core::ExecutionPattern::Direct => available_ids
+            .iter()
+            .filter(|id| matches!(id.as_str(), "ToolSearch" | "runtime_capabilities"))
+            .cloned()
+            .collect(),
+        _ => available_ids.clone(),
+    };
+    let active = active_ids
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let deferred = available_ids
+        .into_iter()
+        .filter(|id| !active.contains(id))
+        .collect();
+    ToolExposureState {
+        catalog_revision: 1,
+        revision: 1,
+        bootstrap: active_ids.iter().cloned().collect(),
+        active,
+        deferred,
+        reason: format!("runtime execution pattern {}", pattern.as_str()),
+        fallback_full: false,
+    }
+}
+
+fn contract_permission_mode(
+    mode: crate::PermissionMode,
+) -> harness_contract::tool::ToolPermissionMode {
+    match mode {
+        crate::PermissionMode::ReadOnly => harness_contract::tool::ToolPermissionMode::ReadOnly,
+        crate::PermissionMode::WorkspaceWrite => {
+            harness_contract::tool::ToolPermissionMode::WorkspaceWrite
+        }
+        crate::PermissionMode::DangerFullAccess
+        | crate::PermissionMode::Prompt
+        | crate::PermissionMode::Allow => {
+            harness_contract::tool::ToolPermissionMode::DangerFullAccess
+        }
     }
 }
 
@@ -333,7 +363,11 @@ pub trait ApiClient {
         true
     }
 
-    fn configure_tool_contract_scope(&mut self, _scope: ToolContractScope) {}
+    fn configure_tool_exposure(
+        &mut self,
+        _projection: harness_contract::tool::ToolExposureProjection,
+    ) {
+    }
 
     fn context_inventory(&self) -> ProviderContextInventory {
         ProviderContextInventory::default()
@@ -365,6 +399,23 @@ pub trait ApiClient {
 /// Trait implemented by tool dispatchers that execute model-requested tools.
 pub trait ToolExecutor: Send + Sync + 'static {
     fn execute(&self, tool_name: &str, input: &str) -> Result<String, ToolError>;
+
+    fn describe_tool_effect(
+        &self,
+        _tool_name: &str,
+        _input: &serde_json::Value,
+    ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
+        None
+    }
+
+    fn execute_authorized(
+        &self,
+        _authorization: &harness_contract::tool::ToolExecutionAuthorization,
+        tool_name: &str,
+        input: &str,
+    ) -> Result<String, ToolError> {
+        self.execute(tool_name, input)
+    }
 
     fn has_registered_tools(&self) -> bool {
         !self.available_tool_names().is_empty()
@@ -703,8 +754,6 @@ pub struct ConversationRuntime<C, T> {
     fallbacks: Vec<String>,
     /// T35: Cancellation token for graceful shutdown.
     cancellation_token: CancellationToken,
-    /// T36: Tool orchestrator for result budgeting and truncation.
-    tool_orchestrator: crate::tool_orchestrator::ToolOrchestrator,
     /// Latest assembled context envelope used by a real turn.
     last_context_envelope: std::sync::Mutex<Option<ContextEnvelope>>,
     /// Active context profile used to assemble the next runtime envelope.
@@ -719,6 +768,10 @@ pub struct ConversationRuntime<C, T> {
     tool_trace_context_items: std::sync::Mutex<Vec<ContextItem>>,
     /// Governance observations produced by tool calls in the active turn.
     turn_tool_observations: std::sync::Mutex<Vec<ToolObservation>>,
+    /// Revisioned tool set visible to the next provider request.
+    tool_exposure_state: std::sync::Mutex<Option<ToolExposureState>>,
+    /// Stable evidence projections emitted during the active turn.
+    turn_evidence_audits: std::sync::Mutex<Vec<EvidenceAuditProjection>>,
     /// Per-turn component accounting and tool-result lease consumption.
     turn_context_ledger: std::sync::Mutex<crate::context_ledger::ContextLedger>,
     /// Latest context governance report emitted by a completed turn.
@@ -932,11 +985,6 @@ where
             model: feature_config.model().map(str::to_string),
             fallbacks: feature_config.fallbacks().to_vec(),
             cancellation_token: CancellationToken::new(),
-            tool_orchestrator: crate::tool_orchestrator::ToolOrchestrator::with_budget(
-                initial_budget_plan
-                    .tool_result_budget
-                    .to_tool_result_budget(),
-            ),
             last_context_envelope: std::sync::Mutex::new(None),
             context_profile: std::sync::Mutex::new(ContextProfile::MainTurn),
             runtime_control_policy,
@@ -944,6 +992,8 @@ where
             last_collaboration_result: std::sync::Mutex::new(None),
             tool_trace_context_items: std::sync::Mutex::new(Vec::new()),
             turn_tool_observations: std::sync::Mutex::new(Vec::new()),
+            tool_exposure_state: std::sync::Mutex::new(None),
+            turn_evidence_audits: std::sync::Mutex::new(Vec::new()),
             turn_context_ledger: std::sync::Mutex::new(crate::context_ledger::ContextLedger::new(
                 initial_budget_plan.effective_context_budget,
                 initial_budget_plan.tool_result_budget.max_total_tokens as u64,
@@ -1094,6 +1144,9 @@ where
         if let Ok(mut guard) = self.turn_tool_observations.lock() {
             guard.clear();
         }
+        if let Ok(mut guard) = self.turn_evidence_audits.lock() {
+            guard.clear();
+        }
     }
 
     fn push_turn_tool_observation(&self, observation: ToolObservation) {
@@ -1124,6 +1177,82 @@ where
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default()
+    }
+
+    fn push_turn_evidence_audit(&self, projection: EvidenceAuditProjection) {
+        if let Ok(mut guard) = self.turn_evidence_audits.lock() {
+            if let Some(existing) = guard
+                .iter_mut()
+                .find(|existing| existing.evidence_ref == projection.evidence_ref)
+            {
+                *existing = projection;
+            } else {
+                guard.push(projection);
+            }
+        }
+    }
+
+    fn turn_evidence_audits(&self) -> Vec<EvidenceAuditProjection> {
+        self.turn_evidence_audits
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    fn existing_evidence_access(&self, evidence_ref: &EvidenceRef) -> Option<EvidenceAccessRef> {
+        self.turn_evidence_audits.lock().ok().and_then(|guard| {
+            guard
+                .iter()
+                .find(|projection| &projection.evidence_ref == evidence_ref)
+                .and_then(|projection| projection.access.clone())
+        })
+    }
+
+    fn current_tool_exposure_projection(
+        &self,
+    ) -> Option<harness_contract::tool::ToolExposureProjection> {
+        let schema_tokens = self.api_client.context_inventory().tool_schema_tokens;
+        self.tool_exposure_state
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|state| state.projection(schema_tokens)))
+    }
+
+    fn activate_tool_discovery(&self, output: &str) {
+        let Ok(discovery) =
+            serde_json::from_str::<harness_contract::tool::ToolDiscoveryReceipt>(output)
+        else {
+            tracing::warn!("ToolSearch returned a non-canonical discovery receipt");
+            return;
+        };
+        let Ok(mut guard) = self.tool_exposure_state.lock() else {
+            tracing::warn!("tool exposure state lock poisoned");
+            return;
+        };
+        let Some(state) = guard.as_mut() else {
+            tracing::warn!("ToolSearch completed before tool exposure was initialized");
+            return;
+        };
+        let allowed_ids = state
+            .bootstrap
+            .iter()
+            .chain(state.active.iter())
+            .chain(state.deferred.iter())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let policy = ToolExposurePolicy {
+            allowed_ids,
+            maximum_permission: contract_permission_mode(self.permission_policy.active_mode()),
+            supports_dynamic_exposure: true,
+        };
+        let activation = ToolExposurePlanner.activate(state, &discovery, &policy);
+        tracing::info!(
+            catalog_revision = activation.catalog_revision,
+            previous_exposure_revision = activation.previous_exposure_revision,
+            exposure_revision = activation.exposure_revision,
+            activated = ?activation.activated_ids().collect::<Vec<_>>(),
+            "ToolSearch activation applied to the next provider request"
+        );
     }
 
     fn remember_tool_trace_from_message(&self, message: &ConversationMessage) {
@@ -1201,13 +1330,6 @@ where
         });
         let store = Arc::clone(store);
         tokio::spawn(async move {
-            let sequence = match store.next_event_sequence(&session_id).await {
-                Ok(sequence) => sequence,
-                Err(error) => {
-                    tracing::warn!(%error, session_id, "context envelope sequence allocation failed");
-                    return;
-                }
-            };
             let created_at_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|duration| duration.as_millis() as u64)
@@ -1216,20 +1338,19 @@ where
                 session_id: session_id.clone(),
                 event_type: "ContextEnvelope".to_string(),
                 event_json: payload.to_string(),
-                sequence,
+                sequence: 0,
                 created_at_ms,
             };
-            match store.append_context_envelope_event_if_absent(&event).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    tracing::debug!(
-                        session_id,
-                        sequence,
-                        "context envelope event already persisted"
-                    );
+            match store
+                .append_context_envelope_event_if_absent_allocating_sequence(&event)
+                .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    tracing::debug!(session_id, "context envelope event already persisted");
                 }
                 Err(error) => {
-                    tracing::warn!(%error, session_id, sequence, "context envelope event append failed");
+                    tracing::warn!(%error, session_id, "context envelope event append failed");
                 }
             }
         });
@@ -1249,26 +1370,10 @@ where
         let session_id = self.session().session_id;
         let payload = serde_json::json!({
             "type": "ContextTurnReport",
-            "turn_id": report.turn_id,
-            "profile": report.profile,
-            "pressure": report.pressure,
-            "input_token_estimate": report.input_token_estimate,
-            "output_token_estimate": report.output_token_estimate,
-            "evidence_refs": report.evidence_refs,
-            "observations": report.observations,
-            "governance_decision": report.governance_decision,
-            "compaction_receipt": report.compaction_receipt,
-            "knowledge": report.knowledge,
+            "report": report,
         });
         let store = Arc::clone(store);
         tokio::spawn(async move {
-            let sequence = match store.next_event_sequence(&session_id).await {
-                Ok(sequence) => sequence,
-                Err(error) => {
-                    tracing::warn!(%error, session_id, "context turn report sequence allocation failed");
-                    return;
-                }
-            };
             let created_at_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|duration| duration.as_millis() as u64)
@@ -1277,11 +1382,11 @@ where
                 session_id: session_id.clone(),
                 event_type: "ContextTurnReport".to_string(),
                 event_json: payload.to_string(),
-                sequence,
+                sequence: 0,
                 created_at_ms,
             };
-            if let Err(error) = store.append_event(&event).await {
-                tracing::warn!(%error, session_id, sequence, "context turn report append failed");
+            if let Err(error) = store.append_event_allocating_sequence(&event).await {
+                tracing::warn!(%error, session_id, "context turn report append failed");
             }
         });
     }
@@ -1338,34 +1443,30 @@ where
         });
         let store = Arc::clone(store);
         tokio::spawn(async move {
-            let sequence = match store.next_event_sequence(&session_id).await {
-                Ok(sequence) => sequence,
-                Err(error) => {
-                    tracing::warn!(%error, session_id, "context governance report sequence allocation failed");
-                    return;
-                }
-            };
             let created_at_ms = now_ms();
             let event = memory::SessionEvent {
                 session_id: session_id.clone(),
                 event_type: "RuntimeContextGovernanceReport".to_string(),
                 event_json: payload.to_string(),
-                sequence,
+                sequence: 0,
                 created_at_ms,
             };
-            if let Err(error) = store.append_event(&event).await {
-                tracing::warn!(%error, session_id, sequence, "context governance report append failed");
+            if let Err(error) = store.append_event_allocating_sequence(&event).await {
+                tracing::warn!(%error, session_id, "context governance report append failed");
             }
             let runtime_event = memory::RuntimeEvent::new(
                 session_id.clone(),
-                sequence.saturating_add(1),
+                0,
                 memory::RuntimeEventScope::Context,
                 "context.governance_report",
                 payload,
                 created_at_ms,
             );
-            if let Err(error) = store.append_runtime_event(&runtime_event).await {
-                tracing::warn!(%error, session_id, sequence, "context governance runtime event append failed");
+            if let Err(error) = store
+                .append_runtime_event_allocating_sequence(&runtime_event)
+                .await
+            {
+                tracing::warn!(%error, session_id, "context governance runtime event append failed");
             }
         });
     }
@@ -1503,6 +1604,12 @@ where
         for observation in self.turn_tool_observations() {
             report = report.with_observation(observation);
         }
+        if let Some(exposure) = self.current_tool_exposure_projection() {
+            report = report.with_tool_exposure(exposure);
+        }
+        for projection in self.turn_evidence_audits() {
+            report = report.with_audit_projection(projection);
+        }
         if let Some(knowledge) = self.take_turn_knowledge_report() {
             report = report.with_knowledge(knowledge);
         }
@@ -1620,8 +1727,6 @@ where
         {
             self.auto_compaction_input_tokens_threshold = plan.compaction_threshold_tokens as u32;
         }
-        self.tool_orchestrator
-            .set_budget(plan.tool_result_budget.to_tool_result_budget());
         apply_runtime_budget_to_control_policy(&mut self.runtime_control_policy, &plan);
         self
     }
@@ -1759,17 +1864,9 @@ where
         self
     }
 
-    /// Attach a CowdEventBus for domain event emission and drain pending warnings.
+    /// Attach a CowdEventBus for domain event emission.
     #[must_use]
     pub fn with_cowd_event_bus(mut self, bus: crate::cowd_event::CowdEventBus) -> Self {
-        // Drain config warnings into the cowd bus now that it's available
-        if let Ok(mut pending) = crate::config::PENDING_WARNINGS.lock() {
-            for event in pending.drain(..) {
-                if let crate::cowd_event::CowdEvent::Warning { message } = event {
-                    let _ = bus.emit(crate::cowd_event::CowdEvent::Warning { message });
-                }
-            }
-        }
         self.cowd_bus = Some(Arc::new(bus.clone()));
         if let Some(ref mem) = self.memory_manager {
             let engine = DiscussionEngine::new(Arc::new(bus), Arc::clone(mem));
@@ -1860,16 +1957,6 @@ where
             });
         }
         consumed.len()
-    }
-
-    /// T36: Set a custom tool orchestrator for result budgeting.
-    #[must_use]
-    pub fn with_tool_orchestrator(
-        mut self,
-        orchestrator: crate::tool_orchestrator::ToolOrchestrator,
-    ) -> Self {
-        self.tool_orchestrator = orchestrator;
-        self
     }
 
     /// P0: Enable AAAK symbolic index mode for memory context injection.
@@ -1969,7 +2056,6 @@ where
         sub_rt.runtime_control_policy = self.runtime_control_policy.clone();
         sub_rt = sub_rt.with_model_context_window(lease.max_tokens.min(u64::from(u32::MAX)) as u32);
         sub_rt.max_iterations = config.max_turns;
-        sub_rt.tool_orchestrator = self.tool_orchestrator.clone();
         if let Some(ref mem) = self.memory_manager {
             sub_rt = sub_rt.with_memory_manager(Arc::clone(mem));
         }
@@ -2325,10 +2411,18 @@ where
             &execution_decision.strategy.understanding,
         );
         let evidence_plan_guidance = crate::evidence_planner::evidence_plan_prompt(&evidence_plan);
-        self.api_client
-            .configure_tool_contract_scope(tool_contract_scope_for_pattern(
-                execution_decision.pattern(),
-            ));
+        let provider_inventory = self.api_client.context_inventory();
+        let initial_tool_exposure = tool_exposure_for_pattern(
+            execution_decision.pattern(),
+            self.tool_executor.available_tool_names(),
+            provider_inventory.tool_schema_tokens,
+        );
+        self.api_client.configure_tool_exposure(
+            initial_tool_exposure.projection(provider_inventory.tool_schema_tokens),
+        );
+        if let Ok(mut guard) = self.tool_exposure_state.lock() {
+            *guard = Some(initial_tool_exposure);
+        }
         self.record_runtime_policy_decision(&execution_decision, user_sequence);
         let execution_decision_guidance =
             crate::execution_core::runtime_execution_guidance_prompt(&execution_decision);
@@ -2526,6 +2620,9 @@ where
                     for attempt in 0..max_retries {
                         let mut req = request.clone();
                         req.model = model.to_string();
+                        if let Some(exposure) = self.current_tool_exposure_projection() {
+                            self.api_client.configure_tool_exposure(exposure);
+                        }
                         self.record_provider_context_request(&req, iterations);
 
                         let stream_idle_timeout = stream_idle_timeout_for_messages(&req.messages);
@@ -3617,10 +3714,7 @@ where
         .to_string();
         let executor = Arc::clone(&self.tool_executor);
         let timeout = self.tool_timeout.unwrap_or_else(|| {
-            Duration::from_secs(
-                crate::tool_orchestrator::ToolSafetyRegistry::global()
-                    .get_timeout_secs("checkpoint_create"),
-            )
+            Duration::from_secs(crate::tool_execution_profile("checkpoint_create").timeout_secs)
         });
         let result = tokio::time::timeout(
             timeout,
@@ -3843,15 +3937,11 @@ where
                 let tname = tool_name.to_string();
                 let tname_for_err = tname.clone();
                 let tinput = effective_input.clone();
-                // Per-tool timeout: check registry for per-tool override or category default,
-                // then cap with the global self.tool_timeout if set.
-                let registry_timeout = Duration::from_secs(
-                    crate::tool_orchestrator::ToolSafetyRegistry::global()
-                        .get_timeout_secs(tool_name),
-                );
+                let profile_timeout =
+                    Duration::from_secs(crate::tool_execution_profile(tool_name).timeout_secs);
                 let tool_timeout = self
                     .tool_timeout
-                    .map_or(registry_timeout, |t| t.min(registry_timeout));
+                    .map_or(profile_timeout, |t| t.min(profile_timeout));
                 let (output, mut is_error, mut failure_kind) = if tool_name == "evidence_retrieve" {
                     match self.retrieve_tool_evidence(&effective_input) {
                         Ok(output) => (output, false, None),
@@ -3859,9 +3949,30 @@ where
                     }
                 } else {
                     let tool_exec = Arc::clone(&self.tool_executor);
+                    let parsed_input = serde_json::from_str::<serde_json::Value>(&tinput)
+                        .unwrap_or(serde_json::Value::Null);
+                    let authorization = tool_exec
+                        .describe_tool_effect(&tname, &parsed_input)
+                        .map(|descriptor| {
+                            crate::ToolPolicy.authorize(
+                                &descriptor,
+                                format!("{}:{tool_use_id}:{iterations}", self.session().session_id),
+                                self.permission_policy.active_mode(),
+                                tool_timeout.as_secs(),
+                            )
+                        })
+                        .transpose()
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
                     match tokio::time::timeout(
                         tool_timeout,
-                        tokio::task::spawn_blocking(move || tool_exec.execute(&tname, &tinput)),
+                        tokio::task::spawn_blocking(move || match authorization.as_ref() {
+                            Some(decision) => tool_exec.execute_authorized(
+                                &decision.authorization,
+                                &tname,
+                                &tinput,
+                            ),
+                            None => tool_exec.execute(&tname, &tinput),
+                        }),
                     )
                     .await
                     {
@@ -3921,6 +4032,9 @@ where
 
                 // T36: Truncate oversized tool results before storing.
                 // Append hook feedback messages to the tool output.
+                if tool_name == "ToolSearch" && !is_error {
+                    self.activate_tool_discovery(&output);
+                }
                 let mut combined = output;
                 for msg in pre_hook_result.messages() {
                     combined.push_str("\n");
@@ -3949,36 +4063,58 @@ where
                     .as_ref()
                     .map(vision_index_summary)
                     .unwrap_or_else(|| combined.clone());
-                let raw_ref = self.record_tool_raw_evidence(
-                    tool_use_id,
+                let (raw_ref, raw_access) = self
+                    .record_tool_raw_evidence(
+                        tool_use_id,
+                        tool_name,
+                        &completed_record.input_hash,
+                        &combined,
+                        is_error,
+                        elapsed_ms,
+                    )
+                    .await;
+                self.maybe_index_tool_output(
+                    raw_ref.id(),
                     tool_name,
-                    &completed_record.input_hash,
+                    &indexable_output,
+                    raw_access.as_ref(),
+                );
+                let completed_record = if raw_access.is_some() {
+                    completed_record.with_full_output_ref(format!("tool://{}", raw_ref.id()))
+                } else {
+                    completed_record
+                };
+                let mut model_receipt = self.tool_model_receipt(
+                    tool_name,
                     &combined,
                     is_error,
-                    elapsed_ms,
+                    &raw_ref,
+                    raw_access.as_ref(),
                 );
-                self.maybe_index_tool_output(raw_ref.id(), tool_name, &indexable_output);
-                let completed_record =
-                    completed_record.with_full_output_ref(format!("tool://{}", raw_ref.id()));
-                let model_summary = prepared_vision
-                    .as_ref()
-                    .map(|payload| vision_tool_model_receipt(payload, &raw_ref))
-                    .unwrap_or_else(|| {
-                        self.tool_model_receipt(tool_name, &combined, is_error, &raw_ref)
-                    });
-                if prepared_vision.is_some() {
-                    let receipt_tokens =
-                        crate::context_ledger::estimate_text_tokens(&model_summary);
-                    if let Ok(mut ledger) = self.turn_context_ledger.lock() {
-                        let _ = ledger.reserve_tool_result(receipt_tokens);
-                    }
-                    self.record_context_component(
-                        crate::context_ledger::ContextComponentKind::ToolResult,
-                        receipt_tokens,
-                        Some(format!("tool://{}", raw_ref.id())),
-                        iterations,
-                    );
+                if let Some(payload) = prepared_vision.as_ref() {
+                    model_receipt.summary = if raw_access.is_some() {
+                        vision_tool_model_receipt(payload, &raw_ref)
+                    } else {
+                        format!(
+                            "Tool `vision_analyze` completed, but raw evidence persistence is unavailable. Image input is attached as a structured vision block for the next model call. path={}, media_type={}, size_bytes={}, prompt={}",
+                            payload.image_path,
+                            payload.media_type,
+                            payload.size_bytes.unwrap_or_default(),
+                            payload.prompt
+                        )
+                    };
+                    model_receipt.receipt_tokens =
+                        crate::context_ledger::estimate_text_tokens(&model_receipt.summary);
+                    model_receipt.omitted_tokens = model_receipt
+                        .raw_tokens
+                        .saturating_sub(model_receipt.receipt_tokens);
+                    model_receipt.truncated =
+                        model_receipt.receipt_tokens < model_receipt.raw_tokens;
                 }
+                let audit_projection =
+                    crate::context_evidence::audit_projection(&model_receipt, raw_access.as_ref());
+                self.push_turn_evidence_audit(audit_projection);
+                let model_summary = model_receipt.summary;
                 self.emit_tool_completed(
                     tool_use_id,
                     tool_name,
@@ -4290,7 +4426,7 @@ where
         };
 
         let result_msg = if acquire_category_permit {
-            let sem = self.tool_category_semaphore(tool_name);
+            let sem = self.tool_category_semaphore(tool_name, input);
             let _permit = sem.acquire().await.map_err(|error| {
                 RuntimeError::new(format!("tool category semaphore closed: {error}"))
             })?;
@@ -4336,8 +4472,12 @@ where
         (msg_id, (result_msg, inject))
     }
 
-    fn tool_category_semaphore(&self, tool_name: &str) -> &Semaphore {
-        match self.tool_orchestrator.classify(tool_name) {
+    fn tool_category_semaphore(&self, tool_name: &str, input: &str) -> &Semaphore {
+        let category = self
+            .tool_executor
+            .classify_tool_safety(tool_name, input)
+            .unwrap_or_else(|| crate::classify_tool_request(tool_name, input));
+        match category {
             crate::tool_orchestrator::ToolSafetyCategory::WriteLocal => &self.write_semaphore,
             crate::tool_orchestrator::ToolSafetyCategory::Network => &self.network_semaphore,
             crate::tool_orchestrator::ToolSafetyCategory::Destructive => {
@@ -4360,13 +4500,17 @@ where
         {
             return Ok(false);
         }
-        let registry = crate::tool_orchestrator::ToolSafetyRegistry::global();
         if !batch.indices.iter().all(|idx| {
             requests
                 .get(*idx)
                 .map(|request| {
                     !request.depends_on.is_empty()
-                        && registry.classify(&request.tool_name)
+                        && self
+                            .tool_executor
+                            .classify_tool_safety(&request.tool_name, &request.input)
+                            .unwrap_or_else(|| {
+                                crate::classify_tool_request(&request.tool_name, &request.input)
+                            })
                             == crate::tool_orchestrator::ToolSafetyCategory::ReadOnly
                 })
                 .unwrap_or(false)
@@ -4439,8 +4583,10 @@ where
             "tool_name": &req.tool_name,
             "input": &req.input,
         });
-        let safety_cat =
-            crate::tool_orchestrator::ToolSafetyCategory::from_tool_name(&req.tool_name);
+        let safety_cat = self
+            .tool_executor
+            .classify_tool_safety(&req.tool_name, &req.input)
+            .unwrap_or_else(|| crate::classify_tool_request(&req.tool_name, &req.input));
         let mut task = WaveTask::new(&req.tool_use_id, &req.tool_name)
             .with_payload(payload)
             .with_safety_category(safety_cat);
@@ -4793,25 +4939,21 @@ where
             },
             "receipt": receipt,
         });
-        let event_sequence = match store.next_event_sequence(&session_id).await {
-            Ok(sequence) => sequence,
-            Err(error) => {
-                tracing::warn!(%error, session_id, "session compaction event sequence allocation failed");
-                return;
-            }
-        };
         let created_at_ms = now_ms();
         let event = memory::SessionEvent {
             session_id: session_id.clone(),
             event_type: "SessionCompacted".to_string(),
             event_json: payload.to_string(),
-            sequence: event_sequence,
+            sequence: 0,
             created_at_ms,
         };
-        if let Err(error) = store.append_event(&event).await {
-            tracing::warn!(%error, session_id, event_sequence, "session compaction event append failed");
-            return;
-        }
+        let event = match store.append_event_allocating_sequence(&event).await {
+            Ok(event) => event,
+            Err(error) => {
+                tracing::warn!(%error, session_id, "session compaction event append failed");
+                return;
+            }
+        };
         let context_payload = serde_json::json!({
             "source": "conversation_runtime.compaction",
             "sequence": sequence,
@@ -4823,14 +4965,17 @@ where
         });
         let context_event = memory::RuntimeEvent::new(
             session_id.clone(),
-            event_sequence.saturating_add(1),
+            0,
             memory::RuntimeEventScope::Context,
             "context.session_compacted",
             context_payload,
             created_at_ms,
         );
-        if let Err(error) = store.append_runtime_event(&context_event).await {
-            tracing::warn!(%error, session_id, event_sequence, "canonical compaction runtime event append failed");
+        if let Err(error) = store
+            .append_runtime_event_allocating_sequence(&context_event)
+            .await
+        {
+            tracing::warn!(%error, session_id, event_sequence = event.sequence, "canonical compaction runtime event append failed");
             return;
         }
         if let Some(receipt) = context_event
@@ -4845,7 +4990,7 @@ where
             {
                 let memory_event = memory::RuntimeEvent::new(
                     session_id.clone(),
-                    event_sequence.saturating_add(2),
+                    0,
                     memory::RuntimeEventScope::Memory,
                     "memory.semantic_checkpoint.created",
                     serde_json::json!({
@@ -4854,8 +4999,11 @@ where
                     }),
                     created_at_ms,
                 );
-                if let Err(error) = store.append_runtime_event(&memory_event).await {
-                    tracing::warn!(%error, session_id, event_sequence, "semantic checkpoint runtime event append failed");
+                if let Err(error) = store
+                    .append_runtime_event_allocating_sequence(&memory_event)
+                    .await
+                {
+                    tracing::warn!(%error, session_id, "semantic checkpoint runtime event append failed");
                 }
             }
         }
@@ -5498,8 +5646,15 @@ where
         });
     }
 
-    fn maybe_index_tool_output(&self, tool_use_id: &str, tool_name: &str, output: &str) {
-        if output.lines().count() < DEFAULT_OUTPUT_REF_MIN_LINES {
+    fn maybe_index_tool_output(
+        &self,
+        tool_use_id: &str,
+        tool_name: &str,
+        output: &str,
+        access: Option<&EvidenceAccessRef>,
+    ) {
+        if output.lines().count() < DEFAULT_OUTPUT_REF_MIN_LINES && output.chars().count() < 16_000
+        {
             return;
         }
         let Some(ref sandbox) = self.tool_output_sandbox else {
@@ -5512,9 +5667,22 @@ where
             );
             return;
         };
-        if let Some(summary) =
-            guard.index_tool_output(tool_use_id, tool_name, output, DEFAULT_OUTPUT_REF_MIN_LINES)
-        {
+        let Some(access) = access else {
+            tracing::warn!(
+                tool_call_id = tool_use_id,
+                "skipping derived tool index because canonical raw evidence is unavailable"
+            );
+            return;
+        };
+        let evidence =
+            memory::types::CanonicalRawEvidence::new(access.clone(), preview_chars(output, 600));
+        if let Some(summary) = guard.index_tool_output_with_evidence(
+            tool_use_id,
+            tool_name,
+            output,
+            DEFAULT_OUTPUT_REF_MIN_LINES,
+            &evidence,
+        ) {
             tracing::debug!(
                 tool_call_id = tool_use_id,
                 tool_name,
@@ -5601,6 +5769,15 @@ where
     fn record_provider_context_request(&self, request: &ApiRequest, request_sequence: usize) {
         let mut system_tokens =
             crate::context_ledger::estimate_text_tokens(&request.system_prompt.join("\n\n"));
+        let capability_tokens = request
+            .system_prompt
+            .iter()
+            .filter(|fragment| {
+                fragment.starts_with("## Runtime evidence plan")
+                    || fragment.starts_with("## Runtime execution decision")
+            })
+            .map(|fragment| crate::context_ledger::estimate_text_tokens(fragment))
+            .sum::<u64>();
         let mut history_tokens = 0u64;
         let mut tool_input_tokens = 0u64;
         let mut tool_result_tokens = 0u64;
@@ -5662,7 +5839,11 @@ where
                 }
             }
         }
-        system_tokens = system_tokens.saturating_sub(memory_tokens.saturating_add(handoff_tokens));
+        system_tokens = system_tokens.saturating_sub(
+            memory_tokens
+                .saturating_add(handoff_tokens)
+                .saturating_add(capability_tokens),
+        );
         let inventory = self.api_client.context_inventory();
         if let Ok(mut ledger) = self.turn_context_ledger.lock() {
             ledger.begin_request(request_sequence);
@@ -5689,6 +5870,14 @@ where
             crate::context_ledger::ContextComponentKind::AgentHandoff,
             handoff_tokens,
             Some(format!("provider-request:{request_sequence}:handoff")),
+            request_sequence,
+        );
+        self.record_context_component(
+            crate::context_ledger::ContextComponentKind::Capability,
+            capability_tokens,
+            Some(format!(
+                "provider-request:{request_sequence}:runtime-capability"
+            )),
             request_sequence,
         );
         self.record_context_component(
@@ -5720,7 +5909,7 @@ where
         }
     }
 
-    fn record_tool_raw_evidence(
+    async fn record_tool_raw_evidence(
         &self,
         tool_use_id: &str,
         tool_name: &str,
@@ -5728,19 +5917,15 @@ where
         output: &str,
         is_error: bool,
         duration_ms: u64,
-    ) -> EvidenceRef {
+    ) -> (EvidenceRef, Option<EvidenceAccessRef>) {
         let content_hash = model_protocol::prompt_cache::stable_hash_bytes(output.as_bytes());
         let evidence_id = format!("tool-raw-{tool_use_id}-{content_hash:016x}");
-        let is_new = self
-            .turn_context_ledger
-            .lock()
-            .map(|mut ledger| ledger.register_evidence_hash(evidence_id.clone()))
-            .unwrap_or(true);
-        if !is_new {
-            return EvidenceRef::new("tool", evidence_id);
+        let evidence_ref = EvidenceRef::new("tool", evidence_id.clone());
+        if let Some(access) = self.existing_evidence_access(&evidence_ref) {
+            return (evidence_ref, Some(access));
         }
         let Some(ref store) = self.session_store else {
-            return EvidenceRef::new("tool", evidence_id);
+            return (evidence_ref, None);
         };
         let session_id = self.session().session_id;
         let payload = serde_json::json!({
@@ -5757,37 +5942,41 @@ where
             "content_hash": format!("{content_hash:016x}"),
             "raw": output,
         });
-        let store = Arc::clone(store);
-        let event_evidence_id = evidence_id.clone();
-        tokio::spawn(async move {
-            let sequence = match store.next_event_sequence(&session_id).await {
-                Ok(sequence) => sequence,
-                Err(error) => {
-                    tracing::warn!(%error, session_id, "tool raw evidence sequence allocation failed");
-                    return;
-                }
-            };
-            let created_at_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_millis() as u64)
-                .unwrap_or(0);
-            let event = memory::SessionEvent {
-                session_id: session_id.clone(),
-                event_type: "ToolObservationRaw".to_string(),
-                event_json: payload.to_string(),
-                sequence,
-                created_at_ms,
-            };
-            if let Err(error) = store.append_event(&event).await {
+        let created_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        let event = memory::SessionEvent {
+            session_id: session_id.clone(),
+            event_type: "ToolObservationRaw".to_string(),
+            event_json: payload.to_string(),
+            sequence: 0,
+            created_at_ms,
+        };
+        let persisted = match store.append_event_allocating_sequence(&event).await {
+            Ok(event) => event,
+            Err(error) => {
                 tracing::warn!(
                     %error,
                     session_id,
-                    evidence_id = event_evidence_id,
-                    "tool raw evidence append failed"
+                    evidence_id,
+                    "tool raw evidence append failed; retaining inline model fallback"
                 );
+                return (evidence_ref, None);
             }
-        });
-        EvidenceRef::new("tool", evidence_id)
+        };
+        let access = EvidenceAccessRef::durable(
+            evidence_ref.clone(),
+            format!("sha256:{:x}", Sha256::digest(output.as_bytes())),
+            output.len() as u64,
+            "text/plain; charset=utf-8",
+            format!("session-event://{session_id}/{}", persisted.sequence),
+            format!("session:{session_id}"),
+        );
+        if let Ok(mut ledger) = self.turn_context_ledger.lock() {
+            let _ = ledger.register_evidence_hash(evidence_id);
+        }
+        (evidence_ref, Some(access))
     }
 
     fn tool_model_receipt(
@@ -5796,7 +5985,8 @@ where
         output: &str,
         is_error: bool,
         raw_ref: &EvidenceRef,
-    ) -> String {
+        access: Option<&EvidenceAccessRef>,
+    ) -> crate::context_evidence::ModelReceipt {
         let raw_tokens = crate::context_ledger::estimate_text_tokens(output);
         let per_tool_limit = self
             .runtime_budget_plan()
@@ -5808,20 +5998,29 @@ where
             .lock()
             .map(|mut ledger| ledger.reserve_tool_result(requested))
             .unwrap_or(requested);
-        let receipt = crate::context_evidence::build_tool_receipt(
+        let mut receipt = crate::context_evidence::build_tool_receipt(
             tool_name,
             output,
             is_error,
             raw_ref.clone(),
             granted.max(24),
         );
+        if access.is_none() {
+            receipt.summary = format!(
+                "Tool `{tool_name}` {}. Raw evidence persistence is unavailable; full inline fallback:\n{output}",
+                if is_error { "failed" } else { "completed" }
+            );
+            receipt.receipt_tokens = crate::context_ledger::estimate_text_tokens(&receipt.summary);
+            receipt.omitted_tokens = 0;
+            receipt.truncated = false;
+        }
         self.record_context_component(
             crate::context_ledger::ContextComponentKind::ToolResult,
             receipt.receipt_tokens,
-            Some(format!("tool://{}", raw_ref.id())),
+            access.map(|_| format!("tool://{}", raw_ref.id())),
             self.session().messages.len(),
         );
-        receipt.summary
+        receipt
     }
 
     #[allow(dead_code)]
@@ -5833,8 +6032,10 @@ where
         iterations: usize,
     ) -> ToolInvocationRecord {
         let session_id = self.session().session_id;
-        let safety_category =
-            crate::tool_orchestrator::ToolSafetyRegistry::global().classify(tool_name);
+        let safety_category = self
+            .tool_executor
+            .classify_tool_safety(tool_name, input)
+            .unwrap_or_else(|| crate::classify_tool_request(tool_name, input));
         ToolInvocationRecord::started(
             session_id,
             iterations,
@@ -6222,7 +6423,7 @@ where
                         return;
                     }
                 }
-                if let Err(e) = store.append_event(&event).await {
+                if let Err(e) = store.append_event_allocating_sequence(&event).await {
                     tracing::warn!(%e, session_id, sequence, "dual_write: session event append failed");
                 }
             });
@@ -6292,7 +6493,7 @@ where
         tokio::spawn(async move {
             match event.to_session_event() {
                 Ok(record) => {
-                    if let Err(error) = store.append_event(&record).await {
+                    if let Err(error) = store.append_event_allocating_sequence(&record).await {
                         tracing::warn!(%error, session_id, sequence, "runtime policy event append failed");
                     }
                 }
@@ -6932,10 +7133,13 @@ impl<T: ToolExecutor> WaveExecutor for ToolWaveExecutor<T> {
             .unwrap_or("")
             .to_string();
 
-        let tname = tool_name.clone();
         let tool_timeout = Duration::from_secs(
-            crate::tool_orchestrator::ToolSafetyRegistry::global().get_timeout_secs(&tname),
+            tool_exec
+                .classify_tool_safety(&tool_name, &input)
+                .unwrap_or_else(|| crate::classify_tool_request(&tool_name, &input))
+                .default_timeout_secs(),
         );
+        let timeout_tool_name = tool_name.clone();
         Box::pin(async move {
             let start = std::time::Instant::now();
             let raw = tokio::time::timeout(
@@ -6967,7 +7171,7 @@ impl<T: ToolExecutor> WaveExecutor for ToolWaveExecutor<T> {
                     duration_ms: 0,
                 }),
                 Err(_elapsed) => {
-                    tracing::warn!(tool = %tname, timeout_secs = tool_timeout.as_secs(), "wave tool execution timed out");
+                    tracing::warn!(tool = %timeout_tool_name, timeout_secs = tool_timeout.as_secs(), "wave tool execution timed out");
                     Ok(TaskResult {
                         task_id,
                         success: false,
@@ -7475,7 +7679,16 @@ mod tests {
             "ordinary evidence ".repeat(1_200),
             "remaining evidence ".repeat(1_200)
         );
-        runtime.maybe_index_tool_output(evidence_id, "read_file", &output);
+        let session_id = runtime.session().session_id;
+        let access = harness_contract::context::EvidenceAccessRef::durable(
+            harness_contract::core::EvidenceRef::new("tool", evidence_id),
+            "sha256:test",
+            output.len() as u64,
+            "text/plain; charset=utf-8",
+            format!("session-event://{session_id}/1"),
+            format!("session:{session_id}"),
+        );
+        runtime.maybe_index_tool_output(evidence_id, "read_file", &output, Some(&access));
 
         let retrieved = runtime
             .retrieve_tool_evidence(&format!(

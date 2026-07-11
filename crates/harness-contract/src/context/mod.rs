@@ -2,7 +2,117 @@
 
 pub use crate::core::EvidenceRef;
 use crate::core::{AiKernelError, AiKernelResult, KernelRef};
+use crate::tool::ToolExposureProjection;
 use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceDurability {
+    Pending,
+    Durable,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceAccessRef {
+    pub evidence_ref: EvidenceRef,
+    pub sha256: String,
+    pub bytes: u64,
+    pub media_type: String,
+    pub durability: EvidenceDurability,
+    pub retrieval_selector: String,
+    pub visibility_scope: String,
+}
+
+impl EvidenceAccessRef {
+    #[must_use]
+    pub fn durable(
+        evidence_ref: EvidenceRef,
+        sha256: impl Into<String>,
+        bytes: u64,
+        media_type: impl Into<String>,
+        retrieval_selector: impl Into<String>,
+        visibility_scope: impl Into<String>,
+    ) -> Self {
+        Self {
+            evidence_ref,
+            sha256: sha256.into(),
+            bytes,
+            media_type: media_type.into(),
+            durability: EvidenceDurability::Durable,
+            retrieval_selector: retrieval_selector.into(),
+            visibility_scope: visibility_scope.into(),
+        }
+    }
+
+    #[must_use]
+    pub const fn is_durable(&self) -> bool {
+        matches!(self.durability, EvidenceDurability::Durable)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextBudgetLeaseRef {
+    pub lease_id: String,
+    pub owner_id: String,
+    pub scope: String,
+    pub max_tokens: u64,
+    pub consumed_tokens: u64,
+    pub revision: u64,
+}
+
+impl ContextBudgetLeaseRef {
+    #[must_use]
+    pub fn new(
+        lease_id: impl Into<String>,
+        owner_id: impl Into<String>,
+        scope: impl Into<String>,
+        max_tokens: u64,
+        revision: u64,
+    ) -> Self {
+        Self {
+            lease_id: lease_id.into(),
+            owner_id: owner_id.into(),
+            scope: scope.into(),
+            max_tokens,
+            consumed_tokens: 0,
+            revision,
+        }
+    }
+
+    #[must_use]
+    pub fn with_consumed_tokens(mut self, consumed_tokens: u64) -> Self {
+        self.consumed_tokens = consumed_tokens.min(self.max_tokens);
+        self
+    }
+
+    #[must_use]
+    pub const fn remaining_tokens(&self) -> u64 {
+        self.max_tokens.saturating_sub(self.consumed_tokens)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceContentKind {
+    Text,
+    Json,
+    Diff,
+    Error,
+    Media,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceAuditProjection {
+    pub evidence_ref: EvidenceRef,
+    pub content_kind: EvidenceContentKind,
+    pub raw_tokens: u64,
+    pub receipt_tokens: u64,
+    pub omitted_tokens: u64,
+    pub raw_available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<EvidenceAccessRef>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -530,6 +640,10 @@ pub struct ContextTurnReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ledger: Option<ContextLedgerProjection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_exposure: Option<ToolExposureProjection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audit_projections: Vec<EvidenceAuditProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub knowledge: Option<crate::knowledge::KnowledgeTurnReport>,
 }
 
@@ -547,6 +661,8 @@ impl ContextTurnReport {
             governance_decision: None,
             compaction_receipt: None,
             ledger: None,
+            tool_exposure: None,
+            audit_projections: Vec::new(),
             knowledge: None,
         }
     }
@@ -554,6 +670,25 @@ impl ContextTurnReport {
     #[must_use]
     pub fn with_ledger(mut self, ledger: ContextLedgerProjection) -> Self {
         self.ledger = Some(ledger);
+        self
+    }
+
+    #[must_use]
+    pub fn with_tool_exposure(mut self, exposure: ToolExposureProjection) -> Self {
+        self.tool_exposure = Some(exposure);
+        self
+    }
+
+    #[must_use]
+    pub fn with_audit_projection(mut self, projection: EvidenceAuditProjection) -> Self {
+        if !self
+            .evidence_refs
+            .iter()
+            .any(|reference| reference == &projection.evidence_ref)
+        {
+            self.evidence_refs.push(projection.evidence_ref.clone());
+        }
+        self.audit_projections.push(projection);
         self
     }
 

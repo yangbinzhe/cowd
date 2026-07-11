@@ -5,6 +5,7 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub struct ProviderSubAgentTurnConfig {
+    pub provider_registry: std::sync::Arc<crate::ProviderRegistry>,
     pub model: String,
     pub system_prompt: Vec<String>,
     pub tool_definitions: Vec<ProviderToolDefinition>,
@@ -21,7 +22,11 @@ pub fn run_provider_subagent_turn<T>(
 where
     T: ToolExecutor,
 {
-    let api_client = ProviderRuntimeClient::new(config.model, config.tool_definitions)?;
+    let api_client = ProviderRuntimeClient::new(
+        config.provider_registry,
+        config.model,
+        config.tool_definitions,
+    )?;
     let mut runtime = ConversationRuntime::new(
         Session::new(),
         api_client,

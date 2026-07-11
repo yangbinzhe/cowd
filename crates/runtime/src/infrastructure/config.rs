@@ -1,12 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-
-/// Config warnings buffered before the CowdEventBus is available.
-/// Drained by ConversationRuntime::with_cowd_event_bus().
-pub static PENDING_WARNINGS: std::sync::LazyLock<Mutex<Vec<crate::cowd_event::CowdEvent>>> =
-    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
 
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +24,25 @@ pub enum ConfigError {
     Missing(String),
     #[error("Invalid value for {key}: {message}")]
     Invalid { key: String, message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigDiagnosticSeverity {
+    Warning,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigDiagnostic {
+    pub severity: ConfigDiagnosticSeverity,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigLoadResult {
+    pub config: RuntimeConfig,
+    pub diagnostics: Vec<ConfigDiagnostic>,
 }
 
 // ── Config Source (Precedence) ─────────────────────────────────────────
@@ -897,6 +910,10 @@ impl ConfigLoader {
     }
 
     pub fn load(&self) -> Result<RuntimeConfig, ConfigError> {
+        self.load_with_diagnostics().map(|result| result.config)
+    }
+
+    pub fn load_with_diagnostics(&self) -> Result<ConfigLoadResult, ConfigError> {
         let mut merged = BTreeMap::new();
         let mut loaded_entries = Vec::new();
         let mut mcp_servers = BTreeMap::new();
@@ -939,14 +956,17 @@ impl ConfigLoader {
         // Inject config file `env:` section into the process environment.
         inject_config_env(&merged);
 
-        for warning in &all_warnings {
-            tracing::warn!("{warning}");
-            if let Ok(mut w) = PENDING_WARNINGS.lock() {
-                w.push(crate::cowd_event::CowdEvent::Warning {
+        let mut diagnostics = all_warnings
+            .iter()
+            .map(|warning| {
+                tracing::warn!("{warning}");
+                ConfigDiagnostic {
+                    severity: ConfigDiagnosticSeverity::Warning,
+                    code: "config_validation_warning".to_string(),
                     message: warning.to_string(),
-                });
-            }
-        }
+                }
+            })
+            .collect::<Vec<_>>();
 
         let merged_value = JsonValue::Object(merged.clone());
 
@@ -964,7 +984,7 @@ impl ConfigLoader {
             permission_rules: parse_optional_permission_rules(&merged_value)?,
             approval: parse_optional_approval_config(&merged_value)?,
             sandbox: parse_optional_sandbox_config(&merged_value)?,
-            fallbacks: parse_fallbacks(&merged_value),
+            fallbacks: parse_fallbacks(&merged_value, &mut diagnostics),
             providers: parse_optional_providers_config(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
             memory: parse_optional_memory_config(&merged_value)?,
@@ -974,10 +994,13 @@ impl ConfigLoader {
             runtime_control: parse_optional_runtime_control_config(&merged_value)?,
         };
 
-        Ok(RuntimeConfig {
-            merged,
-            loaded_entries,
-            feature_config,
+        Ok(ConfigLoadResult {
+            config: RuntimeConfig {
+                merged,
+                loaded_entries,
+                feature_config,
+            },
+            diagnostics,
         })
     }
 }
@@ -1752,7 +1775,7 @@ fn parse_optional_sandbox_config(root: &JsonValue) -> Result<SandboxConfig, Conf
     })
 }
 
-fn parse_fallbacks(root: &JsonValue) -> Vec<String> {
+fn parse_fallbacks(root: &JsonValue, diagnostics: &mut Vec<ConfigDiagnostic>) -> Vec<String> {
     let Some(object) = root.as_object() else {
         return vec![];
     };
@@ -1766,9 +1789,11 @@ fn parse_fallbacks(root: &JsonValue) -> Vec<String> {
     if let Some(v) = find_key_dual(object, "provider_fallbacks", "merged settings") {
         let msg = "'providerFallbacks' is deprecated, use 'fallbacks' instead. All per-model chains are now merged into a single global list.".to_string();
         tracing::warn!("{msg}");
-        if let Ok(mut w) = PENDING_WARNINGS.lock() {
-            w.push(crate::cowd_event::CowdEvent::Warning { message: msg });
-        }
+        diagnostics.push(ConfigDiagnostic {
+            severity: ConfigDiagnosticSeverity::Warning,
+            code: "deprecated_provider_fallbacks".to_string(),
+            message: msg,
+        });
         return extract_fallbacks_from_legacy(v);
     }
     vec![]

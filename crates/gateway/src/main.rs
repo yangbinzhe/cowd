@@ -89,7 +89,6 @@ use std::sync::{LazyLock, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use model_protocol::provider_config::{ProviderConfig, ProvidersConfig};
 use model_protocol::usage::TokenUsage;
 #[cfg(test)]
 use provider as provider_crate;
@@ -3172,106 +3171,6 @@ fn parse_titled_body(value: &str) -> Option<(String, String)> {
     Some((title.to_string(), body.to_string()))
 }
 
-/// Fallback: load providers directly from the active Cowd config home.
-/// when ConfigLoader merge loses them.
-fn fallback_init_providers_from_user_config() {
-    let user_cfg = runtime::cowd_dirs::config_home_dir().join("config.yaml");
-    if !user_cfg.exists() {
-        return;
-    }
-    let raw = match std::fs::read_to_string(&user_cfg) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    let yaml_val: serde_yaml::Value = match serde_yaml::from_str(&raw) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    let providers_yaml = match yaml_val.get("providers") {
-        Some(v) => v,
-        None => return,
-    };
-    let providers_map = match providers_yaml.as_mapping() {
-        Some(m) => m,
-        None => return,
-    };
-
-    let mut providers = std::collections::HashMap::new();
-    for (key, value) in providers_map {
-        let name = match key.as_str() {
-            Some(s) => s.to_string(),
-            None => continue,
-        };
-        let entry = match value.as_mapping() {
-            Some(m) => m,
-            None => continue,
-        };
-        let base_url = entry
-            .get("base_url")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let api_key = entry
-            .get("api_key")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let models: Vec<String> = entry
-            .get("models")
-            .and_then(|v| v.as_sequence())
-            .map(|seq| {
-                seq.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let protocol = entry
-            .get("protocol")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-
-        providers.insert(
-            name.clone(),
-            ProviderConfig {
-                name: name.clone(),
-                base_url,
-                api_key,
-                models,
-                protocol,
-            },
-        );
-    }
-
-    runtime::init_global_providers(ProvidersConfig { providers });
-    tracing::warn!(
-        path = %user_cfg.display(),
-        "[init] fallback: loaded {} providers from Cowd config home",
-        runtime::list_all_providers().len()
-    );
-}
-
-fn init_runtime_providers_for_cwd(cwd: &Path) {
-    let loader = runtime::ConfigLoader::default_for(cwd);
-    match loader.load() {
-        Ok(cfg) => {
-            let providers = cfg.providers().clone();
-            tracing::debug!(
-                "[init] merged providers count: {}",
-                providers.providers.len()
-            );
-            if !providers.is_empty() {
-                runtime::init_global_providers(providers);
-            } else {
-                fallback_init_providers_from_user_config();
-            }
-        }
-        Err(e) => {
-            tracing::warn!("failed to load config for provider registry: {e}");
-            fallback_init_providers_from_user_config();
-        }
-    }
-}
-
 fn gateway_auth_token_from_platform(platform: &runtime::GatewayPlatformConfig) -> Option<String> {
     // Prefer flat auth_token key (legacy format).
     let flat = platform.extra.get("auth_token").and_then(|v| v.as_str());
@@ -4790,7 +4689,7 @@ mod tests {
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -8440,8 +8339,22 @@ UU conflicted.rs",
             &runtime_config,
         )
         .expect("plugin state should load");
+        let test_tool_host = Arc::new(tools::ToolHost::new(
+            "runtime-plugin-lifecycle",
+            &workspace,
+            tools::ToolHostSnapshot::new(
+                Arc::new(runtime_plugin_state.tool_registry.clone()),
+                Arc::new(tools::lsp_client::LspRegistry::new()),
+                None,
+            ),
+        ));
         let mut runtime = create_runtime_entry_with_bootstrap_state(
             None,
+            Arc::new(
+                runtime::ProviderRegistry::new(runtime_config.providers().clone())
+                    .expect("provider registry"),
+            ),
+            test_tool_host,
             Session::new(),
             "runtime-plugin-lifecycle",
             DEFAULT_MODEL.to_string(),

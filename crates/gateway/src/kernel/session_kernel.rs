@@ -331,7 +331,6 @@ impl SessionKernel {
         let Some(store) = self.unified_store.as_ref() else {
             return Ok(false);
         };
-        let sequence = store.next_event_sequence(session_id).await?;
         let created_at_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis() as u64)
@@ -340,10 +339,10 @@ impl SessionKernel {
             session_id: session_id.to_string(),
             event_type: event_type.to_string(),
             event_json: payload.to_string(),
-            sequence,
+            sequence: 0,
             created_at_ms,
         };
-        store.append_event(&event).await?;
+        store.append_event_allocating_sequence(&event).await?;
         Ok(true)
     }
 
@@ -359,8 +358,7 @@ impl SessionKernel {
             let record = new_api_session_record(session_id, None);
             store.create_session(&record).await?;
         }
-        let sequence = store.next_event_sequence(session_id).await?;
-        let mut envelope = envelope.with_sequence(sequence);
+        let mut envelope = envelope.with_sequence(0);
         envelope.session_id = session_id.to_string();
         let created_at_ms = current_time_ms();
         let event = SessionEvent {
@@ -368,11 +366,11 @@ impl SessionKernel {
             event_type: "TurnJournal".to_string(),
             event_json: serde_json::to_string(&envelope)
                 .map_err(|error| MemoryError::Store(error.to_string()))?,
-            sequence,
+            sequence: 0,
             created_at_ms,
         };
-        store.append_event(&event).await?;
-        Ok(Some(sequence))
+        let stored = store.append_event_allocating_sequence(&event).await?;
+        Ok(Some(stored.sequence))
     }
 
     pub(crate) async fn append_runtime_event(
@@ -385,11 +383,12 @@ impl SessionKernel {
         let Some(store) = self.unified_store.as_ref() else {
             return Ok(None);
         };
-        let sequence = store.next_event_sequence(session_id).await?;
         let created_at_ms = current_time_ms();
-        let event = RuntimeEvent::new(session_id, sequence, scope, kind, payload, created_at_ms);
-        store.append_runtime_event(&event).await?;
-        Ok(Some(sequence))
+        let event = RuntimeEvent::new(session_id, 0, scope, kind, payload, created_at_ms);
+        let stored = store
+            .append_runtime_event_allocating_sequence(&event)
+            .await?;
+        Ok(Some(stored.sequence))
     }
 
     pub(crate) async fn persist_workgraph_review(
@@ -408,9 +407,11 @@ impl SessionKernel {
             });
         };
 
-        let sequence = store.next_event_sequence(&graph.session_id).await?;
-        let event = graph.reviewed_runtime_event(sequence, packet);
-        store.append_runtime_event(&event).await?;
+        let mut event = graph.reviewed_runtime_event(0, packet);
+        let stored = store
+            .append_runtime_event_allocating_sequence(&event)
+            .await?;
+        event.sequence = stored.sequence;
 
         let memory_pulse = memory_manager
             .map(|manager| manager.process_memory_pulse_runtime_event(&event))
@@ -420,7 +421,7 @@ impl SessionKernel {
         Ok(RuntimeClosedLoopResult {
             session_id: graph.session_id.clone(),
             persisted: true,
-            runtime_event_sequence: Some(sequence),
+            runtime_event_sequence: Some(stored.sequence),
             memory_pulse,
             degraded_reason: None,
         })
@@ -570,6 +571,7 @@ impl SessionKernel {
             .delete_events_by_type_from(session_id, "message_appended", 0)
             .await?;
 
+        let mut message_events = Vec::with_capacity(session.messages.len());
         for (sequence, message) in session.messages.iter().enumerate() {
             let message_record = message.to_session_message(session_id, sequence);
             store.insert_message(&message_record).await?;
@@ -577,7 +579,7 @@ impl SessionKernel {
             let message_json =
                 serde_json::from_str::<serde_json::Value>(&message.to_json().render())
                     .unwrap_or(serde_json::Value::Null);
-            let event = SessionEvent {
+            message_events.push(SessionEvent {
                 session_id: session_id.to_string(),
                 event_type: "message_appended".to_string(),
                 event_json: serde_json::json!({
@@ -589,9 +591,11 @@ impl SessionKernel {
                 .to_string(),
                 sequence,
                 created_at_ms: message_record.created_at_ms,
-            };
-            store.append_event(&event).await?;
+            });
         }
+        store
+            .append_events_allocating_sequence(&message_events)
+            .await?;
         Ok(true)
     }
 }

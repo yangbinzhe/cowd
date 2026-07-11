@@ -1,17 +1,14 @@
+pub mod projection;
+pub mod raw;
+
+use harness_contract::context::EvidenceContentKind;
 use harness_contract::core::EvidenceRef;
 use serde::{Deserialize, Serialize};
 
 use crate::context_ledger::estimate_text_tokens;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EvidenceContentKind {
-    Text,
-    Json,
-    Diff,
-    Error,
-    Media,
-}
+pub use harness_contract::context::EvidenceAuditProjection as AuditProjection;
+pub use projection::audit_projection;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelReceipt {
@@ -22,16 +19,6 @@ pub struct ModelReceipt {
     pub receipt_tokens: u64,
     pub omitted_tokens: u64,
     pub truncated: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AuditProjection {
-    pub evidence_ref: EvidenceRef,
-    pub content_kind: EvidenceContentKind,
-    pub raw_tokens: u64,
-    pub receipt_tokens: u64,
-    pub omitted_tokens: u64,
-    pub raw_available: bool,
 }
 
 #[must_use]
@@ -62,18 +49,6 @@ pub fn build_tool_receipt(
         receipt_tokens,
         omitted_tokens: raw_tokens.saturating_sub(receipt_tokens),
         truncated: receipt_tokens < raw_tokens,
-    }
-}
-
-#[must_use]
-pub fn audit_projection(receipt: &ModelReceipt) -> AuditProjection {
-    AuditProjection {
-        evidence_ref: receipt.evidence_ref.clone(),
-        content_kind: receipt.content_kind,
-        raw_tokens: receipt.raw_tokens,
-        receipt_tokens: receipt.receipt_tokens,
-        omitted_tokens: receipt.omitted_tokens,
-        raw_available: true,
     }
 }
 

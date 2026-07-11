@@ -3286,7 +3286,15 @@ mod tests {
         }
         let model =
             std::env::var("COWD_EVAL_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string());
-        let mut client = runtime::ProviderRuntimeClient::new(model.clone(), Vec::new())
+        let cwd = std::env::current_dir().expect("current directory");
+        let config = runtime::ConfigLoader::default_for(&cwd)
+            .load()
+            .expect("runtime config should load");
+        let registry = std::sync::Arc::new(
+            runtime::ProviderRegistry::new(config.providers().clone())
+                .expect("provider registry should initialize"),
+        );
+        let mut client = runtime::ProviderRuntimeClient::new(registry, model.clone(), Vec::new())
             .expect("provider client should initialize when real eval is enabled");
         let request = runtime::ApiRequest {
             system_prompt: vec![

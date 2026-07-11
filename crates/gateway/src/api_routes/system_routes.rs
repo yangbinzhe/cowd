@@ -255,12 +255,36 @@ fn accumulate_usage_bucket(
 }
 
 async fn tools_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    Json(
-        state
-            .services
-            .system
-            .tool_catalog(state.tool_registry.definitions(None)),
-    )
+    let definitions = state
+        .services
+        .runtime
+        .as_ref()
+        .map(|runtime| {
+            runtime
+                .tool_host()
+                .pin_snapshot()
+                .snapshot()
+                .catalog
+                .definitions(None)
+        })
+        .unwrap_or_else(|| state.tool_registry.definitions(None));
+    Json(state.services.system.tool_catalog(definitions))
+}
+
+fn runtime_tool_host(
+    state: &AppState,
+) -> Result<Arc<tools::ToolHost>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.tool_host())
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "runtime tool host unavailable",
+            )
+        })
 }
 
 async fn tool_execute_handler(
@@ -278,11 +302,12 @@ async fn tool_execute_handler(
         ));
     }
     let input = ensure_tool_input_within_workspace(&state, &state.workspace_root, body.input)?;
+    let tool_host = runtime_tool_host(&state)?;
     let receipt = state
         .services
         .system
         .execute_tool_receipt(
-            &state.tool_registry,
+            &tool_host,
             &state.workspace_root,
             &tool_name,
             input,
@@ -296,7 +321,8 @@ async fn tool_execute_handler(
 async fn tool_cache_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    Ok(Json(state.services.system.tool_cache_receipt()))
+    let tool_host = runtime_tool_host(&state)?;
+    Ok(Json(state.services.system.tool_cache_receipt(&tool_host)))
 }
 
 async fn tool_batch_readonly_handler(
@@ -321,11 +347,12 @@ async fn tool_batch_readonly_handler(
             .unwrap_or_else(|| serde_json::json!({}));
         ensure_tool_input_within_workspace(&state, &state.workspace_root, input)?;
     }
+    let tool_host = runtime_tool_host(&state)?;
     let receipt = state
         .services
         .system
         .execute_tool_receipt(
-            &state.tool_registry,
+            &tool_host,
             &state.workspace_root,
             "tool_batch_readonly",
             serde_json::json!({
@@ -344,11 +371,12 @@ async fn tool_mutation_preview_handler(
     Json(body): Json<ToolMutationRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let edits = ensure_edits_within_workspace(&state, &state.workspace_root, body.edits)?;
+    let tool_host = runtime_tool_host(&state)?;
     let receipt = state
         .services
         .system
         .execute_tool_receipt(
-            &state.tool_registry,
+            &tool_host,
             &state.workspace_root,
             "mutation_preview",
             serde_json::json!({ "edits": edits }),
@@ -364,11 +392,12 @@ async fn tool_mutation_apply_handler(
     Json(body): Json<ToolMutationRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let edits = ensure_edits_within_workspace(&state, &state.workspace_root, body.edits)?;
+    let tool_host = runtime_tool_host(&state)?;
     let receipt = state
         .services
         .system
         .execute_tool_receipt(
-            &state.tool_registry,
+            &tool_host,
             &state.workspace_root,
             "apply_patch_transaction",
             serde_json::json!({
@@ -385,11 +414,12 @@ async fn tool_mutation_apply_handler(
 async fn tool_checkpoints_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let tool_host = runtime_tool_host(&state)?;
     let receipt = state
         .services
         .system
         .execute_tool_receipt(
-            &state.tool_registry,
+            &tool_host,
             &state.workspace_root,
             "checkpoint_list",
             serde_json::json!({}),
@@ -404,11 +434,12 @@ async fn tool_checkpoint_create_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(body): Json<ToolCheckpointCreateRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let tool_host = runtime_tool_host(&state)?;
     let receipt = state
         .services
         .system
         .execute_tool_receipt(
-            &state.tool_registry,
+            &tool_host,
             &state.workspace_root,
             "checkpoint_create",
             serde_json::json!({ "label": body.label }),
@@ -423,11 +454,12 @@ async fn tool_checkpoint_diff_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let tool_host = runtime_tool_host(&state)?;
     let receipt = state
         .services
         .system
         .execute_tool_receipt(
-            &state.tool_registry,
+            &tool_host,
             &state.workspace_root,
             "checkpoint_diff",
             serde_json::json!({ "id": id }),
@@ -442,11 +474,12 @@ async fn tool_checkpoint_restore_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let tool_host = runtime_tool_host(&state)?;
     let receipt = state
         .services
         .system
         .execute_tool_receipt(
-            &state.tool_registry,
+            &tool_host,
             &state.workspace_root,
             "checkpoint_restore",
             serde_json::json!({ "id": id }),

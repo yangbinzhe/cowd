@@ -18,7 +18,6 @@ use harness_contract::context::{
 use serde::{Deserialize, Serialize};
 
 use crate::context_runtime::{AgentContextLease, AgentReturnRequirement, ContextSourceKind};
-use crate::tool_orchestrator::ToolResultBudget;
 
 pub const DEFAULT_SUBAGENT_BUDGET_TOKENS: usize =
     crate::budget_policy::DEFAULT_SUBAGENT_BUDGET_TOKENS;
@@ -550,7 +549,6 @@ use crate::conversation::{ApiClient, ConversationRuntime, ToolExecutor};
 pub struct SubAgentRuntime<C: ApiClient, T: ToolExecutor> {
     config: SubAgentConfig,
     runtime: ConversationRuntime<C, T>,
-    result_budget: ToolResultBudget,
     turns_executed: usize,
     tokens_consumed: usize,
     started_at: Instant,
@@ -598,7 +596,6 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
         memory::agent_directory::AgentDirectory::global().register(info);
 
         Self {
-            result_budget: ToolResultBudget::default(),
             turns_executed: 0,
             tokens_consumed: 0,
             started_at: Instant::now(),
@@ -617,13 +614,6 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
     #[must_use]
     pub fn with_parent_memory(mut self, memory: Arc<CognitiveContextManager>) -> Self {
         self.parent_memory = Some(memory);
-        self
-    }
-
-    /// Create with a custom result budget.
-    #[must_use]
-    pub fn with_result_budget(mut self, budget: ToolResultBudget) -> Self {
-        self.result_budget = budget;
         self
     }
 
@@ -682,11 +672,6 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
     pub fn record_turn(&mut self, tokens: usize) {
         self.turns_executed += 1;
         self.tokens_consumed += tokens;
-    }
-
-    /// Truncate a tool result according to the result budget.
-    pub fn truncate_result(&self, output: &str) -> String {
-        self.result_budget.truncate(output)
     }
 
     /// Get the write source for this sub-agent.
@@ -1355,14 +1340,6 @@ mod tests {
         assert_eq!(runtime.remaining_budget(), 1000);
         runtime.record_turn(300);
         assert_eq!(runtime.remaining_budget(), 700);
-    }
-
-    #[test]
-    fn result_truncation() {
-        let runtime = SubAgentRuntime::new(SubAgentConfig::default(), make_dummy_runtime());
-        let long_output = "x".repeat(100_000);
-        let truncated = runtime.truncate_result(&long_output);
-        assert!(truncated.len() < long_output.len());
     }
 
     #[test]

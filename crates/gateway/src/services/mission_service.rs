@@ -1097,12 +1097,17 @@ fn spawn_provider_lifecycle_agent_for_team(
 ) -> Result<runtime::AgentSnapshot, String> {
     let runtime_state =
         crate::runtime_bootstrap::assemble_runtime_state().map_err(|error| error.to_string())?;
+    let provider_registry = std::sync::Arc::new(
+        runtime::ProviderRegistry::new(runtime_state.feature_config.providers().clone())
+            .map_err(|rejected| rejected.diagnostics.errors.join("; "))?,
+    );
     let spawn_request = build_spawn_request_for_team(
         request,
         model,
         runtime::AgentExecutionBackendKind::InProcess,
         None,
         &runtime_state.tool_registry,
+        provider_registry,
     )?;
     let executor = GatewayToolExecutor::new(
         Some(spawn_request.allowed_tools.clone()),
@@ -1121,6 +1126,10 @@ fn spawn_process_jsonl_lifecycle_agent_for_team(
 ) -> Result<runtime::AgentSnapshot, String> {
     let runtime_state =
         crate::runtime_bootstrap::assemble_runtime_state().map_err(|error| error.to_string())?;
+    let provider_registry = std::sync::Arc::new(
+        runtime::ProviderRegistry::new(runtime_state.feature_config.providers().clone())
+            .map_err(|rejected| rejected.diagnostics.errors.join("; "))?,
+    );
     runtime::spawn_provider_agent(
         build_spawn_request_for_team(
             request,
@@ -1128,6 +1137,7 @@ fn spawn_process_jsonl_lifecycle_agent_for_team(
             runtime::AgentExecutionBackendKind::ProcessJsonl,
             Some(spec),
             &runtime_state.tool_registry,
+            provider_registry,
         )?,
         GatewayToolExecutor::new(
             None,
@@ -1145,6 +1155,7 @@ fn build_spawn_request_for_team(
     backend: runtime::AgentExecutionBackendKind,
     process_jsonl: Option<runtime::AgentProcessJsonlSpec>,
     tool_registry: &crate::runtime_bootstrap::GatewayToolRegistry,
+    provider_registry: std::sync::Arc<runtime::ProviderRegistry>,
 ) -> Result<runtime::SpawnAgentRequest, String> {
     let subagent_type = runtime::normalize_subagent_type(Some(&request.role_id));
     let prompt = team_role_prompt(request);
@@ -1155,6 +1166,7 @@ fn build_spawn_request_for_team(
     });
     let tool_definitions = crate::filter_tool_specs(tool_registry, Some(&capability.allowed_tools));
     Ok(runtime::SpawnAgentRequest {
+        provider_registry,
         description: format!("{}: {}", request.role_id, request.responsibility),
         prompt: format!(
             "{}\nCapability binding: {}\n",
@@ -1416,6 +1428,7 @@ mod tests {
             runtime::AgentExecutionBackendKind::InProcess,
             None,
             &registry,
+            std::sync::Arc::new(runtime::ProviderRegistry::empty()),
         )
         .expect("spawn request");
 

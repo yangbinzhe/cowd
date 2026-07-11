@@ -235,6 +235,28 @@ impl UnifiedSessionStore {
         self.inner.lock().await.append_event(event)
     }
 
+    /// Atomically allocate the next session-local sequence and append an event.
+    pub async fn append_event_allocating_sequence(
+        &self,
+        event: &SessionEvent,
+    ) -> Result<SessionEvent> {
+        self.inner
+            .lock()
+            .await
+            .append_event_allocating_sequence(event)
+    }
+
+    /// Atomically allocate contiguous sequences and append a same-session batch.
+    pub async fn append_events_allocating_sequence(
+        &self,
+        events: &[SessionEvent],
+    ) -> Result<Vec<SessionEvent>> {
+        self.inner
+            .lock()
+            .await
+            .append_events_allocating_sequence(events)
+    }
+
     /// Append a context envelope event unless the same envelope id already exists.
     pub async fn append_context_envelope_event_if_absent(
         &self,
@@ -246,10 +268,31 @@ impl UnifiedSessionStore {
             .append_context_envelope_event_if_absent(event)
     }
 
+    /// Atomically de-duplicate a context envelope and allocate its sequence.
+    pub async fn append_context_envelope_event_if_absent_allocating_sequence(
+        &self,
+        event: &SessionEvent,
+    ) -> Result<Option<SessionEvent>> {
+        self.inner
+            .lock()
+            .await
+            .append_context_envelope_event_if_absent_allocating_sequence(event)
+    }
+
     /// Append a canonical runtime event to the session event log.
     pub async fn append_runtime_event(&self, event: &RuntimeEvent) -> Result<()> {
+        self.append_runtime_event_allocating_sequence(event)
+            .await
+            .map(|_| ())
+    }
+
+    /// Persist a runtime event using the store-owned sequence allocator.
+    pub async fn append_runtime_event_allocating_sequence(
+        &self,
+        event: &RuntimeEvent,
+    ) -> Result<SessionEvent> {
         let event = event.to_session_event()?;
-        self.append_event(&event).await
+        self.append_event_allocating_sequence(&event).await
     }
 
     /// Retrieve events for a session starting from `from_seq` (inclusive).
@@ -574,6 +617,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_event_allocator_keeps_column_and_envelope_sequence_equal() {
+        let store = UnifiedSessionStore::open_in_memory().unwrap();
+        store
+            .create_session(&make_record("s-runtime-allocated"))
+            .await
+            .unwrap();
+        let stored = store
+            .append_runtime_event_allocating_sequence(&RuntimeEvent::new(
+                "s-runtime-allocated",
+                9_999,
+                RuntimeEventScope::Turn,
+                "turn.completed",
+                serde_json::json!({"ok": true}),
+                2,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stored.sequence, 0);
+
+        let page = store
+            .runtime_events_page("s-runtime-allocated", 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(page.events[0].sequence, 0);
+        assert_eq!(page.next_seq, Some(1));
+    }
+
+    #[tokio::test]
     async fn timeline_events_page_projects_legacy_and_runtime_events() {
         let store = UnifiedSessionStore::open_in_memory().unwrap();
         store
@@ -612,6 +683,46 @@ mod tests {
         assert_eq!(page.events[0].scope, RuntimeEventScope::Tool);
         assert_eq!(page.next_seq, Some(1));
         assert!(page.has_more);
+    }
+
+    #[tokio::test]
+    async fn concurrent_allocating_appends_produce_one_ordered_sequence() {
+        let store = UnifiedSessionStore::open_in_memory().unwrap();
+        store
+            .create_session(&make_record("s-concurrent-sequence"))
+            .await
+            .unwrap();
+
+        let mut tasks = Vec::new();
+        for index in 0..100usize {
+            let store = store.clone();
+            tasks.push(tokio::spawn(async move {
+                store
+                    .append_event_allocating_sequence(&SessionEvent {
+                        session_id: "s-concurrent-sequence".to_string(),
+                        event_type: "concurrent".to_string(),
+                        event_json: format!(r#"{{"index":{index}}}"#),
+                        sequence: usize::MAX,
+                        created_at_ms: index as u64,
+                    })
+                    .await
+                    .unwrap()
+                    .sequence
+            }));
+        }
+        let mut allocated = Vec::new();
+        for task in tasks {
+            allocated.push(task.await.unwrap());
+        }
+        allocated.sort_unstable();
+        assert_eq!(allocated, (0..100).collect::<Vec<_>>());
+
+        let replay = store.get_events("s-concurrent-sequence", 0).await.unwrap();
+        assert_eq!(replay.len(), 100);
+        assert!(replay
+            .iter()
+            .enumerate()
+            .all(|(expected, event)| event.sequence == expected));
     }
 
     #[tokio::test]

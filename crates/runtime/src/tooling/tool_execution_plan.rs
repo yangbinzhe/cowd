@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::execution_core::{RuntimeCompileTarget, RuntimeExecutionDecision};
 use crate::tool_dispatch::ToolRequest;
-use crate::tool_orchestrator::{ToolSafetyCategory, ToolSafetyRegistry};
+use crate::tool_orchestrator::{classify_tool_request, ToolSafetyCategory};
 
 pub const TOOL_EXECUTION_PLAN_CONTRACT_VERSION: u32 = 2;
 
@@ -160,7 +160,6 @@ impl ToolExecutionPlan {
         requests: &[ToolRequest],
         classify_registered_tool: impl Fn(&str, &str) -> Option<ToolSafetyCategory>,
     ) -> Self {
-        let registry = ToolSafetyRegistry::global();
         let mut parallel_read_count = 0;
         let mut limited_count = 0;
         let mut destructive_count = 0;
@@ -169,8 +168,7 @@ impl ToolExecutionPlan {
         let mut tasks = requests
             .iter()
             .map(|request| {
-                let builtin_category =
-                    registry.classify_request(&request.tool_name, &request.input);
+                let builtin_category = classify_tool_request(&request.tool_name, &request.input);
                 let safety_category = if builtin_category == ToolSafetyCategory::WriteLocal {
                     classify_registered_tool(&request.tool_name, &request.input)
                         .unwrap_or(builtin_category)

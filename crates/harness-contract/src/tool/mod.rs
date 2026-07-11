@@ -3,7 +3,138 @@
 use std::collections::BTreeSet;
 
 use crate::core::{AiKernelError, AiKernelResult};
+use crate::policy::PermissionScope;
 use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolDescriptorHealth {
+    Healthy,
+    Degraded,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolDescriptorRef {
+    pub canonical_id: String,
+    pub display_name: String,
+    pub source: String,
+    pub schema_hash: String,
+    pub required_permission: ToolPermissionMode,
+    pub permission_source: String,
+    pub health: ToolDescriptorHealth,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolDiscoveryReceipt {
+    pub query: String,
+    pub catalog_revision: u64,
+    pub descriptors: Vec<ToolDescriptorRef>,
+    pub activation_candidates: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolActivationStatus {
+    Activated,
+    Denied,
+    Unavailable,
+    NotFound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolActivationDecision {
+    pub canonical_id: String,
+    pub status: ToolActivationStatus,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolActivationReceipt {
+    pub catalog_revision: u64,
+    pub previous_exposure_revision: u64,
+    pub exposure_revision: u64,
+    pub decisions: Vec<ToolActivationDecision>,
+}
+
+impl ToolActivationReceipt {
+    #[must_use]
+    pub fn activated_ids(&self) -> impl Iterator<Item = &str> {
+        self.decisions.iter().filter_map(|decision| {
+            (decision.status == ToolActivationStatus::Activated)
+                .then_some(decision.canonical_id.as_str())
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolExposureProjection {
+    pub catalog_revision: u64,
+    pub exposure_revision: u64,
+    pub bootstrap_ids: Vec<String>,
+    pub active_ids: Vec<String>,
+    pub deferred_ids: Vec<String>,
+    pub fallback_full: bool,
+    pub reason: String,
+    pub schema_tokens: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolEffectKind {
+    Read,
+    Write,
+    Network,
+    Process,
+    Package,
+    System,
+    Destructive,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolIdempotency {
+    Idempotent,
+    IdempotentWithKey,
+    NonIdempotent,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolApprovalClass {
+    None,
+    Policy,
+    User,
+    Administrator,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolEffectDescriptor {
+    pub tool_id: String,
+    pub descriptor_hash: String,
+    pub effect_kind: ToolEffectKind,
+    pub idempotency: ToolIdempotency,
+    pub scopes: Vec<PermissionScope>,
+    pub required_permission: ToolPermissionMode,
+    pub approval_class: ToolApprovalClass,
+    pub uses_network: bool,
+    pub spawns_process: bool,
+    pub mutates_packages: bool,
+    pub mutates_system: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolExecutionAuthorization {
+    pub request_id: String,
+    pub tool_id: String,
+    pub descriptor_hash: String,
+    pub scope: PermissionScope,
+    pub permission_lease: String,
+    pub timeout_lease: String,
+    pub idempotency_key: Option<String>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -277,6 +408,7 @@ fn normalize_path(path: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::{PermissionOperation, PermissionResource};
 
     #[test]
     fn read_operations_share_a_parallel_batch() {
@@ -344,5 +476,67 @@ mod tests {
         assert!(plan.requires_checkpoint);
         assert!(!plan.receipt(0, 1, false).checkpoint_created);
         assert!(plan.receipt(1, 0, true).checkpoint_created);
+    }
+
+    #[test]
+    fn activation_receipt_exposes_only_accepted_canonical_ids() {
+        let receipt = ToolActivationReceipt {
+            catalog_revision: 7,
+            previous_exposure_revision: 2,
+            exposure_revision: 3,
+            decisions: vec![
+                ToolActivationDecision {
+                    canonical_id: "read_file".to_string(),
+                    status: ToolActivationStatus::Activated,
+                    reason: "allowed".to_string(),
+                },
+                ToolActivationDecision {
+                    canonical_id: "write_file".to_string(),
+                    status: ToolActivationStatus::Denied,
+                    reason: "read-only lease".to_string(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            receipt.activated_ids().collect::<Vec<_>>(),
+            vec!["read_file"]
+        );
+    }
+
+    #[test]
+    fn effect_and_authorization_contracts_have_stable_wire_names() {
+        let scope = PermissionScope::new(PermissionResource::File, PermissionOperation::Write);
+        let descriptor = ToolEffectDescriptor {
+            tool_id: "write_file".to_string(),
+            descriptor_hash: "sha256:descriptor".to_string(),
+            effect_kind: ToolEffectKind::Write,
+            idempotency: ToolIdempotency::IdempotentWithKey,
+            scopes: vec![scope.clone()],
+            required_permission: ToolPermissionMode::WorkspaceWrite,
+            approval_class: ToolApprovalClass::Policy,
+            uses_network: false,
+            spawns_process: false,
+            mutates_packages: false,
+            mutates_system: false,
+        };
+        let authorization = ToolExecutionAuthorization {
+            request_id: "request-1".to_string(),
+            tool_id: descriptor.tool_id.clone(),
+            descriptor_hash: descriptor.descriptor_hash.clone(),
+            scope,
+            permission_lease: "permission-1".to_string(),
+            timeout_lease: "timeout-1".to_string(),
+            idempotency_key: Some("write-1".to_string()),
+        };
+
+        assert_eq!(
+            serde_json::to_value(descriptor).unwrap()["effect_kind"],
+            "write"
+        );
+        assert_eq!(
+            serde_json::to_value(authorization).unwrap()["idempotency_key"],
+            "write-1"
+        );
     }
 }

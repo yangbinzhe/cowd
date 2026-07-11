@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use futures::StreamExt;
+use harness_contract::tool::ToolExposureProjection;
 use provider::{
     max_tokens_for_model, ApiError, ContentBlockDelta, ImageSource, InputContentBlock,
     InputMessage, MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
@@ -10,10 +12,11 @@ use provider::{
 };
 
 use crate::{
-    resolve_global_provider, ApiClient, ApiRequest, AssistantEvent, ConfigLoader, ContentBlock,
-    ConversationMessage, MessageRole, PromptCacheEvent, ProviderContextInventory, RuntimeError,
-    ToolContractScope,
+    ApiClient, ApiRequest, AssistantEvent, ConfigLoader, ContentBlock, ConversationMessage,
+    MessageRole, PromptCacheEvent, ProviderContextInventory, RuntimeError,
 };
+
+use crate::provider_registry::{ProviderRegistry, ProviderRegistrySnapshot};
 
 pub use provider::OutputContentBlock as ProviderOutputContentBlock;
 pub use provider::ToolDefinition as ProviderToolDefinition;
@@ -25,38 +28,45 @@ struct ProviderEntry {
 }
 
 pub struct ProviderRuntimeClient {
-    chain: Vec<ProviderEntry>,
+    registry: Arc<ProviderRegistry>,
+    chain_models: Vec<String>,
     tool_definitions: Vec<ToolDefinition>,
-    active_tool_scope: ToolContractScope,
+    tool_exposure: Option<ToolExposureProjection>,
     reasoning_effort: Option<String>,
     emit_output: bool,
     stream_callback: Option<std::sync::mpsc::SyncSender<crate::CowdEvent>>,
 }
 
 impl ProviderRuntimeClient {
-    pub fn new(model: String, tool_definitions: Vec<ToolDefinition>) -> Result<Self, String> {
+    pub fn new(
+        registry: Arc<ProviderRegistry>,
+        model: String,
+        tool_definitions: Vec<ToolDefinition>,
+    ) -> Result<Self, String> {
         let fallback_config = load_provider_fallback_config();
-        Self::new_with_fallback_config(model, tool_definitions, &fallback_config)
+        Self::new_with_fallback_config(registry, model, tool_definitions, &fallback_config)
     }
 
     pub fn new_with_fallback_config(
+        registry: Arc<ProviderRegistry>,
         model: String,
         tool_definitions: Vec<ToolDefinition>,
         fallbacks: &[String],
     ) -> Result<Self, String> {
-        let primary = build_provider_entry(&model)?;
-        let mut chain = vec![primary];
+        let snapshot = registry.pin();
+        build_provider_entry(&snapshot, &model)?;
+        let mut chain_models = vec![model];
         if let Some(vision_model) = load_vision_model_config() {
-            match build_provider_entry(&vision_model) {
-                Ok(entry) => chain.push(entry),
+            match build_provider_entry(&snapshot, &vision_model) {
+                Ok(_) => chain_models.push(vision_model),
                 Err(error) => {
                     tracing::warn!("skipping unavailable vision provider {vision_model}: {error}");
                 }
             }
         }
         for fallback_model in fallbacks {
-            match build_provider_entry(fallback_model) {
-                Ok(entry) => chain.push(entry),
+            match build_provider_entry(&snapshot, fallback_model) {
+                Ok(_) => chain_models.push(fallback_model.clone()),
                 Err(error) => {
                     tracing::warn!(
                         "skipping unavailable fallback provider {fallback_model}: {error}"
@@ -64,11 +74,12 @@ impl ProviderRuntimeClient {
                 }
             }
         }
-        chain.dedup_by(|a, b| a.model == b.model);
+        chain_models.dedup();
         Ok(Self {
-            chain,
+            registry,
+            chain_models,
             tool_definitions,
-            active_tool_scope: ToolContractScope::Full,
+            tool_exposure: None,
             reasoning_effort: None,
             emit_output: false,
             stream_callback: None,
@@ -77,10 +88,12 @@ impl ProviderRuntimeClient {
 
     #[must_use]
     pub fn chain_models(&self) -> Vec<&str> {
-        self.chain
-            .iter()
-            .map(|entry| entry.model.as_str())
-            .collect()
+        self.chain_models.iter().map(String::as_str).collect()
+    }
+
+    #[must_use]
+    pub fn provider_registry(&self) -> &Arc<ProviderRegistry> {
+        &self.registry
     }
 
     #[must_use]
@@ -102,24 +115,49 @@ impl ProviderRuntimeClient {
         self.reasoning_effort = effort;
     }
 
+    /// Install the explicit tool schema set selected by Runtime.
+    ///
+    /// An unconfigured client exposes no tools. Older projections are ignored,
+    /// which prevents a delayed planner update from rolling schema visibility
+    /// back after a newer activation revision has reached the client.
+    pub fn configure_tool_exposure(&mut self, projection: ToolExposureProjection) {
+        let is_stale = self.tool_exposure.as_ref().is_some_and(|current| {
+            projection.catalog_revision < current.catalog_revision
+                || (projection.catalog_revision == current.catalog_revision
+                    && projection.exposure_revision < current.exposure_revision)
+        });
+        if is_stale {
+            tracing::warn!(
+                catalog_revision = projection.catalog_revision,
+                exposure_revision = projection.exposure_revision,
+                "ignoring stale provider tool exposure projection"
+            );
+            return;
+        }
+        self.tool_exposure = Some(projection);
+    }
+
     pub fn switch_model(&mut self, new_model: &str) -> Result<(), String> {
-        self.chain = vec![build_provider_entry(new_model)?];
+        let snapshot = self.registry.pin();
+        build_provider_entry(&snapshot, new_model)?;
+        self.chain_models = vec![new_model.to_string()];
         self.model_fallbacks_extend();
         Ok(())
     }
 
     fn model_fallbacks_extend(&mut self) {
+        let snapshot = self.registry.pin();
         if let Some(vision_model) = load_vision_model_config() {
-            match build_provider_entry(&vision_model) {
-                Ok(entry) => self.chain.push(entry),
+            match build_provider_entry(&snapshot, &vision_model) {
+                Ok(_) => self.chain_models.push(vision_model),
                 Err(error) => {
                     tracing::warn!("skipping unavailable vision provider {vision_model}: {error}");
                 }
             }
         }
         for fallback_model in load_provider_fallback_config() {
-            match build_provider_entry(&fallback_model) {
-                Ok(entry) => self.chain.push(entry),
+            match build_provider_entry(&snapshot, &fallback_model) {
+                Ok(_) => self.chain_models.push(fallback_model),
                 Err(error) => {
                     tracing::warn!(
                         "skipping unavailable fallback provider {fallback_model}: {error}"
@@ -127,42 +165,41 @@ impl ProviderRuntimeClient {
                 }
             }
         }
-        self.chain.dedup_by(|a, b| a.model == b.model);
+        self.chain_models.dedup();
     }
 
     fn active_tool_definitions(&self) -> Vec<ToolDefinition> {
-        self.tool_definitions
-            .iter()
-            .filter(|definition| tool_visible_in_scope(&definition.name, self.active_tool_scope))
-            .cloned()
-            .collect()
+        tool_definitions_for_exposure(&self.tool_definitions, self.tool_exposure.as_ref())
     }
 }
 
-fn tool_visible_in_scope(name: &str, scope: ToolContractScope) -> bool {
-    if scope == ToolContractScope::Full {
-        return true;
-    }
-    let normalized = name.to_ascii_lowercase();
-    let discovery = matches!(
-        normalized.as_str(),
-        "runtime_capabilities" | "runtime_orchestrate" | "tool_search" | "list_tools"
-    );
-    if discovery || scope == ToolContractScope::Minimal {
-        return discovery;
-    }
-    [
-        "read", "grep", "glob", "search", "find", "list", "get", "inspect", "status", "snapshot",
-        "query", "fetch", "retrieve",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker))
+fn tool_definitions_for_exposure(
+    definitions: &[ToolDefinition],
+    exposure: Option<&ToolExposureProjection>,
+) -> Vec<ToolDefinition> {
+    let Some(exposure) = exposure else {
+        return Vec::new();
+    };
+    let active_ids = exposure
+        .bootstrap_ids
+        .iter()
+        .chain(exposure.active_ids.iter())
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    definitions
+        .iter()
+        .filter(|definition| active_ids.contains(definition.name.as_str()))
+        .cloned()
+        .collect()
 }
 
-fn build_provider_entry(model: &str) -> Result<ProviderEntry, String> {
+fn build_provider_entry(
+    snapshot: &ProviderRegistrySnapshot,
+    model: &str,
+) -> Result<ProviderEntry, String> {
     let resolved = model.trim().to_string();
-    let client = match resolve_global_provider(&resolved) {
-        Some(provider) => ProviderClient::from_config(&provider).map_err(|e| e.to_string())?,
+    let client = match snapshot.resolve(&resolved) {
+        Some(provider) => ProviderClient::from_config(provider).map_err(|e| e.to_string())?,
         None => {
             tracing::warn!(
                 "model '{resolved}' not in providers config, falling back to environment variables"
@@ -198,17 +235,12 @@ impl ApiClient for ProviderRuntimeClient {
     ) -> Pin<
         Box<dyn futures::stream::Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>,
     > {
-        let events = async move {
-            match self.stream_collect_inner(request).await {
-                Ok(events) => events.into_iter().map(Ok).collect::<Vec<_>>(),
-                Err(error) => vec![Err(error)],
-            }
-        };
-        Box::pin(futures::stream::once(events).flat_map(futures::stream::iter))
+        let provider_snapshot = self.registry.pin();
+        self.stream_with_provider_snapshot(request, provider_snapshot)
     }
 
-    fn configure_tool_contract_scope(&mut self, scope: ToolContractScope) {
-        self.active_tool_scope = scope;
+    fn configure_tool_exposure(&mut self, projection: ToolExposureProjection) {
+        ProviderRuntimeClient::configure_tool_exposure(self, projection);
     }
 
     fn context_inventory(&self) -> ProviderContextInventory {
@@ -224,9 +256,26 @@ impl ApiClient for ProviderRuntimeClient {
 }
 
 impl ProviderRuntimeClient {
+    pub(crate) fn stream_with_provider_snapshot(
+        &mut self,
+        request: ApiRequest,
+        provider_snapshot: ProviderRegistrySnapshot,
+    ) -> Pin<
+        Box<dyn futures::stream::Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>,
+    > {
+        let events = async move {
+            match self.stream_collect_inner(request, provider_snapshot).await {
+                Ok(events) => events.into_iter().map(Ok).collect::<Vec<_>>(),
+                Err(error) => vec![Err(error)],
+            }
+        };
+        Box::pin(futures::stream::once(events).flat_map(futures::stream::iter))
+    }
+
     async fn stream_collect_inner(
         &mut self,
         request: ApiRequest,
+        provider_snapshot: ProviderRegistrySnapshot,
     ) -> Result<Vec<AssistantEvent>, RuntimeError> {
         let messages = convert_messages(&request.messages);
         let system =
@@ -235,7 +284,9 @@ impl ProviderRuntimeClient {
         let tool_choice = (!active_tools.is_empty()).then_some(ToolChoice::Auto);
 
         let needs_vision = request_has_image_input(&messages);
-        let chain = self.candidate_chain(&request.model, needs_vision);
+        // One provider snapshot is pinned for the whole request, including all
+        // retries and fallbacks. A concurrent reload only affects later requests.
+        let chain = self.candidate_chain(&provider_snapshot, &request.model, needs_vision);
         let mut last_error: Option<ApiError> = None;
         for (index, entry) in chain.iter().enumerate() {
             let message_request = MessageRequest {
@@ -287,15 +338,29 @@ impl ProviderRuntimeClient {
         )))
     }
 
-    fn candidate_chain(&self, requested_model: &str, needs_vision: bool) -> Vec<ProviderEntry> {
+    fn candidate_chain(
+        &self,
+        snapshot: &ProviderRegistrySnapshot,
+        requested_model: &str,
+        needs_vision: bool,
+    ) -> Vec<ProviderEntry> {
         let base = self
-            .chain
+            .chain_models
             .iter()
-            .filter(|entry| !needs_vision || !model_is_known_without_vision(&entry.model))
-            .cloned()
+            .filter(|model| !needs_vision || !model_is_known_without_vision(model))
+            .filter_map(|model| match build_provider_entry(snapshot, model) {
+                Ok(entry) => Some(entry),
+                Err(error) => {
+                    tracing::warn!("skipping unavailable provider model {model}: {error}");
+                    None
+                }
+            })
             .collect::<Vec<_>>();
         let base = if base.is_empty() {
-            self.chain.clone()
+            self.chain_models
+                .iter()
+                .filter_map(|model| build_provider_entry(snapshot, model).ok())
+                .collect()
         } else {
             base
         };
@@ -306,7 +371,7 @@ impl ProviderRuntimeClient {
             if let Some(existing) = base.iter().find(|entry| entry.model == requested_model) {
                 ordered.push(existing.clone());
             } else if !needs_vision || !model_is_known_without_vision(requested_model) {
-                match build_provider_entry(requested_model) {
+                match build_provider_entry(snapshot, requested_model) {
                     Ok(entry) => ordered.push(entry),
                     Err(error) => tracing::warn!(
                         "skipping requested provider model {requested_model}: {error}"
@@ -570,61 +635,61 @@ fn prompt_cache_record_to_runtime_event(
 
 #[cfg(test)]
 mod tests {
-    use super::{looks_like_vision_unsupported, request_has_image_input, tool_visible_in_scope};
-    use provider::{ApiError, ImageSource, InputContentBlock, InputMessage};
+    use super::{
+        looks_like_vision_unsupported, request_has_image_input, tool_definitions_for_exposure,
+    };
+    use harness_contract::tool::ToolExposureProjection;
+    use provider::{ApiError, ImageSource, InputContentBlock, InputMessage, ToolDefinition};
+    use serde_json::json;
 
-    use crate::ToolContractScope;
+    fn tool(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: None,
+            input_schema: json!({"type": "object"}),
+        }
+    }
 
-    #[test]
-    fn minimal_scope_only_exposes_runtime_discovery() {
-        assert!(tool_visible_in_scope(
-            "runtime_capabilities",
-            ToolContractScope::Minimal
-        ));
-        assert!(tool_visible_in_scope(
-            "runtime_orchestrate",
-            ToolContractScope::Minimal
-        ));
-        assert!(!tool_visible_in_scope(
-            "read_file",
-            ToolContractScope::Minimal
-        ));
-        assert!(!tool_visible_in_scope(
-            "write_file",
-            ToolContractScope::Minimal
-        ));
+    fn exposure(bootstrap: &[&str], active: &[&str], revision: u64) -> ToolExposureProjection {
+        ToolExposureProjection {
+            catalog_revision: 7,
+            exposure_revision: revision,
+            bootstrap_ids: bootstrap.iter().map(|id| (*id).to_string()).collect(),
+            active_ids: active.iter().map(|id| (*id).to_string()).collect(),
+            deferred_ids: Vec::new(),
+            fallback_full: false,
+            reason: "test".to_string(),
+            schema_tokens: 0,
+        }
     }
 
     #[test]
-    fn readonly_scope_keeps_inspection_and_rejects_mutation() {
-        assert!(tool_visible_in_scope(
-            "workspace_snapshot",
-            ToolContractScope::ReadOnly
-        ));
-        assert!(tool_visible_in_scope(
-            "grep_many",
-            ToolContractScope::ReadOnly
-        ));
-        assert!(!tool_visible_in_scope(
-            "apply_patch",
-            ToolContractScope::ReadOnly
-        ));
-        assert!(!tool_visible_in_scope(
-            "shell_exec",
-            ToolContractScope::ReadOnly
-        ));
+    fn unconfigured_client_exposes_no_tool_schema() {
+        let tools = vec![tool("tool_search"), tool("read_file")];
+        assert!(tool_definitions_for_exposure(&tools, None).is_empty());
     }
 
     #[test]
-    fn full_scope_keeps_every_registered_contract() {
-        assert!(tool_visible_in_scope(
-            "apply_patch",
-            ToolContractScope::Full
-        ));
-        assert!(tool_visible_in_scope(
-            "custom_domain_tool",
-            ToolContractScope::Full
-        ));
+    fn explicit_projection_selects_bootstrap_and_active_ids_only() {
+        let tools = vec![tool("tool_search"), tool("read_file"), tool("write_file")];
+        let projection = exposure(&["tool_search"], &["read_file"], 3);
+        let visible = tool_definitions_for_exposure(&tools, Some(&projection))
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(visible, vec!["tool_search", "read_file"]);
+    }
+
+    #[test]
+    fn fallback_flag_does_not_bypass_explicit_ids() {
+        let tools = vec![tool("tool_search"), tool("dangerous_tool")];
+        let mut projection = exposure(&["tool_search"], &[], 1);
+        projection.fallback_full = true;
+        let visible = tool_definitions_for_exposure(&tools, Some(&projection));
+
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].name, "tool_search");
     }
 
     #[test]

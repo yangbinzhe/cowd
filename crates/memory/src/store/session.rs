@@ -17,9 +17,9 @@ use chrono::{DateTime, Utc};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::types::Value;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, TransactionBehavior};
 
-use crate::{error::MemoryError, store::Result};
+use crate::{error::MemoryError, runtime_event::RUNTIME_EVENT_TYPE, store::Result};
 
 // ---------------------------------------------------------------------------
 // Sentinel for in-memory databases (tests only)
@@ -216,6 +216,11 @@ fn init_schema(conn: &Connection) -> Result<()> {
         conn.execute_batch(stmt).map_err(sql_err)?;
     }
 
+    if let Err(error) = ensure_session_event_sequence_constraint(conn) {
+        let _ = conn.execute_batch("ROLLBACK;");
+        return Err(error);
+    }
+
     ensure_messages_schema(conn)?;
 
     let existing_session_columns = {
@@ -302,6 +307,30 @@ fn init_schema(conn: &Connection) -> Result<()> {
     .map_err(sql_err)?;
 
     conn.execute_batch("COMMIT;").map_err(sql_err)?;
+    Ok(())
+}
+
+fn ensure_session_event_sequence_constraint(conn: &Connection) -> Result<()> {
+    let duplicate_groups: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM (\
+                 SELECT session_id, sequence FROM session_events \
+                 GROUP BY session_id, sequence HAVING COUNT(*) > 1\
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sql_err)?;
+    if duplicate_groups > 0 {
+        return Err(MemoryError::Store(format!(
+            "session_events contains {duplicate_groups} duplicate (session_id, sequence) groups; refusing to create the durable sequence constraint"
+        )));
+    }
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_session_events_session_sequence \
+         ON session_events(session_id, sequence)",
+    )
+    .map_err(sql_err)?;
     Ok(())
 }
 
@@ -1408,16 +1437,80 @@ impl SqliteSessionStore {
         Ok(())
     }
 
-    /// Append a context envelope event only if this envelope id is not already present.
-    ///
-    /// Returns `true` when a row was inserted and `false` when an existing
-    /// `ContextEnvelope` row with the same `envelope.id` already exists.
-    pub fn append_context_envelope_event_if_absent(&self, event: &SessionEvent) -> Result<bool> {
-        if event.event_type != "ContextEnvelope" {
-            self.append_event(event)?;
-            return Ok(true);
+    /// Allocate the next session-local sequence and append one event in the
+    /// same SQLite transaction. The input sequence is treated as a placeholder.
+    pub fn append_event_allocating_sequence(&self, event: &SessionEvent) -> Result<SessionEvent> {
+        let mut appended = self.append_events_allocating_sequence(std::slice::from_ref(event))?;
+        appended
+            .pop()
+            .ok_or_else(|| MemoryError::Store("event allocation returned no row".to_string()))
+    }
+
+    /// Allocate contiguous sequences and append a same-session event batch in
+    /// one `BEGIN IMMEDIATE` transaction.
+    pub fn append_events_allocating_sequence(
+        &self,
+        events: &[SessionEvent],
+    ) -> Result<Vec<SessionEvent>> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        let session_id = events[0].session_id.as_str();
+        if session_id.trim().is_empty() || events.iter().any(|event| event.session_id != session_id)
+        {
+            return Err(MemoryError::Store(
+                "atomic session event batch must contain one non-empty session_id".to_string(),
+            ));
         }
 
+        let mut conn = self.conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_err)?;
+        let first_sequence: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(sequence) + 1, 0) FROM session_events WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .map_err(sql_err)?;
+
+        let mut appended = Vec::with_capacity(events.len());
+        for (offset, event) in events.iter().enumerate() {
+            let sequence = first_sequence
+                .checked_add(offset as i64)
+                .ok_or_else(|| MemoryError::Store("session event sequence overflow".to_string()))?;
+            let event_json = event_json_with_allocated_sequence(event, sequence as usize)?;
+            tx.execute(
+                r"INSERT INTO session_events
+                   (session_id, event_type, event_json, sequence, created_at_ms)
+                  VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    event.session_id,
+                    event.event_type,
+                    event_json,
+                    sequence,
+                    event.created_at_ms as i64,
+                ],
+            )
+            .map_err(sql_err)?;
+            let mut stored = event.clone();
+            stored.sequence = sequence as usize;
+            stored.event_json = event_json_with_allocated_sequence(event, stored.sequence)?;
+            appended.push(stored);
+        }
+        tx.commit().map_err(sql_err)?;
+        Ok(appended)
+    }
+
+    /// Atomically de-duplicate a context envelope and allocate its sequence.
+    pub fn append_context_envelope_event_if_absent_allocating_sequence(
+        &self,
+        event: &SessionEvent,
+    ) -> Result<Option<SessionEvent>> {
+        if event.event_type != "ContextEnvelope" {
+            return self.append_event_allocating_sequence(event).map(Some);
+        }
         let envelope_id = serde_json::from_str::<serde_json::Value>(&event.event_json)
             .ok()
             .and_then(|payload| {
@@ -1426,29 +1519,41 @@ impl SqliteSessionStore {
                     .or_else(|| payload.get("envelope_id"))
                     .and_then(|value| value.as_str())
                     .map(str::to_string)
-            });
+            })
+            .ok_or_else(|| {
+                MemoryError::Store(
+                    "ContextEnvelope append requires envelope.id or envelope_id".to_string(),
+                )
+            })?;
 
-        let Some(envelope_id) = envelope_id else {
-            self.append_event(event)?;
-            return Ok(true);
-        };
-
-        let conn = self.conn()?;
-        let exists: i64 = conn
+        let mut conn = self.conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_err)?;
+        let exists: i64 = tx
             .query_row(
-                r"SELECT COUNT(*)
-                  FROM session_events
+                r"SELECT COUNT(*) FROM session_events
                   WHERE event_type = 'ContextEnvelope'
-                    AND json_extract(event_json, '$.envelope.id') = ?1",
+                    AND COALESCE(
+                        json_extract(event_json, '$.envelope.id'),
+                        json_extract(event_json, '$.envelope_id')
+                    ) = ?1",
                 params![envelope_id],
                 |row| row.get(0),
             )
             .map_err(sql_err)?;
         if exists > 0 {
-            return Ok(false);
+            tx.commit().map_err(sql_err)?;
+            return Ok(None);
         }
-
-        conn.execute(
+        let sequence: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(sequence) + 1, 0) FROM session_events WHERE session_id = ?1",
+                params![event.session_id],
+                |row| row.get(0),
+            )
+            .map_err(sql_err)?;
+        tx.execute(
             r"INSERT INTO session_events
                (session_id, event_type, event_json, sequence, created_at_ms)
               VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -1456,12 +1561,24 @@ impl SqliteSessionStore {
                 event.session_id,
                 event.event_type,
                 event.event_json,
-                event.sequence as i64,
+                sequence,
                 event.created_at_ms as i64,
             ],
         )
         .map_err(sql_err)?;
-        Ok(true)
+        tx.commit().map_err(sql_err)?;
+        let mut stored = event.clone();
+        stored.sequence = sequence as usize;
+        Ok(Some(stored))
+    }
+
+    /// Append a context envelope event only if this envelope id is not already present.
+    ///
+    /// Returns `true` when a row was inserted and `false` when an existing
+    /// `ContextEnvelope` row with the same `envelope.id` already exists.
+    pub fn append_context_envelope_event_if_absent(&self, event: &SessionEvent) -> Result<bool> {
+        self.append_context_envelope_event_if_absent_allocating_sequence(event)
+            .map(|stored| stored.is_some())
     }
 
     /// Retrieve events for a session starting from `from_seq` (inclusive).
@@ -1756,6 +1873,24 @@ impl SqliteSessionStore {
         .map_err(sql_err)?;
         Ok(())
     }
+}
+
+fn event_json_with_allocated_sequence(event: &SessionEvent, sequence: usize) -> Result<String> {
+    if event.event_type != RUNTIME_EVENT_TYPE {
+        return Ok(event.event_json.clone());
+    }
+    let mut payload =
+        serde_json::from_str::<serde_json::Value>(&event.event_json).map_err(|error| {
+            MemoryError::Store(format!(
+                "runtime event JSON must be valid before sequence allocation: {error}"
+            ))
+        })?;
+    let object = payload
+        .as_object_mut()
+        .ok_or_else(|| MemoryError::Store("runtime event JSON must be an object".to_string()))?;
+    object.insert("sequence".to_string(), serde_json::json!(sequence));
+    serde_json::to_string(&payload)
+        .map_err(|error| MemoryError::Store(format!("runtime event JSON encode failed: {error}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -2145,7 +2280,7 @@ mod tests {
             .get_events_by_type_limited("s-context-once", "ContextEnvelope", 0, 10)
             .unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].sequence, 1);
+        assert_eq!(events[0].sequence, 0);
         assert!(events[0].event_json.contains("first"));
     }
 
@@ -2231,6 +2366,113 @@ mod tests {
     }
 
     #[test]
+    fn allocating_sequence_appends_contiguous_batch_atomically() {
+        let (store, _dir) = make_store();
+        store
+            .create_session(&make_record("s-atomic-batch"))
+            .unwrap();
+        let events = ["first", "second", "third"].map(|event_type| SessionEvent {
+            session_id: "s-atomic-batch".to_string(),
+            event_type: event_type.to_string(),
+            event_json: "{}".to_string(),
+            sequence: usize::MAX,
+            created_at_ms: 1,
+        });
+
+        let appended = store
+            .append_events_allocating_sequence(&events)
+            .expect("atomic batch should append");
+        assert_eq!(
+            appended
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(store.get_events("s-atomic-batch", 0).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn allocating_sequence_is_atomic_across_parallel_sqlite_connections() {
+        let (store, _dir) = make_store();
+        store
+            .create_session(&make_record("s-parallel-sqlite"))
+            .unwrap();
+        let store = std::sync::Arc::new(store);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(100));
+        let mut workers = Vec::new();
+        for index in 0..100usize {
+            let store = std::sync::Arc::clone(&store);
+            let barrier = std::sync::Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                store
+                    .append_event_allocating_sequence(&SessionEvent {
+                        session_id: "s-parallel-sqlite".to_string(),
+                        event_type: "parallel".to_string(),
+                        event_json: format!(r#"{{"index":{index}}}"#),
+                        sequence: usize::MAX,
+                        created_at_ms: index as u64,
+                    })
+                    .unwrap()
+                    .sequence
+            }));
+        }
+        let mut sequences = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        sequences.sort_unstable();
+        assert_eq!(sequences, (0..100).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn session_event_sequence_constraint_rejects_duplicate() {
+        let (store, _dir) = make_store();
+        store
+            .create_session(&make_record("s-unique-event"))
+            .unwrap();
+        let event = SessionEvent {
+            session_id: "s-unique-event".to_string(),
+            event_type: "first".to_string(),
+            event_json: "{}".to_string(),
+            sequence: 0,
+            created_at_ms: 1,
+        };
+        store.append_event(&event).unwrap();
+        let mut duplicate = event;
+        duplicate.event_type = "duplicate".to_string();
+        assert!(store.append_event(&duplicate).is_err());
+        assert_eq!(store.get_events("s-unique-event", 0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn allocating_batch_rolls_back_when_runtime_envelope_is_invalid() {
+        let (store, _dir) = make_store();
+        store
+            .create_session(&make_record("s-batch-rollback"))
+            .unwrap();
+        let events = vec![
+            SessionEvent {
+                session_id: "s-batch-rollback".to_string(),
+                event_type: "normal".to_string(),
+                event_json: "{}".to_string(),
+                sequence: usize::MAX,
+                created_at_ms: 1,
+            },
+            SessionEvent {
+                session_id: "s-batch-rollback".to_string(),
+                event_type: RUNTIME_EVENT_TYPE.to_string(),
+                event_json: "not-json".to_string(),
+                sequence: usize::MAX,
+                created_at_ms: 2,
+            },
+        ];
+        assert!(store.append_events_allocating_sequence(&events).is_err());
+        assert!(store.get_events("s-batch-rollback", 0).unwrap().is_empty());
+    }
+
+    #[test]
     fn event_page_query_uses_session_sequence_index() {
         let (store, _dir) = make_store();
         store.create_session(&make_record("s-event-index")).unwrap();
@@ -2252,7 +2494,8 @@ mod tests {
             .collect();
         let plan_text = plan.join(" | ");
         assert!(
-            plan_text.contains("idx_session_events_session_seq"),
+            plan_text.contains("idx_session_events_session_seq")
+                || plan_text.contains("uq_session_events_session_sequence"),
             "expected event sequence index in query plan, got: {plan_text}"
         );
     }
@@ -2505,6 +2748,56 @@ mod tests {
             })
             .unwrap();
         assert_eq!(store.get_message_count("legacy").unwrap(), 2);
+    }
+
+    #[test]
+    fn open_rejects_legacy_duplicate_event_sequences_without_silent_rewrite() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("duplicate-events.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE sessions (
+                session_id TEXT PRIMARY KEY,
+                platform TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                user_id TEXT,
+                model TEXT,
+                created_at TEXT NOT NULL,
+                last_activity TEXT NOT NULL,
+                message_count INTEGER NOT NULL DEFAULT 0,
+                reset_policy TEXT NOT NULL,
+                metadata_json TEXT,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                estimated_cost_usd REAL NOT NULL DEFAULT 0.0,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at_ms INTEGER NOT NULL DEFAULT 0,
+                updated_at_ms INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE session_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                event_json TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                created_at_ms INTEGER NOT NULL
+            );
+            INSERT INTO sessions(session_id, platform, chat_id, created_at, last_activity, reset_policy)
+            VALUES ('duplicate-session', 'test', 'chat', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', 'None');
+            INSERT INTO session_events(session_id, event_type, event_json, sequence, created_at_ms)
+            VALUES ('duplicate-session', 'one', '{}', 0, 1),
+                   ('duplicate-session', 'two', '{}', 0, 2);
+            "#,
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = match SqliteSessionStore::open(&path) {
+            Ok(_) => panic!("duplicate event sequences must block migration"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("duplicate (session_id, sequence)"));
     }
 
     #[test]
