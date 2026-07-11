@@ -1,0 +1,1285 @@
+use std::collections::BTreeMap;
+use std::sync::{Arc, RwLock, Weak};
+
+use async_trait::async_trait;
+use harness_contract::agent::{
+    AgentCommand, AgentCommandReceipt, AgentCommandRejectReason, AgentCommandRequest, AgentInput,
+    AgentLifecycleEvent, AgentReturnPacket, AgentStatus, AgentTaskPacket, AgentTerminalStatus,
+};
+use serde::{Deserialize, Serialize};
+
+use crate::execution_core::graph::executors::{AgentTaskBackend, AgentTaskBackendResolver};
+use crate::runtime_event_store::{
+    AppendTransactionRequest, ExpectedStreamRevision, RuntimeEventInput, RuntimeEventRef,
+    RuntimeEventScope,
+};
+use crate::{ProviderRegistry, RuntimeEventStore, RuntimeServices};
+
+use crate::agent_catalog::AgentCatalog;
+use crate::agent_model_selector::{AgentModelSelection, AgentModelSelector};
+use crate::agent_result_validator::validate_agent_return;
+use crate::agent_run_handle::{AgentBackendCapabilities, AgentBackendKind, AgentRunHandle};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRunSnapshot {
+    pub run_id: String,
+    pub agent_id: String,
+    pub task_id: String,
+    pub session_id: String,
+    pub graph_id: String,
+    pub node_id: String,
+    pub attempt: u32,
+    pub expected_graph_revision: u64,
+    pub backend: AgentBackendKind,
+    pub status: AgentStatus,
+    pub revision: u64,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub started_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub failure: Option<String>,
+}
+
+/// A verified Agent record exported by the pre-V4 upgrade coordinator.
+///
+/// Legacy files alone are intentionally not accepted: they did not carry the
+/// complete workspace/session/graph/node binding required by the canonical
+/// runtime. The coordinator must provide that binding and, for a terminal
+/// record, its canonical result before this importer will write lifecycle
+/// truth.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyAgentStateRecord {
+    pub source_ref: String,
+    pub snapshot: AgentRunSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub returned: Option<AgentReturnPacket>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyAgentImportReport {
+    pub source_id: String,
+    pub duplicate: bool,
+    pub imported_agent_ids: Vec<String>,
+    pub blocked_agent_ids: Vec<String>,
+}
+
+impl AgentRunSnapshot {
+    #[must_use]
+    pub fn handle(&self) -> AgentRunHandle {
+        AgentRunHandle {
+            run_id: self.run_id.clone(),
+            agent_id: self.agent_id.clone(),
+            backend: self.backend,
+            revision: self.revision,
+            status: self.status,
+        }
+    }
+}
+
+#[async_trait]
+pub trait AgentRuntimeBackend: Send + Sync {
+    fn kind(&self) -> AgentBackendKind;
+    fn capabilities(&self) -> AgentBackendCapabilities;
+    async fn execute(
+        &self,
+        packet: AgentTaskPacket,
+        selection: AgentModelSelection,
+    ) -> Result<AgentReturnPacket, String>;
+    async fn command(
+        &self,
+        _handle: &AgentRunHandle,
+        _request: &AgentCommandRequest,
+    ) -> Result<(), AgentCommandRejectReason> {
+        Err(AgentCommandRejectReason::UnsupportedByBackend)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedAgentEvent {
+    snapshot: AgentRunSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receipt: Option<AgentCommandReceipt>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    returned: Option<AgentReturnPacket>,
+}
+
+#[derive(Default)]
+struct AgentRunRecord {
+    snapshot: Option<AgentRunSnapshot>,
+    receipts: BTreeMap<String, AgentCommandReceipt>,
+    inputs: Vec<AgentInput>,
+    returned: Option<AgentReturnPacket>,
+}
+
+/// Single workspace-scoped owner of agent lifecycle state. The event store is
+/// canonical; the in-memory map is only a replayable command/cache projection.
+pub struct AgentRuntime {
+    event_store: Arc<RuntimeEventStore>,
+    selector: AgentModelSelector,
+    catalog: Arc<AgentCatalog>,
+    records: RwLock<BTreeMap<String, AgentRunRecord>>,
+    backends: RwLock<BTreeMap<AgentBackendKind, Arc<dyn AgentRuntimeBackend>>>,
+    services: RwLock<Option<Weak<RuntimeServices>>>,
+}
+
+impl AgentRuntime {
+    #[must_use]
+    pub fn new(
+        event_store: Arc<RuntimeEventStore>,
+        provider_registry: Arc<ProviderRegistry>,
+    ) -> Self {
+        let runtime = Self {
+            event_store,
+            selector: AgentModelSelector::new(provider_registry),
+            catalog: Arc::new(AgentCatalog::new()),
+            records: RwLock::new(BTreeMap::new()),
+            backends: RwLock::new(BTreeMap::new()),
+            services: RwLock::new(None),
+        };
+        runtime.restore_projection();
+        runtime
+    }
+
+    pub fn bind_services(&self, services: Arc<RuntimeServices>) {
+        *self
+            .services
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(&services));
+    }
+
+    #[must_use]
+    pub fn services(&self) -> Option<Arc<RuntimeServices>> {
+        self.services
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(Weak::upgrade)
+    }
+
+    #[must_use]
+    pub fn catalog(&self) -> &Arc<AgentCatalog> {
+        &self.catalog
+    }
+
+    pub fn register_backend(&self, backend: Arc<dyn AgentRuntimeBackend>) {
+        self.backends
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(backend.kind(), backend);
+    }
+
+    #[must_use]
+    pub fn list(&self) -> Vec<AgentRunSnapshot> {
+        let mut runs = self
+            .records
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .filter_map(|record| record.snapshot.clone())
+            .collect::<Vec<_>>();
+        runs.sort_by(|left, right| {
+            left.updated_at_ms
+                .cmp(&right.updated_at_ms)
+                .then_with(|| left.agent_id.cmp(&right.agent_id))
+        });
+        runs
+    }
+
+    #[must_use]
+    pub fn get(&self, agent_id: &str) -> Option<AgentRunSnapshot> {
+        self.records
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(agent_id)
+            .and_then(|record| record.snapshot.clone())
+    }
+
+    /// Restore a verified durable run projection during Runtime recovery.
+    ///
+    /// This is intentionally a projection recovery API, not an execution API:
+    /// callers cannot attach a backend or mutate graph state through it.
+    pub fn restore_verified_run(&self, snapshot: AgentRunSnapshot) -> Result<(), String> {
+        if [
+            snapshot.run_id.as_str(),
+            snapshot.agent_id.as_str(),
+            snapshot.task_id.as_str(),
+            snapshot.session_id.as_str(),
+            snapshot.graph_id.as_str(),
+            snapshot.node_id.as_str(),
+        ]
+        .iter()
+        .any(|value| value.trim().is_empty())
+        {
+            return Err("recovered AgentRuntime snapshot has an empty binding".into());
+        }
+        self.persist_snapshot(snapshot, "agent.recovered", "recovered", None, None)
+            .map(|_| ())
+    }
+
+    /// Convert replayed active runs without a reattached backend handle into
+    /// a durable blocked state. Restart recovery must never pretend a child
+    /// process or in-process turn is still controllable merely because its
+    /// last persisted event was `running`.
+    pub fn block_unrecoverable_replayed_runs(&self) -> Result<Vec<String>, String> {
+        let snapshots = self.list();
+        let mut blocked = Vec::new();
+        for mut snapshot in snapshots
+            .into_iter()
+            .filter(|snapshot| !snapshot.status.is_terminal())
+        {
+            snapshot.status = AgentStatus::Blocked;
+            snapshot.updated_at_ms = now_ms();
+            snapshot.failure = Some("backend handle is unavailable after runtime restart".into());
+            let agent_id = snapshot.agent_id.clone();
+            self.persist_snapshot(
+                snapshot,
+                "agent.blocked_recovery",
+                "backend handle is unavailable after runtime restart",
+                None,
+                None,
+            )?;
+            blocked.push(agent_id);
+        }
+        Ok(blocked)
+    }
+
+    /// Import a coordinator-verified legacy Agent snapshot set exactly once.
+    ///
+    /// This transaction owns both the import marker and every imported Agent
+    /// stream, so a crash cannot leave a marker without an Agent projection or
+    /// import only a subset of the supplied records. Active legacy records are
+    /// deliberately blocked because an old process/session handle cannot be
+    /// proved recoverable by a new runtime.
+    pub fn import_legacy_state_records(
+        &self,
+        source_id: impl Into<String>,
+        records: Vec<LegacyAgentStateRecord>,
+    ) -> Result<LegacyAgentImportReport, String> {
+        let source_id = source_id.into();
+        if source_id.trim().is_empty() {
+            return Err("legacy Agent import source_id must not be empty".into());
+        }
+        let marker_stream = legacy_import_stream_id(&source_id);
+        let existing_marker = self
+            .event_store
+            .list_stream(&marker_stream)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|event| event.kind == "agent.legacy_imported");
+        if let Some(marker) = existing_marker {
+            return Ok(LegacyAgentImportReport {
+                source_id,
+                duplicate: true,
+                imported_agent_ids: marker.payload["imported_agent_ids"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(ToString::to_string)
+                    .collect(),
+                blocked_agent_ids: marker.payload["blocked_agent_ids"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(ToString::to_string)
+                    .collect(),
+            });
+        }
+
+        let mut expected_streams = vec![ExpectedStreamRevision {
+            stream_id: marker_stream.clone(),
+            expected_revision: self
+                .event_store
+                .stream_revision(&marker_stream)
+                .map_err(|error| error.to_string())?,
+        }];
+        let mut events = Vec::with_capacity(records.len().saturating_add(1));
+        let mut imported = Vec::with_capacity(records.len());
+        let mut blocked = Vec::new();
+        let mut snapshots = Vec::with_capacity(records.len());
+        let mut seen_agents = std::collections::BTreeSet::new();
+
+        for record in records {
+            validate_legacy_record(&record)?;
+            if !seen_agents.insert(record.snapshot.agent_id.clone()) {
+                return Err(format!(
+                    "legacy Agent import contains duplicate agent_id {}",
+                    record.snapshot.agent_id
+                ));
+            }
+
+            let stream_id = agent_stream_id(&record.snapshot.agent_id);
+            let mut snapshot = record.snapshot;
+            if !snapshot.status.is_terminal() {
+                snapshot.status = AgentStatus::Blocked;
+                snapshot.failure =
+                    Some("legacy active backend handle is not recoverable by AgentRuntime".into());
+                blocked.push(snapshot.agent_id.clone());
+            }
+            snapshot.updated_at_ms = now_ms();
+            snapshot.revision = self
+                .event_store
+                .stream_revision(&stream_id)
+                .map_err(|error| error.to_string())?
+                .saturating_add(1);
+            expected_streams.push(ExpectedStreamRevision {
+                stream_id: stream_id.clone(),
+                expected_revision: snapshot.revision.saturating_sub(1),
+            });
+            let payload = PersistedAgentEvent {
+                snapshot: snapshot.clone(),
+                receipt: None,
+                returned: record.returned,
+            };
+            events.push(
+                RuntimeEventInput {
+                    stream_id,
+                    scope: RuntimeEventScope::Agent,
+                    kind: "agent.legacy_imported".into(),
+                    status: Some("legacy Agent state imported".into()),
+                    actor: Some("upgrade_coordinator".into()),
+                    refs: vec![
+                        RuntimeEventRef {
+                            kind: "run".into(),
+                            id: snapshot.run_id.clone(),
+                        },
+                        RuntimeEventRef {
+                            kind: "legacy_source".into(),
+                            id: record.source_ref,
+                        },
+                    ],
+                    payload: serde_json::to_value(payload).map_err(|error| error.to_string())?,
+                }
+                .into(),
+            );
+            imported.push(snapshot.agent_id.clone());
+            snapshots.push(snapshot);
+        }
+        events.push(
+            RuntimeEventInput {
+                stream_id: marker_stream.clone(),
+                scope: RuntimeEventScope::Recovery,
+                kind: "agent.legacy_imported".into(),
+                status: Some("legacy Agent import complete".into()),
+                actor: Some("upgrade_coordinator".into()),
+                refs: Vec::new(),
+                payload: serde_json::json!({
+                    "source_id": source_id.clone(),
+                    "imported_agent_ids": imported.clone(),
+                    "blocked_agent_ids": blocked.clone(),
+                }),
+            }
+            .into(),
+        );
+        self.event_store
+            .append_transaction(AppendTransactionRequest {
+                transaction_id: format!("legacy-agent-import:{source_id}"),
+                expected_streams,
+                events,
+            })
+            .map_err(|error| error.to_string())?;
+        self.restore_projection();
+        Ok(LegacyAgentImportReport {
+            source_id,
+            duplicate: false,
+            imported_agent_ids: imported,
+            blocked_agent_ids: blocked,
+        })
+    }
+
+    #[must_use]
+    pub fn events(&self, agent_id: &str) -> Vec<AgentLifecycleEvent> {
+        let stream_id = agent_stream_id(agent_id);
+        self.event_store
+            .list_stream(&stream_id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|event| {
+                let payload = serde_json::from_value::<PersistedAgentEvent>(event.payload).ok()?;
+                Some(AgentLifecycleEvent {
+                    event_id: event.event_id,
+                    agent_id: payload.snapshot.agent_id,
+                    revision: payload.snapshot.revision,
+                    status: payload.snapshot.status,
+                    kind: event.kind,
+                    message: event.status.unwrap_or_default(),
+                    created_at_ms: event.created_at_ms,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn execute_task(&self, packet: AgentTaskPacket) -> Result<AgentReturnPacket, String> {
+        if let Some(existing) = self.get(&packet.agent_id) {
+            if existing.run_id == packet.run_id && existing.status.is_terminal() {
+                return self
+                    .records
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&packet.agent_id)
+                    .and_then(|record| record.returned.clone())
+                    .ok_or_else(|| {
+                        "terminal AgentRuntime state lacks a canonical return packet".to_string()
+                    });
+            }
+            if existing.run_id != packet.run_id && !existing.status.is_terminal() {
+                return Err(format!(
+                    "agent {} already owns an active run",
+                    packet.agent_id
+                ));
+            }
+        }
+        let backend_kind = backend_from_packet(&packet);
+        let selection = match self.selector.select(nonempty(&packet.model_lease)) {
+            Ok(selection) => selection,
+            Err(error) => {
+                let failure = error.to_string();
+                let returned = blocked_return(&packet, failure.clone());
+                self.persist_snapshot(
+                    AgentRunSnapshot {
+                        run_id: packet.run_id.clone(),
+                        agent_id: packet.agent_id.clone(),
+                        task_id: packet.task_id.clone(),
+                        session_id: packet.session_id.clone(),
+                        graph_id: packet.graph_id.clone(),
+                        node_id: packet.node_id.clone(),
+                        attempt: packet.attempt,
+                        expected_graph_revision: packet.expected_graph_revision,
+                        backend: backend_kind,
+                        status: AgentStatus::Blocked,
+                        revision: 0,
+                        model: None,
+                        provider: None,
+                        started_at_ms: now_ms(),
+                        updated_at_ms: now_ms(),
+                        failure: Some(failure.clone()),
+                    },
+                    "agent.blocked",
+                    &failure,
+                    None,
+                    Some(returned.clone()),
+                )?;
+                return Ok(returned);
+            }
+        };
+        let snapshot = AgentRunSnapshot {
+            run_id: packet.run_id.clone(),
+            agent_id: packet.agent_id.clone(),
+            task_id: packet.task_id.clone(),
+            session_id: packet.session_id.clone(),
+            graph_id: packet.graph_id.clone(),
+            node_id: packet.node_id.clone(),
+            attempt: packet.attempt,
+            expected_graph_revision: packet.expected_graph_revision,
+            backend: backend_kind,
+            status: AgentStatus::Prepared,
+            revision: 0,
+            model: Some(selection.model.clone()),
+            provider: Some(selection.provider.clone()),
+            started_at_ms: now_ms(),
+            updated_at_ms: now_ms(),
+            failure: None,
+        };
+        self.persist_snapshot(snapshot, "agent.prepared", "prepared", None, None)?;
+        let mut running = self
+            .get(&packet.agent_id)
+            .expect("prepared agent projection");
+        running.status = AgentStatus::Running;
+        running.updated_at_ms = now_ms();
+        self.persist_snapshot(running.clone(), "agent.running", "running", None, None)?;
+
+        let backend = self
+            .backends
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&backend_kind)
+            .cloned();
+        let mut returned = match backend {
+            Some(backend) => match backend.execute(packet.clone(), selection).await {
+                Ok(returned) => returned,
+                Err(error) => failed_return(&packet, error),
+            },
+            None => blocked_return(
+                &packet,
+                format!("agent backend {backend_kind:?} is not installed for this RuntimeServices instance"),
+            ),
+        };
+        // A cancel/shutdown command is durable lifecycle truth. Backends may
+        // observe the interruption as a transport/process error, but they may
+        // not overwrite a committed cancellation with `failed` or `completed`.
+        if self
+            .get(&packet.agent_id)
+            .is_some_and(|snapshot| snapshot.status == AgentStatus::Cancelled)
+        {
+            returned.status = AgentTerminalStatus::Cancelled;
+            returned.outcome.clear();
+            returned.failure = Some("agent cancelled by command".into());
+        }
+        validate_agent_return(&packet, &returned).map_err(|error| error.to_string())?;
+        let mut terminal = self
+            .get(&packet.agent_id)
+            .expect("running agent projection");
+        terminal.status = terminal_status(returned.status);
+        terminal.updated_at_ms = now_ms();
+        terminal.failure = returned.failure.clone();
+        self.persist_snapshot(
+            terminal,
+            "agent.terminal",
+            "terminal",
+            None,
+            Some(returned.clone()),
+        )?;
+        Ok(returned)
+    }
+
+    pub async fn command(&self, request: AgentCommandRequest) -> AgentCommandReceipt {
+        if let Some(receipt) = self
+            .records
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&request.agent_id)
+            .and_then(|record| record.receipts.get(&request.command_id).cloned())
+        {
+            return receipt;
+        }
+        let Some(snapshot) = self.get(&request.agent_id) else {
+            return self.reject_command(
+                request,
+                AgentStatus::Blocked,
+                AgentCommandRejectReason::NotFound,
+                "agent not found",
+            );
+        };
+        if snapshot.revision != request.expected_revision {
+            return self.reject_command(
+                request,
+                snapshot.status,
+                AgentCommandRejectReason::StaleRevision,
+                "agent revision does not match",
+            );
+        }
+        if snapshot.status.is_terminal() {
+            return self.reject_command(
+                request,
+                snapshot.status,
+                AgentCommandRejectReason::Terminal,
+                "agent is terminal",
+            );
+        }
+        if matches!(request.command, AgentCommand::SendInput) && request.input.is_none() {
+            return self.reject_command(
+                request,
+                snapshot.status,
+                AgentCommandRejectReason::InvalidInput,
+                "send_input requires input",
+            );
+        }
+        let backend = self
+            .backends
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&snapshot.backend)
+            .cloned();
+        let Some(backend) = backend else {
+            return self.reject_command(
+                request,
+                snapshot.status,
+                AgentCommandRejectReason::UnsupportedByBackend,
+                "agent backend is unavailable",
+            );
+        };
+        if let Err(reason) = backend.command(&snapshot.handle(), &request).await {
+            return self.reject_command(
+                request,
+                snapshot.status,
+                reason,
+                "agent backend rejected command",
+            );
+        }
+        let mut updated = snapshot;
+        if let Some(input) = request.input.clone() {
+            self.records
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(updated.agent_id.clone())
+                .or_default()
+                .inputs
+                .push(input);
+        }
+        updated.status = match request.command {
+            AgentCommand::Pause => AgentStatus::Paused,
+            AgentCommand::Resume => AgentStatus::Running,
+            AgentCommand::Cancel | AgentCommand::Shutdown => AgentStatus::Cancelled,
+            AgentCommand::SendInput | AgentCommand::Interrupt => updated.status,
+        };
+        updated.updated_at_ms = now_ms();
+        let receipt = AgentCommandReceipt {
+            command_id: request.command_id,
+            agent_id: updated.agent_id.clone(),
+            accepted_revision: updated.revision.saturating_add(1),
+            status: updated.status,
+            accepted: true,
+            reject_reason: None,
+            message: "command accepted".into(),
+        };
+        self.persist_snapshot(
+            updated,
+            "agent.command",
+            "command accepted",
+            Some(receipt.clone()),
+            None,
+        )
+        .unwrap_or_else(|error| AgentCommandReceipt {
+            accepted: false,
+            reject_reason: Some(AgentCommandRejectReason::InvalidInput),
+            message: error,
+            ..receipt
+        })
+    }
+
+    fn reject_command(
+        &self,
+        request: AgentCommandRequest,
+        status: AgentStatus,
+        reason: AgentCommandRejectReason,
+        message: &str,
+    ) -> AgentCommandReceipt {
+        let receipt = AgentCommandReceipt {
+            command_id: request.command_id,
+            agent_id: request.agent_id.clone(),
+            accepted_revision: request.expected_revision,
+            status,
+            accepted: false,
+            reject_reason: Some(reason),
+            message: message.into(),
+        };
+        if let Some(snapshot) = self.get(&request.agent_id) {
+            let _ = self.persist_snapshot(
+                snapshot,
+                "agent.command_rejected",
+                message,
+                Some(receipt.clone()),
+                None,
+            );
+        }
+        receipt
+    }
+
+    fn persist_snapshot(
+        &self,
+        mut snapshot: AgentRunSnapshot,
+        kind: &str,
+        message: &str,
+        receipt: Option<AgentCommandReceipt>,
+        returned: Option<AgentReturnPacket>,
+    ) -> Result<AgentCommandReceipt, String> {
+        let stream_id = agent_stream_id(&snapshot.agent_id);
+        snapshot.revision = self
+            .event_store
+            .stream_revision(&stream_id)
+            .map_err(|error| error.to_string())?
+            .saturating_add(1);
+        let payload = PersistedAgentEvent {
+            snapshot: snapshot.clone(),
+            receipt: receipt.clone(),
+            returned: returned.clone(),
+        };
+        self.event_store
+            .append(RuntimeEventInput {
+                stream_id,
+                scope: RuntimeEventScope::Agent,
+                kind: kind.into(),
+                status: Some(message.into()),
+                actor: Some("agent_runtime".into()),
+                refs: vec![
+                    RuntimeEventRef {
+                        kind: "run".into(),
+                        id: snapshot.run_id.clone(),
+                    },
+                    RuntimeEventRef {
+                        kind: "graph".into(),
+                        id: snapshot.graph_id.clone(),
+                    },
+                    RuntimeEventRef {
+                        kind: "node".into(),
+                        id: snapshot.node_id.clone(),
+                    },
+                ],
+                payload: serde_json::to_value(payload).map_err(|error| error.to_string())?,
+            })
+            .map_err(|error| error.to_string())?;
+        let mut records = self
+            .records
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let record = records.entry(snapshot.agent_id.clone()).or_default();
+        record.snapshot = Some(snapshot.clone());
+        if returned.is_some() {
+            record.returned = returned;
+        }
+        if let Some(receipt) = receipt {
+            record
+                .receipts
+                .insert(receipt.command_id.clone(), receipt.clone());
+            return Ok(receipt);
+        }
+        Ok(AgentCommandReceipt {
+            command_id: format!("event:{}:{}", snapshot.agent_id, snapshot.revision),
+            agent_id: snapshot.agent_id,
+            accepted_revision: snapshot.revision,
+            status: snapshot.status,
+            accepted: true,
+            reject_reason: None,
+            message: message.into(),
+        })
+    }
+
+    fn restore_projection(&self) {
+        let Ok(stream_ids) = self
+            .event_store
+            .stream_ids_for_scope(RuntimeEventScope::Agent)
+        else {
+            return;
+        };
+        let mut records = self
+            .records
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for stream_id in stream_ids {
+            for event in self.event_store.list_stream(&stream_id).unwrap_or_default() {
+                let Ok(payload) = serde_json::from_value::<PersistedAgentEvent>(event.payload)
+                else {
+                    continue;
+                };
+                let record = records
+                    .entry(payload.snapshot.agent_id.clone())
+                    .or_default();
+                record.snapshot = Some(payload.snapshot);
+                if let Some(receipt) = payload.receipt {
+                    record.receipts.insert(receipt.command_id.clone(), receipt);
+                }
+                if payload.returned.is_some() {
+                    record.returned = payload.returned;
+                }
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl AgentTaskBackend for AgentRuntime {
+    async fn execute(&self, packet: AgentTaskPacket) -> Result<AgentReturnPacket, String> {
+        self.execute_task(packet).await
+    }
+}
+
+pub struct AgentRuntimeResolver {
+    runtime: Arc<AgentRuntime>,
+}
+
+impl AgentRuntimeResolver {
+    #[must_use]
+    pub fn new(runtime: Arc<AgentRuntime>) -> Self {
+        Self { runtime }
+    }
+}
+
+impl AgentTaskBackendResolver for AgentRuntimeResolver {
+    fn resolve(&self, _packet: &AgentTaskPacket) -> Option<Arc<dyn AgentTaskBackend>> {
+        Some(Arc::clone(&self.runtime) as Arc<dyn AgentTaskBackend>)
+    }
+}
+
+fn agent_stream_id(agent_id: &str) -> String {
+    format!("agent:{agent_id}")
+}
+
+fn legacy_import_stream_id(source_id: &str) -> String {
+    format!("agent-migration:{source_id}")
+}
+
+fn validate_legacy_record(record: &LegacyAgentStateRecord) -> Result<(), String> {
+    let snapshot = &record.snapshot;
+    if record.source_ref.trim().is_empty()
+        || [
+            snapshot.run_id.as_str(),
+            snapshot.agent_id.as_str(),
+            snapshot.task_id.as_str(),
+            snapshot.session_id.as_str(),
+            snapshot.graph_id.as_str(),
+            snapshot.node_id.as_str(),
+        ]
+        .iter()
+        .any(|value| value.trim().is_empty())
+    {
+        return Err("legacy Agent record lacks a verified canonical binding".into());
+    }
+    if snapshot.status.is_terminal() {
+        let Some(returned) = record.returned.as_ref() else {
+            return Err(format!(
+                "legacy terminal Agent {} lacks its canonical return packet",
+                snapshot.agent_id
+            ));
+        };
+        if returned.run_id != snapshot.run_id
+            || returned.agent_id != snapshot.agent_id
+            || returned.task_id != snapshot.task_id
+            || returned.session_id != snapshot.session_id
+            || returned.graph_id != snapshot.graph_id
+            || returned.node_id != snapshot.node_id
+            || returned.attempt != snapshot.attempt
+            || returned.expected_graph_revision != snapshot.expected_graph_revision
+            || terminal_status(returned.status) != snapshot.status
+        {
+            return Err(format!(
+                "legacy terminal Agent {} return binding does not match its snapshot",
+                snapshot.agent_id
+            ));
+        }
+    } else if record.returned.is_some() {
+        return Err(format!(
+            "legacy active Agent {} must not carry a terminal return packet",
+            snapshot.agent_id
+        ));
+    }
+    Ok(())
+}
+
+fn backend_from_packet(packet: &AgentTaskPacket) -> AgentBackendKind {
+    packet
+        .constraints
+        .iter()
+        .any(|constraint| constraint == "backend:process_jsonl")
+        .then_some(AgentBackendKind::ProcessJsonl)
+        .unwrap_or(AgentBackendKind::InProcess)
+}
+
+fn terminal_status(status: AgentTerminalStatus) -> AgentStatus {
+    match status {
+        AgentTerminalStatus::Completed => AgentStatus::Completed,
+        AgentTerminalStatus::Failed => AgentStatus::Failed,
+        AgentTerminalStatus::Cancelled => AgentStatus::Cancelled,
+        AgentTerminalStatus::Blocked => AgentStatus::Blocked,
+    }
+}
+
+fn nonempty(value: &str) -> Option<&str> {
+    (!value.trim().is_empty() && value != "default" && value != "auto").then_some(value)
+}
+
+fn blocked_return(packet: &AgentTaskPacket, failure: String) -> AgentReturnPacket {
+    return_packet(
+        packet,
+        AgentTerminalStatus::Blocked,
+        String::new(),
+        Some(failure),
+    )
+}
+
+fn failed_return(packet: &AgentTaskPacket, failure: String) -> AgentReturnPacket {
+    return_packet(
+        packet,
+        AgentTerminalStatus::Failed,
+        String::new(),
+        Some(failure),
+    )
+}
+
+fn return_packet(
+    packet: &AgentTaskPacket,
+    status: AgentTerminalStatus,
+    outcome: String,
+    failure: Option<String>,
+) -> AgentReturnPacket {
+    AgentReturnPacket {
+        run_id: packet.run_id.clone(),
+        agent_id: packet.agent_id.clone(),
+        task_id: packet.task_id.clone(),
+        session_id: packet.session_id.clone(),
+        mission_id: packet.mission_id.clone(),
+        team_id: packet.team_id.clone(),
+        graph_id: packet.graph_id.clone(),
+        node_id: packet.node_id.clone(),
+        attempt: packet.attempt,
+        expected_graph_revision: packet.expected_graph_revision,
+        status,
+        outcome,
+        acceptance: Vec::new(),
+        evidence_refs: Vec::new(),
+        changes: Vec::new(),
+        conflicts: Vec::new(),
+        unresolved: Vec::new(),
+        input_tokens: 0,
+        output_tokens: 0,
+        model: String::new(),
+        provider: String::new(),
+        tool_calls: 0,
+        failure,
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::config::{ProviderConfig, ProvidersConfig};
+    use harness_contract::context::ContextBudgetLeaseRef;
+
+    struct CompletedBackend;
+
+    #[async_trait]
+    impl AgentRuntimeBackend for CompletedBackend {
+        fn kind(&self) -> AgentBackendKind {
+            AgentBackendKind::InProcess
+        }
+
+        fn capabilities(&self) -> AgentBackendCapabilities {
+            AgentBackendCapabilities::in_process()
+        }
+
+        async fn execute(
+            &self,
+            packet: AgentTaskPacket,
+            selection: AgentModelSelection,
+        ) -> Result<AgentReturnPacket, String> {
+            Ok(AgentReturnPacket {
+                run_id: packet.run_id,
+                agent_id: packet.agent_id,
+                task_id: packet.task_id,
+                session_id: packet.session_id,
+                mission_id: packet.mission_id,
+                team_id: packet.team_id,
+                graph_id: packet.graph_id,
+                node_id: packet.node_id,
+                attempt: packet.attempt,
+                expected_graph_revision: packet.expected_graph_revision,
+                status: AgentTerminalStatus::Completed,
+                outcome: "completed".into(),
+                acceptance: vec!["verified".into()],
+                evidence_refs: Vec::new(),
+                changes: Vec::new(),
+                conflicts: Vec::new(),
+                unresolved: Vec::new(),
+                input_tokens: 3,
+                output_tokens: 2,
+                model: selection.model,
+                provider: selection.provider,
+                tool_calls: 0,
+                failure: None,
+            })
+        }
+
+        async fn command(
+            &self,
+            _handle: &AgentRunHandle,
+            _request: &AgentCommandRequest,
+        ) -> Result<(), AgentCommandRejectReason> {
+            Ok(())
+        }
+    }
+
+    fn configured_registry() -> Arc<ProviderRegistry> {
+        Arc::new(
+            ProviderRegistry::new(ProvidersConfig {
+                providers: HashMap::from([(
+                    "test".into(),
+                    ProviderConfig {
+                        name: "test".into(),
+                        base_url: "https://example.test/v1".into(),
+                        api_key: "test".into(),
+                        models: vec!["fast".into()],
+                        protocol: Some("responses".into()),
+                    },
+                )]),
+            })
+            .expect("valid provider registry"),
+        )
+    }
+
+    fn task(agent_id: &str) -> AgentTaskPacket {
+        AgentTaskPacket {
+            run_id: format!("run-{agent_id}"),
+            agent_id: agent_id.into(),
+            task_id: "task-1".into(),
+            session_id: "session-1".into(),
+            mission_id: None,
+            team_id: None,
+            graph_id: "graph-1".into(),
+            node_id: "node-1".into(),
+            attempt: 1,
+            expected_graph_revision: 1,
+            objective: "verify lifecycle".into(),
+            acceptance: vec!["verified".into()],
+            constraints: Vec::new(),
+            context_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            allowed_tools: Vec::new(),
+            allowed_skills: Vec::new(),
+            permission_lease: "read_only".into(),
+            model_lease: "fast".into(),
+            budget_lease: ContextBudgetLeaseRef::new("budget-1", agent_id, "agent", 1000, 1),
+            idempotency_key: format!("idempotency-{agent_id}"),
+        }
+    }
+
+    fn legacy_snapshot(packet: &AgentTaskPacket, status: AgentStatus) -> AgentRunSnapshot {
+        AgentRunSnapshot {
+            run_id: packet.run_id.clone(),
+            agent_id: packet.agent_id.clone(),
+            task_id: packet.task_id.clone(),
+            session_id: packet.session_id.clone(),
+            graph_id: packet.graph_id.clone(),
+            node_id: packet.node_id.clone(),
+            attempt: packet.attempt,
+            expected_graph_revision: packet.expected_graph_revision,
+            backend: AgentBackendKind::InProcess,
+            status,
+            revision: 0,
+            model: Some("fast".into()),
+            provider: Some("test".into()),
+            started_at_ms: 1,
+            updated_at_ms: 1,
+            failure: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_import_is_atomic_idempotent_and_blocks_unrecoverable_active_runs() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("store"));
+        let runtime = AgentRuntime::new(Arc::clone(&store), configured_registry());
+        let active = task("legacy-active");
+        let completed = task("legacy-completed");
+        let returned = return_packet(
+            &completed,
+            AgentTerminalStatus::Completed,
+            "completed before upgrade".into(),
+            None,
+        );
+        let report = runtime
+            .import_legacy_state_records(
+                "upgrade-manifest-sha256",
+                vec![
+                    LegacyAgentStateRecord {
+                        source_ref: "legacy/active.json".into(),
+                        snapshot: legacy_snapshot(&active, AgentStatus::Running),
+                        returned: None,
+                    },
+                    LegacyAgentStateRecord {
+                        source_ref: "legacy/completed.json".into(),
+                        snapshot: legacy_snapshot(&completed, AgentStatus::Completed),
+                        returned: Some(returned.clone()),
+                    },
+                ],
+            )
+            .expect("import succeeds");
+        assert!(!report.duplicate);
+        assert_eq!(report.imported_agent_ids.len(), 2);
+        assert_eq!(report.blocked_agent_ids, vec![active.agent_id.clone()]);
+        assert_eq!(
+            runtime
+                .get(&active.agent_id)
+                .expect("active projection")
+                .status,
+            AgentStatus::Blocked
+        );
+        assert_eq!(
+            runtime
+                .execute_task(completed.clone())
+                .await
+                .expect("replayed terminal result"),
+            returned
+        );
+
+        let replayed = AgentRuntime::new(Arc::clone(&store), configured_registry());
+        assert_eq!(
+            replayed
+                .get(&completed.agent_id)
+                .expect("terminal replay")
+                .status,
+            AgentStatus::Completed
+        );
+        let duplicate = replayed
+            .import_legacy_state_records("upgrade-manifest-sha256", Vec::new())
+            .expect("duplicate marker");
+        assert!(duplicate.duplicate);
+        assert_eq!(duplicate.imported_agent_ids.len(), 2);
+    }
+
+    #[test]
+    fn legacy_import_rejects_unbound_records_without_partial_writes() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("store"));
+        let runtime = AgentRuntime::new(Arc::clone(&store), configured_registry());
+        let valid = task("legacy-valid");
+        let mut invalid_snapshot = legacy_snapshot(&task("legacy-invalid"), AgentStatus::Running);
+        invalid_snapshot.graph_id.clear();
+        let error = runtime
+            .import_legacy_state_records(
+                "bad-upgrade-manifest",
+                vec![
+                    LegacyAgentStateRecord {
+                        source_ref: "legacy/valid.json".into(),
+                        snapshot: legacy_snapshot(&valid, AgentStatus::Running),
+                        returned: None,
+                    },
+                    LegacyAgentStateRecord {
+                        source_ref: "legacy/invalid.json".into(),
+                        snapshot: invalid_snapshot,
+                        returned: None,
+                    },
+                ],
+            )
+            .expect_err("unbound records are rejected");
+        assert!(error.contains("canonical binding"));
+        assert!(runtime.get(&valid.agent_id).is_none());
+        assert!(store
+            .list_stream(&legacy_import_stream_id("bad-upgrade-manifest"))
+            .expect("marker stream")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminal_lifecycle_replays_from_the_event_store() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("store"));
+        let runtime = AgentRuntime::new(Arc::clone(&store), configured_registry());
+        runtime.register_backend(Arc::new(CompletedBackend));
+        let packet = task("agent-replay");
+
+        let returned = runtime.execute_task(packet.clone()).await.expect("run");
+        assert_eq!(returned.status, AgentTerminalStatus::Completed);
+        assert_eq!(
+            runtime.get(&packet.agent_id).unwrap().status,
+            AgentStatus::Completed
+        );
+        assert_eq!(runtime.events(&packet.agent_id).len(), 3);
+        let replayed_return = runtime
+            .execute_task(packet.clone())
+            .await
+            .expect("replay result");
+        assert_eq!(replayed_return, returned);
+        assert_eq!(runtime.events(&packet.agent_id).len(), 3);
+
+        let restored = AgentRuntime::new(store, configured_registry());
+        let snapshot = restored.get(&packet.agent_id).expect("replayed snapshot");
+        assert_eq!(snapshot.status, AgentStatus::Completed);
+        assert_eq!(snapshot.graph_id, packet.graph_id);
+        assert_eq!(snapshot.node_id, packet.node_id);
+        assert_eq!(
+            restored
+                .execute_task(packet)
+                .await
+                .expect("restored return"),
+            returned
+        );
+    }
+
+    #[tokio::test]
+    async fn command_receipt_is_revisioned_and_idempotent() {
+        let runtime = AgentRuntime::new(
+            Arc::new(RuntimeEventStore::try_open_in_memory().expect("store")),
+            configured_registry(),
+        );
+        runtime.register_backend(Arc::new(CompletedBackend));
+        let packet = task("agent-command");
+        runtime
+            .restore_verified_run(AgentRunSnapshot {
+                run_id: packet.run_id.clone(),
+                agent_id: packet.agent_id.clone(),
+                task_id: packet.task_id.clone(),
+                session_id: packet.session_id.clone(),
+                graph_id: packet.graph_id.clone(),
+                node_id: packet.node_id.clone(),
+                attempt: packet.attempt,
+                expected_graph_revision: packet.expected_graph_revision,
+                backend: AgentBackendKind::InProcess,
+                status: AgentStatus::Running,
+                revision: 0,
+                model: Some("fast".into()),
+                provider: Some("test".into()),
+                started_at_ms: 1,
+                updated_at_ms: 1,
+                failure: None,
+            })
+            .expect("restore");
+        let revision = runtime.get(&packet.agent_id).unwrap().revision;
+        let command = AgentCommandRequest {
+            command_id: "command-1".into(),
+            agent_id: packet.agent_id.clone(),
+            expected_revision: revision,
+            command: AgentCommand::Interrupt,
+            input: None,
+        };
+        let first = runtime.command(command.clone()).await;
+        let duplicate = runtime.command(command).await;
+        assert!(first.accepted);
+        assert_eq!(first, duplicate);
+        assert_eq!(runtime.events(&packet.agent_id).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn unavailable_model_is_recorded_as_blocked_not_running() {
+        let runtime = AgentRuntime::new(
+            Arc::new(RuntimeEventStore::try_open_in_memory().expect("store")),
+            Arc::new(ProviderRegistry::empty()),
+        );
+        let packet = task("agent-blocked");
+        let returned = runtime
+            .execute_task(packet.clone())
+            .await
+            .expect("blocked return");
+        assert_eq!(returned.status, AgentTerminalStatus::Blocked);
+        let snapshot = runtime.get(&packet.agent_id).expect("blocked snapshot");
+        assert_eq!(snapshot.status, AgentStatus::Blocked);
+        assert!(snapshot.failure.is_some());
+        assert_eq!(runtime.events(&packet.agent_id).len(), 1);
+    }
+
+    #[test]
+    fn restart_recovery_blocks_runs_without_a_recovered_handle() {
+        let runtime = AgentRuntime::new(
+            Arc::new(RuntimeEventStore::try_open_in_memory().expect("store")),
+            configured_registry(),
+        );
+        let packet = task("agent-recovery");
+        runtime
+            .restore_verified_run(AgentRunSnapshot {
+                run_id: packet.run_id.clone(),
+                agent_id: packet.agent_id.clone(),
+                task_id: packet.task_id.clone(),
+                session_id: packet.session_id.clone(),
+                graph_id: packet.graph_id.clone(),
+                node_id: packet.node_id.clone(),
+                attempt: packet.attempt,
+                expected_graph_revision: packet.expected_graph_revision,
+                backend: AgentBackendKind::ProcessJsonl,
+                status: AgentStatus::Running,
+                revision: 0,
+                model: Some("fast".into()),
+                provider: Some("test".into()),
+                started_at_ms: 1,
+                updated_at_ms: 1,
+                failure: None,
+            })
+            .expect("restore");
+
+        assert_eq!(
+            runtime.block_unrecoverable_replayed_runs().expect("block"),
+            vec![packet.agent_id.clone()]
+        );
+        let snapshot = runtime.get(&packet.agent_id).expect("blocked run");
+        assert_eq!(snapshot.status, AgentStatus::Blocked);
+        assert!(snapshot
+            .failure
+            .as_deref()
+            .unwrap_or_default()
+            .contains("backend handle"));
+    }
+}

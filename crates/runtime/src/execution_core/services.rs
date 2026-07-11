@@ -21,8 +21,9 @@ use super::graph::{
 };
 use crate::runtime_event_store::RuntimeEventStoreError;
 use crate::{
-    ApprovalQueue, ConflictArbiter, MissionEvidenceBus, MissionRuntime, RuntimeEventStore,
-    SessionInputRouter, SessionRelationGraph,
+    AgentRuntime, AgentRuntimeResolver, ApprovalQueue, ConflictArbiter, InProcessAgentWorker,
+    MissionEvidenceBus, MissionRuntime, ProcessJsonlAdapter, RuntimeEventStore, SessionInputRouter,
+    SessionRelationGraph,
 };
 
 #[derive(Debug, Error)]
@@ -47,6 +48,8 @@ pub enum RuntimeServicesError {
     EmptyRoot,
     #[error("mission runtime initialization failed: {0}")]
     Mission(String),
+    #[error("agent runtime initialization failed: {0}")]
+    AgentRuntime(String),
     #[error("session input router was concurrently installed")]
     DuplicateSessionRouter,
     #[error("workspace mutation is blocked because upgrade recovery is required")]
@@ -156,6 +159,19 @@ impl RuntimeServicesBuilder {
             self.provider_registry,
             self.tool_execution_host,
         )?);
+        services.agent_runtime.bind_services(Arc::clone(&services));
+        services
+            .agent_runtime
+            .register_backend(Arc::new(InProcessAgentWorker::new(Arc::downgrade(
+                &services,
+            ))));
+        services
+            .agent_runtime
+            .register_backend(Arc::new(ProcessJsonlAdapter::new()));
+        services
+            .agent_runtime
+            .block_unrecoverable_replayed_runs()
+            .map_err(RuntimeServicesError::AgentRuntime)?;
         if let Some(store) = self.session_store {
             services.install_session_store(store)?;
         }
@@ -172,6 +188,7 @@ pub struct RuntimeServices {
     tool_batch_executor: Arc<ScopedNodeExecutor>,
     cross_plane_connector_executor: Arc<ScopedNodeExecutor>,
     agent_task_executor: Arc<AgentTaskExecutor>,
+    agent_runtime: Arc<AgentRuntime>,
     verify_executor: Arc<VerifyNodeExecutor>,
     synthesize_executor: Arc<SynthesizeNodeExecutor>,
     graph_state_store: ExecutionGraphStateStore,
@@ -211,7 +228,7 @@ impl RuntimeServices {
     pub fn in_memory() -> Result<Arc<Self>, RuntimeServicesError> {
         let workspace_key = format!("in-memory-{}", uuid::Uuid::new_v4());
         let workspace_root = PathBuf::from(format!("/{workspace_key}"));
-        Ok(Arc::new(Self::assemble(
+        let services = Arc::new(Self::assemble(
             workspace_root,
             workspace_key.clone(),
             Arc::new(RuntimeEventStore::try_open_in_memory()?),
@@ -226,7 +243,21 @@ impl RuntimeServices {
             None,
             Arc::new(crate::ProviderRegistry::empty()),
             None,
-        )?))
+        )?);
+        services.agent_runtime.bind_services(Arc::clone(&services));
+        services
+            .agent_runtime
+            .register_backend(Arc::new(InProcessAgentWorker::new(Arc::downgrade(
+                &services,
+            ))));
+        services
+            .agent_runtime
+            .register_backend(Arc::new(ProcessJsonlAdapter::new()));
+        services
+            .agent_runtime
+            .block_unrecoverable_replayed_runs()
+            .map_err(RuntimeServicesError::AgentRuntime)?;
+        Ok(services)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -248,6 +279,13 @@ impl RuntimeServices {
         let cross_plane_connector_executor =
             Arc::new(ScopedNodeExecutor::new("cross_plane_connector"));
         let agent_task_executor = Arc::new(AgentTaskExecutor::new());
+        let agent_runtime = Arc::new(AgentRuntime::new(
+            Arc::clone(&event_store),
+            Arc::clone(&provider_registry),
+        ));
+        agent_task_executor.install_resolver(Arc::new(AgentRuntimeResolver::new(Arc::clone(
+            &agent_runtime,
+        ))));
         let verify_executor = Arc::new(VerifyNodeExecutor::new(graph_state_store.clone()));
         let synthesize_executor = Arc::new(SynthesizeNodeExecutor::new());
         let session_dispatch_executor =
@@ -315,6 +353,7 @@ impl RuntimeServices {
             tool_batch_executor,
             cross_plane_connector_executor,
             agent_task_executor,
+            agent_runtime,
             verify_executor,
             synthesize_executor,
             graph_state_store,
@@ -376,6 +415,9 @@ impl RuntimeServices {
     }
     pub fn agent_task_executor(&self) -> &Arc<AgentTaskExecutor> {
         &self.agent_task_executor
+    }
+    pub fn agent_runtime(&self) -> &Arc<AgentRuntime> {
+        &self.agent_runtime
     }
     pub fn verify_executor(&self) -> &Arc<VerifyNodeExecutor> {
         &self.verify_executor
@@ -671,6 +713,12 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use harness_contract::agent::{AgentReturnPacket, AgentTaskPacket, AgentTerminalStatus};
+    use harness_contract::context::ContextBudgetLeaseRef;
+    use harness_contract::execution_graph::{
+        ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec, ExecutionNodeStatus,
+    };
+
     struct TestExecutionHost;
 
     impl crate::RuntimeExecutionHost for TestExecutionHost {
@@ -692,6 +740,51 @@ mod tests {
 
     struct ServiceScopedBackend {
         calls: Arc<AtomicUsize>,
+    }
+
+    struct CompletedAgentBackend;
+
+    #[async_trait::async_trait]
+    impl crate::AgentRuntimeBackend for CompletedAgentBackend {
+        fn kind(&self) -> crate::AgentBackendKind {
+            crate::AgentBackendKind::InProcess
+        }
+
+        fn capabilities(&self) -> crate::AgentBackendCapabilities {
+            crate::AgentBackendCapabilities::in_process()
+        }
+
+        async fn execute(
+            &self,
+            packet: AgentTaskPacket,
+            selection: crate::AgentModelSelection,
+        ) -> Result<AgentReturnPacket, String> {
+            Ok(AgentReturnPacket {
+                run_id: packet.run_id,
+                agent_id: packet.agent_id,
+                task_id: packet.task_id,
+                session_id: packet.session_id,
+                mission_id: packet.mission_id,
+                team_id: packet.team_id,
+                graph_id: packet.graph_id,
+                node_id: packet.node_id,
+                attempt: packet.attempt,
+                expected_graph_revision: packet.expected_graph_revision,
+                status: AgentTerminalStatus::Completed,
+                outcome: "verified agent result".into(),
+                acceptance: vec!["completed".into()],
+                evidence_refs: Vec::new(),
+                changes: Vec::new(),
+                conflicts: Vec::new(),
+                unresolved: Vec::new(),
+                input_tokens: 5,
+                output_tokens: 3,
+                model: selection.model,
+                provider: selection.provider,
+                tool_calls: 0,
+                failure: None,
+            })
+        }
     }
 
     #[async_trait::async_trait]
@@ -1041,5 +1134,93 @@ mod tests {
             graph.node_statuses["startup-node"],
             ExecutionNodeStatus::Completed
         );
+    }
+
+    #[tokio::test]
+    async fn canonical_agent_task_flows_through_runner_and_commits_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let providers = crate::config::ProvidersConfig {
+            providers: std::collections::HashMap::from([(
+                "test".into(),
+                crate::config::ProviderConfig {
+                    name: "test".into(),
+                    base_url: "https://example.test/v1".into(),
+                    api_key: "test".into(),
+                    models: vec!["fast".into()],
+                    protocol: Some("responses".into()),
+                },
+            )]),
+        };
+        let services = RuntimeServices::builder(temp.path(), &workspace)
+            .provider_registry(Arc::new(crate::ProviderRegistry::new(providers).unwrap()))
+            .build()
+            .unwrap();
+        services
+            .agent_runtime()
+            .register_backend(Arc::new(CompletedAgentBackend));
+
+        let mut graph = ExecutionGraph::new("agent graph integration");
+        graph.id = "agent-runtime-graph".into();
+        let packet = AgentTaskPacket {
+            run_id: "agent-runtime-run".into(),
+            agent_id: "agent-runtime-agent".into(),
+            task_id: "agent-runtime-task".into(),
+            session_id: "agent-runtime-session".into(),
+            mission_id: None,
+            team_id: None,
+            graph_id: graph.id.clone(),
+            node_id: "agent-runtime-node".into(),
+            attempt: 1,
+            expected_graph_revision: 0,
+            objective: "complete one graph-owned agent task".into(),
+            acceptance: vec!["completed".into()],
+            constraints: Vec::new(),
+            context_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            allowed_tools: Vec::new(),
+            allowed_skills: Vec::new(),
+            permission_lease: "read_only".into(),
+            model_lease: "fast".into(),
+            budget_lease: ContextBudgetLeaseRef::new(
+                "agent-runtime-budget",
+                "agent-runtime-agent",
+                "agent",
+                1000,
+                1,
+            ),
+            idempotency_key: "agent-runtime-idempotency".into(),
+        };
+        let mut node = ExecutionNodeSpec::new(
+            ExecutionNodeKind::AgentTask,
+            crate::execution_core::graph::executors::AgentTaskExecutor::KIND,
+            serde_json::to_string(&packet).unwrap(),
+        );
+        node.id = packet.node_id.clone();
+        node.idempotency_key = packet.idempotency_key.clone();
+        node.acceptance.criteria = packet.acceptance.clone();
+        graph.nodes.push(node);
+
+        let report = services
+            .graph_runner()
+            .start(graph)
+            .await
+            .expect("run graph");
+        assert_eq!(report.completed, 1);
+        let graph = services.graph_state_store().load(&report.graph_id).unwrap();
+        assert_eq!(
+            graph.node_statuses.get(&packet.node_id),
+            Some(&ExecutionNodeStatus::Completed)
+        );
+        let agent = services
+            .agent_runtime()
+            .get(&packet.agent_id)
+            .expect("agent projection");
+        assert_eq!(
+            agent.status,
+            harness_contract::agent::AgentStatus::Completed
+        );
+        assert_eq!(services.agent_runtime().events(&packet.agent_id).len(), 3);
     }
 }

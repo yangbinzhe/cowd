@@ -88,6 +88,10 @@ struct AgentAssembleRequest {
 
 #[derive(Debug, Deserialize)]
 struct RuntimeAgentCommandRequest {
+    #[serde(rename = "commandId")]
+    command_id: Option<String>,
+    #[serde(rename = "expectedRevision")]
+    expected_revision: Option<u64>,
     #[serde(default)]
     payload: Option<Value>,
 }
@@ -169,14 +173,22 @@ async fn execution_graphs_handler(
     Ok(Json(value))
 }
 
-async fn runtime_agents_list_handler() -> impl IntoResponse {
-    Json(runtime::global_agent_lifecycle_service().projection())
+async fn runtime_agents_list_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime = runtime_services(&state)?;
+    Ok(Json(serde_json::json!({
+        "kind": "runtime.agent.list",
+        "agents": runtime.agent_runtime().list(),
+    })))
 }
 
 async fn runtime_agent_detail_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    runtime::global_agent_lifecycle_service()
+    runtime_services(&state)?
+        .agent_runtime()
         .get(&id)
         .map(|agent| {
             Json(serde_json::json!({
@@ -188,89 +200,128 @@ async fn runtime_agent_detail_handler(
 }
 
 async fn runtime_agent_events_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    runtime::global_agent_lifecycle_service()
-        .events(&id)
-        .map(|events| {
-            Json(serde_json::json!({
-                "kind": "runtime.agent.events",
-                "agentId": id,
-                "count": events.len(),
-                "events": events,
-            }))
-        })
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "agent not found"))
+    let runtime = runtime_services(&state)?;
+    if runtime.agent_runtime().get(&id).is_none() {
+        return Err(api_error(StatusCode::NOT_FOUND, "agent not found"));
+    }
+    let events = runtime.agent_runtime().events(&id);
+    Ok(Json(serde_json::json!({
+        "kind": "runtime.agent.events",
+        "agentId": id,
+        "count": events.len(),
+        "events": events,
+    })))
 }
 
-async fn runtime_agent_cancel_handler(Path(id): Path<String>) -> impl IntoResponse {
-    Json(agent_execution_capability_unavailable(
-        "runtime.agent.cancel",
+async fn runtime_agent_cancel_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    runtime_agent_command_result(
+        &state,
         &id,
-        None,
-        None,
-    ))
+        harness_contract::agent::AgentCommand::Cancel,
+        RuntimeAgentCommandRequest {
+            command_id: None,
+            expected_revision: None,
+            payload: None,
+        },
+    )
+    .await
 }
 
 async fn runtime_agent_input_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
     Json(body): Json<RuntimeAgentCommandRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    runtime_agent_command_result(&id, runtime::AgentExecutionCommandKind::Input, body.payload)
+    runtime_agent_command_result(
+        &state,
+        &id,
+        harness_contract::agent::AgentCommand::SendInput,
+        body,
+    )
+    .await
 }
 
 async fn runtime_agent_interrupt_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
     Json(body): Json<RuntimeAgentCommandRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     runtime_agent_command_result(
+        &state,
         &id,
-        runtime::AgentExecutionCommandKind::Interrupt,
-        body.payload,
+        harness_contract::agent::AgentCommand::Interrupt,
+        body,
     )
+    .await
 }
 
 async fn runtime_agent_shutdown_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
     Json(body): Json<RuntimeAgentCommandRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     runtime_agent_command_result(
+        &state,
         &id,
-        runtime::AgentExecutionCommandKind::Shutdown,
-        body.payload,
+        harness_contract::agent::AgentCommand::Shutdown,
+        body,
     )
+    .await
 }
 
-fn runtime_agent_command_result(
+async fn runtime_agent_command_result(
+    state: &Arc<AppState>,
     id: &str,
-    command: runtime::AgentExecutionCommandKind,
-    payload: Option<Value>,
+    command: harness_contract::agent::AgentCommand,
+    body: RuntimeAgentCommandRequest,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    Ok(Json(agent_execution_capability_unavailable(
-        "runtime.agent.command",
-        id,
-        Some(command),
-        payload,
-    )))
+    let runtime = runtime_services(state)?;
+    let snapshot = runtime
+        .agent_runtime()
+        .get(id)
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "agent not found"))?;
+    let input = body.payload.map(|payload| match payload {
+        Value::String(text) => harness_contract::agent::AgentInput::UserSupplement(text),
+        value => harness_contract::agent::AgentInput::ControlContext(value),
+    });
+    let receipt = runtime
+        .agent_runtime()
+        .command(harness_contract::agent::AgentCommandRequest {
+            command_id: body
+                .command_id
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            agent_id: id.to_string(),
+            expected_revision: body.expected_revision.unwrap_or(snapshot.revision),
+            command,
+            input,
+        })
+        .await;
+    Ok(Json(serde_json::json!({
+        "kind": "runtime.agent.command",
+        "receipt": receipt,
+    })))
 }
 
-fn agent_execution_capability_unavailable(
-    kind: &str,
-    agent_id: &str,
-    command: Option<runtime::AgentExecutionCommandKind>,
-    payload: Option<Value>,
-) -> Value {
-    serde_json::json!({
-        "kind": kind,
-        "ok": false,
-        "status": "capability_unavailable",
-        "capability": "agent_execution",
-        "available_in": "V5",
-        "side_effects_started": false,
-        "agent_id": agent_id,
-        "command": command,
-        "payload": payload,
-    })
+fn runtime_services(
+    state: &AppState,
+) -> Result<Arc<runtime::RuntimeServices>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.runtime_services())
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "RuntimeServices is unavailable",
+            )
+        })
 }
 
 async fn agent_team_profiles_list_handler(

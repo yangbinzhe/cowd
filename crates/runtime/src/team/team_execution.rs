@@ -12,8 +12,8 @@ use harness_contract::execution_graph::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    global_agent_task_mailbox, global_team_runtime_service, AgentTask, AgentTaskStatus,
-    CollaborationTemplateId, TeamRuntimeSnapshot,
+    global_team_runtime_service, AgentTask, AgentTaskStatus, CollaborationTemplateId,
+    TeamRuntimeSnapshot,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,37 +67,27 @@ impl TeamExecutionLoop {
             .get(team_id)
             .ok_or_else(|| format!("team runtime not found: {team_id}"))?;
         let spec = runtime_spec_for(&team);
-        let existing_by_role = global_agent_task_mailbox()
-            .list_for_team(team_id)
-            .into_iter()
-            .map(|task| (task.role_id.clone(), task))
-            .collect::<BTreeMap<_, _>>();
         let tasks = team
             .agents
             .iter()
-            .map(|agent| {
-                existing_by_role
-                    .get(&agent.role_id)
-                    .cloned()
-                    .unwrap_or_else(|| AgentTask {
-                        task_id: make_task_id(&team.team_id, &agent.role_id),
-                        team_id: team.team_id.clone(),
-                        session_id: team.session_id.clone(),
-                        role_id: agent.role_id.clone(),
-                        agent_id: agent.agent_id.clone(),
-                        objective: format!("{}: {}", agent.role_id, team.objective),
-                        expected_output: format!(
-                            "Produce role output for {} and evidence for {}",
-                            agent.role_id,
-                            team.template_id.as_str()
-                        ),
-                        context_refs: vec![format!("team:{}", team.team_id)],
-                        evidence_refs: agent.evidence_duties.clone(),
-                        status: AgentTaskStatus::Pending,
-                        outcome: None,
-                        created_at_ms: 0,
-                        updated_at_ms: 0,
-                    })
+            .map(|agent| AgentTask {
+                task_id: make_task_id(&team.team_id, &agent.role_id),
+                team_id: team.team_id.clone(),
+                session_id: team.session_id.clone(),
+                role_id: agent.role_id.clone(),
+                agent_id: agent.agent_id.clone(),
+                objective: format!("{}: {}", agent.role_id, team.objective),
+                expected_output: format!(
+                    "Produce role output for {} and evidence for {}",
+                    agent.role_id,
+                    team.template_id.as_str()
+                ),
+                context_refs: vec![format!("team:{}", team.team_id)],
+                evidence_refs: agent.evidence_duties.clone(),
+                status: AgentTaskStatus::Pending,
+                outcome: None,
+                created_at_ms: 0,
+                updated_at_ms: 0,
             })
             .collect::<Vec<_>>();
         let execution_graph = build_execution_graph(&team, &spec, &tasks)?;
@@ -441,11 +431,8 @@ mod tests {
             })
             .expect("team");
 
-        let before = global_agent_task_mailbox().list_for_team(&team.team_id);
         let plan = TeamExecutionLoop::plan(&team.team_id).expect("plan");
-        let after = global_agent_task_mailbox().list_for_team(&team.team_id);
 
-        assert!(before.is_empty() && after.is_empty());
         assert_eq!(plan.tasks.len(), plan.spec.roles.len());
         assert!(plan.execution_graph_quality.is_dag);
         assert!(plan.execution_graph_quality.has_verify_node);

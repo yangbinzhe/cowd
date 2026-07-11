@@ -285,14 +285,17 @@ pub struct CollaborationOrchestrator<E: SubAgentExecutor> {
     executor: Arc<E>,
     parent_memory: Option<Arc<memory::CognitiveContextManager>>,
     discovery: TeamDiscoveryProtocol,
+    directory: Arc<AgentDirectory>,
 }
 
 impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
     pub fn new(executor: Arc<E>) -> Self {
+        let directory = Arc::new(AgentDirectory::new());
         Self {
             executor,
             parent_memory: None,
-            discovery: TeamDiscoveryProtocol::new(),
+            discovery: TeamDiscoveryProtocol::new().with_directory(Arc::clone(&directory)),
+            directory,
         }
     }
 
@@ -303,7 +306,16 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
 
     /// Inject a `TeamDiscoveryProtocol` for reputation-aware team assembly.
     pub fn with_discovery(mut self, discovery: TeamDiscoveryProtocol) -> Self {
+        self.directory = Arc::clone(discovery.directory());
         self.discovery = discovery;
+        self
+    }
+
+    /// Inject the scoped directory used by fallback discovery. The directory is
+    /// owned by the runtime scope, never a process-global singleton.
+    pub fn with_directory(mut self, directory: Arc<AgentDirectory>) -> Self {
+        self.discovery = TeamDiscoveryProtocol::new().with_directory(Arc::clone(&directory));
+        self.directory = directory;
         self
     }
 
@@ -360,8 +372,8 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
             });
         }
 
-        // Fallback: simple AgentDirectory discovery.
-        let candidates = AgentDirectory::global().discover(&task.required_capabilities);
+        // Fallback: simple discovery in this runtime scope.
+        let candidates = self.directory.discover(&task.required_capabilities);
         if candidates.is_empty() {
             return None;
         }
@@ -1875,11 +1887,13 @@ Memory: lightweight spike has a live-memory pulse candidate"
 
     #[tokio::test]
     async fn leased_strategy_run_attaches_template_without_artificial_dependencies() {
-        AgentDirectory::global().register(dummy_agent_info(
+        let directory = Arc::new(AgentDirectory::new());
+        directory.register(dummy_agent_info(
             "template-contract-worker",
             vec!["rust".to_string(), "testing".to_string()],
         ));
-        let orch = CollaborationOrchestrator::<DummyExecutor>::new(Arc::new(DummyExecutor));
+        let orch = CollaborationOrchestrator::<DummyExecutor>::new(Arc::new(DummyExecutor))
+            .with_directory(Arc::clone(&directory));
         let task = "implement a runtime refactor then compile and test";
         let leased = crate::execution_core::StrategyDecisionEngine.decide(task, None);
 
@@ -1907,7 +1921,7 @@ Memory: lightweight spike has a live-memory pulse candidate"
         );
         assert!(decision.plan.review_contract.contains("mandatory"));
         assert!(decision.plan.budget_policy.max_parallel_agents >= 2);
-        AgentDirectory::global().unregister("template-contract-worker");
+        directory.unregister("template-contract-worker");
     }
 
     fn subtask(id: &str, description: &str, dependencies: &[&str]) -> SubTask {

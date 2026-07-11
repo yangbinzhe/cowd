@@ -121,24 +121,26 @@ mod session;
 pub use session::workspace_sessions_dir;
 #[path = "agent/agent.rs"]
 pub mod agent;
-#[path = "agent/agent_backend.rs"]
-pub mod agent_backend;
 #[path = "agent/agent_capability.rs"]
 pub mod agent_capability;
+#[path = "agent/catalog.rs"]
+pub mod agent_catalog;
 #[path = "agent/agent_collaboration.rs"]
 pub mod agent_collaboration;
 #[path = "agent/agent_discussion.rs"]
 pub mod agent_discussion;
-#[path = "agent/agent_event_bus.rs"]
-pub mod agent_event_bus;
-#[path = "agent/agent_lifecycle.rs"]
-pub mod agent_lifecycle;
-#[path = "agent/agent_mailbox.rs"]
-pub mod agent_mailbox;
-#[path = "team/agent_outcome_bridge.rs"]
-pub mod agent_outcome_bridge;
-#[path = "team/agent_task_binding.rs"]
-pub mod agent_task_binding;
+#[path = "agent/in_process_worker.rs"]
+pub mod agent_in_process_worker;
+#[path = "agent/model_selector.rs"]
+pub mod agent_model_selector;
+#[path = "agent/process_jsonl_adapter.rs"]
+pub mod agent_process_jsonl_adapter;
+#[path = "agent/result_validator.rs"]
+pub mod agent_result_validator;
+#[path = "agent/run_handle.rs"]
+pub mod agent_run_handle;
+#[path = "agent/runtime.rs"]
+pub mod agent_runtime;
 #[path = "approval/approval_gate.rs"]
 pub mod approval_gate;
 #[path = "policy/autonomy_profile.rs"]
@@ -232,8 +234,6 @@ pub mod steward_runtime;
 #[path = "steward/steward_scheduler.rs"]
 pub mod steward_scheduler;
 pub mod structured_data;
-#[path = "agent/subagent_turn.rs"]
-pub mod subagent_turn;
 #[path = "conversation/summary_compression.rs"]
 pub mod summary_compression;
 #[path = "infrastructure/surface_contract.rs"]
@@ -244,6 +244,8 @@ pub mod task;
 pub mod task_packet;
 #[path = "mission/task_registry.rs"]
 pub mod task_registry;
+#[path = "team/agent_task.rs"]
+pub mod team_agent_task;
 #[path = "team/team_cron_registry.rs"]
 pub mod team_cron_registry;
 #[path = "team/team_discovery.rs"]
@@ -276,21 +278,15 @@ pub mod turn_supervisor;
 pub mod upgrade;
 #[path = "provider/usage.rs"]
 mod usage;
-#[path = "infrastructure/worker_boot.rs"]
-pub mod worker_boot;
 
 pub use agent::{
-    ProductionExecutor, SubAgentConfig, SubAgentError, SubAgentExecutor, SubAgentProgressCallback,
-    SubAgentResult, SubAgentToolMode,
-};
-pub use agent_backend::{
-    AgentBackendCapability, AgentExecutionBackendKind, AgentExecutionCommand,
-    AgentExecutionCommandKind, AgentExecutionCommandReceipt, AgentExecutionEventEnvelope,
-    AgentProcessJsonlSpec,
+    SubAgentConfig, SubAgentError, SubAgentExecutor, SubAgentProgressCallback, SubAgentResult,
+    SubAgentToolMode,
 };
 pub use agent_capability::{
     resolve_agent_capability, AgentCapabilityRequest, ResolvedAgentCapability,
 };
+pub use agent_catalog::{AgentCatalog, AgentCatalogEntry};
 pub use agent_collaboration::{
     AgentTaskTrace, AgentTeam, CollaborationBoard, CollaborationContextResult, CollaborationOps,
     CollaborationOrchestrator, CollaborationReviewPacket, CollaborationScorecard,
@@ -299,23 +295,14 @@ pub use agent_collaboration::{
 pub use agent_discussion::{
     ConsensusMethod, ConsensusResult, Contribution, Discussion, DiscussionEngine, DiscussionPhase,
 };
-pub use agent_event_bus::{global_agent_event_bus, AgentEventBus, AgentProgressEvent};
-pub use agent_lifecycle::{
-    agent_store_dir, build_agent_system_prompt, classify_lane_failure, derive_agent_state,
-    global_agent_lifecycle_service, iso8601_now, maybe_commit_provenance, normalize_subagent_type,
-    persist_agent_terminal_state, prepare_agent_job, resolve_agent_model, slugify_agent_name,
-    spawn_provider_agent, AgentCommandReceipt, AgentJob, AgentLifecycleEvent,
-    AgentLifecycleService, AgentSnapshot, SpawnAgentRequest, DEFAULT_AGENT_MAX_ITERATIONS,
-    DEFAULT_AGENT_MODEL, DEFAULT_AGENT_SYSTEM_DATE,
-};
-pub use agent_mailbox::{
-    global_agent_task_mailbox, AgentTask, AgentTaskCompletionReceipt, AgentTaskMailboxService,
-    AgentTaskOutcome, AgentTaskQualityStatus, AgentTaskReceipt, AgentTaskStatus,
-};
-pub use agent_outcome_bridge::{bridge_agent_terminal_snapshot, AgentRuntimeOutcomeBridgeReceipt};
-pub use agent_task_binding::{
-    global_agent_task_binding_registry, AgentTaskBinding, AgentTaskBindingRegistry,
-    AgentTaskBindingStatus,
+pub use agent_in_process_worker::InProcessAgentWorker;
+pub use agent_model_selector::{AgentModelSelection, AgentModelSelectionError, AgentModelSelector};
+pub use agent_process_jsonl_adapter::{ProcessJsonlAdapter, ProcessJsonlSpec};
+pub use agent_result_validator::{validate_agent_return, AgentResultValidationError};
+pub use agent_run_handle::{AgentBackendCapabilities, AgentBackendKind, AgentRunHandle};
+pub use agent_runtime::{
+    AgentRunSnapshot, AgentRuntime, AgentRuntimeBackend, AgentRuntimeResolver,
+    LegacyAgentImportReport, LegacyAgentStateRecord,
 };
 pub use approval_queue::{
     ApprovalQueue, ApprovalSource, ApprovalSourceKind, ApprovalTimeoutPolicy,
@@ -427,9 +414,14 @@ pub use gates::{
     PreFlightGate, RevisionCheck, RevisionGate, ViolationSeverity, ViolationType,
 };
 pub use git_context::{GitCommitEntry, GitContext};
+pub use harness_contract::agent::AgentLifecycleEvent;
 pub use hooks::{
     format_hook_output, HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter,
     HookRunResult, HookRunner, HOOK_PREVIEW_CHAR_LIMIT,
+};
+pub use team_agent_task::{
+    AgentTask, AgentTaskCompletionReceipt, AgentTaskOutcome, AgentTaskQualityStatus,
+    AgentTaskStatus,
 };
 #[path = "conversation/host.rs"]
 pub mod host;
@@ -634,9 +626,6 @@ pub use steward_scheduler::{
     StewardDecisionLedger, StewardDecisionLedgerRecord, StewardScheduler, StewardSchedulerConfig,
     StewardSchedulerHandoffSummary, StewardSchedulerProjection, StewardSchedulerTickReport,
 };
-pub use subagent_turn::{
-    final_assistant_text, run_provider_subagent_turn, ProviderSubAgentTurnConfig,
-};
 pub use task_packet::{
     validate_packet, TaskPacket, TaskPacketValidationError, TaskScope, ValidatedPacket,
 };
@@ -688,11 +677,6 @@ pub use wave::{
     DependencyGraph, ErrorPolicy, TaskContext, TaskId, TaskResult, TaskStatus, Wave, WaveConfig,
     WaveError, WaveExecutor, WaveOrchestrator, WaveResult, WaveStatus, WaveTask,
 };
-pub use worker_boot::{
-    StartupEvidenceBundle, StartupFailureClassification, Worker, WorkerEvent, WorkerEventKind,
-    WorkerEventPayload, WorkerFailure, WorkerFailureKind, WorkerPromptTarget, WorkerReadySnapshot,
-    WorkerRegistry, WorkerStatus, WorkerTaskReceipt, WorkerTrustResolution,
-};
 
 #[path = "conversation/cached_prompt.rs"]
 pub mod cached_prompt;
@@ -703,7 +687,7 @@ pub use budget_policy::{
 };
 pub use cached_prompt::CachedSystemPrompt;
 pub use context_runtime::{
-    AgentContextLease, AgentContextView, AgentReturnPacket, AgentReturnRequirement,
+    AgentContextLease, AgentContextView, AgentReturnContextProjection, AgentReturnRequirement,
     AssembledContext, ContextAuthority, ContextBudgetAllocation, ContextBudgetExplanation,
     ContextBudgetReport, ContextCacheStabilityReport, ContextDegradationPath, ContextDiagnostics,
     ContextEnvelope, ContextEnvelopeRequest, ContextEpochReport, ContextIdentity, ContextItem,

@@ -318,6 +318,115 @@ impl AgentSpec {
     }
 }
 
+/// Backend-neutral lifecycle state for an agent run. Execution graph node
+/// state remains owned by `ExecutionGraph`; this type describes only the
+/// delegated agent itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentStatus {
+    Prepared,
+    Starting,
+    Running,
+    WaitingInput,
+    WaitingApproval,
+    Paused,
+    Blocked,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl AgentStatus {
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Blocked | Self::Completed | Self::Failed | Self::Cancelled
+        )
+    }
+
+    #[must_use]
+    pub const fn terminal_status(self) -> Option<AgentTerminalStatus> {
+        match self {
+            Self::Completed => Some(AgentTerminalStatus::Completed),
+            Self::Failed => Some(AgentTerminalStatus::Failed),
+            Self::Cancelled => Some(AgentTerminalStatus::Cancelled),
+            Self::Blocked => Some(AgentTerminalStatus::Blocked),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
+pub enum AgentInput {
+    UserSupplement(String),
+    PeerMessage {
+        from_agent_id: String,
+        message: String,
+    },
+    ControlContext(serde_json::Value),
+    ApprovalResult {
+        approval_id: String,
+        approved: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCommand {
+    SendInput,
+    Interrupt,
+    Pause,
+    Resume,
+    Cancel,
+    Shutdown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCommandRejectReason {
+    NotFound,
+    StaleRevision,
+    Terminal,
+    UnsupportedByBackend,
+    InvalidInput,
+    PermissionDenied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCommandRequest {
+    pub command_id: String,
+    pub agent_id: String,
+    pub expected_revision: u64,
+    pub command: AgentCommand,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<AgentInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCommandReceipt {
+    pub command_id: String,
+    pub agent_id: String,
+    pub accepted_revision: u64,
+    pub status: AgentStatus,
+    pub accepted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reject_reason: Option<AgentCommandRejectReason>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentLifecycleEvent {
+    pub event_id: String,
+    pub agent_id: String,
+    pub revision: u64,
+    pub status: AgentStatus,
+    pub kind: String,
+    pub message: String,
+    pub created_at_ms: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

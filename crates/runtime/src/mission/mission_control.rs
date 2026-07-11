@@ -9,10 +9,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    global_agent_lifecycle_service, global_steward_runtime_service, global_team_runtime_service,
-    GlobalApprovalDecision, MissionEvent, MissionProjection, MissionSessionCommandSummary,
-    MissionSessionSnapshot, RuntimeEventInput, RuntimeEventScope, RuntimeServices,
-    StartMissionSessionRequest,
+    global_steward_runtime_service, global_team_runtime_service, GlobalApprovalDecision,
+    MissionEvent, MissionProjection, MissionSessionCommandSummary, MissionSessionSnapshot,
+    RuntimeEventInput, RuntimeEventScope, RuntimeServices, StartMissionSessionRequest,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -261,9 +260,12 @@ impl MissionControlRuntime {
 fn build_projection(services: &RuntimeServices) -> MissionControlProjection {
     let mission = services
         .mission_runtime()
-        .projection(services.session_relations());
+        .projection(services.session_relations(), services.agent_runtime());
     let team_projection = global_team_runtime_service().projection();
-    let agent_projection = global_agent_lifecycle_service().projection();
+    let agent_projection = serde_json::json!({
+        "kind": "runtime.agents",
+        "agents": services.agent_runtime().list(),
+    });
     let approval_projection = services.approval_queue().projection();
     let steward_projection = global_steward_runtime_service().projection();
     let relations = services.session_relations().projection();
@@ -979,11 +981,11 @@ fn command_receipt_result(
 fn route_to_agent(
     session_id: &str,
     command: &MissionControlCommand,
-    _services: &RuntimeServices,
+    services: &RuntimeServices,
 ) -> Result<(MissionControlCommandStatus, String, serde_json::Value), String> {
     let agent_id = payload_string(&command.payload, "agent_id")?;
     let command_text = payload_string(&command.payload, "command")?;
-    if global_agent_lifecycle_service().get(&agent_id).is_none() {
+    if services.agent_runtime().get(&agent_id).is_none() {
         return Err(format!("agent not found: {agent_id}"));
     }
     Ok((
@@ -1050,9 +1052,8 @@ fn payload_optional_string(payload: &serde_json::Value, key: &str) -> Option<Str
 mod tests {
     use super::*;
     use crate::{
-        global_agent_task_mailbox, AgentExecutionBackendKind, AgentSnapshot, ApprovalSource,
-        ApprovalSourceKind, ApprovalTimeoutPolicy, CancellationToken, ConflictResolutionRequest,
-        ConflictSeverity, ConflictSourceKind, SubmitGlobalApprovalRequest, DEFAULT_AGENT_MODEL,
+        ApprovalSource, ApprovalSourceKind, ApprovalTimeoutPolicy, ConflictResolutionRequest,
+        ConflictSeverity, ConflictSourceKind, SubmitGlobalApprovalRequest,
     };
     use harness_contract::core::TaskRisk;
 
@@ -1155,79 +1156,6 @@ mod tests {
             .iter()
             .any(|action| action.action == "session.dispatch" && action.available));
         assert!(projection.event_digest.total_recent_events > 0);
-    }
-
-    #[test]
-    fn mission_control_route_to_agent_reports_capability_unavailable_without_side_effects() {
-        let services = RuntimeServices::in_memory().expect("runtime services");
-        let suffix = uuid::Uuid::new_v4();
-        let session_id = format!("mission-control-route-session-{suffix}");
-        let agent_id = format!("mission-control-route-agent-{suffix}");
-        let session = MissionControlRuntime::execute(
-            MissionControlCommand {
-                target: MissionControlCommandTarget::Mission,
-                action: MissionControlAction::StartSession,
-                actor: Some("test-human".to_string()),
-                payload: serde_json::json!({
-                    "title": "route to agent",
-                    "session_id": session_id,
-                }),
-                evidence_refs: Vec::new(),
-            },
-            &services,
-        );
-        assert_eq!(session.status, MissionControlCommandStatus::Executed);
-        global_agent_lifecycle_service().register_started(
-            AgentSnapshot {
-                agent_id: agent_id.clone(),
-                name: "route-agent".to_string(),
-                description: "route test".to_string(),
-                subagent_type: Some("worker".to_string()),
-                model: Some(DEFAULT_AGENT_MODEL.to_string()),
-                status: "running".to_string(),
-                backend: AgentExecutionBackendKind::InProcess,
-                output_file: String::new(),
-                manifest_file: String::new(),
-                created_at: "1".to_string(),
-                started_at: Some("1".to_string()),
-                completed_at: None,
-                lane_events: Vec::new(),
-                current_blocker: None,
-                derived_state: "working".to_string(),
-                error: None,
-            },
-            CancellationToken::new(),
-        );
-
-        let routed = MissionControlRuntime::execute(
-            MissionControlCommand {
-                target: MissionControlCommandTarget::Session {
-                    session_id: session_id.clone(),
-                },
-                action: MissionControlAction::RouteToAgent,
-                actor: Some("test-human".to_string()),
-                payload: serde_json::json!({
-                    "agent_id": agent_id,
-                    "command": "inspect routed work",
-                    "team_id": "route-team",
-                    "role_id": "reviewer",
-                }),
-                evidence_refs: vec!["manual:evidence".to_string()],
-            },
-            &services,
-        );
-
-        assert_eq!(routed.status, MissionControlCommandStatus::Failed);
-        assert_eq!(routed.result["status"], "capability_unavailable");
-        assert_eq!(routed.result["capability"], "agent_execution");
-        assert_eq!(routed.result["available_in"], "V5");
-        assert!(global_agent_task_mailbox()
-            .list_for_team("route-team")
-            .is_empty());
-        assert!(services
-            .mission_evidence()
-            .list_for_team("route-team")
-            .is_empty());
     }
 
     #[test]

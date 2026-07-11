@@ -210,7 +210,10 @@ impl MissionService {
     }
 
     fn mission_projection(&self) -> runtime::MissionProjection {
-        self.mission().projection(self.relation_graph())
+        self.mission().projection(
+            self.relation_graph(),
+            self.runtime_services().agent_runtime(),
+        )
     }
 
     pub(crate) fn envelope(&self, operation: &'static str) -> ServiceEnvelope {
@@ -385,16 +388,12 @@ impl MissionService {
         task_id: &str,
         request: SubmitAgentTaskOutcomeHttpRequest,
     ) -> Result<serde_json::Value, String> {
-        let task = runtime::global_agent_task_mailbox()
-            .get(task_id)
-            .ok_or_else(|| format!("agent task not found: {task_id}"))?;
-        if task.team_id != team_id {
+        let plan = runtime::TeamExecutionLoop::plan(team_id)?;
+        if !plan.tasks.iter().any(|task| task.task_id == task_id) {
             return Err(format!(
-                "agent task {task_id} belongs to team {}, not {team_id}",
-                task.team_id
+                "agent task not found in team execution plan: {task_id}"
             ));
         }
-        let plan = runtime::TeamExecutionLoop::plan(team_id)?;
         let command = harness_contract::execution_graph::ExecutionGraphCommand::Advance {
             expected_revision: plan.execution_graph.revision,
         };
@@ -520,19 +519,34 @@ impl MissionService {
             "kind": "mission_control.agent_events",
             "ok": true,
             "agent_id": agent_id,
-            "events": runtime::global_agent_event_bus().list_for_agent(agent_id),
-            "tasks": runtime::global_agent_task_mailbox().list_for_agent(agent_id),
+            "events": self.runtime_services().agent_runtime().events(agent_id),
+            "run": self.runtime_services().agent_runtime().get(agent_id),
         })
     }
 
     pub(crate) fn team_mission_evidence(&self, team_id: &str) -> serde_json::Value {
+        let team = runtime::global_team_runtime_service().get(team_id);
+        let agent_events = team
+            .as_ref()
+            .map(|team| {
+                team.agents
+                    .iter()
+                    .filter_map(|agent| agent.agent_id.as_deref())
+                    .map(|agent_id| self.runtime_services().agent_runtime().events(agent_id))
+                    .flatten()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let planned_tasks = runtime::TeamExecutionLoop::plan(team_id)
+            .map(|plan| plan.tasks)
+            .unwrap_or_default();
         serde_json::json!({
             "envelope": self.session_control_contract(),
             "kind": "mission_control.team_evidence",
             "ok": true,
             "team_id": team_id,
-            "events": runtime::global_agent_event_bus().list_for_team(team_id),
-            "tasks": runtime::global_agent_task_mailbox().list_for_team(team_id),
+            "events": agent_events,
+            "tasks": planned_tasks,
             "evidence": self.runtime_services().mission_evidence().list_for_team(team_id),
         })
     }
@@ -846,7 +860,12 @@ impl MissionService {
             target_ref: request.target_ref.clone(),
             command: request.command.clone(),
         });
-        let routed = route_mission_command_receipt(self.mission(), &receipt, &request.command)?;
+        let routed = route_mission_command_receipt(
+            self.mission(),
+            self.runtime_services(),
+            &receipt,
+            &request.command,
+        )?;
         Ok(serde_json::json!({
             "envelope": self.relation_command_contract(),
             "ok": true,
@@ -1077,6 +1096,7 @@ fn current_time_ms() -> u64 {
 
 fn route_mission_command_receipt(
     mission: &runtime::MissionRuntime,
+    runtime_services: &runtime::RuntimeServices,
     receipt: &runtime::SessionRouteReceipt,
     command: &str,
 ) -> Result<serde_json::Value, String> {
@@ -1092,10 +1112,7 @@ fn route_mission_command_receipt(
         }));
     }
     if let Some(agent_id) = &receipt.resolved_agent_id {
-        if runtime::global_agent_lifecycle_service()
-            .get(agent_id)
-            .is_none()
-        {
+        if runtime_services.agent_runtime().get(agent_id).is_none() {
             return Err(format!("route target agent not found: {agent_id}"));
         }
         return Ok(serde_json::json!({

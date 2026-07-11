@@ -9,15 +9,15 @@ use crate::execution_core::{
     NodeExecutionTicket, NodeExecutorError,
 };
 use crate::{
-    agent, agent_collaboration, model_context_window_with_overrides, permissions::SharedPrompter,
-    CompactionConfig, CompactionResult, ContentBlock, ContextEnvelope, ContextItem, ContextProfile,
+    model_context_window_with_overrides, permissions::SharedPrompter, CompactionConfig,
+    CompactionResult, ContentBlock, ContextEnvelope, ContextItem, ContextProfile,
     ContextSourceKind, ConversationMessage, CowdEvent, CowdEventBus, HookAbortSignal,
     HookProgressReporter, PermissionPolicy, ProviderRuntimeClient, ProviderToolDefinition,
     ResumeContextPacket, RuntimeError, RuntimeFeatureConfig, Session, ToolCallback, ToolExecutor,
     TurnSummary,
 };
 use async_trait::async_trait;
-use harness_contract::agent::{AgentReturnPacket, AgentTaskPacket, AgentTerminalStatus};
+use harness_contract::agent::AgentTaskPacket;
 use harness_contract::execution_graph::{
     ExecutionEdge, ExecutionEdgeKind, ExecutionNodeKind, ExecutionNodeResult, ExecutionNodeSpec,
     ExecutionNodeStatus, ExecutionUsage,
@@ -127,23 +127,10 @@ where
         }
 
         if config.enable_collaboration {
-            let subagent_model = config.subagent_model;
-            let subagent_tool_definitions = config.subagent_tool_definitions;
-            let provider_registry = Arc::clone(&config.provider_registry);
-            let executor = agent::ProductionExecutor::new(
-                move || {
-                    ProviderRuntimeClient::new(
-                        Arc::clone(&provider_registry),
-                        subagent_model.clone(),
-                        subagent_tool_definitions.clone(),
-                    )
-                    .expect("sub-agent provider client creation failed")
-                },
-                config.subagent_tool_executor.clone(),
-            )
-            .with_approval_gate_slot(Arc::clone(&approval_gate_slot));
-            let executor_arc = Arc::new(executor);
-            runtime = runtime.with_collaboration(agent_collaboration::new_boxed(executor_arc));
+            return Err(
+                "collaboration must be compiled into AgentTask nodes and executed by AgentRuntime"
+                    .to_string(),
+            );
         }
 
         Ok(Self {
@@ -542,13 +529,6 @@ where
                 services: Arc::downgrade(&services),
             }));
         services
-            .agent_task_executor()
-            .install_resolver(Arc::new(TurnAgentResolver {
-                session_id: session_id.clone(),
-                runtime: Arc::downgrade(&runtime),
-                services: Arc::downgrade(&services),
-            }));
-        services
             .synthesize_executor()
             .install_resolver(Arc::new(TurnSynthesizeResolver {
                 session_id: session_id.clone(),
@@ -680,11 +660,6 @@ fn ticket_session_id(payload: &str) -> Option<String> {
         })
 }
 
-struct TurnAgentBackend<C: ApiClient, T: ToolExecutor> {
-    runtime: Arc<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
-    services: Arc<crate::RuntimeServices>,
-}
-
 struct TurnModelResolver<C: ApiClient, T: ToolExecutor> {
     session_id: String,
     runtime: std::sync::Weak<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
@@ -733,32 +708,6 @@ where
     }
 }
 
-struct TurnAgentResolver<C: ApiClient, T: ToolExecutor> {
-    session_id: String,
-    runtime: std::sync::Weak<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
-    services: std::sync::Weak<crate::RuntimeServices>,
-}
-
-impl<C, T> crate::execution_core::graph::executors::AgentTaskBackendResolver
-    for TurnAgentResolver<C, T>
-where
-    C: ApiClient + Clone + Send + Sync + 'static,
-    T: ToolExecutor,
-{
-    fn resolve(
-        &self,
-        packet: &AgentTaskPacket,
-    ) -> Option<Arc<dyn crate::execution_core::graph::executors::AgentTaskBackend>> {
-        if packet.session_id != self.session_id {
-            return None;
-        }
-        Some(Arc::new(TurnAgentBackend {
-            runtime: self.runtime.upgrade()?,
-            services: self.services.upgrade()?,
-        }))
-    }
-}
-
 struct TurnSynthesizeResolver<C: ApiClient, T: ToolExecutor> {
     session_id: String,
     runtime: std::sync::Weak<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
@@ -784,62 +733,6 @@ where
             state: self.state.upgrade()?,
             services: self.services.upgrade()?,
         }))
-    }
-}
-
-#[async_trait]
-impl<C, T> crate::execution_core::graph::executors::AgentTaskBackend for TurnAgentBackend<C, T>
-where
-    C: ApiClient + Clone + Send + Sync + 'static,
-    T: ToolExecutor,
-{
-    async fn execute(&self, packet: AgentTaskPacket) -> Result<AgentReturnPacket, String> {
-        let mut config = crate::agent::SubAgentConfig {
-            task_description: packet.objective.clone(),
-            allowed_tools: packet.allowed_tools.clone(),
-            model: Some(packet.model_lease.clone()),
-            session_id: Some(packet.session_id.clone()),
-            ..crate::agent::SubAgentConfig::default()
-        };
-        config.ensure_context_lease(&packet.session_id, &packet.agent_id);
-        let mut agent = self.runtime.lock().await.create_subagent_runtime(&config);
-        let result = agent.run_loop_async(&packet.objective).await;
-        let failed = !result.completed_normally;
-        let outcome = result.output;
-        Ok(AgentReturnPacket {
-            run_id: packet.run_id,
-            agent_id: packet.agent_id,
-            task_id: packet.task_id,
-            session_id: packet.session_id,
-            mission_id: packet.mission_id,
-            team_id: packet.team_id,
-            graph_id: packet.graph_id,
-            node_id: packet.node_id,
-            attempt: packet.attempt,
-            expected_graph_revision: packet.expected_graph_revision,
-            status: if !failed {
-                AgentTerminalStatus::Completed
-            } else {
-                AgentTerminalStatus::Failed
-            },
-            outcome,
-            acceptance: packet.acceptance,
-            evidence_refs: Vec::new(),
-            changes: Vec::new(),
-            conflicts: Vec::new(),
-            unresolved: Vec::new(),
-            input_tokens: result.tokens_used as u64,
-            output_tokens: 0,
-            model: packet.model_lease.clone(),
-            provider: self
-                .services
-                .provider_registry()
-                .pin()
-                .provider_name_for_model(&packet.model_lease)
-                .unwrap_or_else(|| "environment".to_string()),
-            tool_calls: result.tool_call_count as u64,
-            failure: failed.then(|| "provider agent did not complete normally".to_string()),
-        })
     }
 }
 
@@ -1004,10 +897,7 @@ where
                                 .collect(),
                             allowed_skills: Vec::new(),
                             permission_lease: "turn-permission-lease".to_string(),
-                            model_lease: state
-                                .model
-                                .clone()
-                                .unwrap_or_else(|| "active-model".to_string()),
+                            model_lease: state.model.clone().unwrap_or_default(),
                             budget_lease: harness_contract::context::ContextBudgetLeaseRef::new(
                                 format!("budget:{}", agent_node.id),
                                 agent_node.id.clone(),

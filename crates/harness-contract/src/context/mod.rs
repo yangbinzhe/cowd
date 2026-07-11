@@ -444,7 +444,7 @@ impl ToolObservation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentReturnPacketV2 {
+pub struct AgentReturnContextEnvelope {
     pub parent_session_id: String,
     pub child_agent_id: String,
     pub result_summary: String,
@@ -459,7 +459,7 @@ pub struct AgentReturnPacketV2 {
     pub token_estimate: u64,
 }
 
-impl AgentReturnPacketV2 {
+impl AgentReturnContextEnvelope {
     #[must_use]
     pub fn new(
         parent_session_id: impl Into<String>,

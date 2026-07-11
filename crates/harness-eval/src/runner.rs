@@ -581,7 +581,10 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
             ],
         });
     let conflict_count = runtime_services.conflict_resolver().receipts().len() as u64;
-    let projection = mission.projection(runtime_services.session_relations());
+    let projection = mission.projection(
+        runtime_services.session_relations(),
+        runtime_services.agent_runtime(),
+    );
     let checks = vec![
         (
             "simple_question_direct",

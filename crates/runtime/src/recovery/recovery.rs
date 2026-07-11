@@ -3,11 +3,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    candidate_from_action, global_agent_lifecycle_service, global_agent_task_mailbox,
-    global_steward_runtime_service, global_team_runtime_service, AgentExecutionCommandKind,
-    AgentTaskStatus, MissionSessionCommandStatus, RuntimeEventInput, RuntimeEventRef,
-    RuntimeEventReplayer, RuntimeEventScope, RuntimeRecoveryAction, RuntimeRecoveryActionKind,
-    RuntimeRecoveryCandidate, RuntimeReplayReport, RuntimeServices,
+    candidate_from_action, global_steward_runtime_service, global_team_runtime_service,
+    MissionSessionCommandStatus, RuntimeEventInput, RuntimeEventRef, RuntimeEventReplayer,
+    RuntimeEventScope, RuntimeRecoveryAction, RuntimeRecoveryActionKind, RuntimeRecoveryCandidate,
+    RuntimeReplayReport, RuntimeServices,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,7 +76,7 @@ fn augmented_candidates(
         .collect::<Vec<_>>();
     for command in services
         .mission_runtime()
-        .projection(services.session_relations())
+        .projection(services.session_relations(), services.agent_runtime())
         .session_commands
     {
         let (action, risk, precondition) = match command.status {
@@ -114,30 +113,33 @@ fn augmented_candidates(
             evidence_refs: command.evidence_refs.clone(),
         });
     }
-    for task in global_agent_task_mailbox().list() {
-        let (action, risk, precondition) = match task.status {
-            AgentTaskStatus::Pending | AgentTaskStatus::Claimed | AgentTaskStatus::Running => (
+    for agent in services.agent_runtime().list() {
+        let (action, risk, precondition) = match agent.status {
+            harness_contract::agent::AgentStatus::Prepared
+            | harness_contract::agent::AgentStatus::Starting
+            | harness_contract::agent::AgentStatus::Running
+            | harness_contract::agent::AgentStatus::WaitingInput
+            | harness_contract::agent::AgentStatus::WaitingApproval
+            | harness_contract::agent::AgentStatus::Paused => (
                 RuntimeRecoveryActionKind::MarkInterrupted,
                 "medium",
-                "agent task is not terminal and must be confirmed before retry or synthesis",
+                "agent run is not terminal and must be confirmed before retry or synthesis",
             ),
-            AgentTaskStatus::Failed => (
-                RuntimeRecoveryActionKind::MarkInterrupted,
-                "medium",
-                "failed agent task needs retry, cancellation, or synthesis exclusion",
-            ),
-            AgentTaskStatus::Completed | AgentTaskStatus::Cancelled => continue,
+            harness_contract::agent::AgentStatus::Blocked
+            | harness_contract::agent::AgentStatus::Completed
+            | harness_contract::agent::AgentStatus::Failed
+            | harness_contract::agent::AgentStatus::Cancelled => continue,
         };
         candidates.push(RuntimeRecoveryCandidate {
-            candidate_id: format!("recovery-candidate-agent-task-{}", task.task_id),
-            owner: "runtime.agent_task_mailbox".to_string(),
-            source_stream_id: format!("agent-task:{}", task.task_id),
+            candidate_id: format!("recovery-candidate-agent-{}", agent.agent_id),
+            owner: "runtime.agent".to_string(),
+            source_stream_id: format!("agent:{}", agent.agent_id),
             scope: RuntimeEventScope::Agent,
             action,
             risk: risk.to_string(),
             precondition: precondition.to_string(),
-            reason: format!("agent task status is {:?}", task.status).to_ascii_lowercase(),
-            evidence_refs: task.evidence_refs.clone(),
+            reason: format!("agent status is {:?}", agent.status).to_ascii_lowercase(),
+            evidence_refs: vec![format!("graph:{}", agent.graph_id)],
         });
     }
     dedupe_candidates(candidates)
@@ -294,17 +296,10 @@ fn apply_action(
             }
         }
         RuntimeRecoveryActionKind::MarkInterrupted if action.stream_id.starts_with("agent:") => {
-            let agent_id = action.stream_id.trim_start_matches("agent:");
-            match global_agent_lifecycle_service().command(
-                agent_id,
-                AgentExecutionCommandKind::Interrupt,
-                Some(serde_json::json!({
-                    "reason": action.reason,
-                })),
-            ) {
-                Ok(_) => RecoveryApplyOutcome::Applied("agent interrupted".to_string()),
-                Err(error) => RecoveryApplyOutcome::Failed(error),
-            }
+            RecoveryApplyOutcome::Skipped(
+                "AgentRuntime interruption is delivered through the async RuntimeHost command adapter"
+                    .to_string(),
+            )
         }
         _ => RecoveryApplyOutcome::Skipped("no safe executor for stream/action".to_string()),
     }

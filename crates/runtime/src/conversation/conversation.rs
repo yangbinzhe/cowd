@@ -56,12 +56,11 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use tracing;
 
-use crate::agent::{SubAgentConfig, SubAgentRuntime};
 use crate::agent_collaboration::{CollaborationContextResult, CollaborationOps};
 use crate::agent_discussion::DiscussionEngine;
 use crate::budget_policy::{
     clamp_context_budget_ratio_bp, resolve_compact_threshold, RuntimeBudgetInputs,
-    RuntimeBudgetPlan, DEFAULT_SUBAGENT_BUDGET_TOKENS,
+    RuntimeBudgetPlan,
 };
 use crate::compact::{
     compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
@@ -2040,50 +2039,6 @@ where
             .map(|evaluator| evaluator.evaluate_all(&context))
     }
 
-    /// Create a sub-agent runtime with independent LLM reasoning capabilities.
-    pub fn create_subagent_runtime(&self, config: &SubAgentConfig) -> SubAgentRuntime<C, T>
-    where
-        C: Clone + Send + Sync + 'static,
-    {
-        let mut config = config.clone();
-        if config.context_lease().is_none()
-            && config.budget_tokens == DEFAULT_SUBAGENT_BUDGET_TOKENS
-        {
-            config.budget_tokens = self
-                .runtime_budget_plan()
-                .subagent_default_budget
-                .min(usize::MAX as u64) as usize;
-        }
-        let parent_session_id = self.session().session_id;
-        let lease = config.ensure_context_lease(parent_session_id, "primary");
-        let model = config.model.clone().or_else(|| self.model.clone());
-        let filtered_prompt =
-            filter_system_prompt_for_role(&self.system_prompt, &config.task_description);
-        let mut sub_rt = ConversationRuntime::new_with_features(
-            crate::session::Session::new(),
-            self.api_client.clone(),
-            Arc::clone(&self.tool_executor),
-            self.permission_policy.clone(),
-            filtered_prompt,
-            &RuntimeFeatureConfig::default(),
-        );
-        if let Some(ref m) = model {
-            sub_rt.model = Some(m.clone());
-        }
-        sub_rt.set_context_profile(ContextProfile::SubAgent);
-        sub_rt.runtime_control_policy = self.runtime_control_policy.clone();
-        sub_rt = sub_rt.with_model_context_window(lease.max_tokens.min(u64::from(u32::MAX)) as u32);
-        sub_rt.max_iterations = config.max_turns;
-        if let Some(ref mem) = self.memory_manager {
-            sub_rt = sub_rt.with_memory_manager(Arc::clone(mem));
-        }
-        let mut sub_agent = SubAgentRuntime::new(config, sub_rt);
-        if let Some(ref mem) = self.memory_manager {
-            sub_agent = sub_agent.with_parent_memory(Arc::clone(mem));
-        }
-        sub_agent
-    }
-
     /// Explicitly disable the memory subsystem, regardless of feature config.
     #[must_use]
     pub fn without_memory(mut self) -> Self {
@@ -2220,6 +2175,11 @@ where
         user_input: &str,
         first_step: bool,
     ) -> Result<ModelStepResult, RuntimeError> {
+        if self.cancellation_token.is_cancelled() {
+            return Err(RuntimeError::new(
+                "turn cancelled before provider execution",
+            ));
+        }
         let started_at = Instant::now();
         if first_step {
             self.clear_collaboration_result();
@@ -2465,6 +2425,9 @@ where
         prompter: &crate::permissions::SharedPrompter,
         iteration: usize,
     ) -> Result<ToolBatchStepResult, RuntimeError> {
+        if self.cancellation_token.is_cancelled() {
+            return Err(RuntimeError::new("turn cancelled before tool execution"));
+        }
         use crate::execution_scheduler::schedule_tool_execution_plan_for_decision;
         use crate::tool_dispatch::ToolRequest;
 
@@ -5441,17 +5404,6 @@ pub fn auto_compaction_threshold_from_env() -> u32 {
     parse_auto_compaction_threshold(value.as_deref())
 }
 
-fn filter_system_prompt_for_role(system_prompt: &[String], task_description: &str) -> Vec<String> {
-    let mut filtered = vec![format!(
-        "You are a sub-agent with the following task:\n\n{}\n\
-         Complete this task faithfully and report your results.\n\
-         Do NOT perform work outside the scope of this task.",
-        task_description
-    )];
-    filtered.extend_from_slice(system_prompt);
-    filtered
-}
-
 /// Convert a [`RuntimeFeatureConfig`] memory section into a [`CcMemoryConfig`]
 /// suitable for [`CognitiveContextManager::new`].
 #[doc(alias = "memory")]
@@ -6034,7 +5986,6 @@ mod tests {
     };
     use crate::permissions::{PermissionMode, PermissionPolicy};
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
-    use crate::SubAgentConfig;
     use crate::{resolve_context_budget_tokens, RuntimeBudgetInputs, RuntimeBudgetPlan};
     use futures::stream::Stream;
     use model_protocol::usage::TokenUsage;
@@ -6161,36 +6112,6 @@ mod tests {
 
         assert!(preview.ends_with("..."));
         assert!(text.starts_with(preview.trim_end_matches("...")));
-    }
-
-    #[test]
-    fn create_subagent_runtime_assigns_context_lease() {
-        let parent_session = Session::new();
-        let parent_session_id = parent_session.session_id.clone();
-        let runtime = ConversationRuntime::new(
-            parent_session,
-            MockApi,
-            StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
-            vec!["system".to_string()],
-        )
-        .without_memory();
-        let config = SubAgentConfig {
-            task_description: "review implementation".to_string(),
-            budget_tokens: 2_048,
-            ..SubAgentConfig::default()
-        };
-
-        let sub_agent = runtime.create_subagent_runtime(&config);
-        let lease = sub_agent
-            .context_lease()
-            .expect("sub-agent should receive context lease");
-
-        assert_eq!(lease.parent_session_id, parent_session_id);
-        assert_eq!(lease.parent_agent_id, "primary");
-        assert_eq!(lease.task_contract, "review implementation");
-        assert_eq!(lease.max_tokens, 2_048);
-        assert_eq!(sub_agent.agent_id(), lease.child_agent_id);
     }
 
     #[test]

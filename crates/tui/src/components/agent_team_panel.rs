@@ -715,7 +715,7 @@ mod tests {
     struct AgentDirectory;
 
     impl AgentDirectory {
-        fn global() -> Self {
+        fn new() -> Self {
             Self
         }
 
@@ -796,7 +796,7 @@ mod tests {
     #[test]
     fn sync_populates_agents() {
         let _guard = agent_directory_test_guard();
-        let dir = AgentDirectory::global();
+        let dir = AgentDirectory::new();
         dir.clear_all();
         dir.register(dummy_agent(
             "test-1",
@@ -816,7 +816,7 @@ mod tests {
     #[test]
     fn selected_agent_returns_correct_entry() {
         let _guard = agent_directory_test_guard();
-        let dir = AgentDirectory::global();
+        let dir = AgentDirectory::new();
         dir.clear_all();
         dir.register(dummy_agent(
             "alpha",
@@ -918,7 +918,7 @@ mod tests {
     #[test]
     fn render_with_agents() {
         let _guard = agent_directory_test_guard();
-        let dir = AgentDirectory::global();
+        let dir = AgentDirectory::new();
         dir.clear_all();
         dir.register(dummy_agent(
             "agent-1",
@@ -952,7 +952,7 @@ mod tests {
     #[test]
     fn keyboard_navigation_jk() {
         let _guard = agent_directory_test_guard();
-        let dir = AgentDirectory::global();
+        let dir = AgentDirectory::new();
         dir.clear_all();
         dir.register(dummy_agent("a", "Planner", AgentStatus::Active, vec![]));
         dir.register(dummy_agent("b", "Executor", AgentStatus::Busy, vec![]));
@@ -1011,7 +1011,7 @@ mod tests {
     #[test]
     fn keyboard_gg_jumps() {
         let _guard = agent_directory_test_guard();
-        let dir = AgentDirectory::global();
+        let dir = AgentDirectory::new();
         dir.clear_all();
         dir.register(dummy_agent("a", "P", AgentStatus::Active, vec![]));
         dir.register(dummy_agent("b", "E", AgentStatus::Active, vec![]));
@@ -1043,7 +1043,7 @@ mod tests {
     #[test]
     fn enter_toggles_detail() {
         let _guard = agent_directory_test_guard();
-        let dir = AgentDirectory::global();
+        let dir = AgentDirectory::new();
         dir.clear_all();
         dir.register(dummy_agent(
             "det",
@@ -1074,7 +1074,7 @@ mod tests {
     #[test]
     fn esc_collapses_detail_then_hides() {
         let _guard = agent_directory_test_guard();
-        let dir = AgentDirectory::global();
+        let dir = AgentDirectory::new();
         dir.clear_all();
         dir.register(dummy_agent("esc", "Executor", AgentStatus::Active, vec![]));
 
@@ -1151,7 +1151,7 @@ mod tests {
     #[test]
     fn sync_from_app_renders_execution_graph_and_delegate_tasks() {
         let _guard = agent_directory_test_guard();
-        let dir = AgentDirectory::global();
+        let dir = AgentDirectory::new();
         dir.clear_all();
         dir.register(dummy_agent(
             "planner-1",
@@ -1199,7 +1199,7 @@ mod tests {
     #[test]
     fn sync_resets_detail_when_roster_changes() {
         let _guard = agent_directory_test_guard();
-        let dir = AgentDirectory::global();
+        let dir = AgentDirectory::new();
         dir.clear_all();
         dir.register(dummy_agent("x", "E", AgentStatus::Active, vec![]));
 
@@ -1231,7 +1231,7 @@ mod tests {
     #[test]
     fn selection_clamped_after_roster_shrinks() {
         let _guard = agent_directory_test_guard();
-        let dir = AgentDirectory::global();
+        let dir = AgentDirectory::new();
         dir.clear_all();
         dir.register(dummy_agent("a", "P", AgentStatus::Active, vec![]));
         dir.register(dummy_agent("b", "E", AgentStatus::Active, vec![]));
@@ -1252,7 +1252,7 @@ mod tests {
     #[test]
     fn scroll_offset_tracks_selection_on_j() {
         let _guard = agent_directory_test_guard();
-        let dir = AgentDirectory::global();
+        let dir = AgentDirectory::new();
         dir.clear_all();
         for i in 0..15 {
             dir.register(dummy_agent(

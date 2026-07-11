@@ -12,10 +12,11 @@ use crate::skill::SkillActivationRecord;
 
 // ── TeamDiscoveryProtocol ──────────────────────────────────────────────────────
 
-/// Discovers and ranks agents for a given task using the global
+/// Discovers and ranks agents for one runtime scope using an injected
 /// `AgentDirectory` plus an optional reputation database.
 pub struct TeamDiscoveryProtocol {
     db: Option<Arc<Mutex<rusqlite::Connection>>>,
+    directory: Arc<AgentDirectory>,
 }
 
 /// A simple team result: a leader and a list of workers.
@@ -39,7 +40,10 @@ pub struct PersistedTeam {
 impl TeamDiscoveryProtocol {
     /// Create an in-memory-only discovery protocol (no persistence).
     pub fn new() -> Self {
-        Self { db: None }
+        Self {
+            db: None,
+            directory: Arc::new(AgentDirectory::new()),
+        }
     }
 
     /// Create a discovery protocol backed by a SQLite database at `db_path`.
@@ -76,7 +80,21 @@ impl TeamDiscoveryProtocol {
         .map_err(|e| format!("create table: {e}"))?;
         Ok(Self {
             db: Some(Arc::new(Mutex::new(conn))),
+            directory: Arc::new(AgentDirectory::new()),
         })
+    }
+
+    /// Bind discovery to the owner-provided runtime directory. This avoids a
+    /// process-global registry leaking agents across sessions or workspaces.
+    #[must_use]
+    pub fn with_directory(mut self, directory: Arc<AgentDirectory>) -> Self {
+        self.directory = directory;
+        self
+    }
+
+    #[must_use]
+    pub fn directory(&self) -> &Arc<AgentDirectory> {
+        &self.directory
     }
 
     // ── discover_team ──────────────────────────────────────────────────────
@@ -90,7 +108,7 @@ impl TeamDiscoveryProtocol {
         _task_description: &str,
         required_capabilities: &[String],
     ) -> Vec<AgentInfo> {
-        let candidates = AgentDirectory::global().discover(required_capabilities);
+        let candidates = self.directory.discover(required_capabilities);
         if candidates.is_empty() {
             return Vec::new();
         }
@@ -228,8 +246,8 @@ impl TeamDiscoveryProtocol {
     }
 
     /// Update reputation for an agent in the in-memory directory.
-    pub fn record_task_outcome(agent_id: &str, success: bool, peer_rating: Option<f64>) {
-        let agents = AgentDirectory::global().list_active();
+    pub fn record_task_outcome(&self, agent_id: &str, success: bool, peer_rating: Option<f64>) {
+        let agents = self.directory.list_active();
         for mut agent in agents {
             if agent.agent_id != agent_id {
                 continue;
@@ -251,7 +269,7 @@ impl TeamDiscoveryProtocol {
                 rep.peer_rating = (rep.peer_rating * (n - 1.0) + rating) / n;
             }
             agent.reputation = Some(rep);
-            AgentDirectory::global().register(agent);
+            self.directory.register(agent);
 
             // P9: Bidirectional sync — also update ReputationManager
             if let Some(mgr) = ReputationManager::global_opt() {
@@ -298,11 +316,16 @@ fn now_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use memory::agent_directory::{AgentDirectory, AgentInfo, AgentStatus, ReputationScore};
+    use memory::agent_directory::{AgentInfo, AgentStatus, ReputationScore};
 
-    fn register_test_agent(id: &str, capabilities: Vec<String>, rep: Option<ReputationScore>) {
+    fn register_test_agent(
+        proto: &TeamDiscoveryProtocol,
+        id: &str,
+        capabilities: Vec<String>,
+        rep: Option<ReputationScore>,
+    ) {
         let now = now_millis();
-        AgentDirectory::global().register(AgentInfo {
+        proto.directory().register(AgentInfo {
             agent_id: id.to_string(),
             role: "Executor".to_string(),
             capabilities,
@@ -313,18 +336,22 @@ mod tests {
         });
     }
 
-    fn cleanup(ids: &[&str]) {
+    fn cleanup(proto: &TeamDiscoveryProtocol, ids: &[&str]) {
         for id in ids {
-            AgentDirectory::global().unregister(id);
+            proto.directory().unregister(id);
         }
     }
 
     #[test]
     fn discover_team_ranks_by_skill_overlap() {
-        register_test_agent("td1_a1", vec!["rust".into(), "testing".into()], None);
-        register_test_agent("td1_a2", vec!["rust".into()], None);
-
         let proto = TeamDiscoveryProtocol::new();
+        register_test_agent(
+            &proto,
+            "td1_a1",
+            vec!["rust".into(), "testing".into()],
+            None,
+        );
+        register_test_agent(&proto, "td1_a2", vec!["rust".into()], None);
         let ranked =
             proto.discover_team("Build a Rust service", &["rust".into(), "testing".into()]);
 
@@ -338,12 +365,14 @@ mod tests {
             "a1 (2 matches) should rank before a2 (1 match)"
         );
 
-        cleanup(&["td1_a1", "td1_a2"]);
+        cleanup(&proto, &["td1_a1", "td1_a2"]);
     }
 
     #[test]
     fn reputation_boosts_ranking() {
+        let proto = TeamDiscoveryProtocol::new();
         register_test_agent(
+            &proto,
             "td2_rep_a",
             vec!["rust".into()],
             Some(ReputationScore {
@@ -355,6 +384,7 @@ mod tests {
             }),
         );
         register_test_agent(
+            &proto,
             "td2_rep_b",
             vec!["rust".into(), "testing".into()],
             Some(ReputationScore {
@@ -366,7 +396,6 @@ mod tests {
             }),
         );
 
-        let proto = TeamDiscoveryProtocol::new();
         let ranked = proto.discover_team("Rust refactoring", &["rust".into()]);
 
         let pos_a = ranked.iter().position(|a| a.agent_id == "td2_rep_a");
@@ -378,20 +407,21 @@ mod tests {
             "high-rep agent should rank before low-rep agent"
         );
 
-        cleanup(&["td2_rep_a", "td2_rep_b"]);
+        cleanup(&proto, &["td2_rep_a", "td2_rep_b"]);
     }
 
     #[test]
     fn auto_assemble_produces_leader_and_workers() {
+        let proto = TeamDiscoveryProtocol::new();
         register_test_agent(
+            &proto,
             "td3_lead",
             vec!["rust".into(), "planning".into(), "review".into()],
             None,
         );
-        register_test_agent("td3_wr", vec!["rust".into()], None);
-        register_test_agent("td3_wt", vec!["testing".into()], None);
+        register_test_agent(&proto, "td3_wr", vec!["rust".into()], None);
+        register_test_agent(&proto, "td3_wt", vec!["testing".into()], None);
 
-        let proto = TeamDiscoveryProtocol::new();
         let team = proto
             .auto_assemble(
                 "Build a Rust microservice",
@@ -414,17 +444,19 @@ mod tests {
             "w-test should NOT be a worker (no matching skills)"
         );
 
-        cleanup(&["td3_lead", "td3_wr", "td3_wt"]);
+        cleanup(&proto, &["td3_lead", "td3_wr", "td3_wt"]);
     }
 
     #[test]
     fn auto_assemble_for_activation_uses_skill_candidate_names() {
+        let proto = TeamDiscoveryProtocol::new();
         register_test_agent(
+            &proto,
             "td_skill_release",
             vec!["release".into(), "git-release".into()],
             None,
         );
-        register_test_agent("td_skill_debug", vec!["debug".into()], None);
+        register_test_agent(&proto, "td_skill_debug", vec!["debug".into()], None);
 
         let activation = crate::skill::SkillActivationRecord::new(
             "session-skill",
@@ -438,14 +470,13 @@ mod tests {
                 source: crate::skill::activation::RuntimeSkillCandidateSource::Profile,
             }],
         );
-        let proto = TeamDiscoveryProtocol::new();
         let team = proto
             .auto_assemble_for_activation(&activation)
             .expect("skill activation should assemble a team");
 
         assert_eq!(team.leader.agent_id, "td_skill_release");
 
-        cleanup(&["td_skill_release", "td_skill_debug"]);
+        cleanup(&proto, &["td_skill_release", "td_skill_debug"]);
     }
 
     #[test]
@@ -455,8 +486,8 @@ mod tests {
 
         let proto = TeamDiscoveryProtocol::with_db(&db_path).expect("create db");
 
-        register_test_agent("td4_lead", vec!["rust".into()], None);
-        register_test_agent("td4_w1", vec!["testing".into()], None);
+        register_test_agent(&proto, "td4_lead", vec!["rust".into()], None);
+        register_test_agent(&proto, "td4_w1", vec!["testing".into()], None);
 
         let now = now_millis();
         let w1 = AgentInfo {
@@ -480,12 +511,14 @@ mod tests {
         assert_eq!(loaded[0].worker_ids, vec!["td4_w1"]);
         assert_eq!(loaded[0].status, "active");
 
-        cleanup(&["td4_lead", "td4_w1"]);
+        cleanup(&proto, &["td4_lead", "td4_w1"]);
     }
 
     #[test]
     fn record_task_outcome_updates_reputation_correctly() {
+        let proto = TeamDiscoveryProtocol::new();
         register_test_agent(
+            &proto,
             "td5_ag",
             vec!["rust".into()],
             Some(ReputationScore {
@@ -497,9 +530,9 @@ mod tests {
             }),
         );
 
-        TeamDiscoveryProtocol::record_task_outcome("td5_ag", true, Some(4.0));
+        proto.record_task_outcome("td5_ag", true, Some(4.0));
 
-        let active = AgentDirectory::global().list_active();
+        let active = proto.directory().list_active();
         let agent = active.iter().find(|a| a.agent_id == "td5_ag").unwrap();
         let rep = agent.reputation.as_ref().unwrap();
         assert_eq!(rep.task_count, 3);
@@ -508,7 +541,7 @@ mod tests {
         assert!(rep.last_success_at_ms > 0);
         assert!(rep.peer_rating > 3.0);
 
-        cleanup(&["td5_ag"]);
+        cleanup(&proto, &["td5_ag"]);
     }
 
     #[test]

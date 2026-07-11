@@ -2418,7 +2418,6 @@ pub(crate) mod tests {
         }
 
         let teams_before = runtime::global_team_runtime_service().projection();
-        let agents_before = runtime::global_agent_lifecycle_service().projection();
         let team = app
             .clone()
             .oneshot(
@@ -2448,10 +2447,6 @@ pub(crate) mod tests {
         assert_eq!(
             runtime::global_team_runtime_service().projection(),
             teams_before
-        );
-        assert_eq!(
-            runtime::global_agent_lifecycle_service().projection(),
-            agents_before
         );
 
         let approval = app
@@ -4935,38 +4930,37 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_agent_routes_project_events_and_cancel() {
-        let app = api_router(test_state());
+    async fn runtime_agent_routes_reject_commands_without_recoverable_backend_handle() {
+        let state = test_state();
         let agent_id = format!("agent-route-{}", uuid::Uuid::new_v4());
-        let dir = std::env::temp_dir().join(format!("cowd-agent-route-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let output_file = dir.join("agent.md");
-        let manifest_file = dir.join("agent.json");
-        std::fs::write(&output_file, "# Agent Task\n").unwrap();
-        let snapshot = runtime::AgentSnapshot {
-            agent_id: agent_id.clone(),
-            name: String::from("route-agent"),
-            description: String::from("route test"),
-            subagent_type: Some(String::from("Explore")),
-            model: Some(String::from(runtime::DEFAULT_AGENT_MODEL)),
-            status: String::from("running"),
-            backend: runtime::AgentExecutionBackendKind::InProcess,
-            output_file: output_file.display().to_string(),
-            manifest_file: manifest_file.display().to_string(),
-            created_at: String::from("1"),
-            started_at: Some(String::from("1")),
-            completed_at: None,
-            lane_events: vec![],
-            current_blocker: None,
-            derived_state: String::from("working"),
-            error: None,
-        };
-        runtime::global_agent_lifecycle_service()
-            .register_started(snapshot, runtime::CancellationToken::new());
-        assert!(!manifest_file.exists());
-        let events_before = runtime::global_agent_lifecycle_service()
-            .events(&agent_id)
-            .expect("agent events");
+        let services = state
+            .services
+            .runtime
+            .as_ref()
+            .expect("runtime service")
+            .runtime_services();
+        services
+            .agent_runtime()
+            .restore_verified_run(runtime::AgentRunSnapshot {
+                run_id: format!("run-{agent_id}"),
+                agent_id: agent_id.clone(),
+                task_id: "task-route".to_string(),
+                session_id: "session-route".to_string(),
+                graph_id: "graph-route".to_string(),
+                node_id: "node-route".to_string(),
+                attempt: 1,
+                expected_graph_revision: 1,
+                backend: runtime::AgentBackendKind::InProcess,
+                status: harness_contract::agent::AgentStatus::Running,
+                revision: 0,
+                model: None,
+                provider: None,
+                started_at_ms: 1,
+                updated_at_ms: 1,
+                failure: None,
+            })
+            .expect("restore agent");
+        let app = api_router(state);
 
         let detail = app
             .clone()
@@ -4994,10 +4988,11 @@ pub(crate) mod tests {
         assert_eq!(cancel.status(), StatusCode::OK);
         let body = to_bytes(cancel.into_body(), usize::MAX).await.unwrap();
         let cancel_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(cancel_json["status"], "capability_unavailable");
-        assert_eq!(cancel_json["capability"], "agent_execution");
-        assert_eq!(cancel_json["available_in"], "V5");
-        assert_eq!(cancel_json["side_effects_started"], false);
+        assert_eq!(cancel_json["receipt"]["accepted"], false);
+        assert_eq!(
+            cancel_json["receipt"]["reject_reason"],
+            "unsupported_by_backend"
+        );
 
         let events = app
             .clone()
@@ -5012,52 +5007,43 @@ pub(crate) mod tests {
         assert_eq!(events.status(), StatusCode::OK);
         let body = to_bytes(events.into_body(), usize::MAX).await.unwrap();
         let events_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(events_json["events"], serde_json::json!(events_before));
-
-        assert!(!manifest_file.exists());
-        let _ = std::fs::remove_dir_all(dir);
+        assert!(events_json["count"].as_u64().unwrap_or_default() >= 2);
     }
 
     #[tokio::test]
-    async fn runtime_agent_routes_deliver_input_interrupt_and_shutdown_commands() {
-        let app = api_router(test_state());
+    async fn runtime_agent_routes_preserve_rejection_for_unrecoverable_process_handles() {
+        let state = test_state();
         let agent_id = format!("agent-command-{}", uuid::Uuid::new_v4());
-        let dir = std::env::temp_dir().join(format!("cowd-agent-command-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let output_file = dir.join("agent.md");
-        let manifest_file = dir.join("agent.json");
-        std::fs::write(&output_file, "# Agent Task\n").unwrap();
-        let snapshot = runtime::AgentSnapshot {
-            agent_id: agent_id.clone(),
-            name: String::from("command-agent"),
-            description: String::from("command test"),
-            subagent_type: Some(String::from("Explore")),
-            model: Some(String::from(runtime::DEFAULT_AGENT_MODEL)),
-            status: String::from("running"),
-            backend: runtime::AgentExecutionBackendKind::ProcessJsonl,
-            output_file: output_file.display().to_string(),
-            manifest_file: manifest_file.display().to_string(),
-            created_at: String::from("1"),
-            started_at: Some(String::from("1")),
-            completed_at: None,
-            lane_events: vec![],
-            current_blocker: None,
-            derived_state: String::from("working"),
-            error: None,
-        };
-        runtime::global_agent_lifecycle_service()
-            .register_started(snapshot, runtime::CancellationToken::new());
-        let (tx, rx) = std::sync::mpsc::channel::<runtime::AgentExecutionCommand>();
-        runtime::global_agent_lifecycle_service()
-            .attach_command_channel(&agent_id, tx)
-            .expect("command channel");
-        assert!(!manifest_file.exists());
+        let services = state
+            .services
+            .runtime
+            .as_ref()
+            .expect("runtime service")
+            .runtime_services();
+        services
+            .agent_runtime()
+            .restore_verified_run(runtime::AgentRunSnapshot {
+                run_id: format!("run-{agent_id}"),
+                agent_id: agent_id.clone(),
+                task_id: "task-command".to_string(),
+                session_id: "session-command".to_string(),
+                graph_id: "graph-command".to_string(),
+                node_id: "node-command".to_string(),
+                attempt: 1,
+                expected_graph_revision: 1,
+                backend: runtime::AgentBackendKind::ProcessJsonl,
+                status: harness_contract::agent::AgentStatus::Running,
+                revision: 0,
+                model: None,
+                provider: None,
+                started_at_ms: 1,
+                updated_at_ms: 1,
+                failure: None,
+            })
+            .expect("restore agent");
+        let app = api_router(state);
 
-        for (path, expected) in [
-            ("input", runtime::AgentExecutionCommandKind::Input),
-            ("interrupt", runtime::AgentExecutionCommandKind::Interrupt),
-            ("shutdown", runtime::AgentExecutionCommandKind::Shutdown),
-        ] {
+        for path in ["input", "interrupt", "shutdown"] {
             let response = app
                 .clone()
                 .oneshot(
@@ -5075,74 +5061,9 @@ pub(crate) mod tests {
             assert_eq!(response.status(), StatusCode::OK);
             let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(json["status"], "capability_unavailable");
-            assert_eq!(json["capability"], "agent_execution");
-            assert_eq!(json["available_in"], "V5");
-            assert_eq!(json["side_effects_started"], false);
-            assert_eq!(json["command"], serde_json::json!(expected));
-            assert!(matches!(
-                rx.try_recv(),
-                Err(std::sync::mpsc::TryRecvError::Empty)
-            ));
+            assert_eq!(json["receipt"]["accepted"], false);
+            assert_eq!(json["receipt"]["reject_reason"], "unsupported_by_backend");
         }
-        assert!(!manifest_file.exists());
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn runtime_agent_command_reports_unavailable_without_requiring_channel() {
-        let app = api_router(test_state());
-        let agent_id = format!("agent-no-command-channel-{}", uuid::Uuid::new_v4());
-        let dir = std::env::temp_dir().join(format!(
-            "cowd-agent-no-command-channel-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let output_file = dir.join("agent.md");
-        let manifest_file = dir.join("agent.json");
-        std::fs::write(&output_file, "# Agent Task\n").unwrap();
-        runtime::global_agent_lifecycle_service().register_started(
-            runtime::AgentSnapshot {
-                agent_id: agent_id.clone(),
-                name: String::from("no-command-agent"),
-                description: String::from("no command channel test"),
-                subagent_type: Some(String::from("Explore")),
-                model: Some(String::from(runtime::DEFAULT_AGENT_MODEL)),
-                status: String::from("queued"),
-                backend: runtime::AgentExecutionBackendKind::InProcess,
-                output_file: output_file.display().to_string(),
-                manifest_file: manifest_file.display().to_string(),
-                created_at: String::from("1"),
-                started_at: Some(String::from("1")),
-                completed_at: None,
-                lane_events: vec![],
-                current_blocker: None,
-                derived_state: String::from("queued"),
-                error: None,
-            },
-            runtime::CancellationToken::new(),
-        );
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/runtime/agents/{agent_id}/input"))
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({"payload": {"text": "hi"}}).to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["status"], "capability_unavailable");
-        assert_eq!(json["capability"], "agent_execution");
-        assert_eq!(json["side_effects_started"], false);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

@@ -500,9 +500,31 @@ async fn record_upgrade_disposition(
                             .to_string()
                     })
             }
-            "agent" => runtime::global_agent_lifecycle_service()
-                .cancel(&request.carrier_id)
-                .map(|_| ()),
+            "agent" => {
+                let runtime_services = runtime_service.runtime_services();
+                let agent_runtime = runtime_services.agent_runtime();
+                match agent_runtime.get(&request.carrier_id) {
+                    Some(snapshot) => {
+                        let receipt = agent_runtime
+                            .command(harness_contract::agent::AgentCommandRequest {
+                                command_id: format!(
+                                    "gateway-upgrade-cancel-{}",
+                                    uuid::Uuid::new_v4()
+                                ),
+                                agent_id: snapshot.agent_id.clone(),
+                                expected_revision: snapshot.revision,
+                                command: harness_contract::agent::AgentCommand::Cancel,
+                                input: None,
+                            })
+                            .await;
+                        receipt
+                            .accepted
+                            .then_some(())
+                            .ok_or_else(|| receipt.message)
+                    }
+                    None => Err(format!("agent not found: {}", request.carrier_id)),
+                }
+            }
             "team" => state
                 .services
                 .mission

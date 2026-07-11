@@ -375,6 +375,7 @@ pub struct ProblemSolvingPipeline<E: SubAgentExecutor> {
     config: ProblemSolvingConfig,
     executor: Arc<E>,
     parent_memory: Option<Arc<memory::CognitiveContextManager>>,
+    directory: Arc<AgentDirectory>,
 }
 
 impl<E: SubAgentExecutor + 'static> ProblemSolvingPipeline<E> {
@@ -383,6 +384,7 @@ impl<E: SubAgentExecutor + 'static> ProblemSolvingPipeline<E> {
             config: ProblemSolvingConfig::default(),
             executor,
             parent_memory: None,
+            directory: Arc::new(AgentDirectory::new()),
         }
     }
 
@@ -393,6 +395,11 @@ impl<E: SubAgentExecutor + 'static> ProblemSolvingPipeline<E> {
 
     pub fn with_parent_memory(mut self, memory: Arc<memory::CognitiveContextManager>) -> Self {
         self.parent_memory = Some(memory);
+        self
+    }
+
+    pub fn with_directory(mut self, directory: Arc<AgentDirectory>) -> Self {
+        self.directory = directory;
         self
     }
 
@@ -440,8 +447,9 @@ impl<E: SubAgentExecutor + 'static> ProblemSolvingPipeline<E> {
             }
 
             // Collect perspectives from available agents.
-            let directory = AgentDirectory::global();
-            let agents = directory.discover(&["planning".to_string(), "general".to_string()]);
+            let agents = self
+                .directory
+                .discover(&["planning".to_string(), "general".to_string()]);
             let mut perspectives: Vec<String> = Vec::new();
 
             for agent in agents.iter().take(3) {

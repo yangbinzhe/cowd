@@ -450,7 +450,8 @@ impl RuntimeService {
             .collect::<Vec<_>>();
 
         carriers.extend(
-            runtime::global_agent_lifecycle_service()
+            self.runtime_services()
+                .agent_runtime()
                 .list()
                 .into_iter()
                 .map(|snapshot| {
@@ -459,11 +460,12 @@ impl RuntimeService {
                         "agent",
                         snapshot.agent_id.clone(),
                         status,
-                        snapshot.lane_events.len() as u64,
-                        (!snapshot.output_file.trim().is_empty())
-                            .then_some(snapshot.output_file.clone()),
-                        (!snapshot.manifest_file.trim().is_empty())
-                            .then_some(snapshot.manifest_file.clone()),
+                        snapshot.revision,
+                        snapshot.failure.clone(),
+                        Some(format!(
+                            "graph://{}/node/{}",
+                            snapshot.graph_id, snapshot.node_id
+                        )),
                         &snapshot,
                     )
                 }),
@@ -491,7 +493,10 @@ impl RuntimeService {
         carriers.extend(
             self.runtime_services
                 .mission_runtime()
-                .projection(self.runtime_services.session_relations())
+                .projection(
+                    self.runtime_services.session_relations(),
+                    self.runtime_services.agent_runtime(),
+                )
                 .sessions
                 .into_iter()
                 .map(|snapshot| {
@@ -1998,16 +2003,22 @@ fn upgrade_carrier_record(
     }
 }
 
-fn upgrade_agent_status(status: &str) -> runtime::UpgradeCarrierStatus {
-    match status.trim().to_ascii_lowercase().as_str() {
-        "pending" | "ready" | "created" => runtime::UpgradeCarrierStatus::Ready,
-        "running" | "active" => runtime::UpgradeCarrierStatus::Running,
-        "waiting" | "pending_approval" => runtime::UpgradeCarrierStatus::Waiting,
-        "paused" | "interrupted" => runtime::UpgradeCarrierStatus::Paused,
-        "completed" | "succeeded" => runtime::UpgradeCarrierStatus::Completed,
-        "failed" | "error" => runtime::UpgradeCarrierStatus::Failed,
-        "cancelled" | "canceled" | "shutdown" => runtime::UpgradeCarrierStatus::Cancelled,
-        _ => runtime::UpgradeCarrierStatus::Blocked,
+fn upgrade_agent_status(
+    status: &harness_contract::agent::AgentStatus,
+) -> runtime::UpgradeCarrierStatus {
+    match status {
+        harness_contract::agent::AgentStatus::Prepared
+        | harness_contract::agent::AgentStatus::Starting => runtime::UpgradeCarrierStatus::Ready,
+        harness_contract::agent::AgentStatus::Running => runtime::UpgradeCarrierStatus::Running,
+        harness_contract::agent::AgentStatus::WaitingInput
+        | harness_contract::agent::AgentStatus::WaitingApproval => {
+            runtime::UpgradeCarrierStatus::Waiting
+        }
+        harness_contract::agent::AgentStatus::Paused => runtime::UpgradeCarrierStatus::Paused,
+        harness_contract::agent::AgentStatus::Completed => runtime::UpgradeCarrierStatus::Completed,
+        harness_contract::agent::AgentStatus::Failed => runtime::UpgradeCarrierStatus::Failed,
+        harness_contract::agent::AgentStatus::Cancelled => runtime::UpgradeCarrierStatus::Cancelled,
+        harness_contract::agent::AgentStatus::Blocked => runtime::UpgradeCarrierStatus::Blocked,
     }
 }
 
@@ -2180,11 +2191,11 @@ mod tests {
     #[test]
     fn upgrade_status_mapping_preserves_active_and_terminal_boundaries() {
         assert_eq!(
-            upgrade_agent_status("running"),
+            upgrade_agent_status(&harness_contract::agent::AgentStatus::Running),
             runtime::UpgradeCarrierStatus::Running
         );
         assert_eq!(
-            upgrade_agent_status("completed"),
+            upgrade_agent_status(&harness_contract::agent::AgentStatus::Completed),
             runtime::UpgradeCarrierStatus::Completed
         );
         assert_eq!(

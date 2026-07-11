@@ -10,7 +10,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{global_agent_lifecycle_service, global_team_runtime_service};
+use crate::{global_team_runtime_service, AgentRuntime};
 use crate::{
     RuntimeCapabilityCatalog, SessionRecoveryCandidate, SessionRelationGraph, StewardScheduler,
     TeamExecutionLoop,
@@ -656,7 +656,11 @@ impl MissionRuntime {
             .clone()
     }
 
-    pub fn projection(&self, relations: &SessionRelationGraph) -> MissionProjection {
+    pub fn projection(
+        &self,
+        relations: &SessionRelationGraph,
+        agent_runtime: &AgentRuntime,
+    ) -> MissionProjection {
         let state = self
             .state
             .lock()
@@ -671,7 +675,10 @@ impl MissionRuntime {
             session_command_summary: session_command_summary(&state.session_commands),
             session_commands: state.session_commands.values().cloned().collect(),
             team_projection: global_team_runtime_service().projection(),
-            agent_projection: global_agent_lifecycle_service().projection(),
+            agent_projection: serde_json::json!({
+                "kind": "runtime.agents",
+                "agents": agent_runtime.list(),
+            }),
             approval_projection: serde_json::Value::Null,
             relation_projection: relations.projection(),
             execution_graph_projection: mission_execution_graph_projection(),
@@ -1075,6 +1082,7 @@ mod tests {
     #[test]
     fn mission_runtime_tracks_multiple_sessions_and_projection() {
         let runtime = MissionRuntime::new();
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
         let first = runtime
             .start_session(StartMissionSessionRequest {
                 title: "first task".to_string(),
@@ -1113,7 +1121,7 @@ mod tests {
         assert_eq!(routed.status, "queued");
         assert_eq!(routed.target_session_id, "mission-session-b");
 
-        let projection = runtime.projection(&SessionRelationGraph::new());
+        let projection = runtime.projection(&SessionRelationGraph::new(), services.agent_runtime());
         assert_eq!(projection.active_session_id, None);
         assert_eq!(projection.routed_commands.len(), 1);
         let session = projection
@@ -1142,6 +1150,7 @@ mod tests {
     #[test]
     fn mission_projection_v2_exposes_runtime_control_closure() {
         let runtime = MissionRuntime::new();
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
         runtime
             .start_session(StartMissionSessionRequest {
                 title: "projection v2".to_string(),
@@ -1149,7 +1158,7 @@ mod tests {
             })
             .expect("session");
 
-        let projection = runtime.projection(&SessionRelationGraph::new());
+        let projection = runtime.projection(&SessionRelationGraph::new(), services.agent_runtime());
 
         assert_eq!(projection.schema_version, 2);
         assert_eq!(

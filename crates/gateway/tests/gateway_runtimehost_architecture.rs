@@ -286,19 +286,19 @@ fn production_code_does_not_depend_on_daemon_module() {
 fn production_turns_enter_the_execution_graph_host_once() {
     let gateway_entry_source = read_repo("crates/gateway/src/runtime/runtime_entry.rs");
     let gateway_service_source = read_repo("crates/gateway/src/runtime/runtime_service.rs");
-    let subagent_source = read_repo("crates/runtime/src/agent/subagent_turn.rs");
+    let in_process_agent_source = read_repo("crates/runtime/src/agent/in_process_worker.rs");
     let agent_source = read_repo("crates/runtime/src/agent/agent.rs");
     let host_source = read_repo("crates/runtime/src/conversation/host.rs");
     let gateway_entry = gateway_entry_source.as_str();
     let gateway_service = production_part(&gateway_service_source);
-    let subagent = production_part(&subagent_source);
+    let in_process_agent = production_part(&in_process_agent_source);
     let agent = production_part(&agent_source);
     let host = production_part(&host_source);
 
     assert!(gateway_entry.contains(".submit_turn(content, prompter)"));
     assert!(gateway_service.contains(".submit_turn(&content"));
-    assert!(subagent.contains("runtime.submit_turn(&prompt"));
-    assert!(agent.contains("submit_owned_conversation_turn("));
+    assert!(in_process_agent.contains("submit_turn(&packet.objective"));
+    assert!(agent.contains("production implementations submit canonical AgentTask nodes"));
     assert!(host.contains("services.graph_runner().start(graph).await"));
     assert!(host.contains("ExecutionGraphCompiler"));
     assert!(!host.contains("execute_model_tool_cycle"));
@@ -306,7 +306,7 @@ fn production_turns_enter_the_execution_graph_host_once() {
     for (path, source) in [
         ("gateway runtime entry", gateway_entry),
         ("gateway runtime service", gateway_service),
-        ("provider subagent", subagent),
+        ("in-process agent", in_process_agent),
         ("generic agent", agent),
     ] {
         assert!(

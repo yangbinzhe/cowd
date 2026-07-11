@@ -292,7 +292,7 @@ pub enum AgentReturnRequirement {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentReturnPacket {
+pub struct AgentReturnContextProjection {
     pub parent_session_id: String,
     pub child_agent_id: String,
     pub result_summary: String,
@@ -1667,7 +1667,7 @@ impl ContextRuntimeKernel {
         )
     }
 
-    pub fn agent_return_item(packet: &AgentReturnPacket) -> ContextItem {
+    pub fn agent_return_item(packet: &AgentReturnContextProjection) -> ContextItem {
         let mut content = format!(
             "Agent {} returned: {}",
             packet.child_agent_id, packet.result_summary
@@ -2911,7 +2911,7 @@ mod tests {
         assert_eq!(identity.mode, ContextMode::SubAgent);
         assert_eq!(identity.parent_agent_id.as_deref(), Some("primary"));
 
-        let packet = AgentReturnPacket {
+        let packet = AgentReturnContextProjection {
             parent_session_id: "session-1".to_string(),
             child_agent_id: "reviewer".to_string(),
             result_summary: "diff is safe".to_string(),

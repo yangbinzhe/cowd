@@ -10,6 +10,7 @@ use crate::execution_core::graph::{
     NodeExecutionContext, NodeExecutionOutcome, NodeExecutionTicket, NodeExecutor,
     NodeExecutorError,
 };
+use crate::validate_agent_return;
 
 #[async_trait]
 pub trait AgentTaskBackend: Send + Sync {
@@ -124,9 +125,9 @@ impl NodeExecutor for AgentTaskExecutor {
                     node_id: ticket.node_id.clone(),
                     reason,
                 })?;
-        validate_return(&packet, &returned).map_err(|reason| NodeExecutorError::Poll {
+        validate_agent_return(&packet, &returned).map_err(|reason| NodeExecutorError::Poll {
             node_id: ticket.node_id.clone(),
-            reason,
+            reason: reason.to_string(),
         })?;
         let status = match returned.status {
             AgentTerminalStatus::Completed => ExecutionNodeStatus::Completed,
@@ -171,38 +172,6 @@ fn validate_packet(packet: &AgentTaskPacket) -> Result<(), String> {
     .any(|value| value.trim().is_empty())
     {
         return Err("AgentTaskPacket contains an empty required binding".into());
-    }
-    Ok(())
-}
-
-fn validate_return(task: &AgentTaskPacket, returned: &AgentReturnPacket) -> Result<(), String> {
-    if returned.run_id != task.run_id
-        || returned.agent_id != task.agent_id
-        || returned.task_id != task.task_id
-        || returned.session_id != task.session_id
-        || returned.graph_id != task.graph_id
-        || returned.node_id != task.node_id
-        || returned.attempt != task.attempt
-        || returned.expected_graph_revision != task.expected_graph_revision
-    {
-        return Err("AgentReturnPacket does not match task identity/revision binding".into());
-    }
-    if matches!(returned.status, AgentTerminalStatus::Completed)
-        && returned.outcome.trim().is_empty()
-    {
-        return Err("completed AgentReturnPacket has no outcome".into());
-    }
-    if matches!(returned.status, AgentTerminalStatus::Completed)
-        && !task.acceptance.is_empty()
-        && returned.acceptance.is_empty()
-    {
-        return Err("completed AgentReturnPacket did not evaluate acceptance criteria".into());
-    }
-    if matches!(returned.status, AgentTerminalStatus::Completed)
-        && !task.evidence_refs.is_empty()
-        && returned.evidence_refs.is_empty()
-    {
-        return Err("completed AgentReturnPacket is missing required evidence".into());
     }
     Ok(())
 }
@@ -272,14 +241,15 @@ mod tests {
         let task = task();
         let mut returned = returned(&task);
         returned.expected_graph_revision += 1;
-        assert!(validate_return(&task, &returned)
-            .unwrap_err()
-            .contains("identity/revision"));
+        assert_eq!(
+            validate_agent_return(&task, &returned).unwrap_err(),
+            crate::AgentResultValidationError::BindingMismatch
+        );
     }
 
     #[test]
     fn accepts_complete_bound_return_packet() {
         let task = task();
-        validate_return(&task, &returned(&task)).expect("valid return packet");
+        validate_agent_return(&task, &returned(&task)).expect("valid return packet");
     }
 }

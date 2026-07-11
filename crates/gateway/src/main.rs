@@ -634,7 +634,6 @@ fn run_static_entry() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
         } => print_static_tool_command(args.as_deref(), output_format)?,
         CliAction::Setup { output_format } => print_setup(output_format)?,
-        CliAction::State { output_format } => mcp_serve::run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
         CliAction::Export {
             session_reference,
@@ -943,9 +942,6 @@ pub(crate) enum CliAction {
         output_format: CliOutputFormat,
     },
     Setup {
-        output_format: CliOutputFormat,
-    },
-    State {
         output_format: CliOutputFormat,
     },
     Init {

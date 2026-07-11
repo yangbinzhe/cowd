@@ -286,41 +286,15 @@ fn fresh_approved_lane_gets_merge_action() {
     assert_eq!(actions, vec![PolicyAction::MergeToDev]);
 }
 
-/// worker_boot + recovery_recipes + policy_engine integration:
-/// When a session completes with a provider failure, does the worker
-/// status transition trigger the correct recovery recipe, and does
-/// the resulting recovery state feed into policy decisions?
+/// Recovery policy and green-state policy integrate through a normalized
+/// runtime startup failure, without a second process-local worker registry.
 #[test]
-fn worker_provider_failure_flows_through_recovery_to_policy() {
+fn provider_failure_flows_through_recovery_to_policy() {
     use runtime::recovery_recipes::{
         attempt_recovery, FailureScenario, RecoveryContext, RecoveryResult, RecoveryStep,
+        StartupFailureKind,
     };
-    use runtime::worker_boot::{WorkerFailureKind, WorkerRegistry, WorkerStatus};
-
-    // given — a worker that encounters a provider failure during session completion
-    let registry = WorkerRegistry::new();
-    let worker = registry.create("/tmp/repo-recovery-test", &[], true);
-
-    // Worker reaches ready state
-    registry
-        .observe(&worker.worker_id, "Ready for your input\n>")
-        .expect("ready observe should succeed");
-    registry
-        .send_prompt(&worker.worker_id, Some("Run analysis"), None)
-        .expect("prompt send should succeed");
-
-    // Session completes with provider failure (finish="unknown", tokens=0)
-    let failed_worker = registry
-        .observe_completion(&worker.worker_id, "unknown", 0)
-        .expect("completion observe should succeed");
-    assert_eq!(failed_worker.status, WorkerStatus::Failed);
-    let failure = failed_worker
-        .last_error
-        .expect("worker should have recorded error");
-    assert_eq!(failure.kind, WorkerFailureKind::Provider);
-
-    // Bridge: WorkerFailureKind -> FailureScenario
-    let scenario = FailureScenario::from_worker_failure_kind(failure.kind);
+    let scenario = FailureScenario::from_startup_failure_kind(StartupFailureKind::Provider);
     assert_eq!(scenario, FailureScenario::ProviderFailure);
 
     // Recovery recipe lookup and execution
@@ -439,11 +413,12 @@ fn team_discovery_ranks_by_skill_overlap_from_directory() {
         },
     ];
 
+    let directory = std::sync::Arc::new(AgentDirectory::new());
     for a in &agents {
-        AgentDirectory::global().register(a.clone());
+        directory.register(a.clone());
     }
 
-    let discovery = TeamDiscoveryProtocol::new();
+    let discovery = TeamDiscoveryProtocol::new().with_directory(std::sync::Arc::clone(&directory));
     let ranked = discovery.discover_team(
         "Build a Rust microservice with tests",
         &[rust_skill.into(), testing_skill.into()],
@@ -458,7 +433,7 @@ fn team_discovery_ranks_by_skill_overlap_from_directory() {
 
     // Cleanup
     for a in &agents {
-        AgentDirectory::global().unregister(&a.agent_id);
+        directory.unregister(&a.agent_id);
     }
 }
 
@@ -522,11 +497,13 @@ fn orchestrator_assemble_team_uses_discovery_protocol() {
         },
     ];
 
+    let directory = std::sync::Arc::new(AgentDirectory::new());
     for a in &agents {
-        AgentDirectory::global().register(a.clone());
+        directory.register(a.clone());
     }
 
-    let orch = CollaborationOrchestrator::<NoopExecutor>::new(std::sync::Arc::new(NoopExecutor));
+    let orch = CollaborationOrchestrator::<NoopExecutor>::new(std::sync::Arc::new(NoopExecutor))
+        .with_directory(std::sync::Arc::clone(&directory));
 
     let task = CollaborationTask {
         description: "Rust refactoring".into(),
@@ -545,7 +522,7 @@ fn orchestrator_assemble_team_uses_discovery_protocol() {
 
     // Cleanup
     for a in &agents {
-        AgentDirectory::global().unregister(&a.agent_id);
+        directory.unregister(&a.agent_id);
     }
 }
 
@@ -590,7 +567,8 @@ async fn test_reputation_flows_to_agent_directory() {
         last_heartbeat_ms: now,
         reputation: None,
     };
-    AgentDirectory::global().register(info);
+    let directory = AgentDirectory::new();
+    directory.register(info);
 
     // 3. Record completion (sync, not async)
     let metrics = rep_mgr
@@ -598,7 +576,7 @@ async fn test_reputation_flows_to_agent_directory() {
         .expect("record_completion should succeed");
 
     // 4. Bridge: manually update AgentDirectory reputation from metrics
-    AgentDirectory::global().update_reputation(
+    directory.update_reputation(
         "test-rep-1",
         ReputationScore {
             success_rate: metrics.avg_quality_score,
@@ -610,7 +588,7 @@ async fn test_reputation_flows_to_agent_directory() {
     );
 
     // 5. Verify reputation is now non-None in the directory
-    let agents = AgentDirectory::global().list_active();
+    let agents = directory.list_active();
     let agent = agents
         .iter()
         .find(|a| a.agent_id == "test-rep-1")
@@ -625,7 +603,7 @@ async fn test_reputation_flows_to_agent_directory() {
     );
 
     // Cleanup
-    AgentDirectory::global().unregister("test-rep-1");
+    directory.unregister("test-rep-1");
 }
 
 /// DiscussionEngine + L4 memory integration:
@@ -697,7 +675,8 @@ async fn test_collaboration_orchestrator_synthesis() {
 
     // Register a dummy agent so assemble_team doesn't return None.
     let dummy_skill = "rust-run-boxed-unique";
-    AgentDirectory::global().register(AgentInfo {
+    let directory = Arc::new(AgentDirectory::new());
+    directory.register(AgentInfo {
         agent_id: "dummy-1".to_string(),
         role: "Executor".to_string(),
         capabilities: vec![dummy_skill.to_string()],
@@ -707,7 +686,8 @@ async fn test_collaboration_orchestrator_synthesis() {
         reputation: None,
     });
 
-    let orch = CollaborationOrchestrator::<DummyExec>::new(Arc::new(DummyExec));
+    let orch = CollaborationOrchestrator::<DummyExec>::new(Arc::new(DummyExec))
+        .with_directory(Arc::clone(&directory));
     let result: Option<String> = orch
         .run_boxed("test task", &[dummy_skill.to_string()])
         .await;
@@ -718,7 +698,7 @@ async fn test_collaboration_orchestrator_synthesis() {
     let synthesis = result.unwrap();
     assert!(!synthesis.is_empty(), "synthesis should be non-empty");
 
-    AgentDirectory::global().unregister("dummy-1");
+    directory.unregister("dummy-1");
 }
 
 /// MemorySyncProtocol import:
