@@ -418,11 +418,11 @@ impl TieredSessionStore {
 
         // 5. Update session metadata — restore message_count and clear
         //    archive marker.
-        let mut record = self
-            .store
-            .get_session(session_id)
-            .await?
-            .unwrap_or_else(|| unreachable!("session must exist if we were able to archive it"));
+        let mut record = self.store.get_session(session_id).await?.ok_or_else(|| {
+            store_err(format!(
+                "session `{session_id}` disappeared while restoring its archive"
+            ))
+        })?;
 
         record.message_count = message_count as i64;
         record.metadata_json = None; // clear archive metadata

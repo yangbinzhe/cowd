@@ -1,3 +1,14 @@
+// Test assertions intentionally use unwrap/expect/panic; normal library builds remain strict.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 

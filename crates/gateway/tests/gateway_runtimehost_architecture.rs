@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
 use std::path::PathBuf;
 
 fn repo_root() -> PathBuf {
@@ -1347,10 +1354,11 @@ fn entry_boundary_crates_exist_as_migration_targets() {
         "cli must keep TUI as a full-build-only optional surface dependency"
     );
     assert!(
-        cli_main.contains("open_tui_or_exit()")
+        cli_main.contains("open_tui()")
             && cli_main.contains("#[cfg(feature = \"tui-surface\")]")
-            && cli_main.contains("tui::terminal_entry()"),
-        "cli launcher must route TUI usage through the feature-gated TUI surface entry"
+            && cli_main.contains("match tui::terminal_entry()")
+            && cli_main.contains("std::process::ExitCode::FAILURE"),
+        "cli launcher must route TUI usage through the feature-gated TUI surface entry and preserve its failure status"
     );
     assert!(
         cli_main.contains("TUI surface is not built in this binary"),

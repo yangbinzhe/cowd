@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
 //! RED Tests: VerbatimSink - zero-loss raw storage (mempalace philosophy)
 //!
 //! Tests that verbatim entries survive intact, never pass through compression,

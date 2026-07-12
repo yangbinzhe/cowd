@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
 #![allow(clippy::doc_markdown, clippy::uninlined_format_args, unused_imports)]
 //! Integration tests for cross-module wiring.
 //!

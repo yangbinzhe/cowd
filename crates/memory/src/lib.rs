@@ -1,4 +1,13 @@
 #![warn(deprecated)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
 //! `memory` – unified memory framework for the cowd AI assistant.
 //!
 //! # Architecture

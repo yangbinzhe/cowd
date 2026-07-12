@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get git SHA (short hash)
     let git_sha = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
@@ -65,14 +65,16 @@ fn main() {
     }
     watch_git_path("packed-refs");
 
-    generate_route_registry();
+    generate_route_registry()?;
+    Ok(())
 }
 
-fn generate_route_registry() {
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
+fn generate_route_registry() -> std::io::Result<()> {
+    let manifest_dir =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").map_err(std::io::Error::other)?);
     let route_root = manifest_dir.join("src/api_routes");
     let mut files = Vec::new();
-    collect_route_sources(&route_root, &route_root, &mut files);
+    collect_route_sources(&route_root, &route_root, &mut files)?;
     files.sort();
 
     let mut routes = Vec::new();
@@ -86,8 +88,7 @@ fn generate_route_registry() {
         }
         let absolute = route_root.join(&relative);
         println!("cargo:rerun-if-changed={}", absolute.display());
-        let source = fs::read_to_string(&absolute)
-            .unwrap_or_else(|error| panic!("read route source {}: {error}", absolute.display()));
+        let source = fs::read_to_string(&absolute)?;
         routes.extend(
             parse_routes(&source)
                 .into_iter()
@@ -105,27 +106,28 @@ fn generate_route_registry() {
         ));
     }
     generated.push_str("];\n");
-    let output =
-        PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR")).join("gateway_route_registry.rs");
-    fs::write(output, generated).expect("write generated route registry");
+    let output = PathBuf::from(env::var("OUT_DIR").map_err(std::io::Error::other)?)
+        .join("gateway_route_registry.rs");
+    fs::write(output, generated)
 }
 
-fn collect_route_sources(root: &Path, current: &Path, files: &mut Vec<PathBuf>) {
-    let entries = fs::read_dir(current)
-        .unwrap_or_else(|error| panic!("read route directory {}: {error}", current.display()));
+fn collect_route_sources(
+    root: &Path,
+    current: &Path,
+    files: &mut Vec<PathBuf>,
+) -> std::io::Result<()> {
+    let entries = fs::read_dir(current)?;
     for entry in entries {
-        let entry = entry.expect("route directory entry");
+        let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
-            collect_route_sources(root, &path, files);
+            collect_route_sources(root, &path, files)?;
         } else if path.extension().and_then(|value| value.to_str()) == Some("rs") {
-            files.push(
-                path.strip_prefix(root)
-                    .expect("relative route source")
-                    .to_path_buf(),
-            );
+            let relative = path.strip_prefix(root).map_err(std::io::Error::other)?;
+            files.push(relative.to_path_buf());
         }
     }
+    Ok(())
 }
 
 fn parse_routes(source: &str) -> Vec<(String, String, String)> {

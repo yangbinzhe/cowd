@@ -58,7 +58,6 @@ pub struct ToolActivationReceipt {
 }
 
 impl ToolActivationReceipt {
-    #[must_use]
     pub fn activated_ids(&self) -> impl Iterator<Item = &str> {
         self.decisions.iter().filter_map(|decision| {
             (decision.status == ToolActivationStatus::Activated)

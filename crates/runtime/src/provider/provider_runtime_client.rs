@@ -799,7 +799,9 @@ fn response_to_events(response: MessageResponse) -> Vec<AssistantEvent> {
     let mut pending_tools = BTreeMap::new();
 
     for (index, block) in response.content.into_iter().enumerate() {
-        let index = u32::try_from(index).expect("response block index overflow");
+        let Ok(index) = u32::try_from(index) else {
+            break;
+        };
         push_provider_output_block(block, index, &mut events, &mut pending_tools, false);
         if let Some((id, name, input)) = pending_tools.remove(&index) {
             events.push(AssistantEvent::ToolUse { id, name, input });

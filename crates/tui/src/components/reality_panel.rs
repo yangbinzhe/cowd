@@ -23,7 +23,7 @@ pub struct RealityPanel {
     memory_status: Option<String>,
     memory_entries: usize,
     view: RealityView,
-    scroll: u16,
+    scroll: usize,
 }
 
 impl RealityPanel {
@@ -143,8 +143,9 @@ impl Component for RealityPanel {
             }
         }
 
-        let start = self.scroll as usize;
-        let viewport = area.height.saturating_sub(2) as usize;
+        let viewport = usize::from(area.height.saturating_sub(2));
+        self.scroll = self.scroll.min(lines.len().saturating_sub(viewport.max(1)));
+        let start = self.scroll;
         let visible = lines
             .into_iter()
             .skip(start)

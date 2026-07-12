@@ -90,8 +90,12 @@ pub fn validate_protocol_spec(spec: &ProtocolSpec) -> Result<(), ProtocolValidat
             ));
         }
         if dependency.kind == RoleDependencyKind::CrossFanout {
-            let consumer = spec.role(&dependency.consumer_role).expect("declared role");
-            let provider = spec.role(&dependency.provider_role).expect("declared role");
+            let consumer = spec.role(&dependency.consumer_role).ok_or_else(|| {
+                invalid_spec(&protocol, "cross-fanout consumer role is not declared")
+            })?;
+            let provider = spec.role(&dependency.provider_role).ok_or_else(|| {
+                invalid_spec(&protocol, "cross-fanout provider role is not declared")
+            })?;
             if !consumer.has_variable_cardinality()
                 || !provider.has_variable_cardinality()
                 || consumer.min_instances != provider.min_instances

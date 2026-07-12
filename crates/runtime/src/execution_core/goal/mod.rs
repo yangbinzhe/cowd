@@ -404,7 +404,7 @@ impl GoalStore {
             GoalCompletion::Satisfied => "satisfied",
             GoalCompletion::Blocked => "blocked",
             GoalCompletion::Cancelled => "cancelled",
-            GoalCompletion::Open => unreachable!(),
+            GoalCompletion::Open => return Err("terminal completion must not be open".to_string()),
         };
         Ok(goal_event(
             &goal,
@@ -467,7 +467,9 @@ impl GoalStore {
             GoalCompletion::Satisfied => "completed".to_string(),
             GoalCompletion::Blocked => "blocked".to_string(),
             GoalCompletion::Cancelled => "cancelled".to_string(),
-            GoalCompletion::Open => unreachable!(),
+            GoalCompletion::Open => {
+                return Err("completion cannot transition back to open".to_string())
+            }
         };
         goal.revision = goal.revision.saturating_add(1);
         self.append_goal_event(
@@ -479,7 +481,9 @@ impl GoalStore {
                 GoalCompletion::Satisfied => "satisfied",
                 GoalCompletion::Blocked => "blocked",
                 GoalCompletion::Cancelled => "cancelled",
-                GoalCompletion::Open => unreachable!(),
+                GoalCompletion::Open => {
+                    return Err("completion cannot transition back to open".to_string())
+                }
             },
             &goal,
             "runtime.goal_store",

@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
 //! E2E test: full memory lifecycle (Task 24).
 //!
 //! Simulates: conversation → auto-extract → compress → persist → restart → verify.

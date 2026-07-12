@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
 //! Integration tests — end-to-end memory enhancement with code indexing.
 //!
 //! Tests the full flow: init code graph → index project → ask code question

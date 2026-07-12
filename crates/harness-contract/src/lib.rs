@@ -4,6 +4,17 @@
 //! intentionally avoids stores, SDK clients, gateway APIs, runtime executors,
 //! and external adapters.
 
+// Test assertions intentionally use unwrap/expect; normal library builds remain strict.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
+
 pub mod agent;
 pub mod behavior;
 pub mod context;

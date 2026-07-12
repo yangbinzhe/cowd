@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use crate::app::{App, CurrentTaskSummary};
-use crate::components::panel_scroll::{offset_to_u16, PanelScrollState};
+use crate::components::panel_scroll::PanelScrollState;
 use crate::components::{Component, EventResult, RenderContext};
 use crate::runtime_control_store::TaskSummary;
 
@@ -151,10 +151,16 @@ impl Component for GoalWorkbenchPanel {
 
         ctx.frame_mut().render_widget(
             {
-                self.scroll.sync(lines.len(), inner.height.max(1) as usize);
-                Paragraph::new(Text::from(lines))
+                self.scroll
+                    .sync(lines.len(), usize::from(inner.height.max(1)));
+                let visible = lines
+                    .into_iter()
+                    .skip(self.scroll.offset)
+                    .take(self.scroll.viewport_len)
+                    .collect::<Vec<_>>();
+                Paragraph::new(Text::from(visible))
                     .wrap(Wrap { trim: false })
-                    .scroll((offset_to_u16(self.scroll.offset), 0))
+                    .scroll((0, 0))
             },
             inner,
         );

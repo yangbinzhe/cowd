@@ -244,19 +244,19 @@ impl DecisionThreadStore {
 
     /// Open (or create) the thread for `topic` and return a mutable reference.
     pub fn get_or_create(&mut self, topic: &str) -> &mut DecisionThread {
-        if !self.threads.iter().any(|t| t.topic == topic) {
-            self.threads.push(DecisionThread {
-                id: Uuid::new_v4().to_string(),
-                topic: topic.to_owned(),
-                entries: Vec::new(),
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            });
+        if let Some(index) = self.threads.iter().position(|thread| thread.topic == topic) {
+            return &mut self.threads[index];
         }
-        self.threads
-            .iter_mut()
-            .find(|t| t.topic == topic)
-            .expect("just inserted")
+
+        self.threads.push(DecisionThread {
+            id: Uuid::new_v4().to_string(),
+            topic: topic.to_owned(),
+            entries: Vec::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        let index = self.threads.len() - 1;
+        &mut self.threads[index]
     }
 
     // ─── Entry management ────────────────────────────────────────────────────

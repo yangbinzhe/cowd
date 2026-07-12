@@ -658,6 +658,33 @@ fn build_evidence_manifest(
     })
 }
 
+fn mission_runtime_collaboration_failure(
+    started: Instant,
+    objective: &str,
+    stage: &str,
+    error: impl std::fmt::Display,
+) -> Value {
+    json!({
+        "kind": "harness_eval.mission_runtime_collaboration_closure",
+        "status": "failed",
+        "objective": objective,
+        "failure_degraded_reason": format!("{stage}: {error}"),
+        "selected_strategy": Value::Null,
+        "execution_graph": Value::Null,
+        "agents": Value::Null,
+        "sessions": Value::Null,
+        "conflicts": Value::Null,
+        "mission_projection": Value::Null,
+        "terminal_evidence": Value::Null,
+        "final_result_quality": {
+            "passed_checks": [],
+            "failed_checks": [stage],
+            "score": 0.0,
+        },
+        "latency": {"elapsed_ms": started.elapsed().as_millis(), "provider_rounds": 0},
+    })
+}
+
 fn evaluate_mission_runtime_collaboration_closure() -> Value {
     let started = Instant::now();
     let objective = "复杂代码重构需要多 Agent 并行审查、跨 Session 跟踪、冲突仲裁和证据化回归";
@@ -675,50 +702,66 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
         runtime::CollaborationTemplateMatcher::default().decide(objective, &strategy);
     let session_id = format!("mission-eval-session-{}", uuid::Uuid::new_v4());
     let mission = runtime::MissionRuntime::new();
-    let session = mission
-        .start_session(runtime::StartMissionSessionRequest {
-            title: "Mission runtime collaboration closure".to_string(),
-            session_id: Some(session_id.clone()),
-        })
-        .expect("mission session");
+    let session = match mission.start_session(runtime::StartMissionSessionRequest {
+        title: "Mission runtime collaboration closure".to_string(),
+        session_id: Some(session_id.clone()),
+    }) {
+        Ok(session) => session,
+        Err(error) => {
+            return mission_runtime_collaboration_failure(
+                started,
+                objective,
+                "start_mission_session",
+                error,
+            );
+        }
+    };
     let team_id = format!("harness-eval-team-{}", uuid::Uuid::new_v4());
-    let team_build = runtime::TeamBuilder
-        .build(runtime::TeamBuildRequest {
-            team_id: team_id.clone(),
-            session_id: session.session_id.clone(),
-            objective: objective.to_string(),
-            template_id: harness_contract::team::TeamTemplateId::FanoutResearchSynthesis,
-            roles: vec![
-                harness_contract::team::TeamRoleSpec {
-                    role_id: "analysis".to_string(),
-                    responsibility: "independent architecture analysis".to_string(),
-                    required_capabilities: vec!["analysis".to_string()],
-                    allowed_tools: vec!["read_file".to_string()],
-                    acceptance: vec!["cite evidence".to_string()],
-                    evidence_duties: vec!["source evidence".to_string()],
-                },
-                harness_contract::team::TeamRoleSpec {
-                    role_id: "review".to_string(),
-                    responsibility: "independent adversarial review".to_string(),
-                    required_capabilities: vec!["review".to_string()],
-                    allowed_tools: vec!["read_file".to_string()],
-                    acceptance: vec!["identify risk".to_string()],
-                    evidence_duties: vec!["review evidence".to_string()],
-                },
-            ],
-            role_dependencies: Vec::new(),
-            selected_agent_profiles: std::collections::BTreeMap::new(),
-            verdict: harness_contract::team::TeamLiftVerdict {
-                accepted: true,
-                max_parallel_agents: 2,
-                reasons: vec!["independent analysis and review".to_string()],
-                resized_from: 2,
+    let team_build = match runtime::TeamBuilder.build(runtime::TeamBuildRequest {
+        team_id: team_id.clone(),
+        session_id: session.session_id.clone(),
+        objective: objective.to_string(),
+        template_id: harness_contract::team::TeamTemplateId::FanoutResearchSynthesis,
+        roles: vec![
+            harness_contract::team::TeamRoleSpec {
+                role_id: "analysis".to_string(),
+                responsibility: "independent architecture analysis".to_string(),
+                required_capabilities: vec!["analysis".to_string()],
+                allowed_tools: vec!["read_file".to_string()],
+                acceptance: vec!["cite evidence".to_string()],
+                evidence_duties: vec!["source evidence".to_string()],
             },
-            permission_lease: "read_only".to_string(),
-            model_lease: "harness_eval".to_string(),
-            backend_constraint: None,
-        })
-        .expect("team graph compiles");
+            harness_contract::team::TeamRoleSpec {
+                role_id: "review".to_string(),
+                responsibility: "independent adversarial review".to_string(),
+                required_capabilities: vec!["review".to_string()],
+                allowed_tools: vec!["read_file".to_string()],
+                acceptance: vec!["identify risk".to_string()],
+                evidence_duties: vec!["review evidence".to_string()],
+            },
+        ],
+        role_dependencies: Vec::new(),
+        selected_agent_profiles: std::collections::BTreeMap::new(),
+        verdict: harness_contract::team::TeamLiftVerdict {
+            accepted: true,
+            max_parallel_agents: 2,
+            reasons: vec!["independent analysis and review".to_string()],
+            resized_from: 2,
+        },
+        permission_lease: "read_only".to_string(),
+        model_lease: "harness_eval".to_string(),
+        backend_constraint: None,
+    }) {
+        Ok(team_build) => team_build,
+        Err(error) => {
+            return mission_runtime_collaboration_failure(
+                started,
+                objective,
+                "build_team_execution_graph",
+                error,
+            );
+        }
+    };
     let capability = runtime::resolve_agent_capability(runtime::AgentCapabilityRequest {
         role_id: "executor".to_string(),
         allowed_capabilities: vec![
@@ -729,17 +772,34 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
         ],
         evidence_duties: vec!["changes".to_string(), "verification".to_string()],
     });
-    let runtime_services = runtime::RuntimeServices::in_memory().expect("runtime services");
-    let relation = runtime_services
-        .session_relations()
-        .add_relation(
-            &session.session_id,
-            format!("{}-review", session.session_id),
-            runtime::SessionRelationKind::ConflictsWith,
-            "review lane disputes unbounded execution",
-            vec![format!("execution_graph:{}", team_build.graph.id)],
-        )
-        .expect("conflict relation");
+    let runtime_services = match runtime::RuntimeServices::in_memory() {
+        Ok(services) => services,
+        Err(error) => {
+            return mission_runtime_collaboration_failure(
+                started,
+                objective,
+                "initialize_runtime_services",
+                error,
+            );
+        }
+    };
+    let relation = match runtime_services.session_relations().add_relation(
+        &session.session_id,
+        format!("{}-review", session.session_id),
+        runtime::SessionRelationKind::ConflictsWith,
+        "review lane disputes unbounded execution",
+        vec![format!("execution_graph:{}", team_build.graph.id)],
+    ) {
+        Ok(relation) => relation,
+        Err(error) => {
+            return mission_runtime_collaboration_failure(
+                started,
+                objective,
+                "record_session_conflict_relation",
+                error,
+            );
+        }
+    };
     runtime_services
         .conflict_resolver()
         .resolve(runtime::ConflictResolutionRequest {

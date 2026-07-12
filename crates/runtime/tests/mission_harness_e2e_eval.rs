@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
 use harness_contract::core::TaskRisk;
 use harness_contract::strategy::{decide_strategy, StrategyInput};
 use runtime::eval_gate::{

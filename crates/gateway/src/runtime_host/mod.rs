@@ -47,7 +47,7 @@ impl RuntimeMcpServiceAdapter {
         let registry = McpToolRegistry::new();
         for (server_name, server_config) in config.mcp().servers() {
             let single_server = BTreeMap::from([(server_name.clone(), server_config.clone())]);
-            let mut manager = McpServerManager::from_servers(&single_server);
+            let manager = McpServerManager::from_servers(&single_server);
             if manager.server_names().is_empty() {
                 registry.register_server(
                     server_name,
@@ -62,7 +62,20 @@ impl RuntimeMcpServiceAdapter {
                 continue;
             }
 
-            let discovery = manager.discover_tools_best_effort().await;
+            let discovery = match registry.install_server_manager(server_name, manager) {
+                Ok(discovery) => discovery,
+                Err(error) => {
+                    registry.register_server(
+                        server_name,
+                        McpConnectionStatus::Error,
+                        vec![],
+                        vec![],
+                        Some(error.clone()),
+                    );
+                    tracing::warn!(server = server_name, error = %error, "failed to start MCP server worker");
+                    continue;
+                }
+            };
             let failed = discovery
                 .failed_servers
                 .iter()
@@ -89,8 +102,10 @@ impl RuntimeMcpServiceAdapter {
                 vec![],
                 failed.map(|failure| failure.error.clone()),
             );
-            if status == McpConnectionStatus::Connected {
-                registry.set_server_manager(server_name, manager);
+            if status != McpConnectionStatus::Connected {
+                if let Err(error) = registry.remove_server_manager(server_name) {
+                    tracing::warn!(server = server_name, error = %error, "failed to stop unhealthy MCP server worker");
+                }
             }
         }
         Self { registry }
@@ -893,11 +908,21 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         #[cfg(unix)]
         {
             let mut sigterm =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("failed to install SIGTERM handler");
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                    Ok(signal) => signal,
+                    Err(error) => {
+                        tracing::error!("failed to install SIGTERM handler: {error}");
+                        return;
+                    }
+                };
             let mut sigint =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-                    .expect("failed to install SIGINT handler");
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+                    Ok(signal) => signal,
+                    Err(error) => {
+                        tracing::error!("failed to install SIGINT handler: {error}");
+                        return;
+                    }
+                };
             tokio::select! {
                 _ = sigterm.recv() => tracing::info!("SIGTERM received, shutting down"),
                 _ = sigint.recv() => tracing::info!("SIGINT received, shutting down"),
@@ -905,10 +930,10 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         }
         #[cfg(not(unix))]
         {
-            tokio::signal::ctrl_c()
-                .await
-                .expect("failed to install ctrl_c handler");
-            tracing::info!("shutdown signal received");
+            match tokio::signal::ctrl_c().await {
+                Ok(()) => tracing::info!("shutdown signal received"),
+                Err(error) => tracing::error!("failed to install ctrl_c handler: {error}"),
+            }
         }
     };
 

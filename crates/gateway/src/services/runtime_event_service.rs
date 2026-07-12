@@ -13,6 +13,10 @@ impl RuntimeEventService {
         Self { store }
     }
 
+    #[allow(
+        clippy::panic,
+        reason = "this constructor is used by legacy infallible static service assembly; startup must not proceed without the durable event store"
+    )]
     pub(crate) fn open(config_home: &Path) -> Self {
         let path = config_home.join("storage/runtime-events.sqlite");
         let store = RuntimeEventStore::open(&path).unwrap_or_else(|error| {

@@ -37,16 +37,11 @@ pub struct OpenAiCompatConfig {
     pub wire_protocol: OpenAiWireProtocol,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum OpenAiWireProtocol {
+    #[default]
     Completions,
     Responses,
-}
-
-impl Default for OpenAiWireProtocol {
-    fn default() -> Self {
-        Self::Completions
-    }
 }
 
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
@@ -799,8 +794,9 @@ impl StreamState {
         let deferred = self.deferred_xml_text.get_or_insert_with(String::new);
         deferred.push_str(&content);
         if !is_xml_tool_call_prefix(deferred) {
-            let text = self.deferred_xml_text.take().expect("deferred text exists");
-            self.emit_text_content(text, events);
+            if let Some(text) = self.deferred_xml_text.take() {
+                self.emit_text_content(text, events);
+            }
         }
     }
 
@@ -2593,6 +2589,42 @@ mod tests {
                 ..
             })
         )));
+    }
+
+    #[test]
+    fn streaming_plain_text_with_tools_is_released_immediately() {
+        use super::{ChatCompletionChunk, ChunkChoice, ChunkDelta, StreamState};
+        use crate::types::{ContentBlockDelta, ContentBlockDeltaEvent, StreamEvent};
+
+        let tool = ToolDefinition {
+            name: "read_file".to_string(),
+            description: Some("read a source file".to_string()),
+            input_schema: json!({"type":"object"}),
+        };
+        let mut state = StreamState::new("step-3.7-flash".to_string(), &[tool]);
+        let events = state
+            .ingest_chunk(ChatCompletionChunk {
+                id: "message-plain".to_string(),
+                model: Some("step-3.7-flash".to_string()),
+                choices: vec![ChunkChoice {
+                    delta: ChunkDelta {
+                        content: Some("ordinary answer".to_string()),
+                        ..ChunkDelta::default()
+                    },
+                    finish_reason: None,
+                }],
+                usage: None,
+            })
+            .expect("stream chunk");
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                delta: ContentBlockDelta::TextDelta { text },
+                ..
+            }) if text == "ordinary answer"
+        )));
+        assert!(state.deferred_xml_text.is_none());
     }
 
     #[test]

@@ -15,6 +15,18 @@ use ratatui::Frame;
 use crate::skin::SkinConfig;
 use crate::theme::ThemeEngine;
 
+/// Convert an unbounded logical length to Ratatui's terminal coordinate type.
+///
+/// Logical state must remain `usize`; only a final terminal geometry value may
+/// saturate because Ratatui rectangles are intrinsically `u16`-bounded.
+#[must_use]
+pub(crate) fn terminal_len(value: usize) -> u16 {
+    match u16::try_from(value) {
+        Ok(value) => value,
+        Err(_) => u16::MAX,
+    }
+}
+
 // ── ComponentId ──────────────────────────────────────────────────
 
 /// A newtype wrapper around `&'static str` for type-safe component
@@ -172,8 +184,12 @@ impl<'frame, 'buf, 'theme> RenderContext<'frame, 'buf, 'theme> {
     #[must_use]
     pub fn measure_text(&self, text: &str) -> (u16, u16) {
         let lines: Vec<&str> = text.lines().collect();
-        let width = lines.iter().map(|l| l.len() as u16).max().unwrap_or(0);
-        let height = lines.len() as u16;
+        let width = lines
+            .iter()
+            .map(|line| terminal_len(line.chars().count()))
+            .max()
+            .unwrap_or(0);
+        let height = terminal_len(lines.len());
         (width, height)
     }
 }

@@ -1344,10 +1344,13 @@ fn identity_trust_rank(trust: IdentityTrust) -> u8 {
 }
 
 fn identity_contact_keys(identity_ref: &str) -> Vec<String> {
-    static EMAIL_RE: OnceLock<Regex> = OnceLock::new();
-    let email_re = EMAIL_RE.get_or_init(|| {
-        Regex::new(r"(?i)[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}").expect("valid email regex")
-    });
+    static EMAIL_RE: OnceLock<Option<Regex>> = OnceLock::new();
+    let Some(email_re) = EMAIL_RE
+        .get_or_init(|| Regex::new(r"(?i)[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}").ok())
+        .as_ref()
+    else {
+        return Vec::new();
+    };
     let mut keys = Vec::new();
     for matched in email_re.find_iter(identity_ref) {
         keys.push(format!("email:{}", matched.as_str().to_ascii_lowercase()));

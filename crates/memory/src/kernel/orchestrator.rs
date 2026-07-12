@@ -919,11 +919,13 @@ fn estimate_tokens(content: &str) -> u64 {
 /// - `"Alice is child_of Charlie"` → same
 /// - `"Alice's full_name is Alice Smith"` → triple(subject="Alice", predicate="full_name", object="Alice Smith")
 fn extract_triple_from_content(content: &str, source_agent: Option<&str>) -> Option<Triple> {
-    static PARENT_RE: OnceLock<regex::Regex> = OnceLock::new();
-    static CHILD_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static PARENT_RE: OnceLock<std::result::Result<regex::Regex, regex::Error>> = OnceLock::new();
+    static CHILD_RE: OnceLock<std::result::Result<regex::Regex, regex::Error>> = OnceLock::new();
 
-    let parent_re =
-        PARENT_RE.get_or_init(|| regex::Regex::new(r#"(\w+)'s\s+parent\s+is\s+(\w+)"#).unwrap());
+    let parent_re = PARENT_RE
+        .get_or_init(|| regex::Regex::new(r#"(\w+)'s\s+parent\s+is\s+(\w+)"#))
+        .as_ref()
+        .ok()?;
     if let Some(caps) = parent_re.captures(content) {
         let subject = caps.get(1)?.as_str().to_string();
         let object = caps.get(2)?.as_str().to_string();
@@ -942,8 +944,10 @@ fn extract_triple_from_content(content: &str, source_agent: Option<&str>) -> Opt
     }
 
     // Pattern: "X is child_of Y"
-    let child_re =
-        CHILD_RE.get_or_init(|| regex::Regex::new(r#"(\w+)\s+is\s+child_of\s+(\w+)"#).unwrap());
+    let child_re = CHILD_RE
+        .get_or_init(|| regex::Regex::new(r#"(\w+)\s+is\s+child_of\s+(\w+)"#))
+        .as_ref()
+        .ok()?;
     if let Some(caps) = child_re.captures(content) {
         let subject = caps.get(1)?.as_str().to_string();
         let object = caps.get(2)?.as_str().to_string();
@@ -974,37 +978,38 @@ fn register_facts_from_content(
     content: &str,
     source_agent: Option<&str>,
 ) {
-    static REGISTER_PARENT_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static REGISTER_PARENT_RE: OnceLock<std::result::Result<regex::Regex, regex::Error>> =
+        OnceLock::new();
 
-    let parent_re = Some(
-        REGISTER_PARENT_RE
-            .get_or_init(|| regex::Regex::new(r#"(\w+)'s\s+parent\s+is\s+(\w+)"#).unwrap()),
-    );
-    if let Some(re) = parent_re {
-        for caps in re.captures_iter(content) {
-            if let (Some(subj), Some(obj)) = (caps.get(1), caps.get(2)) {
-                let subject = subj.as_str();
-                let parent_name = obj.as_str();
-                let mut facts = EntityFacts::default();
-                facts.entity_type = Some("person".to_string());
-                facts.parent = Some(parent_name.to_string());
-                checker.register_facts(subject, facts);
+    let Ok(parent_re) = REGISTER_PARENT_RE
+        .get_or_init(|| regex::Regex::new(r#"(\w+)'s\s+parent\s+is\s+(\w+)"#))
+        .as_ref()
+    else {
+        return;
+    };
+    for caps in parent_re.captures_iter(content) {
+        if let (Some(subj), Some(obj)) = (caps.get(1), caps.get(2)) {
+            let subject = subj.as_str();
+            let parent_name = obj.as_str();
+            let mut facts = EntityFacts::default();
+            facts.entity_type = Some("person".to_string());
+            facts.parent = Some(parent_name.to_string());
+            checker.register_facts(subject, facts);
 
-                // Register triple for cross-agent conflict detection
-                let triple = Triple {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    subject: subject.to_string(),
-                    predicate: "child_of".to_string(),
-                    object: parent_name.to_string(),
-                    valid_from: Some(chrono::Utc::now()),
-                    valid_until: None,
-                    confidence: 1.0,
-                    source_memory_id: None,
-                    source_file: None,
-                    source_agent: source_agent.map(String::from),
-                };
-                checker.register_triple(triple);
-            }
+            // Register triple for cross-agent conflict detection
+            let triple = Triple {
+                id: uuid::Uuid::new_v4().to_string(),
+                subject: subject.to_string(),
+                predicate: "child_of".to_string(),
+                object: parent_name.to_string(),
+                valid_from: Some(chrono::Utc::now()),
+                valid_until: None,
+                confidence: 1.0,
+                source_memory_id: None,
+                source_file: None,
+                source_agent: source_agent.map(String::from),
+            };
+            checker.register_triple(triple);
         }
     }
 }

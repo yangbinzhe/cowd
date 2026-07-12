@@ -2,6 +2,7 @@ use std::{collections::HashSet, path::Path as FsPath, sync::Arc};
 
 use axum::{
     extract::{Path, State as AxumState},
+    http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, post},
     Json, Router,
@@ -161,66 +162,99 @@ async fn cross_plane_create_identity_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(binding): Json<CrossPlaneIdentityBinding>,
 ) -> impl IntoResponse {
-    let binding = state
+    match state
         .services
         .cross_plane
         .control()
         .upsert_identity(binding)
-        .expect("cross-plane identity must commit");
-    Json(serde_json::json!({
-        "kind": "cross_plane_identity",
-        "identity": binding
-    }))
+    {
+        Ok(binding) => Json(serde_json::json!({
+            "kind": "cross_plane_identity",
+            "identity": binding
+        }))
+        .into_response(),
+        Err(error) => cross_plane_commit_error("upsert_identity", error),
+    }
 }
 
 async fn cross_plane_revoke_identity_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let revoked = state
-        .services
-        .cross_plane
-        .control()
-        .revoke_identity(&id)
-        .expect("cross-plane identity revocation must commit");
-    Json(serde_json::json!({
-        "kind": "cross_plane_identity_revoked",
-        "id": id,
-        "revoked": revoked
-    }))
+    match state.services.cross_plane.control().revoke_identity(&id) {
+        Ok(revoked) => Json(serde_json::json!({
+            "kind": "cross_plane_identity_revoked",
+            "id": id,
+            "revoked": revoked
+        }))
+        .into_response(),
+        Err(error) => cross_plane_commit_error("revoke_identity", error),
+    }
 }
 
 async fn cross_plane_create_grant_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(grant): Json<CrossPlaneGrant>,
 ) -> impl IntoResponse {
-    let grant = state
-        .services
-        .cross_plane
-        .control()
-        .upsert_grant(grant)
-        .expect("cross-plane grant must commit");
-    Json(serde_json::json!({
-        "kind": "cross_plane_grant",
-        "grant": grant
-    }))
+    match state.services.cross_plane.control().upsert_grant(grant) {
+        Ok(grant) => Json(serde_json::json!({
+            "kind": "cross_plane_grant",
+            "grant": grant
+        }))
+        .into_response(),
+        Err(error) => cross_plane_commit_error("upsert_grant", error),
+    }
 }
 
 async fn cross_plane_revoke_grant_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let revoked = state
-        .services
-        .cross_plane
-        .control()
-        .revoke_grant(&id)
-        .expect("cross-plane grant revocation must commit");
-    Json(serde_json::json!({
-        "kind": "cross_plane_grant_revoked",
-        "id": id,
-        "revoked": revoked
-    }))
+    match state.services.cross_plane.control().revoke_grant(&id) {
+        Ok(revoked) => Json(serde_json::json!({
+            "kind": "cross_plane_grant_revoked",
+            "id": id,
+            "revoked": revoked
+        }))
+        .into_response(),
+        Err(error) => cross_plane_commit_error("revoke_grant", error),
+    }
+}
+
+fn cross_plane_commit_error(
+    operation: &str,
+    error: impl std::fmt::Display,
+) -> axum::response::Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "kind": "cross_plane_commit_error",
+            "operation": operation,
+            "error": error.to_string(),
+        })),
+    )
+        .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cross_plane_commit_error;
+    use axum::{body::to_bytes, http::StatusCode};
+
+    #[tokio::test]
+    async fn commit_failures_return_a_structured_internal_error() {
+        let response = cross_plane_commit_error("upsert_identity", "durable store unavailable");
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("cross-plane error response body must remain readable");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("cross-plane error response must be JSON");
+        assert_eq!(payload["kind"], "cross_plane_commit_error");
+        assert_eq!(payload["operation"], "upsert_identity");
+        assert_eq!(payload["error"], "durable store unavailable");
+    }
 }
 
 async fn cross_plane_audit_handler(

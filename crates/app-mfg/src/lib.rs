@@ -3,6 +3,17 @@
 //! This crate is the application-facing MFG boundary over Matrix structured
 //! facts, Memory projections, skills and governed action dispatch.
 
+// Test assertions intentionally use unwrap/expect; normal library builds remain strict.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
+
 pub mod analysis;
 pub mod app;
 pub mod cockpit;

@@ -122,6 +122,8 @@ pub enum ScopeLockError {
     TimedOut { waited_ms: u64 },
     #[error("scope lock manager lock is poisoned")]
     Poisoned,
+    #[error("scope lock waiter registration was lost before acquisition")]
+    RegistrationLost,
     #[error("scope lock I/O failed for {path}: {source}")]
     Io {
         path: PathBuf,
@@ -210,11 +212,10 @@ impl ScopeLockManager {
                     .state
                     .lock()
                     .map_err(|_| ScopeLockError::Poisoned)?;
-                let pending_index = guard
-                    .pending
-                    .iter()
-                    .position(|pending| pending.id == id)
-                    .expect("registered waiter must remain pending");
+                let Some(pending_index) = guard.pending.iter().position(|pending| pending.id == id)
+                else {
+                    return Err(ScopeLockError::RegistrationLost);
+                };
                 let blocked_by_earlier_conflict = guard
                     .pending
                     .iter()

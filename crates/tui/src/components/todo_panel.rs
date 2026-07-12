@@ -20,7 +20,7 @@ use ratatui::{
 };
 
 use crate::components::base::{Component, EventResult, RenderContext};
-use crate::components::panel_scroll::{offset_to_u16, PanelScrollState};
+use crate::components::panel_scroll::PanelScrollState;
 
 /// A single todo item extracted from TodoWrite JSON.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,12 +233,16 @@ impl Component for TodoPanel {
             Style::default().fg(Color::DarkGray),
         )));
 
-        let text = Text::from(items);
         self.scroll
-            .sync(text.lines.len(), inner.height.max(1) as usize);
-        let paragraph = Paragraph::new(text)
+            .sync(items.len(), usize::from(inner.height.max(1)));
+        let visible = items
+            .into_iter()
+            .skip(self.scroll.offset)
+            .take(self.scroll.viewport_len)
+            .collect::<Vec<_>>();
+        let paragraph = Paragraph::new(Text::from(visible))
             .wrap(Wrap { trim: false })
-            .scroll((offset_to_u16(self.scroll.offset), 0));
+            .scroll((0, 0));
         ctx.frame_mut().render_widget(paragraph, inner);
     }
 

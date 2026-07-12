@@ -304,7 +304,7 @@ pub struct App {
     /// Current runtime session lease mode for the attached TUI session.
     pub gateway_lease_mode: Option<String>,
 
-    pub scroll_offset: u16,
+    pub scroll_offset: usize,
     pub auto_scroll: bool,
 
     pub turn_active: bool,
@@ -330,7 +330,7 @@ pub struct App {
 
     pub cached_chat_lines: Vec<ratatui::text::Line<'static>>,
 
-    pub entry_line_counts: Vec<u16>,
+    pub entry_line_counts: Vec<usize>,
     pub lines_dirty: bool,
     last_built_line_count: usize,
 
@@ -342,7 +342,7 @@ pub struct App {
     pub search_current: usize,
     pub search_active: bool,
 
-    pub viewport_height: u16,
+    pub viewport_height: usize,
 
     pub help_visible: bool,
 
@@ -780,7 +780,10 @@ impl App {
                 start_index: start,
             });
         }
-        self.timeline_pages.back_mut().unwrap().entries.push(entry);
+        let Some(page) = self.timeline_pages.back_mut() else {
+            return;
+        };
+        page.entries.push(entry);
         self.total_entries += 1;
         self.soft_evict();
         self.hard_evict();
@@ -817,7 +820,7 @@ impl App {
             };
             let evict_count = front.entries.len();
 
-            let evicted_lines: u16 = if !self.entry_line_counts.is_empty() {
+            let evicted_lines: usize = if !self.entry_line_counts.is_empty() {
                 let count = evict_count.min(self.entry_line_counts.len());
                 self.entry_line_counts
                     .iter()
@@ -855,7 +858,7 @@ impl App {
             };
             let evict_count = front.entries.len();
 
-            let evicted_lines: u16 = if !self.entry_line_counts.is_empty() {
+            let evicted_lines: usize = if !self.entry_line_counts.is_empty() {
                 let count = evict_count.min(self.entry_line_counts.len());
                 self.entry_line_counts
                     .iter()
@@ -1158,18 +1161,18 @@ impl App {
     }
 
     pub fn scroll_to_entry(&mut self, entry_idx: usize) {
-        let vh = self.viewport_height.max(1) as usize;
+        let vh = self.viewport_height.max(1);
         let mut offset: usize = 0;
         for i in 0..entry_idx.min(self.entry_line_counts.len()) {
-            offset += self.entry_line_counts[i] as usize + 1;
+            offset += self.entry_line_counts[i] + 1;
         }
-        let entry_h = self.entry_line_counts.get(entry_idx).copied().unwrap_or(1) as usize;
+        let entry_h = self.entry_line_counts.get(entry_idx).copied().unwrap_or(1);
 
-        let scroll = self.scroll_offset as usize;
+        let scroll = self.scroll_offset;
         if offset < scroll {
-            self.scroll_offset = offset as u16;
+            self.scroll_offset = offset;
         } else if offset + entry_h > scroll + vh {
-            self.scroll_offset = offset.saturating_sub(vh.saturating_sub(entry_h)) as u16;
+            self.scroll_offset = offset.saturating_sub(vh.saturating_sub(entry_h));
         }
     }
 

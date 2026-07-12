@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
 use harness_contract::core::ExecutionPattern;
 use harness_contract::execution_graph::{
     apply_node_transition, validate_execution_graph, ExecutionEdge, ExecutionEdgeKind,

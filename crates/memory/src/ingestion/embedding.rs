@@ -370,7 +370,12 @@ where
             }
         }
     }
-    Err(last_error.unwrap())
+    match last_error {
+        Some(error) => Err(error),
+        None => Err(MemoryError::InvalidArgument(
+            "embedding retry count must be greater than zero".to_string(),
+        )),
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

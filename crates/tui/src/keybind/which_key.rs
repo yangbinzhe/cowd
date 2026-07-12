@@ -72,11 +72,14 @@ impl WhichKey {
         let gap: u16 = 2;
         let max_desc_len: u16 = filtered
             .iter()
-            .map(|b| b.description.len() as u16)
+            .map(|binding| {
+                crate::components::base::terminal_len(binding.description.chars().count())
+            })
             .max()
             .unwrap_or(20);
         let content_width = (chord_col_width + gap + max_desc_len).max(42); // min width for tab bar
-        let content_height = filtered.len() as u16 + 2;
+        let content_height =
+            crate::components::base::terminal_len(filtered.len()).saturating_add(2);
         let total_width = (content_width + 4).min(area.width.saturating_sub(2));
         let total_height = (content_height + 2).min(area.height.saturating_sub(2));
         let x = (area.width.saturating_sub(total_width)) / 2;
@@ -116,7 +119,9 @@ impl WhichKey {
             let chord_str = super::chord_to_string(&binding.chord.keys);
             let padding = " ".repeat(
                 chord_col_width
-                    .saturating_sub(chord_str.len() as u16)
+                    .saturating_sub(crate::components::base::terminal_len(
+                        chord_str.chars().count(),
+                    ))
                     .max(1) as usize,
             );
             lines.push(Line::from(vec![

@@ -18,6 +18,33 @@ pub struct EvolutionClosureReport {
     pub evidence_refs: Vec<String>,
 }
 
+fn failed_evolution_report(
+    signal_count: usize,
+    diagnosis_count: usize,
+    proposal_count: usize,
+    mut evidence_refs: Vec<String>,
+    stage: &str,
+    error: impl std::fmt::Display,
+) -> EvolutionClosureReport {
+    evidence_refs.push(format!("failure:{stage}:{error}"));
+    EvolutionClosureReport {
+        kind: "harness_eval.evolution_closure".to_string(),
+        signal_count,
+        diagnosis_count,
+        proposal_count,
+        candidate_count: 0,
+        sandbox_eval_count: 0,
+        skill_draft_count: 0,
+        human_approval_boundary: false,
+        adoption_gate_count: 0,
+        artifact_count: 0,
+        adoption_receipt_count: 0,
+        mainline_modified: false,
+        status: "failed".to_string(),
+        evidence_refs,
+    }
+}
+
 #[must_use]
 pub fn evaluate_evolution_closure() -> EvolutionClosureReport {
     let signals = vec![
@@ -37,10 +64,24 @@ pub fn evaluate_evolution_closure() -> EvolutionClosureReport {
         ),
     ];
     let diagnosis = runtime::EvolutionDiagnosisEngine::diagnose(&signals);
+    let mut evidence_refs = signals
+        .iter()
+        .flat_map(|signal| signal.evidence_refs.clone())
+        .chain([diagnosis.diagnosis_id.clone()])
+        .collect::<Vec<_>>();
     let mut drafts = runtime::EvolutionLifecycleService::open_from_signals(&signals);
-    let draft = drafts.pop().expect("evolution lifecycle draft");
+    let Some(draft) = drafts.pop() else {
+        return failed_evolution_report(
+            signals.len(),
+            1,
+            0,
+            evidence_refs,
+            "open_evolution_lifecycle",
+            "no lifecycle draft was generated from deterministic signals",
+        );
+    };
     let proposal = draft.proposal;
-    let candidate = runtime::EvolutionCandidateGenerator::generate_with_artifacts(
+    let candidate = match runtime::EvolutionCandidateGenerator::generate_with_artifacts(
         std::env::temp_dir().join(format!(
             "cowd-evolution-eval-artifacts-{}",
             uuid::Uuid::new_v4()
@@ -48,8 +89,19 @@ pub fn evaluate_evolution_closure() -> EvolutionClosureReport {
         &proposal,
         "baseline:current",
         "candidate:sandbox",
-    )
-    .expect("candidate artifacts");
+    ) {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            return failed_evolution_report(
+                signals.len(),
+                1,
+                1,
+                evidence_refs,
+                "generate_candidate_artifacts",
+                error,
+            );
+        }
+    };
     let skill_draft = proposal.to_skill_draft();
     let sandbox_root =
         std::env::temp_dir().join(format!("cowd-evolution-eval-{}", uuid::Uuid::new_v4()));
@@ -57,17 +109,37 @@ pub fn evaluate_evolution_closure() -> EvolutionClosureReport {
         sandbox_root.join("runner"),
         runtime::EvolutionRunnerPolicy::default(),
     );
-    let mut runner_results = vec![runner.run_artifact_check(&candidate).expect("runner")];
+    let mut runner_results = match runner.run_artifact_check(&candidate) {
+        Ok(result) => vec![result],
+        Err(error) => {
+            return failed_evolution_report(
+                signals.len(),
+                1,
+                1,
+                evidence_refs,
+                "run_candidate_artifact_check",
+                error,
+            );
+        }
+    };
     for (mode, command) in [
         ("baseline", candidate.baseline_command.as_str()),
         ("candidate", candidate.candidate_command.as_str()),
         ("verification", candidate.verification_command.as_str()),
     ] {
-        runner_results.push(
-            runner
-                .run_named_command(&candidate, mode, command)
-                .expect("runner command"),
-        );
+        match runner.run_named_command(&candidate, mode, command) {
+            Ok(result) => runner_results.push(result),
+            Err(error) => {
+                return failed_evolution_report(
+                    signals.len(),
+                    1,
+                    1,
+                    evidence_refs,
+                    "run_candidate_command",
+                    error,
+                );
+            }
+        }
     }
     let eval_request =
         runtime::EvolutionEvaluationRequest::from_candidate(&candidate, &runner_results);
@@ -78,27 +150,34 @@ pub fn evaluate_evolution_closure() -> EvolutionClosureReport {
     );
     let mut candidate = candidate;
     candidate.comparison_report_ref = Some(comparison.comparison_id.clone());
-    let sandbox_eval = runtime::EvolutionSandboxOrchestrator::new(&sandbox_root)
+    let sandbox_eval = match runtime::EvolutionSandboxOrchestrator::new(&sandbox_root)
         .run(&proposal, &candidate)
-        .unwrap_or_else(|error| panic!("evolution sandbox run failed: {error}"));
+    {
+        Ok(result) => result,
+        Err(error) => {
+            return failed_evolution_report(
+                signals.len(),
+                1,
+                1,
+                evidence_refs,
+                "run_evolution_sandbox",
+                error,
+            );
+        }
+    };
     let promotion_receipt = runtime::EvolutionPromotionManager::promote(&candidate);
     let human_approval_boundary = proposal.risk.approval_required
         && candidate.human_approval_required
         && sandbox_eval.human_approval_required;
     let mainline_modified = candidate.mainline_modified || sandbox_eval.mainline_modified;
-    let evidence_refs = signals
-        .iter()
-        .flat_map(|signal| signal.evidence_refs.clone())
-        .chain([
-            diagnosis.diagnosis_id.clone(),
-            candidate.candidate_id.clone(),
-            sandbox_eval.artifact_path.clone(),
-            skill_draft.skill_id.clone(),
-            promotion_receipt.promotion_id.clone(),
-            comparison.comparison_id.clone(),
-        ])
-        .chain(sandbox_eval.artifact_paths.clone())
-        .collect::<Vec<_>>();
+    evidence_refs.extend([
+        candidate.candidate_id.clone(),
+        sandbox_eval.artifact_path.clone(),
+        skill_draft.skill_id.clone(),
+        promotion_receipt.promotion_id.clone(),
+        comparison.comparison_id.clone(),
+    ]);
+    evidence_refs.extend(sandbox_eval.artifact_paths.clone());
     let status = if signals.len() >= 3
         && !diagnosis.acceptance_gates.is_empty()
         && !proposal.acceptance_gates.is_empty()

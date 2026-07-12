@@ -133,6 +133,10 @@ impl MissionService {
         self
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "MissionService methods are installed only in runtime-bound GatewayServices; baseline services do not expose mission operations"
+    )]
     fn runtime(&self) -> &runtime::MissionRuntimePort {
         self.runtime_port
             .as_ref()

@@ -21,6 +21,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
+use crate::components::base::terminal_len;
 use crate::components::RenderContext;
 
 // ── Data Types ────────────────────────────────────────────────────────
@@ -561,7 +562,7 @@ impl QuestionForm {
         // 2. Compute dialog size: 80% of screen width, adaptive height
         let max_w = ((area.width as f32) * 0.8) as u16;
         let w = max_w.min(80).max(40);
-        let h = Self::compute_height(self, w);
+        let h = Self::compute_height(self, w).min(area.height);
         let x = area.x + (area.width.saturating_sub(w)) / 2;
         let y = area.y + (area.height.saturating_sub(h)) / 2;
         let dialog_rect = Rect::new(x, y, w, h);
@@ -593,7 +594,9 @@ impl QuestionForm {
 
         if self.on_confirm() {
             // Confirm tab: "Review" header + one line per question
-            h += 1 + self.questions.len() as u16;
+            h = h
+                .saturating_add(1)
+                .saturating_add(terminal_len(self.questions.len()));
         } else {
             // Question text line + blank
             let q_text = self.current_question().map_or("", |q| q.question.as_str());
@@ -616,7 +619,7 @@ impl QuestionForm {
                 // Editing textarea area
                 if self.editing {
                     // Show up to 3 lines of textarea
-                    let buf_lines = self.edit_buffer.lines().count().max(1) as u16;
+                    let buf_lines = terminal_len(self.edit_buffer.lines().count().max(1));
                     h += buf_lines.min(3);
                 } else if !self.current_custom_input().is_empty() {
                     // Show current custom input preview

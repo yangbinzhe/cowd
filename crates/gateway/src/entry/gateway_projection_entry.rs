@@ -649,7 +649,7 @@ pub(crate) fn handle_gateway_context_command(
             "Cross-Plane Summary",
             SHARED_RT.block_on(client.cross_plane_summary())?,
         ),
-        GatewayContextSlashCommand::Help => unreachable!("help returned above"),
+        GatewayContextSlashCommand::Help => return Ok(()),
     };
     print_gateway_projection_response(title, &value);
     Ok(())

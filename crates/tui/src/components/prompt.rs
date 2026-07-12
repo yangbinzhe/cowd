@@ -24,7 +24,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use tui_textarea::{CursorMove, TextArea};
 
-use crate::components::base::{Component, EventResult, RenderContext};
+use crate::components::base::{terminal_len, Component, EventResult, RenderContext};
 use crate::context_tokens::ContextWorkspaceEntry;
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1095,7 +1095,7 @@ impl Prompt {
         if !self.show_suggestions || self.suggestions.is_empty() {
             0
         } else {
-            self.suggestions.len() as u16 + 2 // +2 for borders
+            terminal_len(self.suggestions.len()).saturating_add(2) // +2 for borders
         }
     }
 
@@ -1222,7 +1222,7 @@ impl Prompt {
             .len()
             .min(self.engine.max_suggestions)
             .max(1);
-        let desired_h = desired_visible as u16 + 2;
+        let desired_h = terminal_len(desired_visible).saturating_add(2);
         let below_y = base_area.y.saturating_add(base_area.height);
         let below_space = screen
             .y
@@ -1316,12 +1316,17 @@ impl Component for Prompt {
         // Render inline preview: dimmed text after the cursor
         if !self.inline_preview.is_empty() {
             let (row, col) = (self.textarea.cursor().0, self.textarea.cursor().1);
-            let preview_x = area.x + col as u16 + 1; // +1 for border
+            let preview_x = area.x.saturating_add(terminal_len(col)).saturating_add(1); // +1 for border
 
             if preview_x < area.x + area.width - 1 {
                 let preview_text = self.inline_preview.clone();
                 // Truncate to fit
-                let available = (area.x + area.width - 1).saturating_sub(preview_x) as usize;
+                let available = usize::from(
+                    area.x
+                        .saturating_add(area.width)
+                        .saturating_sub(1)
+                        .saturating_sub(preview_x),
+                );
                 let display: String = preview_text.chars().take(available).collect();
 
                 let preview_span = Span::styled(
@@ -1333,8 +1338,8 @@ impl Component for Prompt {
 
                 let preview_area = Rect::new(
                     preview_x,
-                    area.y + row as u16 + 1, // +1 for top border
-                    available as u16,
+                    area.y.saturating_add(terminal_len(row)).saturating_add(1), // +1 for top border
+                    terminal_len(available),
                     1,
                 );
 

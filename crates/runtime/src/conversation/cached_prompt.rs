@@ -140,11 +140,9 @@ impl CachedSystemPrompt {
             tracing::warn!("CachedSystemPrompt lock poisoned in needs_rebuild, recovering");
             poisoned.into_inner()
         });
-        let cached = inner
-            .layers
-            .get(&layer)
-            .expect("CacheLayer::all() guarantees every variant is initialised");
-        cached.prompt.is_empty() || cached.memory_count != current_memory_count
+        inner.layers.get(&layer).map_or(true, |cached| {
+            cached.prompt.is_empty() || cached.memory_count != current_memory_count
+        })
     }
 
     /// Rebuild (or initialise) the cached prompt for a single layer.

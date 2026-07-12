@@ -4,47 +4,48 @@ use harness_eval::{
 };
 use std::{path::PathBuf, time::Duration};
 
-fn main() {
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("harness-eval: {error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), String> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if matches!(
         args.first().map(String::as_str),
         Some("--help") | Some("-h")
     ) {
         print_help();
-        return;
+        return Ok(());
     }
     match args.first().map(String::as_str) {
         Some("paired-performance") => {
-            let baseline_url = required_option(&args[1..], "--baseline-url");
-            let candidate_url = required_option(&args[1..], "--candidate-url");
-            let model = required_option(&args[1..], "--provider");
-            let output = required_option(&args[1..], "--output");
+            let baseline_url = required_option(&args[1..], "--baseline-url")?;
+            let candidate_url = required_option(&args[1..], "--candidate-url")?;
+            let model = required_option(&args[1..], "--provider")?;
+            let output = required_option(&args[1..], "--output")?;
             let pairs = option_value(&args[1..], "--pairs")
                 .as_deref()
                 .unwrap_or("5")
                 .parse::<usize>()
-                .unwrap_or_else(|_| {
-                    eprintln!("--pairs must be a positive integer");
-                    std::process::exit(2);
-                });
+                .map_err(|_| "--pairs must be a positive integer".to_string())?;
             let timeout_secs = option_value(&args[1..], "--timeout-secs")
                 .as_deref()
                 .unwrap_or("600")
                 .parse::<u64>()
-                .unwrap_or_else(|_| {
-                    eprintln!("--timeout-secs must be an integer");
-                    std::process::exit(2);
-                });
+                .map_err(|_| "--timeout-secs must be an integer".to_string())?;
             let poll_interval_ms = option_value(&args[1..], "--poll-interval-ms")
                 .as_deref()
                 .unwrap_or("20")
                 .parse::<u64>()
                 .ok()
                 .filter(|value| *value > 0)
-                .unwrap_or_else(|| {
-                    eprintln!("--poll-interval-ms must be a positive integer");
-                    std::process::exit(2);
-                });
+                .ok_or_else(|| "--poll-interval-ms must be a positive integer".to_string())?;
             let token = std::env::var("COWD_API_TOKEN").ok();
             let report = run_paired_performance(PairedPerformanceOptions {
                 baseline_url,
@@ -58,42 +59,34 @@ fn main() {
                 // an entire extra poll and produced false performance regressions.
                 poll_interval: Duration::from_millis(poll_interval_ms),
             })
-            .unwrap_or_else(|error| {
-                eprintln!("paired performance evaluation failed: {error}");
-                std::process::exit(1);
-            });
+            .map_err(|error| format!("paired performance evaluation failed: {error}"))?;
             let output = PathBuf::from(output);
             if let Some(parent) = output.parent() {
-                std::fs::create_dir_all(parent).unwrap_or_else(|error| {
-                    eprintln!("cannot create paired performance report directory: {error}");
-                    std::process::exit(1);
-                });
+                std::fs::create_dir_all(parent).map_err(|error| {
+                    format!("cannot create paired performance report directory: {error}")
+                })?;
             }
-            std::fs::write(
-                &output,
-                serde_json::to_vec_pretty(&report).expect("paired performance json"),
-            )
-            .unwrap_or_else(|error| {
-                eprintln!("cannot write paired performance report: {error}");
-                std::process::exit(1);
-            });
+            let report_json = serde_json::to_vec_pretty(&report)
+                .map_err(|error| format!("serialize paired performance report: {error}"))?;
+            std::fs::write(&output, report_json)
+                .map_err(|error| format!("cannot write paired performance report: {error}"))?;
             println!("paired-performance-report: {}", output.display());
             if report["status"].as_str() != Some("passed") {
                 eprintln!(
                     "paired performance release gate failed; see {}",
                     output.display()
                 );
-                std::process::exit(1);
+                return Err(format!(
+                    "paired performance release gate failed; see {}",
+                    output.display()
+                ));
             }
-            return;
+            return Ok(());
         }
         Some("review-report") => {
             let run_dir = option_value(&args[1..], "--run-dir")
                 .or_else(|| option_value(&args[1..], "--report-dir"))
-                .unwrap_or_else(|| {
-                    eprintln!("review-report requires --run-dir <path>");
-                    std::process::exit(2);
-                });
+                .ok_or_else(|| "review-report requires --run-dir <path>".to_string())?;
             let options = HarnessEvalRunnerOptions {
                 level: HarnessEvalLevel::Deep,
                 provider: option_value(&args[1..], "--provider"),
@@ -101,34 +94,27 @@ fn main() {
                 allow_real_model: args.iter().any(|value| value == "--allow-real-model"),
             };
             let output = HarnessEvalReportStore::review_report_dir(run_dir, options)
-                .unwrap_or_else(|error| {
-                    eprintln!("failed to review harness eval report: {error}");
-                    std::process::exit(1);
-                });
+                .map_err(|error| format!("failed to review harness eval report: {error}"))?;
             println!("full-analysis-report: {}", output.display());
-            return;
+            return Ok(());
         }
         Some("terminal-gate") => {
             let evidence_dir = option_value(&args[1..], "--evidence-dir")
                 .unwrap_or_else(|| "../plan/0706-AIHarness终局100闭环升级/90-审计证据".to_string());
             let report_json = option_value(&args[1..], "--report-json").map(PathBuf::from);
             let gate = terminal_gate_report_with_report(PathBuf::from(evidence_dir), report_json);
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&gate).expect("terminal gate json")
-            );
-            return;
+            let gate_json = serde_json::to_string_pretty(&gate)
+                .map_err(|error| format!("serialize terminal gate report: {error}"))?;
+            println!("{gate_json}");
+            return Ok(());
         }
         _ => {}
     }
 
     let level = match args.first().map(String::as_str) {
         Some(value) if value.starts_with('-') => HarnessEvalLevel::Quick,
-        Some(value) => HarnessEvalLevel::from_str(value).unwrap_or_else(|| {
-            eprintln!("unknown harness eval level: {value}");
-            print_help();
-            std::process::exit(2);
-        }),
+        Some(value) => HarnessEvalLevel::from_str(value)
+            .ok_or_else(|| format!("unknown harness eval level: {value}"))?,
         None => HarnessEvalLevel::Quick,
     };
 
@@ -151,10 +137,8 @@ fn main() {
     };
 
     let store = HarnessEvalReportStore::new(default_report_root(default_config_home()));
-    let record = run_eval(&store, options).unwrap_or_else(|error| {
-        eprintln!("failed to run harness eval: {error}");
-        std::process::exit(1);
-    });
+    let record = run_eval(&store, options)
+        .map_err(|error| format!("failed to run harness eval: {error}"))?;
 
     println!("mission harness {} eval: {}", record.level, record.status);
     println!("run: {}", record.run_id);
@@ -169,6 +153,7 @@ fn main() {
             }
         }
     }
+    Ok(())
 }
 
 fn print_help() {
@@ -183,11 +168,8 @@ fn option_value(args: &[String], key: &str) -> Option<String> {
         .map(|pair| pair[1].clone())
 }
 
-fn required_option(args: &[String], key: &str) -> String {
-    option_value(args, key).unwrap_or_else(|| {
-        eprintln!("paired-performance requires {key} <value>");
-        std::process::exit(2);
-    })
+fn required_option(args: &[String], key: &str) -> Result<String, String> {
+    option_value(args, key).ok_or_else(|| format!("paired-performance requires {key} <value>"))
 }
 
 fn default_config_home() -> PathBuf {

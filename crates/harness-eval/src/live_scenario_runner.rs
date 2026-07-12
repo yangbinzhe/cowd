@@ -269,7 +269,7 @@ impl LiveScenarioRunner {
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
             .map(ToString::to_string);
-        if execution_id.is_none() {
+        let Some(execution_id_ref) = execution_id.as_deref() else {
             return failed_scenario_with_session(
                 spec,
                 started,
@@ -281,22 +281,16 @@ impl LiveScenarioRunner {
                 ),
                 Value::Null,
             );
-        }
+        };
 
-        let terminal = self.wait_for_terminal_message(
-            &session_id,
-            execution_id.as_deref().expect("execution id checked above"),
-            &timeout,
-            &mut trace,
-        );
+        let terminal =
+            self.wait_for_terminal_message(&session_id, execution_id_ref, &timeout, &mut trace);
         let Ok(terminal) = terminal else {
             let mut diagnostics =
-                self.capture_diagnostics(&session_id, execution_id.as_deref(), &mut trace);
-            if let Some(execution_id) = execution_id.as_deref() {
-                let cleanup = self.cancel_execution_lineage(execution_id, &mut trace);
-                if let Some(object) = diagnostics.as_object_mut() {
-                    object.insert("cancellation".to_string(), cleanup);
-                }
+                self.capture_diagnostics(&session_id, Some(execution_id_ref), &mut trace);
+            let cleanup = self.cancel_execution_lineage(execution_id_ref, &mut trace);
+            if let Some(object) = diagnostics.as_object_mut() {
+                object.insert("cancellation".to_string(), cleanup);
             }
             return failed_scenario_with_session_and_execution(
                 spec,

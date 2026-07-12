@@ -9,17 +9,12 @@ use crate::execution_graph::ExecutionGraphProjection;
 
 pub const EXECUTION_PROJECTION_SCHEMA_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectionDetailScope {
+    #[default]
     Summary,
     Full,
-}
-
-impl Default for ProjectionDetailScope {
-    fn default() -> Self {
-        Self::Summary
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

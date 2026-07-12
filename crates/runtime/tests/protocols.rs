@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
 use harness_contract::agent::AgentTaskPacket;
 use harness_contract::execution_graph::{
     validate_execution_graph, ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind,

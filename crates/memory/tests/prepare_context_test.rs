@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
 //! Tests for prepare_context and recall integration.
 //!
 //! These tests verify that CognitiveContextManager can recall durable memories

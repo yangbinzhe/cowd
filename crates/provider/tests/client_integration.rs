@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::{Mutex as StdMutex, OnceLock};

@@ -188,10 +188,9 @@ impl MissionRuntime {
                     }
                 }
                 let snapshot = {
-                    let snapshot = state
-                        .sessions
-                        .get_mut(&session_id)
-                        .expect("existing Mission session must remain addressable");
+                    let snapshot = state.sessions.get_mut(&session_id).ok_or_else(|| {
+                        format!("mission session `{session_id}` disappeared during activation")
+                    })?;
                     snapshot.status = MissionSessionStatus::Active;
                     snapshot.updated_at_ms = now;
                     snapshot.clone()

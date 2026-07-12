@@ -241,7 +241,7 @@ impl EntityRegistry {
         }
         entries
             .iter()
-            .max_by(|a, b| a.confidence.partial_cmp(&b.confidence).unwrap())
+            .max_by(|a, b| a.confidence.total_cmp(&b.confidence))
     }
 
     /// Retrieve the chronological evolution timeline for an entity.

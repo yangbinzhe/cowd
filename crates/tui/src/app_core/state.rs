@@ -833,7 +833,8 @@ impl TuiState {
         }
 
         // BUG 2 FIX: Dynamic input height based on line count.
-        let input_lines = self.app.input.lines().len().max(1) as u16;
+        let input_lines =
+            crate::components::base::terminal_len(self.app.input.lines().len().max(1));
         let max_input = (area.height / 2).max(3);
         let input_h = (input_lines + 2).min(max_input).max(3);
         let frame_areas = TuiFrameAreas::build(area, input_h, self.app.search_active);
@@ -891,8 +892,11 @@ impl TuiState {
                 && frame_areas.body.width >= 100
             {
                 let max_topic_w = frame_areas.body.width.saturating_sub(40);
-                let topic_w =
-                    ((frame_areas.body.width as u32 * 55 / 100) as u16).clamp(48, max_topic_w);
+                let desired_topic_width = u32::from(frame_areas.body.width) * 55 / 100;
+                let topic_w = crate::components::base::terminal_len(
+                    usize::try_from(desired_topic_width).unwrap_or(usize::MAX),
+                )
+                .clamp(48, max_topic_w);
                 chat_area.width = frame_areas.body.width.saturating_sub(topic_w).max(40);
             }
             if topic_fullscreen {
@@ -2362,7 +2366,7 @@ impl TuiState {
             "shutdown" => run_gateway_api_blocking(move |client| async move {
                 client.runtime_agent_shutdown(&agent_id, payload).await
             }),
-            _ => unreachable!(),
+            _ => return false,
         };
         self.agent_team_panel
             .record_action_result(&format!("agent.{action}"), result);
@@ -3376,11 +3380,12 @@ impl TuiState {
     fn dispatch_action(&mut self, action: Action) {
         match action {
             Action::Scroll(delta) => {
+                let magnitude = usize::try_from(delta.unsigned_abs()).unwrap_or(usize::MAX);
                 if delta > 0 {
-                    self.app.scroll_offset = self.app.scroll_offset.saturating_add(delta as u16);
+                    self.app.scroll_offset = self.app.scroll_offset.saturating_add(magnitude);
                     self.app.auto_scroll = false;
                 } else {
-                    self.app.scroll_offset = self.app.scroll_offset.saturating_sub((-delta) as u16);
+                    self.app.scroll_offset = self.app.scroll_offset.saturating_sub(magnitude);
                     self.app.auto_scroll = false;
                 }
                 self.set_focus_target(FocusTarget::Chat);
@@ -4160,7 +4165,9 @@ impl TuiState {
         let n = menu_items.len();
 
         let w = 42u16;
-        let h = (n as u16 + 4).min(area.height.saturating_sub(2));
+        let h = crate::components::base::terminal_len(n)
+            .saturating_add(4)
+            .min(area.height.saturating_sub(2));
         let x = (area.width.saturating_sub(w)) / 2;
         let y = (area.height.saturating_sub(h)) / 2;
         let menu_rect = ratatui::layout::Rect::new(x, y, w, h);
@@ -4371,7 +4378,9 @@ impl L4MemoryView {
         }
 
         let width = area.width.min(40);
-        let height = (lines.len() as u16 + 2).min(area.height);
+        let height = crate::components::base::terminal_len(lines.len())
+            .saturating_add(2)
+            .min(area.height);
         let rect = ratatui::layout::Rect::new(
             area.x.saturating_add(area.width.saturating_sub(width)),
             area.y,

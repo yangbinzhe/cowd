@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
 //! Swarm concurrency stress test: 5 agents write to L4 simultaneously.
 //!
 //! Verifies:

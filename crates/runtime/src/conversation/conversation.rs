@@ -623,11 +623,13 @@ pub trait ApiClient {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.block_on(collect)
         } else {
-            tokio::runtime::Builder::new_current_thread()
+            let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .expect("stream_collect rt")
-                .block_on(collect)
+                .map_err(|error| {
+                    RuntimeError::new(format!("build stream collector runtime: {error}"))
+                })?;
+            runtime.block_on(collect)
         }
     }
 }
@@ -1168,15 +1170,18 @@ where
                     // Inside a runtime — spawn a fresh thread with its own runtime
                     // to avoid nested enter_runtime panic.
                     let mem_cfg = mem_cfg.clone();
-                    let handle = std::thread::spawn(move || {
+                    let handle = std::thread::spawn(move || -> Result<_, String> {
                         let rt = tokio::runtime::Builder::new_current_thread()
                             .enable_all()
                             .build()
-                            .expect("failed to create memory init runtime");
+                            .map_err(|error| {
+                                format!("failed to create memory init runtime: {error}")
+                            })?;
                         rt.block_on(CognitiveContextManager::new(mem_cfg))
+                            .map_err(|error| error.to_string())
                     });
-                    match handle.join().expect("memory init thread panicked") {
-                        Ok(mgr) => {
+                    match handle.join() {
+                        Ok(Ok(mgr)) => {
                             mgr.set_active_agent("primary".to_string());
                             let mgr = mgr.init_memory_sync();
                             tracing::debug!(
@@ -1184,10 +1189,15 @@ where
                             );
                             (Some(Arc::new(mgr)), None)
                         }
-                        Err(err) => {
+                        Ok(Err(err)) => {
                             let msg = format!(
                                 "Memory system unavailable: {err}. Context will NOT persist between turns. Check your memory store paths, vector API credentials, and ~/.cowd/memory/ directory."
                             );
+                            tracing::error!("{msg}");
+                            (None, Some(msg))
+                        }
+                        Err(_) => {
+                            let msg = "Memory system unavailable: initialization thread panicked. Context will NOT persist between turns.".to_string();
                             tracing::error!("{msg}");
                             (None, Some(msg))
                         }
@@ -4056,12 +4066,32 @@ where
     }
 
     #[must_use]
+    #[allow(
+        clippy::panic,
+        reason = "the synchronous compatibility API cannot return an error; an OS worker that cannot join would violate the session read contract"
+    )]
     pub fn session(&self) -> Session {
         if let Ok(session) = self.session.try_read() {
             return session.clone();
         }
-        if tokio::runtime::Handle::try_current().is_ok() {
-            panic!("session() cannot wait for a contended session lock inside an async runtime; use session_async()")
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                return tokio::task::block_in_place(|| self.session.blocking_read().clone());
+            }
+
+            // `block_in_place` is unsupported by a current-thread Tokio runtime.
+            // The async API remains preferred; this compatibility accessor moves the
+            // blocking read to a short-lived OS thread instead of panicking inside
+            // Tokio when legacy synchronous callers use it from that runtime.
+            let session = Arc::clone(&self.session);
+            return std::thread::scope(|scope| {
+                scope
+                    .spawn(move || session.blocking_read().clone())
+                    .join()
+                    .unwrap_or_else(|_| {
+                        panic!("session read worker terminated before returning a session")
+                    })
+            });
         }
         self.session.blocking_read().clone()
     }
@@ -6656,6 +6686,36 @@ mod tests {
             provider_transport_policy(1_000_000, &large).idle_timeout
                 > provider_transport_policy(32_768, &small).idle_timeout
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn synchronous_session_accessor_works_from_current_thread_runtime_when_contended() {
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+        let expected_session_id = runtime.session_async().await.session_id;
+        let lock = Arc::clone(&runtime.session);
+        let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(1);
+        let holder = std::thread::spawn(move || {
+            let _guard = lock.blocking_write();
+            let _ = locked_tx.send(());
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        });
+        locked_rx
+            .recv()
+            .expect("native holder must acquire the session lock before the compatibility read");
+
+        let session = runtime.session();
+
+        holder
+            .join()
+            .expect("native session-lock holder must finish");
+        assert_eq!(session.session_id, expected_session_id);
     }
 
     #[test]

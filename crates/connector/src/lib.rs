@@ -1,3 +1,12 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
 //! Connector contracts, external resources, and connector-local stores.
 //!
 //! This module describes provider accounts, external capabilities, and resource

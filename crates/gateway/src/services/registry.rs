@@ -67,6 +67,10 @@ impl GatewayServices {
         Self::baseline_with_config_home(::runtime::cowd_dirs::config_home_dir())
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "the in-memory cross-plane baseline is a deterministic local dependency for static command projections"
+    )]
     pub(crate) fn baseline_with_config_home(config_home: impl AsRef<std::path::Path>) -> Self {
         let config_home = config_home.as_ref();
         Self {

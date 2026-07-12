@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use crate::app::{App, TimelineEntry};
-use crate::components::panel_scroll::{offset_to_u16, PanelScrollState};
+use crate::components::panel_scroll::PanelScrollState;
 use crate::components::{Component, EventResult, RenderContext};
 
 /// Turn-level activity summary for "what's happening now" display.
@@ -524,7 +524,7 @@ impl Component for RuntimeActivityPanel {
             }
             let remaining_rows = area
                 .height
-                .saturating_sub(lines.len() as u16)
+                .saturating_sub(u16::try_from(lines.len()).unwrap_or(u16::MAX))
                 .saturating_sub(3)
                 .max(6) as usize;
             let start = self.recent_process.len().saturating_sub(remaining_rows);
@@ -544,12 +544,19 @@ impl Component for RuntimeActivityPanel {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray));
-        self.scroll
-            .sync(lines.len(), area.height.saturating_sub(2).max(1) as usize);
+        self.scroll.sync(
+            lines.len(),
+            usize::from(area.height.saturating_sub(2).max(1)),
+        );
+        let visible = lines
+            .into_iter()
+            .skip(self.scroll.offset)
+            .take(self.scroll.viewport_len)
+            .collect::<Vec<_>>();
         ctx.frame_mut().render_widget(
-            Paragraph::new(lines)
+            Paragraph::new(visible)
                 .block(block)
-                .scroll((offset_to_u16(self.scroll.offset), 0))
+                .scroll((0, 0))
                 .wrap(Wrap { trim: false }),
             area,
         );
@@ -648,9 +655,10 @@ fn process_line(item: &ProcessEvent) -> Line<'static> {
 
 fn process_separator_line(turn: usize, width: u16) -> Line<'static> {
     let label = format!(" #{} ", turn);
-    let width = width.max(label.len() as u16) as usize;
-    let side = width.saturating_sub(label.len()) / 2;
-    let right = width.saturating_sub(label.len()).saturating_sub(side);
+    let label_width = label.chars().count();
+    let width = usize::from(width).max(label_width);
+    let side = width.saturating_sub(label_width) / 2;
+    let right = width.saturating_sub(label_width).saturating_sub(side);
     Line::from(Span::styled(
         format!("{}{}{}", "─".repeat(side), label, "─".repeat(right)),
         Style::default().fg(Color::DarkGray),

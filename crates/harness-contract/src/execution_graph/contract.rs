@@ -58,21 +58,11 @@ pub struct ExecutionEdge {
     pub kind: ExecutionEdgeKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionAcceptance {
     pub criteria: Vec<String>,
     pub required_evidence: Vec<String>,
     pub minimum_score_basis_points: Option<u16>,
-}
-
-impl Default for ExecutionAcceptance {
-    fn default() -> Self {
-        Self {
-            criteria: Vec::new(),
-            required_evidence: Vec::new(),
-            minimum_score_basis_points: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

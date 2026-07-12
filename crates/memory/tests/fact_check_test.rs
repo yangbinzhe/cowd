@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
 //! RED Tests: Task 2 - Fact check write path integration
 //!
 //! These tests verify that MemoryOrchestrator.remember() uses FactChecker

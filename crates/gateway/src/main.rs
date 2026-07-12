@@ -5,6 +5,15 @@
     dead_code
 )]
 #![deny(deprecated)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
 #[path = "static/agent_static.rs"]
 mod agent_static;
 mod api_routes;
@@ -299,6 +308,10 @@ fn wait_for_gateway_start(
     Err("gateway process did not become ready before timeout".into())
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "a process-wide runtime is required by synchronous CLI adapters; construction failure aborts startup before serving work"
+)]
 pub(crate) static SHARED_RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -482,6 +495,10 @@ pub fn backend_entry() {
     exit_on_error(run_backend_entry())
 }
 
+#[allow(
+    clippy::exit,
+    reason = "top-level CLI boundary must preserve command exit status for scripts"
+)]
 fn exit_on_error(result: Result<(), Box<dyn std::error::Error>>) {
     if let Err(error) = result {
         let message = error.to_string();
@@ -579,7 +596,7 @@ fn run_static_entry() -> Result<(), Box<dyn std::error::Error>> {
         bootstrap::run_bootstrap()?;
         // 引导完成后询问是否继续启动
         print!("按 Enter 键启动 Cowd 或 Ctrl+C 退出... ");
-        io::stdout().flush().unwrap();
+        io::stdout().flush()?;
         let mut input = String::new();
         io::stdin().read_line(&mut input).ok();
     }
@@ -1813,6 +1830,10 @@ fn dump_manifests_at_path(
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(
+    clippy::exit,
+    reason = "legacy resume CLI reports structured command failures through conventional exit statuses"
+)]
 fn resume_session(session_path: &Path, commands: &[String], output_format: CliOutputFormat) {
     let session_reference = session_path.display().to_string();
     let (handle, session) = match load_session_reference(&session_reference) {
@@ -1940,11 +1961,12 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                 }
                 if output_format == CliOutputFormat::Json {
                     if let Some(value) = json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&value)
-                                .expect("resume command json output")
-                        );
+                        match serde_json::to_string_pretty(&value) {
+                            Ok(json) => println!("{json}"),
+                            Err(error) => {
+                                eprintln!("failed to render resume command JSON: {error}")
+                            }
+                        }
                     } else if let Some(message) = message {
                         println!("{message}");
                     }
@@ -2570,6 +2592,10 @@ fn detect_broad_cwd() -> Option<PathBuf> {
 /// Enforce the broad-CWD policy: when running from home or root, either
 /// require the --allow-broad-cwd flag, or prompt for confirmation (interactive),
 /// or exit with an error (non-interactive).
+#[allow(
+    clippy::exit,
+    reason = "interactive CLI cancellation must terminate before a broad workspace can be used"
+)]
 fn enforce_broad_cwd_policy(
     allow_broad_cwd: bool,
     output_format: CliOutputFormat,
@@ -4261,20 +4287,18 @@ fn first_visible_line(text: &str) -> &str {
 }
 
 fn format_bash_result(icon: &str, parsed: &serde_json::Value) -> String {
-    use std::fmt::Write as _;
-
     let mut lines = vec![format!("{icon} \x1b[38;5;245mbash\x1b[0m")];
     if let Some(task_id) = parsed
         .get("backgroundTaskId")
         .and_then(|value| value.as_str())
     {
-        write!(&mut lines[0], " backgrounded ({task_id})").expect("write to string");
+        lines[0].push_str(&format!(" backgrounded ({task_id})"));
     } else if let Some(status) = parsed
         .get("returnCodeInterpretation")
         .and_then(|value| value.as_str())
         .filter(|status| !status.is_empty())
     {
-        write!(&mut lines[0], " {status}").expect("write to string");
+        lines[0].push_str(&format!(" {status}"));
     }
 
     if let Some(stdout) = parsed.get("stdout").and_then(|value| value.as_str()) {
@@ -8673,6 +8697,7 @@ UU conflicted.rs",
     }
 }
 
+#[cfg(test)]
 fn write_mcp_server_fixture(script_path: &Path) {
     let script = [
             "#!/usr/bin/env python3",

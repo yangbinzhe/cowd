@@ -4,6 +4,22 @@
 
 ## 三层测试入口
 
+## Clippy 门禁
+
+发布阻断使用：
+
+```bash
+scripts/ci/clippy-safety.sh
+```
+
+该门禁将 Rust warning、未处理 `unwrap/expect`、显式 panic、未完成路径、debug 宏和进程退出视为错误。`clippy::all` 与 `clippy::pedantic` 仍应定期运行：
+
+```bash
+scripts/ci/clippy-style-report.sh
+```
+
+后者是非阻断的风格债务报告。其内容可能随 Rust/Clippy 版本变化；涉及截断、转换或 API 形态的建议必须在对应业务模块中单独审查，不能在发布修复中机械改写。
+
 ### 1. 日常快速门禁
 
 ```bash

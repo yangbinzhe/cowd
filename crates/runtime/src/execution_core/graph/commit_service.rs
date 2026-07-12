@@ -225,7 +225,11 @@ impl ExecutionCommitService {
                 Err(error) => return Err(error),
             }
         }
-        Err(last_lineage_conflict.expect("lineage retry loop records its conflict"))
+        Err(last_lineage_conflict.unwrap_or_else(|| {
+            ExecutionCommitError::InvalidReplan(
+                "lineage registration retry exhausted without a conflict receipt".to_string(),
+            )
+        }))
     }
 
     pub async fn register_graph_async(

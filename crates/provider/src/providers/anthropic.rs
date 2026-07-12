@@ -417,9 +417,7 @@ impl AnthropicClient {
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
         let mut attempts = 0;
-        let mut last_error: Option<ApiError>;
-
-        loop {
+        let last_error = loop {
             attempts += 1;
             if let Some(session_tracer) = &self.session_tracer {
                 session_tracer.record_http_request_started(
@@ -429,7 +427,7 @@ impl AnthropicClient {
                     Map::new(),
                 );
             }
-            match self.send_raw_request(request).await {
+            let retry_error = match self.send_raw_request(request).await {
                 Ok(response) => match expect_success(response).await {
                     Ok(response) => {
                         if let Some(session_tracer) = &self.session_tracer {
@@ -446,7 +444,7 @@ impl AnthropicClient {
                     }
                     Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => {
                         self.record_request_failure(attempts, &error);
-                        last_error = Some(error);
+                        error
                     }
                     Err(error) => {
                         let error = enrich_bearer_auth_error(error, &self.auth);
@@ -456,24 +454,24 @@ impl AnthropicClient {
                 },
                 Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => {
                     self.record_request_failure(attempts, &error);
-                    last_error = Some(error);
+                    error
                 }
                 Err(error) => {
                     self.record_request_failure(attempts, &error);
                     return Err(error);
                 }
-            }
+            };
 
             if attempts > self.max_retries {
-                break;
+                break retry_error;
             }
 
             tokio::time::sleep(self.jittered_backoff_for_attempt(attempts)?).await;
-        }
+        };
 
         Err(ApiError::RetriesExhausted {
             attempts,
-            last_error: Box::new(last_error.expect("retry loop must capture an error")),
+            last_error: Box::new(last_error),
         })
     }
 

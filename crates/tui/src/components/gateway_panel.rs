@@ -17,7 +17,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
-use crate::components::panel_scroll::{offset_to_u16, PanelScrollState};
+use crate::components::panel_scroll::PanelScrollState;
 use crate::components::{Component, EventResult, RenderContext};
 use crate::{
     app::App,
@@ -110,7 +110,7 @@ pub struct GatewayPanel {
     pub evolution_status: Option<String>,
     pub evolution_summary: Option<String>,
     /// Scroll offset for content overflow.
-    pub scroll_offset: u16,
+    pub scroll_offset: usize,
 }
 
 pub type GatewayExecutionReceipt = RuntimeActionReceiptSummary;
@@ -1399,16 +1399,20 @@ impl Component for GatewayPanel {
 
         let viewport_len = area.height.saturating_sub(2).max(1) as usize;
         let mut scroll = PanelScrollState {
-            offset: self.scroll_offset as usize,
+            offset: self.scroll_offset,
             content_len: lines.len(),
             viewport_len,
         };
         scroll.clamp();
-        self.scroll_offset = offset_to_u16(scroll.offset);
+        self.scroll_offset = scroll.offset;
 
-        let paragraph = Paragraph::new(lines)
-            .block(block)
-            .scroll((self.scroll_offset, 0));
+        let visible = lines
+            .into_iter()
+            .skip(self.scroll_offset)
+            .take(viewport_len)
+            .collect::<Vec<_>>();
+
+        let paragraph = Paragraph::new(visible).block(block).scroll((0, 0));
         ctx.frame_mut().render_widget(paragraph, area);
     }
 
@@ -1442,7 +1446,7 @@ impl Component for GatewayPanel {
                 EventResult::Consumed
             }
             KeyCode::End => {
-                self.scroll_offset = u16::MAX;
+                self.scroll_offset = usize::MAX;
                 EventResult::Consumed
             }
             KeyCode::Char('r') => EventResult::Consumed, // refresh

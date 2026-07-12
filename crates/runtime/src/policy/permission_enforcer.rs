@@ -1098,11 +1098,13 @@ impl DestructivePatternDetector {
         let no_null: String = cmd.chars().filter(|c| *c != '\0').collect();
 
         // Step 2: Strip ANSI escape sequences (static regex avoids recompilation on hot path)
-        static ANSI_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-            regex::Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07")
-                .expect("invalid ANSI escape regex pattern")
+        static ANSI_RE: std::sync::LazyLock<Option<regex::Regex>> =
+            std::sync::LazyLock::new(|| {
+                regex::Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07").ok()
+            });
+        let no_ansi = ANSI_RE.as_ref().map_or(no_null.clone(), |regex| {
+            regex.replace_all(&no_null, "").to_string()
         });
-        let no_ansi = ANSI_RE.replace_all(&no_null, "").to_string();
 
         // Step 3: Compact consecutive whitespace
         let compact: String = no_ansi.split_whitespace().collect::<Vec<_>>().join(" ");

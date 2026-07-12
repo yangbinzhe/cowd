@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
 //! Agent scope tests: source_agent, visibility, and peer perception
 //! Verifies Phase 1 features of the 3D memory framework
 

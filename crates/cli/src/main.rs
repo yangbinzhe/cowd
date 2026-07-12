@@ -1,29 +1,45 @@
-fn main() {
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
+
+fn main() -> std::process::ExitCode {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let first_arg = args.first().map(String::as_str);
 
     if should_open_tui(&args) || matches!(first_arg, Some("tui")) {
-        open_tui_or_exit();
-        return;
+        return open_tui();
     }
 
     match first_arg {
         Some("gateway") => gateway::backend_entry(),
         _ => gateway::static_entry(),
     }
+    std::process::ExitCode::SUCCESS
 }
 
 #[cfg(feature = "tui-surface")]
-fn open_tui_or_exit() {
-    tui::terminal_entry();
+fn open_tui() -> std::process::ExitCode {
+    match tui::terminal_entry() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("TUI failed: {error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
 }
 
 #[cfg(not(feature = "tui-surface"))]
-fn open_tui_or_exit() {
+fn open_tui() -> std::process::ExitCode {
     eprintln!(
         "TUI surface is not built in this binary; rebuild cowd with `--features full` or install a full build."
     );
-    std::process::exit(2);
+    std::process::ExitCode::from(2)
 }
 
 #[cfg(feature = "tui-surface")]

@@ -248,7 +248,7 @@ async fn command_agent(
         MissionCommandAction::Cancel => AgentCommand::Cancel,
         MissionCommandAction::Input => AgentCommand::SendInput,
         MissionCommandAction::Replan => AgentCommand::Interrupt,
-        _ => unreachable!("matched agent action"),
+        _ => return Err("mission action is not valid for an agent target".to_string()),
     };
     let input = matches!(command.action, MissionCommandAction::Input)
         .then(|| {

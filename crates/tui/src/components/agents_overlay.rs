@@ -11,6 +11,7 @@ use ratatui::{
 };
 
 use crate::app::{App, TimelineEntry};
+use crate::components::base::terminal_len;
 use crate::components::{Component, EventResult, RenderContext};
 
 /// A single agent entry extracted from the timeline.
@@ -119,7 +120,9 @@ impl Component for AgentsOverlay {
             area.width.saturating_sub(40).min(2),
             area.y,
             40.min(area.width),
-            (self.agents.len() as u16 + 5).min(area.height),
+            terminal_len(self.agents.len())
+                .saturating_add(5)
+                .min(area.height),
         );
 
         // Clear background

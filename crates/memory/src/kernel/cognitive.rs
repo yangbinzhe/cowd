@@ -471,13 +471,9 @@ impl CognitiveContextManager {
         // Build state_rebuilder if workspace_root is available
         let ws_root = workspace_root.clone();
         let state_rebuilder = ws_root.as_ref().map(|ws| StateRebuilder::new(ws.clone()));
-        let tool_sandbox = match ToolOutputSandbox::new() {
-            Ok(ts) => Mutex::new(ts),
-            Err(e) => {
-                tracing::warn!("failed to initialize tool sandbox: {e}");
-                Mutex::new(ToolOutputSandbox::new().expect("tool sandbox retry"))
-            }
-        };
+        let tool_sandbox = ToolOutputSandbox::new().map(Mutex::new).map_err(|error| {
+            MemoryError::Other(format!("failed to initialize tool output sandbox: {error}"))
+        })?;
 
         let audit_path = config.store.blob_dir.join("audit.jsonl");
         let audit_log = match AuditLog::open(audit_path.clone()) {
@@ -577,17 +573,16 @@ impl CognitiveContextManager {
     ///
     /// Propagates the guard to the underlying [`MemoryOrchestrator`] so that
     /// [`MemoryOrchestrator::remember`] also enforces layer permissions.
-    pub fn with_write_guard(mut self, guard: MemoryWriteGuard) -> Self {
-        let inner = match Arc::try_unwrap(self.orchestrator) {
-            Ok(inner) => inner,
-            Err(_) => panic!(
-                "orchestrator Arc must have exactly 1 reference when applying write guard; \
-                 ensure init_memory_sync is called after with_write_guard"
-            ),
-        };
+    pub fn with_write_guard(mut self, guard: MemoryWriteGuard) -> Result<Self> {
+        let inner = Arc::try_unwrap(self.orchestrator).map_err(|_| {
+            MemoryError::Other(
+                "cannot apply a memory write guard after the orchestrator has been shared"
+                    .to_string(),
+            )
+        })?;
         self.orchestrator = Arc::new(inner.with_write_guard(Arc::new(guard.clone())));
         self.write_guard = Some(guard);
-        self
+        Ok(self)
     }
 
     /// Set the audit log for tracking write operations.

@@ -43,6 +43,10 @@ impl GatewayRuntimeEntry {
         }
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "the private runtime slot is empty only in test fixtures or while an exclusive mutable turn owns it"
+    )]
     pub(crate) fn with_hook_abort_signal(
         mut self,
         hook_abort_signal: runtime::HookAbortSignal,
@@ -184,12 +188,20 @@ impl GatewayRuntimeEntry {
         self.runtime_ref().last_context_envelope()
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "production entries are constructed with a runtime; None is reserved for test fixtures"
+    )]
     fn runtime_ref(&self) -> &runtime::StandardRuntimeHost<GatewayToolExecutor> {
         self.runtime
             .as_ref()
             .expect("runtime should exist while gateway runtime entry is alive")
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "production entries are constructed with a runtime; None is reserved for test fixtures"
+    )]
     fn runtime_mut(&mut self) -> &mut runtime::StandardRuntimeHost<GatewayToolExecutor> {
         self.runtime
             .as_mut()

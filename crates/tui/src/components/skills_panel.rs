@@ -230,7 +230,7 @@ pub struct SkillsPanel {
     /// Current view mode.
     view_mode: ViewMode,
     /// Scroll offset for long lists.
-    pub scroll_offset: u16,
+    pub scroll_offset: usize,
     /// Status message to display (auto-clears).
     status_message: Option<String>,
     /// Last Gateway skill action receipt.
@@ -641,7 +641,7 @@ impl SkillsPanel {
             )));
             lines.push(Line::raw(""));
 
-            let visible_start = self.scroll_offset as usize;
+            let visible_start = self.scroll_offset;
             let max_visible = inner_height.saturating_sub(lines.len() + 1);
             let visible_end = (visible_start + max_visible).min(total);
 
@@ -800,8 +800,8 @@ impl SkillsPanel {
                     self.selected_index = Some(next);
                     // Auto-scroll: ensure selected is visible
                     let max_visible = 10; // approximate
-                    if next >= self.scroll_offset as usize + max_visible {
-                        self.scroll_offset = (next.saturating_sub(max_visible - 1)) as u16;
+                    if next >= self.scroll_offset + max_visible {
+                        self.scroll_offset = next.saturating_sub(max_visible - 1);
                     }
                 }
                 EventResult::Consumed
@@ -811,8 +811,8 @@ impl SkillsPanel {
                 if !filtered.is_empty() {
                     let prev = self.selected_index.map_or(0, |i| i.saturating_sub(1));
                     self.selected_index = Some(prev);
-                    if prev < self.scroll_offset as usize {
-                        self.scroll_offset = prev as u16;
+                    if prev < self.scroll_offset {
+                        self.scroll_offset = prev;
                     }
                 }
                 EventResult::Consumed

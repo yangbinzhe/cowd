@@ -498,7 +498,7 @@ impl AgentRuntime {
         self.persist_snapshot(snapshot, "agent.prepared", "prepared", None, None)?;
         let mut running = self
             .get(&packet.agent_id)
-            .expect("prepared agent projection");
+            .ok_or_else(|| format!("prepared agent projection `{}` is missing", packet.agent_id))?;
         running.status = AgentStatus::Running;
         running.updated_at_ms = now_ms();
         self.persist_snapshot(running.clone(), "agent.running", "running", None, None)?;
@@ -533,7 +533,7 @@ impl AgentRuntime {
         validate_agent_return(&packet, &returned).map_err(|error| error.to_string())?;
         let mut terminal = self
             .get(&packet.agent_id)
-            .expect("running agent projection");
+            .ok_or_else(|| format!("running agent projection `{}` is missing", packet.agent_id))?;
         terminal.status = terminal_status(returned.status);
         terminal.updated_at_ms = now_ms();
         terminal.failure = returned.failure.clone();

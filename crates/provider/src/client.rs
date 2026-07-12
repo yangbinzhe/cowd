@@ -27,7 +27,7 @@ impl ProviderClient {
         anthropic_auth: Option<AuthSource>,
     ) -> Result<Self, ApiError> {
         let resolved_model = model.trim();
-        match providers::detect_provider_kind(&resolved_model) {
+        match providers::detect_provider_kind(resolved_model) {
             ProviderKind::Anthropic => Ok(Self::Anthropic(match anthropic_auth {
                 Some(auth) => AnthropicClient::from_auth(auth),
                 None => AnthropicClient::from_env()?,
@@ -39,7 +39,7 @@ impl ProviderClient {
                 // DashScope models (qwen-*) also return ProviderKind::OpenAi because they
                 // speak the OpenAI wire format, but they need the DashScope config which
                 // reads DASHSCOPE_API_KEY and points at dashscope.aliyuncs.com.
-                let config = match providers::metadata_for_model(&resolved_model) {
+                let config = match providers::metadata_for_model(resolved_model) {
                     Some(meta) if meta.auth_env == "DASHSCOPE_API_KEY" => {
                         OpenAiCompatConfig::dashscope()
                     }
@@ -94,7 +94,12 @@ impl ProviderClient {
                 let wire_protocol = match protocol {
                     ProviderProtocol::Completions => OpenAiWireProtocol::Completions,
                     ProviderProtocol::Responses => OpenAiWireProtocol::Responses,
-                    ProviderProtocol::Anthropic => unreachable!("handled above"),
+                    ProviderProtocol::Anthropic => {
+                        return Err(ApiError::InvalidProviderConfig {
+                            provider: provider.name.clone(),
+                            reason: "Anthropic protocol must use the Anthropic client".to_string(),
+                        });
+                    }
                 };
                 Ok(Self::OpenAi(OpenAiCompatClient::new_custom_with_protocol(
                     provider.api_key.clone(),

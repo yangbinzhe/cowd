@@ -902,6 +902,23 @@ fn branch_divergence_output(
         "branch divergence detected before workspace tests: `{branch}` {relation} `{main_ref}`. Missing commits: {missing_summary}. Merge or rebase `{main_ref}` before re-running `{command}`."
     );
 
+    let lane_event = LaneEvent::new(
+        LaneEventName::BranchStaleAgainstMain,
+        LaneEventStatus::Blocked,
+        iso8601_now(),
+    )
+    .with_failure_class(LaneFailureClass::BranchDivergence)
+    .with_detail(stderr.clone())
+    .with_data(json!({
+        "branch": branch,
+        "mainRef": main_ref,
+        "commitsBehind": commits_behind,
+        "commitsAhead": commits_ahead,
+        "missingCommits": missing_fixes,
+        "blockedCommand": command,
+        "recommendedAction": format!("merge or rebase {main_ref} before workspace tests")
+    }));
+
     BashCommandOutput {
         stdout: String::new(),
         stderr: stderr.clone(),
@@ -914,25 +931,9 @@ fn branch_divergence_output(
         dangerously_disable_sandbox: None,
         return_code_interpretation: Some("preflight_blocked:branch_divergence".to_string()),
         no_output_expected: Some(false),
-        structured_content: Some(vec![serde_json::to_value(
-            LaneEvent::new(
-                LaneEventName::BranchStaleAgainstMain,
-                LaneEventStatus::Blocked,
-                iso8601_now(),
-            )
-            .with_failure_class(LaneFailureClass::BranchDivergence)
-            .with_detail(stderr.clone())
-            .with_data(json!({
-                "branch": branch,
-                "mainRef": main_ref,
-                "commitsBehind": commits_behind,
-                "commitsAhead": commits_ahead,
-                "missingCommits": missing_fixes,
-                "blockedCommand": command,
-                "recommendedAction": format!("merge or rebase {main_ref} before workspace tests")
-            })),
-        )
-        .expect("lane event should serialize")]),
+        structured_content: serde_json::to_value(lane_event)
+            .ok()
+            .map(|event| vec![event]),
         persisted_output_path: None,
         persisted_output_size: None,
         sandbox_status: None,
@@ -3544,7 +3545,9 @@ fn get_nested_value<'a>(
 }
 
 fn set_nested_value(root: &mut serde_json::Map<String, Value>, path: &[&str], new_value: Value) {
-    let (first, rest) = path.split_first().expect("config path must not be empty");
+    let Some((first, rest)) = path.split_first() else {
+        return;
+    };
     if rest.is_empty() {
         root.insert((*first).to_string(), new_value);
         return;
@@ -3556,8 +3559,9 @@ fn set_nested_value(root: &mut serde_json::Map<String, Value>, path: &[&str], ne
     if !entry.is_object() {
         *entry = Value::Object(serde_json::Map::new());
     }
-    let map = entry.as_object_mut().expect("object inserted");
-    set_nested_value(map, rest, new_value);
+    if let Some(map) = entry.as_object_mut() {
+        set_nested_value(map, rest, new_value);
+    }
 }
 
 fn remove_nested_value(root: &mut serde_json::Map<String, Value>, path: &[&str]) -> bool {

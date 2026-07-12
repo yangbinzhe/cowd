@@ -185,11 +185,21 @@ impl TeamBuilder {
         for dependency in &role_dependencies {
             let from = node_id_by_role
                 .get(&dependency.from_role_id)
-                .expect("template validation checked dependency source")
+                .ok_or_else(|| {
+                    format!(
+                        "team dependency source role `{}` is not part of the compiled team",
+                        dependency.from_role_id
+                    )
+                })?
                 .clone();
             let to = node_id_by_role
                 .get(&dependency.to_role_id)
-                .expect("template validation checked dependency target")
+                .ok_or_else(|| {
+                    format!(
+                        "team dependency target role `{}` is not part of the compiled team",
+                        dependency.to_role_id
+                    )
+                })?
                 .clone();
             graph.edges.push(ExecutionEdge {
                 from,
@@ -199,11 +209,21 @@ impl TeamBuilder {
             let task = tasks
                 .iter_mut()
                 .find(|task| task.role_id == dependency.to_role_id)
-                .expect("template validation checked task target");
+                .ok_or_else(|| {
+                    format!(
+                        "team task for dependency target role `{}` is missing",
+                        dependency.to_role_id
+                    )
+                })?;
             task.depends_on_task_ids.push(
                 task_id_by_role
                     .get(&dependency.from_role_id)
-                    .expect("template validation checked task source")
+                    .ok_or_else(|| {
+                        format!(
+                            "team task for dependency source role `{}` is missing",
+                            dependency.from_role_id
+                        )
+                    })?
                     .clone(),
             );
         }

@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
 //! Performance benchmarks for the memory system (Task 22-23).
 //!
 //! Tests key operations with timing assertions to catch regression.

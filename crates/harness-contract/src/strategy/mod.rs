@@ -589,12 +589,14 @@ pub fn understand(input: &StrategyInput) -> TaskUnderstanding {
     let complexity = classify_complexity(
         input,
         domain,
-        requires_write,
-        requires_external_facts,
-        requests_parallelism,
-        requests_multi_agent,
-        requests_deep_plan,
-        likely_single_file,
+        ComplexitySignals {
+            requires_write,
+            requires_external_facts,
+            requests_parallelism,
+            requests_multi_agent,
+            requests_deep_plan,
+            likely_single_file,
+        },
     );
 
     TaskUnderstanding {
@@ -795,26 +797,34 @@ fn classify_risk(input: &StrategyInput, normalized: &str, requires_write: bool) 
     }
 }
 
-fn classify_complexity(
-    input: &StrategyInput,
-    domain: TaskDomain,
+#[derive(Debug, Clone, Copy)]
+struct ComplexitySignals {
     requires_write: bool,
     requires_external_facts: bool,
     requests_parallelism: bool,
     requests_multi_agent: bool,
     requests_deep_plan: bool,
     likely_single_file: bool,
+}
+
+fn classify_complexity(
+    input: &StrategyInput,
+    domain: TaskDomain,
+    signals: ComplexitySignals,
 ) -> TaskComplexity {
-    if requests_multi_agent || requests_deep_plan || contains_many_scopes(&input.prompt) {
+    if signals.requests_multi_agent
+        || signals.requests_deep_plan
+        || contains_many_scopes(&input.prompt)
+    {
         return TaskComplexity::Strategic;
     }
-    if requests_parallelism
+    if signals.requests_parallelism
         || input.changed_files > 8
         || matches!(domain, TaskDomain::Architecture | TaskDomain::Release)
     {
         return TaskComplexity::Complex;
     }
-    if requires_external_facts
+    if signals.requires_external_facts
         || input.changed_files > 2
         || matches!(
             domain,
@@ -823,7 +833,7 @@ fn classify_complexity(
     {
         return TaskComplexity::Moderate;
     }
-    if requires_write && !likely_single_file {
+    if signals.requires_write && !signals.likely_single_file {
         return TaskComplexity::Moderate;
     }
     if input.prompt.chars().count() <= 80 {

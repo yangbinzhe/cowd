@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -18,6 +19,8 @@ use crate::events::CowdEventSender;
 use crate::gateway_client::{default_auth_token, GatewayApiClient};
 use crate::state::{ProcessedKey, TuiState};
 use crate::{config_migration, cowd_event_channel, error_recovery, CowdEvent, FileEntry};
+
+static SHARED_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct GatewayTuiConfig {
@@ -52,16 +55,14 @@ impl GatewayTuiConfig {
     }
 }
 
-pub fn terminal_entry() {
-    if let Err(error) = run_gateway_tui(GatewayTuiConfig::from_env_args()) {
-        eprintln!("error: {error}");
-        std::process::exit(1);
-    }
+pub fn terminal_entry() -> Result<(), Box<dyn std::error::Error>> {
+    run_gateway_tui(GatewayTuiConfig::from_env_args())
 }
 
 pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::error::Error>> {
     error_recovery::install_tui_panic_hook();
     let migration_report = config_migration::run_startup_migration();
+    let runtime = initialize_shared_rt()?;
 
     let accessibility_enabled = std::env::var("COWD_TUI_ACCESSIBILITY")
         .map(|value| value == "1" || value == "true")
@@ -97,6 +98,7 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                 .to_string()
         })?;
     let gateway_session_ids = attach_gateway_session(
+        runtime,
         &gateway_client,
         &tui_tx,
         &mut state,
@@ -117,7 +119,7 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
     if !migration_report.contains("nothing to migrate") {
         state.add_system_notice(SystemNoticeKind::Info, &migration_report);
     }
-    match list_workspace_files(&gateway_client) {
+    match list_workspace_files(runtime, &gateway_client) {
         Ok(files) => {
             state.prompt.set_workspace_entries(
                 files
@@ -136,7 +138,7 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
     send_session_list(&tui_tx, gateway_session_ids, &session_id);
 
     let startup_ready = true;
-    let res = shared_rt().block_on(async {
+    let res = runtime.block_on(async {
         let mut reader = crossterm::event::EventStream::new();
         let mut execution_projection_stream = None;
         loop {
@@ -280,10 +282,9 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
     });
 
     if let Some(owner) = gateway_lease_owner.as_deref() {
-        let _ =
-            shared_rt().block_on(gateway_client.release_runtime_session_lease(&session_id, owner));
+        let _ = runtime.block_on(gateway_client.release_runtime_session_lease(&session_id, owner));
     }
-    let _ = shared_rt().block_on(gateway_client.detach_session(&session_id, &gateway_actor_id));
+    let _ = runtime.block_on(gateway_client.detach_session(&session_id, &gateway_actor_id));
     if raw_mode_enabled {
         disable_raw_mode()?;
     }
@@ -296,6 +297,7 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
 }
 
 fn attach_gateway_session(
+    runtime: &tokio::runtime::Runtime,
     gateway_client: &GatewayApiClient,
     event_tx: &crate::events::CowdEventSender,
     state: &mut TuiState,
@@ -303,7 +305,7 @@ fn attach_gateway_session(
     gateway_actor_id: &str,
     gateway_lease_owner: &mut Option<String>,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let status = shared_rt()
+    let status = runtime
         .block_on(gateway_client.status())
         .map_err(|err| format!("Gateway API is required for TUI: {err}"))?;
     state.app.server_running = true;
@@ -323,7 +325,7 @@ fn attach_gateway_session(
         &format!("Gateway API connected: {active_api_sessions} active sessions, uptime {server_uptime_secs}s"),
     );
 
-    let ensured = shared_rt()
+    let ensured = runtime
         .block_on(gateway_client.ensure_session(&config.session_id, &config.model))
         .map_err(|err| format!("Gateway session attach failed: {err}"))?;
     state.app.active_api_sessions = ensured
@@ -350,7 +352,7 @@ fn attach_gateway_session(
         &format!("Gateway session {action}: {ensured_session_id}"),
     );
 
-    match shared_rt().block_on(gateway_client.attach_session(
+    match runtime.block_on(gateway_client.attach_session(
         &ensured_session_id,
         gateway_actor_id,
         "tui",
@@ -371,7 +373,7 @@ fn attach_gateway_session(
                         .unwrap_or_default()
                 ),
             );
-            match shared_rt().block_on(gateway_client.replay_session(&ensured_session_id, 0, 100)) {
+            match runtime.block_on(gateway_client.replay_session(&ensured_session_id, 0, 100)) {
                 Ok(replay) => state.add_system_notice(
                     SystemNoticeKind::Info,
                     &format!(
@@ -399,7 +401,7 @@ fn attach_gateway_session(
     }
 
     let lease_owner = gateway_actor_id.to_string();
-    match shared_rt().block_on(gateway_client.acquire_runtime_session_lease(
+    match runtime.block_on(gateway_client.acquire_runtime_session_lease(
         &ensured_session_id,
         &lease_owner,
         "collaborative",
@@ -435,7 +437,7 @@ fn attach_gateway_session(
         ),
     }
 
-    let snapshot = shared_rt().block_on(
+    let snapshot = runtime.block_on(
         crate::runtime_control_store::refresh_runtime_control_snapshot(
             Some(gateway_client),
             Some(&config.session_id),
@@ -446,7 +448,7 @@ fn attach_gateway_session(
     let components = snapshot.runtime_components.unwrap_or_default();
     let degraded_reasons = snapshot.degraded_reasons.clone();
     snapshot.apply_to_app(&mut state.app);
-    match shared_rt().block_on(gateway_client.session_projection(&config.session_id)) {
+    match runtime.block_on(gateway_client.session_projection(&config.session_id)) {
         Ok(projection) => {
             state.app.apply_run_projection(projection);
             state.add_system_notice(
@@ -475,7 +477,7 @@ fn attach_gateway_session(
     let event_client = gateway_client.clone();
     let event_session_id = config.session_id.clone();
     let event_tx = event_tx.clone();
-    let _event_bridge = shared_rt().spawn(async move {
+    let _event_bridge = runtime.spawn(async move {
         let mut after_commit_cursor = None;
         let mut retry_delay = Duration::from_millis(250);
         loop {
@@ -545,7 +547,7 @@ fn dispatch_gateway_slash(
     let command_session_id = session_id.to_string();
     let slash_client = gateway_client.clone();
     let command_tx = tx.clone();
-    shared_rt().spawn(async move {
+    spawn_tui_task(tx, async move {
         let args = serde_json::json!({
             "input": command_input,
             "session_id": command_session_id,
@@ -587,7 +589,7 @@ fn dispatch_gateway_message(
     let event_client = gateway_client.clone();
     let event_session_id = session_id.to_string();
     let event_tx = tx.clone();
-    shared_rt().spawn(async move {
+    spawn_tui_task(tx, async move {
         match event_client
             .send_message_with_resources(&event_session_id, &text, &resource_ids)
             .await
@@ -691,7 +693,7 @@ fn dispatch_gateway_cancel(
     let cancel_session_id = session_id.to_string();
     let cancel_actor_id = actor_id.to_string();
     let cancel_tx = tx.clone();
-    shared_rt().spawn(async move {
+    spawn_tui_task(tx, async move {
         match cancel_client
             .cancel_session_turn(&cancel_session_id, &cancel_actor_id, "tui_user_cancel")
             .await
@@ -749,10 +751,10 @@ fn dispatch_execution_projection_command(
         return;
     }
     let client = gateway_client.clone();
-    let tx = tx.clone();
+    let task_tx = tx.clone();
     let execution_id = projection.execution_id.clone();
     let expected_revision = projection.revision;
-    shared_rt().spawn(async move {
+    spawn_tui_task(tx, async move {
         let receipt = client
             .execute_projection_command(
                 &execution_id,
@@ -766,7 +768,7 @@ fn dispatch_execution_projection_command(
             .await;
         match receipt {
             Ok(receipt) => {
-                let _ = tx.send(CowdEvent::Warning {
+                let _ = task_tx.send(CowdEvent::Warning {
                     message: format!(
                         "Execution command {:?}: {} (revision {})",
                         command, receipt.status, receipt.accepted_revision
@@ -774,7 +776,7 @@ fn dispatch_execution_projection_command(
                 });
             }
             Err(error) => {
-                let _ = tx.send(CowdEvent::TurnError {
+                let _ = task_tx.send(CowdEvent::TurnError {
                     error: format!("Execution command {:?} failed: {error}", command),
                 });
             }
@@ -871,12 +873,18 @@ fn spawn_execution_projection_stream(
     initial_cursor: u64,
     event_tx: CowdEventSender,
 ) {
-    shared_rt().spawn(async move {
+    let failure_tx = event_tx.clone();
+    spawn_tui_task(&failure_tx, async move {
         let mut cursor = initial_cursor;
         let mut retry_delay = Duration::from_millis(250);
         loop {
             match gateway_client
-                .subscribe_execution_projection_events(&execution_id, cursor, false, event_tx.clone())
+                .subscribe_execution_projection_events(
+                    &execution_id,
+                    cursor,
+                    false,
+                    event_tx.clone(),
+                )
                 .await
             {
                 Ok(next_cursor) => {
@@ -897,8 +905,11 @@ fn spawn_execution_projection_stream(
     });
 }
 
-fn list_workspace_files(gateway_client: &GatewayApiClient) -> Result<Vec<FileEntry>, String> {
-    let projection = shared_rt()
+fn list_workspace_files(
+    runtime: &tokio::runtime::Runtime,
+    gateway_client: &GatewayApiClient,
+) -> Result<Vec<FileEntry>, String> {
+    let projection = runtime
         .block_on(gateway_client.workspace_files_recursive(None, 5_000))
         .map_err(|error| error.to_string())?;
     parse_workspace_files_projection(&projection)
@@ -1012,15 +1023,36 @@ fn format_connected_line(model: &str) -> String {
     format!("Connected: {model} via {provider}")
 }
 
-fn shared_rt() -> &'static tokio::runtime::Runtime {
-    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_name("cowd-tui")
-            .build()
-            .expect("failed to build TUI runtime")
-    })
+fn initialize_shared_rt() -> std::io::Result<&'static tokio::runtime::Runtime> {
+    if let Some(runtime) = SHARED_RUNTIME.get() {
+        return Ok(runtime);
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("cowd-tui")
+        .build()?;
+    let _ = SHARED_RUNTIME.set(runtime);
+    SHARED_RUNTIME
+        .get()
+        .ok_or_else(|| std::io::Error::other("TUI runtime initialization was not retained"))
+}
+
+fn shared_rt() -> Option<&'static tokio::runtime::Runtime> {
+    SHARED_RUNTIME.get()
+}
+
+fn spawn_tui_task<F>(event_tx: &CowdEventSender, task: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let Some(runtime) = shared_rt() else {
+        let _ = event_tx.send(CowdEvent::TurnError {
+            error: "TUI async runtime is unavailable; restart the terminal session".to_string(),
+        });
+        return;
+    };
+    runtime.spawn(task);
 }
 
 #[cfg(test)]

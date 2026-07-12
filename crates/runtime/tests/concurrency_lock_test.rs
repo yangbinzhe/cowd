@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
 //! Concurrency safety tests for tokio::sync::RwLock-based Session lock.
 //!
 //! Verifies that switching from std::sync::RwLock to tokio::sync::RwLock

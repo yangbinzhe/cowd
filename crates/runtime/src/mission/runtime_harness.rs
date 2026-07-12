@@ -519,17 +519,17 @@ fn build_context_epoch(
         )
         .with_score(0.9),
     );
-    builder.build().unwrap_or_else(|_| {
-        ContextEpochBuilder::new(ContextIdentity::main(session_id), ContextBudget::new(1))
-            .add_item(ContextItem::new(
-                ContextSourceKind::UserRequest,
-                ContextAuthority::User,
-                ContextRole::RecentTurn,
-                user_input.to_string(),
-            ))
-            .build()
-            .expect("fallback context epoch should build")
-    })
+    builder
+        .build()
+        .unwrap_or_else(|_| harness_contract::context::ContextEpoch {
+            epoch_id: format!("ctx-epoch-{}", uuid::Uuid::new_v4()),
+            identity: ContextIdentity::main(session_id),
+            budget: ContextBudget::new(1),
+            selected: Vec::new(),
+            omitted: Vec::new(),
+            source_registry: Vec::new(),
+            token_total: 0,
+        })
 }
 
 fn build_initial_execution_graph(

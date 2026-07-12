@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
 //! Tests for `SessionMessage` CRUD and FTS5 search.
 //!
 //! Covers:

@@ -1,5 +1,14 @@
 #![deny(deprecated)]
 #![deny(unused_imports)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
 //! Core runtime primitives for the `cowd` CLI and supporting crates.
 //!
 //! This crate owns session persistence, permission evaluation, prompt assembly,

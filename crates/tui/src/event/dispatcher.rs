@@ -93,10 +93,10 @@ impl EventBus {
     pub fn drain(&self) -> Vec<RoutedEvent> {
         let mut heap = BinaryHeap::new();
         // Lock receiver and drain all buffered messages.
-        let receiver = self
-            .receiver
-            .lock()
-            .expect("EventBus receiver lock poisoned");
+        let receiver = match self.receiver.lock() {
+            Ok(receiver) => receiver,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         while let Ok(event) = receiver.try_recv() {
             heap.push(event);
         }

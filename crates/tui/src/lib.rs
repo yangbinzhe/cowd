@@ -1,3 +1,13 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
+
 #[path = "rendering/accessibility.rs"]
 pub mod accessibility;
 #[path = "app_core/action_coverage.rs"]
@@ -44,6 +54,7 @@ pub mod scroll_state;
 pub mod skin;
 #[path = "app_core/state.rs"]
 pub mod state;
+#[cfg(test)]
 pub mod test_utils;
 pub mod theme;
 pub mod workbench;

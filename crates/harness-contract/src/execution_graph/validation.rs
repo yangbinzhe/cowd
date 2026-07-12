@@ -67,7 +67,10 @@ pub fn validate_execution_graph(
         if !ids.contains(&edge.to) {
             return Err(ExecutionGraphValidationError::MissingNode(edge.to.clone()));
         }
-        *indegree.get_mut(&edge.to).expect("validated node") += 1;
+        let count = indegree
+            .get_mut(&edge.to)
+            .ok_or_else(|| ExecutionGraphValidationError::MissingNode(edge.to.clone()))?;
+        *count += 1;
         outgoing
             .entry(edge.from.clone())
             .or_default()
@@ -86,7 +89,9 @@ pub fn validate_execution_graph(
         let mut next = Vec::new();
         for id in &batch {
             for target in outgoing.get(id).into_iter().flatten() {
-                let count = indegree.get_mut(target).expect("validated node");
+                let count = indegree
+                    .get_mut(target)
+                    .ok_or_else(|| ExecutionGraphValidationError::MissingNode(target.clone()))?;
                 *count -= 1;
                 if *count == 0 {
                     next.push(target.clone());

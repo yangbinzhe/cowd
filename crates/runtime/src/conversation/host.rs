@@ -143,6 +143,10 @@ where
         })
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "the private runtime slot is only empty while an exclusive &mut submit call owns it"
+    )]
     pub fn with_hook_abort_signal(mut self, hook_abort_signal: HookAbortSignal) -> Self {
         let runtime = self
             .runtime
@@ -152,6 +156,10 @@ where
         self
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "the private runtime slot is only empty while an exclusive &mut submit call owns it"
+    )]
     pub fn install_turn_control(
         &mut self,
         cancellation_token: crate::CancellationToken,
@@ -168,6 +176,10 @@ where
         );
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "the private runtime slot is only empty while an exclusive &mut submit call owns it"
+    )]
     pub fn install_approval_gate(
         &mut self,
         approval_gate: Arc<crate::approval_gate::SmartApprovalGate>,
@@ -238,6 +250,10 @@ where
     /// This is the only production entry point that may start provider-backed
     /// turn work. Gateway and Agent backends receive a terminal result emitted
     /// by the synthesize node instead of inspecting the session transcript.
+    #[allow(
+        clippy::expect_used,
+        reason = "&mut self excludes all other host calls while the runtime is moved into the graph runner"
+    )]
     pub async fn submit_turn(
         &mut self,
         content: &str,
@@ -260,6 +276,10 @@ where
         result
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "&mut self excludes all other host calls while the runtime is moved into the graph runner"
+    )]
     pub async fn submit_ingress_turn(
         &mut self,
         content: &str,
@@ -335,12 +355,20 @@ where
         self.runtime_ref().last_context_turn_report()
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "the slot can only be empty during an exclusive mutable submit operation"
+    )]
     fn runtime_ref(&self) -> &crate::ConversationRuntime<ProviderRuntimeClient, T> {
         self.runtime
             .as_ref()
             .expect("runtime should exist while standard runtime host is alive")
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "the slot can only be empty during an exclusive mutable submit operation"
+    )]
     fn runtime_mut(&mut self) -> &mut crate::ConversationRuntime<ProviderRuntimeClient, T> {
         self.runtime
             .as_mut()
@@ -368,6 +396,10 @@ where
         .await
 }
 
+#[allow(
+    clippy::panic,
+    reason = "a leaked graph-runner Arc would otherwise make it impossible to return the uniquely owned runtime"
+)]
 async fn submit_owned_conversation_turn_with_ingress<C, T>(
     runtime: crate::ConversationRuntime<C, T>,
     services: Arc<crate::RuntimeServices>,

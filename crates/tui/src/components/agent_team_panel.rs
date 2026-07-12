@@ -75,7 +75,7 @@ pub struct AgentTeamPanel {
     /// Whether the panel is visible (Tab toggles).
     pub visible: bool,
     /// Scroll offset for long lists.
-    pub scroll_offset: u16,
+    pub scroll_offset: usize,
     /// Index of the agent whose detail view is expanded (None = collapsed).
     pub detail_idx: Option<usize>,
     /// Latest execution graph summary emitted by the runtime.
@@ -149,15 +149,15 @@ impl AgentTeamPanel {
                     self.selected_idx += 1;
                 }
                 let max_visible = 10usize;
-                if self.selected_idx >= self.scroll_offset as usize + max_visible {
-                    self.scroll_offset = (self.selected_idx.saturating_sub(max_visible - 1)) as u16;
+                if self.selected_idx >= self.scroll_offset + max_visible {
+                    self.scroll_offset = self.selected_idx.saturating_sub(max_visible - 1);
                 }
                 true
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.selected_idx = self.selected_idx.saturating_sub(1);
-                if self.selected_idx < self.scroll_offset as usize {
-                    self.scroll_offset = self.selected_idx as u16;
+                if self.selected_idx < self.scroll_offset {
+                    self.scroll_offset = self.selected_idx;
                 }
                 true
             }
@@ -485,7 +485,7 @@ impl Component for AgentTeamPanel {
             lines.push(Line::raw(""));
 
             let total = self.agents.len();
-            let visible_start = self.scroll_offset as usize;
+            let visible_start = self.scroll_offset;
             // Estimate how many lines remain after header
             let header_consumed = 2;
             let max_visible = inner_height.saturating_sub(header_consumed + 1);
@@ -621,15 +621,15 @@ impl Component for AgentTeamPanel {
                 }
                 // Auto-scroll
                 let max_visible = 10usize;
-                if self.selected_idx >= self.scroll_offset as usize + max_visible {
-                    self.scroll_offset = (self.selected_idx.saturating_sub(max_visible - 1)) as u16;
+                if self.selected_idx >= self.scroll_offset + max_visible {
+                    self.scroll_offset = self.selected_idx.saturating_sub(max_visible - 1);
                 }
                 EventResult::Consumed
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.selected_idx = self.selected_idx.saturating_sub(1);
-                if self.selected_idx < self.scroll_offset as usize {
-                    self.scroll_offset = self.selected_idx as u16;
+                if self.selected_idx < self.scroll_offset {
+                    self.scroll_offset = self.selected_idx;
                 }
                 EventResult::Consumed
             }
@@ -642,7 +642,7 @@ impl Component for AgentTeamPanel {
                 self.selected_idx = self.agents.len().saturating_sub(1);
                 // Scroll to bottom
                 if self.selected_idx >= 10 {
-                    self.scroll_offset = (self.selected_idx.saturating_sub(9)) as u16;
+                    self.scroll_offset = self.selected_idx.saturating_sub(9);
                 }
                 EventResult::Consumed
             }

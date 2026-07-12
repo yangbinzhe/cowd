@@ -1,6 +1,6 @@
 #![allow(clippy::similar_names)]
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 // ---------------------------------------------------------------------------
 // Core event types
@@ -156,7 +156,7 @@ impl LaneEvent {
             emitted_at,
         )
         .with_optional_detail(detail)
-        .with_data(serde_json::to_value(provenance).expect("commit provenance should serialize"))
+        .with_data(commit_provenance_data(provenance))
     }
 
     #[must_use]
@@ -171,7 +171,7 @@ impl LaneEvent {
             emitted_at,
         )
         .with_optional_detail(detail)
-        .with_data(serde_json::to_value(provenance).expect("commit provenance should serialize"))
+        .with_data(commit_provenance_data(provenance))
     }
 
     #[must_use]
@@ -211,6 +211,31 @@ impl LaneEvent {
         self.data = Some(data);
         self
     }
+}
+
+fn commit_provenance_data(provenance: LaneCommitProvenance) -> Value {
+    let mut data = Map::new();
+    data.insert("commit".to_string(), Value::String(provenance.commit));
+    data.insert("branch".to_string(), Value::String(provenance.branch));
+    if let Some(worktree) = provenance.worktree {
+        data.insert("worktree".to_string(), Value::String(worktree));
+    }
+    if let Some(canonical_commit) = provenance.canonical_commit {
+        data.insert(
+            "canonicalCommit".to_string(),
+            Value::String(canonical_commit),
+        );
+    }
+    if let Some(superseded_by) = provenance.superseded_by {
+        data.insert("supersededBy".to_string(), Value::String(superseded_by));
+    }
+    if !provenance.lineage.is_empty() {
+        data.insert(
+            "lineage".to_string(),
+            Value::Array(provenance.lineage.into_iter().map(Value::String).collect()),
+        );
+    }
+    Value::Object(data)
 }
 
 #[must_use]

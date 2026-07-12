@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
 //! Swarm E2E test: full Planner → Executor → Reviewer lifecycle.
 //!
 //! Simulates a three-agent collaboration through the L4 shared layer:

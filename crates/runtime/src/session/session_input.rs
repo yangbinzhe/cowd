@@ -156,7 +156,7 @@ impl SessionInputStream {
         let mut inner = self
             .inner
             .lock()
-            .expect("session input stream lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         if let Some(existing) = inner.idempotency.get(&envelope.idempotency_key) {
             return SessionInputReceipt {
@@ -274,7 +274,7 @@ impl SessionInputStream {
         let mut inner = self
             .inner
             .lock()
-            .expect("session input stream lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let active_turn = inner.active_turn_id.clone();
         let record = inner
             .records
@@ -295,7 +295,7 @@ impl SessionInputStream {
         let mut inner = self
             .inner
             .lock()
-            .expect("session input stream lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for record in &mut inner.records {
             if consumed.len() >= limit {
                 break;
@@ -319,7 +319,7 @@ impl SessionInputStream {
         let mut inner = self
             .inner
             .lock()
-            .expect("session input stream lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for record in &mut inner.records {
             if promoted.len() >= limit {
                 break;
@@ -341,7 +341,7 @@ impl SessionInputStream {
         let mut inner = self
             .inner
             .lock()
-            .expect("session input stream lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for record in &mut inner.records {
             if drained.len() >= limit {
                 break;
@@ -367,7 +367,7 @@ impl SessionInputStream {
         let inner = self
             .inner
             .lock()
-            .expect("session input stream lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let total = inner.records.len();
         let pending_count = inner
             .records
@@ -411,7 +411,7 @@ impl SessionInputStream {
         let inner = self
             .inner
             .lock()
-            .expect("session input stream lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let selected_turn_id = turn_id.or_else(|| inner.active_turn_id.clone());
         let items: Vec<TurnInboxItem> = inner
             .records
@@ -445,7 +445,7 @@ impl SessionInputStream {
     pub fn record_snapshot(&self, input_id: &SessionInputId) -> Option<SessionInputRecord> {
         self.inner
             .lock()
-            .expect("session input stream lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .records
             .iter()
             .find(|record| &record.envelope.input_id == input_id)

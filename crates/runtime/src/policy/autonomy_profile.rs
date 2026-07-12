@@ -136,11 +136,21 @@ impl AutonomyProfileCatalog {
 
     #[must_use]
     pub fn decide(&self, input: AutonomyDecisionInput) -> AutonomyDecision {
-        let profile = self.get(input.profile_id).unwrap_or_else(|| {
-            self.get(AutonomyProfileId::Supervised)
-                .expect("built-in supervised profile")
-        });
-        profile.decide(input)
+        if let Some(profile) = self
+            .get(input.profile_id)
+            .or_else(|| self.get(AutonomyProfileId::Supervised))
+        {
+            return profile.decide(input);
+        }
+        AutonomyDecision {
+            profile_id: input.profile_id,
+            decision: AutonomyDecisionKind::Deny,
+            reason: "autonomy profile catalog is empty".to_string(),
+            evidence: vec!["autonomy_catalog_empty".to_string()],
+            requested_risk: input.requested_risk,
+            policy_basis: vec!["fail_closed".to_string()],
+            permission_mode: PermissionMode::ReadOnly,
+        }
     }
 }
 
