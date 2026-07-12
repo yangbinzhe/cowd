@@ -903,10 +903,7 @@ pub fn reality_context_eval_specs() -> Vec<RealityScenarioEvalSpec> {
             objective: "上下文压缩后保留可召回线索，不出现绝对遗忘".to_string(),
             expected_pattern: ExecutionPattern::Explore,
             input_summary: "长会话触发压缩并继续追问关键决策依据".to_string(),
-            required_sources: vec![
-                RecallSourceKind::CompactNavigation,
-                RecallSourceKind::SessionCheckpoint,
-            ],
+            required_sources: vec![RecallSourceKind::SessionCheckpoint],
         },
         RealityScenarioEvalSpec {
             id: "fact_matrix_evidence_trace".to_string(),
@@ -1178,9 +1175,7 @@ fn context_source_for(source: RecallSourceKind) -> ContextSourceKind {
             ContextSourceKind::Task
         }
         RecallSourceKind::ToolTrace => ContextSourceKind::ToolTrace,
-        RecallSourceKind::CompactNavigation | RecallSourceKind::SessionCheckpoint => {
-            ContextSourceKind::Handoff
-        }
+        RecallSourceKind::SessionCheckpoint => ContextSourceKind::Handoff,
         RecallSourceKind::AgentPeer => ContextSourceKind::AgentPeer,
         RecallSourceKind::Workspace => ContextSourceKind::Workspace,
     }
@@ -3311,9 +3306,9 @@ mod tests {
         let mut client = runtime::ProviderRuntimeClient::new(registry, model.clone(), Vec::new())
             .expect("provider client should initialize when real eval is enabled");
         let request = runtime::ApiRequest {
-            system_prompt: vec![
+            prompt: runtime::PromptAssembly::new(vec![
                 "You are a strict health-check responder. Return exactly: OK".to_string(),
-            ],
+            ]),
             messages: vec![runtime::ConversationMessage {
                 role: runtime::MessageRole::User,
                 blocks: vec![runtime::ContentBlock::Text {
@@ -3322,6 +3317,14 @@ mod tests {
                 usage: None,
             }],
             model,
+            budget: runtime::context_ledger::RequestBudgetReport::for_attempt(
+                "deepseek-v4-flash",
+                1_000_000,
+                32_000,
+                128,
+                256,
+                0,
+            ),
         };
         let events = client
             .stream_collect(request)

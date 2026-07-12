@@ -1,8 +1,10 @@
-//! Tool output sandbox — derived in-memory FTS5 index over durable raw evidence.
+//! Tool output sandbox — derived in-memory FTS5 index over tool evidence.
 //!
-//! This index is never the lifecycle truth. Every indexed chunk carries the
-//! canonical evidence reference and content hash supplied by the durable
-//! session ledger. Outputs without that receipt are not indexed or replaced.
+//! This index is never the lifecycle truth. Durable chunks carry a canonical
+//! evidence reference from the session ledger; a failed durable write may
+//! instead create an explicitly ephemeral active-runtime entry. Neither form
+//! is replaced by the index, and ephemeral entries are never advertised as
+//! restart-safe evidence.
 //!
 //! Inspired by context-mode's "batch→index→search→inject" pipeline.
 
@@ -102,6 +104,47 @@ impl ToolOutputSandbox {
         if !evidence.is_durable() || evidence.access.bytes != output.len() as u64 {
             return None;
         }
+        self.index_tool_output_with_metadata(
+            tool_call_id,
+            output,
+            threshold_min_lines,
+            &evidence.access.evidence_ref.0.id,
+            &evidence.access.sha256,
+            &evidence.access.retrieval_selector,
+        )
+    }
+
+    /// Index an output retained only by the active Runtime instance. This is
+    /// deliberately separate from canonical evidence: callers must never
+    /// publish its reference as durable or claim it survives a restart.
+    #[must_use]
+    pub fn index_tool_output_ephemeral(
+        &mut self,
+        tool_call_id: &str,
+        output: &str,
+        threshold_min_lines: usize,
+        evidence_ref: &str,
+        content_hash: &str,
+    ) -> Option<ToolOutputSummary> {
+        self.index_tool_output_with_metadata(
+            tool_call_id,
+            output,
+            threshold_min_lines,
+            evidence_ref,
+            content_hash,
+            &format!("runtime-memory://tool-output/{tool_call_id}"),
+        )
+    }
+
+    fn index_tool_output_with_metadata(
+        &mut self,
+        tool_call_id: &str,
+        output: &str,
+        threshold_min_lines: usize,
+        evidence_ref: &str,
+        content_hash: &str,
+        retrieval_selector: &str,
+    ) -> Option<ToolOutputSummary> {
         let lines: Vec<&str> = output.lines().collect();
         if lines.len() < threshold_min_lines && output.chars().count() < 16_000 {
             return None;
@@ -125,7 +168,7 @@ impl ToolOutputSandbox {
                     let _ = tx.execute(
                         "INSERT INTO tool_output_fts(call_id, evidence_ref, content_hash, line_range, content) \
                          VALUES (?1, ?2, ?3, ?4, ?5)",
-                        params![tool_call_id, evidence.access.evidence_ref.0.id, evidence.access.sha256, line_range, chunk_content],
+                        params![tool_call_id, evidence_ref, content_hash, line_range, chunk_content],
                     );
                 }
             } else {
@@ -136,7 +179,7 @@ impl ToolOutputSandbox {
                     let _ = tx.execute(
                         "INSERT INTO tool_output_fts(call_id, evidence_ref, content_hash, line_range, content) \
                          VALUES (?1, ?2, ?3, ?4, ?5)",
-                        params![tool_call_id, evidence.access.evidence_ref.0.id, evidence.access.sha256, line_range, chunk_content],
+                        params![tool_call_id, evidence_ref, content_hash, line_range, chunk_content],
                     );
                 }
             }
@@ -159,10 +202,7 @@ impl ToolOutputSandbox {
             search_hint: format!(
                 "Output indexed ({} lines, {} bytes). \
                  Use evidence_retrieve with evidence_ref {} and selector {}.",
-                total_lines,
-                full_size_bytes,
-                evidence.access.evidence_ref.0.id,
-                evidence.access.retrieval_selector
+                total_lines, full_size_bytes, evidence_ref, retrieval_selector
             ),
         })
     }
@@ -390,6 +430,25 @@ mod tests {
             .index_tool_output("pending-call", "bash", &output, 10)
             .is_none());
         assert_eq!(sandbox.entry_count(), 0);
+    }
+
+    #[test]
+    fn active_runtime_can_index_ephemeral_output_without_claiming_durability() {
+        let mut sandbox = ToolOutputSandbox::new().unwrap();
+        let output = "transient_evidence_marker\n".repeat(120);
+        let summary = sandbox.index_tool_output_ephemeral(
+            "ephemeral-1",
+            &output,
+            10,
+            "tool-raw-ephemeral-1",
+            "ephemeral:hash",
+        );
+
+        assert!(summary.is_some());
+        assert!(sandbox.entry_count() > 0);
+        let found = sandbox.search("ephemeral-1", "transient_evidence_marker", 1);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].evidence_ref, "tool-raw-ephemeral-1");
     }
 
     #[test]

@@ -7,6 +7,10 @@ use serde_json::Value;
 pub struct MessageRequest {
     pub model: String,
     pub max_tokens: u32,
+    /// Runtime-resolved context window for local preflight only. This is never
+    /// serialized to an upstream provider request.
+    #[serde(skip)]
+    pub context_window_limit: Option<u32>,
     pub messages: Vec<InputMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,

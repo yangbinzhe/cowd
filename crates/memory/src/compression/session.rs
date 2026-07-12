@@ -86,6 +86,10 @@ pub struct SessionCompactConfig {
     pub preserve_recent: usize,
     /// Minimum entries to compress (don't fire if history is tiny).
     pub min_messages_to_compact: usize,
+    /// Bound the continuation artifact itself. Raw transcript evidence remains
+    /// durable; this only prevents iterative checkpoints from expanding on
+    /// every compaction cycle.
+    pub max_summary_tokens: u32,
 }
 
 impl Default for SessionCompactConfig {
@@ -94,6 +98,7 @@ impl Default for SessionCompactConfig {
             threshold_tokens: 40_000,
             preserve_recent: 10,
             min_messages_to_compact: 4,
+            max_summary_tokens: 2_000,
         }
     }
 }
@@ -203,6 +208,15 @@ impl SessionCheckpointBuildContext {
     #[must_use]
     pub fn with_project_id(mut self, project_id: Option<String>) -> Self {
         self.project_id = project_id;
+        self
+    }
+
+    /// Runtime supplies a deterministic ID for a planned source range so an
+    /// interrupted compaction can be retried without creating a second
+    /// checkpoint/fact family. Standalone callers keep the UUID from `new`.
+    #[must_use]
+    pub fn with_checkpoint_id(mut self, checkpoint_id: impl Into<String>) -> Self {
+        self.checkpoint_id = checkpoint_id.into();
         self
     }
 
@@ -443,6 +457,14 @@ impl SessionCompactor {
         self
     }
 
+    /// Set the bounded continuation summary capacity for Runtime-managed
+    /// compaction. Values below 128 would produce unusable checkpoints.
+    #[must_use]
+    pub fn with_max_summary_tokens(mut self, max_summary_tokens: u32) -> Self {
+        self.config.max_summary_tokens = max_summary_tokens.max(128);
+        self
+    }
+
     // -----------------------------------------------------------------------
     // Public API
     // -----------------------------------------------------------------------
@@ -474,7 +496,10 @@ impl SessionCompactor {
         let (old_messages, recent) = self.split_messages(messages.clone());
 
         // Generate structured summary (tries LLM, falls back to template).
-        let summary = self.generate_summary(&old_messages, previous_summary).await;
+        let summary = bound_checkpoint_summary(
+            self.generate_summary(&old_messages, previous_summary).await,
+            self.config.max_summary_tokens,
+        );
         let summary_tokens = (summary.len() as u32).div_ceil(4);
 
         // Extract decisions and write to L2.
@@ -539,7 +564,10 @@ impl SessionCompactor {
         previous_summary: Option<&str>,
         build_context: SessionCheckpointBuildContext,
     ) -> Result<SessionSemanticCheckpoint> {
-        let summary = self.generate_summary(messages, previous_summary).await;
+        let summary = bound_checkpoint_summary(
+            self.generate_summary(messages, previous_summary).await,
+            self.config.max_summary_tokens,
+        );
         let summary_tokens = (summary.len() as u32).div_ceil(4);
         let input_tokens = self.estimate_tokens(messages);
         let mut facts = Vec::new();
@@ -1304,6 +1332,23 @@ None
     }
 }
 
+fn bound_checkpoint_summary(summary: String, max_tokens: u32) -> String {
+    let max_chars = usize::try_from(max_tokens)
+        .unwrap_or(2_000)
+        .saturating_mul(4);
+    if summary.chars().count() <= max_chars {
+        return summary;
+    }
+    let suffix =
+        "\n\n[Continuation summary bounded; inspect durable checkpoint evidence for full detail.]";
+    let mut bounded = summary
+        .chars()
+        .take(max_chars.saturating_sub(suffix.chars().count()))
+        .collect::<String>();
+    bounded.push_str(suffix);
+    bounded
+}
+
 impl Default for SessionCompactor {
     fn default() -> Self {
         Self::new()
@@ -1509,6 +1554,35 @@ mod tests {
         assert!(!checkpoint.file_changes.is_empty());
         assert_eq!(checkpoint.resume_cursor.message_index, 2);
         assert_eq!(checkpoint.resume_cursor.event_sequence, Some(8));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_summary_is_bounded_without_dropping_durable_source_range() {
+        let messages = vec![
+            msg(MessageRole::User, &"important request ".repeat(1_000)),
+            msg(MessageRole::Assistant, &"important result ".repeat(1_000)),
+        ];
+        let context = SessionCheckpointBuildContext::new(
+            "session-bounded",
+            "agent-bounded",
+            CompactionSourceRange {
+                session_id: "session-bounded".to_string(),
+                message_start: 0,
+                message_end_exclusive: 2,
+                event_start: Some(0),
+                event_end_exclusive: Some(2),
+                raw_refs: vec![EvidenceRef::durable("raw-bounded")],
+            },
+        );
+        let checkpoint = SessionCompactor::new()
+            .with_max_summary_tokens(128)
+            .build_checkpoint(&messages, None, context)
+            .await
+            .unwrap();
+        assert!(checkpoint.summary.chars().count() <= 512);
+        assert_eq!(checkpoint.source_range.message_start, 0);
+        assert_eq!(checkpoint.source_range.message_end_exclusive, 2);
+        assert_eq!(checkpoint.source_range.raw_refs.len(), 1);
     }
 
     #[test]

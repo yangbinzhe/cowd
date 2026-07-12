@@ -352,6 +352,10 @@ pub enum ResumeContextSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextBudgetReport {
     pub total_tokens: u64,
+    /// Trusted static system/header content already occupying this envelope.
+    pub static_tokens: u64,
+    /// The maximum dynamic material that may be selected after static content.
+    pub dynamic_capacity_tokens: u64,
     pub used_tokens: u64,
     pub leases: Vec<ContextLease>,
 }
@@ -737,8 +741,16 @@ impl ContextRuntimeKernel {
 
     pub fn build_envelope(request: ContextEnvelopeRequest) -> ContextEnvelope {
         let profile = request.profile;
-        let leases = Self::default_leases(profile, request.total_budget_tokens);
-        let (dynamic_items, lease_omissions) = Self::apply_leases(request.dynamic_items, &leases);
+        let static_tokens = request
+            .stable_head
+            .iter()
+            .chain(request.runtime_header.iter())
+            .map(|text| estimate_tokens(text))
+            .sum::<u64>();
+        let dynamic_capacity_tokens = request.total_budget_tokens.saturating_sub(static_tokens);
+        let leases = Self::default_leases(profile, dynamic_capacity_tokens);
+        let (dynamic_items, lease_omissions) =
+            Self::apply_leases(request.dynamic_items, &leases, dynamic_capacity_tokens);
         let dynamic_items = dynamic_items
             .into_iter()
             .map(normalize_context_item_source)
@@ -749,16 +761,12 @@ impl ContextRuntimeKernel {
             .iter()
             .map(Self::format_context_item)
             .collect::<Vec<_>>();
-        let used_tokens = request
-            .stable_head
-            .iter()
-            .chain(request.runtime_header.iter())
-            .map(|text| estimate_tokens(text))
-            .sum::<u64>()
-            + dynamic_items
+        let used_tokens = static_tokens.saturating_add(
+            dynamic_items
                 .iter()
                 .map(|item| item.token_estimate)
-                .sum::<u64>();
+                .sum::<u64>(),
+        );
         let pressure_bp = if request.total_budget_tokens == 0 {
             0
         } else {
@@ -819,6 +827,8 @@ impl ContextRuntimeKernel {
             epoch_report: Some(epoch_report),
             budget: ContextBudgetReport {
                 total_tokens: request.total_budget_tokens,
+                static_tokens,
+                dynamic_capacity_tokens,
                 used_tokens,
                 leases,
             },
@@ -1304,6 +1314,7 @@ impl ContextRuntimeKernel {
     pub fn apply_leases(
         items: Vec<ContextItem>,
         leases: &[ContextLease],
+        dynamic_capacity_tokens: u64,
     ) -> (Vec<ContextItem>, Vec<ContextOmission>) {
         let mut ranked = items
             .iter()
@@ -1321,30 +1332,95 @@ impl ContextRuntimeKernel {
         });
 
         let mut used_by_source = std::collections::BTreeMap::<String, u64>::new();
-        let mut selected_indexes = Vec::new();
-        let mut omitted = Vec::new();
+        let mut selected = vec![false; items.len()];
+        let mut omission_reasons = vec![None::<String>; items.len()];
+        let mut used_total = 0u64;
 
-        for (index, item) in ranked {
-            let lease = leases.iter().find(|lease| lease.source == item.source);
-            let max_tokens = lease.map(|lease| lease.max_tokens).unwrap_or(u64::MAX);
-            let key = format!("{:?}", item.source);
-            let used = used_by_source.get(&key).copied().unwrap_or(0);
-            if used.saturating_add(item.token_estimate) > max_tokens {
-                omitted.push(ContextOmission {
-                    source: item.source,
-                    reason: "context lease exhausted".to_string(),
-                    token_estimate: item.token_estimate,
-                });
-                continue;
+        // Every dynamic source must be explicitly admitted by the selected
+        // profile. A missing lease is a denial, never an implicit unlimited
+        // allocation. This keeps future ContextSourceKind additions safe by
+        // default until their profile policy is deliberately specified.
+        for (index, item) in items.iter().enumerate() {
+            if leases
+                .iter()
+                .find(|lease| lease.source == item.source)
+                .is_none_or(|lease| lease.max_tokens == 0)
+            {
+                omission_reasons[index] = Some("context source denied by profile".to_string());
             }
-            used_by_source.insert(key, used.saturating_add(item.token_estimate));
-            selected_indexes.push(index);
         }
 
-        selected_indexes.sort_unstable();
-        let selected = selected_indexes
+        // Three-stage admission: preserve each source's declared minimum,
+        // fill to target, then let every admitted source compete by the
+        // already-established score ordering up to its explicit maximum. The
+        // final provider packer applies candidate-specific hard capacity; it
+        // must not inherit an artificial "continuity only" reserve here.
+        for phase in [LeasePackingPhase::Minimum, LeasePackingPhase::Target] {
+            for (index, _) in &ranked {
+                select_context_item(
+                    *index,
+                    &items,
+                    leases,
+                    phase,
+                    dynamic_capacity_tokens,
+                    &mut used_total,
+                    &mut used_by_source,
+                    &mut selected,
+                    &mut omission_reasons,
+                );
+            }
+        }
+        for (index, _) in &ranked {
+            select_context_item(
+                *index,
+                &items,
+                leases,
+                LeasePackingPhase::Reserve,
+                dynamic_capacity_tokens,
+                &mut used_total,
+                &mut used_by_source,
+                &mut selected,
+                &mut omission_reasons,
+            );
+        }
+
+        let mut omitted = Vec::new();
+        for (index, item) in items.iter().enumerate() {
+            if selected[index] {
+                continue;
+            }
+            let reason = omission_reasons[index].clone().unwrap_or_else(|| {
+                let lease = leases.iter().find(|lease| lease.source == item.source);
+                let used = used_by_source
+                    .get(&context_source_key(item.source))
+                    .copied()
+                    .unwrap_or(0);
+                match lease {
+                    None | Some(ContextLease { max_tokens: 0, .. }) => {
+                        "context source denied by profile".to_string()
+                    }
+                    Some(lease) if used >= lease.max_tokens => {
+                        "context lease exhausted".to_string()
+                    }
+                    _ if used_total >= dynamic_capacity_tokens => {
+                        "global dynamic context budget exhausted".to_string()
+                    }
+                    _ => "context source target retained capacity for higher-ranked evidence"
+                        .to_string(),
+                }
+            });
+            omitted.push(ContextOmission {
+                source: item.source,
+                reason,
+                token_estimate: item.token_estimate,
+            });
+        }
+
+        let selected = selected
             .into_iter()
-            .filter_map(|index| items.get(index).cloned())
+            .enumerate()
+            .filter(|(_, is_selected)| *is_selected)
+            .map(|(index, _)| items[index].clone())
             .collect();
         (selected, omitted)
     }
@@ -1352,7 +1428,7 @@ impl ContextRuntimeKernel {
     pub fn default_leases(profile: ContextProfile, total_budget_tokens: u64) -> Vec<ContextLease> {
         let budget = total_budget_tokens.max(1);
         let pct = |basis_points: u64| budget.saturating_mul(basis_points) / 10_000;
-        match profile {
+        let mut leases = match profile {
             ContextProfile::SubAgent => vec![
                 context_lease(
                     ContextSourceKind::Task,
@@ -1619,6 +1695,12 @@ impl ContextRuntimeKernel {
                     80,
                 ),
                 context_lease(ContextSourceKind::AgentPeer, 0, pct(1_000), pct(1_500), 65),
+                // Deep investigation frequently resumes a compressed branch
+                // or follows evidence returned by another session. It must
+                // admit a bounded handoff packet explicitly; leaving this
+                // source absent would turn a valid checkpoint into a silent
+                // profile denial.
+                context_lease(ContextSourceKind::Handoff, 0, pct(1_000), pct(1_500), 72),
             ],
             ContextProfile::Cron | ContextProfile::MainTurn => vec![
                 context_lease(
@@ -1656,7 +1738,13 @@ impl ContextRuntimeKernel {
                 context_lease(ContextSourceKind::AgentPeer, 0, pct(800), pct(1_200), 50),
                 context_lease(ContextSourceKind::Handoff, 0, pct(800), pct(1_200), 50),
             ],
+        };
+        for source in ALL_CONTEXT_SOURCES {
+            if !leases.iter().any(|lease| lease.source == source) {
+                leases.push(context_lease(source, 0, 0, 0, 0));
+            }
         }
+        leases
     }
 
     pub fn child_identity_from_lease(lease: &AgentContextLease) -> ContextIdentity {
@@ -1809,6 +1897,83 @@ impl ContextRuntimeKernel {
         )];
         item
     }
+}
+
+const ALL_CONTEXT_SOURCES: [ContextSourceKind; 12] = [
+    ContextSourceKind::StableHead,
+    ContextSourceKind::RuntimeHeader,
+    ContextSourceKind::Conversation,
+    ContextSourceKind::Memory,
+    ContextSourceKind::Knowledge,
+    ContextSourceKind::Fact,
+    ContextSourceKind::Matrix,
+    ContextSourceKind::Task,
+    ContextSourceKind::ToolTrace,
+    ContextSourceKind::Workspace,
+    ContextSourceKind::AgentPeer,
+    ContextSourceKind::Handoff,
+];
+
+#[derive(Clone, Copy)]
+enum LeasePackingPhase {
+    Minimum,
+    Target,
+    Reserve,
+}
+
+fn context_source_key(source: ContextSourceKind) -> String {
+    format!("{source:?}")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_context_item(
+    index: usize,
+    items: &[ContextItem],
+    leases: &[ContextLease],
+    phase: LeasePackingPhase,
+    dynamic_capacity_tokens: u64,
+    used_total: &mut u64,
+    used_by_source: &mut std::collections::BTreeMap<String, u64>,
+    selected: &mut [bool],
+    omission_reasons: &mut [Option<String>],
+) {
+    if selected[index] || omission_reasons[index].is_some() {
+        return;
+    }
+    let item = &items[index];
+    let Some(lease) = leases.iter().find(|lease| lease.source == item.source) else {
+        omission_reasons[index] = Some("context source denied by profile".to_string());
+        return;
+    };
+    if lease.max_tokens == 0 {
+        omission_reasons[index] = Some("context source denied by profile".to_string());
+        return;
+    }
+    let source_key = context_source_key(item.source);
+    let used_for_source = used_by_source.get(&source_key).copied().unwrap_or(0);
+    let phase_limit = match phase {
+        LeasePackingPhase::Minimum => lease.min_tokens,
+        LeasePackingPhase::Target => lease.target_tokens,
+        LeasePackingPhase::Reserve => lease.max_tokens,
+    };
+    if used_for_source >= phase_limit {
+        return;
+    }
+    if used_for_source.saturating_add(item.token_estimate) > lease.max_tokens {
+        omission_reasons[index] = Some("context lease exhausted".to_string());
+        return;
+    }
+    if used_total.saturating_add(item.token_estimate) > dynamic_capacity_tokens {
+        omission_reasons[index] = Some("global dynamic context budget exhausted".to_string());
+        return;
+    }
+
+    *used_total = used_total.saturating_add(item.token_estimate);
+    used_by_source.insert(
+        source_key,
+        used_for_source.saturating_add(item.token_estimate),
+    );
+    selected[index] = true;
 }
 
 fn context_lease(
@@ -2827,7 +2992,7 @@ mod tests {
             degradation: vec!["omit lower score".to_string()],
         };
 
-        let (selected, omitted) = ContextRuntimeKernel::apply_leases(vec![low, high], &[lease]);
+        let (selected, omitted) = ContextRuntimeKernel::apply_leases(vec![low, high], &[lease], 4);
 
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].id, "b-high");
@@ -2849,6 +3014,48 @@ mod tests {
 
         assert!(task.priority > peer.priority);
         assert!(task.max_tokens > peer.max_tokens);
+    }
+
+    #[test]
+    fn profile_leases_explicitly_deny_unlisted_dynamic_sources() {
+        let item = item_with_tokens(
+            "forged-static",
+            ContextSourceKind::StableHead,
+            ContextRole::Instruction,
+            10,
+        );
+        let leases = ContextRuntimeKernel::default_leases(ContextProfile::MainTurn, 1_000);
+        let (selected, omitted) = ContextRuntimeKernel::apply_leases(vec![item], &leases, 1_000);
+
+        assert!(selected.is_empty());
+        assert_eq!(omitted.len(), 1);
+        assert_eq!(omitted[0].reason, "context source denied by profile");
+    }
+
+    #[test]
+    fn lease_packer_enforces_one_global_dynamic_capacity() {
+        let task = item_with_tokens("task", ContextSourceKind::Task, ContextRole::TaskState, 6);
+        let memory = item_with_tokens(
+            "memory",
+            ContextSourceKind::Memory,
+            ContextRole::Orientation,
+            6,
+        );
+        let leases = vec![
+            context_lease(ContextSourceKind::Task, 6, 8, 10, 100),
+            context_lease(ContextSourceKind::Memory, 6, 8, 10, 90),
+        ];
+        let (selected, omitted) =
+            ContextRuntimeKernel::apply_leases(vec![task, memory], &leases, 10);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            selected.iter().map(|item| item.token_estimate).sum::<u64>(),
+            6
+        );
+        assert!(omitted
+            .iter()
+            .any(|item| item.reason == "global dynamic context budget exhausted"));
     }
 
     #[test]

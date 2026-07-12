@@ -30,14 +30,10 @@
 //! }
 //! ```
 
-#![warn(deprecated)]
-
 // --- Public modules ---
 
 #[path = "ingestion/aaak_compression.rs"]
 pub mod aaak_compression;
-#[path = "ingestion/aaak_index.rs"]
-pub mod aaak_index;
 #[path = "lifecycle/agent_directory.rs"]
 pub mod agent_directory;
 #[path = "lifecycle/agent_reputation.rs"]
@@ -150,7 +146,6 @@ pub use aaak_compression::{
     AaakCompressed, AaakCompressor, AaakDictionary, Abbreviation, EntityType, GsdContext, GsdState,
     PriorityItem,
 };
-pub use aaak_index::{estimate_full_injection_tokens, AaakIndex, AaakSlot};
 pub use closet::{
     Closet, ClosetEntry, ClosetManager, ClosetPointer, CodeSymbolId, PointerKind, CHAR_LIMIT,
     RANK_BOOSTS,
@@ -161,10 +156,7 @@ pub use compression::token_estimation::{
     TokenEstimator,
 };
 pub use config::{MemoryConfig, TuningConfig, VectorConfig};
-pub use context_fence::{
-    build_memory_context_block, fence_from_session, filter_through_fence, ContextFence, EntryBlock,
-    FenceConfig, FenceRegistry, LayerBlock, MemoryContextBlock,
-};
+pub use context_fence::{fence_from_session, filter_through_fence, ContextFence, FenceRegistry};
 pub use context_rot::{ContextRotMonitor, RotAlert, RotMetrics};
 pub use embedding::{EmbeddingCapability, EmbeddingClient};
 pub use error::MemoryError;
@@ -179,9 +171,9 @@ pub use hot_reload::{
     SharedConfigReloader,
 };
 pub use kernel::reality_recall::{
-    rank_and_deduplicate_candidates, rank_candidates, CompactNavigationPointer, RecallCandidate,
-    RecallCandidateEvidence, RecallCandidateScores, RecallFence, RecallOmission, RecallReport,
-    RecallRequest, RecallSource, RecallSourceResult, RecallSourceStatus,
+    rank_and_deduplicate_candidates, rank_candidates, RecallCandidate, RecallCandidateEvidence,
+    RecallCandidateScores, RecallFence, RecallOmission, RecallReport, RecallRequest, RecallSource,
+    RecallSourceResult, RecallSourceStatus,
 };
 pub use kernel::{
     MemoryAtomView, MemoryContextPacket, MemoryContextPacketMode, MemoryDegradation, MemoryHealth,

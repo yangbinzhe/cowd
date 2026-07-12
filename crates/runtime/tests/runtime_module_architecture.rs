@@ -77,7 +77,6 @@ fn runtime_root_public_modules_are_classified_by_domain() {
     let allowed_public_modules = [
         "bash_validation",
         "branch_lock",
-        "cached_prompt",
         "cowd_dirs",
         "effect",
         "error",

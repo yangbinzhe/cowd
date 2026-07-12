@@ -423,6 +423,7 @@ async fn apply_runtime_config(
     }
 
     let edge_discovery = state.services.surface.reload_manifests().await;
+    let resource_capabilities = state.services.refresh_resource_capabilities();
     let restart_required = restart_required_report(state.startup_config_snapshot(), &config_json);
     let warnings = reload_warnings(
         &provider_report,
@@ -469,6 +470,15 @@ async fn apply_runtime_config(
             },
             "static_webui": static_webui,
             "edge_registry": edge_discovery,
+            "resource_capabilities": {
+                "status": "applied",
+                "tools": resource_capabilities.tools,
+                "skills": resource_capabilities.skills,
+                "plugins": resource_capabilities.plugins,
+                "mcp_resources": resource_capabilities.mcp_resources,
+                "local_commands": resource_capabilities.local_commands,
+                "provider_native": resource_capabilities.provider_native,
+            },
         },
         "restart_required": restart_required,
         "warnings": warnings,

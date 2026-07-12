@@ -11,10 +11,10 @@ use crate::execution_core::{
     NodeExecutionTicket, NodeExecutorError,
 };
 use crate::{
-    model_context_window_with_overrides, permissions::SharedPrompter, CompactionConfig,
-    CompactionResult, ContentBlock, ContextAuthority, ContextEnvelope, ContextItem, ContextProfile,
-    ContextRole, ContextSourceKind, ContextVisibility, ConversationMessage, CowdEvent,
-    CowdEventBus, HookAbortSignal, HookProgressReporter, PermissionPolicy, ProviderRuntimeClient,
+    model_context_window_with_overrides, permissions::SharedPrompter, AutoCompactionEvent,
+    ContentBlock, ContextAuthority, ContextEnvelope, ContextItem, ContextProfile, ContextRole,
+    ContextSourceKind, ContextVisibility, ConversationMessage, CowdEvent, CowdEventBus,
+    HookAbortSignal, HookProgressReporter, PermissionPolicy, ProviderRuntimeClient,
     ProviderToolDefinition, ResumeContextPacket, RuntimeError, RuntimeFeatureConfig, Session,
     ToolCallback, ToolExecutor, TurnSummary,
 };
@@ -324,16 +324,12 @@ where
         self.runtime_ref().session_async().await
     }
 
-    pub fn compact_active_session(
+    pub async fn compact_active_session(
         &mut self,
-        config: CompactionConfig,
-    ) -> (CompactionResult, Session) {
-        let result = self.runtime_ref().compact(config);
-        if result.removed_message_count > 0 {
-            *self.runtime_mut().session_mut() = result.compacted_session.clone();
-        }
+    ) -> Result<(Option<AutoCompactionEvent>, Session), RuntimeError> {
+        let result = self.runtime_mut().compact_active_session().await?;
         let session = self.runtime_ref().session();
-        (result, session)
+        Ok((result, session))
     }
 
     pub fn active_session_stats_session(&self) -> Session {
@@ -3279,8 +3275,16 @@ mod tests {
             let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
             if attempt >= 2
                 && request
-                    .system_prompt
+                    .prompt
+                    .trusted_system
                     .iter()
+                    .chain(
+                        request
+                            .prompt
+                            .contextual_packets
+                            .iter()
+                            .map(|packet| &packet.content),
+                    )
                     .any(|fragment| fragment.contains("provider path failed repeatedly"))
             {
                 self.saw_recovery_directive.store(true, Ordering::SeqCst);
@@ -3314,7 +3318,8 @@ mod tests {
             if attempt == 0 {
                 self.saw_terminal_boundary.store(
                     request
-                        .system_prompt
+                        .prompt
+                        .trusted_system
                         .iter()
                         .any(|fragment| fragment.contains("Terminal response boundary")),
                     Ordering::SeqCst,
@@ -3358,7 +3363,7 @@ mod tests {
                 ]));
             }
             self.saw_continuation.store(
-                request.system_prompt.iter().any(|fragment| {
+                request.prompt.trusted_system.iter().any(|fragment| {
                     fragment.contains("previous model step produced private reasoning")
                 }),
                 Ordering::SeqCst,

@@ -245,9 +245,9 @@ pub const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "compact",
         aliases: &[],
-        summary: "Compact local session history",
+        summary: "Compact the active Gateway session through a semantic checkpoint",
         argument_hint: None,
-        resume_supported: true,
+        resume_supported: false,
     },
     SlashCommandSpec {
         name: "model",

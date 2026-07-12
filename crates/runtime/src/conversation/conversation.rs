@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
@@ -54,14 +54,12 @@ use memory::types::{Message as MemMessage, MessageRole as MemMessageRole};
 use memory::{MemoryKernel, MemoryTurnContext};
 use model_protocol::telemetry::SessionTracer;
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use tracing;
 
-use crate::budget_policy::{
-    clamp_context_budget_ratio_bp, resolve_compact_threshold, RuntimeBudgetInputs,
-    RuntimeBudgetPlan,
-};
+use crate::budget_policy::{clamp_context_budget_ratio_bp, RuntimeBudgetInputs, RuntimeBudgetPlan};
 use crate::compact::{
-    compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
+    apply_compaction_summary, estimate_session_tokens, plan_session_compaction, CompactionConfig,
 };
 use crate::config::{RuntimeFeatureConfig, SessionCompactConfig as RuntimeSessionCompactConfig};
 use crate::context_runtime::{
@@ -87,20 +85,28 @@ use crate::tool_invocation::{
     now_ms, ToolFailureKind, ToolInvocationRecord, DEFAULT_OUTPUT_REF_MIN_LINES,
 };
 use crate::usage::{ModelPerformanceRegistry, ModelRouteIntent, UsageTracker};
+use crate::PromptAssembly;
 use crate::{RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore};
 use model_protocol::usage::TokenUsage;
 
-const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "COWD_AUTO_COMPACT_INPUT_TOKENS";
+/// Keep enough request capacity for fixed instructions, current history and a
+/// meaningful continuation even when a provider calibrates an unknown model
+/// to a much smaller context window.
+const MIN_PROVIDER_INPUT_RESERVE_TOKENS: u32 = 4_096;
+
+fn bounded_provider_output_tokens(model: &str, context_window: u32) -> u32 {
+    let provider_cap = provider::max_tokens_for_model(model);
+    let window_cap = context_window
+        .saturating_sub(MIN_PROVIDER_INPUT_RESERVE_TOKENS)
+        .max(1_024);
+    provider_cap.min(window_cap)
+}
 
 fn provider_transport_policy(
     context_window: u32,
     request: &ApiRequest,
 ) -> crate::ProviderTransportPolicy {
-    let prompt_chars = request
-        .system_prompt
-        .iter()
-        .map(|item| item.chars().count())
-        .sum::<usize>();
+    let prompt_chars = request.prompt.estimated_chars();
     let message_chars = request
         .messages
         .iter()
@@ -115,6 +121,38 @@ fn provider_transport_policy(
         context_window,
         prompt_chars.saturating_add(message_chars),
     )
+}
+
+fn conversation_messages_token_estimate(messages: &[ConversationMessage]) -> u64 {
+    messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .fold(0u64, |total, block| match block {
+            ContentBlock::Text { text } => {
+                total.saturating_add(crate::context_ledger::estimate_text_tokens(text))
+            }
+            ContentBlock::Image {
+                media_type, data, ..
+            } => total
+                .saturating_add(crate::context_ledger::estimate_text_tokens(media_type))
+                .saturating_add((data.len() as u64).div_ceil(4)),
+            ContentBlock::Thinking { thinking, .. } => {
+                total.saturating_add(crate::context_ledger::estimate_text_tokens(thinking))
+            }
+            ContentBlock::ToolUse { id, name, input } => total
+                .saturating_add(crate::context_ledger::estimate_text_tokens(id))
+                .saturating_add(crate::context_ledger::estimate_text_tokens(name))
+                .saturating_add(crate::context_ledger::estimate_text_tokens(input)),
+            ContentBlock::ToolResult {
+                tool_use_id,
+                tool_name,
+                output,
+                ..
+            } => total
+                .saturating_add(crate::context_ledger::estimate_text_tokens(tool_use_id))
+                .saturating_add(crate::context_ledger::estimate_text_tokens(tool_name))
+                .saturating_add(crate::context_ledger::estimate_text_tokens(output)),
+        })
 }
 
 fn latest_user_prompt_text(messages: &[ConversationMessage]) -> String {
@@ -169,90 +207,6 @@ fn classify_model_step_intent(text: String, calls: Vec<ModelToolCall>) -> ModelS
         }
     } else {
         ModelStepIntent::ToolCalls { calls }
-    }
-}
-
-/// Compatibility recovery for providers that emit an authorized XML tool call
-/// in visible text after a short natural-language preamble. Provider adapters
-/// decode pure XML streams first; this second pass only accepts a contiguous
-/// trailing XML section, every call must name a tool exposed for *this* turn,
-/// and normal Tool DAG authorization still runs afterwards. It never turns an
-/// XML example embedded in a prose answer into an executable command.
-fn trailing_declared_xml_tool_calls(
-    text: &str,
-    available_tools: &[String],
-) -> Option<(String, Vec<ModelToolCall>)> {
-    let allowed = available_tools.iter().cloned().collect::<BTreeSet<_>>();
-    if allowed.is_empty() {
-        return None;
-    }
-    let start = text.to_ascii_lowercase().find("<tool_call>")?;
-    let prefix = text[..start].trim_end();
-    // XML examples in a normal answer are not commands. A provider fallback
-    // may have an optional short planning preamble, but it must not resemble a
-    // complete answer with citations or Markdown sections.
-    if prefix.contains('\n') || prefix.contains('`') || prefix.contains("##") {
-        return None;
-    }
-    let mut rest = text[start..].trim();
-    let mut calls = Vec::new();
-    while !rest.is_empty() {
-        rest = rest.strip_prefix("<tool_call>")?.trim_start();
-        let function_end = rest.find('>')?;
-        let function = &rest[..=function_end];
-        let name = function
-            .strip_prefix("<function=")?
-            .strip_suffix('>')?
-            .trim();
-        if !is_xml_tool_identifier(name) || !allowed.contains(name) {
-            return None;
-        }
-        rest = &rest[function_end + 1..];
-        let function_close = rest.find("</function>")?;
-        let mut parameters = rest[..function_close].trim();
-        let mut input = Map::new();
-        while !parameters.is_empty() {
-            let parameter_end = parameters.find('>')?;
-            let parameter = &parameters[..=parameter_end];
-            let key = parameter
-                .strip_prefix("<parameter=")?
-                .strip_suffix('>')?
-                .trim();
-            if !is_xml_tool_identifier(key) || input.contains_key(key) {
-                return None;
-            }
-            parameters = &parameters[parameter_end + 1..];
-            let close = parameters.find("</parameter>")?;
-            input.insert(
-                key.to_string(),
-                parse_xml_tool_value(parameters[..close].trim()),
-            );
-            parameters = parameters[close + "</parameter>".len()..].trim_start();
-        }
-        rest = rest[function_close + "</function>".len()..].trim_start();
-        rest = rest.strip_prefix("</tool_call>")?.trim_start();
-        calls.push(ModelToolCall {
-            id: format!("xml-text-tool-{}", calls.len()),
-            name: name.to_string(),
-            input: Value::Object(input).to_string(),
-            depends_on: Vec::new(),
-        });
-    }
-    (!calls.is_empty()).then(|| (prefix.to_string(), calls))
-}
-
-fn is_xml_tool_identifier(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-}
-
-fn parse_xml_tool_value(value: &str) -> Value {
-    match value.to_ascii_lowercase().as_str() {
-        "true" => Value::Bool(true),
-        "false" => Value::Bool(false),
-        _ => serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string())),
     }
 }
 
@@ -415,10 +369,13 @@ fn required_team_orchestration_call(objective: &str) -> ModelToolCall {
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiRequest {
-    pub system_prompt: Vec<String>,
+    pub prompt: PromptAssembly,
     pub messages: Vec<ConversationMessage>,
-    /// Target model ID (used by provider fallback chain to switch models).
+    /// Runtime-selected primary model ID.
     pub model: String,
+    /// Request-local capacity contract used for diagnostics and ledger
+    /// reconciliation. Provider must not mutate routing or budget ownership.
+    pub budget: crate::context_ledger::RequestBudgetReport,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -750,6 +707,7 @@ impl std::error::Error for ToolError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeError {
     message: String,
+    provider_context_window_limit: Option<u32>,
 }
 
 impl RuntimeError {
@@ -757,7 +715,24 @@ impl RuntimeError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            provider_context_window_limit: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_provider_context_window_limit(
+        message: impl Into<String>,
+        provider_context_window_limit: Option<u32>,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            provider_context_window_limit,
+        }
+    }
+
+    #[must_use]
+    pub const fn provider_context_window_limit(&self) -> Option<u32> {
+        self.provider_context_window_limit
     }
 }
 
@@ -1006,13 +981,13 @@ pub struct ConversationRuntime<C, T> {
     cowd_bus: Option<Arc<crate::cowd_event::CowdEventBus>>,
     turn_callback: Option<Arc<TurnCallback>>,
     profiler: crate::context_profiler::ContextProfiler,
-    use_aaak_index: bool,
-    auto_compaction_input_tokens_threshold: u32,
-    context_budget_ratio_bp: u32,
+    subsystem_budget_ratio_bp: u32,
     session_compaction_config: RuntimeSessionCompactConfig,
     semantic_checkpoint_enabled: bool,
     model_context_window: u32,
-    cached_prompt: crate::cached_prompt::CachedSystemPrompt,
+    model_context_window_source: provider::ModelContextWindowSource,
+    model_context_windows: BTreeMap<String, u32>,
+    calibrated_model_context_windows: std::sync::Mutex<BTreeMap<String, u32>>,
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Arc<std::sync::Mutex<Option<Box<dyn HookProgressReporter + Send>>>>,
     session_tracer: Option<SessionTracer>,
@@ -1089,6 +1064,9 @@ pub struct ConversationRuntime<C, T> {
     turn_context_ledger: std::sync::Mutex<crate::context_ledger::ContextLedger>,
     /// Latest context governance report emitted by a completed turn.
     last_context_turn_report: std::sync::Mutex<Option<ContextTurnReport>>,
+    /// Compaction is decided before a provider request but reported with the
+    /// completed turn so UI/audit consumers retain a single turn receipt.
+    turn_preflight_compaction: std::sync::Mutex<Option<AutoCompactionEvent>>,
     /// Knowledge activation report prepared from the active memory packet.
     turn_knowledge_report:
         std::sync::Mutex<Option<harness_contract::knowledge::KnowledgeTurnReport>>,
@@ -1143,22 +1121,27 @@ where
         feature_config: &RuntimeFeatureConfig,
     ) -> Self {
         let usage_tracker = UsageTracker::from_session(&session);
-        let context_budget_ratio_bp =
-            clamp_context_budget_ratio_bp(feature_config.compression().session.threshold_ratio_bp);
-        let initial_model_context_window = feature_config.model().map_or(0, |model| {
-            provider::model_context_window_with_overrides(
-                model,
-                Some(feature_config.model_context_windows()),
-            )
+        let subsystem_budget_ratio_bp = feature_config.context_budget().subsystem_budget_ratio_bp;
+        let initial_window_resolution = feature_config.model().map_or(
+            provider::ModelContextWindowResolution {
+                tokens: 128_000,
+                source: provider::ModelContextWindowSource::Assumed,
+            },
+            |model| {
+                provider::model_context_window_resolution(
+                    model,
+                    Some(feature_config.model_context_windows()),
+                )
+            },
+        );
+        let initial_model_context_window = initial_window_resolution.tokens;
+        let initial_model_max_output = feature_config.model().map_or(0, |model| {
+            bounded_provider_output_tokens(model, initial_model_context_window)
         });
-        let initial_model_max_output = feature_config
-            .model()
-            .map_or(0, provider::max_tokens_for_model);
         let initial_budget_plan = RuntimeBudgetPlan::derive(RuntimeBudgetInputs {
             model_context_window: initial_model_context_window,
             model_max_output_tokens: initial_model_max_output,
-            context_budget_ratio_bp,
-            compact_threshold_ratio_bp: context_budget_ratio_bp,
+            subsystem_budget_ratio_bp,
             profile: ContextProfile::MainTurn,
             autonomy_mode: None,
         });
@@ -1256,30 +1239,16 @@ where
             cowd_bus: None,
             turn_callback: None,
             profiler: crate::context_profiler::ContextProfiler::new(),
-            use_aaak_index: feature_config.memory().aaak_index_enabled,
-            auto_compaction_input_tokens_threshold: {
-                let env_val = auto_compaction_threshold_from_env();
-                if env_val > 0 {
-                    env_val
-                } else if feature_config.compression().session.threshold_tokens > 0 {
-                    feature_config.compression().session.threshold_tokens
-                } else {
-                    initial_budget_plan.compaction_threshold_tokens as u32
-                }
-            },
-            context_budget_ratio_bp,
+            subsystem_budget_ratio_bp,
             session_compaction_config: feature_config.compression().session.clone(),
             semantic_checkpoint_enabled: feature_config
                 .memory()
                 .runtime
                 .semantic_checkpoint_enabled,
             model_context_window: initial_model_context_window,
-            cached_prompt: crate::cached_prompt::CachedSystemPrompt::new(
-                crate::cowd_dirs::project_dot_dir(&std::env::current_dir().unwrap_or_default())
-                    .join(crate::cowd_dirs::CONFIG_FILE_YAML),
-                crate::cowd_dirs::project_dot_dir(&std::env::current_dir().unwrap_or_default())
-                    .join("identity.md"),
-            ),
+            model_context_window_source: initial_window_resolution.source,
+            model_context_windows: feature_config.model_context_windows().clone(),
+            calibrated_model_context_windows: std::sync::Mutex::new(BTreeMap::new()),
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: Arc::new(std::sync::Mutex::new(None)),
             session_tracer: None,
@@ -1321,10 +1290,11 @@ where
             tool_exposure_revision: AtomicU64::new(0),
             turn_evidence_audits: std::sync::Mutex::new(Vec::new()),
             turn_context_ledger: std::sync::Mutex::new(crate::context_ledger::ContextLedger::new(
-                initial_budget_plan.effective_context_budget,
+                initial_budget_plan.subsystem_budget_tokens,
                 initial_budget_plan.tool_result_budget.max_total_tokens as u64,
             )),
             last_context_turn_report: std::sync::Mutex::new(None),
+            turn_preflight_compaction: std::sync::Mutex::new(None),
             turn_knowledge_report: std::sync::Mutex::new(None),
             write_semaphore: Arc::new(Semaphore::new(
                 crate::tool_orchestrator::ToolSafetyCategory::WriteLocal.max_concurrency(),
@@ -1721,7 +1691,7 @@ where
         user_input: &str,
         envelope: ContextEnvelope,
         knowledge: Option<KnowledgeTurnReport>,
-    ) -> Vec<String> {
+    ) -> PromptAssembly {
         let fact_decision = self.runtime_fact_decision_for_context(user_input, &envelope);
         let report = ContextRuntimeKernel::governance_report(
             &envelope,
@@ -1730,7 +1700,7 @@ where
             None,
         );
         self.remember_context_governance_report(report);
-        let prompt = Self::provider_prompt_from_envelope(&envelope, None);
+        let prompt = Self::provider_prompt_from_envelope(&envelope);
         self.remember_context_envelope(envelope);
         prompt
     }
@@ -1855,7 +1825,7 @@ where
     }
 
     fn context_budget_tokens(&self) -> u64 {
-        self.runtime_budget_plan().effective_context_budget
+        self.runtime_budget_plan().subsystem_budget_tokens
     }
 
     fn runtime_budget_plan(&self) -> RuntimeBudgetPlan {
@@ -1863,15 +1833,93 @@ where
             .model
             .as_deref()
             .filter(|model| !model.is_empty())
-            .map_or(0, provider::max_tokens_for_model);
+            .map_or(0, |model| {
+                bounded_provider_output_tokens(model, self.context_window_for_model(model))
+            });
         RuntimeBudgetPlan::derive(RuntimeBudgetInputs {
             model_context_window: self.model_context_window,
             model_max_output_tokens: model_max_output,
-            context_budget_ratio_bp: self.context_budget_ratio_bp,
-            compact_threshold_ratio_bp: self.context_budget_ratio_bp,
+            subsystem_budget_ratio_bp: self.subsystem_budget_ratio_bp,
             profile: self.context_profile(),
             autonomy_mode: None,
         })
+    }
+
+    /// A fallback route is only safe when the prepared context fits every
+    /// candidate that may receive it. Use the narrowest configured candidate
+    /// window and output reservation before context selection, rather than
+    /// constructing a large primary-only packet and hoping fallback accepts it.
+    fn runtime_budget_plan_for_candidates(&self, candidates: &[String]) -> RuntimeBudgetPlan {
+        let mut windows = candidates
+            .iter()
+            .filter(|model| !model.trim().is_empty())
+            .map(|model| self.context_window_for_model(model));
+        let model_context_window = windows.next().map_or(self.model_context_window, |first| {
+            windows.fold(first, u32::min)
+        });
+        let mut outputs = candidates
+            .iter()
+            .filter(|model| !model.trim().is_empty())
+            .map(|model| {
+                bounded_provider_output_tokens(model, self.context_window_for_model(model))
+            });
+        let model_max_output_tokens = outputs
+            .next()
+            .map_or(0, |first| outputs.fold(first, u32::min));
+        RuntimeBudgetPlan::derive(RuntimeBudgetInputs {
+            model_context_window,
+            model_max_output_tokens,
+            subsystem_budget_ratio_bp: self.subsystem_budget_ratio_bp,
+            profile: self.context_profile(),
+            autonomy_mode: None,
+        })
+    }
+
+    fn context_window_resolution_for_model(
+        &self,
+        model: &str,
+    ) -> provider::ModelContextWindowResolution {
+        let mut resolution = if self.model.as_deref() == Some(model) {
+            provider::ModelContextWindowResolution {
+                tokens: self.model_context_window,
+                source: self.model_context_window_source,
+            }
+        } else {
+            provider::model_context_window_resolution(model, Some(&self.model_context_windows))
+        };
+        if let Ok(calibrated) = self.calibrated_model_context_windows.lock() {
+            if let Some(&tokens) = calibrated
+                .get(model)
+                .filter(|tokens| **tokens < resolution.tokens)
+            {
+                resolution.tokens = tokens;
+                resolution.source = provider::ModelContextWindowSource::Calibrated;
+            }
+        }
+        resolution
+    }
+
+    fn context_window_for_model(&self, model: &str) -> u32 {
+        self.context_window_resolution_for_model(model).tokens
+    }
+
+    fn calibrate_model_context_window(&self, model: &str, observed_tokens: u32) -> bool {
+        if observed_tokens < 1_024 {
+            return false;
+        }
+        let current = self.context_window_for_model(model);
+        if observed_tokens >= current {
+            return false;
+        }
+        let Ok(mut calibrated) = self.calibrated_model_context_windows.lock() else {
+            return false;
+        };
+        let next = calibrated
+            .get(model)
+            .copied()
+            .map_or(observed_tokens, |existing| existing.min(observed_tokens));
+        calibrated.insert(model.to_string(), next);
+        true
     }
 
     fn memory_turn_context(&self, agent_id: impl Into<String>) -> MemoryTurnContext {
@@ -1957,6 +2005,7 @@ where
         dynamic_items: Vec<ContextItem>,
         omitted: Vec<ContextOmission>,
         degraded_sources: Vec<ContextSourceKind>,
+        total_budget_tokens: u64,
     ) -> ContextEnvelope {
         let session_id = self.session().session_id;
         let profile = self.context_profile();
@@ -1969,6 +2018,9 @@ where
             "context_governance_report_id:{governance_report_id}"
         ));
         let mut selected_items = self.external_context_items();
+        if let Ok(cwd) = std::env::current_dir() {
+            selected_items.extend(crate::prompt::discover_project_context_items(&cwd));
+        }
         selected_items.extend(self.tool_trace_context_items());
         selected_items.extend(dynamic_items);
         let mut envelope = ContextRuntimeKernel::build_envelope(ContextEnvelopeRequest {
@@ -1979,48 +2031,105 @@ where
             stable_head: self.system_prompt.clone(),
             dynamic_items: selected_items,
             omitted,
-            total_budget_tokens: self.context_budget_tokens(),
+            total_budget_tokens,
         });
         envelope.diagnostics.degraded_sources = degraded_sources;
         envelope
     }
 
-    fn provider_prompt_from_envelope(
-        envelope: &ContextEnvelope,
-        dynamic_tail_override: Option<String>,
-    ) -> Vec<String> {
-        let mut prompt = Vec::with_capacity(
-            envelope.assembled.stable_head.len() + envelope.assembled.runtime_header.len() + 1,
-        );
-        prompt.extend(envelope.assembled.stable_head.clone());
-        prompt.extend(envelope.assembled.runtime_header.clone());
-        if let Some(dynamic_tail) = dynamic_tail_override {
-            if !dynamic_tail.trim().is_empty() {
-                prompt.push(dynamic_tail);
-            }
-        } else {
-            prompt.extend(envelope.assembled.dynamic_tail.clone());
+    fn provider_prompt_from_envelope(envelope: &ContextEnvelope) -> PromptAssembly {
+        let mut prompt = PromptAssembly::new(envelope.assembled.stable_head.clone());
+        for header in &envelope.assembled.runtime_header {
+            prompt.push_trusted_system(header.clone());
+        }
+        for item in &envelope.selected {
+            prompt.push_context_item(item);
         }
         prompt
     }
 
-    #[must_use]
-    pub fn with_auto_compaction_input_tokens_threshold(mut self, threshold: u32) -> Self {
-        self.auto_compaction_input_tokens_threshold = threshold;
-        self
+    /// Pack a previously collected context snapshot for one concrete provider
+    /// attempt. This is deliberately pure: a fallback never re-reads memory
+    /// or mutates the session, it only applies the narrower candidate budget.
+    fn pack_provider_attempt(
+        &self,
+        prompt: &PromptAssembly,
+        messages: &[ConversationMessage],
+        model: &str,
+        inventory: ProviderContextInventory,
+    ) -> Result<ApiRequest, RuntimeError> {
+        let window_resolution = self.context_window_resolution_for_model(model);
+        let context_window_tokens = u64::from(window_resolution.tokens);
+        let requested_output_tokens = u64::from(bounded_provider_output_tokens(
+            model,
+            window_resolution.tokens,
+        ));
+        // Protocol framing is deliberately explicit and conservative. Schema
+        // payload itself is accounted separately from fixed wire framing.
+        let protocol_overhead_tokens =
+            128u64.saturating_add(u64::from(inventory.tool_count as u32).saturating_mul(12));
+        let safety_margin_tokens = (context_window_tokens / 100).clamp(128, 2_048);
+        let fixed_input_tokens =
+            crate::context_ledger::estimate_text_tokens(&prompt.trusted_system.join("\n\n"))
+                .saturating_add(conversation_messages_token_estimate(messages))
+                .saturating_add(inventory.tool_schema_tokens);
+        let mut budget = crate::context_ledger::RequestBudgetReport::for_attempt(
+            model,
+            context_window_tokens,
+            requested_output_tokens,
+            protocol_overhead_tokens,
+            safety_margin_tokens,
+            fixed_input_tokens,
+        );
+        budget.set_context_window_source(window_resolution.source.as_str());
+        if !budget.executable {
+            return Err(RuntimeError::new(format!(
+                "provider candidate `{model}` cannot fit fixed request components: fixed={} hard_input_cap={} window={} output_reserve={}",
+                budget.fixed_input_tokens,
+                budget.hard_input_cap_tokens,
+                budget.context_window_tokens,
+                budget.requested_output_tokens,
+            )));
+        }
+        let (packed_prompt, dynamic_tokens, omitted_packet_ids, omitted_packet_reasons) = prompt
+            .pack_for_hard_cap(budget.dynamic_hard_remaining())
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        budget.record_dynamic_packets(dynamic_tokens, omitted_packet_ids, omitted_packet_reasons);
+        if !budget.executable {
+            return Err(RuntimeError::new(format!(
+                "provider candidate `{model}` exceeded its hard request budget after context packing"
+            )));
+        }
+        Ok(ApiRequest {
+            prompt: packed_prompt,
+            messages: messages.to_vec(),
+            model: model.to_string(),
+            budget,
+        })
     }
 
     pub fn with_model_context_window(mut self, ctx_window: u32) -> Self {
-        let previous_window = self.model_context_window;
-        let previous_derived_threshold =
-            resolve_compact_threshold(previous_window, self.context_budget_ratio_bp);
-        self.model_context_window = ctx_window;
-        let plan = self.runtime_budget_plan();
-        if self.auto_compaction_input_tokens_threshold == 0
-            || self.auto_compaction_input_tokens_threshold == previous_derived_threshold
-        {
-            self.auto_compaction_input_tokens_threshold = plan.compaction_threshold_tokens as u32;
+        if ctx_window >= 1_024 {
+            self.model_context_window = ctx_window;
+            // Hosts often pass the same registry/config resolution explicitly
+            // for workspace sizing. Preserve its real provenance instead of
+            // falsely reporting every host value as a user override.
+            self.model_context_window_source = self
+                .model
+                .as_deref()
+                .map(|model| {
+                    provider::model_context_window_resolution(
+                        model,
+                        Some(&self.model_context_windows),
+                    )
+                })
+                .filter(|resolution| resolution.tokens == ctx_window)
+                .map_or(
+                    provider::ModelContextWindowSource::Configured,
+                    |resolution| resolution.source,
+                );
         }
+        let plan = self.runtime_budget_plan();
         apply_runtime_budget_to_control_policy(&mut self.runtime_control_policy, &plan);
         self
     }
@@ -2028,18 +2137,19 @@ where
     pub fn set_active_model(&mut self, model: impl Into<String>) {
         let model = model.into();
         if !model.trim().is_empty() {
+            // A session model switch must not inherit the previous model's
+            // window. Resolve this model independently so explicit per-model
+            // configuration remains authoritative across a live session.
+            if self.model.as_deref() != Some(model.as_str()) {
+                let resolution = provider::model_context_window_resolution(
+                    &model,
+                    Some(&self.model_context_windows),
+                );
+                self.model_context_window = resolution.tokens;
+                self.model_context_window_source = resolution.source;
+            }
             self.model = Some(model);
         }
-    }
-
-    pub fn with_cached_prompt(
-        mut self,
-        config_path: std::path::PathBuf,
-        identity_path: std::path::PathBuf,
-    ) -> Self {
-        self.cached_prompt =
-            crate::cached_prompt::CachedSystemPrompt::new(config_path, identity_path);
-        self
     }
 
     /// Set a tool callback for real-time execution visualization (P0-2).
@@ -2219,7 +2329,7 @@ where
         &self,
         turn_id: &TurnId,
         checkpoint: TurnInputCheckpoint,
-        effective_system_prompt: &mut Vec<String>,
+        prompt: &mut PromptAssembly,
     ) -> usize {
         let consumed = self
             .session_input_stream
@@ -2229,9 +2339,11 @@ where
                 pending.extend(consumed.iter().cloned());
             }
         }
-        if let Some(instruction) = crate::turn_inbox::checkpoint_instruction(checkpoint, &consumed)
-        {
-            effective_system_prompt.push(instruction);
+        if let Some(guidance) = crate::turn_inbox::checkpoint_guidance(checkpoint, &consumed) {
+            prompt.push_trusted_system(guidance);
+        }
+        for item in crate::turn_inbox::checkpoint_context_items(checkpoint, &consumed) {
+            prompt.push_context_item(&item);
         }
         if let Some(ref cowd) = self.cowd_bus {
             if !consumed.is_empty() {
@@ -2262,13 +2374,6 @@ where
         self.consumed_session_inputs
             .lock()
             .map_or_else(|_| Vec::new(), |mut pending| std::mem::take(&mut *pending))
-    }
-
-    /// P0: Enable AAAK symbolic index mode for memory context injection.
-    #[must_use]
-    pub fn with_aaak_index(mut self) -> Self {
-        self.use_aaak_index = true;
-        self
     }
 
     /// P1-05: Register a TurnCallback for generator-style injection after tool results.
@@ -2471,10 +2576,13 @@ where
         let started_at = Instant::now();
         if first_step {
             self.clear_turn_tool_observations();
+            if let Ok(mut preflight_compaction) = self.turn_preflight_compaction.lock() {
+                *preflight_compaction = None;
+            }
             let budget = self.runtime_budget_plan();
             if let Ok(mut ledger) = self.turn_context_ledger.lock() {
                 ledger.reset(
-                    budget.effective_context_budget,
+                    budget.subsystem_budget_tokens,
                     budget.tool_result_budget.max_total_tokens as u64,
                 );
             }
@@ -2517,56 +2625,6 @@ where
         let text_only_response = self.next_model_text_only.swap(false, Ordering::SeqCst);
         let explicitly_forbids_tool_use =
             harness_contract::strategy::prompt_explicitly_forbids_tool_use(user_input);
-        let mut system_prompt = self.prepare_reality_context(user_input).await;
-        let evidence = crate::evidence_planner::plan_evidence_with_understanding(
-            user_input,
-            &decision.strategy.understanding,
-        );
-        system_prompt.push(crate::evidence_planner::evidence_plan_prompt(&evidence));
-        system_prompt.push(crate::execution_core::runtime_execution_guidance_prompt(
-            &decision,
-        ));
-        if text_only_response {
-            system_prompt.push(
-                "## Terminal response boundary\nThis request is a text-only terminal checkpoint. The executable tool set for this request is empty, regardless of any earlier capability inventory or historical tool receipts in the context. Do not emit native function calls, XML tool markup, JSON commands, new plans, or more work. Use only retained evidence receipts to produce the best final answer now. State unresolved facts explicitly instead of performing another search.".to_string(),
-            );
-        }
-        if explicitly_forbids_tool_use {
-            system_prompt.push(
-                "## User-selected execution boundary\nThe user explicitly prohibited tool calls for this request. The executable tool set is empty. Answer from the supplied prompt and retained conversation evidence only; do not emit native function calls, XML tool markup, or JSON commands.".to_string(),
-            );
-        }
-        self.record_runtime_policy_decision(&decision, self.session().messages.len());
-        self.record_context_event(
-            "evidence_plan",
-            "runtime",
-            &format!("{:?}: {}", evidence.mode, evidence.reason),
-            7,
-        );
-        self.record_context_event(
-            "execution_decision",
-            "runtime",
-            &format!(
-                "{}: {:?}",
-                decision.pattern().as_str(),
-                decision.recommended_actions
-            ),
-            8,
-        );
-        if let Some(turn_id) = self.session_input_stream.active_turn_id() {
-            self.consume_runtime_inputs_at_checkpoint(
-                &turn_id,
-                TurnInputCheckpoint::BeforeProviderRequest,
-                &mut system_prompt,
-            );
-        }
-        if knowledge_hard_gate_active(&system_prompt) {
-            return Err(RuntimeError::new(
-                "knowledge compliance hard gate blocked turn",
-            ));
-        }
-
-        let inventory = self.api_client.context_inventory();
         let discovery = self.tool_executor.tool_discovery_receipt();
         let available_tools = discovery
             .descriptors
@@ -2621,19 +2679,149 @@ where
             }
         }
         self.api_client
-            .configure_tool_exposure(exposure.projection(inventory.tool_schema_tokens));
+            .configure_tool_exposure(exposure.projection(0));
 
-        let request = ApiRequest {
-            system_prompt,
-            messages: self.session.read().await.messages.clone(),
-            model: String::new(),
+        // Tool schemas are part of the request budget. Read their inventory
+        // only after Runtime has made the exposure decision.
+        let inventory = self.api_client.context_inventory();
+        let model_candidates = self.model_candidates_for_turn(user_input);
+        let collection_budget = model_candidates
+            .iter()
+            .map(|model| {
+                let window = u64::from(self.context_window_for_model(model));
+                let output = u64::from(bounded_provider_output_tokens(model, window as u32));
+                let protocol = 128u64
+                    .saturating_add(u64::from(inventory.tool_count as u32).saturating_mul(12));
+                let safety = (window / 100).clamp(128, 2_048);
+                window
+                    .saturating_sub(output)
+                    .saturating_sub(protocol)
+                    .saturating_sub(safety)
+            })
+            .max()
+            .unwrap_or_else(|| self.context_budget_tokens());
+        // Collect memory/knowledge/fact/matrix data once against the largest
+        // physically usable input window. The per-attempt packer below still
+        // applies each model's hard cap, schema and history. If preflight
+        // compacts the transcript, this snapshot is rebuilt before dispatch.
+        let one_shot_context_items = self.take_next_model_context_items();
+        let mut prompt = self
+            .prepare_reality_context_with_budget_and_items(
+                user_input,
+                collection_budget,
+                one_shot_context_items.clone(),
+            )
+            .await;
+        let evidence = crate::evidence_planner::plan_evidence_with_understanding(
+            user_input,
+            &decision.strategy.understanding,
+        );
+        let apply_runtime_controls = |prompt: &mut PromptAssembly| {
+            prompt.push_trusted_system(crate::evidence_planner::evidence_plan_prompt(&evidence));
+            prompt.push_trusted_system(crate::execution_core::runtime_execution_guidance_prompt(
+                &decision,
+            ));
+            if text_only_response {
+                prompt.push_trusted_system(
+                    "## Terminal response boundary\nThis request is a text-only terminal checkpoint. The executable tool set for this request is empty, regardless of any earlier capability inventory or historical tool receipts in the context. Do not emit native function calls, simulated tool markup, JSON commands, new plans, or more work. Use only retained evidence receipts to produce the best final answer now. State unresolved facts explicitly instead of performing another search.".to_string(),
+                );
+            }
+            if explicitly_forbids_tool_use {
+                prompt.push_trusted_system(
+                    "## User-selected execution boundary\nThe user explicitly prohibited tool calls for this request. The executable tool set is empty. Answer from the supplied prompt and retained conversation evidence only; do not emit native function calls, simulated tool markup, or JSON commands.".to_string(),
+                );
+            }
         };
+        apply_runtime_controls(&mut prompt);
+        self.record_runtime_policy_decision(&decision, self.session().messages.len());
+        self.record_context_event(
+            "evidence_plan",
+            "runtime",
+            &format!("{:?}: {}", evidence.mode, evidence.reason),
+            7,
+        );
+        self.record_context_event(
+            "execution_decision",
+            "runtime",
+            &format!(
+                "{}: {:?}",
+                decision.pattern().as_str(),
+                decision.recommended_actions
+            ),
+            8,
+        );
+        let mut request_messages = self.session.read().await.messages.clone();
+
+        // Compression is a request-preflight recovery path, never a fixed
+        // transcript-ratio timer. Optional packets have already been allowed
+        // to compete for hard capacity; compact only when no configured
+        // candidate can carry the fixed history plus required continuity.
+        let no_candidate_can_fit = model_candidates.iter().all(|model| {
+            self.pack_provider_attempt(&prompt, &request_messages, model, inventory)
+                .is_err()
+        });
+        if no_candidate_can_fit {
+            let compaction = self
+                .compact_session_with_checkpoint(self.compaction_config_for_session(1))
+                .await?;
+            if compaction.is_none() {
+                return Err(RuntimeError::new(
+                    "all provider candidates reject the required request context and no semantic compaction boundary is available",
+                ));
+            }
+            request_messages = self.session.read().await.messages.clone();
+            prompt = self
+                .prepare_reality_context_with_budget_and_items(
+                    user_input,
+                    collection_budget,
+                    one_shot_context_items,
+                )
+                .await;
+            apply_runtime_controls(&mut prompt);
+            self.record_context_event(
+                "context_preflight_compaction",
+                "runtime",
+                "all provider candidates required semantic compaction before request dispatch",
+                9,
+            );
+            if let Ok(mut preflight_compaction) = self.turn_preflight_compaction.lock() {
+                *preflight_compaction = compaction;
+            }
+        }
+        if let Some(turn_id) = self.session_input_stream.active_turn_id() {
+            self.consume_runtime_inputs_at_checkpoint(
+                &turn_id,
+                TurnInputCheckpoint::BeforeProviderRequest,
+                &mut prompt,
+            );
+        }
+        if knowledge_hard_gate_active(&prompt.trusted_system) {
+            return Err(RuntimeError::new(
+                "knowledge compliance hard gate blocked turn",
+            ));
+        }
+
         let mut last_error = None;
-        for model in self.model_candidates_for_turn(user_input) {
-            let mut request = request.clone();
-            request.model.clone_from(&model);
+        let mut candidates = VecDeque::from(model_candidates);
+        // One retry per model is sufficient: calibration only accepts a
+        // smaller explicit provider limit, so the second request is strictly
+        // smaller. Repeating beyond that would mask malformed provider errors.
+        let mut calibration_retries = BTreeSet::new();
+        while let Some(model) = candidates.pop_front() {
+            let request =
+                match self.pack_provider_attempt(&prompt, &request_messages, &model, inventory) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        last_error = Some(error);
+                        continue;
+                    }
+                };
             self.record_provider_context_request(&request, self.session().messages.len());
-            let transport_policy = provider_transport_policy(self.model_context_window, &request);
+            let attempt_budget = self.runtime_budget_plan_for_candidates(&[model.clone()]);
+            let transport_policy = provider_transport_policy(
+                attempt_budget.model_context_window.min(u64::from(u32::MAX)) as u32,
+                &request,
+            );
             let idle_timeout = transport_policy.idle_timeout;
             let heartbeat_grace = transport_policy.heartbeat_grace;
             let mut stream = self.api_client.stream(request);
@@ -2725,28 +2913,21 @@ where
             }
             drop(stream);
             if let Some(error) = failed {
+                if let Some(observed_limit) = error.provider_context_window_limit() {
+                    if calibration_retries.insert(model.clone())
+                        && self.calibrate_model_context_window(&model, observed_limit)
+                    {
+                        tracing::info!(
+                            model,
+                            observed_limit,
+                            "provider context window calibrated; retrying candidate once"
+                        );
+                        candidates.push_front(model);
+                        continue;
+                    }
+                }
                 last_error = Some(error);
                 continue;
-            }
-
-            // Some OpenAI-compatible providers emit a short planning preamble
-            // followed by XML tool calls as text instead of native tool-use
-            // stream events. Recover only fully declared, trailing calls here,
-            // before persisting the assistant message or deciding the next
-            // graph step. The Tool DAG remains the authority for execution.
-            if !text_only_response && calls.is_empty() {
-                let visible_tools = exposure
-                    .bootstrap
-                    .iter()
-                    .chain(exposure.active.iter())
-                    .cloned()
-                    .collect::<Vec<_>>();
-                if let Some((clean_text, recovered_calls)) =
-                    trailing_declared_xml_tool_calls(&text, &visible_tools)
-                {
-                    text = clean_text;
-                    calls = recovered_calls;
-                }
             }
 
             let mut blocks = Vec::new();
@@ -2801,9 +2982,8 @@ where
                 assistant_message,
                 usage,
                 prompt_cache_events: cache_events,
-                // Preserve the model that actually produced the provider
-                // stream, not merely the outer candidate requested before a
-                // transport fallback may have been selected.
+                // Preserve the model that actually produced the provider stream,
+                // not merely Runtime's preferred candidate.
                 model: effective_model.or(Some(model)),
                 wall_duration_ms: millis_since(started_at).max(1),
                 text_only_response,
@@ -3011,9 +3191,14 @@ where
             tool_results.len().saturating_sub(failed_tools),
             failed_tools,
         );
-        let compaction_started = Instant::now();
-        let auto_compaction = self.maybe_auto_compact().await?;
-        let compaction_elapsed = compaction_started.elapsed();
+        // Request-preflight owns compaction. Finalization never rewrites a
+        // healthy transcript merely because an aggregate token estimate grew.
+        let auto_compaction = self
+            .turn_preflight_compaction
+            .lock()
+            .ok()
+            .and_then(|mut receipt| receipt.take());
+        let compaction_elapsed = Duration::ZERO;
         let memory_started = Instant::now();
         if defer_post_turn_memory_maintenance {
             self.schedule_memory_post_turn().await;
@@ -3992,9 +4177,18 @@ where
         }
     }
 
-    #[must_use]
-    pub fn compact(&self, config: CompactionConfig) -> CompactionResult {
-        compact_session(&*self.session.blocking_read(), config)
+    /// Compact the active transcript through the sole semantic checkpoint
+    /// pipeline. Both automatic preflight compaction and operator-triggered
+    /// compaction use this path so a session never receives a second,
+    /// timeline-only summary representation.
+    pub async fn compact_active_session(
+        &mut self,
+    ) -> Result<Option<AutoCompactionEvent>, RuntimeError> {
+        // Operator-triggered compaction shares the configured preservation and
+        // checkpoint limits with request-preflight compaction. `1` makes the
+        // operation explicit without introducing a second threshold policy.
+        self.compact_session_with_checkpoint(self.compaction_config_for_session(1))
+            .await
     }
 
     #[must_use]
@@ -4138,83 +4332,88 @@ where
             .unwrap_or_else(|arc| arc.blocking_read().clone())
     }
 
-    async fn maybe_auto_compact(&mut self) -> Result<Option<AutoCompactionEvent>, RuntimeError> {
-        // Use the session's estimated token count directly, not the cumulative
-        // usage tracker which spans across multiple sessions and doesn't
-        // reflect the current conversation window pressure.
-        let session_tokens = estimate_session_tokens(&*self.session.read().await);
-
-        if session_tokens < self.auto_compaction_input_tokens_threshold as usize {
-            return Ok(None);
-        }
-
-        self.compact_session_with_checkpoint(self.compaction_config_for_session(0))
-            .await
-    }
-
     async fn compact_session_with_checkpoint(
         &mut self,
         config: CompactionConfig,
     ) -> Result<Option<AutoCompactionEvent>, RuntimeError> {
-        let original_session = self.session.read().await.clone();
-        let result = compact_session(&original_session, config);
-
-        if result.removed_message_count == 0 {
-            return Ok(None);
+        if self.session_store.is_none() {
+            return Err(RuntimeError::new(
+                "semantic compaction requires a durable UnifiedSessionStore; transcript was retained",
+            ));
         }
+        let original_session = self.session.read().await.clone();
+        let Some(plan) = plan_session_compaction(&original_session, config) else {
+            return Ok(None);
+        };
 
         let source_messages = compacted_source_messages(
             &original_session.messages,
-            result.source_message_start,
-            result.source_message_end,
+            plan.source_message_start,
+            plan.source_message_end,
         );
         let raw_refs = source_message_evidence_refs(
             &original_session.session_id,
             &original_session.messages,
-            result.source_message_start,
-            result.source_message_end,
+            plan.source_message_start,
+            plan.source_message_end,
         );
         let checkpoint = if self.semantic_checkpoint_enabled && !source_messages.is_empty() {
             let mem_messages = conversation_messages_to_mem_messages(source_messages);
-            let previous_summary = original_session
-                .compaction
-                .as_ref()
-                .map(|compaction| compaction.summary.as_str());
             let source_range = CompactionSourceRange {
                 session_id: original_session.session_id.clone(),
-                message_start: result.source_message_start,
-                message_end_exclusive: result.source_message_end,
-                event_start: Some(result.source_message_start),
-                event_end_exclusive: Some(result.source_message_end),
+                message_start: plan.source_message_start,
+                message_end_exclusive: plan.source_message_end,
+                event_start: Some(plan.source_message_start),
+                event_end_exclusive: Some(plan.source_message_end),
                 raw_refs: raw_refs.clone(),
             };
             let ctx = self.memory_turn_context("primary");
+            let checkpoint_id = deterministic_checkpoint_id(
+                &original_session.session_id,
+                plan.source_message_start,
+                plan.source_message_end,
+                plan.existing_summary.as_deref(),
+            );
             let build_context = SessionCheckpointBuildContext::new(
                 original_session.session_id.clone(),
                 ctx.agent_id.clone(),
                 source_range,
             )
+            .with_checkpoint_id(checkpoint_id)
             .with_project_id(ctx.project_id.clone())
             .with_task_id(ctx.task_id.clone())
             .with_team_id(ctx.team_id.clone());
             match SessionCompactor::new()
-                .build_checkpoint(&mem_messages, previous_summary, build_context)
+                .with_max_summary_tokens(self.session_compaction_config.summary_max_tokens)
+                .build_checkpoint(
+                    &mem_messages,
+                    plan.existing_summary.as_deref(),
+                    build_context,
+                )
                 .await
             {
-                Ok(checkpoint) => Some(checkpoint),
+                Ok(checkpoint) => checkpoint,
                 Err(error) => {
-                    tracing::warn!(%error, "semantic compaction checkpoint build degraded");
-                    None
+                    return Err(RuntimeError::new(format!(
+                        "semantic compaction checkpoint build failed; transcript was retained: {error}"
+                    )));
                 }
             }
         } else {
-            None
+            return Err(RuntimeError::new(
+                "semantic compaction requires an enabled memory checkpoint; transcript was retained",
+            ));
         };
+
+        // Runtime never synthesizes a second lossy summary. The Memory
+        // checkpoint is the sole continuation artifact and the source of all
+        // durable fact extraction below.
+        let result = apply_compaction_summary(&original_session, plan, checkpoint.summary.clone());
 
         let fact_extraction_decision = RuntimeFactExtractionScheduler::default()
             .decide(RuntimeFactExtractionTrigger::SessionCompaction);
 
-        let mut receipt = checkpoint.as_ref().map(|checkpoint| {
+        let mut receipt = Some({
             let fact_extraction_event = FactExtractionRuntimeEvent::from_decision(
                 &fact_extraction_decision,
                 "memory-session-checkpoint:v1",
@@ -4261,13 +4460,31 @@ where
             receipt
         });
 
-        let checkpoint_for_event = checkpoint.clone();
-        if let (Some(mgr), Some(checkpoint), Some(receipt_mut)) =
-            (&self.memory_manager, checkpoint.as_ref(), receipt.as_mut())
-        {
+        tracing::info!(removed = result.removed_message_count, "compaction");
+        let compacted_len = result.compacted_session.messages.len();
+        let compaction = result.compacted_session.compaction.clone().ok_or_else(|| {
+            RuntimeError::new("semantic compaction did not produce a session compaction record")
+        })?;
+        let newly_committed = self
+            .record_session_compacted(
+                compaction,
+                compacted_len,
+                receipt.clone(),
+                checkpoint.clone(),
+            )
+            .await?;
+        // The checkpoint boundary is now durable. Fact projection is
+        // intentionally replayable: if a process stopped after the event
+        // transaction but before Memory writes, the next attempt recreates
+        // exactly the same deterministic memory IDs instead of losing facts
+        // or emitting duplicates.
+        if !newly_committed {
+            tracing::info!(checkpoint_id = %checkpoint.checkpoint_id, "replaying semantic checkpoint fact projection");
+        }
+        if let (Some(mgr), Some(receipt_mut)) = (&self.memory_manager, receipt.as_mut()) {
             let ctx = self.memory_turn_context("primary");
             let kernel = MemoryKernel::new(Arc::clone(mgr));
-            match kernel.checkpoint_compaction(&ctx, checkpoint.clone()).await {
+            match kernel.checkpoint_compaction(&ctx, checkpoint).await {
                 Ok(memory_receipt) => {
                     receipt_mut.retained_artifact_ids.extend(
                         memory_receipt
@@ -4294,25 +4511,14 @@ where
                     ));
                 }
                 Err(error) => {
-                    tracing::warn!(%error, "semantic compaction checkpoint persist degraded");
+                    tracing::warn!(%error, "semantic compaction fact projection deferred");
                     receipt_mut.evidence_refs.push(EvidenceRef(
-                        KernelRef::new("memory", "semantic_checkpoint_degraded")
+                        KernelRef::new("memory", "semantic_checkpoint_fact_projection_deferred")
                             .with_label(error.to_string()),
                     ));
                 }
             }
         }
-
-        tracing::info!(removed = result.removed_message_count, "compaction");
-        let compacted_len = result.compacted_session.messages.len();
-        let compaction = result.compacted_session.compaction.clone();
-        self.record_session_compacted(
-            compaction,
-            compacted_len,
-            receipt.clone(),
-            checkpoint_for_event,
-        )
-        .await?;
         *self.session.write().await = result.compacted_session;
         Ok(Some(AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
@@ -4331,18 +4537,16 @@ where
 
     async fn record_session_compacted(
         &self,
-        compaction: Option<crate::session::SessionCompaction>,
+        compaction: crate::session::SessionCompaction,
         sequence: usize,
         receipt: Option<CompactionReceipt>,
-        semantic_checkpoint: Option<SessionSemanticCheckpoint>,
-    ) -> Result<(), RuntimeError> {
-        let Some(compaction) = compaction else {
-            return Ok(());
-        };
-        let Some(store) = self.session_store.as_ref() else {
-            self.record_local_compaction_event(compaction, sequence);
-            return Ok(());
-        };
+        semantic_checkpoint: SessionSemanticCheckpoint,
+    ) -> Result<bool, RuntimeError> {
+        let store = self.session_store.as_ref().ok_or_else(|| {
+            RuntimeError::new(
+                "semantic compaction requires a durable UnifiedSessionStore; transcript was retained",
+            )
+        })?;
         let session_id = self.session().session_id;
         let payload = serde_json::json!({
             "type": "SessionCompacted",
@@ -4363,56 +4567,40 @@ where
             payload,
             created_at_ms,
         );
-        let persisted = match store
-            .append_session_domain_event_allocating_sequence(&context_event)
-            .await
-        {
-            Ok(event) => event,
-            Err(error) => {
-                return Err(RuntimeError::new(format!(
-                    "canonical compaction persistence failed for session `{session_id}`: {error}"
-                )));
-            }
-        };
-        if let Some(checkpoint) = semantic_checkpoint {
-            let memory_event = memory::SessionDomainEvent::new(
+        let checkpoint_id = semantic_checkpoint.checkpoint_id.clone();
+        let compaction_event_id = context_event.event_id.clone();
+        let events = vec![
+            context_event,
+            memory::SessionDomainEvent::new(
                 session_id.clone(),
                 0,
                 memory::SessionDomainScope::Memory,
                 "memory.semantic_checkpoint.created",
                 serde_json::json!({
                     "source": "conversation_runtime.compaction",
-                    "compaction_event_sequence": persisted.sequence,
-                    "checkpoint": checkpoint,
+                    "compaction_event_id": compaction_event_id,
+                    "checkpoint": semantic_checkpoint,
                     "receipt": receipt,
                 }),
                 created_at_ms,
-            );
-            if let Err(error) = store
-                .append_session_domain_event_allocating_sequence(&memory_event)
-                .await
-            {
+            ),
+        ];
+        let committed = store
+            .append_session_domain_events_if_checkpoint_absent(&events, &checkpoint_id)
+            .await;
+        let committed = match committed {
+            Ok(true) => true,
+            Ok(false) => {
+                tracing::info!(session_id, checkpoint_id = %checkpoint_id, "reusing committed semantic compaction bundle");
+                false
+            }
+            Err(error) => {
                 return Err(RuntimeError::new(format!(
-                    "semantic checkpoint persistence failed for session `{session_id}` after compaction event {}: {error}",
-                    persisted.sequence
+                    "atomic compaction persistence failed for session `{session_id}`; transcript was retained: {error}"
                 )));
             }
-        }
-        self.record_local_compaction_event(compaction, sequence);
-        Ok(())
-    }
-
-    fn record_local_compaction_event(
-        &self,
-        compaction: crate::session::SessionCompaction,
-        sequence: usize,
-    ) {
-        if let Some(ref log) = self.event_log {
-            if let Ok(mut guard) = log.lock() {
-                guard.push(MessageEvent::MessagesTruncated { sequence });
-                guard.push(MessageEvent::SessionCompacted { compaction });
-            }
-        }
+        };
+        Ok(committed)
     }
 
     fn record_turn_started(&self, user_input: &str) {
@@ -4550,12 +4738,35 @@ where
     ///
     /// Returns a clone of `self.system_prompt` when memory is disabled so the
     /// hot path has zero cost.
-    async fn prepare_reality_context(&self, user_input: &str) -> Vec<String> {
-        let _perf_start = std::time::Instant::now();
-        let next_model_context_items = self.take_next_model_context_items();
+    #[cfg(test)]
+    async fn prepare_reality_context(&self, user_input: &str) -> PromptAssembly {
+        self.prepare_reality_context_with_budget(user_input, self.context_budget_tokens())
+            .await
+    }
 
-        // P5.2: Global invalidation (file changes, max age).
-        self.cached_prompt.check_global();
+    #[cfg(test)]
+    async fn prepare_reality_context_with_budget(
+        &self,
+        user_input: &str,
+        total_budget_tokens: u64,
+    ) -> PromptAssembly {
+        let next_model_context_items = self.take_next_model_context_items();
+        self.prepare_reality_context_with_budget_and_items(
+            user_input,
+            total_budget_tokens,
+            next_model_context_items,
+        )
+        .await
+    }
+
+    async fn prepare_reality_context_with_budget_and_items(
+        &self,
+        user_input: &str,
+        total_budget_tokens: u64,
+        next_model_context_items: Vec<ContextItem>,
+    ) -> PromptAssembly {
+        let _perf_start = std::time::Instant::now();
+
         let evolution_context_items = match crate::evolution_memory_context_items(
             crate::cowd_dirs::config_home_dir(),
             user_input,
@@ -4570,11 +4781,6 @@ where
         };
 
         let Some(mgr) = self.memory_manager.as_ref() else {
-            // No memory manager — cache empty for all layers, return base prompt.
-            use crate::cached_prompt::CacheLayer;
-            for &layer in &CacheLayer::all() {
-                self.cached_prompt.rebuild_layer(layer, Vec::new(), 0);
-            }
             let unavailable_sources = if evolution_context_items.is_empty() {
                 vec![ContextSourceKind::Memory]
             } else {
@@ -4587,6 +4793,7 @@ where
                 dynamic_items,
                 Vec::new(),
                 unavailable_sources,
+                total_budget_tokens,
             );
             return self.finalize_context_prompt(user_input, envelope, None);
         };
@@ -4675,11 +4882,6 @@ where
                     if let Some(cb) = &self.memory_callback {
                         cb.on_memory_update(Vec::new(), "no memories found");
                     }
-                    // Cache empty for all layers.
-                    use crate::cached_prompt::CacheLayer;
-                    for &layer in &CacheLayer::all() {
-                        self.cached_prompt.rebuild_layer(layer, Vec::new(), 0);
-                    }
                     let omissions = packet
                         .omitted
                         .iter()
@@ -4696,57 +4898,9 @@ where
                         dynamic_items,
                         omissions,
                         Vec::new(),
+                        total_budget_tokens,
                     );
                     return self.finalize_context_prompt(user_input, envelope, None);
-                }
-
-                use crate::cached_prompt::CacheLayer;
-                use memory::types::MemoryLayer;
-                let mut items_by_layer: std::collections::HashMap<
-                    CacheLayer,
-                    Vec<&memory::MemoryPacketItem>,
-                > = std::collections::HashMap::new();
-                for item in &packet.selected {
-                    let cl = match item.atom.layer {
-                        MemoryLayer::L0 => CacheLayer::L0,
-                        MemoryLayer::L1 => CacheLayer::L1,
-                        MemoryLayer::L2 => CacheLayer::L2,
-                        MemoryLayer::L3 => CacheLayer::L3,
-                        MemoryLayer::L4 => CacheLayer::L4,
-                    };
-                    items_by_layer.entry(cl).or_default().push(item);
-                }
-
-                for cache_layer in CacheLayer::all() {
-                    let items = items_by_layer.remove(&cache_layer).unwrap_or_default();
-                    let count = items.len();
-
-                    if self.cached_prompt.needs_rebuild(cache_layer, count) {
-                        let mut layer_text = String::new();
-                        for item in &items {
-                            let atom = &item.atom;
-                            let layer_tag = match atom.layer {
-                                MemoryLayer::L0 => "identity",
-                                MemoryLayer::L1 => "working",
-                                MemoryLayer::L2 => "project",
-                                MemoryLayer::L3 => "recall",
-                                MemoryLayer::L4 => "raw",
-                            };
-                            layer_text.push_str(&format!(
-                                "### Context: Memory | {layer_tag}\n- role: {:?}\n- state: {:?}\n- confidence: {:.2}\n- salience: {:.2}\n- title: {}\n- content: {}\n- reason: {}\n- evidence: {}\n",
-                                item.role,
-                                atom.state,
-                                atom.confidence,
-                                atom.salience,
-                                atom.title,
-                                item.content_preview,
-                                item.reason,
-                                atom.evidence_pointer.as_deref().unwrap_or("")
-                            ));
-                        }
-                        self.cached_prompt
-                            .rebuild_layer(cache_layer, vec![layer_text], count);
-                    }
                 }
 
                 if let Some(cb) = &self.memory_callback {
@@ -4840,8 +4994,13 @@ where
                     dynamic_items.extend(activation.items);
                     self.set_turn_knowledge_report(activation.report);
                 }
-                let envelope =
-                    self.build_context_envelope(user_input, dynamic_items, omissions, Vec::new());
+                let envelope = self.build_context_envelope(
+                    user_input,
+                    dynamic_items,
+                    omissions,
+                    Vec::new(),
+                    total_budget_tokens,
+                );
                 self.finalize_context_prompt(user_input, envelope, knowledge_report)
             }
             Err(err) => {
@@ -4861,6 +5020,7 @@ where
                     dynamic_items,
                     Vec::new(),
                     unavailable_sources,
+                    total_budget_tokens,
                 );
                 self.finalize_context_prompt(user_input, envelope, None)
             }
@@ -5034,22 +5194,32 @@ where
             );
             return;
         };
-        let Some(access) = access else {
-            tracing::warn!(
-                tool_call_id = tool_use_id,
-                "skipping derived tool index because canonical raw evidence is unavailable"
+        let content_hash = format!(
+            "{:016x}",
+            model_protocol::prompt_cache::stable_hash_bytes(output.as_bytes())
+        );
+        let summary = if let Some(access) = access {
+            let evidence = memory::types::CanonicalRawEvidence::new(
+                access.clone(),
+                preview_chars(output, 600),
             );
-            return;
+            guard.index_tool_output_with_evidence(
+                tool_use_id,
+                tool_name,
+                output,
+                DEFAULT_OUTPUT_REF_MIN_LINES,
+                &evidence,
+            )
+        } else {
+            guard.index_tool_output_ephemeral(
+                tool_use_id,
+                output,
+                DEFAULT_OUTPUT_REF_MIN_LINES,
+                tool_use_id,
+                &content_hash,
+            )
         };
-        let evidence =
-            memory::types::CanonicalRawEvidence::new(access.clone(), preview_chars(output, 600));
-        if let Some(summary) = guard.index_tool_output_with_evidence(
-            tool_use_id,
-            tool_name,
-            output,
-            DEFAULT_OUTPUT_REF_MIN_LINES,
-            &evidence,
-        ) {
+        if let Some(summary) = summary {
             tracing::debug!(
                 tool_call_id = tool_use_id,
                 tool_name,
@@ -5134,10 +5304,12 @@ where
     }
 
     fn record_provider_context_request(&self, request: &ApiRequest, request_sequence: usize) {
-        let mut system_tokens =
-            crate::context_ledger::estimate_text_tokens(&request.system_prompt.join("\n\n"));
+        let mut system_tokens = crate::context_ledger::estimate_text_tokens(
+            &request.prompt.trusted_system.join("\n\n"),
+        );
         let capability_tokens = request
-            .system_prompt
+            .prompt
+            .trusted_system
             .iter()
             .filter(|fragment| {
                 fragment.starts_with("## Runtime evidence plan")
@@ -5190,30 +5362,31 @@ where
         }
         let mut memory_tokens = 0u64;
         let mut handoff_tokens = 0u64;
-        if let Some(envelope) = self.last_context_envelope() {
-            for item in envelope.selected {
-                match item.source {
-                    ContextSourceKind::Memory
-                    | ContextSourceKind::Knowledge
-                    | ContextSourceKind::Fact
-                    | ContextSourceKind::Matrix => {
-                        memory_tokens = memory_tokens.saturating_add(item.token_estimate);
-                    }
-                    ContextSourceKind::AgentPeer | ContextSourceKind::Handoff => {
-                        handoff_tokens = handoff_tokens.saturating_add(item.token_estimate);
-                    }
-                    _ => {}
+        let mut contextual_tokens = 0u64;
+        for packet in &request.prompt.contextual_packets {
+            let tokens =
+                crate::context_ledger::estimate_text_tokens(&packet.render_for_user_context());
+            match packet.source {
+                ContextSourceKind::Memory
+                | ContextSourceKind::Knowledge
+                | ContextSourceKind::Fact
+                | ContextSourceKind::Matrix => {
+                    memory_tokens = memory_tokens.saturating_add(tokens);
+                }
+                ContextSourceKind::AgentPeer | ContextSourceKind::Handoff => {
+                    handoff_tokens = handoff_tokens.saturating_add(tokens);
+                }
+                _ => {
+                    contextual_tokens = contextual_tokens.saturating_add(tokens);
                 }
             }
         }
-        system_tokens = system_tokens.saturating_sub(
-            memory_tokens
-                .saturating_add(handoff_tokens)
-                .saturating_add(capability_tokens),
-        );
-        let inventory = self.api_client.context_inventory();
+        system_tokens = system_tokens
+            .saturating_add(contextual_tokens)
+            .saturating_sub(capability_tokens);
         if let Ok(mut ledger) = self.turn_context_ledger.lock() {
-            ledger.begin_request(request_sequence);
+            ledger
+                .begin_request_with_budget(request_sequence, request.budget.hard_input_cap_tokens);
         }
         self.record_context_component(
             crate::context_ledger::ContextComponentKind::System,
@@ -5261,11 +5434,13 @@ where
         );
         self.record_context_component(
             crate::context_ledger::ContextComponentKind::ToolSchema,
-            inventory.tool_schema_tokens,
-            Some(format!(
-                "provider-request:{request_sequence}:tools:{}",
-                inventory.tool_count
-            )),
+            request.budget.fixed_input_tokens.saturating_sub(
+                crate::context_ledger::estimate_text_tokens(
+                    &request.prompt.trusted_system.join("\n\n"),
+                )
+                .saturating_add(history_tokens),
+            ),
+            Some(format!("provider-request:{request_sequence}:tools")),
             request_sequence,
         );
     }
@@ -5329,7 +5504,7 @@ where
                     %error,
                     session_id,
                     evidence_id,
-                    "tool raw evidence append failed; retaining inline model fallback"
+                    "tool raw evidence append failed; retaining bounded ephemeral receipt"
                 );
                 return (evidence_ref, None);
             }
@@ -5367,7 +5542,7 @@ where
                 Some(&source_evidence_ref),
             )
             .await;
-        self.maybe_index_tool_output(tool_use_id, tool_name, output, raw_access.as_ref());
+        self.maybe_index_tool_output(raw_ref.id(), tool_name, output, raw_access.as_ref());
         let receipt =
             self.tool_model_receipt(tool_name, output, is_error, &raw_ref, raw_access.as_ref());
         self.push_turn_evidence_audit(crate::context_evidence::audit_projection(
@@ -5422,13 +5597,14 @@ where
             granted.max(24),
         );
         if access.is_none() {
-            receipt.summary = format!(
-                "Tool `{tool_name}` {}. Raw evidence persistence is unavailable; full inline fallback:\n{output}",
-                if is_error { "failed" } else { "completed" }
+            receipt.summary = receipt.summary.replacen(
+                "Evidence: tool://",
+                "Ephemeral evidence (active runtime only): tool://",
+                1,
             );
             receipt.receipt_tokens = crate::context_ledger::estimate_text_tokens(&receipt.summary);
-            receipt.omitted_tokens = 0;
-            receipt.truncated = false;
+            receipt.omitted_tokens = raw_tokens.saturating_sub(receipt.receipt_tokens);
+            receipt.truncated = receipt.receipt_tokens < raw_tokens;
         }
         self.record_context_component(
             crate::context_ledger::ContextComponentKind::ToolResult,
@@ -5888,13 +6064,6 @@ fn message_appended_session_event(
 
 /// Reads the automatic compaction threshold from the environment.
 #[must_use]
-pub fn auto_compaction_threshold_from_env() -> u32 {
-    let value = std::env::var("CC_AUTO_COMPACT_INPUT_TOKENS")
-        .ok()
-        .or_else(|| std::env::var(AUTO_COMPACTION_THRESHOLD_ENV_VAR).ok());
-    parse_auto_compaction_threshold(value.as_deref())
-}
-
 /// Convert a [`RuntimeFeatureConfig`] memory section into a [`CcMemoryConfig`]
 /// suitable for [`CognitiveContextManager::new`].
 #[doc(alias = "memory")]
@@ -5906,16 +6075,15 @@ pub fn build_cc_memory_config(feature_config: &RuntimeFeatureConfig) -> CcMemory
             Some(feature_config.model_context_windows()),
         )
     });
-    let model_max_output = feature_config
-        .model()
-        .map_or(0, provider::max_tokens_for_model);
+    let model_max_output = feature_config.model().map_or(0, |model| {
+        bounded_provider_output_tokens(model, model_context_window)
+    });
     let ratio_bp =
-        clamp_context_budget_ratio_bp(feature_config.compression().session.threshold_ratio_bp);
+        clamp_context_budget_ratio_bp(feature_config.context_budget().subsystem_budget_ratio_bp);
     let plan = RuntimeBudgetPlan::derive(RuntimeBudgetInputs {
         model_context_window,
         model_max_output_tokens: model_max_output,
-        context_budget_ratio_bp: ratio_bp,
-        compact_threshold_ratio_bp: ratio_bp,
+        subsystem_budget_ratio_bp: ratio_bp,
         profile: ContextProfile::MainTurn,
         autonomy_mode: None,
     });
@@ -5999,14 +6167,6 @@ pub fn build_cc_memory_config_with_budget(
     }
 }
 
-#[must_use]
-fn parse_auto_compaction_threshold(value: Option<&str>) -> u32 {
-    value
-        .and_then(|raw| raw.trim().parse::<u32>().ok())
-        .filter(|threshold| *threshold > 0)
-        .unwrap_or(0)
-}
-
 fn extract_tool_info(msg: &ConversationMessage) -> (String, String) {
     if let Some(ContentBlock::ToolResult {
         tool_use_id,
@@ -6049,6 +6209,30 @@ fn source_message_evidence_refs(
             )
         })
         .collect()
+}
+
+fn deterministic_checkpoint_id(
+    session_id: &str,
+    message_start: usize,
+    message_end: usize,
+    previous_summary: Option<&str>,
+) -> String {
+    // This identifier crosses process boundaries through durable events, so
+    // it cannot use DefaultHasher (whose algorithm is not a persistence
+    // contract). Length-prefix every field to avoid ambiguous concatenation.
+    let mut hasher = Sha256::new();
+    let message_start_bytes = message_start.to_le_bytes();
+    let message_end_bytes = message_end.to_le_bytes();
+    for field in [
+        session_id.as_bytes(),
+        message_start_bytes.as_slice(),
+        message_end_bytes.as_slice(),
+        previous_summary.unwrap_or_default().as_bytes(),
+    ] {
+        hasher.update((field.len() as u64).to_le_bytes());
+        hasher.update(field);
+    }
+    format!("checkpoint-{session_id}-{:x}", hasher.finalize())
 }
 
 fn conversation_messages_to_mem_messages(messages: &[ConversationMessage]) -> Vec<MemMessage> {
@@ -6454,10 +6638,10 @@ mod tests {
 
     use super::{
         apply_explicit_team_requirement, build_cc_memory_config_with_budget,
-        enforce_explicit_team_requirement, image_user_message_from_path,
-        is_runtime_team_orchestration_call, prepared_vision_payload, preview_chars,
-        provider_transport_policy, rate_per_second, required_team_orchestration_call,
-        tool_batch_pattern, trailing_declared_xml_tool_calls, vision_user_message, ApiClient,
+        deterministic_checkpoint_id, enforce_explicit_team_requirement,
+        image_user_message_from_path, is_runtime_team_orchestration_call, prepared_vision_payload,
+        preview_chars, provider_transport_policy, rate_per_second,
+        required_team_orchestration_call, tool_batch_pattern, vision_user_message, ApiClient,
         ApiRequest, AssistantEvent, CognitiveContextManager, ConversationRuntime, ModelStepIntent,
         ModelToolCall, RuntimeError, StaticToolExecutor,
     };
@@ -6469,7 +6653,9 @@ mod tests {
     use crate::execution_core::build_runtime_execution_decision;
     use crate::permissions::{PermissionMode, PermissionPolicy};
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
-    use crate::{resolve_context_budget_tokens, RuntimeBudgetInputs, RuntimeBudgetPlan};
+    use crate::{
+        resolve_context_budget_tokens, PromptAssembly, RuntimeBudgetInputs, RuntimeBudgetPlan,
+    };
     use futures::stream::Stream;
     use model_protocol::usage::TokenUsage;
     use std::fs;
@@ -6477,32 +6663,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    #[test]
-    fn recovers_declared_trailing_xml_tool_calls_after_planning_preamble() {
-        let text = "I will inspect the target file first.\n<tool_call><function=read_file><parameter=path>README.md</parameter></function></tool_call>";
-        let (cleaned, calls) = trailing_declared_xml_tool_calls(
-            text,
-            &["read_file".to_string(), "list_files".to_string()],
-        )
-        .expect("declared trailing tool call should be recovered");
-
-        assert_eq!(cleaned, "I will inspect the target file first.");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "read_file");
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&calls[0].input).unwrap()["path"],
-            "README.md"
-        );
-    }
-
-    #[test]
-    fn does_not_recover_unknown_or_prose_xml_examples_as_tool_calls() {
-        let unknown =
-            "I will proceed. <tool_call><function=delete_everything></function></tool_call>";
-        assert!(trailing_declared_xml_tool_calls(unknown, &["read_file".to_string()]).is_none());
-
-        let prose = "Here is an XML example:\n\n```xml\n<tool_call><function=read_file></function></tool_call>\n```";
-        assert!(trailing_declared_xml_tool_calls(prose, &["read_file".to_string()]).is_none());
+    fn rendered_prompt(prompt: &PromptAssembly) -> String {
+        let mut segments = prompt.trusted_system.clone();
+        segments.extend(prompt.contextual_messages());
+        segments.join("\n")
     }
 
     #[test]
@@ -6672,20 +6836,345 @@ mod tests {
     #[test]
     fn provider_transport_policy_scales_with_actual_request_size() {
         let small = ApiRequest {
-            system_prompt: vec!["system".to_string()],
+            prompt: PromptAssembly::new(vec!["system".to_string()]),
             messages: vec![ConversationMessage::user_text("status".to_string())],
             model: "test".to_string(),
+            budget: crate::context_ledger::RequestBudgetReport::for_attempt(
+                "test", 32_768, 4_096, 128, 256, 0,
+            ),
         };
         let large = ApiRequest {
-            system_prompt: vec!["system".repeat(5_000)],
+            prompt: PromptAssembly::new(vec!["system".repeat(5_000)]),
             messages: vec![ConversationMessage::user_text("evidence".repeat(10_000))],
             model: "test".to_string(),
+            budget: crate::context_ledger::RequestBudgetReport::for_attempt(
+                "test", 1_000_000, 32_000, 128, 256, 0,
+            ),
         };
 
         assert!(
             provider_transport_policy(1_000_000, &large).idle_timeout
                 > provider_transport_policy(32_768, &small).idle_timeout
         );
+    }
+
+    #[test]
+    fn candidate_packer_accounts_for_history_schema_and_omits_packet_tail() {
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["builtin policy".to_string()],
+        )
+        .without_memory()
+        .with_model_context_window(128_000);
+        runtime.set_active_model("test");
+        let mut prompt = PromptAssembly::new(vec!["runtime control".repeat(60)]);
+        for source_id in (0..64).map(|index| format!("packet-{index}")) {
+            prompt.contextual_packets.push(crate::PromptContextPacket {
+                authority: ContextAuthority::Project,
+                source: ContextSourceKind::Workspace,
+                role: ContextRole::Evidence,
+                source_id,
+                content: "evidence ".repeat(900),
+                evidence: Vec::new(),
+                utility_score_milli: 0,
+            });
+        }
+
+        let request = runtime
+            .pack_provider_attempt(
+                &prompt,
+                &[ConversationMessage::user_text("history ".repeat(300))],
+                "test",
+                super::ProviderContextInventory {
+                    tool_count: 2,
+                    tool_schema_tokens: 1_200,
+                },
+            )
+            .expect("candidate request should fit after contextual packing");
+
+        assert!(request.budget.input_total_tokens() <= request.budget.hard_input_cap_tokens);
+        assert_eq!(
+            request.budget.target_input_cap_tokens,
+            request.budget.hard_input_cap_tokens
+        );
+        assert!(!request.prompt.contextual_packets.is_empty());
+        assert!(!request.budget.omitted_packet_ids.is_empty());
+    }
+
+    #[derive(Clone)]
+    struct RouteRecordingApi {
+        requests: Arc<std::sync::Mutex<Vec<ApiRequest>>>,
+    }
+
+    impl ApiClient for RouteRecordingApi {
+        fn stream(
+            &mut self,
+            request: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            let model = request.model.clone();
+            self.requests.lock().expect("requests").push(request);
+            let events = if model == "primary" {
+                vec![Err(RuntimeError::new("primary unavailable"))]
+            } else {
+                vec![
+                    Ok(AssistantEvent::ProviderModel { model }),
+                    Ok(AssistantEvent::TextDelta("fallback answer".to_string())),
+                    Ok(AssistantEvent::MessageStop),
+                ]
+            };
+            Box::pin(futures::stream::iter(events))
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_owns_fallback_attempts_and_repacks_each_candidate() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let api = RouteRecordingApi {
+            requests: Arc::clone(&requests),
+        };
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            api,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["builtin policy".to_string()],
+        )
+        .without_memory()
+        .with_model_context_window(128_000);
+        runtime.set_active_model("primary");
+        runtime.fallbacks = vec!["fallback".to_string()];
+
+        let result = runtime
+            .execute_model_step("summarize the current state", true)
+            .await
+            .expect("fallback candidate should complete");
+        assert_eq!(result.model.as_deref(), Some("fallback"));
+        let requests = requests.lock().expect("requests");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["primary", "fallback"]
+        );
+        assert!(requests.iter().all(|request| request.budget.executable));
+    }
+
+    #[derive(Clone)]
+    struct CalibrationRecordingApi {
+        windows: Arc<std::sync::Mutex<Vec<(u64, String)>>>,
+    }
+
+    impl ApiClient for CalibrationRecordingApi {
+        fn stream(
+            &mut self,
+            request: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            let attempt = {
+                let mut windows = self.windows.lock().expect("windows");
+                windows.push((
+                    request.budget.context_window_tokens,
+                    request.budget.context_window_source.clone(),
+                ));
+                windows.len()
+            };
+            let events = if attempt == 1 {
+                vec![Err(RuntimeError::with_provider_context_window_limit(
+                    "provider maximum context length is 32768 tokens",
+                    Some(32_768),
+                ))]
+            } else {
+                vec![
+                    Ok(AssistantEvent::TextDelta("calibrated answer".to_string())),
+                    Ok(AssistantEvent::MessageStop),
+                ]
+            };
+            Box::pin(futures::stream::iter(events))
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_provider_limit_calibrates_once_and_repackages_the_same_model() {
+        let windows = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let api = CalibrationRecordingApi {
+            windows: Arc::clone(&windows),
+        };
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            api,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["builtin policy".to_string()],
+        )
+        .without_memory()
+        .with_model_context_window(128_000);
+        runtime.set_active_model("private-model");
+
+        let result = runtime
+            .execute_model_step("give a concise answer", true)
+            .await
+            .expect("calibrated retry should complete");
+        assert_eq!(result.model.as_deref(), Some("private-model"));
+        let windows = windows.lock().expect("windows");
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].0, 128_000);
+        assert_eq!(windows[1].0, 32_768);
+        assert_eq!(windows[1].1, "calibrated");
+    }
+
+    #[test]
+    fn switching_models_re_resolves_each_configured_context_window() {
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["builtin policy".to_string()],
+        )
+        .without_memory()
+        .with_model_context_window(128_000);
+        runtime
+            .model_context_windows
+            .insert("small-configured-model".to_string(), 32_768);
+
+        runtime.set_active_model("small-configured-model");
+
+        let resolution = runtime.context_window_resolution_for_model("small-configured-model");
+        assert_eq!(resolution.tokens, 32_768);
+        assert_eq!(resolution.source.as_str(), "configured");
+    }
+
+    #[test]
+    fn semantic_checkpoint_id_is_stable_and_boundary_specific() {
+        let first = deterministic_checkpoint_id("session-a", 2, 8, Some("prior"));
+        let retry = deterministic_checkpoint_id("session-a", 2, 8, Some("prior"));
+        let different_boundary = deterministic_checkpoint_id("session-a", 3, 8, Some("prior"));
+
+        assert_eq!(first, retry);
+        assert_ne!(first, different_boundary);
+        assert!(first.starts_with("checkpoint-session-a-"));
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_uses_one_semantic_checkpoint_and_preserves_recent_turns() {
+        let tmp = tempfile::tempdir().expect("temp memory root");
+        let manager = Arc::new(
+            CognitiveContextManager::new(memory::config::MemoryConfig {
+                store: memory::config::StoreConfig {
+                    sqlite_path: tmp.path().join("memory.sqlite"),
+                    blob_dir: tmp.path().join("blobs"),
+                    enable_vector_index: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .expect("memory manager"),
+        );
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage::user_text("old request ".repeat(200)),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "old response ".repeat(200),
+            }]),
+            ConversationMessage::user_text("recent user request"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "recent assistant response".to_string(),
+            }]),
+        ];
+        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().expect("session store"));
+        store
+            .create_session(&memory::SessionRecord {
+                session_id: session.session_id.clone(),
+                platform: "test".to_string(),
+                chat_id: "semantic-compaction".to_string(),
+                user_id: None,
+                model: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                last_activity: "2026-01-01T00:00:00Z".to_string(),
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .expect("session record");
+        let mut runtime = ConversationRuntime::new(
+            session,
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory()
+        .with_memory_manager(manager)
+        .with_session_store(store);
+        runtime.session_compaction_config.preserve_recent = 2;
+
+        let receipt = runtime
+            .compact_active_session()
+            .await
+            .expect("semantic compaction")
+            .expect("a compaction receipt");
+        assert!(receipt.removed_message_count > 0);
+        let compacted = runtime.session_async().await;
+        assert_eq!(
+            compacted.messages.len(),
+            3,
+            "configured preserve_recent=2 must win"
+        );
+        assert!(matches!(
+            &compacted.messages[0].blocks[0],
+            ContentBlock::Text { text }
+                if text.contains("Compressed Session Summary")
+                    && !text.contains("Conversation summary:")
+        ));
+        assert!(compacted.messages.iter().any(|message| {
+            message.blocks.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::Text { text } if text == "recent user request"
+                )
+            })
+        }));
+    }
+
+    #[tokio::test]
+    async fn compaction_without_durable_session_store_retains_the_transcript() {
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage::user_text("old request"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "old response".to_string(),
+            }]),
+            ConversationMessage::user_text("recent request"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "recent response".to_string(),
+            }]),
+        ];
+        let before = session.clone();
+        let mut runtime = ConversationRuntime::new(
+            session,
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+
+        let error = runtime
+            .compact_active_session()
+            .await
+            .expect_err("a non-durable runtime must not compact history");
+
+        assert!(error.to_string().contains("durable UnifiedSessionStore"));
+        assert_eq!(runtime.session_async().await, before);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6824,6 +7313,7 @@ mod tests {
             )],
             Vec::new(),
             Vec::new(),
+            runtime.context_budget_tokens(),
         );
 
         assert_eq!(runtime.context_profile(), ContextProfile::YoloGoal);
@@ -6851,8 +7341,7 @@ mod tests {
         let plan = RuntimeBudgetPlan::derive(RuntimeBudgetInputs {
             model_context_window: 1_000_000,
             model_max_output_tokens: 32_000,
-            context_budget_ratio_bp: 7_000,
-            compact_threshold_ratio_bp: 7_000,
+            subsystem_budget_ratio_bp: 7_000,
             profile: ContextProfile::MainTurn,
             autonomy_mode: None,
         });
@@ -7122,9 +7611,12 @@ mod tests {
         let mut api = RuntimeAwareApi(Arc::clone(&observed_runtime));
         let events = api
             .stream_collect(ApiRequest {
-                system_prompt: Vec::new(),
+                prompt: PromptAssembly::default(),
                 messages: Vec::new(),
                 model: "test".to_string(),
+                budget: crate::context_ledger::RequestBudgetReport::for_attempt(
+                    "test", 128_000, 4_096, 128, 256, 0,
+                ),
             })
             .expect("synchronous collection should succeed");
 
@@ -7430,14 +7922,15 @@ mod tests {
         .with_session_store(Arc::new(
             memory::UnifiedSessionStore::open_in_memory().unwrap(),
         ));
-        let raw = "raw output that must remain inline when the durable write fails";
+        let raw = "raw output retained only in the active runtime when durable write fails\n"
+            .repeat(1_000);
 
         let result = runtime
             .prepare_governed_tool_result(
                 "raw-failure-1",
                 "read_file",
                 r#"{"path":"README.md"}"#,
-                raw,
+                &raw,
                 false,
             )
             .await;
@@ -7449,8 +7942,20 @@ mod tests {
                 _ => None,
             })
             .expect("fallback still produces a model-visible tool result");
-        assert!(output.contains("Raw evidence persistence is unavailable"));
-        assert!(output.contains(raw));
+        assert!(output.contains("Ephemeral evidence (active runtime only)"));
+        assert!(!output.contains(raw.as_str()));
+        let evidence_id = output
+            .split("tool://")
+            .nth(1)
+            .and_then(|tail| tail.split_whitespace().next())
+            .map(|value| value.trim_end_matches('.'))
+            .expect("bounded receipt should identify its evidence");
+        let retrieved = runtime
+            .retrieve_tool_evidence(&format!(
+                r#"{{"evidence_ref":"tool://{evidence_id}","query":"durable write fails","limit":1}}"#
+            ))
+            .expect("active runtime should retain an ephemeral evidence spool");
+        assert!(retrieved.contains(raw.lines().next().unwrap_or_default()));
         let audit = runtime.turn_evidence_audits();
         assert_eq!(audit.len(), 1);
         assert!(audit[0].access.is_none());
@@ -7546,20 +8051,55 @@ mod tests {
 
         let error = runtime
             .record_session_compacted(
-                Some(crate::session::SessionCompaction {
+                crate::session::SessionCompaction {
                     count: 1,
                     removed_message_count: 3,
                     summary: "durability must precede local compaction".to_string(),
-                }),
+                },
                 3,
                 None,
-                None,
+                memory::compression::session::SessionSemanticCheckpoint {
+                    schema_version: 2,
+                    checkpoint_id: "checkpoint-failure".to_string(),
+                    session_id: "missing-session".to_string(),
+                    agent_id: "primary".to_string(),
+                    project_id: None,
+                    task_id: None,
+                    team_id: None,
+                    summary: "durability test".to_string(),
+                    user_rules: Vec::new(),
+                    goal: None,
+                    constraints: Vec::new(),
+                    decisions: Vec::new(),
+                    evidence_refs: Vec::new(),
+                    unresolved: Vec::new(),
+                    file_changes: Vec::new(),
+                    resume_cursor: memory::compression::session::SessionResumeCursor {
+                        message_index: 0,
+                        event_sequence: None,
+                        checkpoint_id: "checkpoint-failure".to_string(),
+                    },
+                    token_stats: memory::compression::session::CheckpointTokenStats {
+                        before: 1,
+                        after: 1,
+                        message_count: 0,
+                    },
+                    source_range: memory::compression::session::CompactionSourceRange {
+                        session_id: "missing-session".to_string(),
+                        message_start: 0,
+                        message_end_exclusive: 0,
+                        event_start: None,
+                        event_end_exclusive: None,
+                        raw_refs: Vec::new(),
+                    },
+                    facts: Vec::new(),
+                },
             )
             .await
             .expect_err("missing session carrier must reject canonical compaction persistence");
         assert!(error
             .to_string()
-            .contains("canonical compaction persistence failed"));
+            .contains("atomic compaction persistence failed"));
     }
 
     #[test]
@@ -7649,9 +8189,10 @@ mod tests {
             vec!["test prompt".to_string()],
         );
         let result = rt.prepare_reality_context("test").await;
-        assert_eq!(result[0], "test prompt");
+        assert_eq!(result.trusted_system[0], "test prompt");
         assert!(
             result
+                .trusted_system
                 .get(1)
                 .is_some_and(|line| line.contains("profile:MainTurn")),
             "without memory manager, returns stable head followed by runtime header"
@@ -7674,9 +8215,10 @@ mod tests {
             .last_context_envelope()
             .expect("context envelope should be recorded");
 
-        assert_eq!(prompt[0], "stable system");
-        assert!(prompt[1].contains("profile:MainTurn"));
+        assert_eq!(prompt.trusted_system[0], "stable system");
+        assert!(prompt.trusted_system[1].contains("profile:MainTurn"));
         assert!(prompt
+            .trusted_system
             .iter()
             .any(|segment| segment.contains("context_governance_report_id:")));
         assert_eq!(envelope.intent, "remember this");
@@ -7685,7 +8227,10 @@ mod tests {
             envelope.diagnostics.degraded_sources,
             vec![ContextSourceKind::Memory]
         );
-        assert!(envelope.selected.is_empty());
+        assert!(envelope
+            .selected
+            .iter()
+            .all(|item| item.source != ContextSourceKind::Memory));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -7716,12 +8261,16 @@ mod tests {
             .expect("context envelope should be recorded");
 
         assert!(prompt
+            .contextual_packets
             .iter()
-            .any(|segment| segment.contains("continue v0.8.13 context work")));
-        assert_eq!(envelope.selected.len(), 1);
-        assert_eq!(envelope.selected[0].source, ContextSourceKind::Handoff);
-        assert_eq!(envelope.selected[0].authority, ContextAuthority::Session);
-        assert!(envelope.selected[0].content.contains("Active task"));
+            .any(|packet| packet.content.contains("continue v0.8.13 context work")));
+        let handoff = envelope
+            .selected
+            .iter()
+            .find(|item| item.source == ContextSourceKind::Handoff)
+            .expect("resume context should remain selected alongside workspace packets");
+        assert_eq!(handoff.authority, ContextAuthority::Session);
+        assert!(handoff.content.contains("Active task"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -7750,8 +8299,9 @@ mod tests {
             .expect("context envelope should be recorded");
 
         assert!(prompt
+            .contextual_packets
             .iter()
-            .any(|segment| segment.contains("cargo test passed")));
+            .any(|packet| packet.content.contains("cargo test passed")));
         assert!(envelope
             .selected
             .iter()
@@ -7769,7 +8319,10 @@ mod tests {
             vec!["base prompt".to_string()],
         );
         let prompt = rt.prepare_reality_context("hello").await;
-        assert!(prompt.len() >= 1, "should have at least system prompt");
+        assert!(
+            !prompt.trusted_system.is_empty(),
+            "should have system prompt"
+        );
     }
 
     #[test]
@@ -7808,9 +8361,11 @@ mod tests {
             vec!["system".to_string()],
         );
         let prompt = rt.prepare_reality_context("test").await;
-        assert!(prompt.len() >= 1);
+        assert!(!prompt.trusted_system.is_empty());
         // Without memory manager, should still return system prompt
-        assert!(prompt[0] == "system" || prompt[0].starts_with("system"));
+        assert!(
+            prompt.trusted_system[0] == "system" || prompt.trusted_system[0].starts_with("system")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -7888,10 +8443,10 @@ mod tests {
         )
         .with_memory_manager(mgr);
 
-        let prompt = rt
-            .prepare_reality_context("请先使用 runtime_capabilities 调用工具分析")
-            .await
-            .join("\n");
+        let prompt = rendered_prompt(
+            &rt.prepare_reality_context("请先使用 runtime_capabilities 调用工具分析")
+                .await,
+        );
         let envelope = rt
             .last_context_envelope()
             .expect("context envelope should be recorded");
@@ -7932,7 +8487,7 @@ mod tests {
         // Verify that prepare_reality_context doesn't panic with empty session
         let result = rt.prepare_reality_context("any query").await;
         assert!(
-            !result.is_empty(),
+            !result.trusted_system.is_empty(),
             "should return at least the system prompt"
         );
     }
@@ -7955,21 +8510,20 @@ mod tests {
         // Without selected memories, the prompt still includes the stable head and
         // runtime governance context. Attachment/resource guidance may add more
         // bounded sections, so this must remain a semantic budget assertion.
-        assert_eq!(prompt[0], "system prompt");
+        assert_eq!(prompt.trusted_system[0], "system prompt");
         assert!(prompt
+            .trusted_system
             .iter()
             .any(|segment| segment.contains("profile:MainTurn")));
-        assert!(!prompt
-            .iter()
-            .any(|segment| segment.contains("<memory_context>")));
-        let total_prompt_chars: usize = prompt.iter().map(|segment| segment.len()).sum();
+        assert!(!rendered_prompt(&prompt).contains("<memory_context>"));
+        let total_prompt_chars = prompt.estimated_chars();
         assert!(
             total_prompt_chars < 20_000,
             "memory-free runtime prompt should stay bounded"
         );
         // System prompt should be reasonably sized
         assert!(
-            prompt[0].len() < 10000,
+            prompt.trusted_system[0].len() < 10000,
             "system prompt should not be oversized"
         );
     }

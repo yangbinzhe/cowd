@@ -507,7 +507,10 @@ impl AnthropicClient {
         // round trip.
         super::preflight_message_request(request)?;
 
-        let Some(limit) = model_token_limit(&request.model) else {
+        let Some(context_window_tokens) = request
+            .context_window_limit
+            .or_else(|| model_token_limit(&request.model).map(|limit| limit.context_window_tokens))
+        else {
             return Ok(());
         };
 
@@ -518,13 +521,13 @@ impl AnthropicClient {
             return Ok(());
         };
         let estimated_total_tokens = counted_input_tokens.saturating_add(request.max_tokens);
-        if estimated_total_tokens > limit.context_window_tokens {
+        if estimated_total_tokens > context_window_tokens {
             return Err(ApiError::ContextWindowExceeded {
                 model: request.model.clone(),
                 estimated_input_tokens: counted_input_tokens,
                 requested_output_tokens: request.max_tokens,
                 estimated_total_tokens,
-                context_window_tokens: limit.context_window_tokens,
+                context_window_tokens,
             });
         }
 

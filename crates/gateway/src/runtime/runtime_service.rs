@@ -130,6 +130,7 @@ pub(crate) struct RuntimeService {
     upgrade_coordinator: Arc<runtime::UpgradeCoordinator>,
     config_reload: Arc<crate::runtime_host::config_reload::ConfigReloadState>,
     tool_host: Arc<tools::ToolHost>,
+    resource_capabilities: runtime::ResourceCapabilityIndex,
     runtime_services: Arc<runtime::RuntimeServices>,
     session_input_router: Arc<runtime::SessionInputRouter>,
 }
@@ -159,6 +160,8 @@ impl RuntimeService {
             .session_input_router()
             .cloned()
             .ok_or_else(|| "durable SessionInputRouter is required".to_string())?;
+        let resource_capabilities = runtime::ResourceCapabilityIndex::default();
+        let _ = resource_capabilities.refresh_from_environment();
         Ok(Self {
             sessions,
             lease_registry,
@@ -179,6 +182,7 @@ impl RuntimeService {
                 "gateway-runtime",
                 std::env::current_dir().unwrap_or_default(),
             )),
+            resource_capabilities,
             runtime_services,
             session_input_router,
         })
@@ -195,6 +199,14 @@ impl RuntimeService {
 
     pub(crate) fn session_input_router(&self) -> Arc<runtime::SessionInputRouter> {
         Arc::clone(&self.session_input_router)
+    }
+
+    pub(crate) fn resource_capability_index(&self) -> runtime::ResourceCapabilityIndex {
+        self.resource_capabilities.clone()
+    }
+
+    pub(crate) fn refresh_resource_capabilities(&self) -> runtime::ResourceCapabilitySnapshot {
+        self.resource_capabilities.refresh_from_environment()
     }
 
     pub(crate) async fn execute_ingress_record(
@@ -1634,18 +1646,29 @@ impl RuntimeService {
         };
 
         let mut runtime_guard = runtime_entry.lock().await;
-        let (result, session_snapshot) =
-            runtime_guard.compact_active_session(runtime::CompactionConfig::default());
+        let (result, session_snapshot) = runtime_guard
+            .compact_active_session()
+            .await
+            .map_err(|error| memory::MemoryError::Compression(error.to_string()))?;
         drop(runtime_guard);
 
         self.sync_session_snapshot(session_id, &session_snapshot)
             .await?;
 
+        let removed_message_count = result
+            .as_ref()
+            .map_or(0, |event| event.removed_message_count);
+        let summary = session_snapshot
+            .compaction
+            .as_ref()
+            .map_or_else(String::new, |compaction| {
+                runtime::format_compact_summary(&compaction.summary)
+            });
         Ok(Some(SessionCompactResult {
             session_id: session_id.to_string(),
-            compacted: result.removed_message_count > 0,
-            removed_message_count: result.removed_message_count,
-            summary: result.formatted_summary,
+            compacted: removed_message_count > 0,
+            removed_message_count,
+            summary,
         }))
     }
 

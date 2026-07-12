@@ -1,6 +1,6 @@
 //! `CognitiveContextManager` – unified entry-point (facade) for the memory framework.
 //!
-//! Coordinates all sub-systems (orchestrator, compression pipeline, relevance
+//! Coordinates all sub-systems (orchestrator, relevance
 //! scoring, dynamic loading, context monitoring, handoff, seeds, drift
 //! detection) to produce the optimal [`PreparedContext`] within the current
 //! token budget.
@@ -36,7 +36,6 @@ use crate::{
     coherence,
     compression::{
         budget::BudgetManager, llm_summarizer::OpenAiSummarizer, monitor::ContextWindowMonitor,
-        CompressionPipeline,
     },
     config::{BudgetCalculator, MemoryConfig},
     context_rot::{ContextRotMonitor, RotAlert, RotMetrics},
@@ -136,8 +135,6 @@ pub struct CognitiveContextManager {
     config: MemoryConfig,
     /// Five-layer memory orchestrator (Arc-wrapped for shared access).
     orchestrator: Arc<MemoryOrchestrator>,
-    /// Three-stage compression pipeline.
-    pipeline: CompressionPipeline,
     /// In-process vector index for semantic search.
     vector_index: Mutex<VectorIndex>,
     /// Hybrid (BM25+vector) searcher for re-ranking.
@@ -249,9 +246,6 @@ impl CognitiveContextManager {
         let orchestrator = Arc::new(
             MemoryOrchestrator::init_with_workspace(config.clone(), workspace_root.clone()).await?,
         );
-
-        // Build the compression pipeline from config.
-        let pipeline = CompressionPipeline::from_config(&config.compression);
 
         // Build the vector index with persistence support.
         // Use VectorIndex::load to restore previously persisted vectors.
@@ -532,7 +526,6 @@ impl CognitiveContextManager {
             memory_sync: None,
             config,
             orchestrator,
-            pipeline,
             vector_index,
             hybrid_searcher: HybridSearcher::new(0.6, 0.4),
             monitor,
@@ -1466,10 +1459,10 @@ impl CognitiveContextManager {
                 .await;
         }
 
-        // ── Step 6: compress messages if necessary ──────────────────────────
-        // Note: pipeline.run takes a mutable Vec; here we work non-destructively
-        // by returning the final PreparedContext based on current state.
-        // Full pipeline run is triggered in on_turn_end.
+        // ── Step 6: Runtime owns transcript compaction ───────────────────────
+        // Context preparation never mutates a transcript. Semantic session
+        // checkpoints are created only by Runtime after a real provider
+        // preflight proves that required input cannot fit.
 
         // ── Step 6b: inject current swarm hot topics from L4 ────────────────
         let hot_topics = self.orchestrator.hot_topics(300).await;
@@ -1676,28 +1669,9 @@ impl CognitiveContextManager {
     // on_turn_end
     // -----------------------------------------------------------------------
 
-    /// Called after each assistant turn to perform lightweight housekeeping.
-    ///
-    /// 1. Runs micro-compact on `messages` (in place).
-    /// 2. Checks whether session-compact threshold is exceeded.
-    /// 3. Runs drift detection on recently loaded entries.
-    /// 4. Checks seed trigger conditions for turn-end keywords.
-    /// 5. Persists vector index for durability.
-    ///
-    /// # Parallel-friendly decomposition
-    ///
-    /// This method is a sequential wrapper around three sub-operations which
-    /// callers can also execute in parallel:
-    ///
-    /// | Step | Method                | Description                |
-    /// |------|-----------------------|----------------------------|
-    /// | 0    | `extract_and_remember`| Extract + persist memories |
-    /// | 3-4  | `run_drift_and_seeds` | Drift detection + seeds    |
-    /// | rest | (inline in on_turn_end)| Compaction, tick, KG, …  |
-    ///
-    /// [`run_memory_post_turn`] uses `tokio::join!` to run steps 0 and 3-4
-    /// concurrently while keeping the remaining maintenance sequential.
-
+    // `run_memory_post_turn` coordinates the post-turn helpers below. Runtime
+    // owns transcript compaction, so this manager only extracts memories and
+    // performs drift, seed, index, and graph maintenance.
     /// Extract memories from the current turn's messages and persist them.
     ///
     /// This covers steps 0, 0b, and 11 from the full turn-end sequence:
@@ -2013,7 +1987,7 @@ impl CognitiveContextManager {
         result
     }
 
-    /// Remaining post-turn maintenance: fact-checker, compaction, tick,
+    /// Remaining post-turn maintenance: fact-checker, tick,
     /// KG persistence, context rotation, closet/seeds save, etc.
     ///
     /// Call this *after* `extract_and_remember` and `run_drift_and_seeds`
@@ -2034,26 +2008,11 @@ impl CognitiveContextManager {
             }
         }
 
-        // ── 1. Micro compact ────────────────────────────────────────────────
-        let pre_compact_tokens: u64 = messages.iter().map(|m| u64::from(m.token_estimate())).sum();
-        self.pipeline.micro_compact(messages);
-
-        // ── 1b. AAAK compact ────────────────────────────────────────────────
-        self.pipeline.aaak_compact(messages);
-
-        // ── 2. Session compact if threshold exceeded ─────────────────────────
-        if self.pipeline.should_session_compact(messages) {
-            self.pipeline
-                .session_compact(messages, &self.orchestrator)
-                .await?;
-        }
-
-        // Record compression ratio (post / pre)
-        let post_compact_tokens: u64 = messages.iter().map(|m| u64::from(m.token_estimate())).sum();
-        if pre_compact_tokens > 0 {
-            let ratio = post_compact_tokens as f64 / pre_compact_tokens as f64;
-            self.perf_monitor.record_compression_ratio(ratio);
-        }
+        // Runtime retains ownership of the conversation transcript and its
+        // sole semantic checkpoint. This memory-maintenance pass must not
+        // apply a second threshold-driven summarizer to a copied transcript:
+        // doing so would create recall noise without changing provider input.
+        let _ = messages;
 
         // ── 5. Run orchestrator maintenance tick ─────────────────────────────
         self.orchestrator.tick().await?;

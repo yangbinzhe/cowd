@@ -145,13 +145,7 @@ mod tests {
     }
 
     fn client(registry: Arc<ProviderRegistry>) -> ProviderRuntimeClient {
-        ProviderRuntimeClient::new_with_fallback_config(
-            registry,
-            "dummy".to_string(),
-            Vec::new(),
-            &[],
-        )
-        .unwrap()
+        ProviderRuntimeClient::new(registry, "dummy".to_string(), Vec::new()).unwrap()
     }
 
     #[test]
@@ -210,9 +204,12 @@ mod tests {
             .push("dummy-v2".to_string());
         registry.replace(updated).expect("valid provider reload");
         let request = ApiRequest {
-            system_prompt: Vec::new(),
+            prompt: crate::PromptAssembly::default(),
             messages: Vec::new(),
             model: String::new(),
+            budget: crate::context_ledger::RequestBudgetReport::for_attempt(
+                "dummy", 128_000, 4_096, 128, 256, 0,
+            ),
         };
         let stream = pool.stream(request);
         drop(stream);

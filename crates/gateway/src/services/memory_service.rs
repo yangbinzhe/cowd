@@ -593,10 +593,6 @@ fn memory_capabilities_json(
                 RealityCapabilityStatus::Disabled,
                 "memory manager is not configured"
             ),
-            "aaak_index": capability_probe_json(
-                RealityCapabilityStatus::Disabled,
-                "memory manager is not configured"
-            ),
             "knowledge_fabric": capability_probe_json(
                 RealityCapabilityStatus::Disabled,
                 "memory manager is not configured"
@@ -619,16 +615,12 @@ fn memory_capabilities_json(
         )
     } else {
         format!(
-            "semantic embedding backend is not configured; search_mode={search_mode}; recall is using keyword/AAAK sources while vector_count={vector_count}"
+            "semantic embedding backend is not configured; search_mode={search_mode}; recall is using keyword sources while vector_count={vector_count}"
         )
     };
 
     serde_json::json!({
         "vector_semantic": capability_probe_json(vector_status, vector_reason),
-        "aaak_index": capability_probe_json(
-            RealityCapabilityStatus::EnabledAndWired,
-            "AAAK compact navigation is exposed as a recall source and omission pointer for deep context recovery"
-        ),
         "knowledge_fabric": capability_probe_json(
             RealityCapabilityStatus::EnabledAndWired,
             "KnowledgeFabric uses durable storage/knowledge.sqlite and feeds activation evidence through runtime context assembly"

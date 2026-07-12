@@ -122,8 +122,8 @@ use runtime::ContextProfile;
 use runtime::PromptCacheEvent;
 use runtime::{
     check_base_commit, format_stale_base_warning, load_system_prompt, resolve_expected_base,
-    resolve_sandbox_status, CompactionConfig, ConfigLoader, ContentBlock, ConversationMessage,
-    MessageRole, PermissionMode, PermissionPolicy, ResolvedPermissionMode, ResumeContextPacket,
+    resolve_sandbox_status, ConfigLoader, ContentBlock, ConversationMessage, MessageRole,
+    PermissionMode, PermissionPolicy, ResolvedPermissionMode, ResumeContextPacket,
     ResumeContextSource, Session, UsageTracker,
 };
 #[cfg(test)]
@@ -2145,28 +2145,6 @@ fn render_resume_usage() -> String {
     )
 }
 
-fn format_compact_report(removed: usize, resulting_messages: usize, skipped: bool) -> String {
-    if skipped {
-        format!(
-            "Compact
-  Result           skipped
-  Reason           session below compaction threshold
-  Messages kept    {resulting_messages}"
-        )
-    } else {
-        format!(
-            "Compact
-  Result           compacted
-  Messages removed {removed}
-  Messages kept    {resulting_messages}"
-        )
-    }
-}
-
-fn format_auto_compaction_notice(removed: usize) -> String {
-    format!("[auto-compacted: removed {removed} messages]")
-}
-
 #[allow(clippy::too_many_lines)]
 fn run_resume_command(
     session_path: &Path,
@@ -2180,29 +2158,14 @@ fn run_resume_command(
             message: Some(render_terminal_help()),
             json: Some(serde_json::json!({ "kind": "help", "text": render_terminal_help() })),
         }),
-        SlashCommand::Compact => {
-            let result = runtime::compact_session(
-                session,
-                CompactionConfig {
-                    max_estimated_tokens: 0,
-                    ..CompactionConfig::default()
-                },
-            );
-            let removed = result.removed_message_count;
-            let kept = result.compacted_session.messages.len();
-            let skipped = removed == 0;
-            Ok(ResumeCommandOutcome {
-                session: result.compacted_session,
-                session_path: None,
-                message: Some(format_compact_report(removed, kept, skipped)),
-                json: Some(serde_json::json!({
-                    "kind": "compact",
-                    "skipped": skipped,
-                    "removed_messages": removed,
-                    "kept_messages": kept,
-                })),
-            })
-        }
+        // Offline JSONL resume has no Runtime, Memory checkpoint builder, or
+        // transactional session store. Keeping the former local text-summary
+        // path would create a second, lossy compaction representation. The
+        // command remains available to Gateway-backed surfaces only.
+        SlashCommand::Compact => Err(
+            "local /compact is unavailable; open the session through the Gateway so semantic checkpoint compaction can run"
+                .into(),
+        ),
         SlashCommand::Clear { confirm } => {
             if !confirm {
                 return Ok(ResumeCommandOutcome {
@@ -4779,8 +4742,8 @@ mod tests {
         build_system_prompt_for_mode, cli_turn_context_profile, collect_session_prompt_history,
         create_managed_session_handle, discover_local_session_import_candidates, ensure_yolo_task,
         filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
-        format_commit_skipped_report, format_compact_report, format_connected_line,
-        format_cost_report, format_history_timestamp, format_issue_report, format_model_report,
+        format_commit_skipped_report, format_connected_line, format_cost_report,
+        format_history_timestamp, format_issue_report, format_model_report,
         format_model_switch_report, format_permissions_report, format_permissions_switch_report,
         format_pr_report, format_resume_report, format_startup_banner,
         format_startup_banner_with_task, format_status_report, format_tool_call_start,
@@ -6678,10 +6641,12 @@ mod tests {
             "expected at least 39 resume-supported commands, got {}",
             names.len()
         );
-        // Verify key resume commands still exist
+        // Verify key offline-resume commands still exist. `/compact` is
+        // intentionally absent: semantic compaction requires a live Gateway
+        // Runtime and durable session store.
         assert!(names.contains(&"help"));
         assert!(names.contains(&"status"));
-        assert!(names.contains(&"compact"));
+        assert!(!names.contains(&"compact"));
     }
 
     #[test]
@@ -6971,16 +6936,6 @@ mod tests {
         assert!(item.content.contains("prefer_parallel_tools"));
         assert!(item.content.contains("read_many"));
         assert!(item.content.contains("tool_batch_readonly"));
-    }
-
-    #[test]
-    fn compact_report_uses_structured_output() {
-        let compacted = format_compact_report(8, 5, false);
-        assert!(compacted.contains("Compact"));
-        assert!(compacted.contains("Result           compacted"));
-        assert!(compacted.contains("Messages removed 8"));
-        let skipped = format_compact_report(0, 3, true);
-        assert!(skipped.contains("Result           skipped"));
     }
 
     #[test]

@@ -14,7 +14,6 @@ impl SlashCommand {
         match self {
             Self::Help => "/help",
             Self::Clear { .. } => "/clear",
-            Self::Compact { .. } => "/compact",
             Self::Cost => "/cost",
             Self::Doctor => "/doctor",
             Self::Config { .. } => "/config",
@@ -79,6 +78,7 @@ impl SlashCommand {
             Self::OutputStyle { .. } => "/output-style",
             Self::AddDir { .. } => "/add-dir",
             Self::Sandbox => "/sandbox",
+            Self::Compact => "/compact",
             Self::Mcp { .. } => "/mcp",
             Self::Export { .. } => "/export",
             Self::Handoff { .. } => "/handoff",

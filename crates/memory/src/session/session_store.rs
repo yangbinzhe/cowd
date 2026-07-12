@@ -321,6 +321,39 @@ impl UnifiedSessionStore {
         self.append_event_allocating_sequence(&event).await
     }
 
+    /// Persist related session-domain records as one ordered transaction. This
+    /// is used for compaction so its continuation checkpoint and the context
+    /// boundary cannot become independently visible.
+    pub async fn append_session_domain_events_allocating_sequence(
+        &self,
+        events: &[SessionDomainEvent],
+    ) -> Result<Vec<SessionEvent>> {
+        let mut wire_events = Vec::with_capacity(events.len());
+        for event in events {
+            wire_events.push(event.to_session_event()?);
+        }
+        self.append_events_allocating_sequence(&wire_events).await
+    }
+
+    /// Atomically commit a semantic checkpoint bundle exactly once per
+    /// `session_id + checkpoint_id`. `Ok(false)` means an earlier attempt
+    /// already committed the same durable checkpoint.
+    pub async fn append_session_domain_events_if_checkpoint_absent(
+        &self,
+        events: &[SessionDomainEvent],
+        checkpoint_id: &str,
+    ) -> Result<bool> {
+        let mut wire_events = Vec::with_capacity(events.len());
+        for event in events {
+            wire_events.push(event.to_session_event()?);
+        }
+        self.inner
+            .lock()
+            .await
+            .append_events_allocating_sequence_if_checkpoint_absent(&wire_events, checkpoint_id)
+            .map(|result| result.is_some())
+    }
+
     /// Retrieve events for a session starting from `from_seq` (inclusive).
     pub async fn get_events(&self, session_id: &str, from_seq: usize) -> Result<Vec<SessionEvent>> {
         self.inner.lock().await.get_events(session_id, from_seq)
@@ -920,6 +953,99 @@ mod tests {
             .unwrap();
         assert_eq!(page.events[0].sequence, 0);
         assert_eq!(page.next_seq, Some(1));
+    }
+
+    #[tokio::test]
+    async fn domain_event_batch_is_contiguous_and_visible_as_one_compaction_pair() {
+        let store = UnifiedSessionStore::open_in_memory().unwrap();
+        store
+            .create_session(&make_record("s-runtime-compaction-batch"))
+            .await
+            .unwrap();
+        let events = [
+            SessionDomainEvent::new(
+                "s-runtime-compaction-batch",
+                0,
+                SessionDomainScope::Context,
+                "context.session_compacted",
+                serde_json::json!({"checkpoint_id":"checkpoint-1"}),
+                1,
+            ),
+            SessionDomainEvent::new(
+                "s-runtime-compaction-batch",
+                0,
+                SessionDomainScope::Memory,
+                "memory.semantic_checkpoint.created",
+                serde_json::json!({"checkpoint_id":"checkpoint-1"}),
+                1,
+            ),
+        ];
+        let stored = store
+            .append_session_domain_events_allocating_sequence(&events)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+
+        let page = store
+            .session_domain_events_page("s-runtime-compaction-batch", 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(page.events.len(), 2);
+        assert_eq!(page.events[0].kind, "context.session_compacted");
+        assert_eq!(page.events[1].kind, "memory.semantic_checkpoint.created");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_batch_retry_reuses_the_committed_bundle() {
+        let store = UnifiedSessionStore::open_in_memory().unwrap();
+        store
+            .create_session(&make_record("s-runtime-compaction-dedup"))
+            .await
+            .unwrap();
+        let checkpoint_id = "checkpoint-stable-1";
+        let events = || {
+            vec![
+                SessionDomainEvent::new(
+                    "s-runtime-compaction-dedup",
+                    0,
+                    SessionDomainScope::Context,
+                    "context.session_compacted",
+                    serde_json::json!({"checkpoint_id":checkpoint_id}),
+                    1,
+                ),
+                SessionDomainEvent::new(
+                    "s-runtime-compaction-dedup",
+                    0,
+                    SessionDomainScope::Memory,
+                    "memory.semantic_checkpoint.created",
+                    serde_json::json!({"checkpoint":{"checkpoint_id":checkpoint_id}}),
+                    1,
+                ),
+            ]
+        };
+        assert!(store
+            .append_session_domain_events_if_checkpoint_absent(&events(), checkpoint_id)
+            .await
+            .unwrap());
+        assert!(!store
+            .append_session_domain_events_if_checkpoint_absent(&events(), checkpoint_id)
+            .await
+            .unwrap());
+        assert_eq!(
+            store
+                .session_domain_events_page("s-runtime-compaction-dedup", 0, 10)
+                .await
+                .unwrap()
+                .events
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]

@@ -287,13 +287,13 @@ fn provider_from_cowd_config(model: &str) -> Option<ProviderConfig> {
     let value = serde_yaml::from_str::<serde_yaml::Value>(&contents).ok()?;
     let root = value.as_mapping()?;
     let providers = root
-        .get(&serde_yaml::Value::String("providers".to_string()))?
+        .get(serde_yaml::Value::String("providers".to_string()))?
         .as_mapping()?;
     for (name, provider) in providers {
         let name = name.as_str()?.to_string();
         let provider = provider.as_mapping()?;
         let models = provider
-            .get(&serde_yaml::Value::String("models".to_string()))
+            .get(serde_yaml::Value::String("models".to_string()))
             .and_then(serde_yaml::Value::as_sequence)?
             .iter()
             .filter_map(serde_yaml::Value::as_str)
@@ -303,15 +303,15 @@ fn provider_from_cowd_config(model: &str) -> Option<ProviderConfig> {
             continue;
         }
         let base_url = provider
-            .get(&serde_yaml::Value::String("base_url".to_string()))
+            .get(serde_yaml::Value::String("base_url".to_string()))
             .and_then(serde_yaml::Value::as_str)?
             .to_string();
         let api_key = provider
-            .get(&serde_yaml::Value::String("api_key".to_string()))
+            .get(serde_yaml::Value::String("api_key".to_string()))
             .and_then(serde_yaml::Value::as_str)?
             .to_string();
         let protocol = provider
-            .get(&serde_yaml::Value::String("protocol".to_string()))
+            .get(serde_yaml::Value::String("protocol".to_string()))
             .and_then(serde_yaml::Value::as_str)
             .map(ToString::to_string);
         return Some(ProviderConfig {

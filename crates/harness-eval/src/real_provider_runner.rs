@@ -66,16 +66,19 @@ pub(crate) fn run_deep_real_provider_review(
         "user_prompt_summary": summarize_text(&prompt, 1200)
     });
     let request = runtime::ApiRequest {
-        system_prompt: vec![
+        prompt: runtime::PromptAssembly::new(vec![
             "You are the AI reviewer for Cowd AI Harness deep-real evaluation.".to_string(),
             "Generate concise but evidence-based Markdown. Do not claim capabilities not supported by the report seed.".to_string(),
-        ],
+        ]),
         messages: vec![runtime::ConversationMessage {
             role: runtime::MessageRole::User,
             blocks: vec![runtime::ContentBlock::Text { text: prompt }],
             usage: None,
         }],
         model: model.clone(),
+        budget: runtime::context_ledger::RequestBudgetReport::for_attempt(
+            &model, 1_000_000, 32_000, 128, 256, 0,
+        ),
     };
 
     let provider_registry = std::env::current_dir()

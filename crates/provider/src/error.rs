@@ -196,6 +196,36 @@ impl ApiError {
         }
     }
 
+    /// Return a provider-declared context window only when the error exposes a
+    /// concrete numeric limit. Runtime uses this to tighten an over-large
+    /// configured/assumed window; generic context errors never calibrate it.
+    #[must_use]
+    pub fn context_window_limit_hint(&self) -> Option<u32> {
+        match self {
+            Self::ContextWindowExceeded {
+                context_window_tokens,
+                ..
+            } => Some(*context_window_tokens),
+            Self::Api { message, body, .. } => message
+                .as_deref()
+                .and_then(parse_context_window_limit)
+                .or_else(|| parse_context_window_limit(body)),
+            Self::RetriesExhausted { last_error, .. } => last_error.context_window_limit_hint(),
+            Self::MissingCredentials { .. }
+            | Self::ExpiredOAuthToken
+            | Self::Auth(_)
+            | Self::InvalidApiKeyEnv(_)
+            | Self::Http(_)
+            | Self::Io(_)
+            | Self::Json { .. }
+            | Self::RequestBodyTooLarge { .. }
+            | Self::InvalidSseFrame(_)
+            | Self::BackoffOverflow { .. }
+            | Self::NoProviderConfigured { .. }
+            | Self::InvalidProviderConfig { .. } => None,
+        }
+    }
+
     #[must_use]
     pub fn request_id(&self) -> Option<&str> {
         match self {
@@ -431,6 +461,51 @@ fn looks_like_context_window_error(text: &str) -> bool {
         .any(|marker| lowered.contains(marker))
 }
 
+fn parse_context_window_limit(text: &str) -> Option<u32> {
+    let lowered = text.to_ascii_lowercase();
+    let marker_index = [
+        "maximum context length",
+        "maximum context window",
+        "context window",
+        "context length",
+    ]
+    .iter()
+    .filter_map(|marker| lowered.find(marker).map(|index| (index, marker.len())))
+    .map(|(index, marker_len)| index.saturating_add(marker_len))
+    .min()?;
+    let suffix = &lowered[marker_index..];
+    let mut digits = String::new();
+    let mut started = false;
+    let mut kilo = false;
+    for character in suffix.chars().take(96) {
+        if character.is_ascii_digit() {
+            started = true;
+            digits.push(character);
+            continue;
+        }
+        if !started {
+            continue;
+        }
+        if started && matches!(character, ',' | '_' | ' ') {
+            continue;
+        }
+        if started && character == 'k' {
+            kilo = true;
+            break;
+        }
+        if started {
+            break;
+        }
+    }
+    let parsed = digits.parse::<u64>().ok()?;
+    let tokens = if kilo {
+        parsed.saturating_mul(1_000)
+    } else {
+        parsed
+    };
+    (tokens >= 1_024 && tokens <= u64::from(u32::MAX)).then_some(tokens as u32)
+}
+
 /// Truncate `body` so the resulting snippet contains at most `max_chars`
 /// characters (counted by Unicode scalar values, not bytes), preserving the
 /// leading slice of the body that the caller most often needs to inspect.
@@ -454,6 +529,31 @@ fn truncate_body_snippet(body: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{truncate_body_snippet, ApiError};
+
+    #[test]
+    fn context_window_hint_requires_a_numeric_provider_limit() {
+        let numeric = ApiError::Api {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            error_type: None,
+            message: Some("maximum context length is 16,385 tokens".to_string()),
+            request_id: None,
+            body: String::new(),
+            retryable: false,
+            suggested_action: None,
+        };
+        assert_eq!(numeric.context_window_limit_hint(), Some(16_385));
+
+        let generic = ApiError::Api {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            error_type: None,
+            message: Some("context window exceeded; reduce the prompt".to_string()),
+            request_id: None,
+            body: String::new(),
+            retryable: false,
+            suggested_action: None,
+        };
+        assert_eq!(generic.context_window_limit_hint(), None);
+    }
 
     #[test]
     fn json_deserialize_error_includes_provider_model_and_truncated_body_snippet() {

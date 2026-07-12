@@ -266,7 +266,7 @@ body{font-family:var(--font-sans);color:var(--text-body);background:var(--bg-dee
 <div class="cap-components"><span class="comp-tag">ContextRuntimeKernel</span><span class="comp-tag">BudgetPolicy</span><span class="comp-tag">EvidencePlanner</span><span class="comp-tag">KnowledgeActivation</span><span class="comp-tag">ContextFanout</span><span class="comp-tag">compact</span></div>
 <ul class="cap-features">
 <li>动态预算：按模型上下文窗口自适应，Yolo/Collaboration/Review 模式</li>
-<li>自动压缩：70% 窗口使用率触发，保留最近 6 条原文</li>
+<li>语义压缩：仅在必需上下文无法装入任一候选模型时触发，保留最近原文与检查点</li>
 <li>记忆召回：按 RuntimeBudgetPlan 动态派生检索预算</li>
 <li>知识激活：运行时激活相关上下文记录</li>
 <li>证据规划：规划证据收集策略</li>
@@ -280,8 +280,8 @@ body{font-family:var(--font-sans);color:var(--text-body);background:var(--bg-dee
 <line x1="220" y1="58" x2="55" y2="64" stroke="#5c5c7a" marker-end="url(#ac)"/>
 <line x1="220" y1="58" x2="220" y2="78" stroke="#5c5c7a" marker-end="url(#ac)"/>
 <line x1="220" y1="58" x2="385" y2="64" stroke="#5c5c7a" marker-end="url(#ac)"/>
-<rect x="10" y="66" width="90" height="60" rx="5" fill="#14141f" stroke="#f0a040"/><text x="55" y="86" text-anchor="middle" fill="#f0a040" font-size="9" font-family="monospace" font-weight="600">预算策略</text><text x="55" y="100" text-anchor="middle" fill="#5c5c7a" font-size="8" font-family="monospace">动态分配</text><text x="55" y="114" text-anchor="middle" fill="#5c5c7a" font-size="8" font-family="monospace">70%触发压缩</text>
-<rect x="175" y="78" width="90" height="60" rx="5" fill="#14141f" stroke="#40f060"/><text x="220" y="98" text-anchor="middle" fill="#40f060" font-size="9" font-family="monospace" font-weight="600">记忆召回</text><text x="220" y="112" text-anchor="middle" fill="#5c5c7a" font-size="8" font-family="monospace">语义检索</text><text x="220" y="126" text-anchor="middle" fill="#5c5c7a" font-size="8" font-family="monospace">AAAK压缩</text>
+<rect x="10" y="66" width="90" height="60" rx="5" fill="#14141f" stroke="#f0a040"/><text x="55" y="86" text-anchor="middle" fill="#f0a040" font-size="9" font-family="monospace" font-weight="600">预算策略</text><text x="55" y="100" text-anchor="middle" fill="#5c5c7a" font-size="8" font-family="monospace">动态分配</text><text x="55" y="114" text-anchor="middle" fill="#5c5c7a" font-size="8" font-family="monospace">硬容量预检</text>
+<rect x="175" y="78" width="90" height="60" rx="5" fill="#14141f" stroke="#40f060"/><text x="220" y="98" text-anchor="middle" fill="#40f060" font-size="9" font-family="monospace" font-weight="600">记忆召回</text><text x="220" y="112" text-anchor="middle" fill="#5c5c7a" font-size="8" font-family="monospace">语义检索</text><text x="220" y="126" text-anchor="middle" fill="#5c5c7a" font-size="8" font-family="monospace">有界压缩</text>
 <rect x="340" y="66" width="90" height="60" rx="5" fill="#14141f" stroke="#40c8e0"/><text x="385" y="86" text-anchor="middle" fill="#40c8e0" font-size="9" font-family="monospace" font-weight="600">知识激活</text><text x="385" y="100" text-anchor="middle" fill="#5c5c7a" font-size="8" font-family="monospace">运行时激活</text><text x="385" y="114" text-anchor="middle" fill="#5c5c7a" font-size="8" font-family="monospace">合规检查</text>
 <line x1="220" y1="138" x2="220" y2="155" marker-end="url(#ac)"/>
 <rect x="175" y="155" width="90" height="50" rx="5" fill="#14141f" stroke="#f07040"/><text x="220" y="174" text-anchor="middle" fill="#f07040" font-size="8" font-family="monospace" font-weight="600">证据规划</text><text x="220" y="188" text-anchor="middle" fill="#5c5c7a" font-size="7" font-family="monospace">收集策略</text>
@@ -297,11 +297,11 @@ body{font-family:var(--font-sans);color:var(--text-body);background:var(--bg-dee
 <div class="fade-up">
 <span class="cap-badge badge-ready">✅ 生产就绪</span>
 <h3 class="cap-title">五层记忆系统</h3>
-<p class="cap-desc">L0-L4 分层记忆架构，AAAK 符号化索引压缩节省 70-85% tokens，向量语义检索 + FTS5 关键词双引擎。</p>
-<div class="cap-components"><span class="comp-tag">memory</span><span class="comp-tag">fact-kernel</span><span class="comp-tag">MemoryOrchestrator</span><span class="comp-tag">AAAK Compressor</span><span class="comp-tag">CognitiveContextManager</span></div>
+<p class="cap-desc">L0-L4 分层记忆架构，使用有界压缩、向量语义检索与 FTS5 关键词检索；压缩效果按实际内容和预算计量，不声明未验证的固定节省比例。</p>
+<div class="cap-components"><span class="comp-tag">memory</span><span class="comp-tag">fact-kernel</span><span class="comp-tag">MemoryOrchestrator</span><span class="comp-tag">Context Compression</span><span class="comp-tag">CognitiveContextManager</span></div>
 <ul class="cap-features">
 <li>L0 身份层 · L1 核心层(≤4000t) · L2 项目层(≤6000t) · L3 深度召回(搜索限制5) · L4 共享层</li>
-<li>AAAK 符号化索引：节省 70-85% tokens</li>
+<li>有界压缩：保留关键规则、目标、决策和证据引用</li>
 <li>向量语义检索 (OpenAI/Ollama/vLLM) + FTS5 关键词双通道</li>
 <li>一致性过滤 (1000bp) + 矛盾检测 (Jaccard ≥ 0.6)</li>
 <li>自动后台提取 (30s, min_confidence 0.6)</li>
@@ -320,7 +320,7 @@ body{font-family:var(--font-sans);color:var(--text-body);background:var(--bg-dee
 <text x="10" y="220" fill="#8888aa" font-size="10" font-family="sans-serif">记忆管线（Memory Pipeline）</text>
 <rect x="10" y="228" width="130" height="36" rx="5" fill="#14141f" stroke="#f0a040"/><text x="75" y="246" text-anchor="middle" fill="#f0a040" font-size="10" font-family="monospace">后台提取</text><text x="75" y="259" text-anchor="middle" fill="#5c5c7a" font-size="8" font-family="monospace">30s轮询·置信度≥0.6</text>
 <line x1="140" y1="246" x2="155" y2="246" stroke="#5c5c7a" stroke-width="1"/>
-<rect x="155" y="228" width="130" height="36" rx="5" fill="#14141f" stroke="#40f060"/><text x="220" y="246" text-anchor="middle" fill="#40f060" font-size="10" font-family="monospace">AAAK 符号压缩</text><text x="220" y="259" text-anchor="middle" fill="#5c5c7a" font-size="8" font-family="monospace">符号化·节省75%token</text>
+<rect x="155" y="228" width="130" height="36" rx="5" fill="#14141f" stroke="#40f060"/><text x="220" y="246" text-anchor="middle" fill="#40f060" font-size="10" font-family="monospace">有界上下文压缩</text><text x="220" y="259" text-anchor="middle" fill="#5c5c7a" font-size="8" font-family="monospace">规则·目标·证据引用</text>
 <line x1="285" y1="246" x2="300" y2="246" stroke="#5c5c7a" stroke-width="1"/>
 <rect x="300" y="228" width="130" height="36" rx="5" fill="#14141f" stroke="#40c8e0"/><text x="365" y="246" text-anchor="middle" fill="#40c8e0" font-size="10" font-family="monospace">向量+FTS5 检索</text><text x="365" y="259" text-anchor="middle" fill="#5c5c7a" font-size="8" font-family="monospace">语义+关键词双引擎</text>
 <text x="10" y="295" fill="#8888aa" font-size="10" font-family="sans-serif">质量治理</text>

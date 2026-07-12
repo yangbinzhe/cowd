@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
-use runtime::{ToolError, ToolExecutor};
+use runtime::{ConfigLoader, ToolError, ToolExecutor};
 use serde::Deserialize;
 use tools::permissions::PermissionMode as ToolPermissionMode;
 use tools::{ToolHost, ToolHostSnapshot};
@@ -41,6 +41,18 @@ struct RuntimeCapabilitiesRequest {
     detail: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct RuntimeConfigViewRequest {
+    detail: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeResourceCapabilitiesRequest {
+    resource_kind: String,
+    mime: Option<String>,
+    intent: String,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct RuntimeToolExecutionBinding<'a> {
     session_id: Option<&'a str>,
@@ -51,7 +63,9 @@ struct RuntimeToolExecutionBinding<'a> {
 fn is_gateway_runtime_control_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "runtime_capabilities"
+        "runtime_config_view"
+            | "runtime_resource_capabilities"
+            | "runtime_capabilities"
             | "runtime_orchestrate"
             | "MCPTool"
             | "ListMcpResourcesTool"
@@ -211,6 +225,16 @@ impl GatewayToolExecutor {
         value: serde_json::Value,
         binding: RuntimeToolExecutionBinding<'_>,
     ) -> Result<String, ToolError> {
+        if tool_name == "runtime_config_view" {
+            let input: RuntimeConfigViewRequest = serde_json::from_value(value)
+                .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+            return self.execute_runtime_config_view(input);
+        }
+        if tool_name == "runtime_resource_capabilities" {
+            let input: RuntimeResourceCapabilitiesRequest = serde_json::from_value(value)
+                .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+            return self.execute_runtime_resource_capabilities(input);
+        }
         if tool_name == "runtime_capabilities" {
             let input: RuntimeCapabilitiesRequest = serde_json::from_value(value)
                 .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
@@ -351,6 +375,148 @@ impl GatewayToolExecutor {
         }
     }
 
+    fn execute_runtime_config_view(
+        &self,
+        input: RuntimeConfigViewRequest,
+    ) -> Result<String, ToolError> {
+        let workspace_root = std::env::current_dir().map_err(|error| {
+            ToolError::new(format!("resolve workspace for config view: {error}"))
+        })?;
+        let config = ConfigLoader::default_for(&workspace_root)
+            .load()
+            .map_err(|error| {
+                ToolError::new(format!("load active runtime configuration: {error}"))
+            })?;
+        let active_model = self
+            .runtime_model_lease
+            .clone()
+            .or_else(|| config.model().map(str::to_string))
+            .unwrap_or_else(|| "unresolved".to_string());
+        let provider = config.providers().resolve_full(&active_model);
+        let effective_protocol = provider
+            .and_then(|provider| {
+                model_protocol::provider_config::ProviderProtocol::effective_for_provider(provider)
+                    .ok()
+            })
+            .map(|protocol| protocol.as_str().to_string())
+            .unwrap_or_else(|| "locally inferred when request is built".to_string());
+        let context_window = runtime::model_context_window_with_overrides(
+            &active_model,
+            Some(config.model_context_windows()),
+        );
+        let detail = input.detail.as_deref().unwrap_or("summary");
+        let provider_projection = config
+            .providers()
+            .providers
+            .values()
+            .map(|provider| {
+                serde_json::json!({
+                    "name": provider.name,
+                    "models": provider.models,
+                    "protocol": model_protocol::provider_config::ProviderProtocol::effective_for_provider(provider)
+                        .map(|protocol| protocol.as_str())
+                        .unwrap_or("invalid"),
+                })
+            })
+            .collect::<Vec<_>>();
+        let mcp = self.mcp_state.as_ref().map_or_else(
+            || serde_json::json!({"configured": false, "servers": []}),
+            |state| {
+                let state = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                serde_json::json!({
+                    "configured": true,
+                    "servers": state.server_names(),
+                    "pending_servers": state.pending_servers(),
+                })
+            },
+        );
+        let response = match detail {
+            "providers" => serde_json::json!({
+                "kind": "runtime.config_view",
+                "detail": "providers",
+                "active_model": active_model,
+                "effective_protocol": effective_protocol,
+                "context_window": context_window,
+                "providers": provider_projection,
+                "fallback_models": config.fallbacks(),
+            }),
+            "policy" => serde_json::json!({
+                "kind": "runtime.config_view",
+                "detail": "policy",
+                "permission_mode": format!("{:?}", config.permission_mode()),
+                "approval": config.approval(),
+                "runtime_control_enabled": config.runtime_control().policy.enabled,
+                "memory_enabled": config.memory().enabled,
+                "compression": config.compression().session,
+                "mcp": mcp,
+            }),
+            "summary" => serde_json::json!({
+                "kind": "runtime.config_view",
+                "detail": "summary",
+                "active_model": active_model,
+                "effective_protocol": effective_protocol,
+                "context_window": context_window,
+                "permission_mode": format!("{:?}", config.permission_mode()),
+                "fallback_models": config.fallbacks(),
+                "mcp": mcp,
+                "redaction": "credentials, headers, environment values, and config paths are intentionally unavailable",
+            }),
+            other => {
+                return Err(ToolError::new(format!(
+                    "unsupported runtime_config_view detail `{other}`; expected summary, providers, or policy"
+                )));
+            }
+        };
+        serde_json::to_string_pretty(&response).map_err(|error| ToolError::new(error.to_string()))
+    }
+
+    fn execute_runtime_resource_capabilities(
+        &self,
+        input: RuntimeResourceCapabilitiesRequest,
+    ) -> Result<String, ToolError> {
+        let kind = input.resource_kind.trim().to_ascii_lowercase();
+        let desired_tools = match kind.as_str() {
+            "image" => ["vision_analyze", "read_file", "read_many"].as_slice(),
+            "audio" | "video" => ["bash", "execute_code", "read_file"].as_slice(),
+            "pdf" | "document" | "archive" => ["bash", "read_file", "read_many"].as_slice(),
+            "csv" => ["execute_code", "read_file", "read_many"].as_slice(),
+            "text" | "markdown" | "code" => ["read_file", "read_many", "grep_many"].as_slice(),
+            _ => ["read_file", "bash", "execute_code"].as_slice(),
+        };
+        let available = self.available_tool_names();
+        let candidate_tools = desired_tools
+            .iter()
+            .filter(|tool| available.iter().any(|name| name == **tool))
+            .map(|tool| (*tool).to_string())
+            .collect::<Vec<_>>();
+        // This is an explicit model tool call, so a bounded environment scan is
+        // allowed. Registration/rendering never performs this discovery.
+        let snapshot = runtime::ResourceCapabilitySnapshot::discover_environment();
+        let keywords = resource_capability_keywords(&kind, input.mime.as_deref(), &input.intent);
+        let filter_candidates = |values: Vec<String>, limit: usize| {
+            values
+                .into_iter()
+                .filter(|value| capability_name_matches(value, &keywords))
+                .take(limit)
+                .collect::<Vec<_>>()
+        };
+        let response = serde_json::json!({
+            "kind": "runtime.resource_capabilities",
+            "resource_kind": kind,
+            "mime": input.mime,
+            "intent": input.intent,
+            "candidate_tools": candidate_tools,
+            "installed_skills": filter_candidates(snapshot.skills, 4),
+            "installed_plugins": filter_candidates(snapshot.plugins, 4),
+            "local_commands": filter_candidates(snapshot.local_commands, 4),
+            "mcp_resource_actions": snapshot.mcp_resources.into_iter().take(2).collect::<Vec<_>>(),
+            "discovery_boundary": "Candidates only. Invoke an exposed tool or approved installation path and verify output before claiming resource content.",
+        });
+        serde_json::to_string_pretty(&response).map_err(|error| ToolError::new(error.to_string()))
+    }
+
     fn available_tool_names(&self) -> Vec<String> {
         self.tool_host
             .pin_snapshot()
@@ -405,6 +571,51 @@ impl GatewayToolExecutor {
         request.capabilities.sort();
         request.capabilities.dedup();
     }
+}
+
+fn resource_capability_keywords(kind: &str, mime: Option<&str>, intent: &str) -> Vec<String> {
+    let mut keywords = vec![kind.to_string()];
+    // Installed command names describe implementation details rather than the
+    // resource's MIME type. Keep the mapping here, beside the explicit
+    // capability query, so normal attachment ingestion never probes PATH or
+    // leaks an installation inventory into every model request.
+    keywords.extend(
+        match kind {
+            "image" => ["vision", "image", "ocr"].as_slice(),
+            "audio" => ["audio", "ffmpeg", "ffprobe", "transcribe"].as_slice(),
+            "video" => ["video", "ffmpeg", "ffprobe", "transcribe"].as_slice(),
+            "pdf" => ["pdf", "pdftotext", "pdfinfo", "document"].as_slice(),
+            "document" => ["document", "pandoc", "unzip", "office"].as_slice(),
+            "archive" => ["archive", "unzip", "tar"].as_slice(),
+            "csv" => ["csv", "python", "dataframe"].as_slice(),
+            "text" | "markdown" | "code" => ["text", "code", "grep"].as_slice(),
+            _ => [].as_slice(),
+        }
+        .iter()
+        .map(|value| (*value).to_string()),
+    );
+    if let Some(mime) = mime {
+        keywords.extend(
+            mime.split(|character: char| !character.is_ascii_alphanumeric())
+                .filter(|part| part.len() >= 3)
+                .map(str::to_ascii_lowercase),
+        );
+    }
+    keywords.extend(
+        intent
+            .split(|character: char| !character.is_alphanumeric())
+            .filter(|part| part.len() >= 4)
+            .take(4)
+            .map(str::to_ascii_lowercase),
+    );
+    keywords.sort();
+    keywords.dedup();
+    keywords
+}
+
+fn capability_name_matches(value: &str, keywords: &[String]) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    keywords.iter().any(|keyword| normalized.contains(keyword))
 }
 
 impl ToolExecutor for GatewayToolExecutor {
@@ -652,6 +863,66 @@ mod tests {
         assert!(response["strategy"]["model_callable_tools"]
             .as_array()
             .is_some_and(|tools| tools.iter().all(|tool| tool != "runtime_orchestrate")));
+    }
+
+    #[test]
+    fn runtime_config_view_is_read_only_and_never_returns_credentials() {
+        let registry = GatewayToolRegistry::builtin()
+            .with_runtime_tools(vec![RuntimeToolDefinition {
+                name: "runtime_config_view".to_string(),
+                description: Some("safe config view".to_string()),
+                input_schema: json!({"type":"object","additionalProperties":false}),
+                required_permission: ToolPermissionMode::ReadOnly,
+            }])
+            .expect("runtime tool registry");
+        let executor = GatewayToolExecutor::new(None, false, registry, None);
+
+        let output = executor
+            .execute("runtime_config_view", r#"{"detail":"summary"}"#)
+            .expect("safe configuration view");
+        let value: serde_json::Value = serde_json::from_str(&output).expect("config view json");
+        assert_eq!(value["kind"], "runtime.config_view");
+        assert!(value.get("config_path").is_none());
+        assert!(value.get("headers").is_none());
+        assert!(value.get("env").is_none());
+    }
+
+    #[test]
+    fn resource_capability_query_is_explicit_and_bounded() {
+        let registry = GatewayToolRegistry::builtin()
+            .with_runtime_tools(vec![RuntimeToolDefinition {
+                name: "runtime_resource_capabilities".to_string(),
+                description: Some("resource capability query".to_string()),
+                input_schema: json!({"type":"object","additionalProperties":true}),
+                required_permission: ToolPermissionMode::ReadOnly,
+            }])
+            .expect("runtime tool registry");
+        let executor = GatewayToolExecutor::new(None, false, registry, None);
+
+        let output = executor
+            .execute(
+                "runtime_resource_capabilities",
+                r#"{"resource_kind":"pdf","mime":"application/pdf","intent":"extract document text"}"#,
+            )
+            .expect("resource capability query");
+        let value: serde_json::Value = serde_json::from_str(&output).expect("resource json");
+        assert_eq!(value["kind"], "runtime.resource_capabilities");
+        assert!(value["candidate_tools"]
+            .as_array()
+            .is_some_and(|tools| tools.len() <= 3));
+        assert!(value["installed_skills"]
+            .as_array()
+            .is_some_and(|items| items.len() <= 4));
+    }
+
+    #[test]
+    fn resource_capability_keywords_include_kind_specific_parsers() {
+        let pdf = resource_capability_keywords("pdf", Some("application/pdf"), "extract text");
+        assert!(pdf.contains(&"pdftotext".to_string()));
+        assert!(pdf.contains(&"pdfinfo".to_string()));
+
+        let audio = resource_capability_keywords("audio", Some("audio/mpeg"), "inspect");
+        assert!(audio.contains(&"ffprobe".to_string()));
     }
 
     #[test]

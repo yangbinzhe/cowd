@@ -185,14 +185,12 @@ impl SystemService {
         workspace_root: &Path,
         config_home: &Path,
     ) -> Result<serde_json::Value, String> {
-        let mut value = self.runtime_config_json(workspace_root, config_home)?;
-        redact_config_secrets(&mut value);
-        Ok(value)
+        let runtime_config = self.runtime_config(workspace_root, config_home)?;
+        Ok(json_value_to_serde(&runtime_config.redacted_json()))
     }
 
-    pub(crate) fn redact_config_json(&self, mut value: serde_json::Value) -> serde_json::Value {
-        redact_config_secrets(&mut value);
-        value
+    pub(crate) fn redact_config_json(&self, value: serde_json::Value) -> serde_json::Value {
+        runtime::redact_serde_json(value)
     }
 
     fn execute_tool_with_workspace(
@@ -432,33 +430,6 @@ fn next_actions_for_tool(tool_name: &str, data: &serde_json::Value) -> Vec<Strin
         "checkpoint_create" => vec!["Use checkpoint diff before restore".to_string()],
         "checkpoint_restore" => vec!["Refresh workspace and inspect diff".to_string()],
         _ => Vec::new(),
-    }
-}
-
-fn redact_config_secrets(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Object(map) => {
-            for (key, item) in map.iter_mut() {
-                let normalized = key.to_ascii_lowercase();
-                if normalized.contains("api_key")
-                    || normalized == "token"
-                    || normalized.ends_with("_token")
-                    || normalized == "secret"
-                    || normalized.ends_with("_secret")
-                    || normalized == "password"
-                {
-                    *item = serde_json::Value::String("[redacted]".to_string());
-                } else {
-                    redact_config_secrets(item);
-                }
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                redact_config_secrets(item);
-            }
-        }
-        _ => {}
     }
 }
 

@@ -846,10 +846,13 @@ fn surface_runtime_content(
     }
     let mut rendered = content.to_string();
 
+    let mut resource_ids = std::collections::BTreeSet::new();
     let resource_pairs = current_resources
         .iter()
         .chain(recent_resources.iter())
-        .filter_map(|registration| registration.resource.clone())
+        .filter_map(|registration| registration.resource.as_ref())
+        .filter(|(resource, _)| resource_ids.insert(resource.id.clone()))
+        .map(|(resource, hint)| hint.prompt_hint(resource))
         .collect::<Vec<_>>();
     rendered.push_str(&runtime::render_resource_context_markdown(&resource_pairs));
 
@@ -881,8 +884,11 @@ fn register_surface_resources(
     media
         .iter()
         .map(|attachment| {
-            match runtime::register_resource_from_path(
+            let store = runtime::ResourceStore::for_config_home_with_capabilities(
                 &state.config_home,
+                state.services.resource_capability_index(),
+            );
+            match store.register_resource_from_path(
                 &attachment.local_path,
                 format!("surface:{surface}"),
                 Some(attachment.source_message_id.clone()),

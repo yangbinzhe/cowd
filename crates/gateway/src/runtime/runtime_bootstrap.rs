@@ -541,6 +541,41 @@ fn assemble_mcp_tool_state(
 fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
     vec![
         RuntimeToolDefinition {
+            name: "runtime_config_view".to_string(),
+            description: Some(
+                "Return a read-only, redacted view of the active model route, context window, permission mode, provider protocol, and runtime policy. Use only when configuration or provider behavior is relevant; secrets, headers, environment values, and configuration paths are never returned.".to_string(),
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "detail": {
+                        "type": "string",
+                        "enum": ["summary", "providers", "policy"],
+                        "description": "Optional focused projection. Defaults to summary."
+                    }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: ToolPermissionMode::ReadOnly,
+        },
+        RuntimeToolDefinition {
+            name: "runtime_resource_capabilities".to_string(),
+            description: Some(
+                "Query a bounded, current capability projection for an attached resource type. Use this only after an attachment is relevant and a narrower parser, skill, plugin, MCP resource, or local command is needed. Returned names are discovery candidates, not proof that inspection succeeded.".to_string(),
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "resource_kind": { "type": "string", "enum": ["image", "audio", "video", "pdf", "text", "markdown", "csv", "document", "archive", "code", "binary", "unknown"] },
+                    "mime": { "type": "string" },
+                    "intent": { "type": "string" }
+                },
+                "required": ["resource_kind", "intent"],
+                "additionalProperties": false
+            }),
+            required_permission: ToolPermissionMode::ReadOnly,
+        },
+        RuntimeToolDefinition {
             name: "runtime_capabilities".to_string(),
             description: Some(
                 "Return Cowd runtime capability guidance, execution patterns, evidence planning, batch/parallel tool advice, and orchestration suggestions for the current task.".to_string(),

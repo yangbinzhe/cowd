@@ -542,10 +542,6 @@ pub(crate) fn check_enterprise_readiness(
                         json!(memory_store_path.display().to_string()),
                     ),
                     ("vector_enabled".to_string(), json!(memory.vector.enabled)),
-                    (
-                        "aaak_index_enabled".to_string(),
-                        json!(memory.aaak_index_enabled),
-                    ),
                 ]),
             );
 

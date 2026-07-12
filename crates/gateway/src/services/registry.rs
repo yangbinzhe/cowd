@@ -106,6 +106,25 @@ impl GatewayServices {
         }
     }
 
+    /// Gateway only projects the Runtime-owned capability snapshot. Baseline
+    /// services used by static command/tests intentionally expose core-only
+    /// capabilities and never perform environment discovery.
+    pub(crate) fn resource_capability_index(&self) -> runtime::ResourceCapabilityIndex {
+        self.runtime
+            .as_ref()
+            .map_or_else(runtime::ResourceCapabilityIndex::default, |runtime| {
+                runtime.resource_capability_index()
+            })
+    }
+
+    pub(crate) fn refresh_resource_capabilities(&self) -> runtime::ResourceCapabilitySnapshot {
+        self.runtime
+            .as_ref()
+            .map_or_else(runtime::ResourceCapabilitySnapshot::default, |runtime| {
+                runtime.refresh_resource_capabilities()
+            })
+    }
+
     #[cfg(test)]
     pub(crate) fn with_approval_for_tests(approval_gate: Arc<SmartApprovalGate>) -> Self {
         let dir = std::env::temp_dir().join(format!(

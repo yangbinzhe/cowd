@@ -266,8 +266,12 @@ async fn send_message(
         resource_count = body.resource_ids.len(),
         "API message received"
     );
-    let runtime_content =
-        render_message_resource_context(&state.config_home, &body.content, &body.resource_ids);
+    let runtime_content = render_message_resource_context(
+        &state.config_home,
+        &state.services.resource_capability_index(),
+        &body.content,
+        &body.resource_ids,
+    );
 
     let session_id = id.clone();
     let event_bus = state.event_bus();
@@ -506,27 +510,29 @@ async fn reclassify_session_input(
 
 fn render_message_resource_context(
     config_home: &std::path::Path,
+    capabilities: &runtime::ResourceCapabilityIndex,
     content: &str,
     ids: &[String],
 ) -> String {
     if ids.is_empty() {
         return content.to_string();
     }
-    let store = runtime::ResourceStore::default_for_config_home(config_home);
+    let store = runtime::ResourceStore::for_config_home_with_capabilities(
+        config_home,
+        capabilities.clone(),
+    );
     let mut pairs = Vec::new();
     let mut failures = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
     for raw_id in ids {
         let id = raw_id.trim().trim_start_matches("resource://");
-        if id.is_empty() {
+        if id.is_empty() || !seen.insert(id.to_string()) {
             continue;
         }
         match store.get(id) {
             Ok(envelope) => {
-                let hint = runtime::resource_hint(
-                    &envelope,
-                    &runtime::ResourceCapabilitySnapshot::default(),
-                );
-                pairs.push((envelope, hint));
+                let hint = runtime::resource_hint(&envelope, &capabilities.snapshot());
+                pairs.push(hint.prompt_hint(&envelope));
             }
             Err(error) => failures.push((raw_id.clone(), error)),
         }
@@ -814,14 +820,16 @@ mod tests {
 
         let rendered = render_message_resource_context(
             &temp.path().join("home"),
+            &runtime::ResourceCapabilityIndex::default(),
             "请分析附件",
-            std::slice::from_ref(&resource.id),
+            &[resource.id.clone(), resource.id.clone()],
         );
 
         assert!(rendered.contains("请分析附件"));
         assert!(rendered.contains("## Attached Resources"));
         assert!(rendered.contains("kind: audio"));
         assert!(rendered.contains("Do not claim audio content"));
+        assert_eq!(rendered.matches("### resource://").count(), 1);
     }
 
     #[test]

@@ -117,6 +117,8 @@ pub mod plugin_lifecycle;
 mod policy_engine;
 #[path = "conversation/prompt.rs"]
 mod prompt;
+#[path = "conversation/prompt_assembly.rs"]
+mod prompt_assembly;
 #[path = "provider/provider_pool.rs"]
 pub mod provider_pool;
 #[path = "recovery/recovery.rs"]
@@ -338,18 +340,19 @@ pub use collaboration_template::{
     CollaborationTemplateMatcher,
 };
 pub use compact::{
-    compact_session, estimate_session_tokens, format_compact_summary,
-    get_compact_continuation_message, should_compact, CompactionConfig, CompactionResult,
+    estimate_session_tokens, format_compact_summary, get_compact_continuation_message,
+    should_compact, CompactionConfig, CompactionResult,
 };
 pub use config::{
-    ApprovalConfig, CompressionConfig, ConfigDiagnostic as RuntimeConfigDiagnostic,
-    ConfigDiagnosticSeverity, ConfigEntry, ConfigError, ConfigLoadResult, ConfigLoader,
-    ConfigSource, DomainProfile, GateAutoFixConfig, GatewayConfig, McpConfigCollection,
-    McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
-    McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, MemoryConfig,
-    PlatformConfig as GatewayPlatformConfig, ResolvedPermissionMode, RuntimeConfig,
-    RuntimeControlConfig, RuntimeFeatureConfig, RuntimeHookConfig, RuntimePermissionRuleConfig,
-    RuntimePluginConfig, ScopedMcpServerConfig, SessionResetPolicy, COWD_SETTINGS_SCHEMA_NAME,
+    redact_serde_json, ApprovalConfig, CompressionConfig,
+    ConfigDiagnostic as RuntimeConfigDiagnostic, ConfigDiagnosticSeverity, ConfigEntry,
+    ConfigError, ConfigLoadResult, ConfigLoader, ConfigSource, DomainProfile, GateAutoFixConfig,
+    GatewayConfig, McpConfigCollection, McpManagedProxyServerConfig, McpOAuthConfig,
+    McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpTransport,
+    McpWebSocketServerConfig, MemoryConfig, PlatformConfig as GatewayPlatformConfig,
+    ResolvedPermissionMode, RuntimeConfig, RuntimeControlConfig, RuntimeFeatureConfig,
+    RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig,
+    SessionResetPolicy, COWD_SETTINGS_SCHEMA_NAME,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
@@ -365,10 +368,10 @@ pub use context_evidence::{
 pub use context_fanout::{plan_context_fanout, ContextFanoutPlan, FanoutToolCall};
 pub use context_tool_exposure::{ToolExposurePlanner, ToolExposurePolicy, ToolExposureState};
 pub use conversation::{
-    auto_compaction_threshold_from_env, build_cc_memory_config, image_user_message_from_path,
-    ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent, CancellationToken,
-    ConversationRuntime, MemoryCallback, PromptCacheEvent, ProviderContextInventory, RuntimeError,
-    StaticToolExecutor, ToolCallback, ToolError, ToolExecutor, TurnSummary,
+    build_cc_memory_config, image_user_message_from_path, ApiClient, ApiRequest, AssistantEvent,
+    AutoCompactionEvent, CancellationToken, ConversationRuntime, MemoryCallback, PromptCacheEvent,
+    ProviderContextInventory, RuntimeError, StaticToolExecutor, ToolCallback, ToolError,
+    ToolExecutor, TurnSummary,
 };
 pub use cowd_event::{
     CowdEvent, CowdEventBus, RunModelTelemetry, RuntimeExecutionGraphSummary,
@@ -534,6 +537,7 @@ pub use prompt::{
     load_system_prompt, prepend_bullets, ContextFile, ProjectContext, PromptBuildError,
     SystemPromptBuilder, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
+pub use prompt_assembly::{PromptAssembly, PromptContextPacket};
 pub use provider::{detect_provider_kind, model_context_window_with_overrides, ProviderKind};
 pub use provider_registry::{
     ProviderRegistry, ProviderRegistryDiagnostics, ProviderRegistryRejected,
@@ -563,8 +567,8 @@ pub use remote::{
 };
 pub use resources::{
     register_resource_from_path, render_resource_context_markdown, resource_hint,
-    ResourceCapabilitySnapshot, ResourceEnvelope, ResourceEvidence, ResourceHint, ResourceKind,
-    ResourceStore, MAX_RESOURCE_BYTES,
+    ResourceCapabilityIndex, ResourceCapabilitySnapshot, ResourceEnvelope, ResourceEvidence,
+    ResourceHint, ResourceKind, ResourcePromptHint, ResourceStore, MAX_RESOURCE_BYTES,
 };
 pub use runtime_event_replay::{
     candidate_from_action, RuntimeEventReplayer, RuntimeRecoveryAction, RuntimeRecoveryActionKind,
@@ -660,14 +664,11 @@ pub use wave::{
     WaveError, WaveExecutor, WaveOrchestrator, WaveResult, WaveStatus, WaveTask,
 };
 
-#[path = "conversation/cached_prompt.rs"]
-pub mod cached_prompt;
 pub use budget_policy::{
-    clamp_context_budget_ratio_bp, resolve_compact_threshold, resolve_context_budget_tokens,
-    MemoryBudgetLease, RuntimeBudgetInputs, RuntimeBudgetPlan, RuntimeControlBudgetLease,
-    ToolOutputBudgetLease, DEFAULT_CONTEXT_BUDGET_RATIO_BP, DEFAULT_SUBAGENT_BUDGET_TOKENS,
+    clamp_context_budget_ratio_bp, resolve_context_budget_tokens, MemoryBudgetLease,
+    RuntimeBudgetInputs, RuntimeBudgetPlan, RuntimeControlBudgetLease, ToolOutputBudgetLease,
+    DEFAULT_SUBAGENT_BUDGET_TOKENS, DEFAULT_SUBSYSTEM_BUDGET_RATIO_BP,
 };
-pub use cached_prompt::CachedSystemPrompt;
 pub use context_runtime::{
     AgentContextLease, AgentContextView, AgentReturnContextProjection, AgentReturnRequirement,
     AssembledContext, ContextAuthority, ContextBudgetAllocation, ContextBudgetExplanation,

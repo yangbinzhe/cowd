@@ -169,11 +169,11 @@ impl GatewayRuntimeEntry {
         self.runtime_ref().session_async().await
     }
 
-    pub(crate) fn compact_active_session(
+    pub(crate) async fn compact_active_session(
         &mut self,
-        config: runtime::CompactionConfig,
-    ) -> (runtime::CompactionResult, runtime::Session) {
-        self.runtime_mut().compact_active_session(config)
+    ) -> Result<(Option<runtime::AutoCompactionEvent>, runtime::Session), runtime::RuntimeError>
+    {
+        self.runtime_mut().compact_active_session().await
     }
 
     pub(crate) fn active_session_stats_session(&self) -> runtime::Session {

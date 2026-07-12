@@ -16,6 +16,7 @@ use chrono::Utc;
 use fact_kernel::{FactKernelService, FactReviewReceipt, InMemoryFactStore};
 use harness_contract::reality::RecallSourceKind;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::{
     cognitive::CognitiveContextManager,
@@ -549,7 +550,12 @@ impl MemoryKernel {
             .facts
             .iter()
             .enumerate()
-            .map(|(index, fact)| (checkpoint.fact_candidate_id_key(index), fact.clone()))
+            .map(|(index, fact)| {
+                (
+                    checkpoint.fact_candidate_id_key(index),
+                    (index, fact.clone()),
+                )
+            })
             .collect::<HashMap<_, _>>();
         let mut fact_service = FactKernelService::with_store(InMemoryFactStore::new());
         for entry in self.manager.list_all_entries().await? {
@@ -559,10 +565,14 @@ impl MemoryKernel {
 
         let mut ids = Vec::with_capacity(fact_review.promoted.len());
         for decision in &fact_review.promoted {
-            let Some(fact) = candidate_to_fact.get(decision.candidate.candidate_id.as_str()) else {
+            let Some((fact_index, fact)) =
+                candidate_to_fact.get(decision.candidate.candidate_id.as_str())
+            else {
                 continue;
             };
-            let id = self.remember_checkpoint_fact(ctx, fact.clone()).await?;
+            let id = self
+                .remember_checkpoint_fact(ctx, &checkpoint.checkpoint_id, *fact_index, fact.clone())
+                .await?;
             ids.push(id);
         }
 
@@ -575,6 +585,8 @@ impl MemoryKernel {
     async fn remember_checkpoint_fact(
         &self,
         ctx: &MemoryTurnContext,
+        checkpoint_id: &str,
+        fact_index: usize,
         fact: SessionCheckpointFact,
     ) -> MemoryKernelResult<MemoryId> {
         let now = Utc::now();
@@ -606,7 +618,11 @@ impl MemoryKernel {
             tags.push(format!("task:{task_id}"));
         }
         let entry = MemoryEntry {
-            id: uuid::Uuid::new_v4(),
+            // A checkpoint event is durable before this projection. Use a
+            // deterministic ID so replay after a crash either creates the
+            // missing memory once or reuses the existing fact without
+            // duplicating the knowledge base.
+            id: checkpoint_memory_id(checkpoint_id, fact_index),
             layer: fact.layer,
             category: fact.category,
             priority: Priority::Normal,
@@ -799,25 +815,6 @@ impl MemoryKernel {
             deduplicate_memory_entries_for_recall(prepared.entries);
         prepared.entries = deduplicated_entries;
         checkpoint_omissions.append(&mut duplicate_omissions);
-        let aaak_index = crate::aaak_index::AaakIndex::from_entries(
-            &prepared.entries,
-            (max_tokens / 8).clamp(128, 2_048),
-        );
-        source_results.push(RecallSourceResult {
-            source: RecallSourceKind::CompactNavigation,
-            status: if aaak_index.slots.is_empty() {
-                "degraded"
-            } else {
-                "enabled_and_wired"
-            }
-            .to_string(),
-            selected_count: aaak_index.slots.len(),
-            omitted_count: 0,
-            degraded_reason: aaak_index
-                .slots
-                .is_empty()
-                .then(|| "AAAK compact index has no slots for this packet".to_string()),
-        });
         let usage_summary = self.usage_summary().await.unwrap_or_default();
         let mut packet = self
             .context_packet_from_entries_with_budget(
@@ -1333,6 +1330,13 @@ impl MemoryKernel {
         }
         Ok(())
     }
+}
+
+fn checkpoint_memory_id(checkpoint_id: &str, fact_index: usize) -> MemoryId {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("cowd:semantic-checkpoint:{checkpoint_id}:fact:{fact_index}").as_bytes(),
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1869,7 +1873,12 @@ mod tests {
     use chrono::{Duration, Utc};
 
     use super::*;
+    use crate::compression::session::{
+        CheckpointFactKind, CheckpointTokenStats, CompactionSourceRange, SessionCheckpointFact,
+        SessionResumeCursor, SessionSemanticCheckpoint,
+    };
     use crate::types::{AgentVisibility, MemoryCategory};
+    use harness_contract::core::EvidenceRef;
 
     fn memory_entry(
         title: &str,
@@ -1956,5 +1965,92 @@ mod tests {
             scoped_entry_scope(&context, &empty_scope_entry),
             MemoryScope::Session("session-a".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_fact_projection_is_idempotent_across_replay() {
+        let temp = tempfile::tempdir().expect("temporary memory root");
+        let manager = Arc::new(
+            CognitiveContextManager::new(crate::config::MemoryConfig {
+                store: crate::config::StoreConfig {
+                    sqlite_path: temp.path().join("memory.sqlite"),
+                    blob_dir: temp.path().join("blobs"),
+                    enable_vector_index: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .expect("memory manager"),
+        );
+        let kernel = MemoryKernel::new(Arc::clone(&manager));
+        let context = MemoryTurnContext::new("session-idempotent", "primary");
+        let checkpoint = SessionSemanticCheckpoint {
+            schema_version: 2,
+            checkpoint_id: "checkpoint-idempotent".to_string(),
+            session_id: "session-idempotent".to_string(),
+            agent_id: "primary".to_string(),
+            project_id: None,
+            task_id: None,
+            team_id: None,
+            summary: "Keep the durable decision.".to_string(),
+            user_rules: Vec::new(),
+            goal: Some("validate replay".to_string()),
+            constraints: Vec::new(),
+            decisions: vec!["use one checkpoint".to_string()],
+            evidence_refs: Vec::new(),
+            unresolved: Vec::new(),
+            file_changes: Vec::new(),
+            resume_cursor: SessionResumeCursor {
+                message_index: 1,
+                event_sequence: Some(1),
+                checkpoint_id: "checkpoint-idempotent".to_string(),
+            },
+            token_stats: CheckpointTokenStats {
+                before: 200,
+                after: 40,
+                message_count: 2,
+            },
+            source_range: CompactionSourceRange {
+                session_id: "session-idempotent".to_string(),
+                message_start: 0,
+                message_end_exclusive: 2,
+                event_start: Some(0),
+                event_end_exclusive: Some(2),
+                raw_refs: vec![EvidenceRef::durable("checkpoint-replay-source")],
+            },
+            facts: vec![SessionCheckpointFact {
+                kind: CheckpointFactKind::Decision,
+                title: "Checkpoint decision".to_string(),
+                content: "Use a deterministic checkpoint fact identifier.".to_string(),
+                category: MemoryCategory::Decision,
+                layer: MemoryLayer::L2,
+                tags: vec!["semantic-checkpoint".to_string()],
+                confidence: 0.9,
+                evidence_refs: vec![EvidenceRef::durable("checkpoint-replay-source")],
+            }],
+        };
+
+        let first = kernel
+            .checkpoint_compaction(&context, checkpoint.clone())
+            .await
+            .expect("first projection");
+        let entries_after_first = manager.list_all_entries().await.expect("entries");
+        assert!(entries_after_first
+            .iter()
+            .any(|entry| entry.id == checkpoint_memory_id(&checkpoint.checkpoint_id, 0)));
+
+        let second = kernel
+            .checkpoint_compaction(&context, checkpoint.clone())
+            .await
+            .expect("replayed projection");
+        let entries_after_replay = manager.list_all_entries().await.expect("entries");
+
+        assert_eq!(entries_after_replay.len(), entries_after_first.len());
+        assert!(first
+            .memory_ids
+            .iter()
+            .all(|id| entries_after_replay.iter().any(|entry| entry.id == *id)));
+        assert!(second.memory_ids.is_empty() || second.memory_ids == first.memory_ids);
     }
 }

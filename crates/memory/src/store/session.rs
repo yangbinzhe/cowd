@@ -3124,10 +3124,21 @@ impl SqliteSessionStore {
 
         let mut appended = Vec::with_capacity(events.len());
         for (offset, event) in events.iter().enumerate() {
+            let offset = i64::try_from(offset).map_err(|_| {
+                MemoryError::Store("session event batch offset exceeds i64 range".to_string())
+            })?;
             let sequence = first_sequence
-                .checked_add(offset as i64)
+                .checked_add(offset)
                 .ok_or_else(|| MemoryError::Store("session event sequence overflow".to_string()))?;
-            let event_json = event_json_with_allocated_sequence(event, sequence as usize)?;
+            let stored_sequence = usize::try_from(sequence).map_err(|_| {
+                MemoryError::Store(
+                    "allocated session event sequence is negative or too large".to_string(),
+                )
+            })?;
+            let event_json = event_json_with_allocated_sequence(event, stored_sequence)?;
+            let created_at_ms = i64::try_from(event.created_at_ms).map_err(|_| {
+                MemoryError::Store("session event timestamp exceeds SQLite i64 range".to_string())
+            })?;
             tx.execute(
                 r"INSERT INTO session_events
                    (session_id, event_type, event_json, sequence, created_at_ms)
@@ -3137,17 +3148,108 @@ impl SqliteSessionStore {
                     event.event_type,
                     event_json,
                     sequence,
-                    event.created_at_ms as i64,
+                    created_at_ms,
                 ],
             )
             .map_err(sql_err)?;
             let mut stored = event.clone();
-            stored.sequence = sequence as usize;
-            stored.event_json = event_json_with_allocated_sequence(event, stored.sequence)?;
+            stored.sequence = stored_sequence;
+            stored.event_json = event_json;
             appended.push(stored);
         }
         tx.commit().map_err(sql_err)?;
         Ok(appended)
+    }
+
+    /// Atomically append a compaction event bundle unless its semantic
+    /// checkpoint has already committed for this session. `None` means a
+    /// previous attempt committed the exact checkpoint and the caller must
+    /// reuse it instead of emitting duplicate facts/events.
+    pub fn append_events_allocating_sequence_if_checkpoint_absent(
+        &self,
+        events: &[SessionEvent],
+        checkpoint_id: &str,
+    ) -> Result<Option<Vec<SessionEvent>>> {
+        if events.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let session_id = events[0].session_id.as_str();
+        if session_id.trim().is_empty() || events.iter().any(|event| event.session_id != session_id)
+        {
+            return Err(MemoryError::Store(
+                "atomic session event batch must contain one non-empty session_id".to_string(),
+            ));
+        }
+        if checkpoint_id.trim().is_empty() {
+            return Err(MemoryError::Store(
+                "checkpoint-aware event batch requires a non-empty checkpoint_id".to_string(),
+            ));
+        }
+
+        let mut conn = self.conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_err)?;
+        let exists: i64 = tx
+            .query_row(
+                r"SELECT COUNT(*) FROM session_events
+                    WHERE session_id = ?1
+                      AND event_type = ?2
+                      AND json_extract(event_json, '$.kind') = 'memory.semantic_checkpoint.created'
+                      AND json_extract(event_json, '$.payload.checkpoint.checkpoint_id') = ?3",
+                params![session_id, SESSION_DOMAIN_EVENT_TYPE, checkpoint_id],
+                |row| row.get(0),
+            )
+            .map_err(sql_err)?;
+        if exists > 0 {
+            tx.commit().map_err(sql_err)?;
+            return Ok(None);
+        }
+
+        let first_sequence: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(sequence) + 1, 0) FROM session_events WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .map_err(sql_err)?;
+        let mut appended = Vec::with_capacity(events.len());
+        for (offset, event) in events.iter().enumerate() {
+            let offset = i64::try_from(offset).map_err(|_| {
+                MemoryError::Store("session event batch offset exceeds i64 range".to_string())
+            })?;
+            let sequence = first_sequence
+                .checked_add(offset)
+                .ok_or_else(|| MemoryError::Store("session event sequence overflow".to_string()))?;
+            let stored_sequence = usize::try_from(sequence).map_err(|_| {
+                MemoryError::Store(
+                    "allocated session event sequence is negative or too large".to_string(),
+                )
+            })?;
+            let event_json = event_json_with_allocated_sequence(event, stored_sequence)?;
+            let created_at_ms = i64::try_from(event.created_at_ms).map_err(|_| {
+                MemoryError::Store("session event timestamp exceeds SQLite i64 range".to_string())
+            })?;
+            tx.execute(
+                r"INSERT INTO session_events
+                   (session_id, event_type, event_json, sequence, created_at_ms)
+                  VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    event.session_id,
+                    event.event_type,
+                    event_json,
+                    sequence,
+                    created_at_ms,
+                ],
+            )
+            .map_err(sql_err)?;
+            let mut stored = event.clone();
+            stored.sequence = stored_sequence;
+            stored.event_json = event_json;
+            appended.push(stored);
+        }
+        tx.commit().map_err(sql_err)?;
+        Ok(Some(appended))
     }
 
     /// Atomically de-duplicate a context envelope and allocate its sequence.
@@ -4173,6 +4275,34 @@ mod tests {
         ];
         assert!(store.append_events_allocating_sequence(&events).is_err());
         assert!(store.get_events("s-batch-rollback", 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn checkpoint_batch_timestamp_overflow_rolls_back_without_partial_event() {
+        let (store, _dir) = make_store();
+        store
+            .create_session(&make_record("s-checkpoint-timestamp-overflow"))
+            .unwrap();
+        let checkpoint_id = "checkpoint-timestamp-overflow";
+        let event = SessionEvent {
+            session_id: "s-checkpoint-timestamp-overflow".to_string(),
+            event_type: SESSION_DOMAIN_EVENT_TYPE.to_string(),
+            event_json: serde_json::json!({
+                "kind": "memory.semantic_checkpoint.created",
+                "payload": {"checkpoint": {"checkpoint_id": checkpoint_id}},
+            })
+            .to_string(),
+            sequence: usize::MAX,
+            created_at_ms: u64::MAX,
+        };
+
+        assert!(store
+            .append_events_allocating_sequence_if_checkpoint_absent(&[event], checkpoint_id)
+            .is_err());
+        assert!(store
+            .get_events("s-checkpoint-timestamp-overflow", 0)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

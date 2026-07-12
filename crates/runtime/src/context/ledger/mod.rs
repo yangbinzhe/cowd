@@ -3,6 +3,94 @@ use std::collections::{BTreeMap, BTreeSet};
 use harness_contract::context::{ContextComponentUsage, ContextLedgerProjection};
 use serde::{Deserialize, Serialize};
 
+/// Per-provider-attempt capacity contract. The hard cap is the only request
+/// packing limit; subsystem budgets never reserve an arbitrary percentage of
+/// a model window for the request itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestBudgetReport {
+    pub model: String,
+    pub context_window_tokens: u64,
+    /// configured | registry | assumed | calibrated
+    pub context_window_source: String,
+    pub requested_output_tokens: u64,
+    pub protocol_overhead_tokens: u64,
+    pub safety_margin_tokens: u64,
+    pub hard_input_cap_tokens: u64,
+    /// Mirrors `hard_input_cap_tokens` for consumers that need a target field.
+    /// It is intentionally not a second, lower request limit.
+    pub target_input_cap_tokens: u64,
+    pub fixed_input_tokens: u64,
+    pub dynamic_input_tokens: u64,
+    pub omitted_packet_ids: Vec<String>,
+    #[serde(default)]
+    pub omitted_packet_reasons: BTreeMap<String, String>,
+    pub executable: bool,
+}
+
+impl RequestBudgetReport {
+    #[must_use]
+    pub fn for_attempt(
+        model: impl Into<String>,
+        context_window_tokens: u64,
+        requested_output_tokens: u64,
+        protocol_overhead_tokens: u64,
+        safety_margin_tokens: u64,
+        fixed_input_tokens: u64,
+    ) -> Self {
+        let hard_input_cap_tokens = context_window_tokens
+            .saturating_sub(requested_output_tokens)
+            .saturating_sub(protocol_overhead_tokens)
+            .saturating_sub(safety_margin_tokens);
+        Self {
+            model: model.into(),
+            context_window_tokens,
+            context_window_source: "unknown".to_string(),
+            requested_output_tokens,
+            protocol_overhead_tokens,
+            safety_margin_tokens,
+            hard_input_cap_tokens,
+            target_input_cap_tokens: hard_input_cap_tokens,
+            fixed_input_tokens,
+            dynamic_input_tokens: 0,
+            omitted_packet_ids: Vec::new(),
+            omitted_packet_reasons: BTreeMap::new(),
+            executable: fixed_input_tokens <= hard_input_cap_tokens,
+        }
+    }
+
+    pub fn set_context_window_source(&mut self, source: impl Into<String>) {
+        self.context_window_source = source.into();
+    }
+
+    #[must_use]
+    pub fn dynamic_hard_remaining(&self) -> u64 {
+        self.hard_input_cap_tokens
+            .saturating_sub(self.fixed_input_tokens)
+    }
+
+    pub fn record_dynamic_packets(
+        &mut self,
+        tokens: u64,
+        omitted_packet_ids: Vec<String>,
+        omitted_packet_reasons: BTreeMap<String, String>,
+    ) {
+        self.dynamic_input_tokens = tokens;
+        self.omitted_packet_ids = omitted_packet_ids;
+        self.omitted_packet_reasons = omitted_packet_reasons;
+        self.executable = self.executable
+            && self
+                .fixed_input_tokens
+                .saturating_add(self.dynamic_input_tokens)
+                <= self.hard_input_cap_tokens;
+    }
+
+    #[must_use]
+    pub fn input_total_tokens(&self) -> u64 {
+        self.fixed_input_tokens
+            .saturating_add(self.dynamic_input_tokens)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextComponentKind {
@@ -88,6 +176,12 @@ impl ContextLedger {
         self.entries.clear();
         self.request_sequence = request_sequence;
         self.calibrated_input_tokens = None;
+    }
+
+    pub fn begin_request_with_budget(&mut self, request_sequence: usize, max_tokens: u64) {
+        self.begin_request(request_sequence);
+        self.max_tokens = max_tokens.max(1);
+        self.tool_result_limit = self.tool_result_limit.min(self.max_tokens).max(1);
     }
 
     pub fn reconcile_input_tokens(&mut self, actual_input_tokens: u64) {
@@ -225,5 +319,19 @@ mod tests {
         let projection = ledger.projection();
         assert_eq!(projection.calibrated_input_tokens, Some(200));
         assert_eq!(projection.consumed_tokens, 200);
+    }
+
+    #[test]
+    fn request_budget_uses_hard_capacity_as_its_only_request_limit() {
+        let mut budget =
+            RequestBudgetReport::for_attempt("small-model", 8_000, 2_000, 128, 256, 2_500);
+        assert!(budget.executable);
+        assert_eq!(budget.target_input_cap_tokens, budget.hard_input_cap_tokens);
+        budget.record_dynamic_packets(
+            budget.dynamic_hard_remaining() + 1,
+            vec!["late".into()],
+            BTreeMap::new(),
+        );
+        assert!(!budget.executable);
     }
 }

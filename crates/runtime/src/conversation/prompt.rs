@@ -1,9 +1,14 @@
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::config::{ConfigError, ConfigLoader, RuntimeConfig};
+use crate::context_runtime::{
+    ContextAuthority, ContextItem, ContextRole, ContextSourceKind, ContextSourceLifecycle,
+    ContextVisibility,
+};
 use crate::git_context::GitContext;
 
 /// Errors raised while assembling the final system prompt.
@@ -48,13 +53,12 @@ pub struct ContextFile {
     pub content: String,
 }
 
-/// Project-local context injected into the rendered system prompt.
+/// Project-local state collected for labelled context packets.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProjectContext {
     pub cwd: PathBuf,
     pub current_date: String,
     pub git_status: Option<String>,
-    pub git_diff: Option<String>,
     pub git_context: Option<GitContext>,
     pub instruction_files: Vec<ContextFile>,
 }
@@ -70,7 +74,6 @@ impl ProjectContext {
             cwd,
             current_date: current_date.into(),
             git_status: None,
-            git_diff: None,
             git_context: None,
             instruction_files,
         })
@@ -82,13 +85,16 @@ impl ProjectContext {
     ) -> std::io::Result<Self> {
         let mut context = Self::discover(cwd, current_date)?;
         context.git_status = read_git_status(&context.cwd);
-        context.git_diff = read_git_diff(&context.cwd);
         context.git_context = GitContext::detect(&context.cwd);
         Ok(context)
     }
 }
 
-/// Builder for the runtime system prompt and dynamic environment sections.
+/// Builder for Cowd-owned, provider-system prompt scaffolding.
+///
+/// Project files, Git state and loaded configuration are intentionally not
+/// emitted here. They are mutable external data and must enter a turn through
+/// the context runtime as labelled, non-system packets.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SystemPromptBuilder {
     output_style_name: Option<String>,
@@ -151,12 +157,6 @@ impl SystemPromptBuilder {
         sections.push(crate::capability_manifest::runtime_capability_primer());
         sections.push(SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string());
         sections.push(self.environment_section());
-        if let Some(project_context) = &self.project_context {
-            sections.push(render_project_context(project_context));
-            if !project_context.instruction_files.is_empty() {
-                sections.push(render_instruction_files(&project_context.instruction_files));
-            }
-        }
         if let Some(config) = &self.config {
             sections.push(render_config_section(config));
         }
@@ -170,10 +170,6 @@ impl SystemPromptBuilder {
     }
 
     fn environment_section(&self) -> String {
-        let cwd = self.project_context.as_ref().map_or_else(
-            || "unknown".to_string(),
-            |context| context.cwd.display().to_string(),
-        );
         let date = self.project_context.as_ref().map_or_else(
             || "unknown".to_string(),
             |context| context.current_date.clone(),
@@ -187,7 +183,6 @@ impl SystemPromptBuilder {
             .unwrap_or("unknown");
         lines.extend(prepend_bullets(vec![
             format!("Active model: {active_model}"),
-            format!("Working directory: {cwd}"),
             format!("Date: {date}"),
             format!(
                 "Platform: {} {}",
@@ -236,9 +231,15 @@ fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
         push_context_file(&mut files, cwd.join(name))?;
     }
 
-    // Layer 4: Ancestor chain (walk up for inherited instructions)
+    // Layer 4: inherited instructions within this workspace only. Never walk
+    // beyond the repository root: parent directories are not project input and
+    // can otherwise silently influence an unrelated workspace.
+    let workspace_root = discover_instruction_workspace_root(cwd);
     let mut cursor = cwd.parent();
     while let Some(dir) = cursor {
+        if !dir.starts_with(&workspace_root) {
+            break;
+        }
         // Check ancestor root dir for common instruction files
         for name in &["AGENTS.md", "CLAUDE.md", "CLAUDE.local.md"][..] {
             push_context_file(&mut files, dir.join(name))?;
@@ -247,10 +248,28 @@ fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
         for name in INSTRUCTION_FILE_NAMES {
             push_context_file(&mut files, dir.join(".cowd").join(name))?;
         }
+        if dir == workspace_root {
+            break;
+        }
         cursor = dir.parent();
     }
 
     Ok(dedupe_instruction_files(files))
+}
+
+fn discover_instruction_workspace_root(cwd: &Path) -> PathBuf {
+    let root = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(cwd)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|output| output.trim().to_string())
+        .filter(|output| !output.is_empty())
+        .map(PathBuf::from);
+
+    root.unwrap_or_else(|| cwd.to_path_buf())
 }
 
 fn push_context_file(files: &mut Vec<ContextFile>, path: PathBuf) -> std::io::Result<()> {
@@ -265,16 +284,14 @@ fn push_context_file(files: &mut Vec<ContextFile>, path: PathBuf) -> std::io::Re
     }
 }
 
+const MAX_GIT_STATUS_BYTES: usize = 8 * 1024;
+
 fn read_git_status(cwd: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .args(["--no-optional-locks", "status", "--short", "--branch"])
-        .current_dir(cwd)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8(output.stdout).ok()?;
+    let stdout = read_git_output_bounded(
+        cwd,
+        &["--no-optional-locks", "status", "--short", "--branch"],
+        MAX_GIT_STATUS_BYTES,
+    )?;
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
         None
@@ -283,101 +300,39 @@ fn read_git_status(cwd: &Path) -> Option<String> {
     }
 }
 
-fn read_git_diff(cwd: &Path) -> Option<String> {
-    let mut sections = Vec::new();
-
-    let staged = read_git_output(cwd, &["diff", "--cached"])?;
-    if !staged.trim().is_empty() {
-        sections.push(format!("Staged changes:\n{}", staged.trim_end()));
-    }
-
-    let unstaged = read_git_output(cwd, &["diff"])?;
-    if !unstaged.trim().is_empty() {
-        sections.push(format!("Unstaged changes:\n{}", unstaged.trim_end()));
-    }
-
-    if sections.is_empty() {
-        None
-    } else {
-        Some(sections.join("\n\n"))
-    }
-}
-
-fn read_git_output(cwd: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
+fn read_git_output_bounded(cwd: &Path, args: &[&str], limit: usize) -> Option<String> {
+    let mut child = Command::new("git")
         .args(args)
         .current_dir(cwd)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout).ok()
-}
-
-fn render_project_context(project_context: &ProjectContext) -> String {
-    let mut lines = vec!["# Project context".to_string()];
-    let mut bullets = vec![
-        format!("Today's date is {}.", project_context.current_date),
-        format!("Working directory: {}", project_context.cwd.display()),
-    ];
-    if !project_context.instruction_files.is_empty() {
-        bullets.push(format!(
-            "Claude instruction files discovered: {}.",
-            project_context.instruction_files.len()
-        ));
-    }
-    lines.extend(prepend_bullets(bullets));
-    if let Some(status) = &project_context.git_status {
-        lines.push(String::new());
-        lines.push("Git status snapshot:".to_string());
-        lines.push(status.clone());
-    }
-    if let Some(ref gc) = project_context.git_context {
-        if !gc.recent_commits.is_empty() {
-            lines.push(String::new());
-            lines.push("Recent commits (last 5):".to_string());
-            for c in &gc.recent_commits {
-                lines.push(format!("  {} {}", c.hash, c.subject));
-            }
-        }
-    }
-    if let Some(diff) = &project_context.git_diff {
-        lines.push(String::new());
-        lines.push("Git diff snapshot:".to_string());
-        lines.push(diff.clone());
-    }
-    if let Some(git_context) = &project_context.git_context {
-        let rendered = git_context.render();
-        if !rendered.is_empty() {
-            lines.push(String::new());
-            lines.push(rendered);
-        }
-    }
-    lines.join("\n")
-}
-
-fn render_instruction_files(files: &[ContextFile]) -> String {
-    let mut sections = vec!["# Claude instructions".to_string()];
-    let mut remaining_chars = MAX_TOTAL_INSTRUCTION_CHARS;
-    for file in files {
-        if remaining_chars == 0 {
-            sections.push(
-                "_Additional instruction content omitted after reaching the prompt budget._"
-                    .to_string(),
-            );
+    let mut stdout = child.stdout.take()?;
+    let mut captured = Vec::with_capacity(limit.min(8 * 1024));
+    let mut buffer = [0u8; 4096];
+    let mut truncated = false;
+    loop {
+        let read = stdout.read(&mut buffer).ok()?;
+        if read == 0 {
             break;
         }
-
-        let raw_content = truncate_instruction_content(&file.content, remaining_chars);
-        let rendered_content = render_instruction_content(&raw_content);
-        let consumed = rendered_content.chars().count().min(remaining_chars);
-        remaining_chars = remaining_chars.saturating_sub(consumed);
-
-        sections.push(format!("## {}", describe_instruction_file(file, files)));
-        sections.push(rendered_content);
+        let remaining = limit.saturating_sub(captured.len());
+        if remaining >= read {
+            captured.extend_from_slice(&buffer[..read]);
+        } else {
+            captured.extend_from_slice(&buffer[..remaining]);
+            truncated = true;
+        }
     }
-    sections.join("\n\n")
+    if !child.wait().ok()?.success() {
+        return None;
+    }
+    let mut output = String::from_utf8(captured).ok()?;
+    if truncated {
+        output.push_str("\n[truncated]");
+    }
+    Some(output)
 }
 
 fn dedupe_instruction_files(files: Vec<ContextFile>) -> Vec<ContextFile> {
@@ -407,19 +362,6 @@ fn stable_content_hash(content: &str) -> u64 {
     hasher.finish()
 }
 
-fn describe_instruction_file(file: &ContextFile, files: &[ContextFile]) -> String {
-    let path = display_context_path(&file.path);
-    let scope = files
-        .iter()
-        .filter_map(|candidate| candidate.path.parent())
-        .find(|parent| file.path.starts_with(parent))
-        .map_or_else(
-            || "workspace".to_string(),
-            |parent| parent.display().to_string(),
-        );
-    format!("{path} (scope: {scope})")
-}
-
 fn truncate_instruction_content(content: &str, remaining_chars: usize) -> String {
     let hard_limit = MAX_INSTRUCTION_FILE_CHARS.min(remaining_chars);
     let trimmed = content.trim();
@@ -430,10 +372,6 @@ fn truncate_instruction_content(content: &str, remaining_chars: usize) -> String
     let mut output = trimmed.chars().take(hard_limit).collect::<String>();
     output.push_str("\n\n[truncated]");
     output
-}
-
-fn render_instruction_content(content: &str) -> String {
-    truncate_instruction_content(content, MAX_INSTRUCTION_FILE_CHARS)
 }
 
 fn display_context_path(path: &Path) -> String {
@@ -476,24 +414,101 @@ pub fn load_system_prompt(
 }
 
 fn render_config_section(config: &RuntimeConfig) -> String {
-    let mut lines = vec!["# Runtime config".to_string()];
-    if config.loaded_entries().is_empty() {
-        lines.extend(prepend_bullets(vec![
-            "No Claw Code settings files loaded.".to_string()
-        ]));
-        return lines.join("\n");
-    }
+    let loaded_count = config.loaded_entries().len();
+    let model = config.model().unwrap_or("unknown");
+    format!(
+        "# Runtime configuration\n - Active model: {model}\n - Loaded configuration sources: {loaded_count}\n - Sensitive configuration values are intentionally unavailable in the model prompt. Use the governed runtime configuration capability when inspection is required."
+    )
+}
 
-    lines.extend(prepend_bullets(
-        config
-            .loaded_entries()
-            .iter()
-            .map(|entry| format!("Loaded {:?}: {}", entry.source, entry.path.display()))
-            .collect(),
-    ));
-    lines.push(String::new());
-    lines.push(config.as_json().render());
-    lines.join("\n")
+/// Converts mutable workspace state into context-runtime items. These packets
+/// retain project usefulness without granting their contents provider-system
+/// authority. Callers may safely omit them when workspace discovery fails.
+pub(crate) fn discover_project_context_items(cwd: &Path) -> Vec<ContextItem> {
+    let Ok(project) = ProjectContext::discover_with_git(cwd, "runtime") else {
+        return Vec::new();
+    };
+    project_context_items(&project)
+}
+
+pub(crate) fn project_context_items(project: &ProjectContext) -> Vec<ContextItem> {
+    let mut items = Vec::new();
+    if let Some(status) = project
+        .git_status
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let mut item = ContextItem::new(
+            "workspace:git-status",
+            ContextSourceKind::Workspace,
+            ContextRole::Orientation,
+            format!(
+                "Git status snapshot for {}:\n{status}",
+                project.cwd.display()
+            ),
+        );
+        item.authority = ContextAuthority::Project;
+        item.visibility = ContextVisibility::Private;
+        item.source_lifecycle = ContextSourceLifecycle::External;
+        item.source_id = Some(project.cwd.display().to_string());
+        item.source_reason = Some("bounded_git_status_snapshot".to_string());
+        item.evidence.push("workspace:git-status".to_string());
+        items.push(item);
+    }
+    if let Some(git) = &project.git_context {
+        let rendered = git.render();
+        if !rendered.trim().is_empty() {
+            let mut item = ContextItem::new(
+                "workspace:git-context",
+                ContextSourceKind::Workspace,
+                ContextRole::Orientation,
+                truncate_instruction_content(&rendered, MAX_INSTRUCTION_FILE_CHARS),
+            );
+            item.authority = ContextAuthority::Project;
+            item.visibility = ContextVisibility::Private;
+            item.source_lifecycle = ContextSourceLifecycle::External;
+            item.source_id = Some(project.cwd.display().to_string());
+            item.source_reason = Some("bounded_git_context_snapshot".to_string());
+            item.evidence.push("workspace:git-context".to_string());
+            items.push(item);
+        }
+    }
+    let config_home = crate::cowd_dirs::config_home_dir();
+    let mut remaining = MAX_TOTAL_INSTRUCTION_CHARS;
+    for file in &project.instruction_files {
+        if remaining == 0 {
+            break;
+        }
+        let content = truncate_instruction_content(&file.content, remaining);
+        remaining = remaining.saturating_sub(content.chars().count());
+        let mut item = ContextItem::new(
+            format!(
+                "workspace:instruction:{}",
+                stable_content_hash(&file.content)
+            ),
+            ContextSourceKind::Workspace,
+            ContextRole::Instruction,
+            format!(
+                "Workspace instruction file: {}\n\n{}",
+                display_context_path(&file.path),
+                content
+            ),
+        );
+        item.authority = if file.path.starts_with(&config_home) {
+            ContextAuthority::User
+        } else {
+            ContextAuthority::Project
+        };
+        item.visibility = ContextVisibility::Private;
+        item.source_lifecycle = ContextSourceLifecycle::External;
+        item.source_id = Some(file.path.display().to_string());
+        item.source_reason = Some("workspace_instruction_file".to_string());
+        item.source_version = Some(format!("{:016x}", stable_content_hash(&file.content)));
+        item.evidence
+            .push(format!("workspace:instruction:{}", file.path.display()));
+        items.push(item);
+    }
+    items
 }
 
 fn get_simple_intro_section(has_output_style: bool) -> String {
@@ -551,8 +566,8 @@ fn get_actions_section() -> String {
 mod tests {
     use super::{
         collapse_blank_lines, display_context_path, normalize_instruction_content,
-        render_instruction_content, render_instruction_files, truncate_instruction_content,
-        ContextFile, ProjectContext, SystemPromptBuilder, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+        project_context_items, truncate_instruction_content, ContextFile, ProjectContext,
+        SystemPromptBuilder, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
     use crate::config::ConfigLoader;
     use std::fs;
@@ -584,6 +599,11 @@ mod tests {
         let root = temp_dir();
         let nested = root.join("apps").join("api");
         fs::create_dir_all(nested.join(".cowd")).expect("nested cc dir");
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&root)
+            .status()
+            .expect("git init should run");
 
         // Isolate user config dir to avoid interference from real ~/.cowd/
         let config_home = root.join("user-cowd");
@@ -638,6 +658,44 @@ mod tests {
     }
 
     #[test]
+    fn never_loads_instruction_files_above_workspace_root() {
+        let _guard = env_lock();
+        let outer = temp_dir();
+        let workspace = outer.join("workspace");
+        let nested = workspace.join("src").join("service");
+        fs::create_dir_all(&nested).expect("nested workspace dir");
+        fs::write(outer.join("CLAUDE.md"), "outside workspace instructions")
+            .expect("write parent instruction");
+        fs::write(workspace.join("CLAUDE.md"), "workspace instructions")
+            .expect("write workspace instruction");
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&workspace)
+            .status()
+            .expect("git init should run");
+
+        let config_home = outer.join("user-cowd");
+        fs::create_dir_all(&config_home).expect("config home dir");
+        let prev = std::env::var_os("COWD_CONFIG_HOME");
+        std::env::set_var("COWD_CONFIG_HOME", &config_home);
+
+        let context = ProjectContext::discover(&nested, "2026-03-31").expect("context should load");
+        let contents = context
+            .instruction_files
+            .iter()
+            .map(|file| file.content.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(contents, vec!["workspace instructions"]);
+        if let Some(value) = prev {
+            std::env::set_var("COWD_CONFIG_HOME", value);
+        } else {
+            std::env::remove_var("COWD_CONFIG_HOME");
+        }
+        fs::remove_dir_all(outer).expect("cleanup temp dir");
+    }
+
+    #[test]
     fn dedupes_identical_instruction_content_across_scopes() {
         let _guard = env_lock();
         let root = temp_dir();
@@ -669,7 +727,7 @@ mod tests {
 
     #[test]
     fn truncates_large_instruction_content_for_rendering() {
-        let rendered = render_instruction_content(&"x".repeat(4500));
+        let rendered = truncate_instruction_content(&"x".repeat(4500), 4_000);
         assert!(rendered.contains("[truncated]"));
         assert!(rendered.len() < 4_100);
     }
@@ -721,7 +779,6 @@ mod tests {
         assert!(status.contains("## No commits yet on") || status.contains("## "));
         assert!(status.contains("?? CLAUDE.md"));
         assert!(status.contains("?? tracked.txt"));
-        assert!(context.git_diff.is_none());
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -775,10 +832,7 @@ mod tests {
         // when: discovering project context with git auto-include
         let context =
             ProjectContext::discover_with_git(&root, "2026-03-31").expect("context should load");
-        let rendered = SystemPromptBuilder::new()
-            .with_os("linux", "6.8")
-            .with_project_context(context.clone())
-            .render();
+        let items = project_context_items(&context);
 
         // then: branch, recent commits and staged files are present in context
         let gc = context
@@ -800,16 +854,16 @@ mod tests {
         assert!(status.contains("## main"));
         assert!(status.contains("A  d.txt"));
 
-        assert!(rendered.contains("Recent commits (last 5):"));
-        assert!(rendered.contains("first commit"));
-        assert!(rendered.contains("Git status snapshot:"));
-        assert!(rendered.contains("## main"));
+        assert!(items
+            .iter()
+            .any(|item| item.content.contains("first commit")));
+        assert!(items.iter().any(|item| item.content.contains("## main")));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     #[test]
-    fn discover_with_git_includes_diff_snapshot_for_tracked_changes() {
+    fn discover_with_git_does_not_capture_raw_diff_for_tracked_changes() {
         let _guard = env_lock();
         ensure_valid_cwd();
         let root = temp_dir();
@@ -845,9 +899,13 @@ mod tests {
         let context =
             ProjectContext::discover_with_git(&root, "2026-03-31").expect("context should load");
 
-        let diff = context.git_diff.expect("git diff should be present");
-        assert!(diff.contains("Unstaged changes:"));
-        assert!(diff.contains("tracked.txt"));
+        let items = project_context_items(&context);
+        assert!(items
+            .iter()
+            .any(|item| item.content.contains("tracked.txt")));
+        assert!(!items
+            .iter()
+            .any(|item| item.content.contains("hello\nworld")));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -890,8 +948,9 @@ mod tests {
             std::env::remove_var("COWD_CONFIG_HOME");
         }
 
-        assert!(prompt.contains("Project rules"));
-        assert!(prompt.contains("permissionMode"));
+        assert!(!prompt.contains("Project rules"));
+        assert!(!prompt.contains("permissionMode"));
+        assert!(prompt.contains("Sensitive configuration values"));
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
@@ -919,12 +978,11 @@ mod tests {
             .render();
 
         assert!(prompt.contains("# System"));
-        assert!(prompt.contains("# Project context"));
-        assert!(prompt.contains("# Claude instructions"));
-        assert!(prompt.contains("Project rules"));
-        assert!(prompt.contains("permissionMode"));
+        assert!(!prompt.contains("# Project context"));
+        assert!(!prompt.contains("Project rules"));
+        assert!(!prompt.contains("permissionMode"));
         assert!(prompt.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY));
-        assert!(prompt.contains("Active model: unknown"));
+        assert!(prompt.contains("Loaded configuration sources"));
         assert!(!prompt.contains("Claude Opus 4.6"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
@@ -954,21 +1012,31 @@ mod tests {
             .instruction_files
             .iter()
             .any(|file| file.path.ends_with(".cowd/instructions.md")));
-        assert!(
-            render_instruction_files(&context.instruction_files).contains("instruction markdown")
-        );
+        assert!(project_context_items(&context)
+            .iter()
+            .any(|item| item.content.contains("instruction markdown")));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     #[test]
     fn renders_instruction_file_metadata() {
-        let rendered = render_instruction_files(&[ContextFile {
-            path: PathBuf::from("/tmp/project/CLAUDE.md"),
-            content: "Project rules".to_string(),
-        }]);
-        assert!(rendered.contains("# Claude instructions"));
-        assert!(rendered.contains("scope: /tmp/project"));
-        assert!(rendered.contains("Project rules"));
+        let context = ProjectContext {
+            cwd: PathBuf::from("/tmp/project"),
+            current_date: "2026-03-31".to_string(),
+            git_status: None,
+            git_context: None,
+            instruction_files: vec![ContextFile {
+                path: PathBuf::from("/tmp/project/CLAUDE.md"),
+                content: "Project rules".to_string(),
+            }],
+        };
+        let items = project_context_items(&context);
+        assert_eq!(items.len(), 1);
+        assert!(items[0]
+            .source_id
+            .as_deref()
+            .is_some_and(|path| path.contains("CLAUDE.md")));
+        assert!(items[0].content.contains("Project rules"));
     }
 }

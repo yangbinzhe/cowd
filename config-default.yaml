@@ -58,7 +58,9 @@ runtime:
 
 # 模型上下文窗口覆盖 (优先级高于内置静态表)
 # 格式: "模型名": token数
-# 使用场景: 自定义 API endpoint 的窗口大小不同、限制本地模型上下文等
+# 使用场景: 自定义 API endpoint 的窗口大小不同、限制本地模型上下文等。
+# 显式配置会被 Runtime 直接采用；只有 Provider 返回明确的、更小的数值上限时，
+# 当前进程才会临时校准并重试一次，不会改写此配置。未配置且无法识别的模型按 128K 估算。
 model_context_windows: {}
 # 示例:
 # model_context_windows:
@@ -149,19 +151,20 @@ storage:
 trusted_roots: []
 
 # =============================================================================
-# 上下文压缩
+# 上下文预算与语义压缩
 # =============================================================================
-# 预检自动压缩: 每次模型调用前检测上下文窗口使用率，超限时自动压缩
+# `context_budget` 仅分配 Runtime 内部的记忆、工具结果、团队和控制预算；
+# 它绝不限制单次 Provider 请求。Provider 请求始终尽量使用模型真实硬容量。
+context_budget:
+  subsystem_budget_ratio_bp: 7000 # 内部子系统预算比例，7000 = 70%
 
-# 压缩阈值:
-#   默认按模型上下文窗口的 70% 触发，适配 32K/128K/1M 等不同窗口。
-#   COWD_AUTO_COMPACT_INPUT_TOKENS 可作为绝对阈值覆盖，仅建议调试或强约束环境使用。
+# 每次模型调用前，Runtime 用候选模型窗口、输出预留、协议开销、工具 schema、
+# 对话历史与必需上下文进行预检。只有所有候选都无法容纳必需内容时才语义压缩。
 compression:
-  # 会话级自动压缩
+  # 会话级语义压缩
   session:
-    threshold_tokens: 0             # 0=按 threshold_ratio_bp 动态计算；>0=固定绝对阈值
-    threshold_ratio_bp: 7000        # 触发比例，7000=模型上下文窗口的 70%
     preserve_recent: 6              # 压缩后保留最近 N 条消息原文
+    summary_max_tokens: 2000        # 语义检查点的最大摘要预算
 
   # 记忆深度压缩开关。会话自动压缩由 session 配置控制。
   deep:
@@ -206,9 +209,6 @@ sandbox:
 memory:
   # 全局开关
   enabled: true
-
-  # AAAK 符号化索引 (节省 70-85% tokens)
-  aaak_index_enabled: true
 
   # 一致性过滤阈值 (基点, 100=0.01, 1000=0.10, 5000=0.50)
   # 低于此阈值的记忆条目将被排除
@@ -434,9 +434,6 @@ gateway:
 #   ANTHROPIC_AUTH_TOKEN           - Anthropic OAuth Token
 #   OPENAI_API_KEY                 - OpenAI API 密钥
 #   OPENAI_BASE_URL                - OpenAI Base URL
-#
-# 压缩:
-#   COWD_AUTO_COMPACT_INPUT_TOKENS - 绝对 token 阈值触发压缩；未设置时使用 compression.session.threshold_ratio_bp
 #
 # 记忆:
 #   COWD_MEMORY_VECTOR_MODEL       - 向量嵌入模型名

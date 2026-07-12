@@ -428,42 +428,44 @@ impl Default for MicroCompactConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionCompactConfig {
-    #[serde(default = "default_session_threshold_tokens")]
-    pub threshold_tokens: u32,
-    #[serde(default = "default_session_threshold_ratio_bp")]
-    pub threshold_ratio_bp: u32,
     #[serde(default = "default_preserve_recent")]
     pub preserve_recent: u32,
     #[serde(default = "default_summary_max")]
     pub summary_max_tokens: u32,
-    #[serde(default = "default_buffer_tokens")]
-    pub buffer_tokens: u32,
 }
 
-fn default_session_threshold_tokens() -> u32 {
-    0
-}
-fn default_session_threshold_ratio_bp() -> u32 {
-    7000
-}
 fn default_preserve_recent() -> u32 {
     6
 }
 fn default_summary_max() -> u32 {
     2000
 }
-fn default_buffer_tokens() -> u32 {
-    13000
-}
 
 impl Default for SessionCompactConfig {
     fn default() -> Self {
         Self {
-            threshold_tokens: 0,
-            threshold_ratio_bp: 7000,
             preserve_recent: 6,
             summary_max_tokens: 2000,
-            buffer_tokens: 13000,
+        }
+    }
+}
+
+/// Budget that Runtime may distribute to internal subsystems. It is explicitly
+/// separate from provider request capacity and session compaction decisions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextBudgetConfig {
+    #[serde(default = "default_subsystem_budget_ratio_bp")]
+    pub subsystem_budget_ratio_bp: u32,
+}
+
+const fn default_subsystem_budget_ratio_bp() -> u32 {
+    7000
+}
+
+impl Default for ContextBudgetConfig {
+    fn default() -> Self {
+        Self {
+            subsystem_budget_ratio_bp: default_subsystem_budget_ratio_bp(),
         }
     }
 }
@@ -610,6 +612,7 @@ pub struct RuntimeFeatureConfig {
     providers: ProvidersConfig,
     trusted_roots: Vec<String>,
     memory: MemoryConfig,
+    context_budget: ContextBudgetConfig,
     compression: CompressionConfig,
     gateway: GatewayConfig,
     gate_auto_fix: GateAutoFixConfig,
@@ -730,9 +733,6 @@ pub struct MemoryConfig {
     pub layers: LayerConfig,
     pub extraction: ExtractionConfig,
     pub vector: VectorConfig,
-    /// When true, use AAAK symbolic index instead of full entry injection
-    /// for memory context, saving 70-85% tokens.
-    pub aaak_index_enabled: bool,
     /// Jaccard similarity threshold for coherence filtering in basis points.
     /// 100 = 0.01, 1000 = 0.10 (default), 5000 = 0.50.
     /// Entries with score below this are excluded from context injection.
@@ -763,7 +763,6 @@ impl Default for MemoryConfig {
             layers: LayerConfig::default(),
             extraction: ExtractionConfig::default(),
             vector: VectorConfig::default(),
-            aaak_index_enabled: true,
             coherence_threshold_bp: 1000,
         }
     }
@@ -988,6 +987,7 @@ impl ConfigLoader {
             providers: parse_optional_providers_config(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
             memory: parse_optional_memory_config(&merged_value)?,
+            context_budget: parse_optional_context_budget_config(&merged_value)?,
             compression: parse_optional_compression_config(&merged_value)?,
             gateway: parse_optional_gateway_config(&merged_value)?,
             gate_auto_fix: parse_optional_gate_auto_fix_config(&merged_value)?,
@@ -1033,6 +1033,14 @@ impl RuntimeConfig {
     #[must_use]
     pub fn as_json(&self) -> JsonValue {
         JsonValue::Object(self.merged.clone())
+    }
+
+    /// Return the merged configuration with all credential-bearing branches
+    /// removed. This is the single redaction implementation for user-visible
+    /// diagnostics; prompt construction must never consume it.
+    #[must_use]
+    pub fn redacted_json(&self) -> JsonValue {
+        redact_json_value(self.as_json())
     }
 
     #[must_use]
@@ -1116,6 +1124,11 @@ impl RuntimeConfig {
     }
 
     #[must_use]
+    pub fn context_budget(&self) -> &ContextBudgetConfig {
+        &self.feature_config.context_budget
+    }
+
+    #[must_use]
     pub fn compression(&self) -> &CompressionConfig {
         &self.feature_config.compression
     }
@@ -1134,6 +1147,78 @@ impl RuntimeConfig {
     pub fn runtime_control(&self) -> &RuntimeControlConfig {
         &self.feature_config.runtime_control
     }
+}
+
+/// Redact a serde JSON projection with the same rules as [`RuntimeConfig`].
+/// Gateway uses this only while shaping already-authorized user-facing API
+/// responses. Keeping the traversal here prevents a second, weaker secret
+/// filter from drifting in an outer layer.
+#[must_use]
+pub fn redact_serde_json(mut value: serde_json::Value) -> serde_json::Value {
+    redact_serde_json_in_place(&mut value);
+    value
+}
+
+fn redact_json_value(value: JsonValue) -> JsonValue {
+    match value {
+        JsonValue::Object(entries) => JsonValue::Object(
+            entries
+                .into_iter()
+                .map(|(key, value)| {
+                    if is_sensitive_config_key(&key) {
+                        (key, JsonValue::String("[redacted]".to_string()))
+                    } else {
+                        (key, redact_json_value(value))
+                    }
+                })
+                .collect(),
+        ),
+        JsonValue::Array(values) => {
+            JsonValue::Array(values.into_iter().map(redact_json_value).collect())
+        }
+        value => value,
+    }
+}
+
+fn redact_serde_json_in_place(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(entries) => {
+            for (key, child) in entries.iter_mut() {
+                if is_sensitive_config_key(key) {
+                    *child = serde_json::Value::String("[redacted]".to_string());
+                } else {
+                    redact_serde_json_in_place(child);
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_serde_json_in_place(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_sensitive_config_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    normalized.contains("apikey")
+        || normalized == "token"
+        || normalized.ends_with("token")
+        || normalized == "secret"
+        || normalized.ends_with("secret")
+        || normalized == "password"
+        || normalized.ends_with("password")
+        || normalized == "authorization"
+        || normalized.ends_with("authorization")
+        || normalized == "headers"
+        || normalized.ends_with("headers")
+        || normalized == "env"
+        || normalized.ends_with("env")
 }
 
 impl RuntimeFeatureConfig {
@@ -1234,6 +1319,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn memory(&self) -> &MemoryConfig {
         &self.memory
+    }
+
+    #[must_use]
+    pub fn context_budget(&self) -> &ContextBudgetConfig {
+        &self.context_budget
     }
 
     #[must_use]
@@ -1403,7 +1493,7 @@ fn inject_config_env(merged: &BTreeMap<String, JsonValue>) {
 ///
 /// Examples:
 /// - `CC_MEMORY_ENABLED=false` → `{"memory": {"enabled": false}}`
-/// - `CC_COMPRESSION_SESSION_THRESHOLD_TOKENS=50000` → `{"compression": {"session": {"threshold_tokens": 50000}}}`
+/// - `CC_CONTEXT_BUDGET_SUBSYSTEM_BUDGET_RATIO_BP=7000` → `{"context": {"budget": {"subsystem": {"budget": {"ratio": {"bp": 7000}}}}}}`
 /// - `CC_MODEL=opus` → `{"model": "opus"}`
 fn collect_env_overrides() -> BTreeMap<String, JsonValue> {
     let mut root: BTreeMap<String, JsonValue> = BTreeMap::new();
@@ -1551,9 +1641,41 @@ fn parse_optional_model_context_windows(
                 "merged settings: field model_context_windows.{k} value out of u32 range"
             ))
         })?;
+        if n < 1_024 {
+            return Err(ConfigError::Parse(format!(
+                "merged settings: field model_context_windows.{k} must be at least 1024"
+            )));
+        }
         result.insert(k.clone(), n);
     }
     Ok(result)
+}
+
+fn parse_optional_context_budget_config(
+    root: &JsonValue,
+) -> Result<ContextBudgetConfig, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(ContextBudgetConfig::default());
+    };
+    let Some(value) = object.get("context_budget") else {
+        return Ok(ContextBudgetConfig::default());
+    };
+    let budget = expect_object(value, "merged settings.context_budget")?;
+    let ratio = optional_u32_dual(
+        budget,
+        "subsystem_budget_ratio_bp",
+        "merged settings.context_budget",
+    )?
+    .unwrap_or(ContextBudgetConfig::default().subsystem_budget_ratio_bp);
+    if !(1_000..=9_500).contains(&ratio) {
+        return Err(ConfigError::Parse(
+            "merged settings.context_budget.subsystem_budget_ratio_bp must be between 1000 and 9500"
+                .to_string(),
+        ));
+    }
+    Ok(ContextBudgetConfig {
+        subsystem_budget_ratio_bp: ratio,
+    })
 }
 
 fn parse_optional_hooks_config(root: &JsonValue) -> Result<RuntimeHookConfig, ConfigError> {
@@ -2048,12 +2170,6 @@ fn parse_optional_memory_config(root: &JsonValue) -> Result<MemoryConfig, Config
         layers,
         extraction,
         vector,
-        aaak_index_enabled: optional_bool_dual(
-            mem,
-            "aaak_index_enabled",
-            "merged settings.memory",
-        )?
-        .unwrap_or(MemoryConfig::default().aaak_index_enabled),
         coherence_threshold_bp: optional_u32_dual(
             mem,
             "coherence_threshold_bp",
@@ -2088,19 +2204,14 @@ fn parse_optional_compression_config(root: &JsonValue) -> Result<CompressionConf
     };
     let session = if let Some(sess_val) = cmp.get("session") {
         let s = expect_object(sess_val, "merged settings.compression.session")?;
+        for removed in ["threshold_tokens", "threshold_ratio_bp", "buffer_tokens"] {
+            if s.contains_key(removed) {
+                return Err(ConfigError::Parse(format!(
+                    "merged settings.compression.session.{removed} was removed; Runtime now compacts from candidate request pressure"
+                )));
+            }
+        }
         SessionCompactConfig {
-            threshold_tokens: optional_u32_dual(
-                s,
-                "threshold_tokens",
-                "merged settings.compression.session",
-            )?
-            .unwrap_or(SessionCompactConfig::default().threshold_tokens),
-            threshold_ratio_bp: optional_u32_dual(
-                s,
-                "threshold_ratio_bp",
-                "merged settings.compression.session",
-            )?
-            .unwrap_or(SessionCompactConfig::default().threshold_ratio_bp),
             preserve_recent: optional_u32_dual(
                 s,
                 "preserve_recent",
@@ -2113,12 +2224,6 @@ fn parse_optional_compression_config(root: &JsonValue) -> Result<CompressionConf
                 "merged settings.compression.session",
             )?
             .unwrap_or(SessionCompactConfig::default().summary_max_tokens),
-            buffer_tokens: optional_u32_dual(
-                s,
-                "buffer_tokens",
-                "merged settings.compression.session",
-            )?
-            .unwrap_or(SessionCompactConfig::default().buffer_tokens),
         }
     } else {
         SessionCompactConfig::default()
@@ -3046,13 +3151,16 @@ fn deep_merge_objects(
 #[cfg(test)]
 mod tests {
     use super::{
-        deep_merge_objects, parse_optional_compression_config, parse_permission_mode_label,
-        ConfigLoader, ConfigSource, DomainProfile, McpServerConfig, McpTransport, ProviderProtocol,
-        ResolvedPermissionMode, RuntimeHookConfig, RuntimePluginConfig, SessionCompactConfig,
+        deep_merge_objects, parse_optional_compression_config,
+        parse_optional_context_budget_config, parse_optional_model_context_windows,
+        parse_permission_mode_label, redact_serde_json, ConfigLoader, ConfigSource, DomainProfile,
+        McpServerConfig, McpTransport, ProviderProtocol, ResolvedPermissionMode, RuntimeConfig,
+        RuntimeFeatureConfig, RuntimeHookConfig, RuntimePluginConfig, SessionCompactConfig,
         COWD_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
+    use std::collections::BTreeMap;
     use std::fs;
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -4200,6 +4308,38 @@ memory:
     }
 
     #[test]
+    fn redacted_json_removes_nested_credential_and_transport_values() {
+        let mut merged = BTreeMap::new();
+        merged.insert(
+            "providers".to_string(),
+            JsonValue::parse(
+                r#"{
+                    "apiKey":"provider-secret",
+                    "headers":{"Authorization":"Bearer secret"},
+                    "env":{"TOKEN":"environment-secret"},
+                    "nested":{"password":"password-secret","safe":"visible"}
+                }"#,
+            )
+            .expect("fixture parses"),
+        );
+        let config = RuntimeConfig {
+            merged,
+            loaded_entries: Vec::new(),
+            feature_config: RuntimeFeatureConfig::default(),
+        };
+
+        let rendered = config.redacted_json().render();
+        assert!(!rendered.contains("provider-secret"));
+        assert!(!rendered.contains("environment-secret"));
+        assert!(!rendered.contains("password-secret"));
+        assert!(rendered.contains("visible"));
+        assert_eq!(
+            redact_serde_json(serde_json::json!({"authorization":"secret","safe":"ok"})),
+            serde_json::json!({"authorization":"[redacted]","safe":"ok"})
+        );
+    }
+
+    #[test]
     fn gateway_webui_dir_reads_configured_static_asset_dir() {
         let root = temp_dir();
         let cwd = root.join("project");
@@ -4314,15 +4454,15 @@ gateway:
     }
 
     #[test]
-    fn compression_session_defaults_to_ratio_based_threshold() {
+    fn compression_session_defaults_to_semantic_checkpoint_controls() {
         let session = SessionCompactConfig::default();
 
-        assert_eq!(session.threshold_tokens, 0);
-        assert_eq!(session.threshold_ratio_bp, 7000);
+        assert_eq!(session.preserve_recent, 6);
+        assert_eq!(session.summary_max_tokens, 2000);
     }
 
     #[test]
-    fn parses_compression_session_threshold_ratio_bp() {
+    fn compression_rejects_removed_ratio_thresholds() {
         let root = JsonValue::parse(
             r#"{
                 "compression": {
@@ -4345,36 +4485,47 @@ gateway:
         )
         .expect("json should parse");
 
-        let compression =
-            parse_optional_compression_config(&root).expect("compression config should parse");
-
-        assert_eq!(compression.session.threshold_tokens, 0);
-        assert_eq!(compression.session.threshold_ratio_bp, 6500);
-        assert_eq!(compression.session.preserve_recent, 12);
-        assert!((compression.micro.time_decay_factor - 1.0).abs() < f32::EPSILON);
-        assert!(!compression.deep.iterative_update);
-        assert_eq!(compression.circuit_breaker.max_retries, 5);
-        assert_eq!(compression.circuit_breaker.cooldown_secs, 60);
+        let error = parse_optional_compression_config(&root)
+            .expect_err("removed request-ratio threshold must be rejected");
+        assert!(error.to_string().contains("threshold_ratio_bp was removed"));
     }
 
     #[test]
-    fn parses_deprecated_camel_case_compression_keys() {
+    fn parses_context_budget_separately_from_compression() {
         let root = JsonValue::parse(
             r#"{
-                "compression": {
-                    "session": {
-                        "thresholdRatioBp": 6400,
-                        "preserveRecent": 10
-                    }
+                "context_budget": {
+                    "subsystem_budget_ratio_bp": 6400
                 }
             }"#,
         )
         .expect("json should parse");
 
-        let compression =
-            parse_optional_compression_config(&root).expect("compression config should parse");
+        let budget = parse_optional_context_budget_config(&root)
+            .expect("context budget config should parse");
 
-        assert_eq!(compression.session.threshold_ratio_bp, 6400);
-        assert_eq!(compression.session.preserve_recent, 10);
+        assert_eq!(budget.subsystem_budget_ratio_bp, 6400);
+    }
+
+    #[test]
+    fn parses_model_context_window_override_and_rejects_invalid_small_value() {
+        let root = JsonValue::parse(
+            r#"{
+                "model_context_windows": {
+                    "private-model": 32768
+                }
+            }"#,
+        )
+        .expect("json should parse");
+        let windows = parse_optional_model_context_windows(&root)
+            .expect("context window override should parse");
+        assert_eq!(windows["private-model"], 32_768);
+
+        let invalid = JsonValue::parse(r#"{"model_context_windows":{"broken":1023}}"#)
+            .expect("json should parse");
+        assert!(parse_optional_model_context_windows(&invalid)
+            .expect_err("sub-1024 context window must fail validation")
+            .to_string()
+            .contains("at least 1024"));
     }
 }
