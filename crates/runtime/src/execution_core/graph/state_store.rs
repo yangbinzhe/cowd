@@ -208,6 +208,17 @@ impl ExecutionGraphStateStore {
                     }
                 })
                 .collect(),
+            edges: graph
+                .edges
+                .iter()
+                .map(
+                    |edge| harness_contract::execution_graph::ExecutionEdgeProjection {
+                        from: edge.from.clone(),
+                        to: edge.to.clone(),
+                        kind: edge.kind,
+                    },
+                )
+                .collect(),
             commit_cursor: graph.recovery_cursor.commit_cursor,
             terminal_result_ref: graph
                 .nodes

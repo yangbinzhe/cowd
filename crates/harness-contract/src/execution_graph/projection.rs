@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-    ExecutionGraph, ExecutionNodeKind, ExecutionNodeStatus, ExecutionParentBinding, ExecutionUsage,
+    ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeStatus,
+    ExecutionParentBinding, ExecutionUsage,
 };
 use crate::context::EvidenceAccessRef;
 
@@ -20,6 +21,16 @@ pub struct ExecutionNodeProjection {
     pub usage: ExecutionUsage,
 }
 
+/// Read-only graph relation safe for surfaces. Execution payloads and private
+/// prompts stay in Runtime; consumers only need stable topology to render and
+/// control the durable graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionEdgeProjection {
+    pub from: String,
+    pub to: String,
+    pub kind: ExecutionEdgeKind,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionGraphProjection {
     pub graph_id: String,
@@ -28,6 +39,7 @@ pub struct ExecutionGraphProjection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_execution: Option<ExecutionParentBinding>,
     pub nodes: Vec<ExecutionNodeProjection>,
+    pub edges: Vec<ExecutionEdgeProjection>,
     pub commit_cursor: u64,
     pub terminal_result_ref: Option<String>,
 }
@@ -59,6 +71,15 @@ pub fn project_execution_graph(graph: &ExecutionGraph) -> ExecutionGraphProjecti
                         .unwrap_or_default(),
                     usage: result.map(|value| value.usage.clone()).unwrap_or_default(),
                 }
+            })
+            .collect(),
+        edges: graph
+            .edges
+            .iter()
+            .map(|edge| ExecutionEdgeProjection {
+                from: edge.from.clone(),
+                to: edge.to.clone(),
+                kind: edge.kind,
             })
             .collect(),
         commit_cursor: graph.recovery_cursor.commit_cursor,

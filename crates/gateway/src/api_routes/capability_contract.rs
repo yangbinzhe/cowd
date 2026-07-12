@@ -161,6 +161,7 @@ pub(crate) fn gateway_openapi_document() -> Value {
                 },
                 "ExecutionProjectionEntity": execution_projection_entity_schema(),
                 "ExecutionNodeProjection": execution_node_projection_schema(),
+                "ExecutionEdgeProjection": execution_edge_projection_schema(),
                 "ExecutionParentBinding": execution_parent_binding_schema(),
                 "ExecutionGraphProjection": execution_graph_projection_schema(),
                 "ChildExecutionProjection": child_execution_projection_schema(),
@@ -853,15 +854,29 @@ fn execution_node_projection_schema() -> Value {
 fn execution_graph_projection_schema() -> Value {
     json!({
         "type": "object",
-        "required": ["graph_id", "revision", "objective", "nodes", "commit_cursor"],
+        "required": ["graph_id", "revision", "objective", "nodes", "edges", "commit_cursor"],
         "properties": {
             "graph_id": {"type": "string"},
             "revision": {"type": "integer", "minimum": 0},
             "objective": {"type": "string"},
             "parent_execution": {"oneOf": [{"$ref": "#/components/schemas/ExecutionParentBinding"}, {"type": "null"}]},
             "nodes": {"type": "array", "items": {"$ref": "#/components/schemas/ExecutionNodeProjection"}},
+            "edges": {"type": "array", "items": {"$ref": "#/components/schemas/ExecutionEdgeProjection"}},
             "commit_cursor": {"type": "integer", "minimum": 0},
             "terminal_result_ref": {"type": ["string", "null"]}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn execution_edge_projection_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["from", "to", "kind"],
+        "properties": {
+            "from": {"type": "string"},
+            "to": {"type": "string"},
+            "kind": {"type": "string", "enum": ["depends_on", "verifies", "produces"]}
         },
         "additionalProperties": false
     })
@@ -1107,6 +1122,11 @@ mod tests {
             document["components"]["schemas"]["ExecutionGraphProjection"]["properties"]
                 ["parent_execution"]["oneOf"][0]["$ref"],
             "#/components/schemas/ExecutionParentBinding"
+        );
+        assert_eq!(
+            document["components"]["schemas"]["ExecutionGraphProjection"]["properties"]["edges"]
+                ["items"]["$ref"],
+            "#/components/schemas/ExecutionEdgeProjection"
         );
 
         let events = &document["paths"]["/api/runtime/executions/{id}/events"]["get"];

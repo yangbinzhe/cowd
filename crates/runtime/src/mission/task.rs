@@ -770,6 +770,7 @@ mod tests {
                     objective: "Attach graph".to_string(),
                     parent_execution: None,
                     nodes: Vec::new(),
+                    edges: Vec::new(),
                     commit_cursor: 9,
                     terminal_result_ref: None,
                 },
