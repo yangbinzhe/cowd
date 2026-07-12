@@ -3365,6 +3365,16 @@ mod tests {
                 assert_eq!(self.executed.load(Ordering::SeqCst), 0);
                 Box::pin(stream::iter(vec![
                     Ok(AssistantEvent::ToolUse {
+                        id: "discover-tools".to_string(),
+                        name: "ToolSearch".to_string(),
+                        input: r#"{"query":"read and update source files"}"#.to_string(),
+                    }),
+                    Ok(AssistantEvent::MessageStop),
+                ]))
+            } else if self.requests == 2 {
+                assert_eq!(self.executed.load(Ordering::SeqCst), 0);
+                Box::pin(stream::iter(vec![
+                    Ok(AssistantEvent::ToolUse {
                         id: "read-1".to_string(),
                         name: "read_file".to_string(),
                         input: r#"{"path":"src/lib.rs"}"#.to_string(),
@@ -3420,13 +3430,107 @@ mod tests {
 
     impl ToolExecutor for RecordingToolExecutor {
         fn execute(&self, name: &str, _input: &str) -> Result<String, ToolError> {
+            if name == "ToolSearch" {
+                return Ok(serde_json::json!({
+                    "query": "read and update source files",
+                    "catalog_revision": 0,
+                    "descriptors": [
+                        {
+                            "canonical_id": "read_file",
+                            "display_name": "read_file",
+                            "source": "test",
+                            "schema_hash": "read-v1",
+                            "required_permission": "read_only",
+                            "permission_source": "test",
+                            "health": "healthy"
+                        },
+                        {
+                            "canonical_id": "write_file",
+                            "display_name": "write_file",
+                            "source": "test",
+                            "schema_hash": "write-v1",
+                            "required_permission": "workspace_write",
+                            "permission_source": "test",
+                            "health": "healthy"
+                        }
+                    ],
+                    "activation_candidates": ["read_file", "write_file"]
+                })
+                .to_string());
+            }
             self.order.lock().unwrap().push(name.to_string());
             self.executed.fetch_add(1, Ordering::SeqCst);
             Ok(format!("{name} complete"))
         }
 
         fn available_tool_names(&self) -> Vec<String> {
-            vec!["read_file".to_string(), "write_file".to_string()]
+            vec![
+                "ToolSearch".to_string(),
+                "read_file".to_string(),
+                "write_file".to_string(),
+            ]
+        }
+
+        fn describe_tool_effect(
+            &self,
+            name: &str,
+            _input: &serde_json::Value,
+        ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
+            use harness_contract::policy::{
+                PermissionOperation, PermissionResource, PermissionScope,
+            };
+            use harness_contract::tool::{
+                ToolApprovalClass, ToolEffectDescriptor, ToolEffectKind, ToolIdempotency,
+                ToolPermissionMode,
+            };
+
+            match name {
+                "read_file" => Some(ToolEffectDescriptor {
+                    tool_id: name.to_string(),
+                    descriptor_hash: "test-read-file-v1".to_string(),
+                    effect_kind: ToolEffectKind::Read,
+                    idempotency: ToolIdempotency::Idempotent,
+                    scopes: vec![PermissionScope::new(
+                        PermissionResource::File,
+                        PermissionOperation::Read,
+                    )],
+                    required_permission: ToolPermissionMode::ReadOnly,
+                    approval_class: ToolApprovalClass::None,
+                    uses_network: false,
+                    spawns_process: false,
+                    mutates_packages: false,
+                    mutates_system: false,
+                }),
+                "write_file" => Some(ToolEffectDescriptor {
+                    tool_id: name.to_string(),
+                    descriptor_hash: "test-write-file-v1".to_string(),
+                    effect_kind: ToolEffectKind::Write,
+                    idempotency: ToolIdempotency::IdempotentWithKey,
+                    scopes: vec![PermissionScope::new(
+                        PermissionResource::File,
+                        PermissionOperation::Write,
+                    )],
+                    required_permission: ToolPermissionMode::WorkspaceWrite,
+                    approval_class: ToolApprovalClass::Policy,
+                    uses_network: false,
+                    spawns_process: false,
+                    mutates_packages: false,
+                    mutates_system: false,
+                }),
+                _ => None,
+            }
+        }
+
+        fn execute_authorized(
+            &self,
+            authorization: &harness_contract::tool::ToolExecutionAuthorization,
+            name: &str,
+            input: &str,
+        ) -> Result<String, ToolError> {
+            if authorization.tool_id != name {
+                return Err(ToolError::new("authorization tool does not match request"));
+            }
+            self.execute(name, input)
         }
 
         fn classify_tool_safety(
@@ -3688,7 +3792,16 @@ mod tests {
             order.lock().unwrap().as_slice(),
             ["read_file", "write_file"]
         );
-        assert_eq!(summary.tool_results.len(), 2);
+        assert_eq!(
+            summary.tool_results.len(),
+            3,
+            "the durable turn trace includes the bootstrap ToolSearch receipt plus two authorized operations"
+        );
+        assert!(summary
+            .tool_results
+            .iter()
+            .flat_map(|message| message.blocks.iter())
+            .any(|block| matches!(block, crate::ContentBlock::ToolResult { tool_name, .. } if tool_name == "ToolSearch")));
         assert_eq!(summary.final_answer, "done once");
         assert_eq!(
             summary

@@ -102,6 +102,7 @@ impl MissionCommandInterpreter {
                     scope: Vec::new(),
                     context_lens: Vec::new(),
                     evidence_refs: Vec::new(),
+                    context_budget_lease: None,
                     permission_lease: "session-dispatch-default".to_string(),
                     deadline_at_ms: None,
                     priority: 128,

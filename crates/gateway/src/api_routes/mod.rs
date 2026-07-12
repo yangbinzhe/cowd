@@ -386,6 +386,7 @@ pub(crate) mod tests {
     use memory::config::{BudgetConfig, StoreConfig};
     use runtime::permission_enforcer::DestructivePatternDetector;
     use runtime::{ContextProfile, ResumeContextSource};
+    use sha2::Digest;
     use std::sync::Arc;
     use std::time::Instant;
     use tower::ServiceExt;
@@ -11512,20 +11513,60 @@ providers:
             ))
             .await
             .unwrap();
+        let raw = "tests passed";
+        let content_hash = format!("sha256:{:x}", sha2::Sha256::digest(raw.as_bytes()));
+        let raw_event = store
+            .append_session_domain_event_allocating_sequence(&memory::SessionDomainEvent::new(
+                session_id,
+                0,
+                memory::SessionDomainScope::Tool,
+                "evidence.raw.persisted",
+                serde_json::json!({
+                    "type": "RawEvidence",
+                    "evidence_id": "tool-1",
+                    "tool_name": "bash",
+                    "raw": raw,
+                    "content_hash": content_hash,
+                    "byte_count": raw.len(),
+                    "media_type": "text/plain",
+                    "visibility_scope": format!("session:{session_id}"),
+                }),
+                1,
+            ))
+            .await
+            .unwrap();
+        let evidence_ref = harness_contract::core::EvidenceRef::new("tool", "tool-1");
+        let projection = harness_contract::context::EvidenceAuditProjection {
+            evidence_ref: evidence_ref.clone(),
+            content_kind: harness_contract::context::EvidenceContentKind::Text,
+            raw_tokens: 3,
+            receipt_tokens: 1,
+            omitted_tokens: 2,
+            raw_available: true,
+            access: Some(harness_contract::context::EvidenceAccessRef::durable(
+                evidence_ref,
+                content_hash,
+                raw.len() as u64,
+                "text/plain",
+                format!("session-event://{session_id}/{}", raw_event.sequence),
+                format!("session:{session_id}"),
+            )),
+        };
         store
-            .append_event(&memory::SessionEvent {
-                session_id: session_id.to_string(),
-                event_type: "ToolComplete".to_string(),
-                event_json: serde_json::json!({
-                    "type": "ToolComplete",
-                    "id": "tool-1",
-                    "name": "bash",
-                    "summary": "tests passed",
-                })
-                .to_string(),
-                sequence: 0,
-                created_at_ms: 1,
-            })
+            .append_session_domain_event_allocating_sequence(&memory::SessionDomainEvent::new(
+                session_id,
+                0,
+                memory::SessionDomainScope::Context,
+                "context.turn_report",
+                serde_json::json!({
+                    "type": "ContextTurnReport",
+                    "report": {
+                        "turn_id": "tool-evidence-turn",
+                        "audit_projections": [projection],
+                    }
+                }),
+                2,
+            ))
             .await
             .unwrap();
 
@@ -11548,7 +11589,8 @@ providers:
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["available"], true);
         assert_eq!(json["kind"], "tool");
-        assert_eq!(json["events"][0]["payload"]["summary"], "tests passed");
+        assert_eq!(json["verified"], true);
+        assert_eq!(json["event"]["snippet"], "tests passed");
     }
 
     #[tokio::test]

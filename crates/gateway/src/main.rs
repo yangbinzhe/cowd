@@ -3320,6 +3320,126 @@ pub(crate) fn session_db_resume_context_packet(session: &Session) -> Option<Resu
     })
 }
 
+/// Resolve the newest complete semantic checkpoint through the same
+/// Session-domain store that Runtime used to persist it. RuntimeFactory is
+/// currently synchronous, so the short SQLite lookup is isolated in its own
+/// current-thread runtime rather than blocking an existing Tokio worker.
+pub(crate) fn semantic_checkpoint_resume_context_packet(
+    store: std::sync::Arc<memory::UnifiedSessionStore>,
+    session_id: &str,
+) -> Option<ResumeContextPacket> {
+    let session_id = session_id.to_string();
+    let lookup_session_id = session_id.clone();
+    let page = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()?
+            .block_on(store.session_domain_events_page(&lookup_session_id, 0, 4_096))
+            .ok()
+    })
+    .join()
+    .ok()
+    .flatten()?;
+    let checkpoint = page
+        .events
+        .into_iter()
+        .rev()
+        .find(|event| event.kind == "memory.semantic_checkpoint.created")
+        .and_then(|event| event.payload.get("checkpoint").cloned())
+        .and_then(|value| {
+            serde_json::from_value::<memory::compression::session::SessionSemanticCheckpoint>(
+                value,
+            )
+            .map_err(|error| {
+                tracing::warn!(%error, %session_id, "ignoring malformed semantic checkpoint during resume");
+                error
+            })
+            .ok()
+        })?;
+    if checkpoint.schema_version == 0
+        || checkpoint.schema_version
+            > memory::compression::session::SESSION_SEMANTIC_CHECKPOINT_SCHEMA_VERSION
+    {
+        tracing::warn!(
+            %session_id,
+            checkpoint_schema = checkpoint.schema_version,
+            supported_schema = memory::compression::session::SESSION_SEMANTIC_CHECKPOINT_SCHEMA_VERSION,
+            "ignoring unsupported semantic checkpoint during resume"
+        );
+        return None;
+    }
+
+    let mut recent_decisions = checkpoint
+        .decisions
+        .iter()
+        .map(|value| format!("decision: {value}"))
+        .collect::<Vec<_>>();
+    recent_decisions.extend(
+        checkpoint
+            .user_rules
+            .iter()
+            .map(|value| format!("user rule (must preserve): {value}")),
+    );
+    recent_decisions.extend(
+        checkpoint
+            .constraints
+            .iter()
+            .map(|value| format!("constraint: {value}")),
+    );
+    recent_decisions.extend(
+        checkpoint
+            .file_changes
+            .iter()
+            .map(|value| format!("file change: {value}")),
+    );
+    recent_decisions.extend(checkpoint.evidence_refs.iter().map(|reference| {
+        format!(
+            "durable evidence reference: {}",
+            serde_json::to_string(reference).unwrap_or_else(|_| "unserializable".to_string())
+        )
+    }));
+    recent_decisions.push(format!(
+        "resume cursor: {}",
+        serde_json::to_string(&checkpoint.resume_cursor).unwrap_or_default()
+    ));
+
+    Some(ResumeContextPacket {
+        session_id,
+        handoff_summary: (!checkpoint.summary.trim().is_empty()).then_some(checkpoint.summary),
+        active_task: checkpoint.goal,
+        recent_decisions,
+        blockers: checkpoint.unresolved,
+        source: ResumeContextSource::SessionDb,
+    })
+}
+
+pub(crate) fn merge_resume_context_packets(
+    session_packet: Option<ResumeContextPacket>,
+    checkpoint_packet: Option<ResumeContextPacket>,
+) -> Option<ResumeContextPacket> {
+    match (session_packet, checkpoint_packet) {
+        (None, None) => None,
+        (Some(packet), None) | (None, Some(packet)) => Some(packet),
+        (Some(mut session), Some(checkpoint)) => {
+            if checkpoint.handoff_summary.is_some() {
+                session.handoff_summary = checkpoint.handoff_summary;
+            }
+            if checkpoint.active_task.is_some() {
+                session.active_task = checkpoint.active_task;
+            }
+            session.recent_decisions.extend(checkpoint.recent_decisions);
+            session.recent_decisions.sort();
+            session.recent_decisions.dedup();
+            session.blockers.extend(checkpoint.blockers);
+            session.blockers.sort();
+            session.blockers.dedup();
+            session.source = ResumeContextSource::SessionDb;
+            Some(session)
+        }
+    }
+}
+
 pub(crate) fn handoff_resume_context_packet(handoff: &memory::HandoffData) -> ResumeContextPacket {
     let active_task = handoff.task_states.first().map(|task| {
         format!(
@@ -4654,16 +4774,17 @@ mod tests {
         render_session_markdown, render_setup_json, render_setup_report, render_terminal_help,
         resolve_model_alias_with_config, resolve_session_reference, resolve_tui_model,
         response_to_events, resume_supported_slash_commands, run_resume_command,
-        runtime_capability_context_item, session_db_path, session_db_resume_context_packet,
-        short_tool_id, slash_command_completion_candidates_with_sessions, status_context,
-        strip_ansi_for_tui, suggestions::format_unknown_slash_command,
-        summarize_tool_payload_for_markdown, sync_cli_session_to_unified_store,
-        try_resolve_bare_skill_prompt, validate_no_args, workspace_context_item,
-        write_mcp_server_fixture, CliAction, CliOutputFormat, GatewayAction,
-        GatewayApprovalSlashCommand, GatewayContextSlashCommand, GatewayCrossPlaneSlashCommand,
-        GatewayTaskSlashCommand, GatewayToolExecutor, GitWorkspaceSummary, LocalHelpTopic,
-        SessionHandle, SessionPromptHistoryEntry, SlashCommand, StatusUsage, DEFAULT_MODEL,
-        LATEST_SESSION_REFERENCE, SHARED_RT, STUB_COMMANDS,
+        runtime_capability_context_item, semantic_checkpoint_resume_context_packet,
+        session_db_path, session_db_resume_context_packet, short_tool_id,
+        slash_command_completion_candidates_with_sessions, status_context, strip_ansi_for_tui,
+        suggestions::format_unknown_slash_command, summarize_tool_payload_for_markdown,
+        sync_cli_session_to_unified_store, try_resolve_bare_skill_prompt, validate_no_args,
+        workspace_context_item, write_mcp_server_fixture, CliAction, CliOutputFormat,
+        GatewayAction, GatewayApprovalSlashCommand, GatewayContextSlashCommand,
+        GatewayCrossPlaneSlashCommand, GatewayTaskSlashCommand, GatewayToolExecutor,
+        GitWorkspaceSummary, LocalHelpTopic, SessionHandle, SessionPromptHistoryEntry,
+        SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, SHARED_RT,
+        STUB_COMMANDS,
     };
     use crate::provider_crate::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use crate::runtime_bootstrap::GatewayToolRegistry as TestToolRegistry;
@@ -6638,6 +6759,100 @@ mod tests {
     }
 
     #[test]
+    fn semantic_checkpoint_resume_restores_all_runtime_critical_fields() {
+        let store = std::sync::Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            store
+                .create_session(&memory::SessionRecord {
+                    session_id: "resume-semantic".to_string(),
+                    platform: "test".to_string(),
+                    chat_id: "resume-semantic".to_string(),
+                    user_id: None,
+                    model: None,
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                    last_activity: "2026-01-01T00:00:00Z".to_string(),
+                    message_count: 0,
+                    reset_policy: "manual".to_string(),
+                    metadata_json: None,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    estimated_cost_usd: 0.0,
+                    status: "active".to_string(),
+                })
+                .await
+                .expect("create session");
+        });
+        let checkpoint: memory::compression::session::SessionSemanticCheckpoint =
+            serde_json::from_value(serde_json::json!({
+                "schema_version": 2,
+                "checkpoint_id": "checkpoint-resume-1",
+                "session_id": "resume-semantic",
+                "agent_id": "primary",
+                "project_id": "project-a",
+                "task_id": "task-a",
+                "team_id": null,
+                "summary": "Implement the evidence boundary",
+                "user_rules": ["never copy raw evidence"],
+                "goal": "finish the V2 compensation",
+                "constraints": ["keep SessionStore canonical"],
+                "decisions": ["use typed handoff references"],
+                "evidence_refs": [],
+                "unresolved": ["verify restart path"],
+                "file_changes": ["crates/runtime/src/context/evidence/raw.rs"],
+                "resume_cursor": {
+                    "message_index": 17,
+                    "event_sequence": 9,
+                    "checkpoint_id": "checkpoint-resume-1"
+                },
+                "token_stats": {"before": 1200, "after": 240, "message_count": 9},
+                "source_range": {
+                    "session_id": "resume-semantic",
+                    "message_start": 0,
+                    "message_end_exclusive": 9,
+                    "event_start": 0,
+                    "event_end_exclusive": 9,
+                    "raw_refs": []
+                },
+                "facts": []
+            }))
+            .expect("checkpoint fixture");
+        let event = memory::SessionDomainEvent::new(
+            "resume-semantic",
+            0,
+            memory::SessionDomainScope::Memory,
+            "memory.semantic_checkpoint.created",
+            serde_json::json!({"checkpoint": checkpoint}),
+            1,
+        );
+        runtime.block_on(async {
+            store
+                .append_session_domain_event_allocating_sequence(&event)
+                .await
+                .expect("persist checkpoint");
+        });
+
+        let packet = semantic_checkpoint_resume_context_packet(store, "resume-semantic")
+            .expect("checkpoint resume packet");
+        let context = runtime::ContextRuntimeKernel::resume_item(&packet).content;
+        for expected in [
+            "Implement the evidence boundary",
+            "finish the V2 compensation",
+            "never copy raw evidence",
+            "keep SessionStore canonical",
+            "use typed handoff references",
+            "verify restart path",
+            "crates/runtime/src/context/evidence/raw.rs",
+            "checkpoint-resume-1",
+        ] {
+            assert!(
+                context.contains(expected),
+                "missing restored field: {expected}"
+            );
+        }
+    }
+
+    #[test]
     fn workspace_context_item_summarizes_runtime_workspace() {
         let root =
             std::env::temp_dir().join(format!("cowd-workspace-context-{}", uuid::Uuid::new_v4()));
@@ -8186,19 +8401,39 @@ UU conflicted.rs",
         let executor =
             GatewayToolExecutor::from_tool_host(None, false, tool_host, state.mcp_state.clone());
 
-        let tool_output = executor
+        let authorize_and_execute = |tool_name: &str, input: &str| {
+            let value: serde_json::Value =
+                serde_json::from_str(input).expect("tool input should be valid JSON");
+            let descriptor = executor
+                .describe_tool_effect(tool_name, &value)
+                .expect("registered tool should describe its effect");
+            let authorization = runtime::ToolPolicy
+                .authorize(
+                    &descriptor,
+                    format!("gateway-mcp-test:{tool_name}"),
+                    PermissionMode::DangerFullAccess,
+                    30,
+                )
+                .expect("test permission should authorize tool")
+                .authorization;
+            executor.execute_authorized(&authorization, tool_name, input)
+        };
+
+        assert!(executor
             .execute("mcp__alpha__echo", r#"{"text":"hello"}"#)
+            .is_err());
+
+        let tool_output = authorize_and_execute("mcp__alpha__echo", r#"{"text":"hello"}"#)
             .expect("discovered mcp tool should execute");
         let tool_json: serde_json::Value =
             serde_json::from_str(&tool_output).expect("tool output should be json");
-        assert_eq!(tool_json["structuredContent"]["echoed"], "hello");
+        assert_eq!(tool_json["output"]["structuredContent"]["echoed"], "hello");
 
-        let wrapped_output = executor
-            .execute(
-                "MCPTool",
-                r#"{"qualifiedName":"mcp__alpha__echo","arguments":{"text":"wrapped"}}"#,
-            )
-            .expect("generic mcp wrapper should execute");
+        let wrapped_output = authorize_and_execute(
+            "MCPTool",
+            r#"{"qualifiedName":"mcp__alpha__echo","arguments":{"text":"wrapped"}}"#,
+        )
+        .expect("generic mcp wrapper should execute");
         let wrapped_json: serde_json::Value =
             serde_json::from_str(&wrapped_output).expect("wrapped output should be json");
         assert_eq!(wrapped_json["structuredContent"]["echoed"], "wrapped");
@@ -8223,19 +8458,17 @@ UU conflicted.rs",
             "mcp__alpha__echo"
         );
 
-        let listed = executor
-            .execute("ListMcpResourcesTool", r#"{"server":"alpha"}"#)
+        let listed = authorize_and_execute("ListMcpResourcesTool", r#"{"server":"alpha"}"#)
             .expect("resources should list");
         let listed_json: serde_json::Value =
             serde_json::from_str(&listed).expect("resource output should be json");
         assert_eq!(listed_json["resources"][0]["uri"], "file://guide.txt");
 
-        let read = executor
-            .execute(
-                "ReadMcpResourceTool",
-                r#"{"server":"alpha","uri":"file://guide.txt"}"#,
-            )
-            .expect("resource should read");
+        let read = authorize_and_execute(
+            "ReadMcpResourceTool",
+            r#"{"server":"alpha","uri":"file://guide.txt"}"#,
+        )
+        .expect("resource should read");
         let read_json: serde_json::Value =
             serde_json::from_str(&read).expect("resource read output should be json");
         assert_eq!(

@@ -393,8 +393,9 @@ impl SessionInputRouter {
                 message_id: format!("cross-session-message:{stable}"),
                 created_at_ms: now_ms(),
             };
+            let ingress_content = handoff_ingress_content(&handoff)?;
             let record = self
-                .persist_input(target, &handoff.objective, &request)
+                .persist_input(target, &ingress_content, &request)
                 .await
                 .map_err(|error| error.to_string())?;
             let receipt = SessionDispatchReceipt {
@@ -863,7 +864,67 @@ fn validate_handoff_command(command: &SessionDispatchCommand) -> Result<(), Stri
                 .to_string(),
         );
     }
+    for reference in &command.handoff.evidence_refs {
+        if reference.is_durable() {
+            let source_scope = format!("session:{}", command.handoff.source_session_id);
+            if reference.visibility_scope != source_scope
+                && !reference.visibility_scope.starts_with("shared:")
+            {
+                return Err(
+                    "durable handoff evidence must be source-session scoped or explicitly shared"
+                        .to_string(),
+                );
+            }
+            if reference.sha256.trim().is_empty()
+                || reference.bytes == 0
+                || reference.retrieval_selector.trim().is_empty()
+            {
+                return Err(
+                    "durable handoff evidence requires hash, byte count, and retrieval selector"
+                        .to_string(),
+                );
+            }
+        } else if !reference.retrieval_selector.trim().is_empty()
+            || !reference.sha256.trim().is_empty()
+            || reference.bytes != 0
+        {
+            return Err(
+                "unavailable handoff evidence must not carry a retrievable raw selector"
+                    .to_string(),
+            );
+        }
+    }
+    if let Some(lease) = &command.handoff.context_budget_lease {
+        if lease.owner_id != command.handoff.source_session_id
+            || lease.scope.trim().is_empty()
+            || lease.max_tokens == 0
+            || lease.consumed_tokens > lease.max_tokens
+        {
+            return Err(
+                "handoff context budget lease must belong to the source session and be valid"
+                    .to_string(),
+            );
+        }
+    }
     Ok(())
+}
+
+fn handoff_ingress_content(
+    handoff: &harness_contract::turn::SessionHandoff,
+) -> Result<String, String> {
+    let evidence = serde_json::to_string(&handoff.evidence_refs)
+        .map_err(|error| format!("serialize typed handoff evidence: {error}"))?;
+    let lease = serde_json::to_string(&handoff.context_budget_lease)
+        .map_err(|error| format!("serialize handoff budget lease: {error}"))?;
+    Ok(format!(
+        "{}\n\n## Cross-session handoff\nSource session: {}\nScope: {}\nAcceptance: {}\nEvidence references (metadata only; do not assume access): {}\nContext budget lease: {}",
+        handoff.objective,
+        handoff.source_session_id,
+        handoff.scope.join(", "),
+        handoff.acceptance.join("; "),
+        evidence,
+        lease,
+    ))
 }
 
 #[must_use]
@@ -1199,6 +1260,7 @@ mod tests {
             scope: vec![],
             context_lens: vec![],
             evidence_refs: vec![],
+            context_budget_lease: None,
             permission_lease: "test".into(),
             deadline_at_ms: None,
             priority: 128,
@@ -1262,6 +1324,7 @@ mod tests {
                 scope: Vec::new(),
                 context_lens: Vec::new(),
                 evidence_refs: Vec::new(),
+                context_budget_lease: None,
                 permission_lease: "test".to_string(),
                 deadline_at_ms: None,
                 priority: 1,
@@ -1272,6 +1335,55 @@ mod tests {
         };
         let error = validate_handoff_command(&command).expect_err("invalid handoff control");
         assert!(error.contains("cancel and approval use MissionCommand"));
+    }
+
+    #[test]
+    fn handoff_contract_rejects_unscoped_raw_and_accepts_source_budget_lease() {
+        let mut command = harness_contract::turn::SessionDispatchCommand {
+            command_id: "typed-handoff".to_string(),
+            action: harness_contract::turn::SessionDispatchAction::Enqueue,
+            handoff: harness_contract::turn::SessionHandoff {
+                handoff_id: "typed-handoff".to_string(),
+                source_session_id: "source".to_string(),
+                target_session_id: "target".to_string(),
+                objective: "review evidence".to_string(),
+                acceptance: Vec::new(),
+                scope: Vec::new(),
+                context_lens: Vec::new(),
+                evidence_refs: vec![harness_contract::context::EvidenceAccessRef::durable(
+                    harness_contract::core::EvidenceRef::new("tool", "raw-1"),
+                    "sha256:abc",
+                    3,
+                    "text/plain",
+                    "session-event://source/1",
+                    "session:other",
+                )],
+                context_budget_lease: Some(
+                    harness_contract::context::ContextBudgetLeaseRef::new(
+                        "lease-1",
+                        "source",
+                        "session_handoff",
+                        1200,
+                        1,
+                    )
+                    .with_consumed_tokens(400),
+                ),
+                permission_lease: "read_only".to_string(),
+                deadline_at_ms: None,
+                priority: 1,
+                correlation_id: "typed-correlation".to_string(),
+                result_contract: "return result".to_string(),
+            },
+            expected_target_revision: 0,
+        };
+        assert!(validate_handoff_command(&command).is_err());
+
+        command.handoff.evidence_refs[0].visibility_scope = "session:source".to_string();
+        assert!(validate_handoff_command(&command).is_ok());
+        let ingress = handoff_ingress_content(&command.handoff).expect("typed ingress");
+        assert!(ingress.contains("Cross-session handoff"));
+        assert!(ingress.contains("sha256:abc"));
+        assert!(!ingress.contains("raw payload"));
     }
 
     struct TerminalSynthesizeBackend;
@@ -1346,7 +1458,11 @@ mod tests {
             acceptance: Vec::new(),
             scope: Vec::new(),
             context_lens: Vec::new(),
-            evidence_refs: vec!["evidence:handoff".into()],
+            evidence_refs: vec![harness_contract::turn::opaque_session_evidence_ref(
+                "s1",
+                "evidence:handoff",
+            )],
+            context_budget_lease: None,
             permission_lease: "test".into(),
             deadline_at_ms: None,
             priority: 128,

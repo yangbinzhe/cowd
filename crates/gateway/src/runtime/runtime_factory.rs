@@ -11,9 +11,9 @@ use crate::runtime_bootstrap::RuntimeBootstrapState;
 use crate::runtime_entry::GatewayRuntimeEntry;
 use crate::services::runtime_skill_profiles_for_workspace;
 use crate::{
-    filter_tool_specs, inject_auto_resume_context, permission_policy,
-    runtime_capability_context_item, session_db_resume_context_packet, workspace_context_item,
-    AllowedToolSet,
+    filter_tool_specs, inject_auto_resume_context, merge_resume_context_packets, permission_policy,
+    runtime_capability_context_item, semantic_checkpoint_resume_context_packet,
+    session_db_resume_context_packet, workspace_context_item, AllowedToolSet,
 };
 
 #[allow(clippy::needless_pass_by_value)]
@@ -114,7 +114,12 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
     if session.model.is_none() {
         session.model = Some(model.clone());
     }
-    let session_resume_packet = session_db_resume_context_packet(&session);
+    let session_resume_packet = merge_resume_context_packets(
+        session_db_resume_context_packet(&session),
+        session_store.as_ref().and_then(|store| {
+            semantic_checkpoint_resume_context_packet(Arc::clone(store), session_id)
+        }),
+    );
     let RuntimeBootstrapState {
         feature_config,
         tool_registry,

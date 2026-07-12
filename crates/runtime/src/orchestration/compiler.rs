@@ -150,7 +150,15 @@ fn compile_session_dispatch(
         acceptance: Vec::new(),
         scope: orchestration_resource_scopes(request),
         context_lens: request.capabilities.clone(),
-        evidence_refs: request.evidence_refs.clone(),
+        evidence_refs: request
+            .evidence_refs
+            .iter()
+            .cloned()
+            .map(|reference| {
+                harness_contract::turn::opaque_session_evidence_ref(source_session_id, reference)
+            })
+            .collect(),
+        context_budget_lease: None,
         permission_lease: if request.constraints.requires_write == Some(true) {
             "workspace_write".to_string()
         } else {

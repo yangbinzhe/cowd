@@ -277,7 +277,10 @@ pub struct SessionSemanticCheckpoint {
     pub facts: Vec<SessionCheckpointFact>,
 }
 
-const SESSION_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
+/// Highest semantic checkpoint schema this build can restore without dropping
+/// fields. Gateway rejects newer snapshots rather than injecting a partial
+/// reconstruction into a resumed model request.
+pub const SESSION_SEMANTIC_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
 
 const fn legacy_session_checkpoint_schema_version() -> u32 {
     1
@@ -677,7 +680,7 @@ impl SessionCompactor {
         };
 
         Ok(SessionSemanticCheckpoint {
-            schema_version: SESSION_CHECKPOINT_SCHEMA_VERSION,
+            schema_version: SESSION_SEMANTIC_CHECKPOINT_SCHEMA_VERSION,
             checkpoint_id: build_context.checkpoint_id,
             session_id: build_context.session_id,
             agent_id: build_context.agent_id,
@@ -1487,7 +1490,10 @@ mod tests {
             .build_checkpoint(&messages, None, context)
             .await
             .unwrap();
-        assert_eq!(checkpoint.schema_version, SESSION_CHECKPOINT_SCHEMA_VERSION);
+        assert_eq!(
+            checkpoint.schema_version,
+            SESSION_SEMANTIC_CHECKPOINT_SCHEMA_VERSION
+        );
         assert!(checkpoint
             .goal
             .as_deref()
@@ -1511,7 +1517,7 @@ mod tests {
             KernelRef::new("session-message", "session-a:0").with_label("source message"),
         );
         let checkpoint = SessionSemanticCheckpoint {
-            schema_version: SESSION_CHECKPOINT_SCHEMA_VERSION,
+            schema_version: SESSION_SEMANTIC_CHECKPOINT_SCHEMA_VERSION,
             checkpoint_id: "checkpoint-a".to_string(),
             session_id: "session-a".to_string(),
             agent_id: "agent-a".to_string(),

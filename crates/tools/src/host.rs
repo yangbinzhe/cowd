@@ -231,6 +231,30 @@ impl ToolHostLease {
         }
     }
 
+    /// Metadata for the complete catalog pinned by this lease. Runtime uses
+    /// this to plan its bootstrap schema; it does not make every descriptor
+    /// model-visible until a discovery activation accepts it.
+    #[must_use]
+    pub fn catalog_receipt(&self) -> ToolDiscoveryReceipt {
+        let descriptors = self
+            .snapshot
+            .catalog
+            .definitions(None)
+            .into_iter()
+            .filter_map(|definition| self.snapshot.catalog.descriptor_ref(&definition.name))
+            .collect::<Vec<_>>();
+        let activation_candidates = descriptors
+            .iter()
+            .map(|descriptor| descriptor.canonical_id.clone())
+            .collect();
+        ToolDiscoveryReceipt {
+            query: "catalog".to_string(),
+            catalog_revision: self.revision,
+            descriptors,
+            activation_candidates,
+        }
+    }
+
     #[must_use]
     pub fn describe_effect(&self, tool_id: &str, input: &Value) -> ToolEffectDescriptor {
         let catalog_known = self.snapshot.catalog.contains(tool_id);

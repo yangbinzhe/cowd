@@ -49,6 +49,26 @@ impl EvidenceAccessRef {
     pub const fn is_durable(&self) -> bool {
         matches!(self.durability, EvidenceDurability::Durable)
     }
+
+    /// A typed, non-retrievable reference for a relationship or execution
+    /// marker. It deliberately carries no selector, bytes, or hash and can
+    /// never be mistaken for durable raw evidence across a Session boundary.
+    #[must_use]
+    pub fn unavailable(
+        evidence_ref: EvidenceRef,
+        media_type: impl Into<String>,
+        visibility_scope: impl Into<String>,
+    ) -> Self {
+        Self {
+            evidence_ref,
+            sha256: String::new(),
+            bytes: 0,
+            media_type: media_type.into(),
+            durability: EvidenceDurability::Unavailable,
+            retrieval_selector: String::new(),
+            visibility_scope: visibility_scope.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

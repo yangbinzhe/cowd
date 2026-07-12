@@ -196,20 +196,23 @@ impl ContextService {
                 .resolve_audit_projection(session, session_id, projection, snippet_bytes)
                 .await;
         }
-        if let Ok(Some((_, raw_events))) = session
-            .stored_events_by_type_page(session_id, "ToolObservationRaw", 0, 1000)
+        if let Ok(Some(raw_events)) = session
+            .stored_timeline_runtime_page(session_id, 0, 1000)
             .await
         {
-            if let Some(raw_match) = raw_events.into_iter().find_map(|event| {
-                let payload = serde_json::from_str::<serde_json::Value>(&event.event_json).ok()?;
-                let evidence_matches = payload
-                    .get("evidence_id")
-                    .and_then(|value| value.as_str())
-                    .is_some_and(|id| id == tool_id);
-                evidence_matches.then(|| {
+            if let Some(raw_match) = raw_events.events.into_iter().find_map(|event| {
+                (event.kind == "evidence.raw.persisted")
+                    .then_some(event)
+                    .and_then(|event| {
+                        let payload = event.payload;
+                        let evidence_matches = payload
+                            .get("evidence_id")
+                            .and_then(|value| value.as_str())
+                            .is_some_and(|id| id == tool_id);
+                        evidence_matches.then(|| {
                     let raw = payload.get("raw").and_then(serde_json::Value::as_str);
                     serde_json::json!({
-                        "type": event.event_type,
+                        "type": event.kind,
                         "sequence": event.sequence,
                         "created_at_ms": event.created_at_ms,
                         "metadata": raw_evidence_metadata(&payload),
@@ -217,6 +220,7 @@ impl ContextService {
                         "snippet_truncated": raw.is_some_and(|raw| raw.len() > snippet_bytes),
                     })
                 })
+                    })
             }) {
                 return serde_json::json!({
                     "ref": reference,
@@ -227,53 +231,12 @@ impl ContextService {
                 });
             }
         }
-        let Some((_, events)) = session
-            .stored_events_page(session_id, 0, 500)
-            .await
-            .ok()
-            .flatten()
-        else {
-            return serde_json::json!({
-                "ref": reference,
-                "kind": "tool",
-                "available": false,
-                "reason": "session events unavailable",
-            });
-        };
-        let matches = events
-            .into_iter()
-            .filter_map(|event| {
-                let payload = serde_json::from_str::<serde_json::Value>(&event.event_json).ok()?;
-                let id_matches = payload
-                    .get("id")
-                    .and_then(|value| value.as_str())
-                    .is_some_and(|id| id == tool_id)
-                    || payload
-                        .get("tool_use_id")
-                        .and_then(|value| value.as_str())
-                        .is_some_and(|id| id == tool_id);
-                let id_matches = id_matches
-                    || payload
-                        .get("evidence_id")
-                        .and_then(|value| value.as_str())
-                        .is_some_and(|id| id == tool_id);
-                id_matches.then(|| {
-                    serde_json::json!({
-                        "type": event.event_type,
-                        "sequence": event.sequence,
-                        "created_at_ms": event.created_at_ms,
-                        "payload": payload,
-                    })
-                })
-            })
-            .collect::<Vec<_>>();
-
         serde_json::json!({
             "ref": reference,
             "kind": "tool",
-            "available": !matches.is_empty(),
+            "available": false,
             "session_id": session_id,
-            "events": matches,
+            "reason": "no canonical durable raw evidence was found",
         })
     }
 
@@ -284,8 +247,8 @@ impl ContextService {
         from_sequence: usize,
         limit: usize,
     ) -> Result<serde_json::Value, ContextServiceError> {
-        let Some((total, events)) = session
-            .stored_events_by_type_page(session_id, "ContextTurnReport", from_sequence, limit)
+        let Some(page) = session
+            .stored_timeline_runtime_page(session_id, from_sequence, limit)
             .await
             .map_err(|error| ContextServiceError::StoreUnavailable(error.to_string()))?
         else {
@@ -293,11 +256,15 @@ impl ContextService {
                 "session store is unavailable".to_string(),
             ));
         };
+        let reports = page
+            .events
+            .into_iter()
+            .filter(|event| event.kind == "context.turn_report")
+            .collect::<Vec<_>>();
+        let total = reports.len();
         let mut projections = Vec::new();
-        for event in events {
-            let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.event_json) else {
-                continue;
-            };
+        for event in reports {
+            let payload = event.payload;
             let report = payload.get("report").unwrap_or(&payload);
             let turn_id = report
                 .get("turn_id")
@@ -342,21 +309,25 @@ impl ContextService {
         session_id: &str,
         evidence_id: &str,
     ) -> Option<EvidenceAuditProjection> {
-        let (_, events) = session
-            .stored_events_by_type_page(session_id, "ContextTurnReport", 0, 1000)
+        let page = session
+            .stored_timeline_runtime_page(session_id, 0, 1000)
             .await
             .ok()??;
-        events.into_iter().rev().find_map(|event| {
-            let payload = serde_json::from_str::<serde_json::Value>(&event.event_json).ok()?;
-            let report = payload.get("report").unwrap_or(&payload);
-            report
-                .get("audit_projections")?
-                .as_array()?
-                .iter()
-                .filter_map(|item| serde_json::from_value(item.clone()).ok())
-                .find(|projection: &EvidenceAuditProjection| {
-                    projection.evidence_ref.id() == evidence_id
-                        && projection_visible_to_session(projection, session_id)
+        page.events.into_iter().rev().find_map(|event| {
+            (event.kind == "context.turn_report")
+                .then_some(event)
+                .and_then(|event| {
+                    let payload = event.payload;
+                    let report = payload.get("report").unwrap_or(&payload);
+                    report
+                        .get("audit_projections")?
+                        .as_array()?
+                        .iter()
+                        .filter_map(|item| serde_json::from_value(item.clone()).ok())
+                        .find(|projection: &EvidenceAuditProjection| {
+                            projection.evidence_ref.id() == evidence_id
+                                && projection_visible_to_session(projection, session_id)
+                        })
                 })
         })
     }
@@ -387,11 +358,15 @@ impl ContextService {
             });
         };
         let event = session
-            .stored_events_page(session_id, sequence, 1)
+            .stored_timeline_runtime_page(session_id, sequence, 1)
             .await
             .ok()
             .flatten()
-            .and_then(|(_, events)| events.into_iter().find(|event| event.sequence == sequence));
+            .and_then(|page| {
+                page.events
+                    .into_iter()
+                    .find(|event| event.sequence == sequence)
+            });
         let Some(event) = event else {
             return serde_json::json!({
                 "ref": format!("tool://{}", projection.evidence_ref.id()),
@@ -401,15 +376,7 @@ impl ContextService {
                 "reason": "durable evidence event is unavailable",
             });
         };
-        let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.event_json) else {
-            return serde_json::json!({
-                "ref": format!("tool://{}", projection.evidence_ref.id()),
-                "kind": "tool",
-                "available": false,
-                "projection": projection,
-                "reason": "durable evidence event payload is invalid",
-            });
-        };
+        let payload = event.payload;
         let raw = payload.get("raw").and_then(serde_json::Value::as_str);
         let verified = raw.is_some_and(|raw| evidence_payload_matches(raw, access));
         serde_json::json!({
@@ -420,7 +387,7 @@ impl ContextService {
             "session_id": session_id,
             "projection": projection,
             "event": {
-                "type": event.event_type,
+                "type": event.kind,
                 "sequence": event.sequence,
                 "created_at_ms": event.created_at_ms,
                 "metadata": raw_evidence_metadata(&payload),
@@ -515,15 +482,22 @@ fn resource_next_actions(resource: &ExternalResourceRef) -> Vec<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use harness_contract::{
         context::{EvidenceAccessRef, EvidenceAuditProjection, EvidenceContentKind},
         core::EvidenceRef,
     };
+    use memory::{SessionDomainEvent, SessionDomainScope, SessionRecord, UnifiedSessionStore};
     use sha2::Digest;
 
     use super::{
         byte_safe_snippet, evidence_payload_matches, projection_visible_to_session,
-        validated_session_event_selector,
+        validated_session_event_selector, ContextService,
+    };
+    use crate::{
+        event_bus::SessionEventBus, gateway::ActiveSessions, services::SessionService,
+        session_kernel::SessionKernel,
     };
 
     fn projection(session_id: &str, raw: &str) -> EvidenceAuditProjection {
@@ -570,5 +544,110 @@ mod tests {
     #[test]
     fn snippets_respect_utf8_boundaries() {
         assert_eq!(byte_safe_snippet("工具结果", 4), "工");
+    }
+
+    #[tokio::test]
+    async fn canonical_domain_events_survive_restart_for_evidence_projection_and_retrieval() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().expect("open store"));
+        let session_id = "evidence-restart-session";
+        store
+            .create_session(&SessionRecord {
+                session_id: session_id.to_string(),
+                platform: "test".to_string(),
+                chat_id: "evidence".to_string(),
+                user_id: None,
+                model: None,
+                created_at: "2026-07-12T00:00:00Z".to_string(),
+                last_activity: "2026-07-12T00:00:00Z".to_string(),
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .expect("create session");
+
+        let raw = "canonical durable output";
+        let raw_event = store
+            .append_session_domain_event_allocating_sequence(&SessionDomainEvent::new(
+                session_id,
+                0,
+                SessionDomainScope::Tool,
+                "evidence.raw.persisted",
+                serde_json::json!({
+                    "type": "RawEvidence",
+                    "evidence_id": "evidence-1",
+                    "raw": raw,
+                    "content_hash": format!("sha256:{:x}", sha2::Sha256::digest(raw.as_bytes())),
+                    "byte_count": raw.len(),
+                    "media_type": "text/plain",
+                    "visibility_scope": format!("session:{session_id}"),
+                }),
+                1,
+            ))
+            .await
+            .expect("persist raw evidence");
+        let evidence_ref = EvidenceRef::new("tool", "evidence-1");
+        let projection = EvidenceAuditProjection {
+            evidence_ref: evidence_ref.clone(),
+            content_kind: EvidenceContentKind::Text,
+            raw_tokens: 6,
+            receipt_tokens: 2,
+            omitted_tokens: 4,
+            raw_available: true,
+            access: Some(EvidenceAccessRef::durable(
+                evidence_ref,
+                format!("sha256:{:x}", sha2::Sha256::digest(raw.as_bytes())),
+                raw.len() as u64,
+                "text/plain",
+                format!("session-event://{session_id}/{}", raw_event.sequence),
+                format!("session:{session_id}"),
+            )),
+        };
+        store
+            .append_session_domain_event_allocating_sequence(&SessionDomainEvent::new(
+                session_id,
+                0,
+                SessionDomainScope::Context,
+                "context.turn_report",
+                serde_json::json!({
+                    "type": "ContextTurnReport",
+                    "report": {
+                        "turn_id": "turn-evidence-1",
+                        "audit_projections": [projection],
+                    }
+                }),
+                2,
+            ))
+            .await
+            .expect("persist context report");
+
+        let restarted_session = SessionService::with_kernel(Arc::new(SessionKernel::new(
+            Arc::new(ActiveSessions::new()),
+            Some(store),
+            SessionEventBus::new(),
+        )));
+        let context = ContextService::new();
+        let projections = context
+            .evidence_audit_projections(&restarted_session, session_id, 0, 20)
+            .await
+            .expect("query canonical report after restart");
+        assert_eq!(projections["total_context_reports"], 1);
+        assert_eq!(projections["projection_count"], 1);
+
+        let resolved = context
+            .resolve_tool_evidence(
+                &restarted_session,
+                "tool://evidence-1",
+                Some(session_id),
+                64,
+            )
+            .await;
+        assert_eq!(resolved["available"], true);
+        assert_eq!(resolved["verified"], true);
+        assert_eq!(resolved["event"]["snippet"], raw);
     }
 }

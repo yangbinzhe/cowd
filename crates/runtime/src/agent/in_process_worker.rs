@@ -322,6 +322,22 @@ struct ScopedRuntimeToolExecutor {
 
 impl ToolExecutor for ScopedRuntimeToolExecutor {
     fn execute(&self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        if tool_name == "ToolSearch" {
+            let query = serde_json::from_str::<serde_json::Value>(input)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("query")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            let mut receipt = self.tool_discovery_receipt();
+            receipt.query = query;
+            return serde_json::to_string(&receipt).map_err(|error| {
+                ToolError::new(format!("serialize agent tool discovery: {error}"))
+            });
+        }
         if !self.allowed_tools.contains(tool_name) {
             return Err(ToolError::new(format!(
                 "tool `{tool_name}` is outside the AgentTaskPacket allow-list"
@@ -359,8 +375,69 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
         }
     }
 
+    fn tool_discovery_receipt(&self) -> harness_contract::tool::ToolDiscoveryReceipt {
+        use harness_contract::tool::{
+            ToolDescriptorHealth, ToolDescriptorRef, ToolDiscoveryReceipt, ToolPermissionMode,
+        };
+
+        let mut descriptors = Vec::with_capacity(self.allowed_tools.len().saturating_add(1));
+        descriptors.push(ToolDescriptorRef {
+            canonical_id: "ToolSearch".to_string(),
+            display_name: "ToolSearch".to_string(),
+            source: "delegated-agent".to_string(),
+            schema_hash: "delegated-agent:tool-search:v1".to_string(),
+            required_permission: ToolPermissionMode::ReadOnly,
+            permission_source: "runtime bootstrap".to_string(),
+            health: ToolDescriptorHealth::Healthy,
+        });
+        descriptors.extend(self.allowed_tools.iter().map(|tool_name| {
+            let descriptor = scoped_tool_effect_descriptor(tool_name);
+            ToolDescriptorRef {
+                canonical_id: tool_name.clone(),
+                display_name: tool_name.clone(),
+                source: "delegated-agent".to_string(),
+                schema_hash: descriptor.descriptor_hash,
+                required_permission: descriptor.required_permission,
+                permission_source: "agent task packet allow-list".to_string(),
+                health: ToolDescriptorHealth::Healthy,
+            }
+        }));
+        ToolDiscoveryReceipt {
+            query: "delegated-agent".to_string(),
+            catalog_revision: 0,
+            descriptors,
+            activation_candidates: self.allowed_tools.iter().cloned().collect(),
+        }
+    }
+
+    fn describe_tool_effect(
+        &self,
+        tool_name: &str,
+        _input: &serde_json::Value,
+    ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
+        self.allowed_tools
+            .contains(tool_name)
+            .then(|| scoped_tool_effect_descriptor(tool_name))
+    }
+
+    fn execute_authorized(
+        &self,
+        authorization: &harness_contract::tool::ToolExecutionAuthorization,
+        tool_name: &str,
+        input: &str,
+    ) -> Result<String, ToolError> {
+        if authorization.tool_id != tool_name || !self.allowed_tools.contains(tool_name) {
+            return Err(ToolError::new(
+                "agent tool authorization does not match the allowed tool request",
+            ));
+        }
+        self.execute(tool_name, input)
+    }
+
     fn available_tool_names(&self) -> Vec<String> {
-        self.allowed_tools.iter().cloned().collect()
+        std::iter::once("ToolSearch".to_string())
+            .chain(self.allowed_tools.iter().cloned())
+            .collect()
     }
 
     fn classify_tool_safety(
@@ -371,6 +448,59 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
         self.allowed_tools
             .contains(tool_name)
             .then(|| crate::ToolSafetyCategory::from_tool_name(tool_name))
+    }
+}
+
+fn scoped_tool_effect_descriptor(tool_name: &str) -> harness_contract::tool::ToolEffectDescriptor {
+    use harness_contract::policy::{PermissionOperation, PermissionResource, PermissionScope};
+    use harness_contract::tool::{
+        ToolApprovalClass, ToolEffectDescriptor, ToolEffectKind, ToolIdempotency,
+        ToolPermissionMode,
+    };
+
+    let safety = crate::ToolSafetyCategory::from_tool_name(tool_name);
+    let (effect_kind, idempotency, required_permission, scope, approval_class) = match safety {
+        crate::ToolSafetyCategory::ReadOnly => (
+            ToolEffectKind::Read,
+            ToolIdempotency::Idempotent,
+            ToolPermissionMode::ReadOnly,
+            PermissionScope::new(PermissionResource::File, PermissionOperation::Read),
+            ToolApprovalClass::None,
+        ),
+        crate::ToolSafetyCategory::WriteLocal => (
+            ToolEffectKind::Write,
+            ToolIdempotency::IdempotentWithKey,
+            ToolPermissionMode::WorkspaceWrite,
+            PermissionScope::new(PermissionResource::File, PermissionOperation::Write),
+            ToolApprovalClass::Policy,
+        ),
+        crate::ToolSafetyCategory::Network => (
+            ToolEffectKind::Network,
+            ToolIdempotency::Unknown,
+            ToolPermissionMode::DangerFullAccess,
+            PermissionScope::new(PermissionResource::Network, PermissionOperation::Execute),
+            ToolApprovalClass::Policy,
+        ),
+        crate::ToolSafetyCategory::Destructive => (
+            ToolEffectKind::Destructive,
+            ToolIdempotency::Unknown,
+            ToolPermissionMode::DangerFullAccess,
+            PermissionScope::new(PermissionResource::Tool, PermissionOperation::Execute),
+            ToolApprovalClass::User,
+        ),
+    };
+    ToolEffectDescriptor {
+        tool_id: tool_name.to_string(),
+        descriptor_hash: format!("delegated-agent:{tool_name}:{effect_kind:?}"),
+        effect_kind,
+        idempotency,
+        scopes: vec![scope],
+        required_permission,
+        approval_class,
+        uses_network: matches!(safety, crate::ToolSafetyCategory::Network),
+        spawns_process: matches!(safety, crate::ToolSafetyCategory::Destructive),
+        mutates_packages: false,
+        mutates_system: matches!(safety, crate::ToolSafetyCategory::Destructive),
     }
 }
 
@@ -451,6 +581,25 @@ mod tests {
         }
     }
 
+    struct EchoRuntimeExecutionHost;
+
+    impl crate::RuntimeExecutionHost for EchoRuntimeExecutionHost {
+        fn execute_runtime_tool(
+            &self,
+            request: &crate::RuntimeToolExecutionRequest,
+        ) -> crate::RuntimeToolExecutionOutcome {
+            crate::RuntimeToolExecutionOutcome {
+                tool_use_id: request.tool_use_id.clone(),
+                tool_name: request.tool_name.clone(),
+                status: crate::RuntimeToolExecutionStatus::Executed,
+                category: request.category,
+                output: Some(format!("authorized:{}", request.tool_name)),
+                error: None,
+                evidence_ref: format!("agent-tool:{}", request.tool_use_id),
+            }
+        }
+    }
+
     #[test]
     fn permission_policy_never_escalates_an_unspecified_lease() {
         let tools = BTreeSet::from(["write_file".to_string()]);
@@ -479,10 +628,53 @@ mod tests {
         assert!(executor.has_registered_tools());
         assert_eq!(
             executor.available_tool_names(),
-            vec!["grep_search".to_string(), "read_file".to_string()]
+            vec![
+                "ToolSearch".to_string(),
+                "grep_search".to_string(),
+                "read_file".to_string(),
+            ]
         );
         assert!(executor.classify_tool_safety("read_file", "{}").is_some());
         assert!(executor.classify_tool_safety("write_file", "{}").is_none());
+        let discovery: harness_contract::tool::ToolDiscoveryReceipt = serde_json::from_str(
+            &executor
+                .execute("ToolSearch", r#"{"query":"read"}"#)
+                .expect("bootstrap search should return the canonical receipt"),
+        )
+        .expect("canonical discovery receipt");
+        assert_eq!(discovery.query, "read");
+        assert_eq!(
+            discovery.activation_candidates,
+            vec!["grep_search", "read_file"]
+        );
+    }
+
+    #[test]
+    fn scoped_executor_requires_runtime_authorization_for_normal_agent_tools() {
+        let executor = ScopedRuntimeToolExecutor {
+            host: Arc::new(EchoRuntimeExecutionHost),
+            allowed_tools: BTreeSet::from(["read_file".to_string()]),
+            session_id: "session".to_string(),
+            model_lease: "model".to_string(),
+            execution_id: "graph".to_string(),
+            node_id: "node".to_string(),
+        };
+        let descriptor = executor
+            .describe_tool_effect("read_file", &serde_json::json!({"path": "README.md"}))
+            .expect("allow-listed delegated tool must describe its effect");
+        let authorization = crate::ToolPolicy
+            .authorize(&descriptor, "agent-test", PermissionMode::ReadOnly, 30)
+            .expect("read tool should be authorized")
+            .authorization;
+        assert_eq!(
+            executor
+                .execute_authorized(&authorization, "read_file", r#"{"path":"README.md"}"#)
+                .expect("authorized tool should execute"),
+            "authorized:read_file"
+        );
+        assert!(executor
+            .execute_authorized(&authorization, "write_file", r#"{"path":"README.md"}"#)
+            .is_err());
     }
 
     #[test]

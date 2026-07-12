@@ -47,13 +47,13 @@ use harness_contract::{
 use memory::cognitive::CognitiveContextManager;
 use memory::compression::session::{
     CompactionSourceRange, SessionCheckpointBuildContext, SessionCompactor,
+    SessionSemanticCheckpoint,
 };
 use memory::config::MemoryConfig as CcMemoryConfig;
 use memory::types::{Message as MemMessage, MessageRole as MemMessageRole};
 use memory::{MemoryKernel, MemoryTurnContext};
 use model_protocol::telemetry::SessionTracer;
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
 use tracing;
 
 use crate::budget_policy::{
@@ -87,7 +87,6 @@ use crate::tool_invocation::{
     now_ms, ToolFailureKind, ToolInvocationRecord, DEFAULT_OUTPUT_REF_MIN_LINES,
 };
 use crate::usage::{ModelPerformanceRegistry, ModelRouteIntent, UsageTracker};
-use crate::wave::{TaskId, TaskResult, WaveError, WaveExecutor, WaveTask};
 use crate::{RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore};
 use model_protocol::usage::TokenUsage;
 
@@ -499,35 +498,52 @@ fn rate_per_second(count: u64, duration_ms: u64) -> Option<f64> {
     Some(count as f64 / (duration_ms as f64 / 1_000.0))
 }
 
-fn tool_exposure_for_pattern(
-    pattern: harness_contract::core::ExecutionPattern,
-    available_ids: Vec<String>,
-    _schema_tokens: u64,
+fn bootstrap_tool_ids() -> [String; 2] {
+    ["ToolSearch".to_string(), "runtime_capabilities".to_string()]
+}
+
+fn tool_exposure_for_catalog(
+    discovery: &harness_contract::tool::ToolDiscoveryReceipt,
+    maximum_permission: harness_contract::tool::ToolPermissionMode,
 ) -> ToolExposureState {
-    let active_ids = match pattern {
-        harness_contract::core::ExecutionPattern::Direct => available_ids
+    let policy = ToolExposurePolicy {
+        allowed_ids: discovery
+            .descriptors
             .iter()
-            .filter(|id| matches!(id.as_str(), "ToolSearch" | "runtime_capabilities"))
-            .cloned()
+            .map(|descriptor| descriptor.canonical_id.clone())
             .collect(),
-        _ => available_ids.clone(),
+        maximum_permission,
+        supports_dynamic_exposure: true,
     };
-    let active = active_ids
+    ToolExposurePlanner.plan(discovery, bootstrap_tool_ids(), &policy)
+}
+
+fn fallback_tool_discovery_receipt(
+    mut available_ids: Vec<String>,
+) -> harness_contract::tool::ToolDiscoveryReceipt {
+    use harness_contract::tool::{
+        ToolDescriptorHealth, ToolDescriptorRef, ToolDiscoveryReceipt, ToolPermissionMode,
+    };
+
+    available_ids.sort();
+    available_ids.dedup();
+    let descriptors = available_ids
         .iter()
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>();
-    let deferred = available_ids
-        .into_iter()
-        .filter(|id| !active.contains(id))
+        .map(|id| ToolDescriptorRef {
+            canonical_id: id.clone(),
+            display_name: id.clone(),
+            source: "executor-fallback".to_string(),
+            schema_hash: format!("fallback:{id}"),
+            required_permission: ToolPermissionMode::ReadOnly,
+            permission_source: "executor-fallback".to_string(),
+            health: ToolDescriptorHealth::Healthy,
+        })
         .collect();
-    ToolExposureState {
-        catalog_revision: 1,
-        revision: 1,
-        bootstrap: active_ids.iter().cloned().collect(),
-        active,
-        deferred,
-        reason: format!("runtime execution pattern {}", pattern.as_str()),
-        fallback_full: false,
+    ToolDiscoveryReceipt {
+        query: "catalog-fallback".to_string(),
+        catalog_revision: 0,
+        descriptors,
+        activation_candidates: available_ids,
     }
 }
 
@@ -620,6 +636,13 @@ pub trait ApiClient {
 pub trait ToolExecutor: Send + Sync + 'static {
     fn execute(&self, tool_name: &str, input: &str) -> Result<String, ToolError>;
 
+    /// Production executors override this with a receipt from their pinned
+    /// ToolHost. The fallback is deliberately read-only for small embedded and
+    /// test executors that do not own a catalog.
+    fn tool_discovery_receipt(&self) -> harness_contract::tool::ToolDiscoveryReceipt {
+        fallback_tool_discovery_receipt(self.available_tool_names())
+    }
+
     fn describe_tool_effect(
         &self,
         _tool_name: &str,
@@ -632,9 +655,11 @@ pub trait ToolExecutor: Send + Sync + 'static {
         &self,
         _authorization: &harness_contract::tool::ToolExecutionAuthorization,
         tool_name: &str,
-        input: &str,
+        _input: &str,
     ) -> Result<String, ToolError> {
-        self.execute(tool_name, input)
+        Err(ToolError::new(format!(
+            "tool `{tool_name}` has no authorized execution implementation"
+        )))
     }
 
     fn has_registered_tools(&self) -> bool {
@@ -1632,40 +1657,53 @@ where
         });
     }
 
-    fn remember_context_turn_report(&self, report: ContextTurnReport) {
+    async fn remember_context_turn_report(
+        &self,
+        report: ContextTurnReport,
+    ) -> Result<(), RuntimeError> {
+        self.persist_context_turn_report(&report).await?;
         if let Ok(mut guard) = self.last_context_turn_report.lock() {
-            *guard = Some(report.clone());
+            *guard = Some(report);
         }
-        self.persist_context_turn_report(report);
+        Ok(())
     }
 
-    fn persist_context_turn_report(&self, report: ContextTurnReport) {
+    async fn persist_context_turn_report(
+        &self,
+        report: &ContextTurnReport,
+    ) -> Result<(), RuntimeError> {
         let Some(store) = self.session_store.as_ref() else {
-            return;
+            // Embedding callers may intentionally run without a durable
+            // session carrier. They receive the in-memory report but cannot
+            // claim restart/audit durability.
+            return Ok(());
         };
         let session_id = self.session().session_id;
         let payload = serde_json::json!({
             "type": "ContextTurnReport",
             "report": report,
         });
-        let store = Arc::clone(store);
-        tokio::spawn(async move {
-            let created_at_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_millis() as u64)
-                .unwrap_or(0);
-            let event = memory::SessionDomainEvent::new(
-                session_id.clone(),
-                0,
-                memory::SessionDomainScope::Context,
-                "context.turn_report",
-                payload,
-                created_at_ms,
-            );
-            if let Err(error) = store.append_session_domain_event(&event).await {
-                tracing::warn!(%error, session_id, "context turn report domain event append failed");
-            }
-        });
+        let created_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        let event = memory::SessionDomainEvent::new(
+            session_id.clone(),
+            0,
+            memory::SessionDomainScope::Context,
+            "context.turn_report",
+            payload,
+            created_at_ms,
+        );
+        store
+            .append_session_domain_event_allocating_sequence(&event)
+            .await
+            .map_err(|error| {
+                RuntimeError::new(format!(
+                    "context governance persistence failed for session `{session_id}`: {error}"
+                ))
+            })?;
+        Ok(())
     }
 
     fn finalize_context_prompt(
@@ -2519,12 +2557,30 @@ where
         }
 
         let inventory = self.api_client.context_inventory();
-        let available_tools = self.tool_executor.available_tool_names();
-        let exposure = tool_exposure_for_pattern(
-            decision.pattern(),
-            available_tools.clone(),
-            inventory.tool_schema_tokens,
-        );
+        let discovery = self.tool_executor.tool_discovery_receipt();
+        let available_tools = discovery
+            .descriptors
+            .iter()
+            .map(|descriptor| descriptor.canonical_id.clone())
+            .collect::<Vec<_>>();
+        let exposure = if first_step {
+            tool_exposure_for_catalog(
+                &discovery,
+                contract_permission_mode(self.permission_policy.active_mode()),
+            )
+        } else {
+            self.tool_exposure_state
+                .lock()
+                .ok()
+                .and_then(|state| state.clone())
+                .filter(|state| state.catalog_revision == discovery.catalog_revision)
+                .unwrap_or_else(|| {
+                    tool_exposure_for_catalog(
+                        &discovery,
+                        contract_permission_mode(self.permission_policy.active_mode()),
+                    )
+                })
+        };
         let mut exposure = if text_only_response || explicitly_forbids_tool_use {
             ToolExposureState {
                 catalog_revision: exposure.catalog_revision,
@@ -2669,8 +2725,14 @@ where
             // before persisting the assistant message or deciding the next
             // graph step. The Tool DAG remains the authority for execution.
             if !text_only_response && calls.is_empty() {
+                let visible_tools = exposure
+                    .bootstrap
+                    .iter()
+                    .chain(exposure.active.iter())
+                    .cloned()
+                    .collect::<Vec<_>>();
                 if let Some((clean_text, recovered_calls)) =
-                    trailing_declared_xml_tool_calls(&text, &available_tools)
+                    trailing_declared_xml_tool_calls(&text, &visible_tools)
                 {
                     text = clean_text;
                     calls = recovered_calls;
@@ -2940,7 +3002,7 @@ where
             failed_tools,
         );
         let compaction_started = Instant::now();
-        let auto_compaction = self.maybe_auto_compact().await;
+        let auto_compaction = self.maybe_auto_compact().await?;
         let compaction_elapsed = compaction_started.elapsed();
         let memory_started = Instant::now();
         if defer_post_turn_memory_maintenance {
@@ -2982,7 +3044,8 @@ where
             usage,
             auto_compaction.clone(),
         );
-        self.remember_context_turn_report(context_turn_report.clone());
+        self.remember_context_turn_report(context_turn_report.clone())
+            .await?;
         let mut assistant_messages = assistant_messages;
         if !matches!(
             terminal_completion,
@@ -3102,10 +3165,52 @@ where
         let timeout = self.tool_timeout.unwrap_or_else(|| {
             Duration::from_secs(crate::tool_execution_profile("checkpoint_create").timeout_secs)
         });
+        let checkpoint_value = match serde_json::from_str::<serde_json::Value>(&checkpoint_input) {
+            Ok(value) => value,
+            Err(error) => {
+                validation.allowed = false;
+                validation
+                    .findings
+                    .push(format!("checkpoint_input_invalid:{error}"));
+                return;
+            }
+        };
+        let Some(descriptor) =
+            executor.describe_tool_effect("checkpoint_create", &checkpoint_value)
+        else {
+            validation.allowed = false;
+            validation
+                .findings
+                .push("checkpoint_create_missing_effect_descriptor".to_string());
+            return;
+        };
+        let authorization = match crate::ToolPolicy.authorize(
+            &descriptor,
+            format!(
+                "{}:checkpoint:{}",
+                self.session().session_id,
+                execution_decision.lease.lease_id
+            ),
+            self.permission_policy.active_mode(),
+            timeout.as_secs(),
+        ) {
+            Ok(decision) => decision,
+            Err(error) => {
+                validation.allowed = false;
+                validation
+                    .findings
+                    .push(format!("checkpoint_authorization_denied:{error}"));
+                return;
+            }
+        };
         let result = tokio::time::timeout(
             timeout,
             tokio::task::spawn_blocking(move || {
-                executor.execute("checkpoint_create", &checkpoint_input)
+                executor.execute_authorized(
+                    &authorization.authorization,
+                    "checkpoint_create",
+                    &checkpoint_input,
+                )
             }),
         )
         .await;
@@ -3357,7 +3462,16 @@ where
                                 &tname,
                                 &tinput,
                             ),
-                            None => tool_exec.execute(&tname, &tinput),
+                            None if matches!(
+                                tname.as_str(),
+                                "ToolSearch" | "runtime_capabilities"
+                            ) =>
+                            {
+                                tool_exec.execute(&tname, &tinput)
+                            }
+                            None => Err(ToolError::new(format!(
+                                "tool `{tname}` is missing a Runtime authorization descriptor"
+                            ))),
                         }),
                     )
                     .await
@@ -3585,7 +3699,7 @@ where
     async fn execute_tool_schedule_batch(
         &self,
         batch: &crate::execution_scheduler::ExecutionBatch,
-        requests: &[crate::tool_dispatch::ToolRequest],
+        _requests: &[crate::tool_dispatch::ToolRequest],
         pending_tool_uses: &[(String, String, String)],
         prompter: &crate::permissions::SharedPrompter,
         iterations: usize,
@@ -3594,12 +3708,6 @@ where
     ) -> Result<(), RuntimeError> {
         match batch.mode {
             crate::execution_scheduler::ExecutionBatchMode::Wave => {
-                if self
-                    .execute_legacy_wave_batch_if_enabled(batch, requests, result_map)
-                    .await?
-                {
-                    return Ok(());
-                }
                 self.execute_tool_indices_serial_into_map(
                     &batch.indices,
                     pending_tool_uses,
@@ -3874,115 +3982,6 @@ where
         }
     }
 
-    async fn execute_legacy_wave_batch_if_enabled(
-        &self,
-        batch: &crate::execution_scheduler::ExecutionBatch,
-        requests: &[crate::tool_dispatch::ToolRequest],
-        result_map: &mut std::collections::HashMap<String, (ConversationMessage, Option<String>)>,
-    ) -> Result<bool, RuntimeError> {
-        if std::env::var("COWD_ENABLE_LEGACY_WAVE_READONLY")
-            .ok()
-            .as_deref()
-            != Some("1")
-        {
-            return Ok(false);
-        }
-        if !batch.indices.iter().all(|idx| {
-            requests
-                .get(*idx)
-                .map(|request| {
-                    !request.depends_on.is_empty()
-                        && self
-                            .tool_executor
-                            .classify_tool_safety(&request.tool_name, &request.input)
-                            .unwrap_or_else(|| {
-                                crate::classify_tool_request(&request.tool_name, &request.input)
-                            })
-                            == crate::tool_orchestrator::ToolSafetyCategory::ReadOnly
-                })
-                .unwrap_or(false)
-        }) {
-            return Ok(false);
-        }
-
-        let mut wave = crate::wave::WaveOrchestrator::new()
-            .with_config(crate::wave::WaveConfig::default().with_max_parallel(8));
-        for &idx in &batch.indices {
-            let Some(request) = requests.get(idx) else {
-                return Err(RuntimeError::new(format!(
-                    "wave batch referenced missing tool index {idx}"
-                )));
-            };
-            let Some(task) = self.detect_wave_task(request) else {
-                return Ok(false);
-            };
-            wave.add_task(task);
-        }
-        wave.build_waves()
-            .map_err(|error: crate::wave::WaveError| RuntimeError::new(error.to_string()))?;
-
-        let wave_exec = ToolWaveExecutor::new(Arc::clone(&self.tool_executor));
-        let wave_results = wave
-            .execute(wave_exec)
-            .await
-            .map_err(|error: crate::wave::WaveError| RuntimeError::new(error.to_string()))?;
-
-        for wave_result in wave_results {
-            for tool_result in wave_result.task_results {
-                let tool_use_id = tool_result.task_id.0.clone();
-                let tool_name = requests
-                    .iter()
-                    .find(|request| request.tool_use_id == tool_use_id)
-                    .map_or("unknown", |request| request.tool_name.as_str())
-                    .to_string();
-                let output = tool_result
-                    .output
-                    .clone()
-                    .unwrap_or_else(|| tool_result.error.clone().unwrap_or_default());
-                let result_msg = ConversationMessage::tool_result(
-                    tool_use_id.clone(),
-                    tool_name,
-                    output,
-                    !tool_result.success,
-                );
-                self.session
-                    .write()
-                    .await
-                    .push_message(result_msg.clone())
-                    .map_err(|error| RuntimeError::new(error.to_string()))?;
-                self.dual_write_message(&result_msg, self.session().messages.len().wrapping_sub(1));
-                let (id, message) = self.collect_tool_result_message(result_msg);
-                result_map.insert(id, message);
-            }
-        }
-        Ok(true)
-    }
-
-    /// T7: Detect whether a [`ToolRequest`] should be executed via wave orchestration.
-    ///
-    /// Returns `Some(WaveTask)` when the request has dependency constraints,
-    /// converting the tool-use ID, tool name, and input into a wave-compatible payload.
-    fn detect_wave_task(&self, req: &crate::tool_dispatch::ToolRequest) -> Option<WaveTask> {
-        if req.depends_on.is_empty() {
-            return None;
-        }
-        let payload = serde_json::json!({
-            "tool_name": &req.tool_name,
-            "input": &req.input,
-        });
-        let safety_cat = self
-            .tool_executor
-            .classify_tool_safety(&req.tool_name, &req.input)
-            .unwrap_or_else(|| crate::classify_tool_request(&req.tool_name, &req.input));
-        let mut task = WaveTask::new(&req.tool_use_id, &req.tool_name)
-            .with_payload(payload)
-            .with_safety_category(safety_cat);
-        for dep in &req.depends_on {
-            task = task.with_dependency(TaskId::new(dep));
-        }
-        Some(task)
-    }
-
     #[must_use]
     pub fn compact(&self, config: CompactionConfig) -> CompactionResult {
         compact_session(&*self.session.blocking_read(), config)
@@ -4109,14 +4108,14 @@ where
             .unwrap_or_else(|arc| arc.blocking_read().clone())
     }
 
-    async fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
+    async fn maybe_auto_compact(&mut self) -> Result<Option<AutoCompactionEvent>, RuntimeError> {
         // Use the session's estimated token count directly, not the cumulative
         // usage tracker which spans across multiple sessions and doesn't
         // reflect the current conversation window pressure.
         let session_tokens = estimate_session_tokens(&*self.session.read().await);
 
         if session_tokens < self.auto_compaction_input_tokens_threshold as usize {
-            return None;
+            return Ok(None);
         }
 
         self.compact_session_with_checkpoint(self.compaction_config_for_session(0))
@@ -4126,12 +4125,12 @@ where
     async fn compact_session_with_checkpoint(
         &mut self,
         config: CompactionConfig,
-    ) -> Option<AutoCompactionEvent> {
+    ) -> Result<Option<AutoCompactionEvent>, RuntimeError> {
         let original_session = self.session.read().await.clone();
         let result = compact_session(&original_session, config);
 
         if result.removed_message_count == 0 {
-            return None;
+            return Ok(None);
         }
 
         let source_messages = compacted_source_messages(
@@ -4232,12 +4231,13 @@ where
             receipt
         });
 
+        let checkpoint_for_event = checkpoint.clone();
         if let (Some(mgr), Some(checkpoint), Some(receipt_mut)) =
-            (&self.memory_manager, checkpoint, receipt.as_mut())
+            (&self.memory_manager, checkpoint.as_ref(), receipt.as_mut())
         {
             let ctx = self.memory_turn_context("primary");
             let kernel = MemoryKernel::new(Arc::clone(mgr));
-            match kernel.checkpoint_compaction(&ctx, checkpoint).await {
+            match kernel.checkpoint_compaction(&ctx, checkpoint.clone()).await {
                 Ok(memory_receipt) => {
                     receipt_mut.retained_artifact_ids.extend(
                         memory_receipt
@@ -4276,13 +4276,18 @@ where
         tracing::info!(removed = result.removed_message_count, "compaction");
         let compacted_len = result.compacted_session.messages.len();
         let compaction = result.compacted_session.compaction.clone();
+        self.record_session_compacted(
+            compaction,
+            compacted_len,
+            receipt.clone(),
+            checkpoint_for_event,
+        )
+        .await?;
         *self.session.write().await = result.compacted_session;
-        self.record_session_compacted(compaction, compacted_len, receipt.clone())
-            .await;
-        Some(AutoCompactionEvent {
+        Ok(Some(AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
             compaction_receipt: receipt,
-        })
+        }))
     }
 
     fn compaction_config_for_session(&self, max_estimated_tokens: usize) -> CompactionConfig {
@@ -4299,21 +4304,14 @@ where
         compaction: Option<crate::session::SessionCompaction>,
         sequence: usize,
         receipt: Option<CompactionReceipt>,
-    ) {
-        if let Some(ref log) = self.event_log {
-            if let Ok(mut guard) = log.lock() {
-                guard.push(MessageEvent::MessagesTruncated { sequence });
-                if let Some(compaction) = compaction.clone() {
-                    guard.push(MessageEvent::SessionCompacted { compaction });
-                }
-            }
-        }
-
+        semantic_checkpoint: Option<SessionSemanticCheckpoint>,
+    ) -> Result<(), RuntimeError> {
         let Some(compaction) = compaction else {
-            return;
+            return Ok(());
         };
         let Some(store) = self.session_store.as_ref() else {
-            return;
+            self.record_local_compaction_event(compaction, sequence);
+            return Ok(());
         };
         let session_id = self.session().session_id;
         let payload = serde_json::json!({
@@ -4341,37 +4339,48 @@ where
         {
             Ok(event) => event,
             Err(error) => {
-                tracing::warn!(%error, session_id, "canonical compaction domain event append failed");
-                return;
+                return Err(RuntimeError::new(format!(
+                    "canonical compaction persistence failed for session `{session_id}`: {error}"
+                )));
             }
         };
-        if let Some(receipt) = context_event
-            .payload
-            .get("receipt")
-            .filter(|receipt| !receipt.is_null())
-        {
-            if receipt
-                .get("retained_artifact_ids")
-                .and_then(|ids| ids.as_array())
-                .is_some_and(|ids| !ids.is_empty())
+        if let Some(checkpoint) = semantic_checkpoint {
+            let memory_event = memory::SessionDomainEvent::new(
+                session_id.clone(),
+                0,
+                memory::SessionDomainScope::Memory,
+                "memory.semantic_checkpoint.created",
+                serde_json::json!({
+                    "source": "conversation_runtime.compaction",
+                    "compaction_event_sequence": persisted.sequence,
+                    "checkpoint": checkpoint,
+                    "receipt": receipt,
+                }),
+                created_at_ms,
+            );
+            if let Err(error) = store
+                .append_session_domain_event_allocating_sequence(&memory_event)
+                .await
             {
-                let memory_event = memory::SessionDomainEvent::new(
-                    session_id.clone(),
-                    0,
-                    memory::SessionDomainScope::Memory,
-                    "memory.semantic_checkpoint.created",
-                    serde_json::json!({
-                        "source": "conversation_runtime.compaction",
-                        "receipt": receipt,
-                    }),
-                    created_at_ms,
-                );
-                if let Err(error) = store
-                    .append_session_domain_event_allocating_sequence(&memory_event)
-                    .await
-                {
-                    tracing::warn!(%error, session_id, event_sequence = persisted.sequence, "semantic checkpoint domain event append failed");
-                }
+                return Err(RuntimeError::new(format!(
+                    "semantic checkpoint persistence failed for session `{session_id}` after compaction event {}: {error}",
+                    persisted.sequence
+                )));
+            }
+        }
+        self.record_local_compaction_event(compaction, sequence);
+        Ok(())
+    }
+
+    fn record_local_compaction_event(
+        &self,
+        compaction: crate::session::SessionCompaction,
+        sequence: usize,
+    ) {
+        if let Some(ref log) = self.event_log {
+            if let Ok(mut guard) = log.lock() {
+                guard.push(MessageEvent::MessagesTruncated { sequence });
+                guard.push(MessageEvent::SessionCompacted { compaction });
             }
         }
     }
@@ -5257,7 +5266,7 @@ where
             return (evidence_ref, None);
         };
         let session_id = self.session().session_id;
-        let payload = serde_json::json!({
+        let metadata = serde_json::json!({
             "type": "ToolObservationRaw",
             "evidence_id": evidence_id,
             "session_id": session_id,
@@ -5268,38 +5277,23 @@ where
             "duration_ms": duration_ms,
             "line_count": output.lines().count(),
             "byte_count": output.len(),
-            "content_hash": format!("{content_hash:016x}"),
             "source_evidence_ref": source_evidence_ref,
-            "raw": output,
         });
-        let created_at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as u64)
-            .unwrap_or(0);
-        let mut event = memory::SessionDomainEvent::new(
-            session_id.clone(),
-            0,
-            memory::SessionDomainScope::Tool,
-            "tool.observation.raw",
-            payload,
-            created_at_ms,
+        let facade = crate::context_evidence::raw::RawEvidenceFacade::new(
+            crate::context_evidence::raw::SessionStoreRawEvidenceStore::new(Arc::clone(store)),
         );
-        event.status = Some(if is_error { "failed" } else { "completed" }.to_string());
-        event.refs.push(memory::SessionDomainRef {
-            ref_type: "tool_call".to_string(),
-            id: tool_use_id.to_string(),
-            label: Some(tool_name.to_string()),
-        });
-        event.refs.push(memory::SessionDomainRef {
-            ref_type: "evidence".to_string(),
-            id: evidence_id.clone(),
-            label: Some("raw".to_string()),
-        });
-        let persisted = match store
-            .append_session_domain_event_allocating_sequence(&event)
+        let access = match facade
+            .persist(crate::context_evidence::raw::RawEvidenceWrite {
+                evidence_ref: evidence_ref.clone(),
+                session_id: session_id.clone(),
+                media_type: "text/plain; charset=utf-8".to_string(),
+                visibility_scope: format!("session:{session_id}"),
+                payload: output.as_bytes().to_vec(),
+                metadata,
+            })
             .await
         {
-            Ok(event) => event,
+            Ok(access) => access,
             Err(error) => {
                 tracing::warn!(
                     %error,
@@ -5310,14 +5304,6 @@ where
                 return (evidence_ref, None);
             }
         };
-        let access = EvidenceAccessRef::durable(
-            evidence_ref.clone(),
-            format!("sha256:{:x}", Sha256::digest(output.as_bytes())),
-            output.len() as u64,
-            "text/plain; charset=utf-8",
-            format!("session-event://{session_id}/{}", persisted.sequence),
-            format!("session:{session_id}"),
-        );
         if let Ok(mut ledger) = self.turn_context_ledger.lock() {
             let _ = ledger.register_evidence_hash(evidence_id);
         }
@@ -6349,99 +6335,87 @@ impl ToolExecutor for StaticToolExecutor {
             .ok_or_else(|| ToolError::new(format!("unknown tool: {tool_name}")))?(input)
     }
 
+    fn describe_tool_effect(
+        &self,
+        tool_name: &str,
+        _input: &serde_json::Value,
+    ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
+        use harness_contract::policy::{PermissionOperation, PermissionResource, PermissionScope};
+        use harness_contract::tool::{
+            ToolApprovalClass, ToolEffectDescriptor, ToolEffectKind, ToolIdempotency,
+            ToolPermissionMode,
+        };
+
+        self.handlers.contains_key(tool_name).then(|| {
+            let safety = crate::tool_orchestrator::ToolSafetyCategory::from_tool_name(tool_name);
+            let (effect_kind, required_permission, scope, approval_class) = match safety {
+                crate::tool_orchestrator::ToolSafetyCategory::ReadOnly => (
+                    ToolEffectKind::Read,
+                    ToolPermissionMode::ReadOnly,
+                    PermissionScope::new(PermissionResource::File, PermissionOperation::Read),
+                    ToolApprovalClass::None,
+                ),
+                crate::tool_orchestrator::ToolSafetyCategory::WriteLocal => (
+                    ToolEffectKind::Write,
+                    ToolPermissionMode::WorkspaceWrite,
+                    PermissionScope::new(PermissionResource::File, PermissionOperation::Write),
+                    ToolApprovalClass::Policy,
+                ),
+                crate::tool_orchestrator::ToolSafetyCategory::Network => (
+                    ToolEffectKind::Network,
+                    ToolPermissionMode::DangerFullAccess,
+                    PermissionScope::new(PermissionResource::Network, PermissionOperation::Execute),
+                    ToolApprovalClass::Policy,
+                ),
+                crate::tool_orchestrator::ToolSafetyCategory::Destructive => (
+                    ToolEffectKind::Destructive,
+                    ToolPermissionMode::DangerFullAccess,
+                    PermissionScope::new(PermissionResource::Tool, PermissionOperation::Execute),
+                    ToolApprovalClass::User,
+                ),
+            };
+            ToolEffectDescriptor {
+                tool_id: tool_name.to_string(),
+                descriptor_hash: format!("static:{tool_name}:{effect_kind:?}"),
+                effect_kind,
+                idempotency: ToolIdempotency::Unknown,
+                scopes: vec![scope],
+                required_permission,
+                approval_class,
+                uses_network: matches!(
+                    safety,
+                    crate::tool_orchestrator::ToolSafetyCategory::Network
+                ),
+                spawns_process: false,
+                mutates_packages: false,
+                mutates_system: matches!(
+                    safety,
+                    crate::tool_orchestrator::ToolSafetyCategory::Destructive
+                ),
+            }
+        })
+    }
+
+    fn execute_authorized(
+        &self,
+        authorization: &harness_contract::tool::ToolExecutionAuthorization,
+        tool_name: &str,
+        input: &str,
+    ) -> Result<String, ToolError> {
+        if authorization.tool_id != tool_name {
+            return Err(ToolError::new(
+                "static tool authorization names a different tool",
+            ));
+        }
+        self.execute(tool_name, input)
+    }
+
     fn has_registered_tools(&self) -> bool {
         !self.handlers.is_empty()
     }
 
     fn available_tool_names(&self) -> Vec<String> {
         self.handlers.keys().cloned().collect()
-    }
-}
-
-/// T7: Wave executor adapter that bridges WaveOrchestrator to ToolExecutor.
-///
-/// Each [`WaveTask`] payload is expected to contain `{"tool_name": "...", "input": "..."}`.
-struct ToolWaveExecutor<T: ToolExecutor> {
-    tool_exec: Arc<T>,
-}
-
-impl<T: ToolExecutor> ToolWaveExecutor<T> {
-    fn new(tool_exec: Arc<T>) -> Self {
-        Self { tool_exec }
-    }
-}
-
-impl<T: ToolExecutor> WaveExecutor for ToolWaveExecutor<T> {
-    fn execute(
-        self: Arc<Self>,
-        task: WaveTask,
-        _context: crate::wave::TaskContext,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TaskResult, WaveError>> + Send>>
-    {
-        let tool_exec = Arc::clone(&self.tool_exec);
-        let task_id = task.id.clone();
-        let tool_name = task
-            .payload
-            .get("tool_name")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&task.name)
-            .to_string();
-        let input = task
-            .payload
-            .get("input")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        let tool_timeout = Duration::from_secs(
-            tool_exec
-                .classify_tool_safety(&tool_name, &input)
-                .unwrap_or_else(|| crate::classify_tool_request(&tool_name, &input))
-                .default_timeout_secs(),
-        );
-        let timeout_tool_name = tool_name.clone();
-        Box::pin(async move {
-            let start = std::time::Instant::now();
-            let raw = tokio::time::timeout(
-                tool_timeout,
-                tokio::task::spawn_blocking(move || tool_exec.execute(&tool_name, &input)),
-            )
-            .await;
-            let duration_ms = start.elapsed().as_millis() as u64;
-            match raw {
-                Ok(Ok(Ok(output))) => Ok(TaskResult {
-                    task_id,
-                    success: true,
-                    output: Some(output),
-                    error: None,
-                    duration_ms,
-                }),
-                Ok(Ok(Err(e))) => Ok(TaskResult {
-                    task_id,
-                    success: false,
-                    output: None,
-                    error: Some(e.to_string()),
-                    duration_ms,
-                }),
-                Ok(Err(e)) => Ok(TaskResult {
-                    task_id,
-                    success: false,
-                    output: None,
-                    error: Some(format!("tool panicked: {e}")),
-                    duration_ms: 0,
-                }),
-                Err(_elapsed) => {
-                    tracing::warn!(tool = %timeout_tool_name, timeout_secs = tool_timeout.as_secs(), "wave tool execution timed out");
-                    Ok(TaskResult {
-                        task_id,
-                        success: false,
-                        output: None,
-                        error: Some(format!("tool timed out after {:?}", tool_timeout)),
-                        duration_ms: 0,
-                    })
-                }
-            }
-        })
     }
 }
 
@@ -7133,7 +7107,11 @@ mod tests {
         }
 
         fn available_tool_names(&self) -> Vec<String> {
-            vec!["read_file".to_string(), "grep_search".to_string()]
+            vec![
+                "ToolSearch".to_string(),
+                "read_file".to_string(),
+                "grep_search".to_string(),
+            ]
         }
     }
 
@@ -7165,8 +7143,140 @@ mod tests {
         let projections = projections.lock().unwrap();
         assert_eq!(projections.len(), 2);
         assert!(projections[0].active_ids.is_empty());
-        assert_eq!(projections[0].deferred_ids.len(), 2);
-        assert!(!projections[1].active_ids.is_empty());
+        assert_eq!(projections[0].deferred_ids.len(), 3);
+        assert_eq!(projections[1].active_ids, vec!["ToolSearch"]);
+        assert!(projections[1]
+            .deferred_ids
+            .contains(&"read_file".to_string()));
+    }
+
+    #[derive(Clone)]
+    struct DynamicExposureApi {
+        requests: Arc<std::sync::atomic::AtomicUsize>,
+        projections: Arc<std::sync::Mutex<Vec<harness_contract::tool::ToolExposureProjection>>>,
+    }
+
+    impl ApiClient for DynamicExposureApi {
+        fn stream(
+            &mut self,
+            _request: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            let request = self
+                .requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if request == 0 {
+                Box::pin(futures::stream::iter(vec![
+                    Ok(AssistantEvent::ToolUse {
+                        id: "discover-1".to_string(),
+                        name: "ToolSearch".to_string(),
+                        input: r#"{"query":"read files"}"#.to_string(),
+                    }),
+                    Ok(AssistantEvent::MessageStop),
+                ]))
+            } else {
+                Box::pin(futures::stream::iter(vec![
+                    Ok(AssistantEvent::TextDelta("discovery complete".to_string())),
+                    Ok(AssistantEvent::MessageStop),
+                ]))
+            }
+        }
+
+        fn configure_tool_exposure(
+            &mut self,
+            projection: harness_contract::tool::ToolExposureProjection,
+        ) {
+            self.projections.lock().unwrap().push(projection);
+        }
+    }
+
+    struct DynamicExposureToolExecutor;
+
+    impl crate::ToolExecutor for DynamicExposureToolExecutor {
+        fn execute(&self, name: &str, _input: &str) -> Result<String, crate::ToolError> {
+            if name != "ToolSearch" {
+                return Err(crate::ToolError::new(
+                    "only bootstrap discovery is executable",
+                ));
+            }
+            Ok(serde_json::json!({
+                "query": "read files",
+                "catalog_revision": 0,
+                "descriptors": [{
+                    "canonical_id": "read_file",
+                    "display_name": "read_file",
+                    "source": "test",
+                    "schema_hash": "read-v1",
+                    "required_permission": "read_only",
+                    "permission_source": "test",
+                    "health": "healthy"
+                }],
+                "activation_candidates": ["read_file"]
+            })
+            .to_string())
+        }
+
+        fn available_tool_names(&self) -> Vec<String> {
+            vec!["ToolSearch".to_string(), "read_file".to_string()]
+        }
+
+        fn classify_tool_safety(
+            &self,
+            name: &str,
+            _input: &str,
+        ) -> Option<crate::tool_orchestrator::ToolSafetyCategory> {
+            (name == "ToolSearch").then_some(crate::tool_orchestrator::ToolSafetyCategory::ReadOnly)
+        }
+    }
+
+    #[tokio::test]
+    async fn dynamic_tool_exposure_defers_schema_until_discovery_activation() {
+        let projections = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let api = DynamicExposureApi {
+            requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            projections: Arc::clone(&projections),
+        };
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            api,
+            DynamicExposureToolExecutor,
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+
+        let first = runtime
+            .execute_model_step("inspect files", true)
+            .await
+            .expect("first model step");
+        let ModelStepIntent::ToolCalls { calls } = first.intent else {
+            panic!("first request must invoke ToolSearch");
+        };
+        let batch = runtime
+            .execute_tool_batch_step(&calls, &crate::SharedPrompter::none(), 1)
+            .await
+            .expect("ToolSearch execution");
+        assert_eq!(batch.failed, 0, "ToolSearch batch must succeed: {batch:?}");
+        assert!(
+            runtime
+                .tool_exposure_state
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|state| state.active.contains("read_file")),
+            "ToolSearch must activate read_file before the following provider request"
+        );
+        runtime
+            .execute_model_step("inspect files", false)
+            .await
+            .expect("second model step");
+
+        let projections = projections.lock().unwrap();
+        assert_eq!(projections.len(), 2);
+        assert_eq!(projections[0].catalog_revision, 0);
+        assert_eq!(projections[0].active_ids, vec!["ToolSearch"]);
+        assert_eq!(projections[0].deferred_ids, vec!["read_file"]);
+        assert!(projections[1].active_ids.contains(&"read_file".to_string()));
+        assert!(projections[1].exposure_revision > projections[0].exposure_revision);
     }
 
     #[tokio::test]
@@ -7235,7 +7345,7 @@ mod tests {
             .await
             .expect("durable tool evidence");
         assert!(events.events.iter().any(|event| {
-            event.kind == "tool.observation.raw"
+            event.kind == "evidence.raw.persisted"
                 && event.payload.get("raw").and_then(serde_json::Value::as_str)
                     == Some(raw.as_str())
         }));
@@ -7243,6 +7353,153 @@ mod tests {
         assert_eq!(audit.len(), 1);
         assert!(audit[0].access.is_some());
         assert!(audit[0].omitted_tokens > 0);
+    }
+
+    #[tokio::test]
+    async fn governed_tool_result_never_publishes_durable_access_after_raw_store_failure() {
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory()
+        // No matching SessionRecord is created: the SessionStore adapter must
+        // fail instead of fabricating an evidence receipt.
+        .with_session_store(Arc::new(
+            memory::UnifiedSessionStore::open_in_memory().unwrap(),
+        ));
+        let raw = "raw output that must remain inline when the durable write fails";
+
+        let result = runtime
+            .prepare_governed_tool_result(
+                "raw-failure-1",
+                "read_file",
+                r#"{"path":"README.md"}"#,
+                raw,
+                false,
+            )
+            .await;
+        let output = result
+            .blocks
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::ToolResult { output, .. } => Some(output),
+                _ => None,
+            })
+            .expect("fallback still produces a model-visible tool result");
+        assert!(output.contains("Raw evidence persistence is unavailable"));
+        assert!(output.contains(raw));
+        let audit = runtime.turn_evidence_audits();
+        assert_eq!(audit.len(), 1);
+        assert!(audit[0].access.is_none());
+        assert!(!audit[0].raw_available);
+    }
+
+    #[tokio::test]
+    async fn context_turn_report_is_durable_before_runtime_exposes_it() {
+        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        let session = Session::new();
+        let session_id = session.session_id.clone();
+        store
+            .create_session(&memory::SessionRecord {
+                session_id: session_id.clone(),
+                platform: "test".to_string(),
+                chat_id: "context-report".to_string(),
+                user_id: None,
+                model: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                last_activity: "2026-01-01T00:00:00Z".to_string(),
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .unwrap();
+        let runtime = ConversationRuntime::new(
+            session,
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory()
+        .with_session_store(Arc::clone(&store));
+        let report = runtime.build_context_turn_report("turn-durable", TokenUsage::default(), None);
+
+        runtime
+            .remember_context_turn_report(report.clone())
+            .await
+            .expect("report persistence must finish before exposure");
+        assert_eq!(runtime.last_context_turn_report(), Some(report.clone()));
+        let events = store
+            .session_domain_events_page(&session_id, 0, 20)
+            .await
+            .expect("report event");
+        assert!(events.events.iter().any(|event| {
+            event.kind == "context.turn_report"
+                && event.payload.get("report") == Some(&serde_json::to_value(&report).unwrap())
+        }));
+    }
+
+    #[tokio::test]
+    async fn context_turn_report_write_failure_does_not_expose_a_successful_report() {
+        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory()
+        .with_session_store(store);
+        let report = runtime.build_context_turn_report("turn-failure", TokenUsage::default(), None);
+
+        let error = runtime
+            .remember_context_turn_report(report)
+            .await
+            .expect_err("a foreign-key persistence failure must fail the terminal report path");
+        assert!(error
+            .to_string()
+            .contains("context governance persistence failed"));
+        assert_eq!(runtime.last_context_turn_report(), None);
+    }
+
+    #[tokio::test]
+    async fn compaction_event_failure_is_terminal_and_does_not_claim_durable_recovery() {
+        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory()
+        .with_session_store(store);
+
+        let error = runtime
+            .record_session_compacted(
+                Some(crate::session::SessionCompaction {
+                    count: 1,
+                    removed_message_count: 3,
+                    summary: "durability must precede local compaction".to_string(),
+                }),
+                3,
+                None,
+                None,
+            )
+            .await
+            .expect_err("missing session carrier must reject canonical compaction persistence");
+        assert!(error
+            .to_string()
+            .contains("canonical compaction persistence failed"));
     }
 
     #[test]

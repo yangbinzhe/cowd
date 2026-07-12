@@ -920,6 +920,7 @@ mod tests {
                 scope: Vec::new(),
                 context_lens: Vec::new(),
                 evidence_refs: Vec::new(),
+                context_budget_lease: None,
                 permission_lease: "test".to_string(),
                 deadline_at_ms: None,
                 priority: 1,

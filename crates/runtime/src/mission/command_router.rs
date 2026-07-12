@@ -200,8 +200,12 @@ async fn submit_session_handoff(
         return Err("handoff requires source session, objective, and correlation id".to_string());
     }
     for reference in &command.evidence_refs {
-        if !handoff.evidence_refs.contains(reference) {
-            handoff.evidence_refs.push(reference.clone());
+        let reference = harness_contract::turn::opaque_session_evidence_ref(
+            &handoff.source_session_id,
+            reference,
+        );
+        if !handoff.evidence_refs.contains(&reference) {
+            handoff.evidence_refs.push(reference);
         }
     }
     let action = if matches!(command.action, MissionCommandAction::Replan) {

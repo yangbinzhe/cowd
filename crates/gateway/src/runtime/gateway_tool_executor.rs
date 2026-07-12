@@ -408,6 +408,22 @@ impl GatewayToolExecutor {
 }
 
 impl ToolExecutor for GatewayToolExecutor {
+    fn tool_discovery_receipt(&self) -> harness_contract::tool::ToolDiscoveryReceipt {
+        let lease = self.tool_host.pin_snapshot();
+        let mut receipt = lease.catalog_receipt();
+        if let Some(allowed) = self.allowed_tools.as_ref() {
+            receipt
+                .descriptors
+                .retain(|descriptor| allowed.contains(&descriptor.canonical_id));
+            receipt.activation_candidates = receipt
+                .descriptors
+                .iter()
+                .map(|descriptor| descriptor.canonical_id.clone())
+                .collect();
+        }
+        receipt
+    }
+
     fn execute(&self, tool_name: &str, input: &str) -> Result<String, ToolError> {
         if self
             .allowed_tools
@@ -425,31 +441,9 @@ impl ToolExecutor for GatewayToolExecutor {
         } else if is_gateway_runtime_control_tool(tool_name) {
             self.execute_runtime_tool(tool_name, value)
         } else {
-            let lease = self.tool_host.pin_snapshot();
-            let effect = lease.describe_effect(tool_name, &value);
-            runtime::ToolPolicy
-                .authorize(
-                    &effect,
-                    format!(
-                        "gateway:{tool_name}:{}",
-                        chrono::Utc::now().timestamp_micros()
-                    ),
-                    runtime::PermissionMode::DangerFullAccess,
-                    300,
-                )
-                .map_err(|error| ToolError::new(error.to_string()))
-                .and_then(|decision| {
-                    let output = lease
-                        .execute(&decision.authorization, tool_name, &value)
-                        .map_err(|error| ToolError::new(error.to_string()))?;
-                    if tool_name.starts_with("mcp__") {
-                        let receipt: serde_json::Value = serde_json::from_str(&output)
-                            .map_err(|error| ToolError::new(error.to_string()))?;
-                        return serde_json::to_string_pretty(&receipt["output"])
-                            .map_err(|error| ToolError::new(error.to_string()));
-                    }
-                    Ok(output)
-                })
+            Err(ToolError::new(format!(
+                "ordinary tool `{tool_name}` requires Runtime authorization"
+            )))
         };
         match result {
             Ok(output) => {

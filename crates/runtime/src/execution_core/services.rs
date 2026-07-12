@@ -797,7 +797,11 @@ impl RuntimeServices {
                 acceptance: Vec::new(),
                 scope: vec![format!("mission-schedule:{}", fire.schedule_id)],
                 context_lens: Vec::new(),
-                evidence_refs: vec![format!("schedule-fire:{}", fire.fire_id)],
+                evidence_refs: vec![harness_contract::turn::opaque_session_evidence_ref(
+                    &format!("mission:{}", fire.schedule_id),
+                    format!("schedule-fire:{}", fire.fire_id),
+                )],
+                context_budget_lease: None,
                 permission_lease: fire.permission_lease.clone(),
                 deadline_at_ms: None,
                 priority: fire.priority,
