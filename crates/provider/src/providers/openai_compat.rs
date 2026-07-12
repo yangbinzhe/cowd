@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -301,7 +301,11 @@ impl OpenAiCompatClient {
                             error,
                         )
                     })?;
-                normalize_chat_completion_response(&request.model, payload)?
+                normalize_chat_completion_response(
+                    &request.model,
+                    payload,
+                    request.tools.as_deref().unwrap_or_default(),
+                )?
             }
             OpenAiWireProtocol::Responses => {
                 let payload =
@@ -340,7 +344,10 @@ impl OpenAiCompatClient {
             ),
             pending: VecDeque::new(),
             done: false,
-            state: StreamState::new(request.model.clone()),
+            state: StreamState::new(
+                request.model.clone(),
+                request.tools.as_deref().unwrap_or_default(),
+            ),
         })
     }
 
@@ -580,10 +587,17 @@ struct StreamState {
     stop_reason: Option<String>,
     usage: Option<Usage>,
     tool_calls: BTreeMap<u32, ToolCallState>,
+    /// Some OpenAI-compatible services render an otherwise valid function
+    /// call as XML in `delta.content`, instead of populating `tool_calls`.
+    /// Hold only a leading tool-shaped response until the end of the message
+    /// so it can be decoded under the same declared-tool boundary as native
+    /// calls. Ordinary text is released immediately after its first prefix.
+    deferred_xml_text: Option<String>,
+    exposed_tool_names: BTreeSet<String>,
 }
 
 impl StreamState {
-    fn new(model: String) -> Self {
+    fn new(model: String, tools: &[ToolDefinition]) -> Self {
         Self {
             model,
             message_started: false,
@@ -595,6 +609,8 @@ impl StreamState {
             stop_reason: None,
             usage: None,
             tool_calls: BTreeMap::new(),
+            deferred_xml_text: None,
+            exposed_tool_names: tools.iter().map(|tool| tool.name.clone()).collect(),
         }
     }
 
@@ -667,26 +683,7 @@ impl StreamState {
             }
 
             if let Some(content) = choice.delta.content.filter(|value| !value.is_empty()) {
-                // Close the reasoning block if it was started before the visible content.
-                if self.reasoning_started && !self.reasoning_finished {
-                    self.reasoning_finished = true;
-                    events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                        index: 0,
-                    }));
-                }
-                if !self.text_started {
-                    self.text_started = true;
-                    events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
-                        index: self.reasoning_started as u32,
-                        content_block: OutputContentBlock::Text {
-                            text: String::new(),
-                        },
-                    }));
-                }
-                events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
-                    index: self.reasoning_started as u32,
-                    delta: ContentBlockDelta::TextDelta { text: content },
-                }));
+                self.ingest_text_content(content, &mut events);
             }
 
             for tool_call in choice.delta.tool_calls {
@@ -744,6 +741,8 @@ impl StreamState {
                 index: 0,
             }));
         }
+        self.finish_deferred_xml_text(&mut events);
+
         if self.text_started && !self.text_finished {
             self.text_finished = true;
             events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
@@ -789,6 +788,76 @@ impl StreamState {
             events.push(StreamEvent::MessageStop(MessageStopEvent {}));
         }
         Ok(events)
+    }
+
+    fn ingest_text_content(&mut self, content: String, events: &mut Vec<StreamEvent>) {
+        if self.exposed_tool_names.is_empty() || self.text_started {
+            self.emit_text_content(content, events);
+            return;
+        }
+
+        let deferred = self.deferred_xml_text.get_or_insert_with(String::new);
+        deferred.push_str(&content);
+        if !is_xml_tool_call_prefix(deferred) {
+            let text = self.deferred_xml_text.take().expect("deferred text exists");
+            self.emit_text_content(text, events);
+        }
+    }
+
+    fn emit_text_content(&mut self, content: String, events: &mut Vec<StreamEvent>) {
+        // Close the reasoning block if it was started before visible content.
+        if self.reasoning_started && !self.reasoning_finished {
+            self.reasoning_finished = true;
+            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                index: 0,
+            }));
+        }
+        if !self.text_started {
+            self.text_started = true;
+            events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                index: self.reasoning_started as u32,
+                content_block: OutputContentBlock::Text {
+                    text: String::new(),
+                },
+            }));
+        }
+        events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            index: self.reasoning_started as u32,
+            delta: ContentBlockDelta::TextDelta { text: content },
+        }));
+    }
+
+    fn finish_deferred_xml_text(&mut self, events: &mut Vec<StreamEvent>) {
+        let Some(text) = self.deferred_xml_text.take() else {
+            return;
+        };
+        let Some(calls) = parse_declared_xml_tool_calls(&text, &self.exposed_tool_names) else {
+            self.emit_text_content(text, events);
+            return;
+        };
+
+        self.stop_reason = Some("tool_use".to_string());
+        let mut block_index = self
+            .tool_calls
+            .values()
+            .map(ToolCallState::block_index)
+            .max()
+            .unwrap_or(self.reasoning_started as u32)
+            .saturating_add(1);
+        for (ordinal, call) in calls.into_iter().enumerate() {
+            events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                index: block_index,
+                content_block: OutputContentBlock::ToolUse {
+                    id: format!("xml-tool-{ordinal}"),
+                    name: call.name,
+                    input: Value::Object(call.input),
+                },
+            }));
+            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                index: block_index,
+            }));
+            block_index = block_index.saturating_add(1);
+        }
     }
 }
 
@@ -1566,6 +1635,7 @@ fn should_request_stream_usage(config: OpenAiCompatConfig) -> bool {
 fn normalize_chat_completion_response(
     model: &str,
     response: ChatCompletionResponse,
+    exposed_tools: &[ToolDefinition],
 ) -> Result<MessageResponse, ApiError> {
     let choice = response
         .choices
@@ -1588,7 +1658,25 @@ fn normalize_chat_completion_response(
         });
     }
     if let Some(text) = choice.message.content.filter(|value| !value.is_empty()) {
-        content.push(OutputContentBlock::Text { text });
+        let exposed_tool_names = exposed_tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<BTreeSet<_>>();
+        if choice.message.tool_calls.is_empty() {
+            if let Some(calls) = parse_declared_xml_tool_calls(&text, &exposed_tool_names) {
+                for (ordinal, call) in calls.into_iter().enumerate() {
+                    content.push(OutputContentBlock::ToolUse {
+                        id: format!("xml-tool-{ordinal}"),
+                        name: call.name,
+                        input: Value::Object(call.input),
+                    });
+                }
+            } else {
+                content.push(OutputContentBlock::Text { text });
+            }
+        } else {
+            content.push(OutputContentBlock::Text { text });
+        }
     }
     for tool_call in choice.message.tool_calls {
         content.push(OutputContentBlock::ToolUse {
@@ -1679,6 +1767,85 @@ fn normalize_responses_response(model: &str, response: ResponsesApiResponse) -> 
 
 fn parse_tool_arguments(arguments: &str) -> Value {
     serde_json::from_str(arguments).unwrap_or_else(|_| json!({ "raw": arguments }))
+}
+
+#[derive(Debug, PartialEq)]
+struct DecodedXmlToolCall {
+    name: String,
+    input: serde_json::Map<String, Value>,
+}
+
+/// Returns `Some` only for a complete, all-tool response that can be mapped to
+/// tools exposed in this request. This is a transport compatibility decoder,
+/// not a text-command feature: prose, mixed prose/tool text, unknown names,
+/// malformed tags, and values that cannot be represented safely all stay text.
+fn parse_declared_xml_tool_calls(
+    text: &str,
+    exposed_tool_names: &BTreeSet<String>,
+) -> Option<Vec<DecodedXmlToolCall>> {
+    if exposed_tool_names.is_empty() {
+        return None;
+    }
+    let mut rest = text.trim();
+    let mut calls = Vec::new();
+    while !rest.is_empty() {
+        rest = rest.strip_prefix("<tool_call>")?.trim_start();
+        let function_open_end = rest.find('>')?;
+        let function_open = &rest[..=function_open_end];
+        let name = function_open
+            .strip_prefix("<function=")?
+            .strip_suffix('>')?
+            .trim();
+        if !is_tool_identifier(name) || !exposed_tool_names.contains(name) {
+            return None;
+        }
+        rest = &rest[function_open_end + 1..];
+        let function_close = rest.find("</function>")?;
+        let mut parameters = rest[..function_close].trim();
+        let mut input = serde_json::Map::new();
+        while !parameters.is_empty() {
+            let open_end = parameters.find('>')?;
+            let open = &parameters[..=open_end];
+            let key = open.strip_prefix("<parameter=")?.strip_suffix('>')?.trim();
+            if !is_tool_identifier(key) || input.contains_key(key) {
+                return None;
+            }
+            parameters = &parameters[open_end + 1..];
+            let close = parameters.find("</parameter>")?;
+            input.insert(
+                key.to_string(),
+                parse_xml_tool_scalar(parameters[..close].trim()),
+            );
+            parameters = parameters[close + "</parameter>".len()..].trim_start();
+        }
+        rest = rest[function_close + "</function>".len()..].trim_start();
+        rest = rest.strip_prefix("</tool_call>")?.trim_start();
+        calls.push(DecodedXmlToolCall {
+            name: name.to_string(),
+            input,
+        });
+    }
+    (!calls.is_empty()).then_some(calls)
+}
+
+fn is_xml_tool_call_prefix(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    "<tool_call>".starts_with(trimmed) || trimmed.starts_with("<tool_call>")
+}
+
+fn is_tool_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+fn parse_xml_tool_scalar(value: &str) -> Value {
+    match value.to_ascii_lowercase().as_str() {
+        "true" => Value::Bool(true),
+        "false" => Value::Bool(false),
+        _ => serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string())),
+    }
 }
 
 fn next_sse_frame(buffer: &mut Vec<u8>) -> Option<String> {
@@ -2340,6 +2507,92 @@ mod tests {
     fn normalizes_stop_reasons() {
         assert_eq!(normalize_finish_reason("stop"), "end_turn");
         assert_eq!(normalize_finish_reason("tool_calls"), "tool_use");
+    }
+
+    #[test]
+    fn declared_xml_tool_response_decodes_only_known_complete_calls() {
+        use super::parse_declared_xml_tool_calls;
+        use std::collections::BTreeSet;
+
+        let names = BTreeSet::from(["read_file".to_string()]);
+        let calls = parse_declared_xml_tool_calls(
+            r#"
+                <tool_call><function=read_file>
+                <parameter=path>crates/runtime/src/lib.rs</parameter>
+                <parameter=limit>200</parameter>
+                </function></tool_call>
+            "#,
+            &names,
+        )
+        .expect("strict declared XML tool call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].input["path"], json!("crates/runtime/src/lib.rs"));
+        assert_eq!(calls[0].input["limit"], json!(200));
+
+        assert!(parse_declared_xml_tool_calls(
+            "before <tool_call><function=read_file></function></tool_call>",
+            &names,
+        )
+        .is_none());
+        assert!(parse_declared_xml_tool_calls(
+            "<tool_call><function=delete_workspace></function></tool_call>",
+            &names,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn streaming_declared_xml_tool_response_becomes_tool_use_not_text() {
+        use super::{ChatCompletionChunk, ChunkChoice, ChunkDelta, StreamState};
+        use crate::types::{
+            ContentBlockDelta, ContentBlockDeltaEvent, OutputContentBlock, StreamEvent,
+        };
+
+        let tool = ToolDefinition {
+            name: "read_file".to_string(),
+            description: Some("read a source file".to_string()),
+            input_schema: json!({"type":"object"}),
+        };
+        let mut state = StreamState::new("step-3.7-flash".to_string(), &[tool]);
+        let initial = state
+            .ingest_chunk(ChatCompletionChunk {
+                id: "message-1".to_string(),
+                model: Some("step-3.7-flash".to_string()),
+                choices: vec![ChunkChoice {
+                    delta: ChunkDelta {
+                        content: Some(
+                            "<tool_call><function=read_file><parameter=path>crates/runtime/src/lib.rs</parameter></function></tool_call>".to_string(),
+                        ),
+                        ..ChunkDelta::default()
+                    },
+                    finish_reason: Some("stop".to_string()),
+                }],
+                usage: None,
+            })
+            .expect("stream chunk");
+        assert!(initial.iter().all(|event| !matches!(
+            event,
+            StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                delta: ContentBlockDelta::TextDelta { .. },
+                ..
+            })
+        )));
+
+        let terminal = state.finish().expect("stream finish");
+        assert!(terminal.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockStart(start)
+                if matches!(&start.content_block, OutputContentBlock::ToolUse { name, input, .. }
+                    if name == "read_file" && input["path"] == json!("crates/runtime/src/lib.rs"))
+        )));
+        assert!(terminal.iter().all(|event| !matches!(
+            event,
+            StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                delta: ContentBlockDelta::TextDelta { .. },
+                ..
+            })
+        )));
     }
 
     #[test]

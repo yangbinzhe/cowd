@@ -569,9 +569,14 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
 
     let event_bus = SessionEventBus::new();
     let lease_registry = Arc::new(SessionLeaseRegistry::default());
-    let lifecycle_kernel = Arc::new(SessionLifecycleKernel::new());
-
-    let unified_store = crate::get_unified_store().ok().map(|s| Arc::new(s.clone()));
+    let unified_store = crate::get_unified_store().ok().map(Arc::new);
+    let lifecycle_kernel = Arc::new(
+        unified_store
+            .as_ref()
+            .map_or_else(SessionLifecycleKernel::new, |store| {
+                SessionLifecycleKernel::with_store(Arc::clone(store))
+            }),
+    );
     let session_kernel = Arc::new(SessionKernel::new(
         sessions.clone(),
         unified_store.clone(),
@@ -729,7 +734,14 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     let mut runtime_services_builder =
         runtime::RuntimeServices::builder(&approval_dir, &workspace_root)
             .provider_registry(Arc::clone(&provider_registry))
-            .tool_execution_host(runtime_tool_host);
+            .tool_execution_host(runtime_tool_host)
+            .mission_schedule_policy(
+                runtime_config
+                    .runtime_control()
+                    .policy
+                    .mission_schedule
+                    .clone(),
+            );
     if let Some(store) = unified_store.as_ref() {
         runtime_services_builder = runtime_services_builder.session_store(Arc::clone(store));
     }
@@ -779,7 +791,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     ));
     let config_reload = runtime_service.config_reload();
     let services = Arc::new(crate::services::GatewayServices::new_with_config_home(
-        runtime_service,
+        Arc::clone(&runtime_service),
         task_kernel.clone(),
         surface_host.clone(),
         cognitive.clone(),
@@ -802,6 +814,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         services: services,
         session_lease_registry: Some(lease_registry.clone()),
     });
+    let mission_schedule_timer = spawn_mission_schedule_timer(runtime_service.runtime_services());
     config_reload::initialize_config_reload_status(&config_reload, &app_state);
     let _config_reload_watcher = config_reload::spawn_config_reload_watcher(
         config_reload,
@@ -908,12 +921,43 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     tracing::info!("cleaning up runtime host resources...");
 
     session_runtime_bridge.shutdown().await;
+    mission_schedule_timer.abort();
+    let _ = mission_schedule_timer.await;
 
     tracing::info!("surface host shutdown complete");
 
     // PID file is cleaned up by PidFileGuard drop
     tracing::info!("runtime host shutdown complete");
     Ok(())
+}
+
+/// The timer is an event source only. It claims due durable occurrences and
+/// submits their canonical graphs; GraphRunner remains the sole owner of node
+/// state, retry, and terminal transitions.
+fn spawn_mission_schedule_timer(
+    runtime_services: Arc<runtime::RuntimeServices>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let policy = runtime_services.mission_schedule_policy();
+            if policy.enabled {
+                if let Err(error) = runtime_services
+                    .dispatch_due_mission_schedules(epoch_millis())
+                    .await
+                {
+                    tracing::warn!(%error, "mission schedule timer dispatch failed");
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(policy.tick_interval_ms)).await;
+        }
+    })
+}
+
+fn epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn run_legacy_execution_startup_migration(

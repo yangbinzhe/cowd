@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
@@ -8,9 +9,9 @@ use harness_contract::agent::{
 use harness_contract::turn::{InputSourceKind, SessionInputEnvelope};
 
 use crate::{
-    PermissionMode, PermissionPolicy, ProviderToolDefinition, RuntimeExecutionHost,
-    RuntimeServices, RuntimeToolExecutionRequest, RuntimeToolExecutionStatus, Session,
-    SharedPrompter, StandardRuntimeHost, StandardRuntimeHostConfig, ToolError, ToolExecutor,
+    ContextProfile, PermissionMode, PermissionPolicy, RuntimeExecutionHost, RuntimeServices,
+    RuntimeToolExecutionRequest, RuntimeToolExecutionStatus, Session, SharedPrompter,
+    StandardRuntimeHost, StandardRuntimeHostConfig, ToolError, ToolExecutor,
 };
 
 use crate::agent_model_selector::AgentModelSelection;
@@ -76,28 +77,41 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
+        let tool_names = allowed_tools.iter().cloned().collect::<Vec<_>>();
+        let tool_definitions = host.delegated_tool_definitions(&tool_names);
         let tool_executor = Arc::new(ScopedRuntimeToolExecutor {
             host,
             allowed_tools: allowed_tools.clone(),
+            session_id: packet.session_id.clone(),
+            model_lease: selection.model.clone(),
+            execution_id: packet.graph_id.clone(),
+            node_id: packet.node_id.clone(),
         });
-        let tool_definitions = allowed_tools
-            .iter()
-            .map(|name| ProviderToolDefinition {
-                name: name.clone(),
-                description: Some("Task-authorized runtime tool".into()),
-                input_schema: serde_json::json!({"type":"object"}),
-            })
-            .collect::<Vec<_>>();
-        let max_iterations = packet
-            .constraints
-            .iter()
-            .find_map(|constraint| constraint.strip_prefix("max_iterations:"))
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(32);
         let policy = permission_policy(&packet.permission_lease, &allowed_tools);
         let cancellation = crate::CancellationToken::new();
-        let child_session = Session::new();
+        let (provider_event_sender, provider_event_receiver) = mpsc::sync_channel(64);
+        let progress_runtime = Arc::clone(services.agent_runtime());
+        let progress_agent_id = packet.agent_id.clone();
+        let progress_run_id = packet.run_id.clone();
+        let progress_reporter = std::thread::spawn(move || {
+            let mut saw_model_output = false;
+            while let Ok(event) = provider_event_receiver.recv() {
+                if matches!(event, crate::CowdEvent::TextDelta { .. }) && !saw_model_output {
+                    saw_model_output = true;
+                    let _ = progress_runtime.record_progress(
+                        &progress_agent_id,
+                        "agent.provider.first_output",
+                        &format!("provider produced the first output for run {progress_run_id}"),
+                    );
+                }
+            }
+        });
+        let mut child_session = Session::new();
+        // An in-process role is a child execution of the parent session, not
+        // an unrelated surface session. Keep the canonical session/model
+        // binding available to tool and orchestration contracts.
+        child_session.session_id = packet.session_id.clone();
+        child_session.model = Some(selection.model.clone());
         let child_session_id = child_session.session_id.clone();
         let host = StandardRuntimeHost::new(StandardRuntimeHostConfig {
             runtime_services: Arc::clone(&services),
@@ -107,17 +121,25 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             tool_definitions: tool_definitions.clone(),
             tool_executor: Arc::clone(&tool_executor),
             permission_policy: policy,
-            system_prompt: system_prompt(&packet),
+            system_prompt: system_prompt(&packet, services.workspace_root(), &tool_names),
             feature_config: crate::RuntimeFeatureConfig::default(),
             emit_output: false,
-            stream_callback: None,
+            stream_callback: Some(provider_event_sender),
             tool_callback: None,
             model_context_window: None,
-            session_store: None,
+            // A child agent shares the parent Session authority for durable
+            // tool evidence and context receipts. The session id is already
+            // bound to the parent above, so this cannot create a parallel
+            // store or leak raw tool output back inline as a fallback.
+            session_store: services.session_store(),
             hook_progress_reporter: None,
             external_context_items: Vec::new(),
             skill_profiles: Vec::new(),
             agent_skill_profile: harness_contract::skill::AgentSkillProfile::default(),
+            execution_parent: Some(harness_contract::execution_graph::ExecutionParentBinding {
+                execution_id: packet.graph_id.clone(),
+                node_id: packet.node_id.clone(),
+            }),
         });
         let mut runtime = match host {
             Ok(runtime) => runtime,
@@ -127,6 +149,10 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                 ));
             }
         };
+        // A delegated role has a bounded evidence obligation. It retains the
+        // parent session authority but must not inherit MainTurn's broad,
+        // open-ended exploration profile.
+        runtime.set_context_profile(ContextProfile::SubAgent);
         let input_stream = runtime.session_input_stream();
         self.active_runs
             .lock()
@@ -139,16 +165,29 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                     input_stream,
                 },
             );
-        runtime.set_max_iterations(max_iterations);
         runtime.install_turn_control(cancellation, crate::HookAbortSignal::default());
+        let _ = services.agent_runtime().record_progress(
+            &packet.agent_id,
+            "agent.execution.started",
+            "provider-backed child execution admitted",
+        );
         let result = runtime
             .submit_turn(&packet.objective, &SharedPrompter::none())
             .await;
+        // Dropping the host drops the provider callback sender. The bounded
+        // reporter owns no runtime state beyond the lifecycle projection, so
+        // it can be joined before the terminal Agent result is committed.
+        drop(runtime);
+        let _ = progress_reporter.join();
         self.active_runs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&packet.run_id);
         let summary = result.map_err(|error| format!("in-process agent turn failed: {error}"))?;
+        let evidence_refs =
+            agent_evidence_refs(&packet, &summary.context_turn_report.audit_projections);
+        let (status, failure) =
+            agent_terminal_outcome(summary.terminal_completion, &summary.final_answer);
         Ok(AgentReturnPacket {
             run_id: packet.run_id,
             agent_id: packet.agent_id,
@@ -160,19 +199,26 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             node_id: packet.node_id,
             attempt: packet.attempt,
             expected_graph_revision: packet.expected_graph_revision,
-            status: AgentTerminalStatus::Completed,
+            status,
             outcome: summary.final_answer,
             acceptance: packet.acceptance,
-            evidence_refs: packet.evidence_refs,
+            evidence_refs,
             changes: Vec::new(),
             conflicts: Vec::new(),
             unresolved: Vec::new(),
             input_tokens: u64::from(summary.usage.input_tokens),
             output_tokens: u64::from(summary.usage.output_tokens),
-            model: selection.model,
+            // Keep the model that actually completed the child turn. The
+            // selector value remains the requested lease and may differ after
+            // a configured provider fallback.
+            model: summary
+                .model_telemetry
+                .model
+                .clone()
+                .unwrap_or(selection.model),
             provider: selection.provider,
             tool_calls: summary.tool_results.len() as u64,
-            failure: None,
+            failure,
         })
     }
 
@@ -226,6 +272,27 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
     }
 }
 
+fn agent_terminal_outcome(
+    completion: harness_contract::goal::GoalCompletion,
+    terminal_answer: &str,
+) -> (AgentTerminalStatus, Option<String>) {
+    match completion {
+        harness_contract::goal::GoalCompletion::Satisfied => (AgentTerminalStatus::Completed, None),
+        harness_contract::goal::GoalCompletion::Blocked => (
+            AgentTerminalStatus::Blocked,
+            Some(terminal_answer.to_string()),
+        ),
+        harness_contract::goal::GoalCompletion::Cancelled => (
+            AgentTerminalStatus::Cancelled,
+            Some(terminal_answer.to_string()),
+        ),
+        harness_contract::goal::GoalCompletion::Open => (
+            AgentTerminalStatus::Failed,
+            Some("child turn returned an open goal as a terminal result".to_string()),
+        ),
+    }
+}
+
 fn agent_input_text(input: &AgentInput) -> String {
     match input {
         AgentInput::UserSupplement(text) => text.clone(),
@@ -247,6 +314,10 @@ fn agent_input_text(input: &AgentInput) -> String {
 struct ScopedRuntimeToolExecutor {
     host: Arc<dyn RuntimeExecutionHost>,
     allowed_tools: BTreeSet<String>,
+    session_id: String,
+    model_lease: String,
+    execution_id: String,
+    node_id: String,
 }
 
 impl ToolExecutor for ScopedRuntimeToolExecutor {
@@ -265,6 +336,12 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
             tool_name: tool_name.to_string(),
             input: input.to_string(),
             category: crate::ToolSafetyCategory::from_tool_name(tool_name),
+            session_id: Some(self.session_id.clone()),
+            model_lease: Some(self.model_lease.clone()),
+            parent_execution: Some(harness_contract::execution_graph::ExecutionParentBinding {
+                execution_id: self.execution_id.clone(),
+                node_id: self.node_id.clone(),
+            }),
         };
         let outcome = self.host.execute_runtime_tool(&request);
         match outcome.status {
@@ -280,6 +357,20 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
                     .unwrap_or_else(|| "tool execution failed".into()),
             )),
         }
+    }
+
+    fn available_tool_names(&self) -> Vec<String> {
+        self.allowed_tools.iter().cloned().collect()
+    }
+
+    fn classify_tool_safety(
+        &self,
+        tool_name: &str,
+        _input: &str,
+    ) -> Option<crate::ToolSafetyCategory> {
+        self.allowed_tools
+            .contains(tool_name)
+            .then(|| crate::ToolSafetyCategory::from_tool_name(tool_name))
     }
 }
 
@@ -297,10 +388,17 @@ fn permission_policy(lease: &str, tools: &BTreeSet<String>) -> PermissionPolicy 
         })
 }
 
-fn system_prompt(packet: &AgentTaskPacket) -> Vec<String> {
+fn system_prompt(
+    packet: &AgentTaskPacket,
+    workspace_root: &std::path::Path,
+    tool_names: &[String],
+) -> Vec<String> {
     let mut prompt = vec![
         "You are a delegated Cowd agent. Return an evidence-backed result for the assigned objective.".into(),
+        "You are a leaf role inside an already-running protocol. Do not create a nested team or session; return findings and evidence to the protocol reducer.".into(),
+        "Use only native tool calls exposed by this runtime. Never write simulated tool syntax such as <tool_call>, <function=...>, <parameter=...>, or JSON-shaped pseudo-calls in final text. If no native tool is authorized, answer directly from the supplied objective and upstream evidence.".into(),
         format!("Objective: {}", packet.objective),
+        format!("Workspace root: {}", workspace_root.display()),
     ];
     if !packet.constraints.is_empty() {
         prompt.push(format!("Constraints: {}", packet.constraints.join("; ")));
@@ -308,7 +406,30 @@ fn system_prompt(packet: &AgentTaskPacket) -> Vec<String> {
     if !packet.acceptance.is_empty() {
         prompt.push(format!("Acceptance: {}", packet.acceptance.join("; ")));
     }
+    if !tool_names.is_empty() {
+        prompt.push(format!(
+            "Authorized tool contracts are available natively: {}. When the objective asks for source, workspace, file, or current-state evidence, use an authorized read-only tool and cite the resulting paths/receipts; do not substitute prior model knowledge.",
+            tool_names.join(", ")
+        ));
+    }
     prompt
+}
+
+fn agent_evidence_refs(
+    packet: &AgentTaskPacket,
+    audits: &[harness_contract::context::EvidenceAuditProjection],
+) -> Vec<harness_contract::context::EvidenceAccessRef> {
+    let mut refs = packet.evidence_refs.clone();
+    refs.extend(audits.iter().filter_map(|audit| audit.access.clone()));
+    refs.sort_by(|left, right| {
+        left.evidence_ref
+            .0
+            .ref_type
+            .cmp(&right.evidence_ref.0.ref_type)
+            .then_with(|| left.evidence_ref.0.id.cmp(&right.evidence_ref.0.id))
+    });
+    refs.dedup_by(|left, right| left.evidence_ref == right.evidence_ref);
+    refs
 }
 
 #[cfg(test)]
@@ -318,6 +439,17 @@ mod tests {
     use super::*;
     use harness_contract::agent::AgentCommand;
     use harness_contract::turn::TurnId;
+
+    struct NoopRuntimeExecutionHost;
+
+    impl crate::RuntimeExecutionHost for NoopRuntimeExecutionHost {
+        fn execute_runtime_tool(
+            &self,
+            _request: &crate::RuntimeToolExecutionRequest,
+        ) -> crate::RuntimeToolExecutionOutcome {
+            panic!("the capability advertisement test must not execute a tool")
+        }
+    }
 
     #[test]
     fn permission_policy_never_escalates_an_unspecified_lease() {
@@ -331,6 +463,87 @@ mod tests {
         let tools = BTreeSet::from(["write_file".to_string()]);
         let policy = permission_policy("workspace-write", &tools);
         assert_eq!(policy.active_mode(), PermissionMode::WorkspaceWrite);
+    }
+
+    #[test]
+    fn scoped_executor_advertises_only_packet_authorized_tools() {
+        let executor = ScopedRuntimeToolExecutor {
+            host: Arc::new(NoopRuntimeExecutionHost),
+            allowed_tools: BTreeSet::from(["read_file".to_string(), "grep_search".to_string()]),
+            session_id: "session".to_string(),
+            model_lease: "model".to_string(),
+            execution_id: "graph".to_string(),
+            node_id: "node".to_string(),
+        };
+
+        assert!(executor.has_registered_tools());
+        assert_eq!(
+            executor.available_tool_names(),
+            vec!["grep_search".to_string(), "read_file".to_string()]
+        );
+        assert!(executor.classify_tool_safety("read_file", "{}").is_some());
+        assert!(executor.classify_tool_safety("write_file", "{}").is_none());
+    }
+
+    #[test]
+    fn durable_audits_are_promoted_to_agent_evidence_refs() {
+        let packet = AgentTaskPacket {
+            run_id: "run".into(),
+            agent_id: "agent".into(),
+            task_id: "task".into(),
+            session_id: "session".into(),
+            mission_id: None,
+            team_id: None,
+            graph_id: "graph".into(),
+            node_id: "node".into(),
+            attempt: 1,
+            expected_graph_revision: 0,
+            objective: "inspect".into(),
+            acceptance: Vec::new(),
+            constraints: Vec::new(),
+            context_refs: Vec::new(),
+            evidence_refs: vec![harness_contract::context::EvidenceAccessRef::durable(
+                harness_contract::context::EvidenceRef::new("upstream", "frame"),
+                "sha256:frame",
+                1,
+                "text/plain",
+                "session-event://session/1",
+                "session:session",
+            )],
+            allowed_tools: Vec::new(),
+            allowed_skills: Vec::new(),
+            permission_lease: "read_only".into(),
+            model_lease: "model".into(),
+            budget_lease: harness_contract::context::ContextBudgetLeaseRef::new(
+                "budget", "agent", "agent", 0, 1,
+            ),
+            idempotency_key: "key".into(),
+        };
+        let tool_access = harness_contract::context::EvidenceAccessRef::durable(
+            harness_contract::context::EvidenceRef::new("tool", "tool-1"),
+            "sha256:tool",
+            1,
+            "text/plain",
+            "session-event://session/2",
+            "session:session",
+        );
+        let audits = vec![harness_contract::context::EvidenceAuditProjection {
+            evidence_ref: tool_access.evidence_ref.clone(),
+            content_kind: harness_contract::context::EvidenceContentKind::Text,
+            raw_tokens: 1,
+            receipt_tokens: 1,
+            omitted_tokens: 0,
+            raw_available: true,
+            access: Some(tool_access),
+        }];
+
+        assert_eq!(
+            agent_evidence_refs(&packet, &audits)
+                .into_iter()
+                .map(|reference| reference.evidence_ref.0.id)
+                .collect::<Vec<_>>(),
+            vec!["tool-1".to_string(), "frame".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -370,5 +583,47 @@ mod tests {
         assert_eq!(inbox.items[0].content_preview, "use the new requirement");
         assert!(worker.capabilities().supports_input);
         assert!(!worker.capabilities().supports_pause);
+    }
+
+    #[test]
+    fn blocked_child_turn_is_not_relabelled_as_completed_agent_work() {
+        let (status, failure) = agent_terminal_outcome(
+            harness_contract::goal::GoalCompletion::Blocked,
+            "provider path exhausted",
+        );
+        assert_eq!(status, AgentTerminalStatus::Blocked);
+        assert_eq!(failure.as_deref(), Some("provider path exhausted"));
+    }
+
+    #[test]
+    fn delegated_prompt_rejects_simulated_tool_markup() {
+        let packet = AgentTaskPacket {
+            run_id: "run".into(),
+            agent_id: "agent".into(),
+            task_id: "task".into(),
+            session_id: "session".into(),
+            mission_id: None,
+            team_id: Some("team".into()),
+            graph_id: "graph".into(),
+            node_id: "node".into(),
+            attempt: 1,
+            expected_graph_revision: 0,
+            objective: "inspect source".into(),
+            acceptance: Vec::new(),
+            constraints: Vec::new(),
+            context_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            allowed_tools: Vec::new(),
+            allowed_skills: Vec::new(),
+            permission_lease: "read_only".into(),
+            model_lease: "model".into(),
+            budget_lease: harness_contract::context::ContextBudgetLeaseRef::new(
+                "budget", "agent", "agent", 0, 1,
+            ),
+            idempotency_key: "key".into(),
+        };
+        let prompt = system_prompt(&packet, std::path::Path::new("/workspace"), &[]).join("\n");
+        assert!(prompt.contains("Never write simulated tool syntax"));
+        assert!(prompt.contains("If no native tool is authorized, answer directly"));
     }
 }

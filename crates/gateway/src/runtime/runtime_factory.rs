@@ -148,7 +148,8 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
             tool_host,
             mcp_state.clone(),
         )
-        .with_runtime_session_id(runtime_session_id),
+        .with_runtime_session_id(runtime_session_id)
+        .with_runtime_model_lease(model.clone()),
     );
     tool_executor
         .bind_runtime_services(Arc::clone(&runtime_services))
@@ -173,6 +174,7 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
         external_context_items: vec![workspace_item, capability_item],
         skill_profiles,
         agent_skill_profile: default_runtime_agent_skill_profile(),
+        execution_parent: None,
         runtime_services,
     })
     .map_err(std::io::Error::other)?;

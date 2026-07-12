@@ -1,5 +1,6 @@
 use harness_contract::turn::{
-    InputPayloadKind, InputRoutingDecision, InputRoutingReason, SessionInputEnvelope, TurnId,
+    InputPayloadKind, InputRelationKind, InputRelationProposal, InputRoutingDecision,
+    InputRoutingReason, SessionInputEnvelope, TurnId,
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -78,131 +79,11 @@ pub fn classify_session_input(
         );
     }
 
-    if contains_any(
-        &normalized,
-        &[
-            "@session",
-            "cross-session",
-            "跨session",
-            "跨 session",
-            "跨会话",
-        ],
-    ) {
-        return (
-            InputRoutingDecision::RouteCrossSession,
-            InputRoutingReason::new(
-                "cross_session_reference",
-                "input explicitly references another session",
-                8_700,
-            ),
-        );
-    }
-
-    if contains_any(
-        &normalized,
-        &[
-            "new session",
-            "start a new session",
-            "new conversation",
-            "新建session",
-            "新建 session",
-            "新建一个 session",
-            "新建会话",
-            "新会话",
-            "另开会话",
-            "另开一个会话",
-            "单独会话",
-            "独立 session",
-            "独立session",
-            "独立会话",
-            "新起一个会话",
-            "重新开一个会话",
-        ],
-    ) {
-        return (
-            InputRoutingDecision::CreateNewSession,
-            InputRoutingReason::new(
-                "new_session_request",
-                "input explicitly requests a separate session",
-                8_700,
-            ),
-        );
-    }
-
-    if contains_any(
-        &normalized,
-        &[
-            "@agent",
-            "subagent",
-            "delegate",
-            "parallel",
-            "子agent",
-            "子 agent",
-            "多agent",
-            "多 agent",
-            "委派",
-            "分派",
-            "并行",
-            "团队",
-        ],
-    ) {
-        return (
-            InputRoutingDecision::SpawnSubtask,
-            InputRoutingReason::new(
-                "subtask_or_agent_reference",
-                "input asks for delegated or parallel execution",
-                8_400,
-            ),
-        );
-    }
-
-    if contains_any(
-        &normalized,
-        &[
-            "next",
-            "after this",
-            "later",
-            "todo",
-            "下一步",
-            "后续",
-            "稍后",
-            "待办",
-            "排队",
-        ],
-    ) {
-        return (
-            InputRoutingDecision::EnqueueNextStep,
-            InputRoutingReason::new(
-                "future_work_hint",
-                "input appears to add follow-up work after the active turn",
-                7_700,
-            ),
-        );
-    }
-
-    if contains_any(
-        &normalized,
-        &[
-            "interrupt",
-            "change direction",
-            "stop current",
-            "instead",
-            "打断",
-            "停止当前",
-            "改方向",
-            "重新规划",
-            "不要继续",
-        ],
-    ) {
-        return (
-            InputRoutingDecision::InterruptAndReplan,
-            InputRoutingReason::new(
-                "replan_signal",
-                "input asks to alter the active execution path",
-                8_300,
-            ),
-        );
-    }
+    // Natural-language mentions of teams, sessions, follow-up work, and
+    // replanning are observations, not authority to mutate lifecycle state.
+    // The proposal is carried separately and evaluated by Strategy/Goal policy
+    // inside the canonical graph. Only typed slash/control input is allowed to
+    // take a deterministic control-plane path here.
 
     if state.is_active() {
         return (
@@ -223,6 +104,112 @@ pub fn classify_session_input(
             8_000,
         ),
     )
+}
+
+/// Extract a non-authoritative relationship hint from user input. The caller
+/// persists this alongside the inbox record, then lets Runtime policy decide
+/// whether the hint becomes a supplement, replan, team graph, or new session.
+#[must_use]
+pub fn propose_input_relation(envelope: &SessionInputEnvelope) -> Option<InputRelationProposal> {
+    let normalized = envelope.content.trim().to_ascii_lowercase();
+    let (candidate, confidence, reason) = if contains_any(
+        &normalized,
+        &[
+            "@session",
+            "cross-session",
+            "跨session",
+            "跨 session",
+            "跨会话",
+        ],
+    ) {
+        (
+            InputRelationKind::CrossSession,
+            8_700,
+            "cross_session_reference",
+        )
+    } else if contains_any(
+        &normalized,
+        &[
+            "new session",
+            "start a new session",
+            "new conversation",
+            "新建session",
+            "新建 session",
+            "新建一个 session",
+            "新建会话",
+            "新会话",
+            "另开会话",
+            "另开一个会话",
+            "单独会话",
+            "独立 session",
+            "独立session",
+            "独立会话",
+            "新起一个会话",
+            "重新开一个会话",
+        ],
+    ) {
+        (InputRelationKind::NewSession, 8_700, "new_session_request")
+    } else if contains_any(
+        &normalized,
+        &[
+            "@agent",
+            "subagent",
+            "delegate",
+            "parallel",
+            "子agent",
+            "子 agent",
+            "多agent",
+            "多 agent",
+            "委派",
+            "分派",
+            "并行",
+            "团队",
+        ],
+    ) {
+        (
+            InputRelationKind::Subtask,
+            8_400,
+            "subtask_or_agent_reference",
+        )
+    } else if contains_any(
+        &normalized,
+        &[
+            "interrupt",
+            "change direction",
+            "stop current",
+            "instead",
+            "打断",
+            "停止当前",
+            "改方向",
+            "重新规划",
+            "不要继续",
+        ],
+    ) {
+        (InputRelationKind::Replan, 8_300, "replan_signal")
+    } else if contains_any(
+        &normalized,
+        &[
+            "next",
+            "after this",
+            "later",
+            "todo",
+            "下一步",
+            "后续",
+            "稍后",
+            "待办",
+            "排队",
+        ],
+    ) {
+        (InputRelationKind::NewTask, 7_700, "future_work_hint")
+    } else {
+        return None;
+    };
+    Some(InputRelationProposal {
+        candidate,
+        confidence_basis_points: confidence,
+        reasons: vec![reason.to_string()],
+        target_ref: None,
+    })
 }
 
 fn contains_any(text: &str, needles: &[&str]) -> bool {
@@ -246,18 +233,20 @@ mod tests {
     }
 
     #[test]
-    fn explicit_parallel_input_spawns_subtask() {
+    fn explicit_parallel_input_only_proposes_a_subtask_relation() {
         let envelope =
             SessionInputEnvelope::text("s1", InputSourceKind::Surface, "parallel @agent check");
         let state = RuntimeInputState::active(TurnId::from_string("turn-1"));
 
         let (decision, _) = classify_session_input(&envelope, &state);
+        let proposal = propose_input_relation(&envelope).expect("relation proposal");
 
-        assert_eq!(decision, InputRoutingDecision::SpawnSubtask);
+        assert_eq!(decision, InputRoutingDecision::SupplementCurrentTurn);
+        assert_eq!(proposal.candidate, InputRelationKind::Subtask);
     }
 
     #[test]
-    fn chinese_explicit_new_session_input_creates_new_session() {
+    fn chinese_explicit_new_session_input_only_proposes_new_session() {
         let envelope = SessionInputEnvelope::text(
             "s1",
             InputSourceKind::Surface,
@@ -266,8 +255,10 @@ mod tests {
         let state = RuntimeInputState::active(TurnId::from_string("turn-1"));
 
         let (decision, reason) = classify_session_input(&envelope, &state);
+        let proposal = propose_input_relation(&envelope).expect("relation proposal");
 
-        assert_eq!(decision, InputRoutingDecision::CreateNewSession);
-        assert_eq!(reason.code, "new_session_request");
+        assert_eq!(decision, InputRoutingDecision::SupplementCurrentTurn);
+        assert_eq!(reason.code, "active_turn_supplement");
+        assert_eq!(proposal.candidate, InputRelationKind::NewSession);
     }
 }

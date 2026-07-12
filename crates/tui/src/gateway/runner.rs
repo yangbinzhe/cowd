@@ -8,11 +8,13 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use futures::StreamExt;
+use harness_contract::projection::{ExecutionCommandKind, ExecutionCommandRequest};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::app::{PendingResource, SystemNoticeKind};
 use crate::context_tokens::ContextWorkspaceEntry;
+use crate::events::CowdEventSender;
 use crate::gateway_client::{default_auth_token, GatewayApiClient};
 use crate::state::{ProcessedKey, TuiState};
 use crate::{config_migration, cowd_event_channel, error_recovery, CowdEvent, FileEntry};
@@ -136,6 +138,7 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
     let startup_ready = true;
     let res = shared_rt().block_on(async {
         let mut reader = crossterm::event::EventStream::new();
+        let mut execution_projection_stream = None;
         loop {
             tokio::select! {
                 Some(Ok(event)) = reader.next() => {
@@ -207,6 +210,15 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                                         }
                                         continue;
                                     }
+                                    if let Some(command) = execution_command_from_input(&text) {
+                                        dispatch_execution_projection_command(
+                                            &gateway_client,
+                                            &tui_tx,
+                                            &state,
+                                            command,
+                                        );
+                                        continue;
+                                    }
                                     if text.starts_with('/') {
                                         dispatch_gateway_slash(
                                             &gateway_client,
@@ -249,7 +261,13 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_millis(16)) => {
-                    drain_cowd_events_state(&tui_rx, &mut state);
+                    drain_cowd_events_state(
+                        &tui_rx,
+                        &mut state,
+                        &gateway_client,
+                        &tui_tx,
+                        &mut execution_projection_stream,
+                    ).await;
                     state.update_startup_phase(startup_ready);
                     if state.turn_active {
                         state.tick();
@@ -458,13 +476,28 @@ fn attach_gateway_session(
     let event_session_id = config.session_id.clone();
     let event_tx = event_tx.clone();
     let _event_bridge = shared_rt().spawn(async move {
-        if let Err(err) = event_client
-            .subscribe_session_events(&event_session_id, event_tx.clone())
-            .await
-        {
-            let _ = event_tx.send(CowdEvent::TurnError {
-                error: format!("Gateway event stream stopped: {err}"),
-            });
+        let mut after_commit_cursor = None;
+        let mut retry_delay = Duration::from_millis(250);
+        loop {
+            match event_client
+                .subscribe_session_events(&event_session_id, event_tx.clone(), after_commit_cursor)
+                .await
+            {
+                Ok(cursor) => {
+                    after_commit_cursor = cursor.or(after_commit_cursor);
+                    let _ = event_tx.send(CowdEvent::Warning {
+                        message: "Gateway event stream ended; resuming from durable cursor"
+                            .to_string(),
+                    });
+                }
+                Err(err) => {
+                    let _ = event_tx.send(CowdEvent::Warning {
+                        message: format!("Gateway event stream interrupted: {err}; retrying"),
+                    });
+                }
+            }
+            tokio::time::sleep(retry_delay).await;
+            retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
         }
     });
     state.add_system_notice(
@@ -565,6 +598,27 @@ fn dispatch_gateway_message(
                         ids: resource_ids.clone(),
                     });
                 }
+                if let Some(graph_id) = value
+                    .get("execution")
+                    .and_then(|execution| execution.get("graph_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|graph_id| !graph_id.trim().is_empty())
+                {
+                    let _ = event_tx.send(CowdEvent::ExecutionGraphSummary {
+                        summary: crate::RuntimeExecutionGraphSummary {
+                            graph_id: Some(graph_id.to_string()),
+                            board_id: None,
+                            status: "running".to_string(),
+                            agent_tasks: 0,
+                            child_executions: 0,
+                            memory_candidates: 0,
+                            conflicts: 0,
+                            completion_rate: Some(0.0),
+                            synthesis_lift: None,
+                            complementarity_score: None,
+                        },
+                    });
+                }
                 let mode = value
                     .get("mode")
                     .and_then(serde_json::Value::as_str)
@@ -602,17 +656,8 @@ fn dispatch_gateway_message(
                         text: response.to_string(),
                     });
                 }
-                let _ = event_tx.send(CowdEvent::TurnComplete {
-                    assistant_text: value
-                        .get("response")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    iterations: value
-                        .get("iterations")
-                        .and_then(serde_json::Value::as_u64)
-                        .map(|value| value as u32)
-                        .unwrap_or_default(),
+                let _ = event_tx.send(CowdEvent::Warning {
+                    message: "Gateway accepted input; awaiting durable terminal commit".to_string(),
                 });
             }
             Err(err) => {
@@ -669,16 +714,187 @@ fn dispatch_gateway_cancel(
     });
 }
 
-fn drain_cowd_events_state(rx: &crate::CowdEventReceiver, state: &mut TuiState) {
+fn execution_command_from_input(input: &str) -> Option<ExecutionCommandKind> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "/execution pause" | "/execution/pause" => Some(ExecutionCommandKind::Pause),
+        "/execution resume" | "/execution/resume" => Some(ExecutionCommandKind::Resume),
+        "/execution cancel" | "/execution/cancel" => Some(ExecutionCommandKind::Cancel),
+        "/execution replan" | "/execution/replan" => Some(ExecutionCommandKind::Replan),
+        _ => None,
+    }
+}
+
+fn dispatch_execution_projection_command(
+    gateway_client: &GatewayApiClient,
+    tx: &crate::events::CowdEventSender,
+    state: &TuiState,
+    command: ExecutionCommandKind,
+) {
+    let Some(projection) = state.app.latest_execution_projection.as_ref() else {
+        let _ = tx.send(CowdEvent::Warning {
+            message: "No active execution projection is available for this command".to_string(),
+        });
+        return;
+    };
+    let available = projection
+        .available_commands
+        .iter()
+        .find(|candidate| candidate.command == command);
+    if available.is_some_and(|candidate| !candidate.available) {
+        let _ = tx.send(CowdEvent::Warning {
+            message: available
+                .and_then(|candidate| candidate.reason.clone())
+                .unwrap_or_else(|| "The current execution state rejects this command".to_string()),
+        });
+        return;
+    }
+    let client = gateway_client.clone();
+    let tx = tx.clone();
+    let execution_id = projection.execution_id.clone();
+    let expected_revision = projection.revision;
+    shared_rt().spawn(async move {
+        let receipt = client
+            .execute_projection_command(
+                &execution_id,
+                &ExecutionCommandRequest {
+                    command_id: format!("tui-execution-command-{}", uuid::Uuid::new_v4()),
+                    expected_revision,
+                    command,
+                    payload: serde_json::json!({"source": "tui"}),
+                },
+            )
+            .await;
+        match receipt {
+            Ok(receipt) => {
+                let _ = tx.send(CowdEvent::Warning {
+                    message: format!(
+                        "Execution command {:?}: {} (revision {})",
+                        command, receipt.status, receipt.accepted_revision
+                    ),
+                });
+            }
+            Err(error) => {
+                let _ = tx.send(CowdEvent::TurnError {
+                    error: format!("Execution command {:?} failed: {error}", command),
+                });
+            }
+        }
+    });
+}
+
+async fn drain_cowd_events_state(
+    rx: &crate::CowdEventReceiver,
+    state: &mut TuiState,
+    gateway_client: &GatewayApiClient,
+    event_tx: &CowdEventSender,
+    execution_projection_stream: &mut Option<String>,
+) {
     let mut count = 0;
     let limit = if state.turn_active { 64 } else { 256 };
     while let Ok(event) = rx.try_recv() {
+        let execution_id = match &event {
+            CowdEvent::ExecutionGraphSummary { summary } => summary.graph_id.clone(),
+            _ => None,
+        };
+        if let CowdEvent::ExecutionProjectionDelta { delta } = &event {
+            apply_execution_projection_delta(gateway_client, state, delta).await;
+            count += 1;
+            if count >= limit {
+                break;
+            }
+            continue;
+        }
         state.apply_event(event);
+        if let Some(execution_id) = execution_id {
+            match gateway_client
+                .execution_projection(&execution_id, false)
+                .await
+            {
+                Ok(projection) => {
+                    let cursor = projection.cursor;
+                    state.app.apply_execution_projection(projection);
+                    if execution_projection_stream.as_deref() != Some(execution_id.as_str()) {
+                        *execution_projection_stream = Some(execution_id.clone());
+                        spawn_execution_projection_stream(
+                            gateway_client.clone(),
+                            execution_id,
+                            cursor,
+                            event_tx.clone(),
+                        );
+                    }
+                }
+                Err(error) => state.add_system_notice(
+                    SystemNoticeKind::Warning,
+                    &format!("Execution projection unavailable: {error}"),
+                ),
+            }
+        }
         count += 1;
         if count >= limit {
             break;
         }
     }
+}
+
+async fn apply_execution_projection_delta(
+    gateway_client: &GatewayApiClient,
+    state: &mut TuiState,
+    delta: &crate::protocol::ProjectionDelta,
+) {
+    let Some(projection) = state.app.latest_execution_projection.as_ref() else {
+        return;
+    };
+    let mut reducer = crate::protocol::ExecutionProjectionReducer::default();
+    reducer.install_snapshot(projection);
+    let should_refresh = !delta.events.is_empty()
+        || matches!(
+            reducer.apply_delta(delta),
+            crate::protocol::ProjectionDeltaApply::ResyncRequired
+        );
+    if should_refresh {
+        match gateway_client
+            .execution_projection(&delta.execution_id, false)
+            .await
+        {
+            Ok(snapshot) => state.app.apply_execution_projection(snapshot),
+            Err(error) => state.add_system_notice(
+                SystemNoticeKind::Warning,
+                &format!("Execution projection resync failed: {error}"),
+            ),
+        }
+    }
+}
+
+fn spawn_execution_projection_stream(
+    gateway_client: GatewayApiClient,
+    execution_id: String,
+    initial_cursor: u64,
+    event_tx: CowdEventSender,
+) {
+    shared_rt().spawn(async move {
+        let mut cursor = initial_cursor;
+        let mut retry_delay = Duration::from_millis(250);
+        loop {
+            match gateway_client
+                .subscribe_execution_projection_events(&execution_id, cursor, false, event_tx.clone())
+                .await
+            {
+                Ok(next_cursor) => {
+                    cursor = cursor.max(next_cursor);
+                    retry_delay = Duration::from_millis(250);
+                }
+                Err(error) => {
+                    let _ = event_tx.send(CowdEvent::Warning {
+                        message: format!(
+                            "Execution projection stream interrupted for {execution_id}: {error}; retrying"
+                        ),
+                    });
+                }
+            }
+            tokio::time::sleep(retry_delay).await;
+            retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
+        }
+    });
 }
 
 fn list_workspace_files(gateway_client: &GatewayApiClient) -> Result<Vec<FileEntry>, String> {
@@ -827,6 +1043,20 @@ mod tests {
         );
         assert!(attach_path_from_command("/status").is_none());
         assert!(attach_path_from_command("/attachment").is_none());
+    }
+
+    #[test]
+    fn execution_commands_are_explicit_and_do_not_capture_other_slash_input() {
+        assert_eq!(
+            execution_command_from_input("/execution pause"),
+            Some(ExecutionCommandKind::Pause)
+        );
+        assert_eq!(
+            execution_command_from_input(" /execution/replan "),
+            Some(ExecutionCommandKind::Replan)
+        );
+        assert_eq!(execution_command_from_input("/status"), None);
+        assert_eq!(execution_command_from_input("/execution unknown"), None);
     }
 
     #[test]

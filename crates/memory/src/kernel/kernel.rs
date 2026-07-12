@@ -379,6 +379,7 @@ impl MemoryKernel {
     ) -> MemoryKernelResult<PreparedContext> {
         self.manager.set_active_session(ctx.session_id.clone());
         self.manager.set_active_agent(ctx.agent_id.clone());
+        self.manager.set_active_scope(default_scope_for_ctx(ctx));
 
         match self
             .manager
@@ -414,6 +415,7 @@ impl MemoryKernel {
     ) -> MemoryKernelResult<()> {
         self.manager.set_active_session(ctx.session_id.clone());
         self.manager.set_active_agent(ctx.agent_id.clone());
+        self.manager.set_active_scope(default_scope_for_ctx(ctx));
 
         if let Err(error) = self.manager.on_turn_end(messages).await {
             tracing::warn!(
@@ -437,6 +439,7 @@ impl MemoryKernel {
     ) -> MemoryKernelResult<()> {
         self.manager.set_active_session(ctx.session_id.clone());
         self.manager.set_active_agent(ctx.agent_id.clone());
+        self.manager.set_active_scope(default_scope_for_ctx(ctx));
 
         entry
             .session_id
@@ -1450,6 +1453,12 @@ fn packet_role_and_reason(atom: &MemoryAtomView) -> (MemoryPacketRole, String) {
 
 fn scoped_entry_scope(ctx: &MemoryTurnContext, entry: &MemoryEntry) -> MemoryScope {
     match &entry.scope {
+        // `MemoryScope::default()` is the historical Session("") sentinel.
+        // Never persist it: it is neither visible to its source session nor a
+        // meaningful authorization boundary.
+        MemoryScope::Session(session_id) if session_id.trim().is_empty() => {
+            default_scope_for_ctx(ctx)
+        }
         MemoryScope::Global => {
             if matches!(entry.visibility, AgentVisibility::Private) {
                 return MemoryScope::Agent(ctx.agent_id.clone());
@@ -1474,6 +1483,16 @@ fn scoped_entry_scope(ctx: &MemoryTurnContext, entry: &MemoryEntry) -> MemorySco
             .unwrap_or_else(|| MemoryScope::Session(ctx.session_id.clone())),
         other => other.clone(),
     }
+}
+
+fn default_scope_for_ctx(ctx: &MemoryTurnContext) -> MemoryScope {
+    if let Some(task_id) = ctx.task_id.as_deref().filter(|id| !id.trim().is_empty()) {
+        return MemoryScope::Task(task_id.to_string());
+    }
+    if let Some(project_id) = ctx.project_id.as_deref().filter(|id| !id.trim().is_empty()) {
+        return MemoryScope::Project(project_id.to_string());
+    }
+    MemoryScope::Session(ctx.session_id.clone())
 }
 
 fn memory_scope_visible_to_ctx(scope: &MemoryScope, ctx: &MemoryTurnContext) -> bool {
@@ -1924,5 +1943,18 @@ mod tests {
         assert_eq!(deduplicated[0].id, fresh_id);
         assert_eq!(omitted.len(), 1);
         assert!(omitted[0].reason.contains("duplicate recall candidate"));
+    }
+
+    #[test]
+    fn default_scope_never_persists_the_empty_session_sentinel() {
+        let context = MemoryTurnContext::new("session-a", "primary");
+        let empty_scope_entry = MemoryEntry {
+            scope: MemoryScope::default(),
+            ..memory_entry("Scoped", "must stay with its session", 0.0, 1.0, 0)
+        };
+        assert_eq!(
+            scoped_entry_scope(&context, &empty_scope_entry),
+            MemoryScope::Session("session-a".to_string())
+        );
     }
 }

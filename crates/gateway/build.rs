@@ -1,5 +1,8 @@
-use std::env;
 use std::process::Command;
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 fn main() {
     // Get git SHA (short hash)
@@ -61,6 +64,144 @@ fn main() {
         }
     }
     watch_git_path("packed-refs");
+
+    generate_route_registry();
+}
+
+fn generate_route_registry() {
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
+    let route_root = manifest_dir.join("src/api_routes");
+    let mut files = Vec::new();
+    collect_route_sources(&route_root, &route_root, &mut files);
+    files.sort();
+
+    let mut routes = Vec::new();
+    for relative in files {
+        let file_name = relative.to_string_lossy().replace('\\', "/");
+        if matches!(
+            file_name.as_str(),
+            "route_manifest.rs" | "route_registry.rs"
+        ) {
+            continue;
+        }
+        let absolute = route_root.join(&relative);
+        println!("cargo:rerun-if-changed={}", absolute.display());
+        let source = fs::read_to_string(&absolute)
+            .unwrap_or_else(|error| panic!("read route source {}: {error}", absolute.display()));
+        routes.extend(
+            parse_routes(&source)
+                .into_iter()
+                .map(|(method, path, handler)| (method, path, file_name.clone(), handler)),
+        );
+    }
+    routes.sort();
+    routes.dedup_by(|left, right| left.0 == right.0 && left.1 == right.1);
+    let mut generated =
+        String::from("pub(crate) const GENERATED_ROUTE_METADATA: &[GeneratedRouteMetadata] = &[\n");
+    for (method, path, source, handler) in routes {
+        generated.push_str(&format!(
+            "    GeneratedRouteMetadata {{ method: {:?}, path: {:?}, source: {:?}, handler: {:?} }},\n",
+            method, path, source, handler
+        ));
+    }
+    generated.push_str("];\n");
+    let output =
+        PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR")).join("gateway_route_registry.rs");
+    fs::write(output, generated).expect("write generated route registry");
+}
+
+fn collect_route_sources(root: &Path, current: &Path, files: &mut Vec<PathBuf>) {
+    let entries = fs::read_dir(current)
+        .unwrap_or_else(|error| panic!("read route directory {}: {error}", current.display()));
+    for entry in entries {
+        let entry = entry.expect("route directory entry");
+        let path = entry.path();
+        if path.is_dir() {
+            collect_route_sources(root, &path, files);
+        } else if path.extension().and_then(|value| value.to_str()) == Some("rs") {
+            files.push(
+                path.strip_prefix(root)
+                    .expect("relative route source")
+                    .to_path_buf(),
+            );
+        }
+    }
+}
+
+fn parse_routes(source: &str) -> Vec<(String, String, String)> {
+    let mut routes = Vec::new();
+    let mut offset = 0;
+    while let Some(index) = source[offset..].find(".route(") {
+        let start = offset + index + ".route(".len();
+        let Some(end) = route_call_end(source, start) else {
+            break;
+        };
+        let call = &source[start..end];
+        let trimmed = call.trim_start();
+        let Some(path_start) = trimmed.strip_prefix('"') else {
+            offset = end;
+            continue;
+        };
+        let Some(path_end) = path_start.find('"') else {
+            offset = end;
+            continue;
+        };
+        let path = path_start[..path_end].to_string();
+        let handlers = &path_start[path_end..];
+        for (needle, method) in [
+            ("get(", "GET"),
+            ("post(", "POST"),
+            ("put(", "PUT"),
+            ("patch(", "PATCH"),
+            ("delete(", "DELETE"),
+        ] {
+            if let Some(handler) = method_handler(handlers, needle) {
+                routes.push((method.to_string(), path.clone(), handler));
+            }
+        }
+        offset = end;
+    }
+    routes
+}
+
+fn method_handler(source: &str, needle: &str) -> Option<String> {
+    let index = source.find(needle)?;
+    let handler = source[index + needle.len()..]
+        .trim_start()
+        .chars()
+        .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+        .collect::<String>();
+    (!handler.is_empty()).then_some(handler)
+}
+
+fn route_call_end(source: &str, start: usize) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (relative, character) in source[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match character {
+            '"' => in_string = true,
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(start + relative);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn git_output<const N: usize>(args: [&str; N]) -> Option<String> {

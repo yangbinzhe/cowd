@@ -2377,24 +2377,6 @@ impl TuiState {
             return false;
         }
         match key.code {
-            KeyCode::Char('c') => {
-                let result = self.run_mission_command_action("consume");
-                self.gateway_panel
-                    .record_action_result("mission.command.consume", result);
-                true
-            }
-            KeyCode::Char('C') => {
-                let result = self.run_mission_command_action("cancel");
-                self.gateway_panel
-                    .record_action_result("mission.command.cancel", result);
-                true
-            }
-            KeyCode::Char('y') => {
-                let result = self.run_mission_command_action("retry");
-                self.gateway_panel
-                    .record_action_result("mission.command.retry", result);
-                true
-            }
             KeyCode::Char('e') => {
                 let result = run_gateway_api_blocking(move |client| async move {
                     client.harness_eval_latest_report().await
@@ -2435,58 +2417,13 @@ impl TuiState {
             }
             KeyCode::Char('t') => {
                 let result = run_gateway_api_blocking(move |client| async move {
-                    client
-                        .tick_mission_steward_scheduler(serde_json::json!({
-                            "source": "tui.gateway_panel",
-                            "mode": "tick"
-                        }))
-                        .await
+                    client.tick_mission_schedules(serde_json::json!({})).await
                 });
                 self.gateway_panel
-                    .record_action_result("mission.team.tick", result);
+                    .record_action_result("mission.schedule.tick", result);
                 true
             }
             _ => false,
-        }
-    }
-
-    fn run_mission_command_action(&mut self, action: &str) -> Result<serde_json::Value, String> {
-        let session_id = self
-            .app
-            .gateway_mission_control
-            .as_ref()
-            .and_then(|mission| {
-                mission.active_session_id.clone().or_else(|| {
-                    mission
-                        .sessions
-                        .first()
-                        .map(|session| session.session_id.clone())
-                })
-            })
-            .ok_or_else(|| "No active mission session".to_string())?;
-        let inbox_session = session_id.clone();
-        let inbox = run_gateway_api_blocking(move |client| async move {
-            client.mission_session_inbox(&inbox_session).await
-        })?;
-        let command_id = first_command_id(&inbox)
-            .ok_or_else(|| "No mission command id found in active inbox".to_string())?;
-        match action {
-            "consume" => run_gateway_api_blocking(move |client| async move {
-                client
-                    .consume_mission_session_command(&session_id, &command_id, "operator")
-                    .await
-            }),
-            "cancel" => run_gateway_api_blocking(move |client| async move {
-                client
-                    .cancel_mission_session_command(&session_id, &command_id)
-                    .await
-            }),
-            "retry" => run_gateway_api_blocking(move |client| async move {
-                client
-                    .retry_mission_session_command(&session_id, &command_id)
-                    .await
-            }),
-            _ => Err(format!("unsupported mission command action: {action}")),
         }
     }
 
@@ -3674,7 +3611,6 @@ impl TuiState {
                 });
                 match result {
                     Ok(_) => {
-                        self.apply_local_gateway_approval_response(&approval_id);
                         let verdict = if approved { "approved" } else { "rejected" };
                         self.push_runtime_action_receipt(
                             "ok",
@@ -3721,7 +3657,6 @@ impl TuiState {
                     });
                 match result {
                     Ok(_) => {
-                        self.apply_local_gateway_task_status(&task_id, "cancelled");
                         self.push_runtime_action_receipt(
                             "ok",
                             "cancelled",
@@ -3766,7 +3701,6 @@ impl TuiState {
                 });
                 match result {
                     Ok(_) => {
-                        self.apply_local_gateway_task_status(&task_id, "completed");
                         self.push_runtime_action_receipt(
                             "ok",
                             "completed",
@@ -3993,14 +3927,6 @@ impl TuiState {
             }
             Action::Noop => {}
         }
-    }
-
-    fn apply_local_gateway_approval_response(&mut self, approval_id: &str) {
-        self.mutate_runtime_control_store(|store| store.apply_approval_response(approval_id));
-    }
-
-    fn apply_local_gateway_task_status(&mut self, task_id: &str, status: &str) {
-        self.mutate_runtime_control_store(|store| store.apply_task_status(task_id, status));
     }
 
     fn apply_local_connector_resource_state(&mut self, reference: &str, state: &str) {
@@ -4496,28 +4422,6 @@ where
     }
 }
 
-fn first_command_id(value: &serde_json::Value) -> Option<String> {
-    match value {
-        serde_json::Value::Object(map) => {
-            if let Some(command_id) = map
-                .get("command_id")
-                .and_then(serde_json::Value::as_str)
-                .filter(|item| !item.trim().is_empty())
-            {
-                return Some(command_id.to_string());
-            }
-            for key in ["commands", "items", "session_commands", "inbox"] {
-                if let Some(found) = map.get(key).and_then(first_command_id) {
-                    return Some(found);
-                }
-            }
-            map.values().find_map(first_command_id)
-        }
-        serde_json::Value::Array(items) => items.iter().find_map(first_command_id),
-        _ => None,
-    }
-}
-
 fn first_surface_message_id(value: &serde_json::Value) -> Option<String> {
     first_string_field(
         value,
@@ -4612,71 +4516,6 @@ mod tests {
 
         // Theme engine dark by default
         assert_eq!(state.theme_engine.theme.name, "dark");
-    }
-
-    #[test]
-    fn local_gateway_approval_response_updates_projection_state() {
-        let mut state = TuiState::new("test-model", "test-session");
-        state.app.gateway_approval_items = vec![
-            crate::runtime_control_store::ApprovalSummary {
-                id: "approval-1".to_string(),
-                tool_name: "bash".to_string(),
-                risk: Some("high".to_string()),
-                requester: Some("session".to_string()),
-                input_preview: "rm -rf /tmp/example".to_string(),
-            },
-            crate::runtime_control_store::ApprovalSummary {
-                id: "approval-2".to_string(),
-                tool_name: "edit".to_string(),
-                risk: Some("medium".to_string()),
-                requester: Some("session".to_string()),
-                input_preview: "write file".to_string(),
-            },
-        ];
-        state.app.gateway_pending_approvals = Some(2);
-
-        state.apply_local_gateway_approval_response("approval-1");
-
-        assert_eq!(state.app.gateway_pending_approvals, Some(1));
-        assert_eq!(state.app.gateway_approval_items.len(), 1);
-        assert_eq!(state.app.gateway_approval_items[0].id, "approval-2");
-    }
-
-    #[test]
-    fn local_gateway_task_status_updates_projection_state() {
-        let mut state = TuiState::new("test-model", "test-session");
-        state.app.gateway_tasks = vec![
-            crate::runtime_control_store::TaskSummary {
-                id: "task-1".to_string(),
-                objective: "blocked task".to_string(),
-                status: "blocked".to_string(),
-                current_phase: Some("verify".to_string()),
-                yolo_mode: true,
-                failure_count: 1,
-                review_result: None,
-                artifact_count: 0,
-                blocker_reason: Some("waiting for approval".to_string()),
-            },
-            crate::runtime_control_store::TaskSummary {
-                id: "task-2".to_string(),
-                objective: "running task".to_string(),
-                status: "running".to_string(),
-                current_phase: None,
-                yolo_mode: false,
-                failure_count: 0,
-                review_result: None,
-                artifact_count: 0,
-                blocker_reason: None,
-            },
-        ];
-        state.app.gateway_task_count = Some(2);
-
-        state.apply_local_gateway_task_status("task-1", "completed");
-
-        assert_eq!(state.app.gateway_task_count, Some(2));
-        assert_eq!(state.app.gateway_tasks[0].status, "completed");
-        assert_eq!(state.app.gateway_tasks[0].blocker_reason, None);
-        assert_eq!(state.app.gateway_tasks[1].status, "running");
     }
 
     #[test]

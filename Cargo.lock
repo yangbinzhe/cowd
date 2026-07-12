@@ -52,7 +52,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "app-mfg"
-version = "0.9.476"
+version = "0.9.479"
 dependencies = [
  "chrono",
  "matrix-core",
@@ -67,7 +67,7 @@ dependencies = [
 
 [[package]]
 name = "approval"
-version = "0.9.476"
+version = "0.9.479"
 dependencies = [
  "serde",
  "serde_json",
@@ -266,8 +266,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "chrono-tz"
+version = "0.10.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6139a8597ed92cf816dfb33f5dd6cf0bb93a6adc938f11039f371bc5bcd26c3"
+dependencies = [
+ "chrono",
+ "phf",
+]
+
+[[package]]
 name = "cli"
-version = "0.9.476"
+version = "0.9.479"
 dependencies = [
  "gateway",
  "serde",
@@ -292,7 +302,7 @@ dependencies = [
 
 [[package]]
 name = "connector"
-version = "0.9.476"
+version = "0.9.479"
 dependencies = [
  "chrono",
  "harness-contract",
@@ -336,6 +346,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "cron"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f8c3e73077b4b4a6ab1ea5047c37c57aee77657bc8ecd6f29b0af082d0b0c07"
+dependencies = [
+ "chrono",
+ "nom",
+ "once_cell",
 ]
 
 [[package]]
@@ -507,7 +528,7 @@ dependencies = [
 
 [[package]]
 name = "fact-kernel"
-version = "0.9.476"
+version = "0.9.479"
 dependencies = [
  "chrono",
  "serde",
@@ -689,7 +710,7 @@ dependencies = [
 
 [[package]]
 name = "gateway"
-version = "0.9.476"
+version = "0.9.479"
 dependencies = [
  "app-mfg",
  "approval",
@@ -803,7 +824,7 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "harness-contract"
-version = "0.9.476"
+version = "0.9.479"
 dependencies = [
  "chrono",
  "serde",
@@ -814,11 +835,12 @@ dependencies = [
 
 [[package]]
 name = "harness-eval"
-version = "0.9.476"
+version = "0.9.479"
 dependencies = [
  "fact-kernel",
  "harness-contract",
  "memory",
+ "reqwest",
  "runtime",
  "serde",
  "serde_json",
@@ -1333,7 +1355,7 @@ checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
 name = "matrix-core"
-version = "0.9.476"
+version = "0.9.479"
 dependencies = [
  "chrono",
  "fact-kernel",
@@ -1345,7 +1367,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-repository"
-version = "0.9.476"
+version = "0.9.479"
 dependencies = [
  "chrono",
  "matrix-core",
@@ -1361,7 +1383,7 @@ dependencies = [
 
 [[package]]
 name = "mcp"
-version = "0.9.476"
+version = "0.9.479"
 dependencies = [
  "serde",
  "serde_json",
@@ -1376,7 +1398,7 @@ checksum = "6b947ae49db0d222b1dbc6b113ce7248a3fc3a6ca21b696717bfc000ba4484d8"
 
 [[package]]
 name = "memory"
-version = "0.9.476"
+version = "0.9.479"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1425,6 +1447,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "minimal-lexical"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
+
+[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1460,7 +1488,7 @@ dependencies = [
 
 [[package]]
 name = "model-protocol"
-version = "0.9.476"
+version = "0.9.479"
 dependencies = [
  "lru",
  "serde",
@@ -1484,6 +1512,16 @@ dependencies = [
  "mime",
  "spin",
  "version_check",
+]
+
+[[package]]
+name = "nom"
+version = "7.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
+dependencies = [
+ "memchr",
+ "minimal-lexical",
 ]
 
 [[package]]
@@ -1593,6 +1631,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "phf"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "913273894cec178f401a31ec4b656318d95473527be05c0752cc41cdc32be8b7"
+dependencies = [
+ "phf_shared",
+]
+
+[[package]]
+name = "phf_shared"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06005508882fb681fd97892ecff4b7fd0fee13ef1aa569f8695dae7ab9099981"
+dependencies = [
+ "siphasher",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1619,7 +1675,7 @@ dependencies = [
 
 [[package]]
 name = "plugins"
-version = "0.9.476"
+version = "0.9.479"
 dependencies = [
  "serde",
  "serde_json",
@@ -1670,7 +1726,7 @@ dependencies = [
 
 [[package]]
 name = "provider"
-version = "0.9.476"
+version = "0.9.479"
 dependencies = [
  "model-protocol",
  "reqwest",
@@ -2002,12 +2058,14 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.9.476"
+version = "0.9.479"
 dependencies = [
  "approval",
  "async-trait",
  "base64",
  "chrono",
+ "chrono-tz",
+ "cron",
  "fact-kernel",
  "fs2",
  "futures",
@@ -2282,8 +2340,9 @@ dependencies = [
 
 [[package]]
 name = "session"
-version = "0.9.476"
+version = "0.9.479"
 dependencies = [
+ "memory",
  "serde",
  "serde_json",
  "tokio",
@@ -2360,8 +2419,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
 
 [[package]]
+name = "siphasher"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
+
+[[package]]
 name = "skill"
-version = "0.9.476"
+version = "0.9.479"
 dependencies = [
  "harness-contract",
  "regex",
@@ -2413,7 +2478,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "storage"
-version = "0.9.476"
+version = "0.9.479"
 dependencies = [
  "rusqlite",
  "serde",
@@ -2464,7 +2529,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "surface"
-version = "0.9.476"
+version = "0.9.479"
 dependencies = [
  "chrono",
  "serde",
@@ -2745,7 +2810,7 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "tools"
-version = "0.9.476"
+version = "0.9.479"
 dependencies = [
  "base64",
  "flate2",
@@ -2986,11 +3051,12 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tui"
-version = "0.9.476"
+version = "0.9.479"
 dependencies = [
  "chrono",
  "crossterm",
  "futures",
+ "harness-contract",
  "libc",
  "pulldown-cmark",
  "ratatui",

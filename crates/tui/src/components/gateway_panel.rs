@@ -781,25 +781,6 @@ impl Component for GatewayPanel {
                     ),
                 ]));
                 lines.push(Line::from(vec![
-                    Span::styled("Inbox: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        format!(
-                            "{} total, {} pending, {} running, {} failed",
-                            mission.command_total,
-                            mission.command_pending,
-                            mission.command_running,
-                            mission.command_failed
-                        ),
-                        Style::default().fg(if mission.command_failed > 0 {
-                            Color::Red
-                        } else if mission.command_running > 0 {
-                            Color::Yellow
-                        } else {
-                            Color::White
-                        }),
-                    ),
-                ]));
-                lines.push(Line::from(vec![
                     Span::styled("Graphs/Conflicts: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
                         format!(
@@ -1412,7 +1393,7 @@ impl Component for GatewayPanel {
         // ── Keyboard hint bar ──────────────────────────────────
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "Keys: j/k scroll  PgUp/PgDn page  e eval  E smoke  c consume  C cancel  y retry  t steward tick",
+            "Keys: j/k scroll  PgUp/PgDn page  e eval  E smoke  c consume  C cancel  y retry  t schedule tick",
             Style::default().fg(Color::DarkGray),
         )));
 
@@ -1980,13 +1961,6 @@ mod tests {
             evidence_count: 5,
             capability_action_count: 7,
             event_count: 5,
-            command_pending: 2,
-            command_claimed: 0,
-            command_running: 1,
-            command_completed: 0,
-            command_failed: 0,
-            command_cancelled: 0,
-            command_total: 3,
             control_ready_count: 4,
             control_blocked_count: 1,
             control_requires_approval_count: 1,

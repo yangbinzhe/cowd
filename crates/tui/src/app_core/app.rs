@@ -316,6 +316,9 @@ pub struct App {
     pub latest_context_envelope: Option<Value>,
     pub latest_runtime_policy: Option<crate::RuntimePolicyDecisionSummary>,
     pub latest_execution_graph_summary: Option<crate::RuntimeExecutionGraphSummary>,
+    /// Canonical execution snapshot received from Gateway. This is the only
+    /// TUI source for graph lifecycle state; stream prose remains display-only.
+    pub latest_execution_projection: Option<crate::protocol::ExecutionProjection>,
     pub latest_run_projection: Option<Value>,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -604,6 +607,7 @@ impl App {
             latest_context_envelope: None,
             latest_runtime_policy: None,
             latest_execution_graph_summary: None,
+            latest_execution_projection: None,
             latest_run_projection: None,
             input_tokens: 0,
             output_tokens: 0,
@@ -662,6 +666,54 @@ impl App {
             }
         }
         self.latest_run_projection = Some(projection);
+        self.msg_version = self.msg_version.wrapping_add(1);
+    }
+
+    pub fn apply_execution_projection(&mut self, projection: crate::protocol::ExecutionProjection) {
+        let total_nodes = projection.graph.nodes.len();
+        let terminal_nodes = projection
+            .graph
+            .nodes
+            .iter()
+            .filter(|node| node.status.is_terminal())
+            .count();
+        let status = if projection.graph.nodes.iter().any(|node| {
+            matches!(
+                node.status,
+                harness_contract::execution_graph::ExecutionNodeStatus::Failed
+            )
+        }) {
+            "failed"
+        } else if total_nodes > 0 && terminal_nodes == total_nodes {
+            "terminal"
+        } else if projection.graph.nodes.iter().any(|node| {
+            matches!(
+                node.status,
+                harness_contract::execution_graph::ExecutionNodeStatus::WaitingExternal
+            )
+        }) {
+            "waiting_external"
+        } else {
+            "running"
+        };
+        self.latest_execution_graph_summary = Some(crate::RuntimeExecutionGraphSummary {
+            graph_id: Some(projection.execution_id.clone()),
+            board_id: None,
+            status: status.to_string(),
+            agent_tasks: projection.agents.len(),
+            child_executions: projection.child_executions.len(),
+            memory_candidates: projection.context.len(),
+            conflicts: projection
+                .interventions
+                .iter()
+                .filter(|item| item.status.as_deref() == Some("blocked"))
+                .count(),
+            completion_rate: (total_nodes > 0)
+                .then_some(terminal_nodes as f32 / total_nodes as f32),
+            synthesis_lift: None,
+            complementarity_score: None,
+        });
+        self.latest_execution_projection = Some(projection);
         self.msg_version = self.msg_version.wrapping_add(1);
     }
 
@@ -1337,6 +1389,7 @@ impl App {
                 self.latest_context_envelope = None;
                 self.latest_runtime_policy = None;
                 self.latest_execution_graph_summary = None;
+                self.latest_execution_projection = None;
                 self.latest_run_projection = None;
                 self.thinking_id_counter = 0;
                 self.pre_turn_input = self.input_tokens;
@@ -1558,6 +1611,7 @@ mod tests {
             board_id: Some("b".into()),
             status: "done".into(),
             agent_tasks: 1,
+            child_executions: 0,
             memory_candidates: 2,
             conflicts: 0,
             completion_rate: Some(1.0),

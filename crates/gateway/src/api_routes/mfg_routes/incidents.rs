@@ -541,10 +541,10 @@ pub(super) async fn mfg_execution_cross_plane_bridge_handler(
         .unwrap_or_default();
         let executor = std::sync::Arc::new(crate::services::GatewayCrossPlaneExecutor::new(
             state.services.surface.clone(),
-            target,
+            target.clone(),
             state.services.cross_plane.runtime_control(),
         ));
-        state
+        let projection = state
             .services
             .cross_plane
             .execute_commit_graph(&action, &decision, &graph_key, executor)
@@ -553,13 +553,15 @@ pub(super) async fn mfg_execution_cross_plane_bridge_handler(
         state
             .services
             .cross_plane
-            .find_execution_by_idempotency_key(&graph_key)
-            .ok_or_else(|| {
-                api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "canonical cross-plane graph receipt is missing",
-                )
-            })?
+            .record_message_dispatch_graph(
+                graph_key,
+                action,
+                decision,
+                evidence,
+                target,
+                &projection,
+            )
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
     } else {
         state
             .services

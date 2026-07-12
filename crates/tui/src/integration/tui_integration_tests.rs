@@ -148,6 +148,7 @@ fn integration_clean_mode_renders_current_turn_evidence_summary() {
         board_id: None,
         status: "ready".into(),
         agent_tasks: 0,
+        child_executions: 0,
         memory_candidates: 4,
         conflicts: 0,
         completion_rate: None,

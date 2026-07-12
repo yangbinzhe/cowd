@@ -99,6 +99,9 @@ fn summarize_json(value: &Value, limit: usize) -> String {
 
 fn provider_event_json(event: &runtime::AssistantEvent) -> Value {
     match event {
+        runtime::AssistantEvent::ProviderModel { model } => {
+            json!({"kind": "provider_model", "model": model})
+        }
         runtime::AssistantEvent::TextDelta(text) => {
             json!({"kind": "text_delta", "text_summary": summarize_text(text, 240)})
         }

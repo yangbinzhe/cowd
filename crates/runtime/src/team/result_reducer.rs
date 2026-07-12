@@ -56,6 +56,7 @@ impl SynthesizeBackend for TeamResultReducer {
         let mut evidence = Vec::new();
         let mut usage = ExecutionUsage::default();
         let mut blockers = Vec::new();
+        let mut allows_unresolved = false;
 
         for node in graph.nodes.iter().filter(|node| {
             node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask
@@ -86,6 +87,10 @@ impl SynthesizeBackend for TeamResultReducer {
             usage.output_tokens = usage.output_tokens.saturating_add(returned.output_tokens);
             usage.tool_calls = usage.tool_calls.saturating_add(returned.tool_calls);
             evidence.extend(returned.evidence_refs.clone());
+            allows_unresolved |= packet
+                .constraints
+                .iter()
+                .any(|constraint| constraint == "protocol_allows_unresolved:true");
             match returned.status {
                 AgentTerminalStatus::Completed => {
                     summaries.push(format!("## {}\n{}", packet.agent_id, returned.outcome))
@@ -102,20 +107,10 @@ impl SynthesizeBackend for TeamResultReducer {
             }
         }
 
-        let (status, result_ref, failure) = if blockers.is_empty() {
-            if summaries.is_empty() {
-                return Err("team synthesis has no completed AgentRuntime results".into());
-            }
-            let final_answer = summaries.join("\n\n");
-            (
-                ExecutionNodeStatus::Completed,
-                Some(format!(
-                    "assistant_json:{}",
-                    serde_json::to_string(&final_answer).map_err(|error| error.to_string())?
-                )),
-                None,
-            )
-        } else {
+        if summaries.is_empty() {
+            return Err("team synthesis has no completed AgentRuntime results".into());
+        }
+        let (status, result_ref, failure) = if !blockers.is_empty() && !allows_unresolved {
             (
                 ExecutionNodeStatus::Blocked,
                 None,
@@ -125,6 +120,29 @@ impl SynthesizeBackend for TeamResultReducer {
                     retryable: false,
                     evidence_refs: evidence.clone(),
                 }),
+            )
+        } else {
+            // Protocol teams explicitly permit incomplete lanes. Preserve the
+            // lifecycle failure on those agents, but publish the independent
+            // completed evidence and name the gap for the parent turn. This
+            // keeps a single unavailable synthesis worker from erasing a
+            // real, auditable team result.
+            let mut final_answer = summaries.join("\n\n");
+            if !blockers.is_empty() {
+                final_answer.push_str("\n\n## Unresolved team role outcomes\n");
+                for blocker in blockers {
+                    final_answer.push_str("- ");
+                    final_answer.push_str(&blocker);
+                    final_answer.push('\n');
+                }
+            }
+            (
+                ExecutionNodeStatus::Completed,
+                Some(format!(
+                    "assistant_json:{}",
+                    serde_json::to_string(&final_answer).map_err(|error| error.to_string())?
+                )),
+                None,
             )
         };
         Ok(NodeExecutionOutcome::new(ExecutionNodeResult {

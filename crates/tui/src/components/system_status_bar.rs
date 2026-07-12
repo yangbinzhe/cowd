@@ -356,6 +356,7 @@ mod tests {
             board_id: None,
             status: "ready".into(),
             agent_tasks: 0,
+            child_executions: 0,
             memory_candidates: 3,
             conflicts: 0,
             completion_rate: None,

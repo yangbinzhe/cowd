@@ -103,6 +103,7 @@ mod tests {
                     board_id: Some("board".into()),
                     status: "completed".into(),
                     agent_tasks: 1,
+                    child_executions: 0,
                     memory_candidates: 1,
                     conflicts: 0,
                     completion_rate: Some(1.0),

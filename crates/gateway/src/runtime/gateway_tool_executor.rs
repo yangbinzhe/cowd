@@ -41,6 +41,13 @@ struct RuntimeCapabilitiesRequest {
     detail: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RuntimeToolExecutionBinding<'a> {
+    session_id: Option<&'a str>,
+    model_lease: Option<&'a str>,
+    parent_execution: Option<&'a harness_contract::execution_graph::ExecutionParentBinding>,
+}
+
 fn is_gateway_runtime_control_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
@@ -58,6 +65,7 @@ pub(crate) struct GatewayToolExecutor {
     tool_host: Arc<ToolHost>,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     runtime_session_id: Option<String>,
+    runtime_model_lease: Option<String>,
     runtime_execution_decision: Arc<Mutex<Option<runtime::RuntimeExecutionDecision>>>,
     runtime_services: Arc<OnceLock<Arc<runtime::RuntimeServices>>>,
 }
@@ -86,6 +94,7 @@ impl GatewayToolExecutor {
             tool_host,
             mcp_state,
             runtime_session_id: None,
+            runtime_model_lease: None,
             runtime_execution_decision: Arc::new(Mutex::new(None)),
             runtime_services: Arc::new(OnceLock::new()),
         }
@@ -103,6 +112,7 @@ impl GatewayToolExecutor {
             tool_host,
             mcp_state,
             runtime_session_id: None,
+            runtime_model_lease: None,
             runtime_execution_decision: Arc::new(Mutex::new(None)),
             runtime_services: Arc::new(OnceLock::new()),
         }
@@ -113,6 +123,18 @@ impl GatewayToolExecutor {
         let session_id = session_id.into();
         if !session_id.is_empty() {
             self.runtime_session_id = Some(session_id);
+        }
+        self
+    }
+
+    /// Bind orchestration spawned from this conversation to the exact model
+    /// selected for the parent runtime. Agent graphs may not silently fall
+    /// back to a fictional `default` model lease.
+    #[must_use]
+    pub(crate) fn with_runtime_model_lease(mut self, model: impl Into<String>) -> Self {
+        let model = model.into();
+        if !model.trim().is_empty() {
+            self.runtime_model_lease = Some(model);
         }
         self
     }
@@ -172,6 +194,23 @@ impl GatewayToolExecutor {
         tool_name: &str,
         value: serde_json::Value,
     ) -> Result<String, ToolError> {
+        self.execute_runtime_tool_with_binding(
+            tool_name,
+            value,
+            RuntimeToolExecutionBinding {
+                session_id: self.runtime_session_id.as_deref(),
+                model_lease: self.runtime_model_lease.as_deref(),
+                parent_execution: None,
+            },
+        )
+    }
+
+    fn execute_runtime_tool_with_binding(
+        &self,
+        tool_name: &str,
+        value: serde_json::Value,
+        binding: RuntimeToolExecutionBinding<'_>,
+    ) -> Result<String, ToolError> {
         if tool_name == "runtime_capabilities" {
             let input: RuntimeCapabilitiesRequest = serde_json::from_value(value)
                 .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
@@ -196,18 +235,25 @@ impl GatewayToolExecutor {
         }
         if tool_name == "runtime_orchestrate" {
             let mut value = value;
-            if let Some(session_id) = &self.runtime_session_id {
-                if let Some(object) = value.as_object_mut() {
-                    let missing_session = object
-                        .get("session_id")
-                        .and_then(serde_json::Value::as_str)
-                        .is_none_or(str::is_empty);
-                    if missing_session {
-                        object.insert(
-                            "session_id".to_string(),
-                            serde_json::Value::String(session_id.clone()),
-                        );
-                    }
+            if let Some(object) = value.as_object_mut() {
+                // The gateway owns session/model binding. A model can request
+                // a target session only through the typed dispatch fields;
+                // it cannot redirect a graph or its child agents by forging
+                // the parent identity in tool JSON.
+                if let Some(session_id) = binding
+                    .session_id
+                    .filter(|session_id| !session_id.trim().is_empty())
+                {
+                    object.insert(
+                        "session_id".to_string(),
+                        serde_json::Value::String(session_id.to_string()),
+                    );
+                }
+                if let Some(model) = binding.model_lease.filter(|model| !model.trim().is_empty()) {
+                    object.insert(
+                        "model_lease".to_string(),
+                        serde_json::Value::String(model.to_string()),
+                    );
                 }
             }
             let leased_decision = self
@@ -215,10 +261,11 @@ impl GatewayToolExecutor {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
-            let request = serde_json::from_value::<runtime::RuntimeOrchestrationRequest>(value)
+            let mut request = serde_json::from_value::<runtime::RuntimeOrchestrationRequest>(value)
                 .map_err(|error| {
                     ToolError::new(format!("invalid runtime_orchestrate input: {error}"))
                 })?;
+            self.bind_delegated_capabilities(&mut request);
             let services = self.runtime_services.get().cloned().ok_or_else(|| {
                 ToolError::new("runtime_orchestrate requires the workspace RuntimeServices Runner")
             })?;
@@ -235,13 +282,36 @@ impl GatewayToolExecutor {
                                 request,
                                 decision.as_ref(),
                                 services.as_ref(),
+                                binding.parent_execution.cloned(),
                             )),
                         )
                     })
                     .join()
                     .map_err(|_| ToolError::new("runtime orchestration worker panicked"))?
             })?;
-            return serde_json::to_string_pretty(&result)
+            tracing::info!(
+                status = %result.status,
+                selected_pattern = %result.decision.selected_pattern.as_str(),
+                findings = ?result.decision.validation_findings,
+                "runtime orchestration request completed"
+            );
+            if matches!(
+                result.status.as_str(),
+                "rejected" | "unavailable" | "blocked"
+            ) {
+                let execution = serde_json::to_string(&result.execution)
+                    .unwrap_or_else(|_| "{\"type\":\"unserializable_execution\"}".to_string());
+                return Err(ToolError::new(format!(
+                    "runtime orchestration {}: {}; execution={execution}",
+                    result.status,
+                    result.decision.validation_findings.join(", ")
+                )));
+            }
+            // The full orchestration graph is retained as durable raw tool
+            // evidence by ConversationRuntime. The parent model receives the
+            // typed terminal receipt only; otherwise a completed team graph
+            // recursively injects every child projection into the next turn.
+            return serde_json::to_string_pretty(&result.model_receipt())
                 .map_err(|error| ToolError::new(error.to_string()));
         }
 
@@ -301,6 +371,39 @@ impl GatewayToolExecutor {
             .ok()?
             .into_iter()
             .find_map(|(name, permission)| (name == tool_name).then_some(permission))
+    }
+
+    /// A team request must carry explicit least-privilege capabilities into
+    /// its protocol packets. Models are not required to enumerate the local
+    /// read-only catalog in tool JSON, and forwarding arbitrary names would
+    /// let a prompt define its own delegation boundary. Gateway therefore
+    /// intersects caller hints with its active catalog and adds the active
+    /// read-only evidence tools. Lifecycle controls never propagate to leaf
+    /// agents.
+    fn bind_delegated_capabilities(&self, request: &mut runtime::RuntimeOrchestrationRequest) {
+        let mut allowed_tools = self
+            .available_tool_names()
+            .into_iter()
+            .filter(|name| !is_gateway_runtime_control_tool(name))
+            .filter(|name| self.tool_permission_mode(name) == Some(ToolPermissionMode::ReadOnly))
+            .collect::<Vec<_>>();
+        allowed_tools.sort();
+        allowed_tools.dedup();
+        let allowed = allowed_tools
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+
+        request.capabilities.retain(|capability| {
+            capability
+                .strip_prefix("tool:")
+                .map_or(true, |tool| allowed.contains(tool))
+        });
+        request
+            .capabilities
+            .extend(allowed_tools.into_iter().map(|tool| format!("tool:{tool}")));
+        request.capabilities.sort();
+        request.capabilities.dedup();
     }
 }
 
@@ -440,7 +543,36 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
         request: &runtime::RuntimeToolExecutionRequest,
     ) -> runtime::RuntimeToolExecutionOutcome {
         let evidence_ref = format!("gateway-tool:{}", request.tool_use_id);
-        match <Self as ToolExecutor>::execute(self, &request.tool_name, &request.input) {
+        let value = match serde_json::from_str(&request.input) {
+            Ok(value) => value,
+            Err(error) => {
+                return runtime::RuntimeToolExecutionOutcome {
+                    tool_use_id: request.tool_use_id.clone(),
+                    tool_name: request.tool_name.clone(),
+                    status: runtime::RuntimeToolExecutionStatus::Failed,
+                    category: request.category,
+                    output: None,
+                    error: Some(format!("invalid tool input JSON: {error}")),
+                    evidence_ref,
+                };
+            }
+        };
+        let result = if request.tool_name == "ToolSearch" {
+            self.execute_search_tool(value)
+        } else if is_gateway_runtime_control_tool(&request.tool_name) {
+            self.execute_runtime_tool_with_binding(
+                &request.tool_name,
+                value,
+                RuntimeToolExecutionBinding {
+                    session_id: request.session_id.as_deref(),
+                    model_lease: request.model_lease.as_deref(),
+                    parent_execution: request.parent_execution.as_ref(),
+                },
+            )
+        } else {
+            <Self as ToolExecutor>::execute(self, &request.tool_name, &request.input)
+        };
+        match result {
             Ok(output) => runtime::RuntimeToolExecutionOutcome {
                 tool_use_id: request.tool_use_id.clone(),
                 tool_name: request.tool_name.clone(),
@@ -460,6 +592,28 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                 evidence_ref,
             },
         }
+    }
+
+    fn delegated_tool_definitions(
+        &self,
+        tool_names: &[String],
+    ) -> Vec<runtime::ProviderToolDefinition> {
+        let allowed = tool_names
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        self.tool_host
+            .pin_snapshot()
+            .snapshot()
+            .catalog
+            .definitions(Some(&allowed))
+            .into_iter()
+            .map(|definition| runtime::ProviderToolDefinition {
+                name: definition.name,
+                description: definition.description,
+                input_schema: definition.input_schema,
+            })
+            .collect()
     }
 }
 
@@ -610,10 +764,7 @@ mod tests {
             capabilities["execution_decision"]["lease"]["lease_id"],
             lease_id
         );
-        assert_eq!(
-            orchestration["evidence"]["strategy_lease"]["lease_id"],
-            lease_id
-        );
+        assert_eq!(orchestration["evidence"]["strategy_lease_id"], lease_id);
     }
 
     #[test]
@@ -641,25 +792,17 @@ mod tests {
             .bind_runtime_services(runtime::RuntimeServices::in_memory().unwrap())
             .unwrap();
 
-        let output = executor
+        let error = executor
             .execute(
                 "runtime_orchestrate",
                 r#"{"intent":"需要多 Agent 协同审查架构","action":"request_team"}"#,
             )
-            .expect("gateway-bound runtime orchestrate should execute without explicit session_id");
+            .expect_err("unavailable team orchestration must not be reported as a successful tool");
 
-        let response: serde_json::Value = serde_json::from_str(&output).expect("typed response");
-        assert_eq!(response["status"], "unavailable");
-        assert_eq!(response["execution"]["type"], "orchestration_not_submitted");
-        assert_eq!(response["evidence"]["accepted"], false);
-        assert!(response["decision"]["validation_findings"]
-            .as_array()
-            .expect("validation findings")
-            .iter()
-            .any(|finding| finding
-                .as_str()
-                .is_some_and(|value| value.contains("execution_capability_unavailable"))));
-        assert!(!output.contains("missing_session_id_for_team_runtime"));
+        assert!(error.to_string().contains("runtime orchestration blocked"));
+        assert!(!error
+            .to_string()
+            .contains("missing_session_id_for_team_runtime"));
     }
 
     #[test]
@@ -699,5 +842,47 @@ mod tests {
         assert_eq!(response["evidence"]["compiled"], true);
         assert_eq!(response["evidence"]["accepted"], false);
         assert!(response["execution"].get("receipt").is_none());
+    }
+
+    #[test]
+    fn delegated_capabilities_are_catalog_bound_read_only_and_non_recursive() {
+        let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin(), None);
+        let mut request = runtime::RuntimeOrchestrationRequest {
+            intent: "review the workspace with a delegated team".to_string(),
+            model_lease: None,
+            session_id: Some("session".to_string()),
+            target_session_id: None,
+            action: runtime::RuntimeOrchestrationAction::RequestTeam,
+            reason: None,
+            template_hint: None,
+            protocol: None,
+            capabilities: vec![
+                "tool:runtime_orchestrate".to_string(),
+                "tool:unknown_tool".to_string(),
+                "tool:write_file".to_string(),
+                "backend:process_jsonl".to_string(),
+            ],
+            evidence_refs: Vec::new(),
+            constraints: Default::default(),
+            surface: None,
+        };
+
+        executor.bind_delegated_capabilities(&mut request);
+        let delegated = request
+            .capabilities
+            .iter()
+            .filter_map(|capability| capability.strip_prefix("tool:"))
+            .collect::<Vec<_>>();
+
+        assert!(!delegated.is_empty());
+        assert!(!delegated.contains(&"runtime_orchestrate"));
+        assert!(!delegated.contains(&"runtime_capabilities"));
+        assert!(!delegated.contains(&"unknown_tool"));
+        assert!(delegated.iter().all(|tool| {
+            executor.tool_permission_mode(tool) == Some(ToolPermissionMode::ReadOnly)
+        }));
+        assert!(request
+            .capabilities
+            .contains(&"backend:process_jsonl".to_string()));
     }
 }

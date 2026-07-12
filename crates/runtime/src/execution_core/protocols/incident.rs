@@ -1,7 +1,7 @@
 use super::{
     validate_protocol_request, OutputSpec, ProtocolAvailability, ProtocolCompileError,
     ProtocolCompileRequest, ProtocolGraphBuilder, ProtocolId, ProtocolSpec, RepairPolicy,
-    RepairTrigger, RoleDependencySpec, RoleSpec, StopPolicy,
+    RepairTrigger, RoleDependencySpec, RoleEvidenceMode, RoleSpec, StopPolicy,
 };
 use harness_contract::execution_graph::ExecutionGraph;
 
@@ -53,28 +53,32 @@ pub(crate) fn spec() -> ProtocolSpec {
                 1,
                 1,
                 OutputSpec::structured(&["severity", "scope", "initial_hypotheses"], true),
-            ),
+            )
+            .with_evidence_mode(RoleEvidenceMode::ObjectiveOnly),
             RoleSpec::agent(
                 "evidence_logs",
                 "Collect and assess relevant log evidence, including collection failures.",
                 1,
                 1,
                 OutputSpec::evidence_backed(&["log_evidence", "gaps", "collection_status"], true),
-            ),
+            )
+            .with_evidence_mode(RoleEvidenceMode::Acquire),
             RoleSpec::agent(
                 "evidence_code",
                 "Inspect code-path evidence and identify uncertainty or unavailable sources.",
                 1,
                 1,
                 OutputSpec::evidence_backed(&["code_evidence", "gaps", "collection_status"], true),
-            ),
+            )
+            .with_evidence_mode(RoleEvidenceMode::Acquire),
             RoleSpec::agent(
                 "evidence_state",
                 "Inspect service and runtime state evidence and record unavailable observations.",
                 1,
                 1,
                 OutputSpec::evidence_backed(&["state_evidence", "gaps", "collection_status"], true),
-            ),
+            )
+            .with_evidence_mode(RoleEvidenceMode::Acquire),
             RoleSpec::agent(
                 "hypotheses",
                 "Rank hypotheses by evidence and state disconfirming observations.",
@@ -84,7 +88,8 @@ pub(crate) fn spec() -> ProtocolSpec {
                     &["ranked_hypotheses", "supporting_evidence", "uncertainty"],
                     true,
                 ),
-            ),
+            )
+            .with_evidence_mode(RoleEvidenceMode::UpstreamOnly),
             RoleSpec::agent(
                 "mitigation",
                 "Produce a bounded mitigation plan with action gates and rollback criteria.",
@@ -94,14 +99,16 @@ pub(crate) fn spec() -> ProtocolSpec {
                     &["mitigation_plan", "action_gates", "rollback_criteria"],
                     true,
                 ),
-            ),
+            )
+            .with_evidence_mode(RoleEvidenceMode::UpstreamOnly),
             RoleSpec::agent(
                 "review",
                 "Review the mitigation plan for safety, evidence sufficiency, and unaddressed impact.",
                 1,
                 1,
                 OutputSpec::evidence_backed(&["review_findings", "safety_risks", "gaps"], true),
-            ),
+            )
+            .with_evidence_mode(RoleEvidenceMode::UpstreamOnly),
             RoleSpec::agent(
                 "report",
                 "Produce an honest incident report, retaining partial or unresolved findings.",
@@ -111,7 +118,8 @@ pub(crate) fn spec() -> ProtocolSpec {
                     &["incident_report", "confirmed_facts", "unresolved", "next_actions"],
                     true,
                 ),
-            ),
+            )
+            .with_evidence_mode(RoleEvidenceMode::UpstreamOnly),
         ],
         dependencies: vec![
             RoleDependencySpec::all("evidence_logs", "triage"),

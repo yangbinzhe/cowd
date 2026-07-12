@@ -3,6 +3,8 @@ use std::fmt;
 use harness_contract::context::EvidenceAccessRef;
 use serde::{Deserialize, Serialize};
 
+use harness_contract::execution_graph::ExecutionParentBinding;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProtocolId {
@@ -79,6 +81,36 @@ pub struct OutputSpec {
     pub allows_unresolved: bool,
 }
 
+/// Declares how a protocol role may acquire evidence. This is part of the
+/// protocol contract, rather than an incidental consequence of graph
+/// topology: a dependent role can legitimately gather new evidence, while a
+/// framing or synthesis role should consume the bounded objective/upstream
+/// packet it already owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoleEvidenceMode {
+    /// The role frames, classifies, or structures the supplied objective and
+    /// must not turn itself into a workspace-wide research worker.
+    ObjectiveOnly,
+    /// The role may use its authorized tools to obtain missing, role-specific
+    /// evidence. It still receives predecessor results when dependencies exist.
+    Acquire,
+    /// The role assesses or synthesizes canonical predecessor output and must
+    /// explicitly report unresolved evidence rather than silently rediscover it.
+    UpstreamOnly,
+}
+
+impl RoleEvidenceMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ObjectiveOnly => "objective_only",
+            Self::Acquire => "acquire",
+            Self::UpstreamOnly => "upstream_only",
+        }
+    }
+}
+
 impl OutputSpec {
     #[must_use]
     pub fn evidence_backed(required_fields: &[&str], allows_unresolved: bool) -> Self {
@@ -113,6 +145,12 @@ pub struct RoleSpec {
     pub min_instances: usize,
     pub max_instances: usize,
     pub output: OutputSpec,
+    #[serde(default = "default_role_evidence_mode")]
+    pub evidence_mode: RoleEvidenceMode,
+}
+
+const fn default_role_evidence_mode() -> RoleEvidenceMode {
+    RoleEvidenceMode::Acquire
 }
 
 impl RoleSpec {
@@ -131,7 +169,14 @@ impl RoleSpec {
             min_instances,
             max_instances,
             output,
+            evidence_mode: RoleEvidenceMode::Acquire,
         }
+    }
+
+    #[must_use]
+    pub fn with_evidence_mode(mut self, evidence_mode: RoleEvidenceMode) -> Self {
+        self.evidence_mode = evidence_mode;
+        self
     }
 
     #[must_use]
@@ -236,6 +281,8 @@ pub struct ProtocolCompileRequest {
     pub mission_id: Option<String>,
     pub team_id: Option<String>,
     pub objective: String,
+    #[serde(default)]
+    pub parent_execution: Option<ExecutionParentBinding>,
     pub context_refs: Vec<String>,
     pub evidence_refs: Vec<EvidenceAccessRef>,
     pub allowed_tools: Vec<String>,
@@ -271,6 +318,7 @@ impl ProtocolCompileRequest {
             mission_id: None,
             team_id: None,
             objective: objective.into(),
+            parent_execution: None,
             context_refs: Vec::new(),
             evidence_refs: Vec::new(),
             allowed_tools: Vec::new(),

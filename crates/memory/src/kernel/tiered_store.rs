@@ -118,6 +118,8 @@ impl Default for TieredSessionStoreConfig {
 /// Lightweight serializable message used for archive persistence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ArchivedMessage {
+    #[serde(default)]
+    stable_message_id: String,
     session_id: String,
     sequence: usize,
     role: String,
@@ -135,6 +137,7 @@ struct ArchivedMessage {
 impl From<SessionMessage> for ArchivedMessage {
     fn from(m: SessionMessage) -> Self {
         Self {
+            stable_message_id: m.stable_message_id,
             session_id: m.session_id,
             sequence: m.sequence,
             role: m.role,
@@ -151,6 +154,11 @@ impl From<SessionMessage> for ArchivedMessage {
 impl From<ArchivedMessage> for SessionMessage {
     fn from(a: ArchivedMessage) -> Self {
         Self {
+            stable_message_id: if a.stable_message_id.is_empty() {
+                format!("archive:{}:{}", a.session_id, a.sequence)
+            } else {
+                a.stable_message_id
+            },
             session_id: a.session_id,
             sequence: a.sequence,
             role: a.role,
@@ -466,6 +474,7 @@ mod tests {
 
     fn make_message(session_id: &str, seq: usize) -> SessionMessage {
         SessionMessage {
+            stable_message_id: format!("tiered:{session_id}:{seq}"),
             session_id: session_id.to_string(),
             sequence: seq,
             role: "user".to_string(),

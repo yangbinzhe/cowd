@@ -29,7 +29,7 @@ use crate::execution_core::graph::executors::{
 pub use contract::{
     OutputSpec, ProtocolAvailability, ProtocolCompileRequest, ProtocolExecutorKind, ProtocolId,
     ProtocolRef, ProtocolSpec, RepairPolicy, RepairTrigger, RoleDependencyKind, RoleDependencySpec,
-    RoleSpec, StopPolicy,
+    RoleEvidenceMode, RoleSpec, StopPolicy,
 };
 pub use debate::{compile as compile_debate, DebateProtocolCompiler};
 pub use incident::{compile as compile_incident, IncidentProtocolCompiler};
@@ -130,6 +130,7 @@ impl<'a> ProtocolGraphBuilder<'a> {
                 id: request.graph_id.clone(),
                 revision: 0,
                 objective: request.objective.clone(),
+                parent_execution: request.parent_execution.clone(),
                 nodes: Vec::new(),
                 edges: Vec::new(),
                 node_statuses: BTreeMap::new(),
@@ -177,6 +178,14 @@ impl<'a> ProtocolGraphBuilder<'a> {
             ),
         ];
         constraints.extend(self.request.backend_constraint.iter().cloned());
+        if self.spec.stop_policy.allows_unresolved {
+            // The graph executor uses this explicit protocol contract to
+            // preserve a terminal role failure for the reducer instead of
+            // severing every dependent path. The Agent lifecycle itself
+            // remains failed/blocked; only the protocol graph can decide
+            // whether the surviving evidence is enough for honest synthesis.
+            constraints.push("protocol_allows_unresolved:true".to_string());
+        }
         constraints.extend(
             self.request
                 .resource_scopes
@@ -184,6 +193,26 @@ impl<'a> ProtocolGraphBuilder<'a> {
                 .map(|scope| format!("resource:{scope}")),
         );
         let idempotency_key = format!("{node_id}:attempt");
+        // A protocol graph owns collaboration topology. `runtime_orchestrate`
+        // is never available to a role worker, but evidence access follows the
+        // declared role contract rather than whether the role happens to be a
+        // frontier node. Incident evidence collectors and JPS solutions are
+        // intentionally dependent on triage/frame output *and* allowed to
+        // acquire their own bounded evidence. Synthesis roles are not.
+        let allowed_tools = if role.evidence_mode == RoleEvidenceMode::Acquire {
+            self.request
+                .allowed_tools
+                .iter()
+                .filter(|tool| !tool.eq_ignore_ascii_case("runtime_orchestrate"))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        constraints.push(format!(
+            "protocol_evidence_mode:{}",
+            role.evidence_mode.as_str()
+        ));
         let packet = AgentTaskPacket {
             run_id: format!("{}:run:{role_label}", self.graph.id),
             agent_id: agent_id.clone(),
@@ -196,17 +225,19 @@ impl<'a> ProtocolGraphBuilder<'a> {
             attempt: 1,
             expected_graph_revision: self.graph.revision,
             objective: format!(
-                "{}\n\nProtocol {} role {}: {}",
+                "{}\n\nProtocol {} role {}: {}\n\n## Role execution boundary\nYou are one bounded worker in an already-compiled protocol graph. Complete only this role's declared output. {} {} Do not create a new team, delegate another agent, or re-decompose the parent objective. When the declared output is supported, return a final role result with unresolved items made explicit.",
                 self.request.objective,
                 self.spec.protocol_ref(),
                 role_id,
-                role.responsibility
+                role.responsibility,
+                role_evidence_instruction(role.evidence_mode),
+                role_slot_focus(role, slot),
             ),
             acceptance,
             constraints,
             context_refs: self.request.context_refs.clone(),
             evidence_refs: self.request.evidence_refs.clone(),
-            allowed_tools: self.request.allowed_tools.clone(),
+            allowed_tools,
             allowed_skills: self.request.allowed_skills.clone(),
             permission_lease: self.request.permission_lease.clone(),
             model_lease: self.request.model_lease.clone(),
@@ -285,5 +316,97 @@ impl<'a> ProtocolGraphBuilder<'a> {
     pub(crate) fn finish(self) -> Result<ExecutionGraph, ProtocolCompileError> {
         validate_protocol_graph(self.spec, self.request, &self.graph)?;
         Ok(self.graph)
+    }
+}
+
+fn role_evidence_instruction(mode: RoleEvidenceMode) -> &'static str {
+    match mode {
+        RoleEvidenceMode::ObjectiveOnly => {
+            "Use the supplied objective and canonical context to frame the work. Do not call tools: record unknowns as unknowns so later evidence roles can resolve them."
+        }
+        RoleEvidenceMode::Acquire => {
+            "Use upstream results before requesting more evidence. When the objective requires source, workspace, file, or current-state evidence, first use an authorized read-only tool to establish the concrete path or fact, then cite that receipt in the role result. Do not substitute model knowledge for requested source evidence. Stop acquiring evidence once the role output is supported."
+        }
+        RoleEvidenceMode::UpstreamOnly => {
+            "Use the completed upstream results as the evidence packet. Do not call tools to rediscover it; reconcile contradictions and state missing evidence explicitly."
+        }
+    }
+}
+
+fn role_slot_focus(role: &RoleSpec, slot: usize) -> &'static str {
+    if !role.has_variable_cardinality() {
+        return "";
+    }
+    // Parallel instances must contribute complementary work instead of each
+    // restarting the same investigation. The lenses are generic enough for
+    // arbitrary domains while still giving a model a concrete divergence cue.
+    match slot % 4 {
+        0 => "Independent lane: establish the current-state evidence and primary constraint path.",
+        1 => "Independent lane: examine alternatives, counterexamples, and tradeoffs.",
+        2 => "Independent lane: examine integration boundaries, operational impact, and verification evidence.",
+        _ => "Independent lane: examine future risks, unresolved assumptions, and the strongest falsification path.",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use harness_contract::agent::AgentTaskPacket;
+    use harness_contract::execution_graph::ExecutionNodeKind;
+
+    use super::{ProtocolCompileRequest, ProtocolId, ProtocolRef, ProtocolRegistry};
+
+    #[test]
+    fn protocol_role_packets_cannot_recursively_orchestrate_new_teams() {
+        let mut request = ProtocolCompileRequest::new(
+            ProtocolRef::new(ProtocolId::Jps, 1),
+            "protocol-boundary",
+            "session",
+            "produce a constrained decision",
+        );
+        request.allowed_tools = vec!["read_file".to_string(), "runtime_orchestrate".to_string()];
+        let graph = ProtocolRegistry::compile(&request).expect("protocol graph");
+
+        let packets = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == ExecutionNodeKind::AgentTask)
+            .map(|node| serde_json::from_str::<AgentTaskPacket>(&node.payload_ref).expect("packet"))
+            .collect::<Vec<_>>();
+        assert!(!packets.is_empty());
+        assert!(packets.iter().all(|packet| {
+            !packet
+                .allowed_tools
+                .iter()
+                .any(|tool| tool == "runtime_orchestrate")
+        }));
+        assert!(packets
+            .iter()
+            .all(|packet| packet.objective.contains("Role execution boundary")));
+        assert!(packets.iter().all(|packet| {
+            !packet
+                .constraints
+                .iter()
+                .any(|constraint| constraint == "protocol_role:frame")
+                || (packet.allowed_tools.is_empty()
+                    && packet
+                        .constraints
+                        .iter()
+                        .any(|constraint| constraint == "protocol_evidence_mode:objective_only"))
+        }));
+        assert!(packets.iter().any(|packet| {
+            packet
+                .constraints
+                .iter()
+                .any(|constraint| constraint == "protocol_role:solution")
+                && packet.allowed_tools == vec!["read_file".to_string()]
+                && packet.objective.contains("Independent lane:")
+        }));
+        assert!(packets.iter().all(|packet| {
+            !packet
+                .constraints
+                .iter()
+                .any(|constraint| constraint == "protocol_role:decision_synthesis")
+                || packet.allowed_tools.is_empty()
+        }));
     }
 }

@@ -5,7 +5,7 @@ fn repo_root() -> PathBuf {
 }
 
 #[test]
-fn mission_team_and_steward_entries_do_not_own_execution() {
+fn mission_entries_do_not_own_execution() {
     let mission_service_source = read_repo("crates/gateway/src/services/mission_service.rs");
     let mission_service = production_part(&mission_service_source);
     for forbidden in [
@@ -19,27 +19,45 @@ fn mission_team_and_steward_entries_do_not_own_execution() {
             "MissionService must not execute through scoped globals: {forbidden}"
         );
     }
-    assert!(mission_service.contains(".command_graph("));
-    assert!(mission_service.contains("\"status\": \"capability_unavailable\""));
+    assert!(mission_service.contains(".cancel_team("));
     assert!(!mission_service.contains("global_agent_lifecycle_service().command("));
-
-    let steward_runtime_source = read_repo("crates/runtime/src/steward/steward_runtime.rs");
-    let steward_runtime = production_part(&steward_runtime_source);
-    assert!(
-        !steward_runtime.contains("pub fn tick_all_once"),
-        "scoped steward globals may retain state but must not expose a scheduler execution loop"
-    );
-
-    let scheduler_source = read_repo("crates/runtime/src/steward/steward_scheduler.rs");
-    let scheduler = production_part(&scheduler_source);
-    assert!(!scheduler.contains(".tick_all_once("));
-    assert!(scheduler.contains("capability_unavailable:steward_execution:V8"));
+    assert!(mission_service.contains("MissionRuntimePort"));
+    for forbidden in [
+        "RuntimeServices",
+        ".graph_runner()",
+        ".team_runtime()",
+        ".mission_runtime()",
+        ".approval_queue()",
+        ".session_relations()",
+    ] {
+        assert!(
+            !mission_service.contains(forbidden),
+            "MissionService must consume Runtime Mission queries/commands through its port: {forbidden}"
+        );
+    }
 
     let mission_control_source = read_repo("crates/runtime/src/mission/mission_control.rs");
     let mission_control = production_part(&mission_control_source);
     assert!(!mission_control.contains("global_agent_lifecycle_service().command("));
-    assert!(!mission_control.contains("global_steward_runtime_service().start("));
-    assert!(mission_control.contains("\"capability\": \"agent_execution\""));
+    assert!(!mission_control.contains("steward_runtime"));
+    assert!(mission_control.contains("crate::execute_mission_command"));
+    assert!(!mission_control.contains("mission_runtime().pause_session("));
+    assert!(!mission_control.contains("approval_queue().decide("));
+    assert!(!mission_control.contains("available_in\": \"V4\""));
+
+    let mission_routes_source = read_repo("crates/gateway/src/api_routes/mission_routes.rs");
+    let mission_routes = production_part(&mission_routes_source);
+    for retired in [
+        "teams/:team_id/handoff",
+        "teams/:team_id/synthesis",
+        "tasks/:task_id/outcome",
+        "tick_team_execution_handler",
+    ] {
+        assert!(
+            !mission_routes.contains(retired),
+            "Gateway must not expose a Mission team control without a Runtime execution path: {retired}"
+        );
+    }
 
     let team_runtime_source = read_repo("crates/runtime/src/team/team_runtime.rs");
     let team_runtime = production_part(&team_runtime_source);
@@ -299,7 +317,13 @@ fn production_turns_enter_the_execution_graph_host_once() {
     assert!(gateway_service.contains(".submit_turn(&content"));
     assert!(in_process_agent.contains("submit_turn(&packet.objective"));
     assert!(agent.contains("production implementations submit canonical AgentTask nodes"));
-    assert!(host.contains("services.graph_runner().start(graph).await"));
+    // The host registers the graph before running it so a reconnecting
+    // surface can attach to its durable cursor before provider work starts.
+    // That is the canonical execution path; `start(graph)` is only a
+    // convenience wrapper and must not be required by this architecture test.
+    assert!(host.contains("let registered = services"));
+    assert!(host.contains(".graph_runner()\n                .register(graph)"));
+    assert!(host.contains(".run_until_quiescent(&registered.id)"));
     assert!(host.contains("ExecutionGraphCompiler"));
     assert!(!host.contains("execute_model_tool_cycle"));
 
@@ -1685,8 +1709,7 @@ fn production_gateway_entry_does_not_run_ai_turns_directly() {
     let runtime_service_source = read_repo("crates/gateway/src/runtime/runtime_service.rs");
     let runtime_service = production_part(&runtime_service_source);
     assert!(
-        runtime_service.contains("run_turn_with_timeout")
-            && runtime_service.contains(".submit_turn(&content")
+        runtime_service.contains(".submit_turn(&content")
             && !runtime_service.contains(".run_turn_async("),
         "RuntimeService must submit through StandardRuntimeHost and the canonical graph runner"
     );
@@ -1839,7 +1862,8 @@ fn v3_turn_call_trace_has_one_compiler_runner_and_commit_owner() {
     assert!(production_part(&gateway_service).contains(".submit_turn(&content"));
     assert!(gateway_entry.contains("self.runtime_mut().submit_turn"));
     assert!(production_part(&host).contains("ExecutionGraphCompiler"));
-    assert!(production_part(&host).contains("services.graph_runner().start(graph).await"));
+    assert!(production_part(&host).contains(".graph_runner()\n                .register(graph)"));
+    assert!(production_part(&host).contains(".run_until_quiescent(&registered.id)"));
     assert!(production_part(&runner).contains("self.commit_service.register_graph_async(graph)"));
     assert!(production_part(&runner).contains("bind_and_start_node_async"));
     assert!(production_part(&commit).contains("append_transaction"));

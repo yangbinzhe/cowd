@@ -4,11 +4,10 @@ use harness_contract::execution_graph::{
     ExecutionGraph, ExecutionGraphCommand, ExecutionNodeKind, ExecutionNodeSpec,
     ExecutionNodeStatus,
 };
+use harness_contract::turn::{SessionDispatchAction, SessionDispatchCommand, SessionHandoff};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    CrossSessionMessage, SessionDispatchMode, SessionExecutionPolicy, StewardAutomationPolicy,
-};
+use crate::{SessionDispatchMode, SessionExecutionPolicy};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MissionCommandInterpretRequest {
@@ -16,8 +15,6 @@ pub struct MissionCommandInterpretRequest {
     pub command_text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_ref: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub autonomy_policy: Option<StewardAutomationPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_mode: Option<SessionDispatchMode>,
     #[serde(default)]
@@ -44,7 +41,6 @@ pub enum MissionCommandTargetKind {
     Session,
     Agent,
     Team,
-    Steward,
     Dispatch,
     Unknown,
 }
@@ -86,48 +82,42 @@ impl MissionCommandInterpreter {
             .target_ref
             .clone()
             .or_else(|| extract_target_ref(command_text.as_str()));
-        let policy = request.autonomy_policy.unwrap_or_default();
-        let dispatch_mode = request
-            .dispatch_mode
-            .unwrap_or_else(|| policy.default_dispatch_mode());
-        let allow_background = request.allow_background.unwrap_or(true);
+        let mut policy = SessionExecutionPolicy::default();
+        if let Some(dispatch_mode) = request.dispatch_mode {
+            policy.dispatch_mode = dispatch_mode;
+        }
+        if let Some(allow_background) = request.allow_background {
+            policy.allow_background = allow_background;
+        }
 
         if let Some(target_ref) = target_ref.clone() {
             let target_kind = classify_target_ref(target_ref.as_str());
             return match target_kind {
-                MissionCommandTargetKind::Session => bridge_interpretation(
-                    current_session_id,
-                    target_ref,
+                MissionCommandTargetKind::Session => bridge_interpretation(SessionHandoff {
+                    handoff_id: format!("handoff-{}", uuid::Uuid::new_v4()),
+                    source_session_id: current_session_id,
+                    target_session_id: target_ref.trim_start_matches('@').to_string(),
+                    objective: command_text,
+                    acceptance: Vec::new(),
+                    scope: Vec::new(),
+                    context_lens: Vec::new(),
+                    evidence_refs: Vec::new(),
+                    permission_lease: "session-dispatch-default".to_string(),
+                    deadline_at_ms: None,
+                    priority: 128,
+                    correlation_id: format!("correlation-{}", uuid::Uuid::new_v4()),
+                    result_contract: "return_checked_result".to_string(),
+                }),
+                MissionCommandTargetKind::Agent => blocked(
                     command_text,
-                    MissionCommandTargetKind::Session,
-                    true,
-                ),
-                MissionCommandTargetKind::Agent => bridge_interpretation(
-                    current_session_id,
-                    target_ref,
-                    command_text,
-                    MissionCommandTargetKind::Agent,
-                    false,
+                    Some(target_ref),
+                    "agent routing must compile an AgentTask; SessionDispatch only accepts SessionHandoff",
                 ),
                 MissionCommandTargetKind::Team => blocked(
                     command_text,
                     Some(target_ref),
                     "team commands require the scoped TeamRuntime command adapter",
                 ),
-                MissionCommandTargetKind::Steward => MissionCommandInterpretation {
-                    kind: "runtime.mission_command_interpretation".to_string(),
-                    status: "blocked".to_string(),
-                    target_kind,
-                    target_ref: Some(target_ref),
-                    command_text,
-                    command: MissionInterpretedCommand::Blocked {
-                        reason: "supervise execution graphs become available in V8".to_string(),
-                    },
-                    blocked_reason: Some(
-                        "supervise execution graphs become available in V8".to_string(),
-                    ),
-                    execution_plan: vec!["capability_unavailable:supervise:V8".to_string()],
-                },
                 MissionCommandTargetKind::Dispatch | MissionCommandTargetKind::Unknown => blocked(
                     command_text,
                     Some(target_ref),
@@ -136,11 +126,6 @@ impl MissionCommandInterpreter {
             };
         }
 
-        let policy = SessionExecutionPolicy {
-            max_commands: policy.default_max_session_commands(),
-            dispatch_mode,
-            allow_background,
-        };
         graph_interpretation(
             command_text,
             None,
@@ -160,15 +145,35 @@ impl MissionCommandInterpreter {
     }
 
     #[must_use]
-    pub fn interpret_session_message(message: CrossSessionMessage) -> MissionCommandInterpretation {
-        let target_kind = classify_target_ref(&message.target_ref);
-        bridge_interpretation(
-            message.from_session_id.clone(),
-            message.target_ref.clone(),
-            message.command.clone(),
-            target_kind,
-            target_kind == MissionCommandTargetKind::Session,
+    pub fn interpret_session_handoff(handoff: SessionHandoff) -> MissionCommandInterpretation {
+        Self::interpret_session_handoff_with_action(handoff, SessionDispatchAction::Enqueue)
+    }
+
+    /// Compile a typed handoff without introducing a graph-external command
+    /// path. MissionCommandRouter selects the action after policy and
+    /// revision validation; the executor receives the same durable contract.
+    #[must_use]
+    pub fn interpret_session_handoff_with_action(
+        handoff: SessionHandoff,
+        action: SessionDispatchAction,
+    ) -> MissionCommandInterpretation {
+        bridge_interpretation_with_action(
+            handoff,
+            action,
+            format!("execution-graph-{}", uuid::Uuid::new_v4()),
         )
+    }
+
+    /// Compiles a handoff with a stable graph identity owned by an external
+    /// durable trigger (for example MissionSchedule). The interpreter remains
+    /// side-effect free; stable identity only makes restart submission
+    /// idempotent at the GraphRunner boundary.
+    #[must_use]
+    pub fn interpret_session_handoff_with_graph_id(
+        handoff: SessionHandoff,
+        graph_id: impl Into<String>,
+    ) -> MissionCommandInterpretation {
+        bridge_interpretation_with_graph_id(handoff, graph_id.into())
     }
 
     #[must_use]
@@ -206,7 +211,8 @@ impl MissionCommandInterpreter {
                 graph_command,
             } => serde_json::json!({
                 "ok": true,
-                "status": "pending_runtime_host",
+                "status": "compiled_graph",
+                "side_effects_started": false,
                 "graph": graph,
                 "command": graph_command,
             }),
@@ -232,36 +238,47 @@ impl MissionCommandInterpreter {
     }
 }
 
-fn bridge_interpretation(
-    current_session_id: String,
-    target_ref: String,
-    command_text: String,
-    target_kind: MissionCommandTargetKind,
-    session_target: bool,
+fn bridge_interpretation(handoff: SessionHandoff) -> MissionCommandInterpretation {
+    bridge_interpretation_with_action(
+        handoff,
+        SessionDispatchAction::Enqueue,
+        format!("execution-graph-{}", uuid::Uuid::new_v4()),
+    )
+}
+
+fn bridge_interpretation_with_graph_id(
+    handoff: SessionHandoff,
+    graph_id: String,
 ) -> MissionCommandInterpretation {
-    let message = CrossSessionMessage {
-        from_session_id: current_session_id,
-        target_ref: target_ref.clone(),
-        command: command_text.clone(),
-        actor: Some("mission_command_interpreter".to_string()),
-        evidence_refs: Vec::new(),
+    bridge_interpretation_with_action(handoff, SessionDispatchAction::Enqueue, graph_id)
+}
+
+fn bridge_interpretation_with_action(
+    handoff: SessionHandoff,
+    action: SessionDispatchAction,
+    graph_id: String,
+) -> MissionCommandInterpretation {
+    let target_ref = handoff.target_session_id.clone();
+    let command_text = handoff.objective.clone();
+    let command = SessionDispatchCommand {
+        command_id: format!("session-dispatch-command:{}", handoff.correlation_id),
+        action,
+        handoff,
+        expected_target_revision: 0,
     };
-    let payload = serde_json::to_string(&message).unwrap_or_default();
+    let payload = serde_json::to_string(&command).unwrap_or_default();
     graph_interpretation(
         command_text,
         Some(target_ref),
-        target_kind,
-        session_dispatch_graph(
-            if session_target {
-                "bridge session input"
-            } else {
-                "route agent input"
-            },
-            format!("session_input:{payload}"),
+        MissionCommandTargetKind::Session,
+        session_dispatch_graph_with_id(
+            "dispatch typed session handoff",
+            format!("session_handoff:{payload}"),
+            graph_id,
         ),
         vec![
             "submit SessionDispatch node".to_string(),
-            "let Runtime SessionInputRouter resolve and enqueue the target".to_string(),
+            "let Runtime SessionInputRouter validate and enqueue the target".to_string(),
         ],
     )
 }
@@ -290,7 +307,20 @@ fn graph_interpretation(
 }
 
 fn session_dispatch_graph(objective: impl Into<String>, payload_ref: String) -> ExecutionGraph {
+    session_dispatch_graph_with_id(
+        objective,
+        payload_ref,
+        format!("execution-graph-{}", uuid::Uuid::new_v4()),
+    )
+}
+
+fn session_dispatch_graph_with_id(
+    objective: impl Into<String>,
+    payload_ref: String,
+    graph_id: String,
+) -> ExecutionGraph {
     let mut graph = ExecutionGraph::new(objective);
+    graph.id = graph_id;
     let node = ExecutionNodeSpec::new(
         ExecutionNodeKind::SessionDispatch,
         "session_dispatch",
@@ -338,8 +368,6 @@ fn classify_target_ref(target_ref: &str) -> MissionCommandTargetKind {
     let target = target_ref.trim_start_matches('@').to_ascii_lowercase();
     if target.starts_with("team-") || target.starts_with("team_") || target.starts_with("team:") {
         MissionCommandTargetKind::Team
-    } else if target.starts_with("steward-") || target.starts_with("steward:") {
-        MissionCommandTargetKind::Steward
     } else if target.starts_with("agent-") || target.starts_with("agent:") {
         MissionCommandTargetKind::Agent
     } else {

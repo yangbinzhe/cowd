@@ -2,8 +2,9 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use futures::StreamExt;
+use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use harness_contract::tool::ToolExposureProjection;
 use provider::{
     max_tokens_for_model, ApiError, ContentBlockDelta, ImageSource, InputContentBlock,
@@ -38,6 +39,36 @@ pub struct ProviderRuntimeClient {
     stream_callback: Option<std::sync::mpsc::SyncSender<crate::CowdEvent>>,
 }
 
+/// Bridges one provider request into the runtime's lazy `ApiClient` stream.
+///
+/// The provider SDK is asynchronous but does not itself implement
+/// `futures::Stream`. Keeping the producer in a cancellable task lets us
+/// expose each upstream event immediately while still aborting the request
+/// when the consumer applies a transport timeout or the turn is cancelled.
+struct ProviderEventStream {
+    receiver: UnboundedReceiver<Result<AssistantEvent, RuntimeError>>,
+    producer: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl futures::Stream for ProviderEventStream {
+    type Item = Result<AssistantEvent, RuntimeError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.receiver).poll_next(cx)
+    }
+}
+
+impl Drop for ProviderEventStream {
+    fn drop(&mut self) {
+        // The consumer owns the request lifetime. In particular, a runtime
+        // transport timeout must not leave a detached provider request running
+        // after its graph node has been failed or replanned.
+        if let Some(producer) = &self.producer {
+            producer.abort();
+        }
+    }
+}
+
 impl ProviderRuntimeClient {
     pub fn new(
         registry: Arc<ProviderRegistry>,
@@ -57,14 +88,6 @@ impl ProviderRuntimeClient {
         let snapshot = registry.pin();
         build_provider_entry(&snapshot, &model)?;
         let mut chain_models = vec![model];
-        if let Some(vision_model) = load_vision_model_config() {
-            match build_provider_entry(&snapshot, &vision_model) {
-                Ok(_) => chain_models.push(vision_model),
-                Err(error) => {
-                    tracing::warn!("skipping unavailable vision provider {vision_model}: {error}");
-                }
-            }
-        }
         for fallback_model in fallbacks {
             match build_provider_entry(&snapshot, fallback_model) {
                 Ok(_) => chain_models.push(fallback_model.clone()),
@@ -148,14 +171,6 @@ impl ProviderRuntimeClient {
 
     fn model_fallbacks_extend(&mut self) {
         let snapshot = self.registry.pin();
-        if let Some(vision_model) = load_vision_model_config() {
-            match build_provider_entry(&snapshot, &vision_model) {
-                Ok(_) => self.chain_models.push(vision_model),
-                Err(error) => {
-                    tracing::warn!("skipping unavailable vision provider {vision_model}: {error}");
-                }
-            }
-        }
         for fallback_model in load_provider_fallback_config() {
             match build_provider_entry(&snapshot, &fallback_model) {
                 Ok(_) => self.chain_models.push(fallback_model),
@@ -264,20 +279,6 @@ impl ProviderRuntimeClient {
     ) -> Pin<
         Box<dyn futures::stream::Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>,
     > {
-        let events = async move {
-            match self.stream_collect_inner(request, provider_snapshot).await {
-                Ok(events) => events.into_iter().map(Ok).collect::<Vec<_>>(),
-                Err(error) => vec![Err(error)],
-            }
-        };
-        Box::pin(futures::stream::once(events).flat_map(futures::stream::iter))
-    }
-
-    async fn stream_collect_inner(
-        &mut self,
-        request: ApiRequest,
-        provider_snapshot: ProviderRegistrySnapshot,
-    ) -> Result<Vec<AssistantEvent>, RuntimeError> {
         let messages = convert_messages(&request.messages);
         let system =
             (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n"));
@@ -288,55 +289,32 @@ impl ProviderRuntimeClient {
         // One provider snapshot is pinned for the whole request, including all
         // retries and fallbacks. A concurrent reload only affects later requests.
         let chain = self.candidate_chain(&provider_snapshot, &request.model, needs_vision);
-        let mut last_error: Option<ApiError> = None;
-        for (index, entry) in chain.iter().enumerate() {
-            let message_request = MessageRequest {
-                model: entry.model.clone(),
-                max_tokens: max_tokens_for_model(&entry.model),
-                messages: messages.clone(),
-                system: system.clone(),
-                tools: (!active_tools.is_empty()).then(|| active_tools.clone()),
-                tool_choice: tool_choice.clone(),
-                stream: true,
-                reasoning_effort: self.reasoning_effort.clone(),
-                ..Default::default()
-            };
-
-            let attempt = stream_with_provider(
-                &entry.client,
-                &message_request,
+        let (sender, receiver) = mpsc::unbounded();
+        let producer = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => Some(handle.spawn(forward_provider_chain(
+                chain,
+                messages,
+                system,
+                active_tools,
+                tool_choice,
+                self.reasoning_effort.clone(),
+                needs_vision,
                 self.emit_output,
                 self.stream_callback.clone(),
-            )
-            .await;
-            match attempt {
-                Ok(events) => return Ok(events),
-                Err(error) if error.is_retryable() && index + 1 < chain.len() => {
-                    tracing::warn!(
-                        "provider {} failed with retryable error, falling back: {error}",
-                        entry.model
-                    );
-                    last_error = Some(error);
-                }
-                Err(error)
-                    if needs_vision
-                        && index + 1 < chain.len()
-                        && looks_like_vision_unsupported(&error) =>
-                {
-                    tracing::warn!(
-                        "provider {} rejected vision input, falling back: {error}",
-                        entry.model
-                    );
-                    last_error = Some(error);
-                }
-                Err(error) => return Err(RuntimeError::new(error.to_string())),
+                sender,
+            ))),
+            Err(_) => {
+                // `ApiClient::stream` is consumed from async Runtime code, but
+                // callers may still construct it in synchronous diagnostics.
+                // Return a normal stream error instead of panicking while
+                // attempting to spawn a Tokio task without a reactor.
+                let _ = sender.unbounded_send(Err(RuntimeError::new(
+                    "provider stream requires an active Tokio runtime",
+                )));
+                None
             }
-        }
-
-        Err(RuntimeError::new(last_error.map_or_else(
-            || String::from("provider chain exhausted with no attempts"),
-            |error| error.to_string(),
-        )))
+        };
+        Box::pin(ProviderEventStream { receiver, producer })
     }
 
     fn candidate_chain(
@@ -357,7 +335,7 @@ impl ProviderRuntimeClient {
                 }
             })
             .collect::<Vec<_>>();
-        let base = if base.is_empty() {
+        let mut base = if base.is_empty() {
             self.chain_models
                 .iter()
                 .filter_map(|model| build_provider_entry(snapshot, model).ok())
@@ -365,6 +343,23 @@ impl ProviderRuntimeClient {
         } else {
             base
         };
+
+        // A configured vision alias is a candidate only for image-bearing
+        // requests. Including it in all text chains makes routing ambiguous
+        // and can silently turn a vision model into a generic fallback.
+        if needs_vision {
+            if let Some(vision_model) = load_vision_model_config() {
+                match build_provider_entry(snapshot, &vision_model) {
+                    Ok(entry) if !base.iter().any(|candidate| candidate.model == entry.model) => {
+                        base.push(entry);
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(
+                        "skipping unavailable vision provider {vision_model}: {error}"
+                    ),
+                }
+            }
+        }
 
         let requested_model = requested_model.trim();
         let mut ordered = Vec::with_capacity(base.len() + usize::from(!requested_model.is_empty()));
@@ -421,26 +416,148 @@ fn looks_like_vision_unsupported(error: &ApiError) -> bool {
             || text.contains("extra inputs"))
 }
 
-#[allow(clippy::too_many_lines)]
-async fn stream_with_provider(
-    client: &ProviderClient,
-    message_request: &MessageRequest,
+#[allow(clippy::too_many_arguments)]
+async fn forward_provider_chain(
+    chain: Vec<ProviderEntry>,
+    messages: Vec<InputMessage>,
+    system: Option<String>,
+    active_tools: Vec<ToolDefinition>,
+    tool_choice: Option<ToolChoice>,
+    reasoning_effort: Option<String>,
+    needs_vision: bool,
     emit_output: bool,
     stream_callback: Option<std::sync::mpsc::SyncSender<crate::CowdEvent>>,
-) -> Result<Vec<AssistantEvent>, ApiError> {
-    let mut stream = client.stream_message(message_request).await?;
-    let mut events = Vec::new();
+    sender: UnboundedSender<Result<AssistantEvent, RuntimeError>>,
+) {
+    let mut last_error: Option<ApiError> = None;
+    for (index, entry) in chain.iter().enumerate() {
+        let message_request = MessageRequest {
+            model: entry.model.clone(),
+            max_tokens: max_tokens_for_model(&entry.model),
+            messages: messages.clone(),
+            system: system.clone(),
+            tools: (!active_tools.is_empty()).then(|| active_tools.clone()),
+            tool_choice: tool_choice.clone(),
+            stream: true,
+            reasoning_effort: reasoning_effort.clone(),
+            ..Default::default()
+        };
+        let attempt = forward_provider_stream(
+            &entry.client,
+            &message_request,
+            &entry.model,
+            emit_output,
+            stream_callback.clone(),
+            &sender,
+        )
+        .await;
+        match attempt {
+            Ok(ForwardedProviderStream::Completed) => return,
+            Ok(ForwardedProviderStream::ConsumerDropped) => return,
+            Err(error)
+                if !error.emitted && error.error.is_retryable() && index + 1 < chain.len() =>
+            {
+                tracing::warn!(
+                    "provider {} failed before a response event, falling back: {error}",
+                    entry.model
+                );
+                last_error = Some(error.error);
+            }
+            Err(error)
+                if needs_vision
+                    && !error.emitted
+                    && index + 1 < chain.len()
+                    && looks_like_vision_unsupported(&error.error) =>
+            {
+                tracing::warn!(
+                    "provider {} rejected vision input before a response event, falling back: {error}",
+                    entry.model
+                );
+                last_error = Some(error.error);
+            }
+            Err(error) => {
+                let _ = sender.unbounded_send(Err(RuntimeError::new(error.error.to_string())));
+                return;
+            }
+        }
+    }
+    let error = last_error.map_or_else(
+        || String::from("provider chain exhausted with no attempts"),
+        |error| error.to_string(),
+    );
+    let _ = sender.unbounded_send(Err(RuntimeError::new(error)));
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardedProviderStream {
+    Completed,
+    ConsumerDropped,
+}
+
+#[derive(Debug)]
+struct ProviderStreamError {
+    error: ApiError,
+    emitted: bool,
+}
+
+impl std::fmt::Display for ProviderStreamError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn forward_provider_stream(
+    client: &ProviderClient,
+    message_request: &MessageRequest,
+    effective_model: &str,
+    emit_output: bool,
+    stream_callback: Option<std::sync::mpsc::SyncSender<crate::CowdEvent>>,
+    sender: &UnboundedSender<Result<AssistantEvent, RuntimeError>>,
+) -> Result<ForwardedProviderStream, ProviderStreamError> {
+    let mut stream = client
+        .stream_message(message_request)
+        .await
+        .map_err(|error| ProviderStreamError {
+            error,
+            emitted: false,
+        })?;
     let mut pending_tools: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
     let mut saw_stop = false;
+    let mut emitted = false;
+    let mut provider_model_emitted = false;
 
-    while let Some(event) = stream.next_event().await? {
+    while let Some(event) = stream
+        .next_event()
+        .await
+        .map_err(|error| ProviderStreamError { error, emitted })?
+    {
+        if !provider_model_emitted {
+            if !forward_event(
+                sender,
+                AssistantEvent::ProviderModel {
+                    model: effective_model.to_string(),
+                },
+                emit_output,
+                &stream_callback,
+                &mut emitted,
+            ) {
+                return Ok(ForwardedProviderStream::ConsumerDropped);
+            }
+            provider_model_emitted = true;
+        }
         match event {
             ApiStreamEvent::MessageStart(start) => {
+                let mut events = Vec::new();
                 for block in start.message.content {
                     push_provider_output_block(block, 0, &mut events, &mut pending_tools, true);
                 }
+                if !forward_events(sender, events, emit_output, &stream_callback, &mut emitted) {
+                    return Ok(ForwardedProviderStream::ConsumerDropped);
+                }
             }
             ApiStreamEvent::ContentBlockStart(start) => {
+                let mut events = Vec::new();
                 push_provider_output_block(
                     start.content_block,
                     start.index,
@@ -448,19 +565,22 @@ async fn stream_with_provider(
                     &mut pending_tools,
                     true,
                 );
+                if !forward_events(sender, events, emit_output, &stream_callback, &mut emitted) {
+                    return Ok(ForwardedProviderStream::ConsumerDropped);
+                }
             }
             ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
                 ContentBlockDelta::TextDelta { text } => {
                     if !text.is_empty() {
-                        if emit_output {
-                            print!("{text}");
-                            let _ = std::io::stdout().flush();
+                        if !forward_event(
+                            sender,
+                            AssistantEvent::TextDelta(text),
+                            emit_output,
+                            &stream_callback,
+                            &mut emitted,
+                        ) {
+                            return Ok(ForwardedProviderStream::ConsumerDropped);
                         }
-                        if let Some(callback) = &stream_callback {
-                            let _ = callback
-                                .try_send(crate::CowdEvent::TextDelta { text: text.clone() });
-                        }
-                        events.push(AssistantEvent::TextDelta(text));
                     }
                 }
                 ContentBlockDelta::InputJsonDelta { partial_json } => {
@@ -473,35 +593,70 @@ async fn stream_with_provider(
             },
             ApiStreamEvent::ContentBlockStop(stop) => {
                 if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
-                    events.push(AssistantEvent::ToolUse { id, name, input });
+                    if !forward_event(
+                        sender,
+                        AssistantEvent::ToolUse { id, name, input },
+                        emit_output,
+                        &stream_callback,
+                        &mut emitted,
+                    ) {
+                        return Ok(ForwardedProviderStream::ConsumerDropped);
+                    }
                 }
             }
             ApiStreamEvent::MessageDelta(delta) => {
-                events.push(AssistantEvent::Usage(delta.usage.token_usage()));
+                if !forward_event(
+                    sender,
+                    AssistantEvent::Usage(delta.usage.token_usage()),
+                    emit_output,
+                    &stream_callback,
+                    &mut emitted,
+                ) {
+                    return Ok(ForwardedProviderStream::ConsumerDropped);
+                }
             }
             ApiStreamEvent::MessageStop(_) => {
                 saw_stop = true;
-                events.push(AssistantEvent::MessageStop);
+                if !forward_event(
+                    sender,
+                    AssistantEvent::MessageStop,
+                    emit_output,
+                    &stream_callback,
+                    &mut emitted,
+                ) {
+                    return Ok(ForwardedProviderStream::ConsumerDropped);
+                }
             }
         }
     }
 
-    push_prompt_cache_record(client, &mut events);
-
-    if !saw_stop
-        && events.iter().any(|event| {
-            matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
-                || matches!(event, AssistantEvent::ToolUse { .. })
-        })
-    {
-        events.push(AssistantEvent::MessageStop);
+    let mut prompt_cache_events = Vec::new();
+    push_prompt_cache_record(client, &mut prompt_cache_events);
+    if !forward_events(
+        sender,
+        prompt_cache_events,
+        emit_output,
+        &stream_callback,
+        &mut emitted,
+    ) {
+        return Ok(ForwardedProviderStream::ConsumerDropped);
     }
 
-    if events
-        .iter()
-        .any(|event| matches!(event, AssistantEvent::MessageStop))
-    {
-        return Ok(events);
+    if saw_stop {
+        return Ok(ForwardedProviderStream::Completed);
+    }
+    if emitted {
+        return if forward_event(
+            sender,
+            AssistantEvent::MessageStop,
+            emit_output,
+            &stream_callback,
+            &mut emitted,
+        ) {
+            Ok(ForwardedProviderStream::Completed)
+        } else {
+            Ok(ForwardedProviderStream::ConsumerDropped)
+        };
     }
 
     let response = client
@@ -509,10 +664,53 @@ async fn stream_with_provider(
             stream: false,
             ..message_request.clone()
         })
-        .await?;
+        .await
+        .map_err(|error| ProviderStreamError { error, emitted })?;
     let mut events = response_to_events(response);
+    events.insert(
+        0,
+        AssistantEvent::ProviderModel {
+            model: effective_model.to_string(),
+        },
+    );
     push_prompt_cache_record(client, &mut events);
-    Ok(events)
+    if forward_events(sender, events, emit_output, &stream_callback, &mut emitted) {
+        Ok(ForwardedProviderStream::Completed)
+    } else {
+        Ok(ForwardedProviderStream::ConsumerDropped)
+    }
+}
+
+fn forward_events(
+    sender: &UnboundedSender<Result<AssistantEvent, RuntimeError>>,
+    events: Vec<AssistantEvent>,
+    emit_output: bool,
+    stream_callback: &Option<std::sync::mpsc::SyncSender<crate::CowdEvent>>,
+    emitted: &mut bool,
+) -> bool {
+    events
+        .into_iter()
+        .all(|event| forward_event(sender, event, emit_output, stream_callback, emitted))
+}
+
+fn forward_event(
+    sender: &UnboundedSender<Result<AssistantEvent, RuntimeError>>,
+    event: AssistantEvent,
+    emit_output: bool,
+    stream_callback: &Option<std::sync::mpsc::SyncSender<crate::CowdEvent>>,
+    emitted: &mut bool,
+) -> bool {
+    if let AssistantEvent::TextDelta(text) = &event {
+        if emit_output {
+            print!("{text}");
+            let _ = std::io::stdout().flush();
+        }
+        if let Some(callback) = stream_callback {
+            let _ = callback.try_send(crate::CowdEvent::TextDelta { text: text.clone() });
+        }
+    }
+    *emitted = true;
+    sender.unbounded_send(Ok(event)).is_ok()
 }
 
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {

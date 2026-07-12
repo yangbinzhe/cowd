@@ -66,7 +66,7 @@ pub use signal::{
     EvolutionSignal, EvolutionSignalInput, EvolutionSignalSeverity, EvolutionSignalSource,
     EvolutionSignalStore, EvolutionSignalType,
 };
-pub use signal_bridge::{signal_from_self_regulation_decision, EvolutionSignalCollector};
+pub use signal_bridge::{signal_from_intervention, EvolutionSignalCollector};
 pub use triage::{EvolutionTriageCluster, EvolutionTriageService};
 pub use versioning::EvolutionVersionRecord;
 pub use worktree_runner::WorktreeRunner;

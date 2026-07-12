@@ -565,9 +565,17 @@ pub fn understand(input: &StrategyInput) -> TaskUnderstanding {
     let normalized = normalize(&input.prompt);
     let domain = classify_domain(&normalized);
     let requires_write = input.explicit_write || contains_any(&normalized, WRITE_TERMS);
-    let requires_external_facts = contains_any(&normalized, EXTERNAL_FACT_TERMS);
+    // A user can mention tools only to rule them out for an otherwise direct
+    // request. Do not turn an explicit prohibition into an evidence-seeking
+    // strategy merely because the word "tool" occurs in the prompt.
+    let requires_external_facts =
+        contains_any(&normalized, EXTERNAL_FACT_TERMS) && !explicitly_forbids_tool_use(&normalized);
     let requests_parallelism = contains_any(&normalized, PARALLEL_TERMS);
-    let requests_multi_agent = contains_any(&normalized, MULTI_AGENT_TERMS);
+    // A request may mention teams solely to prohibit them. Treating every
+    // occurrence of "team" as an affirmative collaboration request turns a
+    // user-selected single-agent execution mode into its opposite.
+    let requests_multi_agent = contains_any(&normalized, MULTI_AGENT_TERMS)
+        && !explicitly_forbids_collaboration(&normalized);
     let requests_deep_plan = contains_any(&normalized, DEEP_PLAN_TERMS);
     let requests_deliberation = contains_any(&normalized, DELIBERATION_TERMS);
     let requests_background = contains_any(&normalized, BACKGROUND_TERMS);
@@ -609,6 +617,62 @@ pub fn understand(input: &StrategyInput) -> TaskUnderstanding {
             requests_multi_agent,
         ),
     }
+}
+
+fn explicitly_forbids_collaboration(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "不要组队",
+            "不要团队",
+            "不要启动团队",
+            "不要启动协作",
+            "不启动团队",
+            "无需团队",
+            "不需要团队",
+            "单 agent",
+            "单agent",
+            "单人执行",
+            "don't use team",
+            "do not use team",
+            "do not start a team",
+            "single agent",
+            "single-agent",
+        ],
+    )
+}
+
+/// Returns whether a prompt contains an unambiguous instruction not to invoke
+/// tools for this request. Runtime consumers use the same interpretation when
+/// selecting the provider tool schema set, so routing and actual exposure
+/// cannot diverge.
+#[must_use]
+pub fn prompt_explicitly_forbids_tool_use(prompt: &str) -> bool {
+    explicitly_forbids_tool_use(&normalize(prompt))
+}
+
+fn explicitly_forbids_tool_use(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "不要调用工具",
+            "不要使用工具",
+            "不调用工具",
+            "不使用工具",
+            "无需调用工具",
+            "不需要调用工具",
+            "无需使用工具",
+            "不需要使用工具",
+            "禁止调用工具",
+            "禁止使用工具",
+            "do not call tools",
+            "don't call tools",
+            "do not use tools",
+            "don't use tools",
+            "no tool calls",
+            "without tools",
+        ],
+    )
 }
 
 fn select_pattern(
@@ -954,10 +1018,36 @@ const WRITE_TERMS: &[&str] = &[
     "迁移",
 ];
 const EXTERNAL_FACT_TERMS: &[&str] = &[
-    "latest", "最新", "today", "现在", "当前", "调研", "research", "web", "论文",
+    "latest",
+    "最新",
+    "today",
+    "现在",
+    "当前",
+    "调研",
+    "research",
+    "web",
+    "论文",
+    // An explicit evidence/tool instruction is not merely a stylistic model
+    // preference. It changes the acceptance contract: the answer must be
+    // grounded in an observable capability result, so Direct must not hide
+    // the tool catalog behind its minimal bootstrap set.
+    "工具",
+    "tool",
+    "证据",
+    "evidence",
+    "读取",
+    "read_file",
 ];
 const PARALLEL_TERMS: &[&str] = &["parallel", "并行", "同时", "fanout", "多路"];
-const MULTI_AGENT_TERMS: &[&str] = &["multi-agent", "多agent", "多 agent", "subagent", "协同"];
+const MULTI_AGENT_TERMS: &[&str] = &[
+    "multi-agent",
+    "多agent",
+    "多 agent",
+    "subagent",
+    "协同",
+    "团队",
+    "team",
+];
 const DEEP_PLAN_TERMS: &[&str] = &[
     "全面",
     "完整",
@@ -1040,6 +1130,32 @@ mod tests {
     }
 
     #[test]
+    fn explicit_tool_evidence_and_team_requests_do_not_fall_back_to_direct() {
+        let tool = decide_strategy(&StrategyInput::from_prompt(
+            "必须通过只读工具读取 Cargo.toml 并提供证据",
+        ));
+        assert_eq!(tool.pattern, ExecutionPattern::Explore);
+        assert!(tool.understanding.requires_external_facts);
+
+        let team = decide_strategy(&StrategyInput::from_prompt(
+            "请实际启动协作团队，分别审查 runtime、memory、gateway 后综合结论",
+        ));
+        assert_eq!(team.pattern, ExecutionPattern::Collaborate);
+        assert!(team.understanding.requests_multi_agent);
+    }
+
+    #[test]
+    fn explicit_tool_prohibition_does_not_create_external_evidence_work() {
+        let prompt = "只回答 7 乘以 8 的结果。不要调用工具，不要组队。";
+        let decision = decide_strategy(&StrategyInput::from_prompt(prompt));
+
+        assert!(prompt_explicitly_forbids_tool_use(prompt));
+        assert_eq!(decision.pattern, ExecutionPattern::Direct);
+        assert!(!decision.understanding.requires_external_facts);
+        assert!(!decision.understanding.requests_multi_agent);
+    }
+
+    #[test]
     fn routes_bounded_write_to_execute_with_bounded_modifier() {
         let decision = decide_strategy(
             &StrategyInput::from_prompt("修复这个单文件小问题")
@@ -1090,6 +1206,16 @@ mod tests {
         assert_eq!(decision.pattern, ExecutionPattern::Collaborate);
         assert!(decision.uses_modifier(ExecutionModifier::WithReviewer));
         assert_contract_legal(&decision);
+    }
+
+    #[test]
+    fn negative_team_constraint_is_not_routed_as_collaboration() {
+        let decision = decide_strategy(&StrategyInput::from_prompt(
+            "请单人执行这次架构审查，不要启动团队或多 Agent。",
+        ));
+
+        assert!(!decision.understanding.requests_multi_agent);
+        assert_ne!(decision.pattern, ExecutionPattern::Collaborate);
     }
 
     #[test]

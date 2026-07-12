@@ -547,6 +547,24 @@ impl AgentRuntime {
         Ok(returned)
     }
 
+    /// Persist a bounded lifecycle progress marker for an active Agent.
+    ///
+    /// Provider deltas are intentionally not written one-by-one. Backends use
+    /// this for state transitions such as execution admission and first model
+    /// output, which makes a live team observable without turning telemetry
+    /// into transcript or event-store noise.
+    pub fn record_progress(&self, agent_id: &str, kind: &str, message: &str) -> Result<(), String> {
+        let Some(mut snapshot) = self.get(agent_id) else {
+            return Err(format!("agent {agent_id} does not exist"));
+        };
+        if snapshot.status.is_terminal() {
+            return Ok(());
+        }
+        snapshot.updated_at_ms = now_ms();
+        self.persist_snapshot(snapshot, kind, message, None, None)
+            .map(|_| ())
+    }
+
     /// Derive bounded peer context from the canonical graph projection before a
     /// dependent AgentTask starts. Graph edges remain the scheduling truth;
     /// this method only makes already-committed predecessor results visible to
@@ -630,13 +648,24 @@ impl AgentRuntime {
             if available == 0 {
                 break;
             }
-            let outcome = truncate_context_text(&returned.outcome, available);
+            let upstream_outcome = if returned.status == AgentTerminalStatus::Completed {
+                returned.outcome.clone()
+            } else {
+                format!(
+                    "UNRESOLVED: upstream role did not complete: {}",
+                    returned
+                        .failure
+                        .clone()
+                        .unwrap_or_else(|| "no terminal outcome".to_string())
+                )
+            };
+            let outcome = truncate_context_text(&upstream_outcome, available);
             remaining = remaining.saturating_sub(outcome.len().saturating_add(96));
             sections.push(format!("### Upstream {role}\n{outcome}"));
         }
         if !sections.is_empty() {
             packet.objective.push_str(
-                "\n\n## Canonical upstream results\nUse these completed peer results as evidence. Reconcile contradictions explicitly; do not assume they are independently verified.\n\n",
+                "\n\n## Canonical upstream results\nUse completed peer results as evidence. Entries marked UNRESOLVED are failed or blocked peer lanes, not evidence; preserve them as explicit gaps rather than treating them as facts. Reconcile contradictions explicitly.\n\n",
             );
             packet.objective.push_str(&sections.join("\n\n"));
         }
@@ -1351,6 +1380,37 @@ mod tests {
         assert!(first.accepted);
         assert_eq!(first, duplicate);
         assert_eq!(runtime.events(&packet.agent_id).len(), 2);
+    }
+
+    #[test]
+    fn progress_markers_preserve_running_lifecycle_without_becoming_terminal() {
+        let runtime = AgentRuntime::new(
+            Arc::new(RuntimeEventStore::try_open_in_memory().expect("store")),
+            configured_registry(),
+        );
+        let packet = task("agent-progress");
+        runtime
+            .restore_verified_run(legacy_snapshot(&packet, AgentStatus::Running))
+            .expect("restore running agent");
+
+        runtime
+            .record_progress(
+                &packet.agent_id,
+                "agent.provider.first_output",
+                "provider emitted the first output",
+            )
+            .expect("progress is durable");
+
+        assert_eq!(
+            runtime
+                .get(&packet.agent_id)
+                .expect("agent projection")
+                .status,
+            AgentStatus::Running
+        );
+        let events = runtime.events(&packet.agent_id);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].kind, "agent.provider.first_output");
     }
 
     #[tokio::test]

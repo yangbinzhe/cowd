@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -10,7 +11,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use memory::store::session::{SessionEvent, SessionListOptions, SessionRecord};
+use memory::store::session::{
+    SessionEvent, SessionListOptions, SessionMissionOutboxOperation, SessionMissionOutboxRequest,
+    SessionRecord,
+};
 use serde::{Deserialize, Serialize};
 
 use super::{new_api_session_record, AppState, ErrorResponse};
@@ -497,24 +501,107 @@ async fn create_session(
 
     let mut info = active_session_info(session_id.clone());
     if state.services.session.has_unified_store() {
-        let record = new_api_session_record(&session_id, Some(model));
-        state
-            .services
-            .session
-            .upsert_stored_session(&record)
-            .await
-            .map_err(|error| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("failed to persist session: {error}"),
-                    }),
-                )
-            })?;
+        let mut record = new_api_session_record(&session_id, Some(model));
+        persist_session_with_mission_registration(&state, &mut record, "API session").await?;
         info = session_info_from_record(record);
     }
 
     Ok((StatusCode::CREATED, Json(info)))
+}
+
+fn mission_outbox_request(
+    state: &AppState,
+    record: &SessionRecord,
+    title: &str,
+    operation: SessionMissionOutboxOperation,
+) -> Result<SessionMissionOutboxRequest, (StatusCode, Json<ErrorResponse>)> {
+    let services = session_runtime_services(state)?;
+    let operation_name = match operation {
+        SessionMissionOutboxOperation::Register => "register",
+        SessionMissionOutboxOperation::Start => "start",
+        SessionMissionOutboxOperation::Close => "close",
+    };
+    Ok(SessionMissionOutboxRequest {
+        request_id: format!(
+            "mission:{}:{operation_name}:{}:{}",
+            services.workspace_key(),
+            record.session_id,
+            record.created_at,
+        ),
+        session_id: record.session_id.clone(),
+        title: title.to_string(),
+        workspace_key: services.workspace_key().to_string(),
+        operation,
+        created_at_ms: current_time_ms(),
+    })
+}
+
+fn bind_session_workspace(record: &mut SessionRecord, state: &AppState) {
+    let mut metadata = record
+        .metadata_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    metadata["workspace_root"] =
+        serde_json::Value::String(state.workspace_root.display().to_string());
+    record.metadata_json = Some(metadata.to_string());
+}
+
+fn session_title(record: &SessionRecord) -> String {
+    record
+        .metadata_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        .and_then(|value| {
+            value
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "Session {}",
+                &record.session_id[..record.session_id.len().min(8)]
+            )
+        })
+}
+
+fn current_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+async fn persist_session_with_mission_registration(
+    state: &AppState,
+    record: &mut SessionRecord,
+    title: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    bind_session_workspace(record, state);
+    let request = mission_outbox_request(
+        state,
+        record,
+        title,
+        SessionMissionOutboxOperation::Register,
+    )?;
+    state
+        .services
+        .session
+        .upsert_stored_session_with_mission_outbox(record, &request)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to persist session and Mission registration: {error}"),
+                }),
+            )
+        })?;
+    Ok(())
 }
 
 async fn branch_session_handler(
@@ -648,19 +735,12 @@ async fn branch_session_handler(
             })
             .to_string(),
         );
-        state
-            .services
-            .session
-            .upsert_stored_session(&record)
-            .await
-            .map_err(|error| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("failed to persist branch session: {error}"),
-                    }),
-                )
-            })?;
+        persist_session_with_mission_registration(
+            &state,
+            &mut record,
+            &format!("{} / branch", source_title),
+        )
+        .await?;
         copied_messages = state
             .services
             .session
@@ -821,22 +901,31 @@ async fn ensure_session_handler(
                 .flatten()
                 .is_none()
         {
-            let record = new_api_session_record(&id, Some(model));
+            let mut record = new_api_session_record(&id, Some(model));
+            persist_session_with_mission_registration(&state, &mut record, "Ensured API session")
+                .await?;
+        }
+        created = true;
+    }
+    if state.services.session.has_unified_store() {
+        if let Some(mut record) =
             state
                 .services
                 .session
-                .upsert_stored_session(&record)
+                .stored_session(&id)
                 .await
                 .map_err(|error| {
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(ErrorResponse {
-                            error: format!("failed to persist session: {error}"),
+                            error: format!("failed to load ensured session: {error}"),
                         }),
                     )
-                })?;
+                })?
+        {
+            persist_session_with_mission_registration(&state, &mut record, "Ensured API session")
+                .await?;
         }
-        created = true;
     }
 
     Ok(Json(serde_json::json!({
@@ -963,19 +1052,42 @@ async fn delete_session(
         .runtime
         .as_ref()
         .is_some_and(|runtime_service| runtime_service.remove_active_runtime_if_present(&id));
-    let removed_stored = state
+    let removed_stored = if let Some(record) = state
         .services
         .session
-        .delete_stored_session(&id)
+        .stored_session(&id)
         .await
         .map_err(|error| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
-                    error: format!("failed to delete session: {error}"),
+                    error: format!("failed to load session before deletion: {error}"),
                 }),
             )
-        })?;
+        })? {
+        let title = session_title(&record);
+        let request = mission_outbox_request(
+            &state,
+            &record,
+            &title,
+            SessionMissionOutboxOperation::Close,
+        )?;
+        state
+            .services
+            .session
+            .delete_stored_session_with_mission_outbox(&request)
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("failed to delete session and queue Mission close: {error}"),
+                    }),
+                )
+            })?
+    } else {
+        false
+    };
 
     if removed_active || removed_stored {
         Ok(StatusCode::NO_CONTENT)

@@ -158,15 +158,74 @@ impl ExecutionCommitService {
                 .insert(node.id.clone(), ExecutionNodeStatus::Planned);
         }
         let transaction_id = format!("{}:planned", graph.id);
-        self.append_graph_event(
-            &graph,
-            0,
-            transaction_id,
-            ExecutionGraphEvent::Planned {
-                graph: graph.clone(),
-            },
-            Vec::new(),
-        )
+        let lineage_event =
+            graph
+                .parent_execution
+                .as_ref()
+                .map(|parent| RuntimeTransactionEventInput {
+                    event: RuntimeEventInput {
+                        stream_id: execution_lineage_stream_id(&parent.execution_id),
+                        scope: RuntimeEventScope::Relation,
+                        kind: "execution.lineage.child_registered.v1".to_string(),
+                        status: Some("registered".to_string()),
+                        actor: Some("execution_commit_service".to_string()),
+                        refs: vec![
+                            RuntimeEventRef {
+                                kind: "execution_graph".to_string(),
+                                id: parent.execution_id.clone(),
+                            },
+                            RuntimeEventRef {
+                                kind: "execution_node".to_string(),
+                                id: parent.node_id.clone(),
+                            },
+                            RuntimeEventRef {
+                                kind: "execution_graph".to_string(),
+                                id: graph.id.clone(),
+                            },
+                        ],
+                        payload: json!({
+                            "parent_execution_id": parent.execution_id,
+                            "parent_node_id": parent.node_id,
+                            "child_execution_id": graph.id,
+                            "child_objective": graph.objective,
+                        }),
+                    },
+                    idempotency_key: Some(format!("{}:child:{}", parent.execution_id, graph.id)),
+                    schema_version: 1,
+                });
+        // Several child graphs may be compiled concurrently for the same
+        // parent tool batch. Their graph streams are independent, but their
+        // durable lineage registrations share one parent stream. Retry only
+        // that optimistic-concurrency collision: the transaction is atomic
+        // and uses stable graph/child idempotency keys, so no child can be
+        // double-registered. A collision on the graph's own stream remains a
+        // real duplicate-graph error and is returned unchanged.
+        let lineage_stream = graph
+            .parent_execution
+            .as_ref()
+            .map(|parent| execution_lineage_stream_id(&parent.execution_id));
+        let domain_events = lineage_event.into_iter().collect::<Vec<_>>();
+        let mut last_lineage_conflict = None;
+        for _ in 0..8 {
+            match self.append_graph_event(
+                &graph,
+                0,
+                transaction_id.clone(),
+                ExecutionGraphEvent::Planned {
+                    graph: graph.clone(),
+                },
+                domain_events.clone(),
+            ) {
+                Ok(receipt) => return Ok(receipt),
+                Err(error)
+                    if is_lineage_registration_conflict(&error, lineage_stream.as_deref()) =>
+                {
+                    last_lineage_conflict = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_lineage_conflict.expect("lineage retry loop records its conflict"))
     }
 
     pub async fn register_graph_async(
@@ -422,6 +481,7 @@ impl ExecutionCommitService {
         }
         let (command_name, reason) = command_metadata(command);
         let mut next = graph.clone();
+        let mut external_resolution: Option<(String, String, String)> = None;
         match command {
             ExecutionGraphCommand::Pause { .. } => {
                 for status in next.node_statuses.values_mut() {
@@ -467,6 +527,37 @@ impl ExecutionCommitService {
                     ExecutionNodeStatus::Cancelled
                 };
             }
+            ExecutionGraphCommand::ResolveExternal {
+                node_id,
+                result_ref,
+                correlation_id,
+                ..
+            } => {
+                let status = next.node_statuses.get_mut(node_id).ok_or_else(|| {
+                    ExecutionCommitError::InvalidCommand(format!(
+                        "external result node `{node_id}` does not exist"
+                    ))
+                })?;
+                if *status != ExecutionNodeStatus::WaitingExternal {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "node `{node_id}` is not waiting for an external result"
+                    )));
+                }
+                *status = ExecutionNodeStatus::Completed;
+                next.node_results.insert(
+                    node_id.clone(),
+                    ExecutionNodeResult {
+                        status: ExecutionNodeStatus::Completed,
+                        result_ref: Some(result_ref.clone()),
+                        evidence_refs: Vec::new(),
+                        failure: None,
+                        usage: Default::default(),
+                        finished_at_ms: now_ms(),
+                    },
+                );
+                external_resolution =
+                    Some((node_id.clone(), result_ref.clone(), correlation_id.clone()));
+            }
             ExecutionGraphCommand::Replan { .. } => {
                 return Err(ExecutionCommitError::InvalidCommand(
                     "replan requires the graph compiler and cannot be applied as a status mutation"
@@ -483,6 +574,36 @@ impl ExecutionCommitService {
                 (from != *to).then(|| node_transition_event(&next, node_id, from, *to, None))
             })
             .collect();
+        if let Some((node_id, result_ref, correlation_id)) = external_resolution {
+            node_events.push(RuntimeTransactionEventInput {
+                event: RuntimeEventInput {
+                    stream_id: format!("session-handoff-correlation:{correlation_id}"),
+                    scope: RuntimeEventScope::SessionInput,
+                    kind: "session.handoff.source_resolved.v1".to_string(),
+                    status: Some("completed".to_string()),
+                    actor: Some("ExecutionGraphRunner".to_string()),
+                    refs: vec![
+                        RuntimeEventRef {
+                            kind: "execution_graph".to_string(),
+                            id: graph.id.clone(),
+                        },
+                        RuntimeEventRef {
+                            kind: "execution_node".to_string(),
+                            id: node_id.clone(),
+                        },
+                    ],
+                    payload: json!({
+                        "result_ref": result_ref,
+                        "correlation_id": correlation_id,
+                    }),
+                },
+                idempotency_key: Some(format!(
+                    "session-handoff-source-resolved:{}:{node_id}:{correlation_id}",
+                    graph.id,
+                )),
+                schema_version: 1,
+            });
+        }
         if let ExecutionGraphCommand::SubmitApproval {
             node_id,
             approved,
@@ -702,6 +823,22 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn is_lineage_registration_conflict(
+    error: &ExecutionCommitError,
+    lineage_stream: Option<&str>,
+) -> bool {
+    matches!(
+        (error, lineage_stream),
+        (
+            ExecutionCommitError::EventStore(RuntimeEventStoreError::StaleRevision {
+                stream_id,
+                ..
+            }),
+            Some(expected_stream),
+        ) if stream_id == expected_stream
+    )
+}
+
 fn validate_replan(
     graph: &ExecutionGraph,
     nodes: &[ExecutionNodeSpec],
@@ -757,6 +894,10 @@ fn node_stream_id(graph_id: &str, node_id: &str) -> String {
     format!("{graph_id}:node:{node_id}")
 }
 
+pub(crate) fn execution_lineage_stream_id(parent_execution_id: &str) -> String {
+    format!("execution-lineage:{parent_execution_id}")
+}
+
 fn node_transition_event(
     graph: &ExecutionGraph,
     node_id: &str,
@@ -803,6 +944,9 @@ fn command_revision(command: &ExecutionGraphCommand) -> u64 {
         | ExecutionGraphCommand::SubmitApproval {
             expected_revision, ..
         }
+        | ExecutionGraphCommand::ResolveExternal {
+            expected_revision, ..
+        }
         | ExecutionGraphCommand::Replan {
             expected_revision, ..
         } => *expected_revision,
@@ -817,6 +961,7 @@ fn command_metadata(command: &ExecutionGraphCommand) -> (&'static str, Option<&s
         ExecutionGraphCommand::Resume { .. } => ("resume", None),
         ExecutionGraphCommand::Cancel { reason, .. } => ("cancel", Some(reason)),
         ExecutionGraphCommand::SubmitApproval { .. } => ("submit_approval", None),
+        ExecutionGraphCommand::ResolveExternal { .. } => ("resolve_external", None),
         ExecutionGraphCommand::Replan { reason, .. } => ("replan", Some(reason)),
     }
 }

@@ -1136,6 +1136,14 @@ impl MfgRepository {
         let mut incident = incident.clone();
         let mut graph = MfgWorkflowGraph::for_incident(&incident)?;
         graph.attach_evidence_packet(packet)?;
+        // Creating an incident from a structured evidence packet is the
+        // completion of its planning step. Evidence research and selected
+        // skills can now proceed concurrently; governance review remains a
+        // later, explicit consumer of those outputs.
+        graph.set_node_terminal_result(
+            "planner",
+            "incident workflow initialized from structured evidence packet",
+        )?;
         incident.workflow_graph_id = Some(graph.workflow_id.clone());
         let mut connection = self
             .connection

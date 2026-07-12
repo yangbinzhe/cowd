@@ -106,6 +106,38 @@ pub struct ObservabilityPolicy {
     pub debug_reasons: bool,
 }
 
+/// Runtime-owned policy for the Mission schedule timer event source. The
+/// timer only submits durable SessionDispatch graphs; it never owns execution
+/// state or advances graph nodes itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionSchedulePolicy {
+    pub enabled: bool,
+    pub tick_interval_ms: u64,
+    pub grace_ms: u64,
+}
+
+impl Default for MissionSchedulePolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            tick_interval_ms: 1_000,
+            grace_ms: 300_000,
+        }
+    }
+}
+
+impl MissionSchedulePolicy {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.tick_interval_ms < 100 {
+            return Err("mission schedule tick_interval_ms must be at least 100".to_string());
+        }
+        if self.grace_ms < self.tick_interval_ms {
+            return Err("mission schedule grace_ms must be at least tick_interval_ms".to_string());
+        }
+        Ok(())
+    }
+}
+
 impl Default for ObservabilityPolicy {
     fn default() -> Self {
         Self {
@@ -127,6 +159,7 @@ pub struct RuntimeControlPolicy {
     pub memory: MemoryControlPolicy,
     pub permission: PermissionControlPolicy,
     pub observability: ObservabilityPolicy,
+    pub mission_schedule: MissionSchedulePolicy,
 }
 
 impl Default for RuntimeControlPolicy {
@@ -139,6 +172,7 @@ impl Default for RuntimeControlPolicy {
             memory: MemoryControlPolicy::default(),
             permission: PermissionControlPolicy::default(),
             observability: ObservabilityPolicy::default(),
+            mission_schedule: MissionSchedulePolicy::default(),
         }
     }
 }

@@ -23,7 +23,7 @@ pub fn validate_request(
         | RuntimeOrchestrationAction::RequestSubagent
         | RuntimeOrchestrationAction::RequestVerification
         | RuntimeOrchestrationAction::RequestBackgroundReview
-        | RuntimeOrchestrationAction::RequestSessionLink => "accepted",
+        | RuntimeOrchestrationAction::DispatchSession => "accepted",
         RuntimeOrchestrationAction::RequestRiskGate => "needs_approval",
         _ => "planned",
     };
@@ -87,11 +87,20 @@ pub fn validate_request(
         status = "rejected".to_string();
         findings.push("empty_intent_rejected".to_string());
     }
-    if request.action == RuntimeOrchestrationAction::RequestSessionLink
+    if request.action == RuntimeOrchestrationAction::DispatchSession
         && request.session_id.as_deref().is_none_or(str::is_empty)
     {
         status = "rejected".to_string();
-        findings.push("missing_session_id_for_session_link".to_string());
+        findings.push("missing_source_session_id_for_dispatch".to_string());
+    }
+    if request.action == RuntimeOrchestrationAction::DispatchSession
+        && request
+            .target_session_id
+            .as_deref()
+            .is_none_or(str::is_empty)
+    {
+        status = "rejected".to_string();
+        findings.push("missing_target_session_id_for_dispatch".to_string());
     }
     let required_approval = approval_requirement(request, execution);
     if let Some(requirement) = required_approval.as_ref() {
@@ -240,7 +249,7 @@ fn strategy_authorizes(
         }
         Action::RequestDeliberation => execution.pattern() == ExecutionPattern::Deliberate,
         Action::RequestTeam => execution.pattern() == ExecutionPattern::Collaborate,
-        Action::RequestBackgroundReview | Action::RequestSessionLink => {
+        Action::RequestBackgroundReview | Action::DispatchSession => {
             execution.pattern() == ExecutionPattern::Supervise
         }
     }

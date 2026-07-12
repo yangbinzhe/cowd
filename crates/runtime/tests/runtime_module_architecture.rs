@@ -45,7 +45,7 @@ fn runtime_module_map_covers_core_harness_lifecycle_domains() {
         "session_execution",
         "agent_runtime",
         "team_builder",
-        "steward_runtime",
+        "mission_command_router",
         "approval_queue",
         "runtime_event_store",
         "recovery",

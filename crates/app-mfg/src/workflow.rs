@@ -372,11 +372,11 @@ impl MfgWorkflowGraph {
     }
 
     pub fn plan_skills(&mut self, plan: &MfgSkillPlan) -> Result<(), MfgWorkflowGraphError> {
-        let dependency = if self.nodes.iter().any(|node| node.node_id == "mfg_reviewer") {
-            "mfg_reviewer"
-        } else {
-            "planner"
-        };
+        // Skills enrich the evidence lane. They must run after the incident
+        // plan exists, but before (and in parallel with) governance review;
+        // making them depend on the reviewer creates a dead path because the
+        // review is meant to consume their evidence.
+        let dependency = "planner";
         for skill in &plan.selected_skills {
             let node_id = skill_agent_node_id(&skill.skill_id);
             let mut node = MfgWorkflowNode::new(

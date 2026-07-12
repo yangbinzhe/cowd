@@ -1,14 +1,17 @@
 //! Workspace-owned runtime service graph.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
-use harness_contract::execution_graph::{ExecutionGraph, ExecutionNodeStatus};
+use harness_contract::execution_graph::{
+    ExecutionGraph, ExecutionGraphCommand, ExecutionNodeStatus,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::cross_plane::{CrossPlaneRuntimeError, CrossPlaneRuntimeService};
+use super::goal::GoalStore;
 use super::graph::{
     executors::{
         AgentTaskExecutor, ApprovalNodeExecutor, CompileTargetGuardExecutor, ScopedNodeExecutor,
@@ -23,8 +26,8 @@ use super::protocols::ProtocolResultReducer;
 use crate::runtime_event_store::RuntimeEventStoreError;
 use crate::{
     AgentRuntime, AgentRuntimeResolver, ApprovalQueue, ConflictArbiter, InProcessAgentWorker,
-    MissionEvidenceBus, MissionRuntime, ProcessJsonlAdapter, RuntimeEventStore, SessionInputRouter,
-    SessionRelationGraph, TeamResultReducer, TeamRuntime,
+    MissionEvidenceBus, MissionRuntime, MissionScheduleStore, ProcessJsonlAdapter,
+    RuntimeEventStore, SessionInputRouter, SessionRelationGraph, TeamResultReducer, TeamRuntime,
 };
 
 #[derive(Debug, Error)]
@@ -55,6 +58,12 @@ pub enum RuntimeServicesError {
     DuplicateSessionRouter,
     #[error("workspace mutation is blocked because upgrade recovery is required")]
     UpgradeRecoveryRequired,
+    #[error("durable session handoff recovery failed: {0}")]
+    SessionHandoffRecovery(String),
+    #[error("execution projection access is denied by the current scoped authorization")]
+    ProjectionAccessDenied,
+    #[error("execution projection invariant failed: {0}")]
+    Invariant(String),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +74,7 @@ pub struct ExecutionStartupRecoveryReport {
     pub terminal_graphs: usize,
     pub waiting_graphs: usize,
     pub blocked_graphs: usize,
+    pub resolved_handoff_results: usize,
     pub errors: Vec<ExecutionStartupRecoveryError>,
     pub records: Vec<ExecutionStartupRecoveryRecord>,
 }
@@ -94,6 +104,7 @@ pub struct RuntimeServicesBuilder {
     provider_registry: Arc<crate::ProviderRegistry>,
     tool_execution_host: Option<Arc<dyn crate::RuntimeExecutionHost>>,
     session_store: Option<Arc<memory::UnifiedSessionStore>>,
+    mission_schedule_policy: crate::MissionSchedulePolicy,
 }
 
 impl RuntimeServicesBuilder {
@@ -121,6 +132,12 @@ impl RuntimeServicesBuilder {
     #[must_use]
     pub fn session_store(mut self, store: Arc<memory::UnifiedSessionStore>) -> Self {
         self.session_store = Some(store);
+        self
+    }
+
+    #[must_use]
+    pub fn mission_schedule_policy(mut self, policy: crate::MissionSchedulePolicy) -> Self {
+        self.mission_schedule_policy = policy;
         self
     }
 
@@ -161,9 +178,9 @@ impl RuntimeServicesBuilder {
             worktree_leases,
             scope_locks,
             self.resource_quotas,
-            Some(state_root.join("mission-state.json")),
             self.provider_registry,
             self.tool_execution_host,
+            self.mission_schedule_policy,
         )?);
         services.agent_runtime.bind_services(Arc::clone(&services));
         services
@@ -213,7 +230,10 @@ pub struct RuntimeServices {
     worktree_leases: Arc<WorktreeLeaseManager>,
     cross_plane: Arc<CrossPlaneRuntimeService>,
     mission_runtime: Arc<MissionRuntime>,
+    mission_schedules: Arc<MissionScheduleStore>,
+    mission_schedule_policy: Arc<RwLock<crate::MissionSchedulePolicy>>,
     session_relations: Arc<SessionRelationGraph>,
+    goal_store: Arc<GoalStore>,
     provider_registry: Arc<crate::ProviderRegistry>,
     tool_execution_host: Option<Arc<dyn crate::RuntimeExecutionHost>>,
     session_dispatch_executor: Arc<crate::session_execution::SessionDispatchNodeExecutor>,
@@ -233,6 +253,7 @@ impl RuntimeServices {
             provider_registry: Arc::new(crate::ProviderRegistry::empty()),
             tool_execution_host: None,
             session_store: None,
+            mission_schedule_policy: crate::MissionSchedulePolicy::default(),
         }
     }
 
@@ -251,9 +272,9 @@ impl RuntimeServices {
             )?),
             Arc::new(ScopeLockManager::new()),
             default_resource_quotas(),
-            None,
             Arc::new(crate::ProviderRegistry::empty()),
             None,
+            crate::MissionSchedulePolicy::default(),
         )?);
         services.agent_runtime.bind_services(Arc::clone(&services));
         services
@@ -279,9 +300,9 @@ impl RuntimeServices {
         worktree_leases: Arc<WorktreeLeaseManager>,
         scope_locks: Arc<ScopeLockManager>,
         resource_quotas: Vec<(ExecutionResourceKind, ResourceQuota)>,
-        mission_state_path: Option<PathBuf>,
         provider_registry: Arc<crate::ProviderRegistry>,
         tool_execution_host: Option<Arc<dyn crate::RuntimeExecutionHost>>,
+        mission_schedule_policy: crate::MissionSchedulePolicy,
     ) -> Result<Self, RuntimeServicesError> {
         let executor_registry = Arc::new(NodeExecutorRegistry::new());
         let graph_state_store = ExecutionGraphStateStore::new(Arc::clone(&event_store));
@@ -359,19 +380,25 @@ impl RuntimeServices {
                 .ok_or_else(|| "upgrade_recovery_required".to_string())
         });
         let mission_evidence = Arc::new(MissionEvidenceBus::new(Arc::clone(&event_store)));
+        let goal_store = Arc::new(GoalStore::new(Arc::clone(&event_store)));
         let conflict_resolver = Arc::new(ConflictArbiter::new(
             Arc::clone(&mission_evidence),
             Arc::clone(&event_store),
         ));
-        let mission_runtime = match mission_state_path {
-            Some(path) => {
-                MissionRuntime::persistent_at(path).map_err(RuntimeServicesError::Mission)?
-            }
-            None => MissionRuntime::new(),
-        };
+        let mission_runtime =
+            MissionRuntime::event_sourced(Arc::clone(&event_store), workspace_key.clone())
+                .map_err(RuntimeServicesError::Mission)?;
+        let mission_schedules = Arc::new(
+            MissionScheduleStore::event_sourced(Arc::clone(&event_store), workspace_key.clone())
+                .map_err(RuntimeServicesError::Mission)?,
+        );
+        let session_relations = Arc::new(
+            SessionRelationGraph::event_sourced(Arc::clone(&event_store), workspace_key.clone())
+                .map_err(RuntimeServicesError::Mission)?,
+        );
         Ok(Self {
             workspace_root,
-            workspace_key,
+            workspace_key: workspace_key.clone(),
             event_store: Arc::clone(&event_store),
             executor_registry,
             model_step_executor,
@@ -391,9 +418,12 @@ impl RuntimeServices {
             resource_manager,
             scope_locks,
             worktree_leases,
-            cross_plane: Arc::new(CrossPlaneRuntimeService::open(event_store)?),
+            cross_plane: Arc::new(CrossPlaneRuntimeService::open(Arc::clone(&event_store))?),
             mission_runtime: Arc::new(mission_runtime),
-            session_relations: Arc::new(SessionRelationGraph::new()),
+            mission_schedules,
+            mission_schedule_policy: Arc::new(RwLock::new(mission_schedule_policy)),
+            session_relations,
+            goal_store,
             provider_registry,
             tool_execution_host,
             session_dispatch_executor,
@@ -408,7 +438,8 @@ impl RuntimeServices {
         if let Some(router) = self.session_input_router.get() {
             return Ok(Arc::clone(router));
         }
-        let router = SessionInputRouter::install(store, &self.workspace_key)?;
+        let router =
+            SessionInputRouter::install(store, &self.workspace_key, Arc::clone(&self.event_store))?;
         self.session_dispatch_executor
             .install_router(Arc::clone(&router))
             .map_err(RuntimeServicesError::Mission)?;
@@ -469,6 +500,9 @@ impl RuntimeServices {
     pub fn mission_evidence(&self) -> &Arc<MissionEvidenceBus> {
         &self.mission_evidence
     }
+    pub fn goal_store(&self) -> &Arc<GoalStore> {
+        &self.goal_store
+    }
     pub fn conflict_resolver(&self) -> &Arc<ConflictArbiter> {
         &self.conflict_resolver
     }
@@ -502,9 +536,11 @@ impl RuntimeServices {
         &self,
     ) -> Result<ExecutionStartupRecoveryReport, RuntimeServicesError> {
         self.ensure_mutation_allowed()?;
+        let resolved_handoff_results = self.resolve_durable_handoff_results().await?;
         let graph_ids = self.graph_state_store.nonterminal_graph_ids_async().await?;
         let mut report = ExecutionStartupRecoveryReport {
             examined_graphs: graph_ids.len(),
+            resolved_handoff_results,
             ..ExecutionStartupRecoveryReport::default()
         };
         let recovery = super::graph::ExecutionGraphRecovery::new(
@@ -593,11 +629,244 @@ impl RuntimeServices {
         Ok(report)
     }
 
+    /// Resolve source graph nodes for target results that were durably
+    /// committed before an adapter process stopped. Graph ownership stays in
+    /// Runtime; Gateway only delivers target turns and never owns recovery.
+    pub async fn resolve_durable_handoff_results(&self) -> Result<usize, RuntimeServicesError> {
+        let Some(router) = self.session_input_router() else {
+            return Ok(0);
+        };
+        let mut resolved = 0;
+        for resolution in router
+            .completed_handoff_resolutions()
+            .map_err(RuntimeServicesError::SessionHandoffRecovery)?
+        {
+            if self.resolve_handoff_source(resolution).await? {
+                resolved += 1;
+            }
+        }
+        Ok(resolved)
+    }
+
+    pub async fn resolve_session_handoff_result(
+        &self,
+        resolution: crate::SessionHandoffResolution,
+    ) -> Result<bool, RuntimeServicesError> {
+        self.resolve_handoff_source(resolution).await
+    }
+
+    async fn resolve_handoff_source(
+        &self,
+        resolution: crate::SessionHandoffResolution,
+    ) -> Result<bool, RuntimeServicesError> {
+        use crate::ExecutionGraphHost;
+
+        for _ in 0..3 {
+            let graph = self
+                .graph_state_store
+                .load(&resolution.source_graph_id)
+                .map_err(|error| RuntimeServicesError::SessionHandoffRecovery(error.to_string()))?;
+            let node = graph
+                .nodes
+                .iter()
+                .find(|node| node.id == resolution.source_node_id)
+                .ok_or_else(|| {
+                    RuntimeServicesError::SessionHandoffRecovery(format!(
+                        "handoff source node `{}` is absent from graph `{}`",
+                        resolution.source_node_id, resolution.source_graph_id
+                    ))
+                })?;
+            let status = graph
+                .node_statuses
+                .get(&resolution.source_node_id)
+                .copied()
+                .ok_or_else(|| {
+                    RuntimeServicesError::SessionHandoffRecovery(format!(
+                        "handoff source node `{}` has no graph status",
+                        resolution.source_node_id
+                    ))
+                })?;
+            if status == ExecutionNodeStatus::Completed {
+                return Ok(false);
+            }
+            if status != ExecutionNodeStatus::WaitingExternal {
+                return Err(RuntimeServicesError::SessionHandoffRecovery(format!(
+                    "handoff source node `{}` is not waiting for a result ({status:?})",
+                    resolution.source_node_id
+                )));
+            }
+            let payload = node
+                .payload_ref
+                .strip_prefix("session_handoff:")
+                .ok_or_else(|| {
+                    RuntimeServicesError::SessionHandoffRecovery(format!(
+                        "handoff source node `{}` does not carry a SessionHandoff payload",
+                        resolution.source_node_id
+                    ))
+                })?;
+            let command: harness_contract::turn::SessionDispatchCommand =
+                serde_json::from_str(payload).map_err(|error| {
+                    RuntimeServicesError::SessionHandoffRecovery(format!(
+                        "invalid durable SessionHandoff source payload: {error}"
+                    ))
+                })?;
+            if command.handoff.correlation_id != resolution.packet.correlation_id {
+                return Err(RuntimeServicesError::SessionHandoffRecovery(format!(
+                    "handoff result correlation does not match source node `{}`",
+                    resolution.source_node_id
+                )));
+            }
+            let result_ref = resolution.packet.result_ref.clone().ok_or_else(|| {
+                RuntimeServicesError::SessionHandoffRecovery(
+                    "handoff result packet is missing its durable result reference".to_string(),
+                )
+            })?;
+            match self
+                .graph_runner
+                .command_graph(
+                    &resolution.source_graph_id,
+                    ExecutionGraphCommand::ResolveExternal {
+                        expected_revision: graph.revision,
+                        node_id: resolution.source_node_id.clone(),
+                        result_ref,
+                        correlation_id: resolution.packet.correlation_id.clone(),
+                    },
+                )
+                .await
+            {
+                Ok(_) => return Ok(true),
+                Err(error) if error.to_string().contains("revision mismatch") => continue,
+                Err(error) => {
+                    return Err(RuntimeServicesError::SessionHandoffRecovery(
+                        error.to_string(),
+                    ));
+                }
+            }
+        }
+        Err(RuntimeServicesError::SessionHandoffRecovery(format!(
+            "handoff source graph `{}` changed concurrently while resolving `{}`",
+            resolution.source_graph_id, resolution.packet.correlation_id
+        )))
+    }
+
     pub fn cross_plane(&self) -> &Arc<CrossPlaneRuntimeService> {
         &self.cross_plane
     }
+
+    /// Timer event source for durable Mission schedules. It claims due
+    /// occurrences first, then submits one stable SessionDispatch graph per
+    /// fire. The source never advances a graph itself and therefore cannot
+    /// become a second scheduler or execution owner.
+    pub async fn dispatch_due_mission_schedules(
+        &self,
+        now_ms: u64,
+    ) -> Result<crate::MissionScheduleDispatchReport, String> {
+        let policy = self.mission_schedule_policy();
+        if !policy.enabled {
+            return Ok(crate::MissionScheduleDispatchReport {
+                kind: "runtime.mission_schedule_dispatch".to_string(),
+                tick: crate::MissionScheduleTickReport {
+                    kind: "runtime.mission_schedule_tick".to_string(),
+                    now_ms,
+                    claimed: Vec::new(),
+                    missed: Vec::new(),
+                },
+                submitted: Vec::new(),
+                failed: Vec::new(),
+            });
+        }
+        let tick = self.mission_schedules.claim_due(now_ms, policy.grace_ms)?;
+        let mut submitted = Vec::new();
+        let mut failed = Vec::new();
+        for fire in self.mission_schedules.pending_fires() {
+            if self.session_input_router().is_none() {
+                failed.push(
+                    self.mission_schedules.mark_failed(
+                        &fire.fire_id,
+                        "SessionInputRouter is not installed; schedule cannot submit a graph"
+                            .to_string(),
+                    )?,
+                );
+                continue;
+            }
+            let handoff = harness_contract::turn::SessionHandoff {
+                handoff_id: format!("schedule-handoff:{}", fire.fire_id),
+                source_session_id: format!("mission:{}", fire.schedule_id),
+                target_session_id: fire.target_session_id.clone(),
+                objective: fire.objective.clone(),
+                acceptance: Vec::new(),
+                scope: vec![format!("mission-schedule:{}", fire.schedule_id)],
+                context_lens: Vec::new(),
+                evidence_refs: vec![format!("schedule-fire:{}", fire.fire_id)],
+                permission_lease: fire.permission_lease.clone(),
+                deadline_at_ms: None,
+                priority: fire.priority,
+                correlation_id: fire.correlation_id.clone(),
+                result_contract: "return evidence-backed scheduled result".to_string(),
+            };
+            let interpretation =
+                crate::MissionCommandInterpreter::interpret_session_handoff_with_graph_id(
+                    handoff,
+                    format!("mission-schedule-dispatch:{}", fire.fire_id),
+                );
+            match interpretation.command {
+                crate::MissionInterpretedCommand::SubmitExecutionGraph { graph, .. } => {
+                    match self.graph_runner.start(graph.clone()).await {
+                        Ok(report) if report.failed == 0 => {
+                            submitted.push(
+                                self.mission_schedules
+                                    .mark_submitted(&fire.fire_id, graph.id)?,
+                            );
+                        }
+                        Ok(report) => failed.push(self.mission_schedules.mark_failed(
+                            &fire.fire_id,
+                            format!(
+                                "SessionDispatch graph completed with {} failed nodes",
+                                report.failed
+                            ),
+                        )?),
+                        Err(error) => failed.push(self.mission_schedules.mark_failed(
+                            &fire.fire_id,
+                            format!("SessionDispatch graph submission failed: {error}"),
+                        )?),
+                    }
+                }
+                crate::MissionInterpretedCommand::Blocked { reason } => {
+                    failed.push(self.mission_schedules.mark_failed(&fire.fire_id, reason)?);
+                }
+            }
+        }
+        Ok(crate::MissionScheduleDispatchReport {
+            kind: "runtime.mission_schedule_dispatch".to_string(),
+            tick,
+            submitted,
+            failed,
+        })
+    }
+
     pub fn mission_runtime(&self) -> &Arc<MissionRuntime> {
         &self.mission_runtime
+    }
+    pub fn mission_schedules(&self) -> &Arc<MissionScheduleStore> {
+        &self.mission_schedules
+    }
+    #[must_use]
+    pub fn mission_schedule_policy(&self) -> crate::MissionSchedulePolicy {
+        self.mission_schedule_policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+    pub fn update_mission_schedule_policy(
+        &self,
+        policy: crate::MissionSchedulePolicy,
+    ) -> Result<(), String> {
+        policy.validate()?;
+        *self
+            .mission_schedule_policy
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = policy;
+        Ok(())
     }
     pub fn session_relations(&self) -> &Arc<SessionRelationGraph> {
         &self.session_relations
@@ -610,6 +879,16 @@ impl RuntimeServices {
     }
     pub fn session_input_router(&self) -> Option<&Arc<SessionInputRouter>> {
         self.session_input_router.get()
+    }
+
+    /// Return the workspace's canonical Session authority when it is
+    /// installed. In-process agents use this exact store for durable raw
+    /// evidence; they never create a second session database.
+    #[must_use]
+    pub fn session_store(&self) -> Option<Arc<memory::UnifiedSessionStore>> {
+        self.session_input_router
+            .get()
+            .map(|router| router.session_store())
     }
 }
 
@@ -747,6 +1026,8 @@ mod tests {
     use harness_contract::execution_graph::{
         ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec, ExecutionNodeStatus,
     };
+    use harness_contract::mission::ScheduleTrigger;
+    use memory::SessionRecord;
 
     struct TestExecutionHost;
 
@@ -964,13 +1245,13 @@ mod tests {
         let left = RuntimeServices::builder(temp.path(), temp.path().join("left"))
             .provider_registry(Arc::clone(&left_provider))
             .tool_execution_host(Arc::clone(&left_tool))
-            .session_store(left_store)
+            .session_store(Arc::clone(&left_store))
             .build()
             .unwrap();
         let right = RuntimeServices::builder(temp.path(), temp.path().join("right"))
             .provider_registry(Arc::clone(&right_provider))
             .tool_execution_host(Arc::clone(&right_tool))
-            .session_store(right_store)
+            .session_store(Arc::clone(&right_store))
             .build()
             .unwrap();
 
@@ -993,6 +1274,97 @@ mod tests {
             left.session_input_router().unwrap(),
             right.session_input_router().unwrap()
         ));
+        assert!(Arc::ptr_eq(
+            &left.session_store().expect("left session store"),
+            &left_store
+        ));
+        assert!(Arc::ptr_eq(
+            &right.session_store().expect("right session store"),
+            &right_store
+        ));
+    }
+
+    #[tokio::test]
+    async fn due_schedule_submits_one_durable_handoff_graph_and_never_duplicates_it() {
+        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        store
+            .create_session(&SessionRecord {
+                session_id: "scheduled-target".to_string(),
+                platform: "test".to_string(),
+                chat_id: "scheduled-chat".to_string(),
+                user_id: None,
+                model: None,
+                created_at: timestamp.clone(),
+                last_activity: timestamp,
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .unwrap();
+        let services = RuntimeServices::in_memory().unwrap();
+        services.install_session_store(Arc::clone(&store)).unwrap();
+        let due_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        services
+            .mission_schedules()
+            .create(
+                crate::CreateMissionScheduleRequest {
+                    mission_id: "schedule-mission".to_string(),
+                    target_session_id: "scheduled-target".to_string(),
+                    objective: "check the durable schedule path".to_string(),
+                    trigger: ScheduleTrigger::At { at_ms: due_at_ms },
+                    autonomy_profile: "assisted".to_string(),
+                    permission_lease: "read_only".to_string(),
+                    priority: 64,
+                },
+                due_at_ms,
+            )
+            .unwrap();
+
+        let first = services
+            .dispatch_due_mission_schedules(due_at_ms)
+            .await
+            .unwrap();
+        assert_eq!(first.tick.claimed.len(), 1);
+        assert_eq!(first.submitted.len(), 1);
+        assert!(first.failed.is_empty());
+        let graph_id = first.submitted[0]
+            .graph_id
+            .clone()
+            .expect("stable graph id");
+        let graph = services.graph_state_store().load(&graph_id).unwrap();
+        assert!(graph
+            .node_statuses
+            .values()
+            .all(|status| *status == ExecutionNodeStatus::WaitingExternal));
+
+        let target_outbox = store
+            .claim_session_runtime_outbox(
+                "schedule-test",
+                due_at_ms.saturating_add(5_000),
+                1_000,
+                8,
+            )
+            .await
+            .unwrap();
+        assert_eq!(target_outbox.len(), 1);
+        assert_eq!(target_outbox[0].session_id, "scheduled-target");
+
+        let second = services
+            .dispatch_due_mission_schedules(due_at_ms.saturating_add(1))
+            .await
+            .unwrap();
+        assert!(second.tick.claimed.is_empty());
+        assert!(second.submitted.is_empty());
+        assert!(second.failed.is_empty());
     }
 
     #[tokio::test]

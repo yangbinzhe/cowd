@@ -121,7 +121,7 @@ fn understanding_with_action_signal(
             understanding.uncertainty = understanding.uncertainty.max(6);
             promote_complexity(&mut understanding, TaskComplexity::Complex);
         }
-        Action::RequestBackgroundReview | Action::RequestSessionLink => {
+        Action::RequestBackgroundReview | Action::DispatchSession => {
             understanding.requests_background = true;
             understanding.estimated_duration = TaskDuration::LongRunning;
             promote_complexity(&mut understanding, TaskComplexity::Complex);
@@ -170,7 +170,7 @@ fn strategy_proposal_from_request(
         }
         Action::RequestDeliberation => ExecutionPattern::Deliberate,
         Action::RequestTeam => ExecutionPattern::Collaborate,
-        Action::RequestBackgroundReview | Action::RequestSessionLink => ExecutionPattern::Supervise,
+        Action::RequestBackgroundReview | Action::DispatchSession => ExecutionPattern::Supervise,
         Action::RequestRiskGate => ExecutionPattern::Execute,
     };
     let mut modifiers = Vec::new();

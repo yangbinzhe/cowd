@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -120,6 +120,61 @@ struct PostCommitExecutor {
     invalid_domain_event: bool,
 }
 
+struct BlockingPostCommitExecutor {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+/// Executes a nested graph from a parent node. Runtime orchestration uses the
+/// same pattern through ToolBatch, so this protects the Runner from holding
+/// its coordination gate across re-entrant executor work.
+struct ReentrantRunnerExecutor {
+    runner: OnceLock<ExecutionGraphRunner>,
+}
+
+#[async_trait]
+impl NodeExecutor for ReentrantRunnerExecutor {
+    fn kind(&self) -> &str {
+        "reentrant_runner"
+    }
+
+    fn validate(&self, _node: &ExecutionNodeSpec) -> Result<(), NodeExecutorError> {
+        Ok(())
+    }
+
+    async fn start(
+        &self,
+        context: NodeExecutionContext,
+    ) -> Result<NodeExecutionTicket, NodeExecutorError> {
+        Ok(NodeExecutionTicket {
+            graph_id: context.graph.id.clone(),
+            node_id: context.node.id.clone(),
+            executor_kind: self.kind().to_string(),
+            attempt: context.attempt,
+            idempotency_key: format!("{}:reentrant", context.node.idempotency_key),
+            payload_ref: context.node.payload_ref.clone(),
+        })
+    }
+
+    async fn poll_or_await(
+        &self,
+        ticket: &NodeExecutionTicket,
+    ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+        let runner = self
+            .runner
+            .get()
+            .expect("runner is installed for reentrant executor");
+        runner
+            .start(ExecutionGraph::new("nested execution from tool-like node"))
+            .await
+            .map_err(|error| NodeExecutorError::Poll {
+                node_id: ticket.node_id.clone(),
+                reason: error.to_string(),
+            })?;
+        Ok(NodeExecutionOutcome::new(completed_result(&ticket.node_id)))
+    }
+}
+
 struct PayloadScopedBackend {
     calls: Arc<AtomicUsize>,
 }
@@ -182,7 +237,7 @@ impl NodeExecutor for PostCommitExecutor {
                 .push(crate::runtime_event_store::RuntimeTransactionEventInput {
                     event: crate::RuntimeEventInput {
                         stream_id: format!("side-effect:{}", ticket.node_id),
-                        scope: crate::RuntimeEventScope::SessionCommand,
+                        scope: crate::RuntimeEventScope::SessionInput,
                         kind: "test.side_effect".to_string(),
                         status: None,
                         actor: None,
@@ -198,6 +253,58 @@ impl NodeExecutor for PostCommitExecutor {
 
     async fn after_commit(&self, _ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
         self.after_commits.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl NodeExecutor for BlockingPostCommitExecutor {
+    fn kind(&self) -> &str {
+        "blocking_post_commit"
+    }
+
+    fn validate(&self, _node: &ExecutionNodeSpec) -> Result<(), NodeExecutorError> {
+        Ok(())
+    }
+
+    async fn start(
+        &self,
+        context: NodeExecutionContext,
+    ) -> Result<NodeExecutionTicket, NodeExecutorError> {
+        Ok(NodeExecutionTicket {
+            graph_id: context.graph.id.clone(),
+            node_id: context.node.id.clone(),
+            executor_kind: self.kind().to_string(),
+            attempt: context.attempt,
+            idempotency_key: context.node.idempotency_key,
+            payload_ref: context.node.payload_ref,
+        })
+    }
+
+    async fn poll_or_await(
+        &self,
+        ticket: &NodeExecutionTicket,
+    ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+        let mut successor = node("successor");
+        successor.executor_kind = "test".to_string();
+        Ok(
+            NodeExecutionOutcome::new(completed_result(&ticket.node_id)).with_replan(
+                ExecutionGraphReplan {
+                    nodes: vec![successor.clone()],
+                    edges: vec![ExecutionEdge {
+                        from: ticket.node_id.clone(),
+                        to: successor.id,
+                        kind: ExecutionEdgeKind::DependsOn,
+                    }],
+                    reason: "post-commit coordination regression".to_string(),
+                },
+            ),
+        )
+    }
+
+    async fn after_commit(&self, _ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
+        self.entered.notify_one();
+        self.release.notified().await;
         Ok(())
     }
 }
@@ -509,7 +616,7 @@ fn completed_result(id: &str) -> ExecutionNodeResult {
 }
 
 #[test]
-fn compiler_exposes_only_v3_available_targets() {
+fn compiler_exposes_the_three_canonical_bootstrap_targets() {
     let compiler = ExecutionGraphCompiler;
     for target in [
         RuntimeCompileTarget::InlineModel,
@@ -525,21 +632,6 @@ fn compiler_exposes_only_v3_available_targets() {
             })
             .expect("available target");
         assert!(!graph.nodes.is_empty());
-    }
-    for target in [
-        RuntimeCompileTarget::DeliberationGraph,
-        RuntimeCompileTarget::TeamGraph,
-        RuntimeCompileTarget::MissionGraph,
-    ] {
-        assert!(matches!(
-            compiler.compile(ExecutionCompileRequest {
-                objective: "future".to_string(),
-                payload_ref: "payload:turn".to_string(),
-                target,
-                resource_scopes: Vec::new(),
-            }),
-            Err(ExecutionCompileError::CapabilityUnavailable { .. })
-        ));
     }
 }
 
@@ -913,6 +1005,33 @@ async fn execution_graph_host_submits_and_projects_the_same_runner_graph() {
         ExecutionNodeStatus::Completed
     );
     assert_eq!(receipt.run.expect("run report").completed, 1);
+}
+
+#[tokio::test]
+async fn nested_graph_submission_from_executor_never_deadlocks_runner_coordination() {
+    let (registry, state, commits) = harness();
+    let executor = Arc::new(ReentrantRunnerExecutor {
+        runner: OnceLock::new(),
+    });
+    registry.register(executor.clone()).unwrap();
+    let runner = test_runner(registry, state.clone(), commits);
+    assert!(executor.runner.set(runner.clone()).is_ok());
+    let mut graph = ExecutionGraph::new("parent submits nested graph");
+    let mut node = node("orchestrate");
+    node.executor_kind = "reentrant_runner".to_string();
+    graph.nodes.push(node);
+    let graph_id = graph.id.clone();
+
+    let report = tokio::time::timeout(Duration::from_secs(1), runner.start(graph))
+        .await
+        .expect("nested graph submission must not wait on the parent coordination lock")
+        .expect("parent graph completes");
+
+    assert_eq!(report.completed, 1);
+    assert_eq!(
+        state.load(&graph_id).unwrap().node_statuses["orchestrate"],
+        ExecutionNodeStatus::Completed
+    );
 }
 
 #[tokio::test]
@@ -1444,6 +1563,128 @@ async fn process_side_effect_hook_runs_only_after_graph_commit() {
             expected_after_commits
         );
     }
+}
+
+#[tokio::test]
+async fn post_commit_callback_never_holds_graph_coordination_lock() {
+    let (registry, state, commits) = harness();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    registry
+        .register(Arc::new(BlockingPostCommitExecutor {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }))
+        .unwrap();
+    registry
+        .register(Arc::new(TestExecutor::new(
+            Vec::new(),
+            Duration::from_millis(1),
+        )))
+        .unwrap();
+    let runner = Arc::new(test_runner(registry, state.clone(), commits));
+    let mut graph = ExecutionGraph::new("post commit coordination");
+    let mut root = node("root");
+    root.executor_kind = "blocking_post_commit".to_string();
+    graph.nodes.push(root);
+    let graph_id = graph.id.clone();
+    let run = {
+        let runner = Arc::clone(&runner);
+        tokio::spawn(async move { runner.start(graph).await })
+    };
+
+    entered.notified().await;
+    let revision = state.load(&graph_id).unwrap().revision;
+    let command = runner.command(
+        &graph_id,
+        ExecutionGraphCommand::Pause {
+            expected_revision: revision,
+            reason: "exercise coordination while callback is pending".to_string(),
+        },
+    );
+    let paused = tokio::time::timeout(Duration::from_millis(100), command)
+        .await
+        .expect("post-commit callback must not block graph command coordination")
+        .expect("pause should commit while callback remains pending");
+    assert!(paused.revision > revision);
+
+    release.notify_one();
+    let report = run.await.unwrap().unwrap();
+    assert!(report.completed >= 1);
+    assert!(state
+        .load(&graph_id)
+        .unwrap()
+        .node_statuses
+        .contains_key("successor"));
+}
+
+#[tokio::test]
+async fn workspace_root_scope_is_a_valid_hierarchical_lock_scope() {
+    let (registry, state, commits) = harness();
+    registry
+        .register(Arc::new(TestExecutor::new(
+            Vec::new(),
+            Duration::from_millis(1),
+        )))
+        .unwrap();
+    let runner = test_runner(registry, state, commits);
+    let mut graph = ExecutionGraph::new("workspace root scope");
+    let mut root = node("root");
+    root.resource_scopes = vec!["read:.".to_string()];
+    graph.nodes.push(root);
+
+    let report = runner.start(graph).await.unwrap();
+    assert_eq!(report.completed, 1);
+    assert_eq!(report.failed, 0);
+}
+
+#[tokio::test]
+async fn workspace_absolute_scope_is_normalized_before_locking() {
+    let (registry, state, commits) = harness();
+    registry
+        .register(Arc::new(TestExecutor::new(
+            Vec::new(),
+            Duration::from_millis(1),
+        )))
+        .unwrap();
+    let runner = test_runner(registry, state, commits);
+    let mut graph = ExecutionGraph::new("workspace absolute scope");
+    let mut root = node("root");
+    root.resource_scopes = vec![format!(
+        "read:{}",
+        std::env::temp_dir().join("Cargo.toml").display()
+    )];
+    graph.nodes.push(root);
+
+    let report = runner.start(graph).await.unwrap();
+    assert_eq!(report.completed, 1);
+    assert_eq!(report.blocked, 0);
+}
+
+#[tokio::test]
+async fn invalid_resource_scope_becomes_a_durable_node_blocker() {
+    let (registry, state, commits) = harness();
+    registry
+        .register(Arc::new(TestExecutor::new(
+            Vec::new(),
+            Duration::from_millis(1),
+        )))
+        .unwrap();
+    let runner = test_runner(registry, state.clone(), commits);
+    let mut graph = ExecutionGraph::new("invalid resource scope");
+    let mut root = node("root");
+    root.resource_scopes = vec!["read:/outside-workspace".to_string()];
+    graph.nodes.push(root);
+    let graph_id = graph.id.clone();
+
+    let report = runner.start(graph).await.unwrap();
+    assert_eq!(report.blocked, 1);
+    let graph = state.load(&graph_id).unwrap();
+    assert_eq!(graph.node_statuses["root"], ExecutionNodeStatus::Blocked);
+    assert_eq!(
+        graph.node_results["root"].failure.as_ref().unwrap().kind,
+        "resource_acquisition_failed"
+    );
 }
 
 async fn run_verify_graph(evidence_id: Option<&str>, required: &str) -> (ExecutionGraph, usize) {

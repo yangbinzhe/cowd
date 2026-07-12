@@ -373,6 +373,38 @@ async fn apply_runtime_config(
         .get("mcp")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({"status": "unavailable"}));
+    let mission_schedule_report = if let Some(runtime) = state.services.runtime.as_ref() {
+        match runtime.runtime_services().update_mission_schedule_policy(
+            runtime_config
+                .runtime_control()
+                .policy
+                .mission_schedule
+                .clone(),
+        ) {
+            Ok(()) => serde_json::json!({
+                "status": "applied",
+                "policy": runtime.runtime_services().mission_schedule_policy(),
+            }),
+            Err(error) => {
+                return serde_json::json!({
+                    "kind": "gateway.config.reload",
+                    "status": "invalid",
+                    "applied": false,
+                    "trigger": trigger,
+                    "fingerprint": fingerprint.digest,
+                    "applied_sections": {
+                        "providers": provider_report,
+                        "tool_host": tool_host_report,
+                        "mcp": mcp_report,
+                    },
+                    "restart_required": { "required": false, "fields": [] },
+                    "warnings": [format!("mission schedule policy was rejected: {error}")],
+                });
+            }
+        }
+    } else {
+        serde_json::json!({"status": "unavailable"})
+    };
 
     let surface_configs = build_surface_runtime_configs(runtime_config.gateway());
     let surface_config_count = surface_configs.len();
@@ -430,6 +462,7 @@ async fn apply_runtime_config(
             "providers": provider_report,
             "tool_host": tool_host_report,
             "mcp": mcp_report,
+            "mission_schedule": mission_schedule_report,
             "surface_runtime_configs": {
                 "status": "applied",
                 "count": surface_config_count,

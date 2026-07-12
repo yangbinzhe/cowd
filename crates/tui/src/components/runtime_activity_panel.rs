@@ -64,6 +64,7 @@ pub struct RuntimeActivityPanel {
     execution_graph_graph_id: String,
     execution_graph_board_id: String,
     execution_graph_agent_tasks: usize,
+    execution_graph_children: usize,
     execution_graph_candidates: usize,
     execution_graph_conflicts: usize,
     execution_graph_completion_pct: String,
@@ -244,6 +245,7 @@ impl RuntimeActivityPanel {
                 .map(short_id)
                 .unwrap_or_else(|| "n/a".to_string());
             self.execution_graph_agent_tasks = summary.agent_tasks;
+            self.execution_graph_children = summary.child_executions;
             self.execution_graph_candidates = summary.memory_candidates;
             self.execution_graph_conflicts = summary.conflicts;
             self.execution_graph_completion_pct = summary
@@ -255,6 +257,7 @@ impl RuntimeActivityPanel {
             self.execution_graph_graph_id = "n/a".to_string();
             self.execution_graph_board_id = "n/a".to_string();
             self.execution_graph_agent_tasks = 0;
+            self.execution_graph_children = 0;
             self.execution_graph_candidates = 0;
             self.execution_graph_conflicts = 0;
             self.execution_graph_completion_pct = "n/a".to_string();
@@ -470,10 +473,11 @@ impl Component for RuntimeActivityPanel {
                 Span::styled("Graph:", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     format!(
-                        "{} {} agents {}",
+                        "{} {} agents {} children {}",
                         self.execution_graph_status,
                         self.execution_graph_completion_pct,
-                        self.execution_graph_agent_tasks
+                        self.execution_graph_agent_tasks,
+                        self.execution_graph_children
                     ),
                     Style::default().fg(if self.execution_graph_status == "completed" {
                         Color::Green
@@ -757,6 +761,7 @@ mod tests {
                 board_id: Some("board-run".to_string()),
                 status: "completed".to_string(),
                 agent_tasks: 2,
+                child_executions: 0,
                 memory_candidates: 1,
                 conflicts: 1,
                 completion_rate: Some(1.0),

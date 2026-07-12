@@ -11,7 +11,7 @@ pub fn runtime_orchestration_actions() -> Vec<&'static str> {
         "request_reflexion_retry",
         "request_background_review",
         "request_risk_gate",
-        "request_session_link",
+        "dispatch_session",
     ]
 }
 

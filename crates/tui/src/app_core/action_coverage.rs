@@ -188,35 +188,11 @@ const REQUIRED_ACTIONS: &[TuiActionCoverage] = &[
         receipt_marker: "AgentTeamPanel",
     },
     TuiActionCoverage {
-        action_id: "mission.session_command.consume",
-        gateway_route: "/api/mission/sessions/:id/inbox/:command_id/consume",
-        client_method: "consume_mission_session_command",
-        panel_key: "c consume",
-        state_dispatch: "consume_mission_session_command",
-        receipt_marker: "GatewayPanel",
-    },
-    TuiActionCoverage {
-        action_id: "mission.session_command.cancel",
-        gateway_route: "/api/mission/sessions/:id/inbox/:command_id/cancel",
-        client_method: "cancel_mission_session_command",
-        panel_key: "C cancel",
-        state_dispatch: "cancel_mission_session_command",
-        receipt_marker: "GatewayPanel",
-    },
-    TuiActionCoverage {
-        action_id: "mission.session_command.retry",
-        gateway_route: "/api/mission/sessions/:id/inbox/:command_id/retry",
-        client_method: "retry_mission_session_command",
-        panel_key: "y retry",
-        state_dispatch: "retry_mission_session_command",
-        receipt_marker: "GatewayPanel",
-    },
-    TuiActionCoverage {
-        action_id: "mission.team.tick",
-        gateway_route: "/api/mission/control/stewards/scheduler",
-        client_method: "tick_mission_steward_scheduler",
-        panel_key: "t steward tick",
-        state_dispatch: "tick_mission_steward_scheduler",
+        action_id: "mission.schedule.tick",
+        gateway_route: "/api/mission/schedules/tick",
+        client_method: "tick_mission_schedules",
+        panel_key: "t schedule tick",
+        state_dispatch: "tick_mission_schedules",
         receipt_marker: "GatewayPanel",
     },
     TuiActionCoverage {
@@ -282,7 +258,6 @@ mod tests {
         assert!(ids.contains(&"surface.messages.purge_archived_events"));
         assert!(ids.contains(&"skill.validate"));
         assert!(ids.contains(&"skill.run"));
-        assert!(ids.contains(&"mission.session_command.consume"));
         assert!(ids.contains(&"agent.interrupt"));
         assert!(ids.contains(&"harness_eval.run_smoke"));
         assert!(ids.contains(&"evolution.overview"));

@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use super::{ExecutionGraph, ExecutionNodeKind, ExecutionNodeStatus};
+use super::{
+    ExecutionGraph, ExecutionNodeKind, ExecutionNodeStatus, ExecutionParentBinding, ExecutionUsage,
+};
 use crate::context::EvidenceAccessRef;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -11,6 +13,11 @@ pub struct ExecutionNodeProjection {
     pub executor_kind: String,
     pub result_ref: Option<String>,
     pub evidence_refs: Vec<EvidenceAccessRef>,
+    /// Canonical node-level usage. Keeping it on the projection makes
+    /// execution metrics traceable across nested graphs without asking a
+    /// surface to infer cost from prose timeline events.
+    #[serde(default)]
+    pub usage: ExecutionUsage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,6 +25,8 @@ pub struct ExecutionGraphProjection {
     pub graph_id: String,
     pub revision: u64,
     pub objective: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_execution: Option<ExecutionParentBinding>,
     pub nodes: Vec<ExecutionNodeProjection>,
     pub commit_cursor: u64,
     pub terminal_result_ref: Option<String>,
@@ -29,6 +38,7 @@ pub fn project_execution_graph(graph: &ExecutionGraph) -> ExecutionGraphProjecti
         graph_id: graph.id.clone(),
         revision: graph.revision,
         objective: graph.objective.clone(),
+        parent_execution: graph.parent_execution.clone(),
         nodes: graph
             .nodes
             .iter()
@@ -47,6 +57,7 @@ pub fn project_execution_graph(graph: &ExecutionGraph) -> ExecutionGraphProjecti
                     evidence_refs: result
                         .map(|value| value.evidence_refs.clone())
                         .unwrap_or_default(),
+                    usage: result.map(|value| value.usage.clone()).unwrap_or_default(),
                 }
             })
             .collect(),

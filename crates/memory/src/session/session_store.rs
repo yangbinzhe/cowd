@@ -29,8 +29,9 @@ use tokio::sync::Mutex;
 use crate::runtime_event::{SessionDomainEvent, SessionDomainEventPage, SESSION_DOMAIN_EVENT_TYPE};
 use crate::store::session::{
     OutboxFailureClass, SessionEvent, SessionListOptions, SessionListPage, SessionMessage,
-    SessionRecord, SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord,
-    SessionRuntimeOutboxRequest, SessionSearchResult, SessionSnapshot, SqliteSessionStore,
+    SessionMissionOutboxRecord, SessionMissionOutboxRequest, SessionRecord,
+    SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest,
+    SessionSearchResult, SessionSnapshot, SqliteSessionStore,
 };
 use crate::store::Result;
 
@@ -129,9 +130,33 @@ impl UnifiedSessionStore {
         self.inner.lock().await.upsert_session(session)
     }
 
+    /// Atomically persist a Session record and its durable Mission lifecycle
+    /// intent. The Gateway bridge later materializes this into RuntimeEventStore.
+    pub async fn upsert_session_with_mission_outbox(
+        &self,
+        session: &SessionRecord,
+        request: &SessionMissionOutboxRequest,
+    ) -> Result<SessionMissionOutboxRecord> {
+        self.inner
+            .lock()
+            .await
+            .upsert_session_with_mission_outbox(session, request)
+    }
+
     /// Permanently remove a session and all its memory associations.
     pub async fn delete_session(&self, session_id: &str) -> Result<()> {
         self.inner.lock().await.delete_session(session_id)
+    }
+
+    /// Atomically delete a Session and queue the matching Mission close intent.
+    pub async fn delete_session_with_mission_outbox(
+        &self,
+        request: &SessionMissionOutboxRequest,
+    ) -> Result<bool> {
+        self.inner
+            .lock()
+            .await
+            .delete_session_with_mission_outbox(request)
     }
 
     /// Mark a session as closed.
@@ -667,6 +692,72 @@ impl UnifiedSessionStore {
             .lock()
             .await
             .blocked_session_runtime_outbox(limit)
+    }
+
+    pub async fn claim_session_mission_outbox(
+        &self,
+        workspace_key: &str,
+        worker_id: &str,
+        now_ms: u64,
+        lease_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<SessionMissionOutboxRecord>> {
+        self.inner.lock().await.claim_session_mission_outbox(
+            workspace_key,
+            worker_id,
+            now_ms,
+            lease_ms,
+            limit,
+        )
+    }
+
+    pub async fn ack_session_mission_outbox(
+        &self,
+        request_id: &str,
+        worker_id: &str,
+        expected_revision: u64,
+        now_ms: u64,
+    ) -> Result<SessionMissionOutboxRecord> {
+        self.inner.lock().await.ack_session_mission_outbox(
+            request_id,
+            worker_id,
+            expected_revision,
+            now_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fail_session_mission_outbox(
+        &self,
+        request_id: &str,
+        worker_id: &str,
+        expected_revision: u64,
+        failure_class: OutboxFailureClass,
+        error: &str,
+        retry_at_ms: u64,
+        max_attempts: u32,
+        now_ms: u64,
+    ) -> Result<SessionMissionOutboxRecord> {
+        self.inner.lock().await.fail_session_mission_outbox(
+            request_id,
+            worker_id,
+            expected_revision,
+            failure_class,
+            error,
+            retry_at_ms,
+            max_attempts,
+            now_ms,
+        )
+    }
+
+    pub async fn get_session_mission_outbox(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<SessionMissionOutboxRecord>> {
+        self.inner
+            .lock()
+            .await
+            .get_session_mission_outbox(request_id)
     }
 
     /// Retrieve messages for a session with pagination.

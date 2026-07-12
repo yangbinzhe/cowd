@@ -360,8 +360,11 @@ impl AgentTeamPanel {
                 Span::styled(summary.status.clone(), Style::default().fg(Color::Yellow)),
                 Span::styled(
                     format!(
-                        "  tasks {} memory {} conflicts {}",
-                        summary.agent_tasks, summary.memory_candidates, summary.conflicts
+                        "  tasks {} children {} memory {} conflicts {}",
+                        summary.agent_tasks,
+                        summary.child_executions,
+                        summary.memory_candidates,
+                        summary.conflicts
                     ),
                     Style::default().fg(Color::DarkGray),
                 ),
@@ -1166,6 +1169,7 @@ mod tests {
             board_id: Some("board-1".to_string()),
             status: "running".to_string(),
             agent_tasks: 3,
+            child_executions: 0,
             memory_candidates: 2,
             conflicts: 1,
             completion_rate: Some(0.5),
@@ -1185,7 +1189,10 @@ mod tests {
         let lines = render_panel(&mut panel, 92, 20);
         let joined = lines.join("\n");
         assert!(joined.contains("Execution graph:"), "{joined}");
-        assert!(joined.contains("tasks 3 memory 2 conflicts 1"), "{joined}");
+        assert!(
+            joined.contains("tasks 3 children 0 memory 2 conflicts 1"),
+            "{joined}"
+        );
         assert!(joined.contains("lift 1.25"), "{joined}");
         assert!(joined.contains("Delegates:"), "{joined}");
         assert!(

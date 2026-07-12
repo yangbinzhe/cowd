@@ -8,6 +8,7 @@
 pub mod cross_plane;
 pub mod deliberation;
 pub mod evidence;
+pub mod goal;
 pub mod graph;
 pub mod model_affordance;
 pub mod orchestration_binding;
@@ -16,6 +17,7 @@ pub mod protocols;
 pub mod reflexion;
 pub mod report;
 pub mod rewoo_plan;
+pub mod safety_fuse;
 pub mod services;
 pub mod strategy_decision;
 pub mod tool_dag;
@@ -23,6 +25,7 @@ pub mod tool_dag;
 pub use cross_plane::{CrossPlaneRuntimeError, CrossPlaneRuntimeService};
 pub use deliberation::{DeliberationMode, DeliberationPlan};
 pub use evidence::RuntimeEvidenceSummary;
+pub use goal::{policy::InterventionPolicy, GoalProjection, GoalStore};
 pub use graph::{
     ExecutionCommitService, ExecutionCompileError, ExecutionCompileRequest, ExecutionGraphCompiler,
     ExecutionGraphHost, ExecutionGraphHostReceipt, ExecutionGraphReplan, ExecutionGraphRunner,
@@ -52,6 +55,9 @@ pub use report::RuntimeExecutionReportSpec;
 pub use rewoo_plan::{
     rewoo_plan_for_intent, rewoo_plan_for_intent_with_evidence_plan, RewooEvidencePlan,
     RewooEvidenceResult, RewooEvidenceStep, RewooObservation, RewooSolverContract,
+};
+pub use safety_fuse::{
+    ExecutionBudgetLease, SafetyFuseDecision, SafetyFusePolicy, SafetyFuseSignals,
 };
 pub use services::{
     ExecutionStartupRecoveryError, ExecutionStartupRecoveryRecord, ExecutionStartupRecoveryReport,

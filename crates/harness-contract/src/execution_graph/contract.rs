@@ -139,6 +139,11 @@ pub struct ExecutionFailure {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionUsage {
+    /// The provider model that actually produced this node result. This is
+    /// distinct from a requested model because Runtime may use a configured
+    /// fallback before any provider output is emitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
@@ -162,11 +167,22 @@ pub struct ExecutionRecoveryCursor {
     pub node_attempts: BTreeMap<String, u32>,
 }
 
+/// Durable lineage from a nested execution back to the graph node that
+/// requested it. This is runtime-owned metadata: model tool JSON must never
+/// be trusted to populate it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionParentBinding {
+    pub execution_id: String,
+    pub node_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionGraph {
     pub id: String,
     pub revision: u64,
     pub objective: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_execution: Option<ExecutionParentBinding>,
     pub nodes: Vec<ExecutionNodeSpec>,
     pub edges: Vec<ExecutionEdge>,
     pub node_statuses: BTreeMap<String, ExecutionNodeStatus>,
@@ -181,6 +197,7 @@ impl ExecutionGraph {
             id: format!("execution-graph-{}", uuid::Uuid::new_v4()),
             revision: 0,
             objective: objective.into(),
+            parent_execution: None,
             nodes: Vec::new(),
             edges: Vec::new(),
             node_statuses: BTreeMap::new(),
@@ -215,6 +232,14 @@ pub enum ExecutionGraphCommand {
         node_id: String,
         approved: bool,
         decision_ref: String,
+    },
+    /// Resolve a node that is waiting on a durable external result. The
+    /// command keeps the transition revision-checked and auditable.
+    ResolveExternal {
+        expected_revision: u64,
+        node_id: String,
+        result_ref: String,
+        correlation_id: String,
     },
     Replan {
         expected_revision: u64,

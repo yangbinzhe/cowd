@@ -564,7 +564,7 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
         RuntimeToolDefinition {
             name: "runtime_orchestrate".to_string(),
             description: Some(
-                "Submit a controlled stateful runtime orchestration request. Executable lifecycle actions create runtime-owned team/subagent/verification/background/session receipts; deliberation/reflexion return strategy packets; risk_gate returns an approval packet. Use runtime_capabilities for read-only planning first.".to_string(),
+                "Submit a controlled stateful runtime orchestration request. Executable lifecycle actions create runtime-owned graph receipts; dispatch_session creates a typed cross-session handoff graph. Deliberation/reflexion return strategy packets; risk_gate returns an approval packet. Use runtime_capabilities for read-only planning first.".to_string(),
             ),
             input_schema: json!({
                 "type": "object",
@@ -574,9 +574,13 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
                         "type": "string",
                         "description": "Optional in gateway/API sessions because Cowd auto-binds the active session_id. Required only for detached/offline runtime_orchestrate calls."
                     },
+                    "target_session_id": {
+                        "type": "string",
+                        "description": "Required only for dispatch_session; the source is session_id."
+                    },
                     "action": {
                         "type": "string",
-                        "description": "executable_lifecycle: request_team, request_subagent, request_verification, request_background_review, request_session_link; executable_tool_dag: request_parallel_tools, request_rewoo_evidence; strategy_packet: request_deliberation, request_reflexion_retry; approval_packet: request_risk_gate",
+                        "description": "executable_lifecycle: request_team, request_subagent, request_verification, request_background_review, dispatch_session; executable_tool_dag: request_parallel_tools, request_rewoo_evidence; strategy_packet: request_deliberation, request_reflexion_retry; approval_packet: request_risk_gate",
                         "enum": [
                             "plan_only",
                             "request_team",
@@ -588,7 +592,7 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
                             "request_reflexion_retry",
                             "request_background_review",
                             "request_risk_gate",
-                            "request_session_link"
+                            "dispatch_session"
                         ]
                     },
                     "reason": { "type": "string" },

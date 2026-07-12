@@ -6,7 +6,10 @@ use std::{
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
-use super::route_manifest::{gateway_route_manifest, GatewayRouteManifestEntry};
+use super::{
+    route_manifest::{gateway_route_manifest, GatewayRouteManifestEntry},
+    route_registry::stable_route_metadata,
+};
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct GatewayCapabilityContract {
@@ -155,7 +158,17 @@ pub(crate) fn gateway_openapi_document() -> Value {
                         "error": {"type": "string"}
                     },
                     "required": ["error"]
-                }
+                },
+                "ExecutionProjectionEntity": execution_projection_entity_schema(),
+                "ExecutionNodeProjection": execution_node_projection_schema(),
+                "ExecutionParentBinding": execution_parent_binding_schema(),
+                "ExecutionGraphProjection": execution_graph_projection_schema(),
+                "ChildExecutionProjection": child_execution_projection_schema(),
+                "ExecutionProjection": execution_projection_schema(),
+                "ProjectionEvent": projection_event_schema(),
+                "ProjectionDelta": projection_delta_schema(),
+                "ExecutionCommandRequest": execution_command_request_schema(),
+                "ExecutionCommandReceipt": execution_command_receipt_schema()
             }
         },
         "paths": Value::Object(paths),
@@ -700,9 +713,14 @@ fn openapi_path(path: &str) -> String {
 
 fn openapi_operation(capability: &GatewayCapability) -> Value {
     let mut operation = Map::new();
+    let stable_metadata = stable_route_metadata(&capability.http.method, &capability.http.path);
     operation.insert(
         "operationId".to_string(),
-        Value::String(openapi_operation_id(&capability.id)),
+        Value::String(
+            stable_metadata
+                .map(|metadata| metadata.operation_id.to_string())
+                .unwrap_or_else(|| openapi_operation_id(&capability.id)),
+        ),
     );
     operation.insert(
         "summary".to_string(),
@@ -735,12 +753,28 @@ fn openapi_operation(capability: &GatewayCapability) -> Value {
                 "required": false,
                 "content": {
                     "application/json": {
-                        "schema": capability.input_schema
+                        "schema": stable_request_schema(capability).unwrap_or_else(|| capability.input_schema.clone())
                     },
                     "multipart/form-data": {
-                        "schema": capability.input_schema
+                        "schema": stable_request_schema(capability).unwrap_or_else(|| capability.input_schema.clone())
                     }
                 }
+            }),
+        );
+    }
+    let response_schema =
+        stable_response_schema(capability).unwrap_or_else(|| capability.output_schema.clone());
+    let mut content = Map::new();
+    content.insert(
+        "application/json".to_string(),
+        json!({"schema": response_schema}),
+    );
+    if stable_metadata.is_some_and(|metadata| metadata.streaming) {
+        content.insert(
+            "text/event-stream".to_string(),
+            json!({
+                "schema": {"type": "string", "format": "event-stream"},
+                "x-cowd-event-schema": {"$ref": "#/components/schemas/ProjectionDelta"}
             }),
         );
     }
@@ -749,11 +783,7 @@ fn openapi_operation(capability: &GatewayCapability) -> Value {
         json!({
             "200": {
                 "description": "Successful Gateway response",
-                "content": {
-                    "application/json": {
-                        "schema": capability.output_schema
-                    }
-                }
+                "content": Value::Object(content)
             },
             "400": {"description": "Bad request"},
             "401": {"description": "Unauthorized"},
@@ -773,6 +803,202 @@ fn openapi_operation(capability: &GatewayCapability) -> Value {
         }),
     );
     Value::Object(operation)
+}
+
+fn stable_request_schema(capability: &GatewayCapability) -> Option<Value> {
+    stable_route_metadata(&capability.http.method, &capability.http.path)
+        .and_then(|metadata| metadata.request_schema)
+        .map(|schema| json!({"$ref": format!("#/components/schemas/{schema}")}))
+}
+
+fn stable_response_schema(capability: &GatewayCapability) -> Option<Value> {
+    stable_route_metadata(&capability.http.method, &capability.http.path).map(
+        |metadata| json!({"$ref": format!("#/components/schemas/{}", metadata.response_schema)}),
+    )
+}
+
+fn execution_projection_entity_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["id", "kind", "revision", "evidence_refs"],
+        "properties": {
+            "id": {"type": "string"},
+            "kind": {"type": "string"},
+            "revision": {"type": "integer", "minimum": 0},
+            "status": {"type": ["string", "null"]},
+            "summary": {"type": ["string", "null"]},
+            "evidence_refs": {"type": "array", "items": {"type": "string"}},
+            "detail": {"type": ["object", "array", "string", "number", "boolean", "null"]}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn execution_node_projection_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["node_id", "kind", "status", "executor_kind", "evidence_refs"],
+        "properties": {
+            "node_id": {"type": "string"},
+            "kind": {"type": "string"},
+            "status": {"type": "string"},
+            "executor_kind": {"type": "string"},
+            "result_ref": {"type": ["string", "null"]},
+            "evidence_refs": {"type": "array", "items": {"type": "string"}}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn execution_graph_projection_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["graph_id", "revision", "objective", "nodes", "commit_cursor"],
+        "properties": {
+            "graph_id": {"type": "string"},
+            "revision": {"type": "integer", "minimum": 0},
+            "objective": {"type": "string"},
+            "parent_execution": {"oneOf": [{"$ref": "#/components/schemas/ExecutionParentBinding"}, {"type": "null"}]},
+            "nodes": {"type": "array", "items": {"$ref": "#/components/schemas/ExecutionNodeProjection"}},
+            "commit_cursor": {"type": "integer", "minimum": 0},
+            "terminal_result_ref": {"type": ["string", "null"]}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn execution_parent_binding_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["execution_id", "node_id"],
+        "properties": {
+            "execution_id": {"type": "string"},
+            "node_id": {"type": "string"}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn child_execution_projection_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["execution_id", "parent_execution_id", "parent_node_id", "revision", "cursor", "status", "objective"],
+        "properties": {
+            "execution_id": {"type": "string"},
+            "parent_execution_id": {"type": "string"},
+            "parent_node_id": {"type": "string"},
+            "revision": {"type": "integer", "minimum": 0},
+            "cursor": {"type": "integer", "minimum": 0},
+            "status": {"type": "string"},
+            "objective": {"type": "string"}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn execution_projection_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["schema_version", "execution_id", "revision", "cursor", "graph", "child_executions", "goals", "agents", "teams", "relations", "approvals", "interventions", "usage", "context", "evidence", "health", "recovery", "available_commands"],
+        "properties": {
+            "schema_version": {"type": "integer", "const": 1},
+            "execution_id": {"type": "string"},
+            "revision": {"type": "integer", "minimum": 0},
+            "cursor": {"type": "integer", "minimum": 0},
+            "session_id": {"type": ["string", "null"]},
+            "mission_id": {"type": ["string", "null"]},
+            "strategy": {"oneOf": [{"$ref": "#/components/schemas/ExecutionProjectionEntity"}, {"type": "null"}]},
+            "graph": {"$ref": "#/components/schemas/ExecutionGraphProjection"},
+            "child_executions": {"type": "array", "items": {"$ref": "#/components/schemas/ChildExecutionProjection"}},
+            "goals": projection_entity_list_schema(),
+            "agents": projection_entity_list_schema(),
+            "teams": projection_entity_list_schema(),
+            "relations": projection_entity_list_schema(),
+            "approvals": projection_entity_list_schema(),
+            "interventions": projection_entity_list_schema(),
+            "usage": projection_entity_list_schema(),
+            "context": projection_entity_list_schema(),
+            "evidence": projection_entity_list_schema(),
+            "health": projection_entity_list_schema(),
+            "recovery": projection_entity_list_schema(),
+            "available_commands": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["command", "available"],
+                    "properties": {
+                        "command": {"type": "string", "enum": ["pause", "resume", "cancel", "replan"]},
+                        "available": {"type": "boolean"},
+                        "reason": {"type": ["string", "null"]}
+                    },
+                    "additionalProperties": false
+                }
+            }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn projection_entity_list_schema() -> Value {
+    json!({"type": "array", "items": {"$ref": "#/components/schemas/ExecutionProjectionEntity"}})
+}
+
+fn projection_event_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["commit_cursor", "transaction_index", "event_id", "kind"],
+        "properties": {
+            "commit_cursor": {"type": "integer", "minimum": 0},
+            "transaction_index": {"type": "integer", "minimum": 0},
+            "event_id": {"type": "string"},
+            "kind": {"type": "string"},
+            "entity": {"oneOf": [{"$ref": "#/components/schemas/ExecutionProjectionEntity"}, {"type": "null"}]}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn projection_delta_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["schema_version", "execution_id", "base_cursor", "target_cursor", "events"],
+        "properties": {
+            "schema_version": {"type": "integer", "const": 1},
+            "execution_id": {"type": "string"},
+            "base_cursor": {"type": "integer", "minimum": 0},
+            "target_cursor": {"type": "integer", "minimum": 0},
+            "events": {"type": "array", "items": {"$ref": "#/components/schemas/ProjectionEvent"}}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn execution_command_request_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["command_id", "expected_revision", "command", "payload"],
+        "properties": {
+            "command_id": {"type": "string", "minLength": 1},
+            "expected_revision": {"type": "integer", "minimum": 0},
+            "command": {"type": "string", "enum": ["pause", "resume", "cancel", "replan"]},
+            "payload": {}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn execution_command_receipt_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["command_id", "accepted_revision", "status"],
+        "properties": {
+            "command_id": {"type": "string"},
+            "accepted_revision": {"type": "integer", "minimum": 0},
+            "status": {"type": "string", "enum": ["accepted", "rejected_stale_revision"]},
+            "reason": {"type": ["string", "null"]}
+        },
+        "additionalProperties": false
+    })
 }
 
 fn openapi_parameters(path: &str) -> Vec<Value> {
@@ -860,6 +1086,53 @@ mod tests {
         assert_eq!(
             document["x-cowd-contract"]["route_count"],
             document["x-cowd-contract"]["capability_count"]
+        );
+    }
+
+    #[test]
+    fn execution_projection_openapi_uses_typed_route_schema_metadata() {
+        let document = gateway_openapi_document();
+        let snapshot = &document["paths"]["/api/runtime/executions/{id}"]["get"];
+        assert_eq!(snapshot["operationId"], "runtime_execution_projection_get");
+        assert_eq!(
+            snapshot["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ExecutionProjection"
+        );
+        assert_eq!(
+            document["components"]["schemas"]["ExecutionProjection"]["properties"]
+                ["child_executions"]["items"]["$ref"],
+            "#/components/schemas/ChildExecutionProjection"
+        );
+        assert_eq!(
+            document["components"]["schemas"]["ExecutionGraphProjection"]["properties"]
+                ["parent_execution"]["oneOf"][0]["$ref"],
+            "#/components/schemas/ExecutionParentBinding"
+        );
+
+        let events = &document["paths"]["/api/runtime/executions/{id}/events"]["get"];
+        assert_eq!(events["operationId"], "runtime_execution_projection_events");
+        assert_eq!(
+            events["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ProjectionDelta"
+        );
+        assert_eq!(
+            events["responses"]["200"]["content"]["text/event-stream"]["x-cowd-event-schema"]
+                ["$ref"],
+            "#/components/schemas/ProjectionDelta"
+        );
+
+        let command = &document["paths"]["/api/runtime/executions/{id}/commands"]["post"];
+        assert_eq!(
+            command["operationId"],
+            "runtime_execution_projection_command"
+        );
+        assert_eq!(
+            command["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ExecutionCommandRequest"
+        );
+        assert_eq!(
+            command["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ExecutionCommandReceipt"
         );
     }
 

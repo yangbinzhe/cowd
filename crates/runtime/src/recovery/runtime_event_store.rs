@@ -27,6 +27,10 @@ pub enum RuntimeEventScope {
     Goal,
     Mission,
     Session,
+    SessionInput,
+    /// Historical durable record for a session command dispatch.  These
+    /// records remain replay-only evidence; command execution is now owned by
+    /// the typed SessionInput/ExecutionGraph path.
     SessionCommand,
     Team,
     Agent,
@@ -50,6 +54,7 @@ impl RuntimeEventScope {
             Self::Goal => "goal",
             Self::Mission => "mission",
             Self::Session => "session",
+            Self::SessionInput => "session_input",
             Self::SessionCommand => "session_command",
             Self::Team => "team",
             Self::Agent => "agent",
@@ -72,6 +77,7 @@ impl RuntimeEventScope {
             "goal" => Ok(Self::Goal),
             "mission" => Ok(Self::Mission),
             "session" => Ok(Self::Session),
+            "session_input" => Ok(Self::SessionInput),
             "session_command" => Ok(Self::SessionCommand),
             "team" => Ok(Self::Team),
             "agent" => Ok(Self::Agent),
@@ -462,6 +468,50 @@ impl RuntimeEventStore {
         .map_err(|error| error.to_string())
     }
 
+    /// Resolve the canonical graph streams that produced terminal work for a
+    /// session. The terminal request is the durable bridge from a session
+    /// input to its graph; callers must not reconstruct this relation from
+    /// transcript text or a client-side naming convention.
+    pub fn execution_events_for_session(
+        &self,
+        session_id: &str,
+        after_commit_cursor: u64,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        if session_id.trim().is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let terminal_requests = self
+            .list_scope(RuntimeEventScope::SessionInput, 10_000)?
+            .into_iter()
+            .filter(|event| event.kind == "runtime.session.terminal_requested")
+            .filter(|event| {
+                event
+                    .payload
+                    .get("session_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(session_id)
+            })
+            .collect::<Vec<_>>();
+        let graph_ids = terminal_requests
+            .iter()
+            .flat_map(|event| event.refs.iter())
+            .filter(|reference| reference.kind == "execution_graph")
+            .map(|reference| reference.id.clone())
+            .collect::<BTreeSet<_>>();
+        let mut related = terminal_requests;
+        for graph_id in graph_ids {
+            related.extend(self.list_stream(&graph_id)?);
+        }
+        related.sort_by_key(|event| (event.commit_cursor, event.transaction_index));
+        related.dedup_by(|left, right| left.event_id == right.event_id);
+        Ok(related
+            .into_iter()
+            .filter(|event| event.commit_cursor > after_commit_cursor)
+            .take(limit)
+            .collect())
+    }
+
     pub fn list_scope(
         &self,
         scope: RuntimeEventScope,
@@ -633,6 +683,41 @@ impl RuntimeEventStore {
         terminal_id: &str,
     ) -> RuntimeEventStoreResult<Option<RuntimeSessionOutboxRecord>> {
         query_runtime_session_outbox(&lock_connection(&self.conn), terminal_id)
+    }
+
+    /// Return already materialized terminal commits after a durable runtime
+    /// cursor. Gateway uses this for resumable surface streams; the transient
+    /// session bus is deliberately not the source of truth for final replies.
+    pub fn materialized_session_terminals_after(
+        &self,
+        session_id: &str,
+        after_commit_cursor: u64,
+        limit: usize,
+    ) -> RuntimeEventStoreResult<Vec<RuntimeSessionOutboxRecord>> {
+        let conn = lock_connection(&self.conn);
+        let mut statement = conn.prepare(
+            "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, status,
+                    attempts, next_attempt_at, claim_owner, claim_expires_at, failure_class,
+                    last_error, materialized_at, revision
+               FROM runtime_session_outbox
+              WHERE session_id=?1
+                AND status='materialized'
+                AND commit_cursor>?2
+              ORDER BY commit_cursor, terminal_id
+              LIMIT ?3",
+        )?;
+        let records = statement
+            .query_map(
+                params![
+                    session_id,
+                    after_commit_cursor as i64,
+                    limit.clamp(1, 500) as i64,
+                ],
+                row_to_runtime_session_outbox,
+            )?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(RuntimeEventStoreError::from)?;
+        Ok(records)
     }
 
     pub fn session_terminal_health(&self) -> RuntimeEventStoreResult<RuntimeSessionOutboxHealth> {
@@ -1473,6 +1558,44 @@ mod tests {
     }
 
     #[test]
+    fn session_execution_events_follow_durable_terminal_graph_reference() {
+        let store = RuntimeEventStore::try_open_in_memory().expect("event store");
+        let graph_id = "graph:session-a";
+        store
+            .append(input(
+                graph_id,
+                RuntimeEventScope::ExecutionGraph,
+                "execution_graph.planned",
+            ))
+            .unwrap();
+        let mut terminal = input(
+            "session-terminal:request-a",
+            RuntimeEventScope::SessionInput,
+            "runtime.session.terminal_requested",
+        );
+        terminal.payload = serde_json::json!({"session_id": "session-a"});
+        terminal.refs = vec![RuntimeEventRef {
+            kind: "execution_graph".to_string(),
+            id: graph_id.to_string(),
+        }];
+        store.append(terminal).unwrap();
+
+        let related = store
+            .execution_events_for_session("session-a", 0, 20)
+            .unwrap();
+        assert!(related
+            .iter()
+            .any(|event| event.stream_id == graph_id && event.kind == "execution_graph.planned"));
+        assert!(related
+            .iter()
+            .any(|event| event.kind == "runtime.session.terminal_requested"));
+        assert!(store
+            .execution_events_for_session("session-b", 0, 20)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn transaction_id_reuse_with_different_request_is_rejected() {
         let store = RuntimeEventStore::try_open_in_memory().expect("event store");
         let request = transaction("tx-conflict");
@@ -1562,6 +1685,30 @@ mod tests {
     }
 
     #[test]
+    fn historical_session_command_scope_remains_replayable_after_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("runtime.sqlite");
+        let store = RuntimeEventStore::try_open(&path).expect("event store opens");
+        store
+            .append(input(
+                "session-command:legacy-1",
+                RuntimeEventScope::SessionCommand,
+                "session_execution.dispatched",
+            ))
+            .expect("historical command event persists");
+        drop(store);
+
+        let reopened = RuntimeEventStore::try_open(&path)
+            .expect("historical session command scope remains readable");
+        let events = reopened
+            .list_scope(RuntimeEventScope::SessionCommand, 10)
+            .expect("historical command scope lists");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].scope, RuntimeEventScope::SessionCommand);
+        assert_eq!(events[0].kind, "session_execution.dispatched");
+    }
+
+    #[test]
     fn unknown_legacy_scope_aborts_migration_and_preserves_version_zero() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("runtime.sqlite");
@@ -1622,6 +1769,46 @@ mod tests {
             .claim_session_terminals("c", 1_000, 50, 8)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn materialized_terminal_replay_is_scoped_cursor_ordered_and_excludes_pending() {
+        let store = RuntimeEventStore::try_open_in_memory().unwrap();
+        for (terminal, message, session, cursor) in [
+            ("t-old", "m-old", "s-a", 4_u64),
+            ("t-new", "m-new", "s-a", 9_u64),
+            ("t-other", "m-other", "s-b", 12_u64),
+            ("t-pending", "m-pending", "s-a", 15_u64),
+        ] {
+            store
+                .enqueue_session_terminal(
+                    terminal,
+                    message,
+                    session,
+                    cursor,
+                    "assistant_json:\"ok\"",
+                )
+                .unwrap();
+        }
+        let claims = store
+            .claim_session_terminals("worker", 100, 50, 10)
+            .unwrap();
+        for terminal in ["t-old", "t-new", "t-other"] {
+            let claimed = claims
+                .iter()
+                .find(|record| record.terminal_id == terminal)
+                .unwrap();
+            store
+                .ack_session_terminal(terminal, "worker", claimed.revision, 101)
+                .unwrap();
+        }
+
+        let replay = store
+            .materialized_session_terminals_after("s-a", 4, 10)
+            .unwrap();
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].terminal_id, "t-new");
+        assert_eq!(replay[0].commit_cursor, 9);
     }
 
     #[test]

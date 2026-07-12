@@ -8,9 +8,6 @@ pub enum RuntimeCompileTarget {
     InlineModel,
     EvidenceGraph,
     ExecutionGraph,
-    DeliberationGraph,
-    TeamGraph,
-    MissionGraph,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,7 +91,7 @@ impl ExecutionPatternCatalog {
                     &["straightforward factual answer", "no material uncertainty"],
                     &["debate@1", "jps@1"],
                     &["agent_runtime", "evidence_ledger", "verification"],
-                    RuntimeCompileTarget::DeliberationGraph,
+                    RuntimeCompileTarget::EvidenceGraph,
                 ),
                 spec(
                     Collaborate,
@@ -111,7 +108,7 @@ impl ExecutionPatternCatalog {
                     ],
                     &["fanout_research_synthesis", "implementation_review_fix"],
                     &["team_runtime", "agent_runtime", "evidence_ledger"],
-                    RuntimeCompileTarget::TeamGraph,
+                    RuntimeCompileTarget::EvidenceGraph,
                 ),
                 spec(
                     Supervise,
@@ -127,7 +124,7 @@ impl ExecutionPatternCatalog {
                     ],
                     &["long_running_project", "incident_response"],
                     &["mission_runtime", "checkpoint", "recovery"],
-                    RuntimeCompileTarget::MissionGraph,
+                    RuntimeCompileTarget::EvidenceGraph,
                 ),
             ],
         }

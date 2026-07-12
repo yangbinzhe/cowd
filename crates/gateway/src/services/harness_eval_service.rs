@@ -1,9 +1,8 @@
 use std::{
-    collections::HashMap,
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, OnceLock,
+        Arc, Mutex,
     },
     thread,
 };
@@ -15,22 +14,7 @@ use harness_eval::{
 };
 use serde_json::{json, Value};
 
-use super::{service_envelope, HarnessEvalService, ServiceEnvelope};
-
-#[derive(Clone)]
-struct ActiveHarnessEvalJob {
-    run_id: String,
-    level: String,
-    requested_at_ms: u128,
-    cancel_requested: Arc<AtomicBool>,
-}
-
-static ACTIVE_HARNESS_EVAL_JOBS: OnceLock<Mutex<HashMap<String, ActiveHarnessEvalJob>>> =
-    OnceLock::new();
-
-fn active_harness_eval_jobs() -> &'static Mutex<HashMap<String, ActiveHarnessEvalJob>> {
-    ACTIVE_HARNESS_EVAL_JOBS.get_or_init(|| Mutex::new(HashMap::new()))
-}
+use super::{service_envelope, ActiveHarnessEvalJob, HarnessEvalService, ServiceEnvelope};
 
 #[derive(Debug)]
 pub(crate) enum HarnessEvalServiceError {
@@ -54,6 +38,7 @@ impl HarnessEvalService {
         Self {
             label: "harness_eval",
             owner: "0.9.412 Harness Eval service boundary",
+            active_jobs: Arc::new(Mutex::new(Default::default())),
         }
     }
 
@@ -178,7 +163,7 @@ impl HarnessEvalService {
             "kind": "harness_eval.runs",
             "envelope": self.envelope("runs"),
             "root": store.root().display().to_string(),
-            "active_jobs": active_jobs_snapshot(),
+            "active_jobs": self.active_jobs_snapshot(),
             "runs": runs,
             "count": runs.len(),
         }))
@@ -200,7 +185,7 @@ impl HarnessEvalService {
         Ok(json!({
             "kind": "harness_eval.run_detail",
             "envelope": self.envelope("run_detail"),
-            "active_job": active_job_snapshot(id),
+            "active_job": self.active_job_snapshot(id),
             "run": run,
         }))
     }
@@ -247,7 +232,8 @@ impl HarnessEvalService {
             .upsert_run(&record)
             .map_err(HarnessEvalServiceError::Internal)?;
         {
-            let mut jobs = active_harness_eval_jobs()
+            let mut jobs = self
+                .active_jobs
                 .lock()
                 .map_err(|error| HarnessEvalServiceError::Internal(error.to_string()))?;
             jobs.insert(
@@ -262,6 +248,7 @@ impl HarnessEvalService {
         }
         let worker_store = store.clone();
         let worker_run_id = run_id.clone();
+        let worker_jobs = Arc::clone(&self.active_jobs);
         thread::spawn(move || {
             let result = run_eval_controlled(
                 &worker_store,
@@ -280,7 +267,7 @@ impl HarnessEvalService {
                 .finished(now_ms());
                 let _ = worker_store.upsert_run(&failed);
             }
-            if let Ok(mut jobs) = active_harness_eval_jobs().lock() {
+            if let Ok(mut jobs) = worker_jobs.lock() {
                 jobs.remove(&worker_run_id);
             }
         });
@@ -294,7 +281,7 @@ impl HarnessEvalService {
         id: &str,
     ) -> Result<Value, HarnessEvalServiceError> {
         let store = self.store(config_home, config);
-        if let Some(job) = active_job(id) {
+        if let Some(job) = self.active_job(id) {
             job.cancel_requested.store(true, Ordering::SeqCst);
             let base = store
                 .get_run(id)
@@ -332,7 +319,7 @@ impl HarnessEvalService {
                 "ok": true,
                 "run_id": requested.run_id,
                 "status": requested.status,
-                "active_job": active_job_snapshot(id),
+                "active_job": self.active_job_snapshot(id),
                 "message": requested.message,
             }));
         }
@@ -387,18 +374,16 @@ impl HarnessEvalService {
                 HarnessEvalServiceError::NotFound("harness eval report not found".to_string())
             })
     }
-}
+    fn active_job(&self, id: &str) -> Option<ActiveHarnessEvalJob> {
+        self.active_jobs
+            .lock()
+            .ok()
+            .and_then(|jobs| jobs.get(id).cloned())
+    }
 
-fn active_job(id: &str) -> Option<ActiveHarnessEvalJob> {
-    active_harness_eval_jobs()
-        .lock()
-        .ok()
-        .and_then(|jobs| jobs.get(id).cloned())
-}
-
-fn active_job_snapshot(id: &str) -> Value {
-    active_job(id)
-        .map(|job| {
+    fn active_job_snapshot(&self, id: &str) -> Value {
+        self.active_job(id)
+            .map(|job| {
             json!({
                 "run_id": job.run_id,
                 "level": job.level,
@@ -406,27 +391,29 @@ fn active_job_snapshot(id: &str) -> Value {
                 "status": if job.cancel_requested.load(Ordering::SeqCst) { "cancel_requested" } else { "running" },
                 "cancel_requested": job.cancel_requested.load(Ordering::SeqCst),
             })
-        })
-        .unwrap_or(Value::Null)
-}
-
-fn active_jobs_snapshot() -> Value {
-    let jobs = active_harness_eval_jobs()
-        .lock()
-        .map(|jobs| jobs.values().cloned().collect::<Vec<_>>())
-        .unwrap_or_default();
-    json!(jobs
-        .into_iter()
-        .map(|job| {
-            json!({
-                "run_id": job.run_id,
-                "level": job.level,
-                "requested_at_ms": job.requested_at_ms,
-                "status": if job.cancel_requested.load(Ordering::SeqCst) { "cancel_requested" } else { "running" },
-                "cancel_requested": job.cancel_requested.load(Ordering::SeqCst),
             })
-        })
-        .collect::<Vec<_>>())
+            .unwrap_or(Value::Null)
+    }
+
+    fn active_jobs_snapshot(&self) -> Value {
+        let jobs = self
+            .active_jobs
+            .lock()
+            .map(|jobs| jobs.values().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        json!(jobs
+            .into_iter()
+            .map(|job| {
+                json!({
+                    "run_id": job.run_id,
+                    "level": job.level,
+                    "requested_at_ms": job.requested_at_ms,
+                    "status": if job.cancel_requested.load(Ordering::SeqCst) { "cancel_requested" } else { "running" },
+                    "cancel_requested": job.cancel_requested.load(Ordering::SeqCst),
+                })
+            })
+            .collect::<Vec<_>>())
+    }
 }
 
 fn pending_record(

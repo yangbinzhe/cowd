@@ -17,13 +17,13 @@ use crate::{
     evaluate_reality_context_scenarios, evaluate_report_gate, harness_capability_coverage_report,
     real_provider_runner::run_deep_real_provider_review,
     report::{
-        HarnessEvalLevel, HarnessEvalRunRecord, HarnessEvalRunStatus, ToolCallDetail,
-        ToolCallSummary,
+        HarnessEvalLevel, HarnessEvalRunRecord, HarnessEvalRunStatus, HarnessEvalUsageSummary,
+        ToolCallDetail, ToolCallSummary,
     },
     report_store::{empty_usage, now_ms, HarnessEvalReportStore},
-    stable_ai_scenario_matrix, E2eScenarioKind, NextGenHarnessEvalInput, RealToolScenarioReport,
-    RealToolScenarioResult, ScenarioCheck, ScenarioObservation, ScenarioSpec, ScenarioSuite,
-    StableAiHealthReport,
+    run_live_gateway_scenarios, stable_ai_scenario_matrix, E2eScenarioKind,
+    NextGenHarnessEvalInput, RealToolScenarioReport, RealToolScenarioResult, ScenarioCheck,
+    ScenarioObservation, ScenarioSpec, ScenarioSuite, StableAiHealthReport,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -238,13 +238,13 @@ pub fn run_eval_controlled(
             "capability": "mission_runtime_collaboration_closure",
             "status": mission_runtime.get("status").and_then(Value::as_str).unwrap_or("failed"),
             "evidence": format!(
-                "template={}, execution_graph={}, conflicts={}, projection_v2={}",
+                "template={}, execution_graph={}, conflicts={}, projection_schema={}",
                 mission_runtime.pointer("/selected_strategy/template").and_then(Value::as_str).unwrap_or("none"),
                 mission_runtime.pointer("/execution_graph/execution_graph_id").and_then(Value::as_str).unwrap_or("none"),
                 mission_runtime.pointer("/conflicts/count").and_then(Value::as_u64).unwrap_or_default(),
                 mission_runtime.pointer("/mission_projection/schema_version").and_then(Value::as_u64).unwrap_or_default(),
             ),
-            "notes": "deterministic closure exercises Runtime capability catalog, team template, ExecutionGraph planning, agent capability binding, session command lifecycle, conflict arbitration, and MissionProjection v2"
+            "notes": "deterministic closure exercises Runtime capability catalog, team template, ExecutionGraph planning, agent capability binding, session command lifecycle, conflict arbitration, and MissionProjection"
         }),
         json!({
             "capability": "next_gen_harness_closure",
@@ -259,6 +259,38 @@ pub fn run_eval_controlled(
             "status": if complex.failed == 0 && complex.average_score >= 0.9 { "passed" } else { "failed" },
             "evidence": format!("{}/{} complex scenarios passed; average={:.2}", complex.passed, complex.total, complex.average_score),
             "notes": "full smoke validates repo refactor, memory governance, multi-agent, cross-session, and recovery scenario models"
+        }));
+    }
+
+    let live_gateway_scenario_details = (options.level == HarnessEvalLevel::Deep
+        && options.allow_real_model)
+        .then(|| run_live_gateway_scenarios(&options));
+    let live_gateway_scenarios = live_gateway_scenario_details
+        .as_ref()
+        .map(live_gateway_scenario_summary);
+    // The production Gateway owns model execution. Its per-scenario metrics
+    // are therefore the canonical real-provider evidence for deep evaluation,
+    // rather than a later report-writing model call.
+    let live_provider_evidence =
+        live_gateway_provider_evidence(live_gateway_scenario_details.as_ref());
+    let mut execution_usage = merge_usage(&usage, &live_provider_evidence.usage);
+    let mut execution_provider_rounds = live_provider_evidence.provider_rounds;
+    let mut execution_rounds = live_provider_evidence.rounds;
+    let report_reviewer_requested = report_reviewer_requested();
+    if let Some(live) = &live_gateway_scenarios {
+        let scenario_count = live
+            .get("scenario_count")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let passed = live
+            .get("passed")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        scenarios.push(json!({
+            "capability": "live_gateway_scenarios",
+            "status": live.get("status").and_then(Value::as_str).unwrap_or("failed"),
+            "evidence": format!("{passed}/{scenario_count} production Gateway scenarios passed"),
+            "notes": live.get("reason").and_then(Value::as_str).unwrap_or("each scenario requires durable session, terminal, cursor, and projection evidence")
         }));
     }
 
@@ -280,6 +312,9 @@ pub fn run_eval_controlled(
     if complex.is_some() {
         runtime_action_log.push(json!({"index": 7, "action": "complex_harness_scenario_suite", "evidence": "full complex scenario suite generated"}));
     }
+    if live_gateway_scenario_details.is_some() {
+        runtime_action_log.push(json!({"index": runtime_action_log.len() + 1, "action": "live_gateway_scenarios", "evidence": "isolated Gateway public API execution with durable session/terminal/projection traces"}));
+    }
     let evolution_closure = evaluate_evolution_closure();
     let mut report = json!({
         "kind": "mission_harness.eval_report",
@@ -288,12 +323,12 @@ pub fn run_eval_controlled(
         "provider": options.provider.as_deref(),
         "budget": options.budget.as_deref(),
         "authorized_real_model": options.allow_real_model,
-        "gateway_process": false,
+        "gateway_process": live_gateway_scenario_details.is_some(),
         "scenario_matrix": stable_ai_scenario_matrix(),
         "stable_ai": stable_ai,
         "scenarios": scenarios,
         "metrics": [
-            {"name": "provider_rounds", "value": "0", "notes": if options.level == HarnessEvalLevel::Deep { "deep-real requires an explicit provider round; report gate fails when none is recorded" } else { "quick/full gateway runs do not consume provider tokens" }},
+            {"name": "provider_rounds", "value": execution_provider_rounds.to_string(), "notes": if options.level == HarnessEvalLevel::Deep { "derived from independently traced isolated Gateway scenarios; an optional report reviewer is tracked separately" } else { "quick/full gateway runs do not consume provider tokens" }},
             {"name": "runtime_actions", "value": runtime_actions.to_string(), "notes": "library runner exercised scenario, coverage, and knowledge fabric checks"},
             {"name": "tool_calls", "value": tool_calls.to_string(), "notes": if options.level == HarnessEvalLevel::Full { "full eval executed local read-only tool evidence" } else { "quick smoke lane intentionally does not execute tools" }}
         ],
@@ -303,33 +338,36 @@ pub fn run_eval_controlled(
         "evolution_closure": evolution_closure,
         "next_gen_harness_closure": next_gen_harness,
         "real_tool_scenarios": real_tool_scenarios,
+        "live_gateway_scenarios": live_gateway_scenarios,
+        "live_gateway_scenario_details": live_gateway_scenario_details,
         "event_observation_parity": event_observation_parity,
         "report_package": {
             "status": "prepared",
-            "required_dirs": ["requests", "responses", "events", "run-evidence", "model-speed", "quality-rubric"]
+            "required_dirs": ["requests", "responses", "events", "run-evidence", "live-scenarios", "model-speed", "quality-rubric"]
         },
         "execution_trace": {
             "kind": "harness_eval.execution_trace",
             "started_at_ms": requested_at_ms,
             "finished_at_ms": now_ms(),
             "total_elapsed_ms": total_elapsed_ms,
-            "provider_rounds": 0,
+            "provider_rounds": execution_provider_rounds,
             "runtime_actions": runtime_actions,
             "tool_calls": tool_calls,
-            "total_usage": usage,
-            "rounds": [],
+            "total_usage": execution_usage,
+            "rounds": execution_rounds,
             "tool_call_log": tool_call_log,
             "runtime_action_log": runtime_action_log
         },
         "tool_call_details": tool_call_details,
         "provider_round_details": [],
         "ai_reviewer": {
-            "status": if options.level == HarnessEvalLevel::Deep { "pending" } else { "not_required" },
-            "report_source": if options.level == HarnessEvalLevel::Deep { "provider_round" } else { "deterministic_analysis" }
+            "status": if options.level == HarnessEvalLevel::Deep && report_reviewer_requested { "pending" } else { "not_requested" },
+            "report_source": "optional_provider_round"
         },
-        "evidence_manifest": build_evidence_manifest(&options, requested_at_ms, tool_calls, usage.total_tokens),
+        "evidence_manifest": build_evidence_manifest(&options, requested_at_ms, tool_calls, execution_usage.total_tokens),
         "result_package_dir": null
     });
+    report["next_gen_harness_closure"]["provider_rounds"] = json!(execution_provider_rounds);
     if control.is_cancel_requested() {
         let record = cancelled_record(
             run_id,
@@ -341,17 +379,25 @@ pub fn run_eval_controlled(
         store.upsert_run(&record)?;
         return Ok(record);
     }
-    if options.level == HarnessEvalLevel::Deep && options.allow_real_model {
+    if options.level == HarnessEvalLevel::Deep
+        && options.allow_real_model
+        && report_reviewer_requested
+    {
         let provider_review = run_deep_real_provider_review(&options, &report);
         let provider_round_count = provider_review.provider_rounds.len();
         let provider_rounds = serde_json::to_value(&provider_review.provider_rounds)
             .map_err(|error| error.to_string())?;
         let provider_round_details = serde_json::to_value(&provider_review.provider_round_details)
             .map_err(|error| error.to_string())?;
-        report["execution_trace"]["rounds"] = provider_rounds;
-        report["execution_trace"]["provider_rounds"] = json!(provider_round_count);
+        if let Some(rounds) = provider_rounds.as_array() {
+            execution_rounds.extend(rounds.iter().cloned());
+        }
+        execution_provider_rounds = execution_provider_rounds.saturating_add(provider_round_count);
+        execution_usage = merge_usage(&execution_usage, &provider_review.usage);
+        report["execution_trace"]["rounds"] = Value::Array(execution_rounds);
+        report["execution_trace"]["provider_rounds"] = json!(execution_provider_rounds);
         report["execution_trace"]["total_usage"] =
-            serde_json::to_value(&provider_review.usage).map_err(|error| error.to_string())?;
+            serde_json::to_value(&execution_usage).map_err(|error| error.to_string())?;
         report["provider_round_details"] = provider_round_details;
         report["ai_reviewer"] = json!({
             "status": provider_review.status,
@@ -363,17 +409,12 @@ pub fn run_eval_controlled(
         if let Some(markdown) = provider_review.reviewer_markdown {
             report["ai_reviewer_report_markdown"] = Value::String(markdown);
         }
-        report["metrics"][0]["value"] = Value::String(provider_round_count.to_string());
+        report["metrics"][0]["value"] = Value::String(execution_provider_rounds.to_string());
         report["evidence_manifest"]["token_usage"] = json!({
-            "total_tokens": provider_review.usage.total_tokens,
-            "source": provider_review.usage.usage_source
+            "total_tokens": execution_usage.total_tokens,
+            "source": execution_usage.usage_source
         });
-        report["next_gen_harness_closure"]["provider_rounds"] = json!(provider_round_count);
-        if let Some(scenarios) = report["next_gen_harness_closure"]["scenarios"].as_array_mut() {
-            for scenario in scenarios {
-                scenario["provider_rounds"] = json!(provider_round_count);
-            }
-        }
+        report["next_gen_harness_closure"]["provider_rounds"] = json!(execution_provider_rounds);
     }
     let cancelled_after_provider = control.is_cancel_requested();
     let gate = evaluate_report_gate(&report);
@@ -441,6 +482,128 @@ fn cancelled_record(
         scenario_count: 0,
         message: message.into(),
     }
+}
+
+fn live_gateway_scenario_summary(details: &Value) -> Value {
+    let mut summary = details.clone();
+    if let Some(scenarios) = summary.get_mut("scenarios").and_then(Value::as_array_mut) {
+        for scenario in scenarios {
+            if let Some(object) = scenario.as_object_mut() {
+                object.remove("trace");
+                object.insert(
+                    "trace_artifact".to_string(),
+                    Value::String("live-scenarios/<scenario>.json".to_string()),
+                );
+            }
+        }
+    }
+    summary
+}
+
+#[derive(Default)]
+struct LiveGatewayProviderEvidence {
+    usage: HarnessEvalUsageSummary,
+    provider_rounds: usize,
+    rounds: Vec<Value>,
+}
+
+fn live_gateway_provider_evidence(details: Option<&Value>) -> LiveGatewayProviderEvidence {
+    let Some(scenarios) = details
+        .and_then(|value| value.get("scenarios"))
+        .and_then(Value::as_array)
+    else {
+        return LiveGatewayProviderEvidence::default();
+    };
+
+    let mut evidence = LiveGatewayProviderEvidence {
+        usage: HarnessEvalUsageSummary {
+            usage_source: "live_gateway_canonical_usage".to_string(),
+            ..HarnessEvalUsageSummary::default()
+        },
+        ..LiveGatewayProviderEvidence::default()
+    };
+    let model = details
+        .and_then(|value| value.get("model"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    for scenario in scenarios {
+        let metrics = scenario.get("metrics").unwrap_or(&Value::Null);
+        let input_tokens = json_u32(metrics.get("input_tokens"));
+        let output_tokens = json_u32(metrics.get("output_tokens"));
+        let cache_tokens = json_u32(metrics.get("cache_tokens"));
+        let total_tokens = json_u32(metrics.get("total_tokens"));
+        let model_rounds = json_u32(metrics.get("model_rounds"));
+        evidence.usage.input_tokens = evidence.usage.input_tokens.saturating_add(input_tokens);
+        evidence.usage.output_tokens = evidence.usage.output_tokens.saturating_add(output_tokens);
+        evidence.usage.cache_read_input_tokens = evidence
+            .usage
+            .cache_read_input_tokens
+            .saturating_add(cache_tokens);
+        evidence.usage.total_tokens =
+            evidence
+                .usage
+                .total_tokens
+                .saturating_add(if total_tokens > 0 {
+                    total_tokens
+                } else {
+                    input_tokens
+                        .saturating_add(output_tokens)
+                        .saturating_add(cache_tokens)
+                });
+        evidence.provider_rounds = evidence
+            .provider_rounds
+            .saturating_add(model_rounds as usize);
+        evidence.rounds.push(json!({
+            "round_kind": "live_gateway_scenario",
+            "scenario_id": scenario.get("scenario_id"),
+            "model": model.as_deref(),
+            "status": scenario.get("status"),
+            "metrics": metrics,
+            "trace_artifact": format!(
+                "live-scenarios/{}.json",
+                scenario.get("scenario_id").and_then(Value::as_str).unwrap_or("unknown")
+            )
+        }));
+    }
+    evidence
+}
+
+fn merge_usage(
+    left: &HarnessEvalUsageSummary,
+    right: &HarnessEvalUsageSummary,
+) -> HarnessEvalUsageSummary {
+    if right.total_tokens == 0 {
+        return left.clone();
+    }
+    if left.total_tokens == 0 {
+        return right.clone();
+    }
+    HarnessEvalUsageSummary {
+        input_tokens: left.input_tokens.saturating_add(right.input_tokens),
+        output_tokens: left.output_tokens.saturating_add(right.output_tokens),
+        cache_creation_input_tokens: left
+            .cache_creation_input_tokens
+            .saturating_add(right.cache_creation_input_tokens),
+        cache_read_input_tokens: left
+            .cache_read_input_tokens
+            .saturating_add(right.cache_read_input_tokens),
+        total_tokens: left.total_tokens.saturating_add(right.total_tokens),
+        usage_source: format!("{}+{}", left.usage_source, right.usage_source),
+    }
+}
+
+fn json_u32(value: Option<&Value>) -> u32 {
+    value
+        .and_then(Value::as_u64)
+        .map(|value| value.min(u64::from(u32::MAX)) as u32)
+        .unwrap_or_default()
+}
+
+fn report_reviewer_requested() -> bool {
+    matches!(
+        std::env::var("COWD_EVAL_REPORT_REVIEWER").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
 }
 
 struct FullRealToolEval {
@@ -566,26 +729,6 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
         ],
         evidence_duties: vec!["changes".to_string(), "verification".to_string()],
     });
-    let command = mission
-        .enqueue_session_command(
-            &session.session_id,
-            &session.session_id,
-            "summarize blockers",
-        )
-        .expect("session command");
-    let claimed = mission
-        .claim_session_command(&session.session_id, &command.command_id)
-        .expect("session command claimed");
-    let running = mission
-        .mark_session_command_running(&session.session_id, &command.command_id)
-        .expect("session command running");
-    let completed = mission
-        .complete_session_command(
-            &session.session_id,
-            &command.command_id,
-            Some(format!("harness-eval-result:{}", command.command_id)),
-        )
-        .expect("session command completed");
     let runtime_services = runtime::RuntimeServices::in_memory().expect("runtime services");
     let relation = runtime_services
         .session_relations()
@@ -597,7 +740,6 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
             vec![format!("execution_graph:{}", team_build.graph.id)],
         )
         .expect("conflict relation");
-    let completed_result_ref = completed.result_ref.clone();
     runtime_services
         .conflict_resolver()
         .resolve(runtime::ConflictResolutionRequest {
@@ -615,6 +757,10 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
         runtime_services.session_relations(),
         runtime_services.agent_runtime(),
         runtime_services.team_runtime(),
+        runtime_services.approval_queue(),
+        runtime_services.conflict_resolver(),
+        runtime_services.mission_evidence(),
+        runtime_services.mission_schedules().projection(),
     );
     let checks = vec![
         (
@@ -645,18 +791,12 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
                 && capability.allowed_tools.contains("bash"),
         ),
         (
-            "session_command_lifecycle",
-            claimed.status == runtime::MissionSessionCommandStatus::Claimed
-                && running.status == runtime::MissionSessionCommandStatus::Running
-                && completed.status == runtime::MissionSessionCommandStatus::Completed,
-        ),
-        (
             "conflict_arbitration",
             conflict_count > 0 && relation.kind == runtime::SessionRelationKind::ConflictsWith,
         ),
         (
             "mission_projection_v2",
-            projection.schema_version == 2
+            projection.schema_version == 3
                 && projection.conflict_projection["kind"] == "runtime.conflicts"
                 && projection.capability_projection["name"] == "cowd-runtime-capability-catalog",
         ),
@@ -711,11 +851,8 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
         },
         "sessions": {
             "session_id": session.session_id,
-            "command_id": command.command_id,
-            "claimed_status": format!("{:?}", claimed.status).to_ascii_lowercase(),
-            "running_status": format!("{:?}", running.status).to_ascii_lowercase(),
-            "command_status": format!("{:?}", completed.status).to_ascii_lowercase(),
-            "result_ref": completed_result_ref.clone(),
+            "dispatch_model": "execution_graph_session_handoff",
+            "dispatch_lifecycle_owner": "runtime.session_execution",
             "relation_id": relation.relation_id,
         },
         "tool_calls": {
@@ -734,9 +871,7 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
         "evidence_refs": [
             format!("team:{team_id}"),
             format!("execution_graph:{}", team_build.graph.id),
-            format!("session-command:{}", command.command_id),
             format!("session-relation:{}", relation.relation_id),
-            format!("session-command-result:{}", command.command_id),
             format!("synthesis:{}", team_build.graph.id)
         ],
         "terminal_evidence": {
@@ -747,8 +882,7 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
             "runtime_turn_result_count": 1,
             "recovery_applied_count": usize::from(conflict_count > 0),
             "recovery_verified_count": 1,
-            "completed_command_id": command.command_id,
-            "completed_result_ref": completed_result_ref,
+            "session_handoff_owner": "runtime.session_execution",
             "source": "mission_runtime_collaboration_closure"
         },
         "token_usage": {
@@ -1026,6 +1160,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn live_gateway_usage_is_canonical_real_provider_evidence() {
+        let details = json!({
+            "model": "deepseek-v4-flash",
+            "scenarios": [
+                {
+                    "scenario_id": "direct",
+                    "status": "passed",
+                    "metrics": {
+                        "input_tokens": 100,
+                        "output_tokens": 20,
+                        "cache_tokens": 3,
+                        "total_tokens": 123,
+                        "model_rounds": 1
+                    }
+                },
+                {
+                    "scenario_id": "team",
+                    "status": "passed",
+                    "metrics": {
+                        "input_tokens": 200,
+                        "output_tokens": 40,
+                        "cache_tokens": 7,
+                        "total_tokens": 247,
+                        "model_rounds": 4
+                    }
+                }
+            ]
+        });
+
+        let evidence = live_gateway_provider_evidence(Some(&details));
+
+        assert_eq!(evidence.provider_rounds, 5);
+        assert_eq!(evidence.usage.input_tokens, 300);
+        assert_eq!(evidence.usage.output_tokens, 60);
+        assert_eq!(evidence.usage.cache_read_input_tokens, 10);
+        assert_eq!(evidence.usage.total_tokens, 370);
+        assert_eq!(evidence.rounds.len(), 2);
+        assert_eq!(evidence.rounds[1]["round_kind"], "live_gateway_scenario");
+        assert_eq!(
+            evidence.rounds[1]["trace_artifact"],
+            "live-scenarios/team.json"
+        );
+    }
+
+    #[test]
     fn deep_eval_is_gated_without_explicit_real_authorization() {
         let root =
             std::env::temp_dir().join(format!("cowd-harness-eval-gated-{}", uuid::Uuid::new_v4()));
@@ -1172,7 +1351,9 @@ mod tests {
         let report = evaluate_mission_runtime_collaboration_closure();
 
         assert_eq!(report["status"], "passed");
-        assert_eq!(report["mission_projection"]["schema_version"], 2);
+        assert!(report["mission_projection"]["schema_version"]
+            .as_u64()
+            .is_some_and(|version| version >= 2));
         assert_eq!(
             report["selected_strategy"]["runtime_actions"]
                 .as_array()

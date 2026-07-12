@@ -253,7 +253,7 @@ fn value_loop_stage_id(event: &RuntimeEvent) -> &'static str {
         return "channel";
     }
     match event.scope.as_str() {
-        "session" | "message" | "turn" | "session_command" => "intake",
+        "session" | "message" | "turn" | "session_input" => "intake",
         "context" => "context",
         "memory" | "mfg" => "memory",
         "policy" | "approval" => "governance",
@@ -329,6 +329,7 @@ mod tests {
     fn event(sequence: usize, scope: &str, kind: &str) -> RuntimeEvent {
         RuntimeEvent {
             sequence: sequence as u64,
+            commit_cursor: None,
             scope: scope.to_string(),
             kind: kind.to_string(),
             status: None,

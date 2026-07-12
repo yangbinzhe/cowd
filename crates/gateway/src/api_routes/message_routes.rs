@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeSet, VecDeque},
     convert::Infallible,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -6,7 +7,7 @@ use std::{
 
 use axum::{
     extract::{Path, Query, State as AxumState},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse,
@@ -21,7 +22,6 @@ use harness_contract::turn::{
 use runtime::{ContextProfile, ResumeContextPacket, ResumeContextSource};
 use serde::Deserialize;
 use tokio::sync::mpsc;
-use tokio::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::event_bus::SessionEventBus;
@@ -97,93 +97,19 @@ struct SessionInputReclassifyRequest {
     reason: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct SessionStreamQuery {
+    /// Exclusive Runtime commit cursor. `Last-Event-ID` takes precedence so
+    /// native EventSource reconnects need no client-specific query mutation.
+    #[serde(default)]
+    from_cursor: Option<u64>,
+}
+
 fn current_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TurnTimeoutClass {
-    Direct,
-    Standard,
-    Deep,
-}
-
-fn classify_turn_timeout_prompt(prompt: &str, profile: ContextProfile) -> TurnTimeoutClass {
-    if matches!(profile, ContextProfile::YoloGoal) {
-        return TurnTimeoutClass::Deep;
-    }
-
-    let lower = prompt.to_lowercase();
-    let deep_markers = [
-        "deep",
-        "architecture",
-        "refactor",
-        "multi-agent",
-        "what if",
-        "scenario",
-        "simulation",
-        "matrix",
-        "memory",
-        "harness",
-        "沉浸式",
-        "深度",
-        "架构",
-        "重构",
-        "全量",
-        "全盘",
-        "复杂",
-        "多agent",
-        "多 agent",
-        "跨session",
-        "跨 session",
-        "记忆",
-        "矩阵",
-        "推演",
-        "测试",
-        "验证",
-    ];
-    if prompt.chars().count() > 500
-        || prompt.lines().count() > 6
-        || deep_markers.iter().any(|marker| lower.contains(marker))
-    {
-        return TurnTimeoutClass::Deep;
-    }
-
-    let direct_markers = [
-        "what is",
-        "怎么写",
-        "解释",
-        "列出",
-        "总结",
-        "简单",
-        "快速",
-        "status",
-        "help",
-    ];
-    if prompt.chars().count() <= 160 && direct_markers.iter().any(|marker| lower.contains(marker)) {
-        return TurnTimeoutClass::Direct;
-    }
-
-    TurnTimeoutClass::Standard
-}
-
-fn turn_timeout_for_prompt(prompt: &str, profile: ContextProfile) -> Duration {
-    match classify_turn_timeout_prompt(prompt, profile) {
-        TurnTimeoutClass::Direct => Duration::from_secs(240),
-        TurnTimeoutClass::Standard => Duration::from_secs(480),
-        TurnTimeoutClass::Deep => Duration::from_secs(900),
-    }
-}
-
-fn turn_max_iterations_for_prompt(prompt: &str, profile: ContextProfile) -> usize {
-    match classify_turn_timeout_prompt(prompt, profile) {
-        TurnTimeoutClass::Direct => 12,
-        TurnTimeoutClass::Standard => 32,
-        TurnTimeoutClass::Deep => 64,
-    }
 }
 
 pub(super) fn task_resume_context_packet(
@@ -378,6 +304,8 @@ async fn send_message(
                 }),
             )
         })?;
+    let execution_graph_id = admission.execution_graph_id;
+    let materialized = admission.materialized;
     let receipt = admission.receipt;
     let projection = runtime_service
         .session_input_projection(&session_id)
@@ -391,13 +319,17 @@ async fn send_message(
         "session_id": session_id,
         "run_id": run_id,
         "status": "accepted",
+        "execution": {
+            "graph_id": execution_graph_id,
+            "status": "accepted",
+        },
         "mode": if active_projection.active_turn_id.is_some() {
             "attached_to_active_turn"
         } else {
             "queued_new_turn"
         },
         "input": receipt,
-        "materialized": admission.materialized,
+        "materialized": materialized,
         "input_projection": projection,
         "turn_inbox": inbox,
     });
@@ -651,6 +583,7 @@ async fn get_session_messages(
                 let blocks: Vec<serde_json::Value> =
                     serde_json::from_str(&m.content_json).unwrap_or_default();
                 let mut val = serde_json::json!({
+                    "id": m.stable_message_id,
                     "session_id": m.session_id,
                     "sequence": m.sequence,
                     "role": m.role,
@@ -715,6 +648,8 @@ struct SseStream {
     session_id: String,
     event_bus: Arc<SessionEventBus>,
     tx: mpsc::Sender<String>,
+    seen_durable_cursors: BTreeSet<u64>,
+    durable_cursor_order: VecDeque<u64>,
 }
 
 impl Stream for SseStream {
@@ -724,12 +659,30 @@ impl Stream for SseStream {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        match self.rx.poll_next_unpin(cx) {
-            std::task::Poll::Ready(Some(data)) => {
-                std::task::Poll::Ready(Some(Ok(Event::default().data(data))))
+        loop {
+            match self.rx.poll_next_unpin(cx) {
+                std::task::Poll::Ready(Some(data)) => {
+                    let durable_cursor = stream_durable_cursor(&data);
+                    if let Some(cursor) = durable_cursor {
+                        if !self.seen_durable_cursors.insert(cursor) {
+                            continue;
+                        }
+                        self.durable_cursor_order.push_back(cursor);
+                        if self.durable_cursor_order.len() > 1_024 {
+                            if let Some(expired) = self.durable_cursor_order.pop_front() {
+                                self.seen_durable_cursors.remove(&expired);
+                            }
+                        }
+                    }
+                    let mut event = Event::default().data(data);
+                    if let Some(cursor) = durable_cursor {
+                        event = event.id(cursor.to_string());
+                    }
+                    return std::task::Poll::Ready(Some(Ok(event)));
+                }
+                std::task::Poll::Ready(None) => return std::task::Poll::Ready(None),
+                std::task::Poll::Pending => return std::task::Poll::Pending,
             }
-            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
-            std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 }
@@ -748,11 +701,22 @@ impl Drop for SseStream {
 async fn sse_stream_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(session_id): Path<String>,
+    Query(query): Query<SessionStreamQuery>,
+    headers: HeaderMap,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let (tx, rx) = mpsc::channel(256);
     let bus_tx = tx.clone();
     let event_bus = state.event_bus();
     event_bus.subscribe(&session_id, bus_tx).await;
+    let resume_cursor = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .or(query.from_cursor)
+        .unwrap_or_default();
+    for event in replay_materialized_terminal_events(&state, &session_id, resume_cursor).await {
+        let _ = tx.send(event).await;
+    }
     let _ = tx
         .send(
             serde_json::json!({
@@ -768,6 +732,8 @@ async fn sse_stream_handler(
         session_id,
         event_bus,
         tx,
+        seen_durable_cursors: BTreeSet::new(),
+        durable_cursor_order: VecDeque::new(),
     };
 
     Sse::new(stream).keep_alive(
@@ -777,43 +743,58 @@ async fn sse_stream_handler(
     )
 }
 
+fn stream_durable_cursor(data: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(data)
+        .ok()?
+        .get("runtime_commit_cursor")?
+        .as_u64()
+}
+
+async fn replay_materialized_terminal_events(
+    state: &AppState,
+    session_id: &str,
+    after_cursor: u64,
+) -> Vec<String> {
+    let Some(runtime) = state.services.runtime.as_ref() else {
+        return Vec::new();
+    };
+    let event_store = Arc::clone(runtime.runtime_services().event_store());
+    let session_id = session_id.to_string();
+    let records = tokio::task::spawn_blocking(move || {
+        event_store.materialized_session_terminals_after(&session_id, after_cursor, 500)
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or_default();
+    records
+        .into_iter()
+        .filter_map(|record| terminal_committed_stream_payload(&record))
+        .collect()
+}
+
+fn terminal_committed_stream_payload(
+    record: &runtime::RuntimeSessionOutboxRecord,
+) -> Option<String> {
+    let response =
+        crate::session_runtime_bridge::decode_terminal_payload(&record.payload_ref).ok()?;
+    Some(
+        serde_json::json!({
+            "type": "TerminalCommitted",
+            "session_id": record.session_id,
+            "terminal_id": record.terminal_id,
+            "message_id": record.message_id,
+            "response": response,
+            "runtime_commit_cursor": record.commit_cursor,
+            "replayed": true,
+        })
+        .to_string(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn turn_timeout_policy_expands_for_deep_tasks() {
-        let direct = turn_timeout_for_prompt("解释一下这个函数", ContextProfile::MainTurn);
-        let standard =
-            turn_timeout_for_prompt("帮我分析当前实现并给出建议", ContextProfile::MainTurn);
-        let deep = turn_timeout_for_prompt(
-            "请进行深度架构分析，模拟 what if 场景，验证 memory matrix harness 多Agent协同并输出完整报告",
-            ContextProfile::MainTurn,
-        );
-
-        assert!(direct < standard);
-        assert!(standard < deep);
-        assert_eq!(deep, Duration::from_secs(900));
-        assert_eq!(
-            turn_max_iterations_for_prompt("解释一下这个函数", ContextProfile::MainTurn),
-            12
-        );
-        assert_eq!(
-            turn_max_iterations_for_prompt(
-                "请进行深度架构分析，模拟 what if 场景，验证 memory matrix harness 多Agent协同并输出完整报告",
-                ContextProfile::MainTurn,
-            ),
-            64
-        );
-    }
-
-    #[test]
-    fn yolo_profile_uses_deep_turn_timeout() {
-        assert_eq!(
-            turn_timeout_for_prompt("继续执行", ContextProfile::YoloGoal),
-            Duration::from_secs(900)
-        );
-    }
 
     #[test]
     fn message_resource_ids_render_runtime_resource_context() {
@@ -841,5 +822,31 @@ mod tests {
         assert!(rendered.contains("## Attached Resources"));
         assert!(rendered.contains("kind: audio"));
         assert!(rendered.contains("Do not claim audio content"));
+    }
+
+    #[test]
+    fn terminal_commit_stream_payload_uses_durable_cursor_and_terminal_identity() {
+        let record = runtime::RuntimeSessionOutboxRecord {
+            terminal_id: "terminal-1".to_string(),
+            message_id: "message-1".to_string(),
+            session_id: "session-1".to_string(),
+            commit_cursor: 42,
+            payload_ref: "assistant_json:\"completed\"".to_string(),
+            status: "materialized".to_string(),
+            attempts: 1,
+            next_attempt_at_ms: None,
+            claim_owner: None,
+            claim_expires_at_ms: None,
+            failure_class: None,
+            last_error: None,
+            materialized_at_ms: Some(1),
+            revision: 2,
+        };
+        let encoded = terminal_committed_stream_payload(&record).expect("valid terminal payload");
+        let event: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(event["type"], "TerminalCommitted");
+        assert_eq!(event["terminal_id"], "terminal-1");
+        assert_eq!(event["runtime_commit_cursor"], 42);
+        assert_eq!(stream_durable_cursor(&encoded), Some(42));
     }
 }

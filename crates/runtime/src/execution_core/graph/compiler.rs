@@ -20,11 +20,6 @@ pub struct ExecutionCompileRequest {
 pub enum ExecutionCompileError {
     #[error(transparent)]
     InvalidGraph(#[from] ExecutionGraphValidationError),
-    #[error("execution capability `{capability}` is unavailable until version `{available_in}`")]
-    CapabilityUnavailable {
-        capability: &'static str,
-        available_in: &'static str,
-    },
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -41,29 +36,6 @@ impl ExecutionGraphCompiler {
     ) -> Result<ExecutionGraph, ExecutionCompileError> {
         let mut graph = ExecutionGraph::new(request.objective);
         let target = request.target;
-        match target {
-            RuntimeCompileTarget::InlineModel
-            | RuntimeCompileTarget::EvidenceGraph
-            | RuntimeCompileTarget::ExecutionGraph => {}
-            RuntimeCompileTarget::DeliberationGraph => {
-                return Err(ExecutionCompileError::CapabilityUnavailable {
-                    capability: "deliberate",
-                    available_in: "V6",
-                });
-            }
-            RuntimeCompileTarget::TeamGraph => {
-                return Err(ExecutionCompileError::CapabilityUnavailable {
-                    capability: "collaborate",
-                    available_in: "V5",
-                });
-            }
-            RuntimeCompileTarget::MissionGraph => {
-                return Err(ExecutionCompileError::CapabilityUnavailable {
-                    capability: "supervise",
-                    available_in: "V8",
-                });
-            }
-        };
         let model = node(
             &graph.id,
             "model",
@@ -101,7 +73,6 @@ impl ExecutionGraphCompiler {
                 ),
                 model,
             ],
-            _ => unreachable!("unavailable targets returned above"),
         };
         graph.edges = dependencies(&graph.nodes);
         validate_execution_graph(&graph)?;
@@ -209,24 +180,6 @@ impl ExecutionGraphCompiler {
                     ),
                 ];
                 graph.edges = dependencies(&graph.nodes);
-            }
-            RuntimeCompileTarget::DeliberationGraph => {
-                return Err(ExecutionCompileError::CapabilityUnavailable {
-                    capability: "deliberate",
-                    available_in: "V6",
-                });
-            }
-            RuntimeCompileTarget::TeamGraph => {
-                return Err(ExecutionCompileError::CapabilityUnavailable {
-                    capability: "collaborate",
-                    available_in: "V5",
-                });
-            }
-            RuntimeCompileTarget::MissionGraph => {
-                return Err(ExecutionCompileError::CapabilityUnavailable {
-                    capability: "supervise",
-                    available_in: "V8",
-                });
             }
         }
         validate_execution_graph(&graph)?;

@@ -57,7 +57,8 @@ impl GatewayServices {
             approval: ApprovalService::with_gate_and_repository(approval_gate, approval_repository)
                 .with_runtime_services(Arc::clone(&runtime_services)),
             cross_plane: CrossPlaneService::new(Arc::clone(&runtime_services)),
-            mission: MissionService::new().with_runtime_services(runtime_services),
+            mission: MissionService::new()
+                .with_runtime_port(runtime::MissionRuntimePort::new(runtime_services)),
             ..Self::baseline_with_config_home(config_home)
         }
     }

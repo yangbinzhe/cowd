@@ -71,7 +71,7 @@ impl ConnectorService {
             }
             .to_string(),
             dispatch_status: match dispatch_status {
-                "service_mock_executed" => "service_mock_executed",
+                "service_executed" | "service_mock_executed" => dispatch_status,
                 _ => "not_dispatched",
             }
             .to_string(),

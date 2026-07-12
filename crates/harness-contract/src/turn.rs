@@ -127,6 +127,105 @@ pub enum InputRoutingDecision {
     RejectPolicy,
 }
 
+/// A proposal produced by deterministic input classification. It is not an
+/// execution command: Runtime strategy and Goal policy decide whether and how
+/// it is materialized into a graph action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputRelationProposal {
+    pub candidate: InputRelationKind,
+    pub confidence_basis_points: u16,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputRelationKind {
+    Supplement,
+    Replan,
+    NewTask,
+    NewSession,
+    Subtask,
+    CrossSession,
+}
+
+/// The only execution payload allowed to cross Session boundaries. Context is
+/// represented by scoped lenses and evidence references; raw histories and
+/// private payloads never travel in this contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionHandoff {
+    pub handoff_id: String,
+    pub source_session_id: String,
+    pub target_session_id: String,
+    pub objective: String,
+    #[serde(default)]
+    pub acceptance: Vec<String>,
+    #[serde(default)]
+    pub scope: Vec<String>,
+    #[serde(default)]
+    pub context_lens: Vec<String>,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    pub permission_lease: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_at_ms: Option<u64>,
+    pub priority: u8,
+    pub correlation_id: String,
+    pub result_contract: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionDispatchAction {
+    Enqueue,
+    Interrupt,
+    Cancel,
+    Approve,
+    Replan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDispatchCommand {
+    pub command_id: String,
+    pub action: SessionDispatchAction,
+    pub handoff: SessionHandoff,
+    pub expected_target_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDispatchReceipt {
+    pub command_id: String,
+    pub source_node_id: String,
+    pub target_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_turn_id: Option<String>,
+    pub accepted_revision: u64,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionResultPacket {
+    pub correlation_id: String,
+    pub source_session_id: String,
+    pub target_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_ref: Option<String>,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    #[serde(default)]
+    pub unresolved: Vec<String>,
+    #[serde(default)]
+    pub conflict_refs: Vec<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnInputCheckpoint {
@@ -260,6 +359,11 @@ pub struct SessionInputReceipt {
     pub session_id: String,
     pub status: SessionInputStatus,
     pub decision: InputRoutingDecision,
+    /// Deterministic classification may describe a possible relation, but it
+    /// never authorizes a graph/session side effect. Strategy and Goal policy
+    /// decide whether to materialize this proposal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relation_proposal: Option<InputRelationProposal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<InputRoutingReason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -275,6 +379,8 @@ pub struct TurnInboxItem {
     pub session_id: String,
     pub status: SessionInputStatus,
     pub decision: InputRoutingDecision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relation_proposal: Option<InputRelationProposal>,
     pub content_preview: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<TurnInputCheckpoint>,

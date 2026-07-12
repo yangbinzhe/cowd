@@ -465,10 +465,21 @@ fn validate_packet_node(
     let expected_protocol = format!("protocol:{}", request.protocol);
     let expected_role = format!("protocol_role:{role_id}");
     let expected_slot = format!("protocol_slot:{slot}");
+    let expected_evidence_mode = format!("protocol_evidence_mode:{}", role.evidence_mode.as_str());
     let backend_constraint_is_bound = request
         .backend_constraint
         .as_ref()
         .is_none_or(|constraint| packet.constraints.contains(constraint));
+    let expected_allowed_tools = if role.evidence_mode == super::RoleEvidenceMode::Acquire {
+        request
+            .allowed_tools
+            .iter()
+            .filter(|tool| !tool.eq_ignore_ascii_case("runtime_orchestrate"))
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     if packet.graph_id != request.graph_id
         || packet.node_id != node.id
         || packet.session_id != request.session_id
@@ -481,11 +492,12 @@ fn validate_packet_node(
         || packet.model_lease != request.model_lease
         || packet.context_refs != request.context_refs
         || packet.evidence_refs != request.evidence_refs
-        || packet.allowed_tools != request.allowed_tools
+        || packet.allowed_tools != expected_allowed_tools
         || packet.allowed_skills != request.allowed_skills
         || !packet.constraints.contains(&expected_protocol)
         || !packet.constraints.contains(&expected_role)
         || !packet.constraints.contains(&expected_slot)
+        || !packet.constraints.contains(&expected_evidence_mode)
         || !backend_constraint_is_bound
     {
         return Err(invalid_graph(

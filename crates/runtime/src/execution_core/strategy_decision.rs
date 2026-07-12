@@ -185,11 +185,25 @@ fn build_runtime_execution_decision_inner(
     if !resource_health.provider_available {
         blocked_reasons.push("provider runtime unavailable".to_string());
     }
+    // A bounded synthesis/peer role can deliberately prohibit tool calls
+    // because its parent graph already supplied the evidence packet. That is
+    // a valid model-only execution boundary, not a failed tool runtime. Keep
+    // the original Execute/Explore policy gates in place so the surrounding
+    // graph still owns verification and terminal commitment.
+    let tool_calls_explicitly_prohibited =
+        harness_contract::strategy::prompt_explicitly_forbids_tool_use(&user_input);
+    if tool_calls_explicitly_prohibited {
+        strategy.reasons.push(
+            "tool calls are intentionally prohibited by the bounded role contract; retain the graph policy and synthesize from supplied evidence"
+                .to_string(),
+        );
+    }
     if !resource_health.tools_available
         && matches!(
             strategy.pattern,
             ExecutionPattern::Explore | ExecutionPattern::Execute
         )
+        && !tool_calls_explicitly_prohibited
     {
         let unavailable_pattern = strategy.pattern;
         if let Err(error) = strategy.retarget(
@@ -535,6 +549,29 @@ mod tests {
         assert!(decision.executable);
         assert!(decision.blocked_reasons.is_empty());
         assert_eq!(decision.gates(), &[ExecutionPolicyGate::Budget]);
+    }
+
+    #[test]
+    fn bounded_toolless_role_remains_executable_when_its_contract_prohibits_tools() {
+        let decision = StrategyDecisionEngine.decide_with_input(
+            StrategyInput::from_prompt(
+                "完成复杂架构综合并给出结论。Do not call tools to rediscover supplied evidence.",
+            ),
+            None,
+            StrategyResourceHealth {
+                tools_available: false,
+                observed: true,
+                ..StrategyResourceHealth::default()
+            },
+        );
+
+        assert!(decision.executable);
+        assert_eq!(decision.pattern(), ExecutionPattern::Execute);
+        assert!(decision
+            .strategy
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("intentionally prohibited")));
     }
 
     #[test]

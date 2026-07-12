@@ -5,8 +5,16 @@ use crate::execution_core::ProtocolRef;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeOrchestrationRequest {
     pub intent: String,
+    /// Runtime-owned execution binding. Gateway adapters inject the active
+    /// session model before compilation; model-generated tool input must never
+    /// select an arbitrary provider lease for a spawned agent graph.
+    #[serde(default)]
+    pub model_lease: Option<String>,
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Required for `dispatch_session`; `session_id` remains the source.
+    #[serde(default)]
+    pub target_session_id: Option<String>,
     #[serde(default)]
     pub action: RuntimeOrchestrationAction,
     #[serde(default)]
@@ -40,7 +48,7 @@ pub enum RuntimeOrchestrationAction {
     RequestReflexionRetry,
     RequestBackgroundReview,
     RequestRiskGate,
-    RequestSessionLink,
+    DispatchSession,
 }
 
 impl Default for RuntimeOrchestrationAction {
@@ -63,7 +71,7 @@ impl RuntimeOrchestrationAction {
             Self::RequestReflexionRetry => "request_reflexion_retry",
             Self::RequestBackgroundReview => "request_background_review",
             Self::RequestRiskGate => "request_risk_gate",
-            Self::RequestSessionLink => "request_session_link",
+            Self::DispatchSession => "dispatch_session",
         }
     }
 }

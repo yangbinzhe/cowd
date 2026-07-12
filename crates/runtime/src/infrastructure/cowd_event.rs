@@ -10,6 +10,7 @@ pub struct RuntimeExecutionGraphSummary {
     pub board_id: Option<String>,
     pub status: String,
     pub agent_tasks: usize,
+    pub child_executions: usize,
     pub memory_candidates: usize,
     pub conflicts: usize,
     pub completion_rate: Option<f32>,

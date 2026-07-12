@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use memory::UnifiedSessionStore;
+use memory::{OutboxFailureClass, SessionMissionOutboxOperation, UnifiedSessionStore};
 use tokio::{sync::watch, task::JoinHandle};
 
 use crate::{event_bus::SessionEventBus, runtime_service::RuntimeService};
@@ -35,6 +35,7 @@ impl SessionRuntimeBridge {
         let router = runtime_service.session_input_router();
         let (shutdown, ingress_rx) = watch::channel(false);
         let delivery_rx = shutdown.subscribe();
+        let mission_rx = shutdown.subscribe();
         let ingress_runtime = Arc::clone(&runtime_service);
         let ingress = tokio::spawn(async move {
             run_ingress_worker(router, ingress_runtime, ingress_rx).await;
@@ -44,9 +45,27 @@ impl SessionRuntimeBridge {
         let delivery = tokio::spawn(async move {
             run_delivery_worker(delivery_store, store, event_bus, delivery_rx).await;
         });
+        let mission_store = runtime_service
+            .session_kernel()
+            .unified_store()
+            .ok_or_else(|| "mission bridge requires UnifiedSessionStore".to_string())?;
+        let mission_runtime = Arc::clone(runtime_service.runtime_services().mission_runtime());
+        let workspace_key = runtime_service
+            .runtime_services()
+            .workspace_key()
+            .to_string();
+        let mission = tokio::spawn(async move {
+            run_mission_membership_worker(
+                mission_store,
+                mission_runtime,
+                workspace_key,
+                mission_rx,
+            )
+            .await;
+        });
         Ok(Self {
             shutdown,
-            handles: vec![ingress, delivery],
+            handles: vec![ingress, delivery, mission],
         })
     }
 
@@ -54,6 +73,108 @@ impl SessionRuntimeBridge {
         let _ = self.shutdown.send(true);
         for handle in self.handles {
             let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
+        }
+    }
+}
+
+async fn run_mission_membership_worker(
+    store: Arc<UnifiedSessionStore>,
+    mission: Arc<runtime::MissionRuntime>,
+    workspace_key: String,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let worker_id = format!("gateway-mission-membership:{}", uuid::Uuid::new_v4());
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+        let claimed = store
+            .claim_session_mission_outbox(
+                &workspace_key,
+                &worker_id,
+                now_ms(),
+                LEASE_MS,
+                WORKER_BATCH,
+            )
+            .await;
+        match claimed {
+            Ok(records) => {
+                for record in records {
+                    materialize_mission_membership(&store, &mission, &worker_id, record).await;
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, workspace_key, "mission membership outbox claim failed")
+            }
+        }
+        tokio::select! {
+            _ = shutdown.changed() => {},
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+        }
+    }
+}
+
+async fn materialize_mission_membership(
+    store: &UnifiedSessionStore,
+    mission: &runtime::MissionRuntime,
+    worker_id: &str,
+    record: memory::SessionMissionOutboxRecord,
+) {
+    let outcome = match record.operation {
+        SessionMissionOutboxOperation::Register => mission
+            .register_session(runtime::StartMissionSessionRequest {
+                title: record.title.clone(),
+                session_id: Some(record.session_id.clone()),
+            })
+            .map(|_| ()),
+        SessionMissionOutboxOperation::Start => mission
+            .start_session(runtime::StartMissionSessionRequest {
+                title: record.title.clone(),
+                session_id: Some(record.session_id.clone()),
+            })
+            .map(|_| ()),
+        SessionMissionOutboxOperation::Close => {
+            if mission.get_session(&record.session_id).is_some() {
+                mission.close_session(&record.session_id).map(|_| ())
+            } else {
+                // A close may race a never-materialized register. There is no
+                // aggregate state to mutate, so the requested final state is
+                // already satisfied and must not poison the outbox.
+                Ok(())
+            }
+        }
+    };
+    match outcome {
+        Ok(()) => {
+            if let Err(error) = store
+                .ack_session_mission_outbox(
+                    &record.request_id,
+                    worker_id,
+                    record.revision,
+                    now_ms(),
+                )
+                .await
+            {
+                tracing::error!(request_id = %record.request_id, %error, "mission lifecycle applied but outbox acknowledgement failed");
+            }
+        }
+        Err(error) => {
+            let retry_at = now_ms().saturating_add(retry_delay_ms(record.attempts));
+            if let Err(failure) = store
+                .fail_session_mission_outbox(
+                    &record.request_id,
+                    worker_id,
+                    record.revision,
+                    OutboxFailureClass::Retryable,
+                    &error,
+                    retry_at,
+                    MAX_ATTEMPTS,
+                    now_ms(),
+                )
+                .await
+            {
+                tracing::error!(request_id = %record.request_id, error = %failure, "mission lifecycle failure state could not be recorded");
+            }
         }
     }
 }
@@ -160,12 +281,12 @@ async fn deliver_terminal(
         Ok((text, message, inserted)) => {
             if inserted {
                 let event = serde_json::json!({
-                    "type": "TurnComplete",
+                    "type": "TerminalCommitted",
                     "session_id": record.session_id,
+                    "terminal_id": record.terminal_id,
                     "message_id": record.message_id,
                     "sequence": message.sequence,
                     "response": text,
-                    "committed": true,
                     "runtime_commit_cursor": record.commit_cursor,
                 });
                 event_bus
@@ -216,7 +337,7 @@ async fn deliver_terminal(
     }
 }
 
-fn decode_terminal_payload(
+pub(crate) fn decode_terminal_payload(
     payload_ref: &str,
 ) -> Result<String, (runtime::RuntimeSessionOutboxFailureClass, String)> {
     let encoded = payload_ref.strip_prefix("assistant_json:").ok_or_else(|| {
@@ -247,7 +368,7 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use memory::SessionRecord;
+    use memory::{SessionMissionOutboxOperation, SessionMissionOutboxRequest, SessionRecord};
     use tokio::sync::mpsc;
 
     async fn delivery_fixture() -> (
@@ -294,6 +415,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mission_membership_bridge_replays_registration_once() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let now = chrono::Utc::now().to_rfc3339();
+        let record = SessionRecord {
+            session_id: "mission-session".to_string(),
+            platform: "test".to_string(),
+            chat_id: "mission-session".to_string(),
+            user_id: None,
+            model: None,
+            created_at: now.clone(),
+            last_activity: now,
+            message_count: 0,
+            reset_policy: "manual".to_string(),
+            metadata_json: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            estimated_cost_usd: 0.0,
+            status: "active".to_string(),
+        };
+        let request = SessionMissionOutboxRequest {
+            request_id: "mission-register-1".to_string(),
+            session_id: record.session_id.clone(),
+            title: "Mission session".to_string(),
+            workspace_key: "workspace-a".to_string(),
+            operation: SessionMissionOutboxOperation::Register,
+            created_at_ms: 100,
+        };
+        store
+            .upsert_session_with_mission_outbox(&record, &request)
+            .await
+            .unwrap();
+        let claimed = store
+            .claim_session_mission_outbox("workspace-a", "worker", 100, 50, 10)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let mission = Arc::new(
+            runtime::MissionRuntime::event_sourced(
+                Arc::new(runtime::RuntimeEventStore::try_open_in_memory().unwrap()),
+                "workspace-a",
+            )
+            .unwrap(),
+        );
+
+        materialize_mission_membership(&store, &mission, "worker", claimed).await;
+
+        assert!(mission.get_session("mission-session").is_some());
+        assert_eq!(
+            store
+                .get_session_mission_outbox("mission-register-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            memory::OutboxStatus::Materialized
+        );
+    }
+
+    #[tokio::test]
+    async fn mission_membership_replay_after_lost_ack_is_idempotent() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let now = chrono::Utc::now().to_rfc3339();
+        let record = SessionRecord {
+            session_id: "mission-replay".to_string(),
+            platform: "test".to_string(),
+            chat_id: "mission-replay".to_string(),
+            user_id: None,
+            model: None,
+            created_at: now.clone(),
+            last_activity: now,
+            message_count: 0,
+            reset_policy: "manual".to_string(),
+            metadata_json: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            estimated_cost_usd: 0.0,
+            status: "active".to_string(),
+        };
+        let request = SessionMissionOutboxRequest {
+            request_id: "mission-replay-1".to_string(),
+            session_id: record.session_id.clone(),
+            title: "Replay session".to_string(),
+            workspace_key: "workspace-a".to_string(),
+            operation: SessionMissionOutboxOperation::Register,
+            created_at_ms: 100,
+        };
+        store
+            .upsert_session_with_mission_outbox(&record, &request)
+            .await
+            .unwrap();
+        let mission = Arc::new(
+            runtime::MissionRuntime::event_sourced(
+                Arc::new(runtime::RuntimeEventStore::try_open_in_memory().unwrap()),
+                "workspace-a",
+            )
+            .unwrap(),
+        );
+        let first = store
+            .claim_session_mission_outbox("workspace-a", "worker-a", 100, 50, 10)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        // Runtime applied the event, but the bridge process lost ownership
+        // before the acknowledgement. A restarted worker must replay safely.
+        materialize_mission_membership(&store, &mission, "wrong-worker", first).await;
+        let replay = store
+            .claim_session_mission_outbox("workspace-a", "worker-b", 150, 50, 10)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        materialize_mission_membership(&store, &mission, "worker-b", replay).await;
+
+        assert_eq!(mission.list_sessions().len(), 1);
+        assert_eq!(
+            mission
+                .events()
+                .iter()
+                .filter(|event| event.event_type == "mission.session.registered")
+                .count(),
+            1
+        );
+        assert_eq!(
+            store
+                .get_session_mission_outbox("mission-replay-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            memory::OutboxStatus::Materialized
+        );
+    }
+
+    #[tokio::test]
     async fn append_success_ack_failure_replays_without_duplicate_message_or_event() {
         let (event_store, store, event_bus, mut rx) = delivery_fixture().await;
         event_store
@@ -307,7 +565,12 @@ mod tests {
 
         deliver_terminal(&event_store, &store, &event_bus, "wrong-owner", record).await;
         assert_eq!(store.get_messages("s1", 0, 10).await.unwrap().len(), 1);
-        assert!(rx.try_recv().is_ok());
+        let terminal_event: serde_json::Value =
+            serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(terminal_event["type"], "TerminalCommitted");
+        assert_eq!(terminal_event["terminal_id"], "t1");
+        assert_eq!(terminal_event["message_id"], "m1");
+        assert_eq!(terminal_event["runtime_commit_cursor"], 7);
         assert_eq!(
             event_store.session_terminal("t1").unwrap().unwrap().status,
             "claimed"

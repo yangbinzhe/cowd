@@ -59,7 +59,7 @@ fn deep_task_closure_links_strategy_execution_graph_memory_matrix_and_final_gate
         "verified closure should pass regression gate"
     );
     assert!(
-        !trace.finalization_blocked,
+        !trace.verification_blocked,
         "evidence-backed closure should finalize"
     );
     assert!(
@@ -93,7 +93,7 @@ fn deep_task_closure_links_strategy_execution_graph_memory_matrix_and_final_gate
     let observation = runtime::eval_gate::ScenarioObservation {
         scenario_id: "deep_task_closure".to_string(),
         strategy_pattern: trace.execution_decision.strategy.pattern,
-        finalization_blocked: trace.finalization_blocked,
+        verification_blocked: trace.verification_blocked,
         regression_allowed: trace.regression_gate.allowed,
         has_execution_graph: trace.execution_graph.is_some(),
         execution_graph_quality_ok: quality.is_dag
@@ -124,7 +124,7 @@ fn failure_repair_scenario_blocks_finalization_and_exposes_repair_owner() {
     );
     let trace = kernel.finalize("", 0, 0);
 
-    assert!(trace.finalization_blocked);
+    assert!(trace.verification_blocked);
     assert!(!trace.regression_gate.allowed);
     assert!(trace.learning_record.has_blocker());
     assert!(

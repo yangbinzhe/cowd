@@ -223,12 +223,12 @@ fn affected_owner(kind: &EvolutionRootCauseKind) -> &'static str {
 fn affected_files(kind: &EvolutionRootCauseKind) -> Vec<String> {
     match kind {
         EvolutionRootCauseKind::RuntimeControlPolicyGap => vec![
-            "crates/runtime/src/self_regulation".to_string(),
+            "crates/runtime/src/execution_core/goal".to_string(),
             "crates/runtime/src/conversation".to_string(),
         ],
         EvolutionRootCauseKind::ContextPolicyGap => vec![
             "crates/runtime/src/context".to_string(),
-            "crates/runtime/src/self_regulation".to_string(),
+            "crates/runtime/src/execution_core/goal".to_string(),
         ],
         EvolutionRootCauseKind::MemoryGovernanceGap => vec![
             "crates/runtime/src/context".to_string(),

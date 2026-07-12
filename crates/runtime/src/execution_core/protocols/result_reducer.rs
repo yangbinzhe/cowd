@@ -2,9 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use harness_contract::agent::{AgentTaskPacket, AgentTerminalStatus};
-use harness_contract::execution_graph::{
-    ExecutionFailure, ExecutionNodeResult, ExecutionNodeStatus, ExecutionUsage,
-};
+use harness_contract::execution_graph::{ExecutionNodeResult, ExecutionNodeStatus, ExecutionUsage};
 
 use crate::execution_core::graph::executors::{SynthesizeBackend, SynthesizeBackendResolver};
 use crate::execution_core::graph::{
@@ -58,6 +56,7 @@ impl SynthesizeBackend for ProtocolResultReducer {
         let mut evidence = Vec::new();
         let mut usage = ExecutionUsage::default();
         let mut blockers = Vec::new();
+        let mut allows_unresolved = false;
 
         for node in graph.nodes.iter().filter(|node| {
             node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask
@@ -93,6 +92,10 @@ impl SynthesizeBackend for ProtocolResultReducer {
                 .iter()
                 .find_map(|constraint| constraint.strip_prefix("protocol_role:"))
                 .unwrap_or("agent");
+            allows_unresolved |= packet
+                .constraints
+                .iter()
+                .any(|constraint| constraint == "protocol_allows_unresolved:true");
             match returned.status {
                 AgentTerminalStatus::Completed => {
                     summaries.push(format!("## {role}\n{}", returned.outcome))
@@ -108,31 +111,46 @@ impl SynthesizeBackend for ProtocolResultReducer {
             }
         }
 
-        let (status, result_ref, failure) = if blockers.is_empty() {
-            if summaries.is_empty() {
-                return Err("protocol synthesis has no completed AgentRuntime results".to_string());
-            }
-            let answer = summaries.join("\n\n");
-            (
-                ExecutionNodeStatus::Completed,
-                Some(format!(
-                    "assistant_json:{}",
-                    serde_json::to_string(&answer).map_err(|error| error.to_string())?
-                )),
-                None,
-            )
-        } else {
-            (
-                ExecutionNodeStatus::Blocked,
-                None,
-                Some(ExecutionFailure {
+        if summaries.is_empty() {
+            return Err("protocol synthesis has no completed AgentRuntime results".to_string());
+        }
+        if !blockers.is_empty() && !allows_unresolved {
+            return Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
+                status: ExecutionNodeStatus::Blocked,
+                result_ref: None,
+                evidence_refs: evidence.clone(),
+                failure: Some(harness_contract::execution_graph::ExecutionFailure {
                     kind: "protocol_agent_terminal_failure".to_string(),
                     message: blockers.join("; "),
                     retryable: false,
-                    evidence_refs: evidence.clone(),
+                    evidence_refs: evidence,
                 }),
-            )
-        };
+                usage,
+                finished_at_ms: crate::tool_invocation::now_ms(),
+            }));
+        }
+        // A protocol that explicitly allows unresolved findings must converge
+        // with the completed lanes and name failed lanes in the durable final
+        // result. Agent lifecycle records remain terminal failures; this is
+        // not a success rewrite, it prevents a single unavailable worker from
+        // destroying independently verified team evidence.
+        let mut answer = summaries.join("\n\n");
+        if !blockers.is_empty() {
+            answer.push_str("\n\n## Unresolved role outcomes\n");
+            for blocker in blockers {
+                answer.push_str("- ");
+                answer.push_str(&blocker);
+                answer.push('\n');
+            }
+        }
+        let (status, result_ref, failure) = (
+            ExecutionNodeStatus::Completed,
+            Some(format!(
+                "assistant_json:{}",
+                serde_json::to_string(&answer).map_err(|error| error.to_string())?
+            )),
+            None,
+        );
         Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
             status,
             result_ref,

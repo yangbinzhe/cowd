@@ -25,11 +25,23 @@ pub fn checkpoint_instruction(
             SessionInputStatus::ControlResolved => "control",
             _ => "input",
         };
+        let proposal = record.relation_proposal.as_ref().map_or_else(
+            || "no lifecycle proposal".to_string(),
+            |proposal| {
+                format!(
+                    "proposal={:?} confidence={} reasons={}",
+                    proposal.candidate,
+                    proposal.confidence_basis_points,
+                    proposal.reasons.join(",")
+                )
+            },
+        );
         lines.push(format!(
-            "- {} `{}` ({:?}): {}",
+            "- {} `{}` ({:?}; {}): {}",
             marker,
             record.envelope.input_id.as_str(),
             record.decision,
+            proposal,
             record.envelope.content
         ));
     }

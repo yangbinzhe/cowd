@@ -85,12 +85,18 @@ pub mod mcp_server;
 mod mcp_stdio;
 #[path = "infrastructure/mcp_tool_bridge.rs"]
 pub mod mcp_tool_bridge;
+#[path = "mission/command_router.rs"]
+pub mod mission_command_router;
 #[path = "mission/mission_control.rs"]
 pub mod mission_control;
 #[path = "mission/mission_evidence.rs"]
 pub mod mission_evidence;
 #[path = "mission/mission_runtime.rs"]
 pub mod mission_runtime;
+#[path = "mission/runtime_port.rs"]
+pub mod mission_runtime_port;
+#[path = "mission/mission_schedule.rs"]
+pub mod mission_schedule;
 pub mod module_map;
 #[path = "policy/permission_enforcer.rs"]
 pub mod permission_enforcer;
@@ -161,6 +167,8 @@ pub mod evidence_planner;
 pub mod evolution;
 #[path = "execution_core/mod.rs"]
 pub mod execution_core;
+#[path = "projection/mod.rs"]
+pub mod execution_projection;
 #[path = "infrastructure/execution_scheduler.rs"]
 pub mod execution_scheduler;
 #[path = "context/fact_extraction.rs"]
@@ -187,6 +195,8 @@ pub mod projection;
 pub mod provider_registry;
 #[path = "provider/provider_runtime_client.rs"]
 pub mod provider_runtime_client;
+#[path = "provider/transport_policy.rs"]
+pub mod provider_transport_policy;
 #[path = "infrastructure/quality_gate.rs"]
 pub mod quality_gate;
 #[path = "context/reality_decision.rs"]
@@ -199,8 +209,6 @@ pub mod runtime_event_replay;
 pub mod runtime_event_store;
 #[path = "mission/runtime_harness.rs"]
 pub mod runtime_harness;
-#[path = "self_regulation/mod.rs"]
-pub mod self_regulation;
 #[path = "session/session_execution.rs"]
 pub mod session_execution;
 #[path = "session/session_input.rs"]
@@ -221,10 +229,6 @@ pub mod stale_base;
 pub mod stale_branch;
 #[path = "steward/steward_agent.rs"]
 pub mod steward_agent;
-#[path = "steward/steward_runtime.rs"]
-pub mod steward_runtime;
-#[path = "steward/steward_scheduler.rs"]
-pub mod steward_scheduler;
 pub mod structured_data;
 #[path = "conversation/summary_compression.rs"]
 pub mod summary_compression;
@@ -270,8 +274,6 @@ pub mod tool_policy;
 pub mod trust_resolver;
 #[path = "conversation/turn_inbox.rs"]
 pub mod turn_inbox;
-#[path = "conversation/turn_supervisor.rs"]
-pub mod turn_supervisor;
 #[path = "upgrade/mod.rs"]
 pub mod upgrade;
 #[path = "provider/usage.rs"]
@@ -444,6 +446,10 @@ pub use evolution::{
     EvolutionSkillDraft, EvolutionTriageCluster, EvolutionTriageService,
     EvolutionVerificationResult, EvolutionVersionRecord, IsolatedRunner, WorktreeRunner,
 };
+pub use harness_contract::turn::{
+    InputRelationKind, InputRelationProposal, SessionDispatchAction, SessionDispatchCommand,
+    SessionDispatchReceipt, SessionHandoff, SessionResultPacket,
+};
 pub use mcp::{
     mcp_server_signature, mcp_tool_name, mcp_tool_prefix, normalize_name_for_mcp,
     scoped_mcp_config_hash, unwrap_ccr_proxy_url,
@@ -470,19 +476,23 @@ pub use mission_command_interpreter::{
     MissionCommandExecutionReceipt, MissionCommandInterpretRequest, MissionCommandInterpretation,
     MissionCommandInterpreter, MissionCommandTargetKind, MissionInterpretedCommand,
 };
+pub use mission_command_router::execute_mission_command;
 pub use mission_control::{
     MissionControlAction, MissionControlAgentNode, MissionControlApprovalNode,
     MissionControlCommand, MissionControlCommandReceipt, MissionControlCommandStatus,
     MissionControlCommandTarget, MissionControlEventDigest, MissionControlEventLine,
     MissionControlProjection, MissionControlRuntime, MissionControlSessionNode,
-    MissionControlStewardNode, MissionControlSummary, MissionControlTeamNode, MissionWorkspace,
+    MissionControlSummary, MissionControlTeamNode, MissionWorkspace,
 };
 pub use mission_evidence::{MissionEvidenceBus, MissionEvidenceRef};
 pub use mission_runtime::{
-    MissionCommandReceipt, MissionEvent, MissionProjection, MissionRecoveryReport,
-    MissionRoutedCommand, MissionRuntime, MissionSessionCommand, MissionSessionCommandKind,
-    MissionSessionCommandStatus, MissionSessionCommandSummary, MissionSessionSnapshot,
-    MissionSessionStatus, StartMissionSessionRequest,
+    MissionEvent, MissionProjection, MissionRuntime, MissionSessionSnapshot,
+    MissionSessionStateReceipt, MissionSessionStatus, StartMissionSessionRequest,
+};
+pub use mission_runtime_port::MissionRuntimePort;
+pub use mission_schedule::{
+    CreateMissionScheduleRequest, MissionScheduleDispatchReport, MissionScheduleStore,
+    MissionScheduleTickReport, UpdateMissionScheduleRequest,
 };
 pub use module_map::{
     runtime_module_map, runtime_module_names_by_domain, RuntimeDomain, RuntimeModuleDescriptor,
@@ -524,6 +534,7 @@ pub use provider_runtime_client::{
     push_provider_output_block, ProviderOutputContentBlock, ProviderRuntimeClient,
     ProviderToolDefinition,
 };
+pub use provider_transport_policy::ProviderTransportPolicy;
 pub use reality_decision::{
     RealityContextBudgetPlan, RealityFactPlan, RealityFactPlanItem, RealityKnowledgeDecision,
     RealityMemoryDecision, RealityRecallQualityReport, RealityRuntimeDecision,
@@ -561,20 +572,15 @@ pub use sandbox::{
     FilesystemIsolationMode, LinuxSandboxCommand, SandboxConfig, SandboxDetectionInputs,
     SandboxRequest, SandboxStatus,
 };
-pub use self_regulation::{
-    AdaptiveController, RuntimeAdaptiveDecision, RuntimeAdaptiveDecisionKind,
-    RuntimeCorrectiveAction, RuntimeProgressLedger, RuntimeSelfRegulationEvent,
-    RuntimeSelfRegulationPolicy, RuntimeStepObservation,
-};
 pub use session::{
     ContentBlock, ConversationMessage, MessageEvent, MessageRole, Session, SessionCompaction,
     SessionError, SessionEventLog, SessionFork, SessionPromptEntry,
 };
 pub use session_execution::{
-    session_ingress_graph_id, CrossSessionMessage, SessionDispatchMode, SessionExecutionPolicy,
-    SessionIngressExecutionReceipt, SessionIngressExecutor, SessionInputRouteReceipt,
-    SessionInputRouteReport, SessionInputRouter, SessionInputRouterError, SessionRecoveryCandidate,
-    SESSION_DISPATCH_EXECUTOR,
+    session_ingress_graph_id, SessionDispatchMode, SessionExecutionPolicy,
+    SessionHandoffResolution, SessionIngressExecutionReceipt, SessionIngressExecutor,
+    SessionInputRouteReceipt, SessionInputRouteReport, SessionInputRouter, SessionInputRouterError,
+    SessionRecoveryCandidate, SESSION_DISPATCH_EXECUTOR,
 };
 pub use session_input::{SessionInputRecord, SessionInputStream};
 pub use session_relation_graph::{
@@ -599,16 +605,6 @@ pub use stale_branch::{
 };
 pub use steward_agent::{
     StewardActionRequest, StewardActionStatus, StewardAgent, StewardDecisionRecord,
-};
-pub use steward_runtime::{
-    global_steward_runtime_service, StartStewardRuntimeRequest, StewardEvent, StewardHandoffReport,
-    StewardLoopReport, StewardRuntimeProjection, StewardRuntimeService, StewardSession,
-    StewardStatus, TickStewardRuntimeRequest,
-};
-pub use steward_scheduler::{
-    global_steward_decision_ledger, StewardAutomationPolicy, StewardAutomationPolicySpec,
-    StewardDecisionLedger, StewardDecisionLedgerRecord, StewardScheduler, StewardSchedulerConfig,
-    StewardSchedulerHandoffSummary, StewardSchedulerProjection, StewardSchedulerTickReport,
 };
 pub use task_packet::{
     validate_packet, TaskPacket, TaskPacketValidationError, TaskScope, ValidatedPacket,
@@ -639,10 +635,6 @@ pub use tool_orchestrator::{
 };
 pub use tool_policy::{ToolExecutionPolicyDecision, ToolPolicy, ToolPolicyError};
 pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};
-pub use turn_supervisor::{
-    fingerprint_tool_call, SupervisorDecision, ToolCallFingerprint, ToolProgressObservation,
-    TurnSupervisor,
-};
 pub use upgrade::{
     ClosureUpgradeInventoryCollector, LegacyExecutionImportError, LegacyExecutionImportReceipt,
     LegacyExecutionImporter, UpgradeCarrierRecord, UpgradeCarrierStatus,
@@ -681,8 +673,8 @@ pub use context_runtime::{
     ToolTracePacket, ToolTraceStatus, WorkspacePacket,
 };
 pub use runtime_control::{
-    AgentControlPolicy, ContextControlPolicy, MemoryControlPolicy, ObservabilityPolicy,
-    PermissionControlPolicy, RuntimeControlPolicy, TaskControlPolicy,
+    AgentControlPolicy, ContextControlPolicy, MemoryControlPolicy, MissionSchedulePolicy,
+    ObservabilityPolicy, PermissionControlPolicy, RuntimeControlPolicy, TaskControlPolicy,
 };
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {

@@ -1,6 +1,7 @@
 use std::{
+    collections::HashMap,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{atomic::AtomicBool, Arc, Mutex},
 };
 
 use harness_contract::{
@@ -59,13 +60,11 @@ pub(crate) use mfg_service::{
     MfgService,
 };
 pub(crate) use mission_service::{
-    AddMissionRelationHttpRequest, AttachMissionAgentHttpRequest, AttachMissionTeamHttpRequest,
-    ConsumeMissionSessionCommandHttpRequest, DecideMissionApprovalHttpRequest,
-    InterpretMissionCommandHttpRequest, InterruptMissionStewardHttpRequest,
-    MissionSessionCommandConsumeMode, MissionTeamHandoffHttpRequest,
-    RouteMissionCommandHttpRequest, StartMissionSessionHttpRequest, StartMissionStewardHttpRequest,
-    StartMissionTeamRuntimeHttpRequest, SubmitAgentTaskOutcomeHttpRequest,
-    SubmitMissionApprovalHttpRequest, TickMissionStewardHttpRequest, UpsertMissionProxyHttpRequest,
+    AddMissionRelationHttpRequest, CreateMissionScheduleHttpRequest,
+    DecideMissionApprovalHttpRequest, InterpretMissionCommandHttpRequest,
+    StartMissionSessionHttpRequest, StartMissionTeamRuntimeHttpRequest,
+    SubmitMissionApprovalHttpRequest, UpdateMissionScheduleHttpRequest,
+    UpsertMissionProxyHttpRequest,
 };
 pub(crate) use reality_service::RealityService;
 pub(crate) use receipt::{service_envelope, ServiceEnvelope};
@@ -227,7 +226,21 @@ pub(crate) struct AuditService {
 pub(crate) struct HarnessEvalService {
     pub(crate) label: &'static str,
     pub(crate) owner: &'static str,
+    pub(crate) active_jobs: HarnessEvalJobRegistry,
 }
+
+/// Process-local worker registry owned by the Gateway service instance.
+/// Durable run state remains in `HarnessEvalReportStore`; this only tracks
+/// cancellable workers currently owned by this process.
+#[derive(Clone)]
+pub(crate) struct ActiveHarnessEvalJob {
+    pub(crate) run_id: String,
+    pub(crate) level: String,
+    pub(crate) requested_at_ms: u128,
+    pub(crate) cancel_requested: Arc<AtomicBool>,
+}
+
+pub(crate) type HarnessEvalJobRegistry = Arc<Mutex<HashMap<String, ActiveHarnessEvalJob>>>;
 
 #[derive(Clone)]
 pub(crate) struct EvolutionService {
@@ -515,7 +528,7 @@ pub(crate) struct AgentService {
 pub(crate) struct MissionService {
     pub(crate) label: &'static str,
     pub(crate) owner: &'static str,
-    runtime_services: Option<Arc<runtime::RuntimeServices>>,
+    runtime_port: Option<runtime::MissionRuntimePort>,
 }
 
 impl AgentService {

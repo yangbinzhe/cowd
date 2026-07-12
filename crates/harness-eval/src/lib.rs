@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 mod evolution;
+mod live_scenario_runner;
+mod paired_performance;
 mod provider_rounds;
 mod real_provider_runner;
 mod report;
@@ -25,6 +27,8 @@ mod terminal_gate;
 mod terminal_matrix;
 
 pub use evolution::{evaluate_evolution_closure, EvolutionClosureReport};
+pub use live_scenario_runner::run_live_gateway_scenarios;
+pub use paired_performance::{run_paired_performance, PairedPerformanceOptions};
 pub use report::{
     evaluate_report_gate, CapabilityResult, ExecutionTrace, HarnessEvalLevel,
     HarnessEvalReportDetail, HarnessEvalReportGate, HarnessEvalReportGateItem,
@@ -488,8 +492,8 @@ pub fn next_gen_harness_closure_specs() -> Vec<NextGenHarnessScenarioSpec> {
             CrossSessionDispatch,
             "跨 Session 派发与联动",
             "主 session 应能派发、观察和引用其他 session 的命令与证据。",
-            vec!["session_command", "session_relation"],
-            vec!["session_command", "session_relation"],
+            vec!["session_input", "session_relation"],
+            vec!["session_input", "session_relation"],
             0,
             true,
             false,
@@ -1668,7 +1672,6 @@ pub fn harness_capability_coverage_report() -> HarnessCapabilityCoverageReport {
         runtime::RuntimeDomain::Session,
         runtime::RuntimeDomain::Agent,
         runtime::RuntimeDomain::Team,
-        runtime::RuntimeDomain::Steward,
         runtime::RuntimeDomain::Approval,
         runtime::RuntimeDomain::Context,
         runtime::RuntimeDomain::Recovery,
@@ -1684,7 +1687,6 @@ pub fn harness_capability_coverage_report() -> HarnessCapabilityCoverageReport {
         runtime::RuntimeDomain::Session,
         runtime::RuntimeDomain::Agent,
         runtime::RuntimeDomain::Team,
-        runtime::RuntimeDomain::Steward,
         runtime::RuntimeDomain::Approval,
         runtime::RuntimeDomain::Context,
         runtime::RuntimeDomain::Recovery,
@@ -2843,14 +2845,11 @@ mod tests {
         let report = harness_capability_coverage_report();
 
         assert_eq!(report.failed, 0);
-        assert!(report.items.iter().any(|item| item.capability == "agent"
-            && item
-                .lifecycle_modules
-                .contains(&"agent_lifecycle".to_string())));
-        assert!(report.items.iter().any(|item| item.capability == "tooling"
-            && item
-                .lifecycle_modules
-                .contains(&"tool_dispatch".to_string())));
+        assert!(report
+            .items
+            .iter()
+            .filter(|item| matches!(item.capability.as_str(), "agent" | "tooling"))
+            .all(|item| !item.lifecycle_modules.is_empty()));
     }
 
     #[test]

@@ -220,7 +220,8 @@ pub use state_rebuilder::{
     StateItem, StateRebuilder, StateSource,
 };
 pub use store::session::{
-    OutboxFailureClass, OutboxStatus, SessionEvent, SessionMessage, SessionRecord,
+    OutboxFailureClass, OutboxStatus, SessionEvent, SessionMessage, SessionMissionOutboxOperation,
+    SessionMissionOutboxRecord, SessionMissionOutboxRequest, SessionRecord,
     SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest,
     SessionSearchResult, SessionSnapshot,
 };

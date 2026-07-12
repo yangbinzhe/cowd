@@ -2384,6 +2384,38 @@ fn parse_optional_runtime_control_config(
             config.policy.memory.max_candidates_per_turn = max;
         }
     }
+    if let Some(schedule_value) = control.get("mission_schedule") {
+        let schedule = expect_object(
+            schedule_value,
+            "merged settings.runtime.control.mission_schedule",
+        )?;
+        if let Some(enabled) = optional_bool(
+            schedule,
+            "enabled",
+            "merged settings.runtime.control.mission_schedule",
+        )? {
+            config.policy.mission_schedule.enabled = enabled;
+        }
+        if let Some(tick_interval_ms) = optional_u64(
+            schedule,
+            "tick_interval_ms",
+            "merged settings.runtime.control.mission_schedule",
+        )? {
+            config.policy.mission_schedule.tick_interval_ms = tick_interval_ms;
+        }
+        if let Some(grace_ms) = optional_u64(
+            schedule,
+            "grace_ms",
+            "merged settings.runtime.control.mission_schedule",
+        )? {
+            config.policy.mission_schedule.grace_ms = grace_ms;
+        }
+        config
+            .policy
+            .mission_schedule
+            .validate()
+            .map_err(ConfigError::Parse)?;
+    }
     if let Some(permission_value) = control.get("permission") {
         let permission = expect_object(
             permission_value,
@@ -3284,6 +3316,10 @@ approval:
                   },
                   "context": {
                     "collaboration_budget_tokens": 16000
+                  },
+                  "mission_schedule": {
+                    "tick_interval_ms": 1500,
+                    "grace_ms": 120000
                   }
                 }
               }
@@ -3323,6 +3359,8 @@ approval:
         assert_eq!(runtime.policy.task.max_failures_before_review, 1);
         assert_eq!(runtime.policy.context.collaboration_budget_tokens, 16_000);
         assert_eq!(runtime.policy.memory.max_candidates_per_turn, 3);
+        assert_eq!(runtime.policy.mission_schedule.tick_interval_ms, 1_500);
+        assert_eq!(runtime.policy.mission_schedule.grace_ms, 120_000);
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

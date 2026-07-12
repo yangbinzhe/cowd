@@ -100,6 +100,14 @@ fn all_compilers_emit_only_canonical_task_verify_and_synthesize_nodes() {
             assert_eq!(task.node_id, node.id);
             assert_eq!(task.expected_graph_revision, 0);
             assert_eq!(task.budget_lease.max_tokens, 4_096);
+            assert_eq!(
+                task.constraints
+                    .iter()
+                    .any(|constraint| constraint == "protocol_allows_unresolved:true"),
+                spec.stop_policy.allows_unresolved,
+                "protocol {} must make its partial-result policy explicit in every role packet",
+                spec.protocol_ref(),
+            );
         }
         assert!(graph.nodes.iter().all(|node| {
             matches!(
@@ -166,33 +174,29 @@ fn debate_adds_one_repair_node_only_when_requested() {
 }
 
 #[test]
-fn jps_fans_out_independent_solutions_and_merges_a_conflict_matrix() {
+fn jps_fans_out_independent_evidence_lanes_then_synthesizes_once() {
     let mut request = request(ProtocolId::Jps, "protocol-jps-fanout");
     request.fanout = 3;
     let graph = compile_jps(&request).expect("jps graph");
-    let frame = role_nodes(&graph, "frame");
     let solutions = role_nodes(&graph, "solution");
-    let evaluation = role_nodes(&graph, "evaluation");
-    let conflict = role_nodes(&graph, "conflict_matrix");
-    assert_eq!(frame.len(), 1);
+    let synthesis = role_nodes(&graph, "decision_synthesis");
     assert_eq!(solutions.len(), 3);
-    assert_eq!(evaluation.len(), 1);
-    assert_eq!(conflict.len(), 1);
+    assert_eq!(synthesis.len(), 1);
+    assert!(role_nodes(&graph, "frame").is_empty());
+    assert!(role_nodes(&graph, "evaluation").is_empty());
+    assert!(role_nodes(&graph, "conflict_matrix").is_empty());
     assert!(solutions
         .iter()
-        .all(|solution| has_dependency(&graph, frame[0], solution)));
-    assert!(solutions
-        .iter()
-        .all(|solution| has_dependency(&graph, solution, conflict[0])));
+        .all(|solution| has_dependency(&graph, solution, synthesis[0])));
     assert!(packet(
         graph
             .nodes
             .iter()
-            .find(|node| node.id == conflict[0])
-            .expect("conflict node")
+            .find(|node| node.id == synthesis[0])
+            .expect("synthesis node")
     )
     .acceptance
-    .contains(&"conflict_matrix".to_string()));
+    .contains(&"conflict_resolution".to_string()));
 }
 
 #[test]

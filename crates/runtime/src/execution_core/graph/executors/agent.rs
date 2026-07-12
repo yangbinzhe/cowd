@@ -129,24 +129,37 @@ impl NodeExecutor for AgentTaskExecutor {
             node_id: ticket.node_id.clone(),
             reason: reason.to_string(),
         })?;
-        let status = match returned.status {
-            AgentTerminalStatus::Completed => ExecutionNodeStatus::Completed,
-            AgentTerminalStatus::Failed => ExecutionNodeStatus::Failed,
-            AgentTerminalStatus::Cancelled => ExecutionNodeStatus::Cancelled,
-            AgentTerminalStatus::Blocked => ExecutionNodeStatus::Blocked,
-        };
-        let failure = returned.failure.clone().map(|message| ExecutionFailure {
-            kind: "agent_backend".into(),
-            message,
-            retryable: false,
-            evidence_refs: returned.evidence_refs.clone(),
-        });
+        let unresolved_tolerated = packet
+            .constraints
+            .iter()
+            .any(|constraint| constraint == "protocol_allows_unresolved:true");
+        let status = execution_status_for_agent_terminal(returned.status, unresolved_tolerated);
+        let failure = (status != ExecutionNodeStatus::Completed)
+            .then(|| returned.failure.clone())
+            .flatten()
+            .map(|message| ExecutionFailure {
+                kind: "agent_backend".into(),
+                message,
+                retryable: false,
+                evidence_refs: returned.evidence_refs.clone(),
+            });
         Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
             status,
-            result_ref: Some(format!("agent-return:{}", returned.run_id)),
+            result_ref: Some(format!(
+                "agent-return:{}{}",
+                returned.run_id,
+                if status == ExecutionNodeStatus::Completed
+                    && returned.status != AgentTerminalStatus::Completed
+                {
+                    ":unresolved"
+                } else {
+                    ""
+                }
+            )),
             evidence_refs: returned.evidence_refs,
             failure,
             usage: ExecutionUsage {
+                model: (!returned.model.trim().is_empty()).then(|| returned.model.clone()),
                 input_tokens: returned.input_tokens,
                 output_tokens: returned.output_tokens,
                 tool_calls: returned.tool_calls,
@@ -154,6 +167,21 @@ impl NodeExecutor for AgentTaskExecutor {
             },
             finished_at_ms: crate::tool_invocation::now_ms(),
         }))
+    }
+}
+
+fn execution_status_for_agent_terminal(
+    status: AgentTerminalStatus,
+    unresolved_tolerated: bool,
+) -> ExecutionNodeStatus {
+    match status {
+        AgentTerminalStatus::Completed => ExecutionNodeStatus::Completed,
+        AgentTerminalStatus::Failed | AgentTerminalStatus::Blocked if unresolved_tolerated => {
+            ExecutionNodeStatus::Completed
+        }
+        AgentTerminalStatus::Failed => ExecutionNodeStatus::Failed,
+        AgentTerminalStatus::Cancelled => ExecutionNodeStatus::Cancelled,
+        AgentTerminalStatus::Blocked => ExecutionNodeStatus::Blocked,
     }
 }
 
@@ -251,5 +279,25 @@ mod tests {
     fn accepts_complete_bound_return_packet() {
         let task = task();
         validate_agent_return(&task, &returned(&task)).expect("valid return packet");
+    }
+
+    #[test]
+    fn unresolved_protocol_role_keeps_graph_path_open_without_rewriting_lifecycle() {
+        assert_eq!(
+            execution_status_for_agent_terminal(AgentTerminalStatus::Failed, true),
+            ExecutionNodeStatus::Completed
+        );
+        assert_eq!(
+            execution_status_for_agent_terminal(AgentTerminalStatus::Blocked, true),
+            ExecutionNodeStatus::Completed
+        );
+        assert_eq!(
+            execution_status_for_agent_terminal(AgentTerminalStatus::Failed, false),
+            ExecutionNodeStatus::Failed
+        );
+        assert_eq!(
+            execution_status_for_agent_terminal(AgentTerminalStatus::Cancelled, true),
+            ExecutionNodeStatus::Cancelled
+        );
     }
 }

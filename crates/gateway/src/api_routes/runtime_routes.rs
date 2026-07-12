@@ -2,13 +2,14 @@ use std::{sync::Arc, time::Instant};
 
 use axum::{
     extract::{Path, Query, State as AxumState},
-    http::StatusCode,
-    response::IntoResponse,
+    http::{header, HeaderMap, StatusCode},
+    response::{sse::Event, IntoResponse, Response, Sse},
     routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
 use serde_json::Value;
+use std::convert::Infallible;
 
 mod control;
 use super::{connector_routes, AppState, ErrorResponse};
@@ -30,6 +31,8 @@ struct RuntimeTimelineRef {
 #[derive(Clone, serde::Serialize)]
 pub(in crate::api_routes) struct RuntimeEvent {
     sequence: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commit_cursor: Option<u64>,
     scope: String,
     kind: String,
     status: Option<String>,
@@ -72,6 +75,7 @@ impl From<memory::SessionDomainEvent> for RuntimeEvent {
         };
         Self {
             sequence: event.sequence as u64,
+            commit_cursor: None,
             scope: session_domain_scope_label(event.scope).to_string(),
             kind,
             status,
@@ -125,6 +129,7 @@ impl From<runtime::DurableRuntimeEvent> for RuntimeEvent {
     fn from(event: runtime::DurableRuntimeEvent) -> Self {
         Self {
             sequence: event.sequence,
+            commit_cursor: Some(event.commit_cursor),
             scope: event.scope.as_str().to_string(),
             kind: event.kind,
             status: event.status,
@@ -177,6 +182,9 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             post(retry_runtime_outbox),
         )
         .route("/api/runtime/events", get(get_runtime_events))
+        .merge(super::route_registry::register_execution_projection_routes(
+            Router::new(),
+        ))
         .route(
             "/api/runtime/events/replay-report",
             get(get_runtime_events_replay_report),
@@ -208,6 +216,162 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/runtime/session-leases/release",
             post(release_runtime_session_lease),
         )
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ExecutionProjectionQuery {
+    #[serde(default)]
+    cursor: Option<u64>,
+    #[serde(default)]
+    detail_scope: harness_contract::projection::ProjectionDetailScope,
+}
+
+fn execution_projection_context(
+    state: &AppState,
+    detail_scope: harness_contract::projection::ProjectionDetailScope,
+) -> Result<harness_contract::projection::ProjectionQueryContext, (StatusCode, Json<ErrorResponse>)>
+{
+    let runtime = state.services.runtime.as_ref().ok_or_else(|| {
+        runtime_event_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime service unavailable",
+        )
+    })?;
+    Ok(harness_contract::projection::ProjectionQueryContext {
+        principal: "gateway-local".to_string(),
+        workspace_id: runtime.runtime_services().workspace_key().to_string(),
+        session_scopes: Vec::new(),
+        mission_scopes: Vec::new(),
+        visibility_grants: vec!["gateway-local".to_string()],
+        detail_scope,
+        authorization_revision: 1,
+    })
+}
+
+fn execution_runtime(
+    state: &AppState,
+) -> Result<Arc<runtime::RuntimeServices>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.runtime_services())
+        .ok_or_else(|| {
+            runtime_event_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "runtime service unavailable",
+            )
+        })
+}
+
+fn projection_error(error: runtime::RuntimeServicesError) -> (StatusCode, Json<ErrorResponse>) {
+    let status = if matches!(error, runtime::RuntimeServicesError::ProjectionAccessDenied) {
+        StatusCode::FORBIDDEN
+    } else {
+        StatusCode::NOT_FOUND
+    };
+    runtime_event_error(status, error)
+}
+
+pub(super) async fn get_execution_projection(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(execution_id): Path<String>,
+    Query(query): Query<ExecutionProjectionQuery>,
+) -> Result<
+    Json<harness_contract::projection::ExecutionProjection>,
+    (StatusCode, Json<ErrorResponse>),
+> {
+    let context = execution_projection_context(&state, query.detail_scope)?;
+    let runtime = execution_runtime(&state)?;
+    runtime::execution_projection::snapshot(&runtime, &execution_id, &context)
+        .await
+        .map(Json)
+        .map_err(projection_error)
+}
+
+pub(super) async fn get_execution_projection_events(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(execution_id): Path<String>,
+    Query(query): Query<ExecutionProjectionQuery>,
+    headers: HeaderMap,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    let cursor = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .or(query.cursor)
+        .unwrap_or_default();
+    let context = execution_projection_context(&state, query.detail_scope)?;
+    let runtime = execution_runtime(&state)?;
+    let wants_sse = headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("text/event-stream"));
+    if !wants_sse {
+        let delta = runtime::execution_projection::delta(&runtime, &execution_id, cursor, &context)
+            .map_err(projection_error)?;
+        return Ok(Json(delta).into_response());
+    }
+    let stream = futures::stream::unfold(
+        (runtime, execution_id, context, cursor),
+        |(runtime, execution_id, context, mut cursor)| async move {
+            loop {
+                match runtime::execution_projection::delta(
+                    &runtime,
+                    &execution_id,
+                    cursor,
+                    &context,
+                ) {
+                    Ok(delta) if delta.target_cursor > cursor => {
+                        cursor = delta.target_cursor;
+                        let event = Event::default()
+                            .id(cursor.to_string())
+                            .event("projection_delta")
+                            .json_data(delta)
+                            .unwrap_or_else(|_| Event::default().event("projection_error"));
+                        return Some((
+                            Ok::<Event, Infallible>(event),
+                            (runtime, execution_id, context, cursor),
+                        ));
+                    }
+                    Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(500)).await,
+                    Err(error) => {
+                        let event = Event::default().event("projection_resync").data(
+                            serde_json::json!({
+                                "reason": error.to_string(),
+                                "snapshot_url": format!("/api/runtime/executions/{execution_id}"),
+                                "base_cursor": cursor,
+                            })
+                            .to_string(),
+                        );
+                        return Some((Ok(event), (runtime, execution_id, context, cursor)));
+                    }
+                }
+            }
+        },
+    );
+    Ok(Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response())
+}
+
+pub(super) async fn execute_projection_command(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(execution_id): Path<String>,
+    Json(request): Json<harness_contract::projection::ExecutionCommandRequest>,
+) -> Result<
+    Json<harness_contract::projection::ExecutionCommandReceipt>,
+    (StatusCode, Json<ErrorResponse>),
+> {
+    let context = execution_projection_context(
+        &state,
+        harness_contract::projection::ProjectionDetailScope::Full,
+    )?;
+    let runtime = execution_runtime(&state)?;
+    runtime::execution_projection::command(&runtime, &execution_id, &context, request)
+        .await
+        .map(Json)
+        .map_err(projection_error)
 }
 
 #[derive(Debug, Deserialize)]
@@ -531,11 +695,39 @@ async fn record_upgrade_disposition(
                 .cancel_team_runtime(&request.carrier_id)
                 .await
                 .map(|_| ()),
-            "mission_session" => runtime_service
-                .runtime_services()
-                .mission_runtime()
-                .close_session(&request.carrier_id)
-                .map(|_| ()),
+            "mission_session" => {
+                // Maintenance is a surface-originated control action too. It
+                // must use the same durable Mission command boundary as TUI,
+                // WebUI, and API controls instead of mutating the aggregate
+                // directly from this route.
+                let services = runtime_service.runtime_services();
+                let receipt = runtime::execute_mission_command(
+                    services.as_ref(),
+                    harness_contract::mission::MissionCommand {
+                        command_id: format!(
+                            "gateway-upgrade-close-session-{}",
+                            uuid::Uuid::new_v4()
+                        ),
+                        action: harness_contract::mission::MissionCommandAction::Close,
+                        target: harness_contract::mission::MissionCommandTarget::Session {
+                            session_id: request.carrier_id.clone(),
+                        },
+                        actor: request.actor.clone(),
+                        expected_revision: None,
+                        correlation_id: format!("upgrade:{}", request.carrier_id),
+                        payload: Value::Null,
+                        evidence_refs: request.result_refs.clone(),
+                    },
+                )
+                .await;
+                (receipt.status == "accepted")
+                    .then_some(())
+                    .ok_or_else(|| {
+                        receipt
+                            .reason
+                            .unwrap_or_else(|| "mission session close was not accepted".to_string())
+                    })
+            }
             "cross_plane_execution" => Err(
                 "cross-plane executions have no safe cancellation adapter; wait for terminal state before recording drain"
                     .to_string(),
@@ -991,9 +1183,19 @@ pub(super) async fn get_runtime_timeline(
         .into_iter()
         .filter(|event| event.sequence >= from_seq as u64)
         .collect::<Vec<_>>();
-    let lifecycle_total = lifecycle_events.len();
+    let related_execution_events = state
+        .services
+        .runtime_events
+        .store()
+        .execution_events_for_session(&params.session_id, 0, limit)
+        .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let lifecycle_total = lifecycle_events.len() + related_execution_events.len();
     events.extend(lifecycle_events.into_iter().map(RuntimeEvent::from));
+    events.extend(related_execution_events.into_iter().map(RuntimeEvent::from));
     events.sort_by_key(|event| (event.created_at_ms, event.sequence));
+    events.dedup_by(|left, right| {
+        left.source == right.source && left.sequence == right.sequence && left.kind == right.kind
+    });
     let combined_total = domain_total + lifecycle_total;
     let combined_has_more = domain_has_more || events.len() > limit;
     events.truncate(limit);

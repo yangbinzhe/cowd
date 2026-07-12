@@ -144,7 +144,7 @@ pub(crate) fn run_deep_real_provider_review(
 }
 
 fn reviewer_prompt(report_seed: &Value, model: &str) -> String {
-    let mut review_seed = report_seed.clone();
+    let mut review_seed = reviewer_evidence_summary(report_seed);
     review_seed["execution_trace"]["provider_rounds"] = json!(1);
     review_seed["execution_trace"]["rounds"] = json!([{
         "round_index": 1,
@@ -192,6 +192,92 @@ Generate `full-analysis-report.md` for this Cowd harness eval package.
     )
 }
 
+/// Builds the bounded evidence handoff for the optional reviewer model.
+///
+/// Raw Gateway request/response traces remain in the result package for
+/// forensic inspection. Sending them back through a second model call is both
+/// wasteful and misleading: a busy live scenario can make the reviewer input
+/// larger than the execution it is assessing. The reviewer receives only the
+/// verdicts, identities, usage, and trace artifact references required for an
+/// evidence-based assessment.
+fn reviewer_evidence_summary(report: &Value) -> Value {
+    let scenarios = report
+        .get("scenarios")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    json!({
+                        "capability": item.get("capability"),
+                        "status": item.get("status"),
+                        "evidence": item.get("evidence"),
+                        "notes": item.get("notes"),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let execution_trace = report
+        .get("execution_trace")
+        .map(|trace| {
+            json!({
+                "total_elapsed_ms": trace.get("total_elapsed_ms"),
+                "provider_rounds": trace.get("provider_rounds"),
+                "runtime_actions": trace.get("runtime_actions"),
+                "tool_calls": trace.get("tool_calls"),
+                "total_usage": trace.get("total_usage"),
+                "rounds": trace.get("rounds"),
+            })
+        })
+        .unwrap_or(Value::Null);
+    json!({
+        "kind": report.get("kind"),
+        "level": report.get("level"),
+        "status": report.get("status"),
+        "provider": report.get("provider"),
+        "budget": report.get("budget"),
+        "authorized_real_model": report.get("authorized_real_model"),
+        "metrics": report.get("metrics"),
+        "scenarios": scenarios,
+        "stable_ai": {
+            "status": report.pointer("/stable_ai/status"),
+            "coverage": report.pointer("/stable_ai/coverage"),
+        },
+        "reality_context_eval": {
+            "passed": report.pointer("/reality_context_eval/passed"),
+            "failed": report.pointer("/reality_context_eval/failed"),
+            "total": report.pointer("/reality_context_eval/total"),
+        },
+        "mission_runtime_collaboration": {
+            "status": report.pointer("/mission_runtime_collaboration/status"),
+            "selected_strategy": report.pointer("/mission_runtime_collaboration/selected_strategy"),
+            "terminal_evidence": report.pointer("/mission_runtime_collaboration/terminal_evidence"),
+        },
+        "next_gen_harness_closure": {
+            "status": report.pointer("/next_gen_harness_closure/status"),
+            "passed": report.pointer("/next_gen_harness_closure/passed"),
+            "total": report.pointer("/next_gen_harness_closure/total"),
+            "missing_capabilities": report.pointer("/next_gen_harness_closure/missing_capabilities"),
+        },
+        "complex_scenarios": {
+            "passed": report.pointer("/complex_scenarios/passed"),
+            "failed": report.pointer("/complex_scenarios/failed"),
+            "total": report.pointer("/complex_scenarios/total"),
+            "average_score": report.pointer("/complex_scenarios/average_score"),
+        },
+        "live_gateway_scenarios": report.get("live_gateway_scenarios"),
+        "execution_trace": execution_trace,
+        "report_gate": report.get("report_gate"),
+        "evidence_package": {
+            "result_package_dir": report.get("result_package_dir"),
+            "raw_live_trace": "live-scenarios/<scenario>.json",
+            "raw_provider_round": "provider-rounds/<round>.json",
+            "rule": "Raw payloads are retained in the package and deliberately excluded from this reviewer request."
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,5 +301,28 @@ mod tests {
         assert!(!prompt.contains(r#""provider_rounds": 0"#));
         assert!(prompt.contains(r#""value": "1"#));
         assert!(!prompt.contains(r#""value": "0"#));
+    }
+
+    #[test]
+    fn reviewer_prompt_excludes_unbounded_live_http_trace_payloads() {
+        let raw_payload = "x".repeat(200_000);
+        let prompt = reviewer_prompt(
+            &json!({
+                "kind": "mission_harness.eval_report",
+                "level": "deep",
+                "scenarios": [{"capability": "live", "status": "passed", "evidence": "3/3"}],
+                "live_gateway_scenarios": {"status": "passed", "scenarios": [{"trace_artifact": "live-scenarios/live.json"}]},
+                "live_gateway_scenario_details": {"scenarios": [{"trace": raw_payload}]},
+                "execution_trace": {"provider_rounds": 0, "total_usage": {"total_tokens": 0}}
+            }),
+            "deepseek-v4-flash",
+        );
+
+        assert!(prompt.contains("live-scenarios/live.json"));
+        assert!(!prompt.contains(&"x".repeat(1_000)));
+        assert!(
+            prompt.len() < 30_000,
+            "reviewer handoff must remain bounded"
+        );
     }
 }

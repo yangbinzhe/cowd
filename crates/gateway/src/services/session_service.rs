@@ -326,6 +326,21 @@ impl SessionService {
         }
     }
 
+    pub(crate) async fn upsert_stored_session_with_mission_outbox(
+        &self,
+        record: &SessionRecord,
+        request: &memory::store::session::SessionMissionOutboxRequest,
+    ) -> Result<bool, MemoryError> {
+        match self.kernel() {
+            Some(kernel) => {
+                kernel
+                    .upsert_stored_session_with_mission_outbox(record, request)
+                    .await
+            }
+            None => Ok(false),
+        }
+    }
+
     pub(crate) async fn update_stored_session(
         &self,
         record: &SessionRecord,
@@ -342,6 +357,20 @@ impl SessionService {
     ) -> Result<bool, MemoryError> {
         match self.kernel() {
             Some(kernel) => kernel.delete_stored_session(session_id).await,
+            None => Ok(false),
+        }
+    }
+
+    pub(crate) async fn delete_stored_session_with_mission_outbox(
+        &self,
+        request: &memory::store::session::SessionMissionOutboxRequest,
+    ) -> Result<bool, MemoryError> {
+        match self.kernel() {
+            Some(kernel) => {
+                kernel
+                    .delete_stored_session_with_mission_outbox(request)
+                    .await
+            }
             None => Ok(false),
         }
     }

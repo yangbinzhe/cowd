@@ -391,10 +391,7 @@ fn compile_target_allows_category(
 ) -> bool {
     match compile_target {
         RuntimeCompileTarget::InlineModel => category == ToolSafetyCategory::ReadOnly,
-        RuntimeCompileTarget::EvidenceGraph
-        | RuntimeCompileTarget::DeliberationGraph
-        | RuntimeCompileTarget::TeamGraph
-        | RuntimeCompileTarget::MissionGraph => matches!(
+        RuntimeCompileTarget::EvidenceGraph => matches!(
             category,
             ToolSafetyCategory::ReadOnly | ToolSafetyCategory::Network
         ),
@@ -528,8 +525,20 @@ fn resource_scope_for(
     safety_category: ToolSafetyCategory,
 ) -> ToolResourceScope {
     match tool_name {
+        // These calls mutate Runtime-owned state, not workspace files. Giving
+        // them a workspace-wide write scope makes a parent ToolBatch hold the
+        // file lock while `runtime_orchestrate` executes a child graph. That
+        // deadlocks a legitimate child read (for example workspace_snapshot)
+        // behind its own parent. Runtime/state authority is still governed by
+        // the tool contract and inner validator; it is simply not a filesystem
+        // ownership claim.
+        "TodoWrite" | "todo_write" | "session_create" | "memory_create" | "memory_delete" => {
+            ToolResourceScope::runtime()
+        }
         "read_file" | "write_file" | "edit_file" => input
             .get("path")
+            .or_else(|| input.get("file_path"))
+            .or_else(|| input.get("file"))
             .and_then(Value::as_str)
             .map(|path| ToolResourceScope::paths(vec![normalize_resource_path(path)]))
             .unwrap_or_else(ToolResourceScope::unknown),
@@ -820,6 +829,23 @@ mod tests {
     }
 
     #[test]
+    fn read_file_accepts_the_registered_file_path_argument_alias() {
+        let plan = ToolExecutionPlan::from_requests(&[ToolRequest {
+            tool_use_id: "read-file-path".to_string(),
+            tool_name: "read_file".to_string(),
+            input: r#"{"file_path":"crates/runtime/src/lib.rs"}"#.to_string(),
+            depends_on: Vec::new(),
+        }]);
+
+        assert_eq!(plan.tasks[0].purity, ToolPurity::ReadOnlyIdempotent);
+        assert_eq!(plan.tasks[0].resource_scope.kind, "paths");
+        assert_eq!(
+            plan.tasks[0].resource_scope.paths,
+            vec!["crates/runtime/src/lib.rs"]
+        );
+    }
+
+    #[test]
     fn plan_marks_overlapping_write_conflicts() {
         let plan = ToolExecutionPlan::from_requests(&[
             ToolRequest {
@@ -943,36 +969,6 @@ mod tests {
                 .validate_against_execution_decision(&execution)
                 .allowed
         );
-
-        for compile_target in [
-            RuntimeCompileTarget::DeliberationGraph,
-            RuntimeCompileTarget::TeamGraph,
-            RuntimeCompileTarget::MissionGraph,
-        ] {
-            let decision = execution_decision(
-                compile_target,
-                TaskRisk::Low,
-                &[ExecutionModifier::WithExternalResearch],
-                &[],
-            );
-            assert!(
-                read_plan
-                    .validate_against_execution_decision(&decision)
-                    .allowed
-            );
-            assert!(
-                network_plan
-                    .validate_against_execution_decision(&decision)
-                    .allowed
-            );
-            assert_eq!(
-                write_plan
-                    .validate_against_execution_decision(&decision)
-                    .findings,
-                vec!["tool_category_not_allowed_by_compile_target"],
-                "{compile_target:?}"
-            );
-        }
     }
 
     #[test]
@@ -1159,6 +1155,23 @@ mod tests {
             execution_decision(RuntimeCompileTarget::InlineModel, TaskRisk::Low, &[], &[]);
 
         assert!(plan.validate_against_execution_decision(&decision).allowed);
+    }
+
+    #[test]
+    fn runtime_state_updates_do_not_claim_a_workspace_write_scope() {
+        let plan = ToolExecutionPlan::from_requests(&[
+            request("todo-1", "TodoWrite", Vec::new()),
+            request("orchestrate-1", "runtime_orchestrate", Vec::new()),
+        ]);
+
+        assert!(plan
+            .tasks
+            .iter()
+            .all(|task| task.resource_scope.kind == "runtime"));
+        assert!(plan
+            .tasks
+            .iter()
+            .all(|task| task.resource_scope.paths.is_empty()));
     }
 
     #[test]

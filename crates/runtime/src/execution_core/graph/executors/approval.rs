@@ -76,7 +76,15 @@ impl NodeExecutor for ApprovalNodeExecutor {
             node_id: context.node.id,
             executor_kind: Self::KIND.into(),
             attempt: context.attempt,
-            idempotency_key: context.node.idempotency_key,
+            // Waiting for approval is a completed observation, not the
+            // irreversible approved transition. A resumed node must receive
+            // a new effect identity so the Runner does not replay the old
+            // `WaitingApproval` receipt instead of re-reading the durable
+            // approval decision.
+            idempotency_key: format!(
+                "{}:approval-attempt:{}",
+                context.node.idempotency_key, context.attempt
+            ),
             payload_ref: context.node.payload_ref,
         })
     }
@@ -84,6 +92,11 @@ impl NodeExecutor for ApprovalNodeExecutor {
         &self,
         ticket: &NodeExecutionTicket,
     ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+        // A graph approval decision is committed atomically with graph state
+        // by the Runner. Refresh before inspecting the idempotent request so
+        // this executor never reopens an approval that another durable commit
+        // has already resolved.
+        self.queue.refresh();
         let payload: ApprovalPayload =
             serde_json::from_str(&ticket.payload_ref).map_err(|error| NodeExecutorError::Poll {
                 node_id: ticket.node_id.clone(),

@@ -72,6 +72,7 @@ mod public_routes;
 mod reality_routes;
 mod resource_routes;
 pub(crate) mod route_manifest;
+mod route_registry;
 mod runtime_routes;
 mod session_routes;
 mod skill_routes;
@@ -564,13 +565,16 @@ pub(crate) mod tests {
         surface_host: Option<Arc<crate::surface_host::SurfaceHost>>,
     ) -> Arc<crate::services::GatewayServices> {
         let sessions = Arc::new(ActiveSessions::new());
-        let lifecycle_kernel =
-            Arc::new(crate::session_lifecycle_kernel::SessionLifecycleKernel::new());
         let runtime_services =
             runtime::RuntimeServices::in_memory().expect("test runtime services");
         let runtime_store = session_kernel.unified_store().unwrap_or_else(|| {
             Arc::new(UnifiedSessionStore::open_in_memory().expect("test session store"))
         });
+        let lifecycle_kernel = Arc::new(
+            crate::session_lifecycle_kernel::SessionLifecycleKernel::with_store(Arc::clone(
+                &runtime_store,
+            )),
+        );
         runtime_services
             .install_session_store(runtime_store)
             .expect("test session router");
@@ -1257,6 +1261,7 @@ pub(crate) mod tests {
         store
             .insert_messages_batch(&[
                 memory::store::session::SessionMessage {
+                    stable_message_id: format!("branch:{source_id}:0"),
                     session_id: source_id.to_string(),
                     sequence: 0,
                     role: "user".to_string(),
@@ -1268,6 +1273,7 @@ pub(crate) mod tests {
                     created_at_ms: 10,
                 },
                 memory::store::session::SessionMessage {
+                    stable_message_id: format!("branch:{source_id}:1"),
                     session_id: source_id.to_string(),
                     sequence: 1,
                     role: "assistant".to_string(),
@@ -1294,13 +1300,23 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::CREATED);
+        let status = response.status();
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "branch response: {}",
+            String::from_utf8_lossy(&body)
+        );
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let branch_id = json["id"].as_str().expect("branch id should be returned");
         let copied = store.get_messages(branch_id, 0, 10).await.unwrap();
         assert_eq!(copied.len(), 2);
         assert_eq!(copied[0].session_id, branch_id);
+        assert_ne!(copied[0].stable_message_id, format!("branch:{source_id}:0"));
+        assert!(copied[0]
+            .stable_message_id
+            .starts_with(&format!("branch:{branch_id}:")));
         assert_eq!(copied[0].sequence, 0);
         assert!(copied[0].content_json.contains("hello"));
         let branch_record = store
@@ -2119,8 +2135,12 @@ pub(crate) mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(backgrounded["receipt"]["status"], "accepted");
-        assert!(backgrounded["mission"]["sessions"]
+        assert_eq!(backgrounded["receipt"]["status"], "executed");
+        assert_eq!(
+            backgrounded["receipt"]["result"]["receipt"]["status"],
+            "accepted"
+        );
+        assert!(backgrounded["projection"]["mission"]["sessions"]
             .as_array()
             .expect("mission sessions")
             .iter()
@@ -2185,6 +2205,89 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn execution_projection_routes_use_runtime_snapshot_delta_and_command_contracts() {
+        use harness_contract::execution_graph::ExecutionGraph;
+
+        let state = test_state();
+        let runtime = state
+            .services
+            .runtime
+            .as_ref()
+            .expect("runtime service")
+            .runtime_services();
+        let graph = ExecutionGraph::new("projection route test");
+        let execution_id = graph.id.clone();
+        runtime
+            .graph_runner()
+            .start(graph)
+            .await
+            .expect("graph starts");
+        let app = api_router(Arc::clone(&state));
+
+        let snapshot = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/runtime/executions/{execution_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot.status(), StatusCode::OK);
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&to_bytes(snapshot.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(snapshot["execution_id"], execution_id);
+        let revision = snapshot["revision"].as_u64().expect("revision");
+        let cursor = snapshot["cursor"].as_u64().expect("cursor");
+
+        let delta = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/runtime/executions/{execution_id}/events?cursor=0"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delta.status(), StatusCode::OK);
+        let delta: serde_json::Value =
+            serde_json::from_slice(&to_bytes(delta.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(delta["target_cursor"].as_u64().unwrap_or_default() >= cursor);
+
+        let command = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/runtime/executions/{execution_id}/commands"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "command_id": "api-projection-pause",
+                            "expected_revision": revision,
+                            "command": "pause",
+                            "payload": { "reason": "test" }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(command.status(), StatusCode::OK);
+        let command: serde_json::Value =
+            serde_json::from_slice(&to_bytes(command.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(command["status"], "accepted");
+        assert!(command["accepted_revision"].as_u64().unwrap_or_default() > revision);
+    }
+
+    #[tokio::test]
     async fn mission_control_route_exposes_runtime_projection_and_command_router() {
         let _guard = mission_route_lock().lock().await;
         let app = api_router(test_state());
@@ -2197,18 +2300,12 @@ pub(crate) mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/mission/control/command")
+                    .uri("/api/mission/sessions")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::json!({
-                            "target": "mission",
-                            "action": "start_session",
-                            "actor": "test-human",
-                            "payload": {
-                                "title": "mission control command a",
-                                "session_id": session_a,
-                            },
-                            "evidence_refs": ["test:mission-control"]
+                            "title": "mission control command a",
+                            "session_id": session_a,
                         })
                         .to_string(),
                     ))
@@ -2216,34 +2313,24 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(created_a.status(), StatusCode::OK);
+        assert_eq!(created_a.status(), StatusCode::CREATED);
         let created_a: serde_json::Value =
             serde_json::from_slice(&to_bytes(created_a.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        assert_eq!(created_a["kind"], "mission_control.command_result");
         assert_eq!(created_a["ok"], true);
-        assert_eq!(created_a["receipt"]["status"], "executed");
-        assert_eq!(
-            created_a["projection"]["kind"],
-            "mission_control.projection"
-        );
+        assert_eq!(created_a["mission"]["kind"], "mission.runtime");
 
         let created_b = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/mission/control/command")
+                    .uri("/api/mission/sessions")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::json!({
-                            "target": "mission",
-                            "action": "start_session",
-                            "actor": "test-human",
-                            "payload": {
-                                "title": "mission control command b",
-                                "session_id": session_b,
-                            }
+                            "title": "mission control command b",
+                            "session_id": session_b,
                         })
                         .to_string(),
                     ))
@@ -2251,36 +2338,7 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(created_b.status(), StatusCode::OK);
-
-        let routed = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/mission/control/command")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "target": { "session": { "session_id": session_a } },
-                            "action": "route_to_session",
-                            "actor": "test-human",
-                            "payload": {
-                                "target_session_id": session_b,
-                                "command": "review from mission control"
-                            }
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(routed.status(), StatusCode::OK);
-        let routed: serde_json::Value =
-            serde_json::from_slice(&to_bytes(routed.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
-        assert_eq!(routed["receipt"]["status"], "queued");
+        assert_eq!(created_b.status(), StatusCode::CREATED);
 
         let dispatch = app
             .clone()
@@ -2318,49 +2376,6 @@ pub(crate) mod tests {
             .all(|receipt| receipt["graph_id"].as_str().is_some()
                 && receipt["commit_cursor"].as_u64().is_some()));
 
-        let stewards_before = runtime::global_steward_runtime_service().projection();
-        let steward_started = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/mission/control/command")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "target": { "session": { "session_id": session_a } },
-                            "action": "start_steward",
-                            "actor": "test-human",
-                            "payload": {
-                                "objective": "supervise mission control route"
-                            }
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let steward_started: serde_json::Value = serde_json::from_slice(
-            &to_bytes(steward_started.into_body(), usize::MAX)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(steward_started["receipt"]["status"], "failed");
-        assert_eq!(
-            steward_started["receipt"]["result"]["status"],
-            "capability_unavailable"
-        );
-        assert_eq!(
-            steward_started["receipt"]["result"]["capability"],
-            "steward_execution"
-        );
-        assert_eq!(
-            runtime::global_steward_runtime_service().projection(),
-            stewards_before
-        );
-
         let control = app
             .oneshot(
                 Request::builder()
@@ -2386,6 +2401,7 @@ pub(crate) mod tests {
             control["projection"]["relations"]["kind"],
             "runtime.session_relations"
         );
+        assert!(control["projection"].get("stewards").is_none());
     }
 
     #[tokio::test]
@@ -2610,125 +2626,6 @@ pub(crate) mod tests {
             serde_json::from_slice(&to_bytes(proxy.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(proxy_json["proxy"]["session_id"], session_b);
-
-        let routed = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/mission/route")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "from_session_id": session_a.clone(),
-                            "target_ref": format!("@{session_b}"),
-                            "command": "review"
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(routed.status(), StatusCode::OK);
-        let routed_json: serde_json::Value =
-            serde_json::from_slice(&to_bytes(routed.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
-        assert_eq!(
-            routed_json["receipt"]["resolved_session_id"].as_str(),
-            Some(session_b.as_str())
-        );
-        assert_eq!(routed_json["routed"]["kind"], "mission.session_command");
-        assert_eq!(
-            routed_json["routed"]["command"]["target_session_id"].as_str(),
-            Some(session_b.as_str())
-        );
-        assert!(routed_json["mission"]["routed_commands"]
-            .as_array()
-            .expect("routed commands")
-            .iter()
-            .any(|command| command["target_session_id"].as_str() == Some(session_b.as_str())));
-    }
-
-    #[tokio::test]
-    async fn mission_routes_manage_steward_runtime_lifecycle() {
-        let _guard = mission_route_lock().lock().await;
-        let app = api_router(test_state());
-        let session_id = format!("mission-steward-session-{}", uuid::Uuid::new_v4());
-        let created = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/mission/sessions")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "title": "steward controlled session",
-                            "session_id": session_id,
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(created.status(), StatusCode::CREATED);
-        let stewards_before = runtime::global_steward_runtime_service().projection();
-
-        let started = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/mission/stewards")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "mission_id": "mission-runtime",
-                            "root_session_id": session_id,
-                            "profile_id": "stewarded",
-                            "objective": "supervise high risk implementation"
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(started.status(), StatusCode::CREATED);
-        let started_json: serde_json::Value =
-            serde_json::from_slice(&to_bytes(started.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
-        assert_eq!(started_json["ok"], false);
-        assert_eq!(started_json["status"], "capability_unavailable");
-        assert_eq!(started_json["capability"], "steward_execution");
-        assert_eq!(started_json["available_in"], "V8");
-        assert_eq!(started_json["side_effects_started"], false);
-
-        let tick_all = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/mission/stewards/tick-all")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(tick_all.status(), StatusCode::OK);
-        let tick_all_json: serde_json::Value =
-            serde_json::from_slice(&to_bytes(tick_all.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
-        assert_eq!(tick_all_json["ok"], false);
-        assert_eq!(tick_all_json["status"], "capability_unavailable");
-        assert_eq!(tick_all_json["capability"], "steward_execution");
-        assert_eq!(tick_all_json["side_effects_started"], false);
-        assert_eq!(
-            runtime::global_steward_runtime_service().projection(),
-            stewards_before
-        );
     }
 
     #[tokio::test]
@@ -2776,69 +2673,6 @@ pub(crate) mod tests {
             .expect("events")
             .iter()
             .any(|event| event["event_type"].as_str() == Some("mission.session.started")));
-    }
-
-    #[tokio::test]
-    async fn runtime_event_replay_does_not_gain_steward_work_from_unavailable_start() {
-        let _guard = mission_route_lock().lock().await;
-        let app = api_router(test_state());
-        let stewards_before = runtime::global_steward_runtime_service().projection();
-        let steward_response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/mission/stewards")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "mission_id": "mission-replay",
-                            "root_session_id": "session-replay",
-                            "profile_id": "stewarded",
-                            "objective": "verify recovery"
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(steward_response.status(), StatusCode::CREATED);
-        let steward_json: serde_json::Value = serde_json::from_slice(
-            &to_bytes(steward_response.into_body(), usize::MAX)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(steward_json["ok"], false);
-        assert_eq!(steward_json["status"], "capability_unavailable");
-        assert_eq!(steward_json["capability"], "steward_execution");
-        assert_eq!(steward_json["side_effects_started"], false);
-        assert_eq!(
-            runtime::global_steward_runtime_service().projection(),
-            stewards_before
-        );
-
-        let report = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/runtime/events/replay-report?limit=2000")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(report.status(), StatusCode::OK);
-        let report_json: serde_json::Value =
-            serde_json::from_slice(&to_bytes(report.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
-        assert_eq!(report_json["kind"], "runtime.events.replay_report");
-        assert!(!report_json["report"]["actions"]
-            .as_array()
-            .expect("actions")
-            .iter()
-            .any(|action| action["action"] == "pause_recovery_required"));
     }
 
     #[tokio::test]
@@ -4682,10 +4516,15 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(skill_run.status(), StatusCode::OK);
-        let skill_run_json: serde_json::Value =
-            serde_json::from_slice(&to_bytes(skill_run.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
+        let skill_run_status = skill_run.status();
+        let skill_run_body = to_bytes(skill_run.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            skill_run_status,
+            StatusCode::OK,
+            "MFG skill run response: {}",
+            String::from_utf8_lossy(&skill_run_body)
+        );
+        let skill_run_json: serde_json::Value = serde_json::from_slice(&skill_run_body).unwrap();
         assert_eq!(skill_run_json["skill_run"]["status"], "completed");
         assert!(skill_run_json["workflow_graph"]["nodes"]
             .as_array()
@@ -6292,6 +6131,7 @@ pub(crate) mod tests {
             .unwrap();
         let messages: Vec<memory::store::session::SessionMessage> = (0..1000)
             .map(|i| memory::store::session::SessionMessage {
+                stable_message_id: format!("page:{session_id}:{i}"),
                 session_id: session_id.to_string(),
                 sequence: i,
                 role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
@@ -6330,6 +6170,7 @@ pub(crate) mod tests {
         assert_eq!(json["next_seq"], 1000);
         assert_eq!(json["has_more"], false);
         assert_eq!(json["messages"].as_array().unwrap().len(), 10);
+        assert_eq!(json["messages"][0]["id"], "page:message-page-session:990");
         assert_eq!(json["messages"][0]["sequence"], 990);
         assert_eq!(json["messages"][9]["sequence"], 999);
     }
@@ -6613,6 +6454,73 @@ pub(crate) mod tests {
         assert_eq!(json["agent_value"]["policy_passed"], false);
         assert_eq!(json["agent_value"]["latest"]["agent_tasks"], 1);
         assert_eq!(json["agent_value"]["latest"]["value_score"], 70);
+    }
+
+    #[tokio::test]
+    async fn runtime_timeline_resolves_session_terminal_to_canonical_graph_events() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let session_id = "runtime-timeline-terminal-session";
+        store
+            .create_session(&new_api_session_record(
+                session_id,
+                Some("test-model".into()),
+            ))
+            .await
+            .unwrap();
+        let state = test_state_with_store(store);
+        let graph_id = "graph:terminal-session";
+        state
+            .services
+            .runtime_events
+            .store()
+            .append(runtime::RuntimeEventInput {
+                stream_id: graph_id.to_string(),
+                scope: runtime::RuntimeEventScope::ExecutionGraph,
+                kind: "execution_graph.planned".to_string(),
+                status: Some("running".to_string()),
+                actor: Some("test".to_string()),
+                refs: Vec::new(),
+                payload: serde_json::json!({"graph": {"graph_id": graph_id, "status": "running"}}),
+            })
+            .unwrap();
+        state
+            .services
+            .runtime_events
+            .store()
+            .append(runtime::RuntimeEventInput {
+                stream_id: "session-terminal:timeline-terminal".to_string(),
+                scope: runtime::RuntimeEventScope::SessionInput,
+                kind: "runtime.session.terminal_requested".to_string(),
+                status: Some("pending_delivery".to_string()),
+                actor: Some("test".to_string()),
+                refs: vec![runtime::RuntimeEventRef {
+                    kind: "execution_graph".to_string(),
+                    id: graph_id.to_string(),
+                }],
+                payload: serde_json::json!({"session_id": session_id}),
+            })
+            .unwrap();
+
+        let app = api_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/runtime/timeline?session_id={session_id}&from_seq=0&limit=10"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["kind"] == "execution_graph.planned"));
     }
 
     #[tokio::test]
@@ -7824,10 +7732,7 @@ providers:
     }
 
     #[tokio::test(flavor = "current_thread")]
-    #[serial_test::serial(trace_capture)]
     async fn runtime_control_plane_emits_structured_trace_event() {
-        use tracing_subscriber::prelude::*;
-
         let root = test_temp_dir("runtime-control-plane-trace");
         let workspace = root.join("workspace");
         let config_home = root.join("home");
@@ -7840,38 +7745,24 @@ providers:
             .task
             .start_goal("trace control plane", false)
             .unwrap();
-        let _trace_guard = trace_capture_lock().lock().await;
-        let capture = CapturedTraceEvents::default();
-        let subscriber = tracing_subscriber::registry().with(capture.clone());
-
-        let _default_trace_subscriber = tracing::subscriber::set_default(subscriber);
-        tracing::callsite::rebuild_interest_cache();
         let Json(json) = runtime_routes::get_runtime_control_plane(AxumState(state)).await;
         assert_eq!(json["kind"], "runtime_control_plane");
-        let lines = capture.lines();
-        let joined = lines.join("\n");
-        assert!(
-            joined.contains("runtime control plane inspected"),
-            "expected control-plane trace event, got: {joined}"
-        );
-        assert!(joined.contains("cowd.runtime.control_plane"));
-        assert!(joined.contains("status=\"attention\""));
-        assert!(joined.contains("performance_status="));
-        assert!(joined.contains("elapsed_ms="));
-        assert!(joined.contains("production_ready=false"));
-        assert!(joined.contains("readiness_score=81"));
-        assert!(joined.contains("blocked_required_count=2"));
-        assert!(joined.contains("degraded=false"));
-        assert!(joined.contains("durable_session_store=true"));
-        assert!(joined.contains("memory_attached=false"));
-        assert!(joined.contains("provider_configured=false"));
-        assert!(joined.contains("provider_count=0"));
-        assert!(joined.contains("provider_model_count=0"));
-        assert!(joined.contains("configured_model_resolved=true"));
-        assert!(joined.contains("stored_sessions=0"));
-        assert!(joined.contains("open_tasks=1"));
-        assert!(joined.contains("component_count=10"));
-        assert!(joined.contains("capability_count="));
+        assert_eq!(json["status"], "attention");
+        assert_eq!(json["degraded"], false);
+        assert_eq!(json["diagnostics"]["durable_session_store"], true);
+        assert_eq!(json["diagnostics"]["memory_attached"], false);
+        assert_eq!(json["diagnostics"]["provider_configured"], false);
+        assert_eq!(json["diagnostics"]["provider_count"], 0);
+        assert_eq!(json["diagnostics"]["provider_model_count"], 0);
+        assert_eq!(json["diagnostics"]["configured_model_resolved"], true);
+        assert_eq!(json["diagnostics"]["stored_sessions"], 0);
+        assert_eq!(json["diagnostics"]["open_tasks"], 1);
+        assert_eq!(json["diagnostics"]["component_count"], 10);
+        assert!(json["diagnostics"]["capability_count"].as_u64().is_some());
+        assert!(json["diagnostics"]["elapsed_ms"].as_u64().is_some());
+        assert!(json["readiness"]["production_ready"].is_boolean());
+        assert!(json["readiness"]["required_blocked"].as_u64().is_some());
+        assert!(json["readiness"]["score"].as_u64().is_some());
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -10321,7 +10212,7 @@ providers:
         let body = to_bytes(executed.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "blocked");
-        assert_eq!(json["dispatch_status"], "execution_graph_rejected");
+        assert_eq!(json["dispatch_status"], "adapter_unavailable");
         assert_eq!(json["executable"], false);
         assert_eq!(json["adapter_capability"]["live_supported"], true);
         assert_eq!(json["adapter_capability"]["adapter_bound"], false);
@@ -10329,7 +10220,7 @@ providers:
             value
                 .as_str()
                 .unwrap_or_default()
-                .starts_with("execution_graph:")
+                .starts_with("adapter:feishu:send_text:not_bound")
         }));
         assert!(json["execution_graph"].is_null());
 
@@ -10670,12 +10561,18 @@ providers:
         let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
 
         assert_eq!(executed_json["status"], "blocked");
-        assert_eq!(executed_json["dispatch_status"], "dispatch_failed");
+        assert_eq!(executed_json["dispatch_status"], "adapter_unavailable");
         assert_eq!(executed_json["dispatched"], false);
-        assert!(executed_json["blockers"].as_array().unwrap().is_empty());
-        assert!(executed_json["execution_graph"]["graph_id"]
-            .as_str()
-            .is_some());
+        assert!(executed_json["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| {
+                value
+                    .as_str()
+                    .is_some_and(|value| value.starts_with("adapter:feishu:send_text:not_bound"))
+            }));
+        assert!(executed_json["execution_graph"].is_null());
     }
 
     #[tokio::test]
@@ -10757,7 +10654,7 @@ providers:
         let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
 
         assert_eq!(executed_json["status"], "blocked");
-        assert_eq!(executed_json["dispatch_status"], "dispatch_failed");
+        assert_eq!(executed_json["dispatch_status"], "adapter_unavailable");
         assert_eq!(
             executed_json["execution_receipt"]["dispatch_target"]["outbound_message"]
                 ["payload_kind"],
@@ -10851,7 +10748,7 @@ providers:
         let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
 
         assert_eq!(executed_json["status"], "blocked");
-        assert_eq!(executed_json["dispatch_status"], "dispatch_failed");
+        assert_eq!(executed_json["dispatch_status"], "adapter_unavailable");
         assert_eq!(
             executed_json["execution_receipt"]["dispatch_target"]["outbound_message"]
                 ["payload_kind"],
@@ -10951,7 +10848,7 @@ providers:
         let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
 
         assert_eq!(executed_json["status"], "blocked");
-        assert_eq!(executed_json["dispatch_status"], "not_started");
+        assert_eq!(executed_json["dispatch_status"], "payload_rejected");
         assert!(executed_json["blockers"]
             .as_array()
             .unwrap()

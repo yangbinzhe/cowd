@@ -1930,7 +1930,7 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                 }
                 if let Ok(store) = get_unified_store() {
                     if let Err(error) = sync_cli_session_to_unified_store(
-                        store,
+                        &store,
                         &handle,
                         session.model.as_deref(),
                         &session,
@@ -7204,13 +7204,9 @@ UU conflicted.rs",
             let target_handle =
                 create_managed_session_handle("resume-switch-target").expect("target handle");
             let target = Session::new().with_workspace_root(root.clone());
-            sync_cli_session_to_unified_store(
-                get_unified_store().expect("store should open"),
-                &target_handle,
-                None,
-                &target,
-            )
-            .expect("target session should sync");
+            let store = get_unified_store().expect("store should open");
+            sync_cli_session_to_unified_store(&store, &target_handle, None, &target)
+                .expect("target session should sync");
             (active_path, active, target_handle)
         });
 

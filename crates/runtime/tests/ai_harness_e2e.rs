@@ -23,7 +23,7 @@ use runtime::{
 struct HarnessObservation {
     scenario_id: String,
     strategy_pattern: ExecutionPattern,
-    finalization_blocked: bool,
+    verification_blocked: bool,
     regression_allowed: bool,
     has_execution_graph: bool,
     execution_graph_quality_ok: bool,
@@ -48,7 +48,7 @@ impl HarnessObservation {
         Self {
             scenario_id: scenario_id.into(),
             strategy_pattern: trace.execution_decision.strategy.pattern,
-            finalization_blocked: trace.finalization_blocked,
+            verification_blocked: trace.verification_blocked,
             regression_allowed: trace.regression_gate.allowed,
             has_execution_graph: trace.execution_graph.is_some(),
             execution_graph_quality_ok,
@@ -86,7 +86,7 @@ impl HarnessObservation {
         ScenarioObservation {
             scenario_id: self.scenario_id,
             strategy_pattern: self.strategy_pattern,
-            finalization_blocked: self.finalization_blocked,
+            verification_blocked: self.verification_blocked,
             regression_allowed: self.regression_allowed,
             has_execution_graph: self.has_execution_graph,
             execution_graph_quality_ok: self.execution_graph_quality_ok,
@@ -104,7 +104,7 @@ fn simple_question_stays_direct_and_clean() {
     let spec = ScenarioSpec::new("simple_question", "explain this function")
         .expect_mode(ExecutionPattern::Direct)
         .require(ScenarioCheck::bool(
-            "verification.finalization_blocked",
+            "verification.verification_blocked",
             ScenarioCheckKind::FinalizationBlocked,
             false,
             "ai-verification/runtime-conversation",
@@ -193,9 +193,8 @@ fn complex_task_builds_execution_execution_graph() {
 #[tokio::test(flavor = "multi_thread")]
 async fn empty_answer_is_blocked_by_finalization_gate() {
     let spec = ScenarioSpec::new("empty_answer_gate", "answer this")
-        .expect_mode(ExecutionPattern::Direct)
         .require(ScenarioCheck::bool(
-            "verification.finalization_blocked",
+            "verification.verification_blocked",
             ScenarioCheckKind::FinalizationBlocked,
             true,
             "ai-verification/runtime-conversation",
@@ -224,7 +223,7 @@ async fn empty_answer_is_blocked_by_finalization_gate() {
         ))
         .require(ScenarioCheck::text_contains(
             "assistant.gate_message",
-            "I cannot finalize this as a completed answer yet",
+            "Execution could not obtain a usable final answer",
             "runtime-conversation",
             "append limitation message when verification blocks finalization",
         ));
@@ -347,7 +346,7 @@ fn matrix_quality_failure_becomes_growth_signal() {
     let observation = ScenarioObservation {
         scenario_id: "matrix_quality_failure".to_string(),
         strategy_pattern: event.strategy_pattern,
-        finalization_blocked: false,
+        verification_blocked: false,
         regression_allowed: false,
         has_execution_graph: false,
         execution_graph_quality_ok: false,

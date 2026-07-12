@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use crate::conversation::ApiClient;
 use crate::conversation::{ModelStepIntent, ModelToolCall};
@@ -9,21 +12,27 @@ use crate::execution_core::{
 };
 use crate::{
     model_context_window_with_overrides, permissions::SharedPrompter, CompactionConfig,
-    CompactionResult, ContentBlock, ContextEnvelope, ContextItem, ContextProfile,
-    ContextSourceKind, ConversationMessage, CowdEvent, CowdEventBus, HookAbortSignal,
-    HookProgressReporter, PermissionPolicy, ProviderRuntimeClient, ProviderToolDefinition,
-    ResumeContextPacket, RuntimeError, RuntimeFeatureConfig, Session, ToolCallback, ToolExecutor,
-    TurnSummary,
+    CompactionResult, ContentBlock, ContextAuthority, ContextEnvelope, ContextItem, ContextProfile,
+    ContextRole, ContextSourceKind, ContextVisibility, ConversationMessage, CowdEvent,
+    CowdEventBus, HookAbortSignal, HookProgressReporter, PermissionPolicy, ProviderRuntimeClient,
+    ProviderToolDefinition, ResumeContextPacket, RuntimeError, RuntimeFeatureConfig, Session,
+    ToolCallback, ToolExecutor, TurnSummary,
 };
 use async_trait::async_trait;
+use futures::{stream, StreamExt};
 use harness_contract::agent::AgentTaskPacket;
 use harness_contract::execution_graph::{
     ExecutionEdge, ExecutionEdgeKind, ExecutionNodeKind, ExecutionNodeResult, ExecutionNodeSpec,
     ExecutionNodeStatus, ExecutionUsage,
 };
+use harness_contract::goal::{
+    AcceptanceCriterion, AcceptanceStatus, GoalCompletion, GoalContract, RuntimeIntervention,
+    RuntimeInterventionKind, RuntimeObservation, RuntimeObservationKind,
+};
 use harness_contract::skill::{AgentSkillProfile, SkillCapabilityProfile};
 use harness_contract::turn::{
-    SessionInputEnvelope, SessionInputProjection, SessionInputReceipt, TurnId, TurnInboxSnapshot,
+    InputRoutingDecision, SessionInputEnvelope, SessionInputProjection, SessionInputReceipt,
+    TurnId, TurnInboxSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -40,6 +49,7 @@ where
     services: Arc<crate::RuntimeServices>,
     approval_gate_slot:
         Arc<std::sync::RwLock<Option<Arc<crate::approval_gate::SmartApprovalGate>>>>,
+    execution_parent: Option<harness_contract::execution_graph::ExecutionParentBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +83,9 @@ where
     pub external_context_items: Vec<ContextItem>,
     pub skill_profiles: Vec<SkillCapabilityProfile>,
     pub agent_skill_profile: AgentSkillProfile,
+    /// Optional runtime-owned parent graph/node for nested agent turns.
+    /// Surface-originated turns leave this empty.
+    pub execution_parent: Option<harness_contract::execution_graph::ExecutionParentBinding>,
 }
 
 impl<T> StandardRuntimeHost<T>
@@ -102,6 +115,7 @@ where
             &config.feature_config,
         )
         .with_model_context_window(model_context_window)
+        .with_explicit_team_escalation(config.execution_parent.is_none())
         .with_runtime_event_store(Arc::clone(services.event_store()))
         .with_skill_profiles(config.skill_profiles)
         .with_agent_skill_profile(config.agent_skill_profile);
@@ -125,6 +139,7 @@ where
             runtime: Some(runtime),
             services,
             approval_gate_slot,
+            execution_parent: config.execution_parent,
         })
     }
 
@@ -200,14 +215,6 @@ where
         self.runtime_ref().set_context_profile(profile);
     }
 
-    pub fn max_iterations(&self) -> usize {
-        self.runtime_ref().max_iterations()
-    }
-
-    pub fn set_max_iterations(&mut self, max_iterations: usize) {
-        self.runtime_mut().set_max_iterations(max_iterations);
-    }
-
     pub fn inject_resume_context(&self, packet: ResumeContextPacket) {
         self.runtime_ref().inject_resume_context(packet);
     }
@@ -246,6 +253,7 @@ where
             content,
             prompter,
             None,
+            self.execution_parent.clone(),
         )
         .await;
         self.runtime = Some(runtime);
@@ -258,18 +266,25 @@ where
         prompter: &SharedPrompter,
         ingress: TurnIngressRef,
     ) -> Result<TurnSummary, RuntimeError> {
-        let runtime = self
+        let mut runtime = self
             .runtime
             .take()
             .expect("runtime should exist before submitting an ingress turn");
+        // The gateway ingress outbox owns the user record and the terminal
+        // outbox owns the assistant record. Keep the in-memory transcript for
+        // model context, but prohibit a second SQLite transcript writer.
+        runtime.set_transcript_persistence(false);
         let (runtime, result) = submit_owned_conversation_turn_with_ingress(
             runtime,
             Arc::clone(&self.services),
             content,
             prompter,
             Some(ingress),
+            self.execution_parent.clone(),
         )
         .await;
+        let mut runtime = runtime;
+        runtime.set_transcript_persistence(true);
         self.runtime = Some(runtime);
         result
     }
@@ -349,7 +364,8 @@ where
     C: ApiClient + Clone + Send + Sync + 'static,
     T: ToolExecutor,
 {
-    submit_owned_conversation_turn_with_ingress(runtime, services, content, prompter, None).await
+    submit_owned_conversation_turn_with_ingress(runtime, services, content, prompter, None, None)
+        .await
 }
 
 async fn submit_owned_conversation_turn_with_ingress<C, T>(
@@ -358,6 +374,7 @@ async fn submit_owned_conversation_turn_with_ingress<C, T>(
     content: &str,
     prompter: &SharedPrompter,
     ingress: Option<TurnIngressRef>,
+    execution_parent: Option<harness_contract::execution_graph::ExecutionParentBinding>,
 ) -> (
     crate::ConversationRuntime<C, T>,
     Result<TurnSummary, RuntimeError>,
@@ -388,11 +405,40 @@ where
             pending_transcript: std::collections::BTreeMap::new(),
             ingress: ingress.clone(),
             session_id: session_id.clone(),
+            goal_id: String::new(),
+            safety_lease: crate::execution_core::SafetyFusePolicy::derive(
+                0,
+                harness_contract::core::TaskComplexity::Simple,
+                None,
+            ),
+            terminal_override: None,
+            last_verified_progress: false,
+            reasoning_only_attempts: 0,
+            force_text_only_next_model: false,
+            terminal_recovery_attempts: 0,
+            bounded_evidence_role: false,
         }));
 
-        let compile_target = crate::execution_core::StrategyDecisionEngine
-            .decide(content, Some(runtime.lock().await.context_profile()))
-            .compile_target;
+        let (strategy, context_window, context_profile) = {
+            let runtime = runtime.lock().await;
+            (
+                crate::execution_core::StrategyDecisionEngine
+                    .decide(content, Some(runtime.context_profile())),
+                runtime.model_context_window(),
+                runtime.context_profile(),
+            )
+        };
+        let compile_target = strategy.compile_target;
+        {
+            let mut graph_state = state.lock().await;
+            graph_state.safety_lease = crate::execution_core::SafetyFusePolicy::derive(
+                context_window,
+                strategy.complexity(),
+                explicit_model_step_limit(content),
+            );
+            graph_state.bounded_evidence_role = context_profile == ContextProfile::SubAgent
+                || compile_target == crate::execution_core::RuntimeCompileTarget::EvidenceGraph;
+        }
         let turn_payload = serde_json::json!({
             "kind": "conversation_turn",
             "session_id": session_id,
@@ -410,6 +456,7 @@ where
                 resource_scopes: Vec::new(),
             })
             .map_err(|error| RuntimeError::new(error.to_string()))?;
+        graph.parent_execution = execution_parent;
         if let Some(ingress) = &ingress {
             let compiled_graph_id = graph.id.clone();
             graph.id = crate::session_execution::session_ingress_graph_id(
@@ -463,6 +510,32 @@ where
                 kind: ExecutionEdgeKind::DependsOn,
             });
         }
+        let goal_id = format!("goal:{}", graph.id);
+        services
+            .goal_store()
+            .create(GoalContract {
+                id: goal_id.clone(),
+                session_id: session_id.clone(),
+                objective: content.to_string(),
+                criteria: vec![AcceptanceCriterion {
+                    id: "terminal_synthesis".to_string(),
+                    statement: "produce one durable terminal synthesis for the user objective"
+                        .to_string(),
+                    required_evidence: vec![format!("execution_graph:{}", graph.id)],
+                    status: AcceptanceStatus::Open,
+                    waiver: None,
+                }],
+                constraints: Vec::new(),
+                phase: "execution".to_string(),
+                evidence_refs: Vec::new(),
+                unresolved: Vec::new(),
+                blockers: Vec::new(),
+                completion: GoalCompletion::Open,
+                revision: 1,
+                user_sequence: 1,
+            })
+            .map_err(RuntimeError::new)?;
+        state.lock().await.goal_id = goal_id;
         let inline_kind = "inline_model".to_string();
         let tool_kind = "tool_batch".to_string();
         for node in &mut graph.nodes {
@@ -501,13 +574,16 @@ where
             .model_step_executor()
             .install_resolver(Arc::new(TurnModelResolver {
                 session_id: session_id.clone(),
+                graph_id: graph_id.clone(),
                 runtime: Arc::downgrade(&runtime),
                 state: Arc::downgrade(&state),
+                services: Arc::downgrade(&services),
             }));
         services
             .tool_batch_executor()
             .install_resolver(Arc::new(TurnToolResolver {
                 session_id: session_id.clone(),
+                graph_id: graph_id.clone(),
                 runtime: Arc::downgrade(&runtime),
                 state: Arc::downgrade(&state),
                 services: Arc::downgrade(&services),
@@ -516,6 +592,7 @@ where
             .synthesize_executor()
             .install_resolver(Arc::new(TurnSynthesizeResolver {
                 session_id: session_id.clone(),
+                graph_id: graph_id.clone(),
                 runtime: Arc::downgrade(&runtime),
                 state: Arc::downgrade(&state),
                 services: Arc::downgrade(&services),
@@ -531,7 +608,39 @@ where
             .map_err(|error| RuntimeError::new(error.to_string()))?;
             services.graph_runner().run_until_quiescent(&graph_id).await
         } else {
-            services.graph_runner().start(graph).await
+            let registered = services
+                .graph_runner()
+                .register(graph)
+                .await
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            // Publish the durable graph ID before execution. Surfaces can now
+            // attach their cursor stream while model/tool nodes are running;
+            // the final summary below remains an update, not the first hint.
+            if let Some(bus) = runtime.lock().await.cowd_bus().cloned() {
+                let agent_tasks = registered
+                    .nodes
+                    .iter()
+                    .filter(|node| matches!(node.kind, ExecutionNodeKind::AgentTask))
+                    .count();
+                bus.emit(CowdEvent::ExecutionGraphSummary {
+                    summary: crate::RuntimeExecutionGraphSummary {
+                        graph_id: Some(registered.id.clone()),
+                        board_id: None,
+                        status: "running".to_string(),
+                        agent_tasks,
+                        child_executions: 0,
+                        memory_candidates: 0,
+                        conflicts: 0,
+                        completion_rate: Some(0.0),
+                        synthesis_lift: None,
+                        complementarity_score: None,
+                    },
+                });
+            }
+            services
+                .graph_runner()
+                .run_until_quiescent(&registered.id)
+                .await
         };
         run_result.map_err(|error| RuntimeError::new(error.to_string()))?;
         let mut state = state.lock().await;
@@ -547,6 +656,49 @@ where
             .projection(&graph_id)
             .await
             .map_err(|error| RuntimeError::new(error.to_string()))?;
+        // Every ingress turn has a durable execution graph. Publish only its
+        // compact identity/health summary on the render bus so surfaces can
+        // attach their own cursor-based projection stream without inferring a
+        // graph from prose events.
+        if let Some(bus) = runtime.lock().await.cowd_bus().cloned() {
+            let terminal_nodes = projection
+                .nodes
+                .iter()
+                .filter(|node| node.status.is_terminal())
+                .count();
+            let failed = projection.nodes.iter().any(|node| {
+                matches!(
+                    node.status,
+                    ExecutionNodeStatus::Failed | ExecutionNodeStatus::Cancelled
+                )
+            });
+            let status = if failed {
+                "failed"
+            } else if !projection.nodes.is_empty() && terminal_nodes == projection.nodes.len() {
+                "terminal"
+            } else {
+                "running"
+            };
+            bus.emit(CowdEvent::ExecutionGraphSummary {
+                summary: crate::RuntimeExecutionGraphSummary {
+                    graph_id: Some(projection.graph_id.clone()),
+                    board_id: None,
+                    status: status.to_string(),
+                    agent_tasks: projection
+                        .nodes
+                        .iter()
+                        .filter(|node| matches!(node.kind, ExecutionNodeKind::AgentTask))
+                        .count(),
+                    child_executions: 0,
+                    memory_candidates: 0,
+                    conflicts: 0,
+                    completion_rate: (!projection.nodes.is_empty())
+                        .then_some(terminal_nodes as f32 / projection.nodes.len() as f32),
+                    synthesis_lift: None,
+                    complementarity_score: None,
+                },
+            });
+        }
         if projection.terminal_result_ref.is_none() {
             return Err(RuntimeError::new(
                 "execution graph completed without a synthesized terminal result",
@@ -580,6 +732,14 @@ struct TurnGraphState {
     pending_transcript: std::collections::BTreeMap<String, Vec<ConversationMessage>>,
     ingress: Option<TurnIngressRef>,
     session_id: String,
+    goal_id: String,
+    safety_lease: crate::execution_core::ExecutionBudgetLease,
+    terminal_override: Option<(GoalCompletion, String)>,
+    last_verified_progress: bool,
+    reasoning_only_attempts: u8,
+    force_text_only_next_model: bool,
+    terminal_recovery_attempts: u8,
+    bounded_evidence_role: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -594,11 +754,24 @@ struct PersistedModelToolCall {
 struct PersistedToolBatch {
     session_id: String,
     calls: Vec<PersistedModelToolCall>,
+    /// A subsequent ToolBatch is already present in the same graph. This
+    /// batch must commit its evidence and let Runner advance that successor
+    /// instead of creating an intervening model node.
+    #[serde(default)]
+    continue_with_tool_batch: bool,
 }
 
 fn encode_tool_calls(
     session_id: &str,
     calls: &[ModelToolCall],
+) -> Result<String, serde_json::Error> {
+    encode_tool_calls_with_continuation(session_id, calls, false)
+}
+
+fn encode_tool_calls_with_continuation(
+    session_id: &str,
+    calls: &[ModelToolCall],
+    continue_with_tool_batch: bool,
 ) -> Result<String, serde_json::Error> {
     serde_json::to_string(&PersistedToolBatch {
         session_id: session_id.to_string(),
@@ -611,21 +784,25 @@ fn encode_tool_calls(
                 depends_on: call.depends_on.clone(),
             })
             .collect(),
+        continue_with_tool_batch,
     })
 }
 
-fn decode_tool_calls(payload: &str) -> Result<Vec<ModelToolCall>, serde_json::Error> {
+fn decode_tool_batch(payload: &str) -> Result<(Vec<ModelToolCall>, bool), serde_json::Error> {
     serde_json::from_str::<PersistedToolBatch>(payload).map(|batch| {
-        batch
-            .calls
-            .into_iter()
-            .map(|call| ModelToolCall {
-                id: call.id,
-                name: call.name,
-                input: call.input,
-                depends_on: call.depends_on,
-            })
-            .collect()
+        (
+            batch
+                .calls
+                .into_iter()
+                .map(|call| ModelToolCall {
+                    id: call.id,
+                    name: call.name,
+                    input: call.input,
+                    depends_on: call.depends_on,
+                })
+                .collect(),
+            batch.continue_with_tool_batch,
+        )
     })
 }
 
@@ -644,10 +821,17 @@ fn ticket_session_id(payload: &str) -> Option<String> {
         })
 }
 
+fn turn_scope_matches(ticket: &NodeExecutionTicket, session_id: &str, graph_id: &str) -> bool {
+    ticket.graph_id == graph_id
+        && ticket_session_id(&ticket.payload_ref).as_deref() == Some(session_id)
+}
+
 struct TurnModelResolver<C: ApiClient, T: ToolExecutor> {
     session_id: String,
+    graph_id: String,
     runtime: std::sync::Weak<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
     state: std::sync::Weak<tokio::sync::Mutex<TurnGraphState>>,
+    services: std::sync::Weak<crate::RuntimeServices>,
 }
 
 impl<C, T> crate::execution_core::graph::executors::ScopedNodeBackendResolver
@@ -657,18 +841,20 @@ where
     T: ToolExecutor,
 {
     fn resolve(&self, ticket: &NodeExecutionTicket) -> Option<Arc<dyn ScopedNodeBackend>> {
-        if ticket_session_id(&ticket.payload_ref).as_deref() != Some(&self.session_id) {
+        if !turn_scope_matches(ticket, &self.session_id, &self.graph_id) {
             return None;
         }
         Some(Arc::new(TurnModelStepBackend {
             runtime: self.runtime.upgrade()?,
             state: self.state.upgrade()?,
+            services: self.services.upgrade()?,
         }))
     }
 }
 
 struct TurnToolResolver<C: ApiClient, T: ToolExecutor> {
     session_id: String,
+    graph_id: String,
     runtime: std::sync::Weak<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
     state: std::sync::Weak<tokio::sync::Mutex<TurnGraphState>>,
     services: std::sync::Weak<crate::RuntimeServices>,
@@ -681,7 +867,7 @@ where
     T: ToolExecutor,
 {
     fn resolve(&self, ticket: &NodeExecutionTicket) -> Option<Arc<dyn ScopedNodeBackend>> {
-        if ticket_session_id(&ticket.payload_ref).as_deref() != Some(&self.session_id) {
+        if !turn_scope_matches(ticket, &self.session_id, &self.graph_id) {
             return None;
         }
         Some(Arc::new(TurnToolBatchBackend {
@@ -694,6 +880,7 @@ where
 
 struct TurnSynthesizeResolver<C: ApiClient, T: ToolExecutor> {
     session_id: String,
+    graph_id: String,
     runtime: std::sync::Weak<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
     state: std::sync::Weak<tokio::sync::Mutex<TurnGraphState>>,
     services: std::sync::Weak<crate::RuntimeServices>,
@@ -709,7 +896,7 @@ where
         &self,
         ticket: &NodeExecutionTicket,
     ) -> Option<Arc<dyn crate::execution_core::graph::executors::SynthesizeBackend>> {
-        if ticket_session_id(&ticket.payload_ref).as_deref() != Some(&self.session_id) {
+        if !turn_scope_matches(ticket, &self.session_id, &self.graph_id) {
             return None;
         }
         Some(Arc::new(TurnSynthesizeBackend {
@@ -723,6 +910,7 @@ where
 struct TurnModelStepBackend<C: ApiClient, T: ToolExecutor> {
     runtime: Arc<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
     state: Arc<tokio::sync::Mutex<TurnGraphState>>,
+    services: Arc<crate::RuntimeServices>,
 }
 
 #[async_trait]
@@ -735,23 +923,93 @@ where
         &self,
         ticket: &NodeExecutionTicket,
     ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
-        let (content, first_step) = {
+        let (content, first_step, fuse_intervention, force_text_only_response) = {
             let mut state = self.state.lock().await;
             let first = state.first_model_step;
             state.first_model_step = false;
-            (state.content.clone(), first)
+            let made_progress = std::mem::take(&mut state.last_verified_progress);
+            let intervention = match crate::execution_core::SafetyFusePolicy::evaluate(
+                &state.safety_lease,
+                state.iterations,
+                made_progress,
+            ) {
+                crate::execution_core::SafetyFuseDecision::Continue => None,
+                crate::execution_core::SafetyFuseDecision::Block { reason } => {
+                    state.terminal_override = Some((
+                        GoalCompletion::Blocked,
+                        format!(
+                            "Execution blocked safely: {reason}\n\nChecked evidence and progress were preserved. Continue with a new constraint, additional evidence, or an explicit replan."
+                        ),
+                    ));
+                    Some(RuntimeIntervention {
+                        goal_id: state.goal_id.clone(),
+                        kind: RuntimeInterventionKind::Block,
+                        reason,
+                        evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
+                        expected_graph_revision: None,
+                    })
+                }
+            };
+            (
+                state.content.clone(),
+                first,
+                intervention,
+                // The override applies to exactly one Provider request. A
+                // recovery may schedule another explicit override below, but
+                // stale state must never disable tools for later turns.
+                std::mem::take(&mut state.force_text_only_next_model),
+            )
         };
+        if let Some(intervention) = fuse_intervention {
+            let mut synthesize = dynamic_node(
+                ticket,
+                0,
+                "safety-block-synthesize",
+                ExecutionNodeKind::Synthesize,
+                crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND,
+                "inline_model",
+            );
+            synthesize.executor_kind =
+                crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND.to_string();
+            let mut outcome = NodeExecutionOutcome::new(completed_result(
+                Some(format!("{}:safety-fuse", ticket.graph_id)),
+                ExecutionUsage::default(),
+            ))
+            .with_replan(ExecutionGraphReplan {
+                nodes: vec![synthesize.clone()],
+                edges: dynamic_edges(&ticket.node_id, &[synthesize]),
+                reason: "safety fuse requested an honest blocked synthesis".to_string(),
+            });
+            outcome.domain_events.push(
+                self.services
+                    .goal_store()
+                    .intervention_event(
+                        &intervention,
+                        format!("{}:safety-intervention", ticket.idempotency_key),
+                    )
+                    .map_err(|reason| NodeExecutorError::Poll {
+                        node_id: ticket.node_id.clone(),
+                        reason,
+                    })?,
+            );
+            return Ok(outcome);
+        }
         let mut runtime = self.runtime.lock().await;
+        if force_text_only_response {
+            runtime.require_next_model_final_response();
+        }
         let transcript_len = runtime.session_async().await.messages.len();
         let result = runtime.execute_model_step(&content, first_step).await;
         rollback_uncommitted_transcript(
             &mut runtime.session_mut_async().await.messages,
             transcript_len,
         );
+        let consumed_inputs = runtime.take_consumed_session_inputs();
         drop(runtime);
         match result {
             Ok(step) => {
                 let usage = ExecutionUsage {
+                    model: step.model.clone(),
                     input_tokens: u64::from(step.usage.input_tokens),
                     output_tokens: u64::from(step.usage.output_tokens),
                     cached_tokens: u64::from(step.usage.cache_read_input_tokens)
@@ -770,6 +1028,27 @@ where
                 state.wall_duration_ms =
                     state.wall_duration_ms.saturating_add(step.wall_duration_ms);
                 state.model = step.model;
+                let provider_tokens_per_second = (step.wall_duration_ms > 0).then(|| {
+                    u32::try_from(
+                        u64::from(step.usage.output_tokens)
+                            .saturating_mul(1_000)
+                            .saturating_div(step.wall_duration_ms),
+                    )
+                    .unwrap_or(u32::MAX)
+                });
+                let context_pressure = context_pressure_basis_points(
+                    u64::from(step.usage.input_tokens),
+                    state.safety_lease.context_window,
+                );
+                state.safety_lease = crate::execution_core::SafetyFusePolicy::refresh(
+                    &state.safety_lease,
+                    crate::execution_core::SafetyFuseSignals {
+                        provider_tokens_per_second,
+                        resource_pressure_basis_points: u16::try_from(context_pressure)
+                            .unwrap_or(u16::MAX),
+                        novelty: if step.usage.output_tokens > 0 { 70 } else { 0 },
+                    },
+                );
                 state.prompt_cache_events.extend(step.prompt_cache_events);
                 state
                     .assistant_messages
@@ -782,67 +1061,435 @@ where
                 state
                     .pending_transcript
                     .insert(ticket.node_id.clone(), committed_messages);
-                let mut committed_result_ref = format!("{}:model-result", ticket.graph_id);
-                let next = match step.intent {
-                    ModelStepIntent::FinalAnswer { text } => {
-                        if text.trim().is_empty() {
-                            return Err(NodeExecutorError::Poll {
-                                node_id: ticket.node_id.clone(),
-                                reason: "model produced an empty FinalAnswer intent".to_string(),
-                            });
-                        }
-                        committed_result_ref = format!(
-                            "assistant_json:{}",
-                            serde_json::to_string(&text).map_err(|error| {
-                                NodeExecutorError::Poll {
-                                    node_id: ticket.node_id.clone(),
-                                    reason: error.to_string(),
-                                }
-                            })?
-                        );
-                        let mut node = dynamic_node(
-                            ticket,
-                            state.iterations,
-                            "synthesize",
-                            ExecutionNodeKind::Synthesize,
-                            crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND,
-                            "inline_model",
-                        );
-                        node.executor_kind =
-                            crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND
+                let goal_id = state.goal_id.clone();
+                let correction_inputs = consumed_inputs
+                    .iter()
+                    .filter(|record| record.decision == InputRoutingDecision::InterruptAndReplan)
+                    .map(|record| record.envelope.content.trim())
+                    .filter(|content| !content.is_empty())
+                    .collect::<Vec<_>>();
+                let input_observation = (!consumed_inputs.is_empty()).then(|| RuntimeObservation {
+                    goal_id: goal_id.clone(),
+                    kind: RuntimeObservationKind::UserInput,
+                    source: "runtime.session_input_checkpoint".to_string(),
+                    summary: format!(
+                        "consumed {} session input update(s); correction_count={}",
+                        consumed_inputs.len(),
+                        correction_inputs.len(),
+                    ),
+                    fingerprint: (!correction_inputs.is_empty()).then(|| {
+                        format!(
+                            "user-correction:{}",
+                            sha256_digest(&correction_inputs.join("\n")),
+                        )
+                    }),
+                    evidence_refs: consumed_inputs
+                        .iter()
+                        .map(|record| format!("session_input:{}", record.envelope.input_id))
+                        .collect(),
+                    metrics: BTreeMap::from([
+                        (
+                            "consumed_input_count".to_string(),
+                            consumed_inputs.len() as i64,
+                        ),
+                        (
+                            "correction_count".to_string(),
+                            correction_inputs.len() as i64,
+                        ),
+                    ]),
+                    progress_delta: if correction_inputs.is_empty() { 0 } else { 1 },
+                    novelty: if correction_inputs.is_empty() {
+                        40
+                    } else {
+                        100
+                    },
+                });
+                let input_revision = if correction_inputs.is_empty() {
+                    None
+                } else {
+                    let correction = correction_inputs.join("\n");
+                    let goal = self
+                        .services
+                        .goal_store()
+                        .get(&goal_id)
+                        .map_err(|reason| NodeExecutorError::Poll {
+                            node_id: ticket.node_id.clone(),
+                            reason,
+                        })?
+                        .ok_or_else(|| NodeExecutorError::Poll {
+                            node_id: ticket.node_id.clone(),
+                            reason: format!("goal {goal_id} disappeared before input revision"),
+                        })?;
+                    let revision = self
+                        .services
+                        .goal_store()
+                        .revision_event(
+                            &goal_id,
+                            goal.revision,
+                            goal.user_sequence.saturating_add(1),
+                            "a running-session user correction requested a governed replan",
+                            |goal| {
+                                goal.objective.push_str("\n\nUser correction:\n");
+                                goal.objective.push_str(&correction);
+                                goal.constraints.push(format!(
+                                    "latest_user_correction:{}",
+                                    sha256_digest(&correction),
+                                ));
+                                vec![
+                                    "objective".to_string(),
+                                    "constraints".to_string(),
+                                    "user_sequence".to_string(),
+                                ]
+                            },
+                        )
+                        .map_err(|reason| NodeExecutorError::Poll {
+                            node_id: ticket.node_id.clone(),
+                            reason,
+                        })?;
+                    state.content.push_str(
+                        "\n\nLatest user correction (must supersede stale assumptions):\n",
+                    );
+                    state.content.push_str(&correction);
+                    Some(revision)
+                };
+                let mut intent = input_revision.as_ref().map_or_else(
+                    || step.intent.clone(),
+                    |_| ModelStepIntent::Replan {
+                        reason: "a newer user correction superseded the current plan".to_string(),
+                    },
+                );
+                if force_text_only_response || step.text_only_response {
+                    intent = match intent {
+                        ModelStepIntent::ToolCalls { .. }
+                        | ModelStepIntent::ApprovalRequired { .. }
+                        | ModelStepIntent::AgentProposal { .. }
+                        | ModelStepIntent::TeamProposal { .. } => {
+                            let final_text = step
+                                .assistant_message
+                                .blocks
+                                .iter()
+                                .filter_map(|block| match block {
+                                    ContentBlock::Text { text } => Some(text.as_str()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                                .trim()
                                 .to_string();
-                        vec![node]
-                    }
-                    ModelStepIntent::ToolCalls { calls } => {
-                        state.next_resource_scopes = resource_scopes_for_tool_calls(&calls);
-                        state.next_calls = calls;
-                        let mut tool_node = dynamic_node(
-                            ticket,
-                            state.iterations,
-                            "tools",
-                            ExecutionNodeKind::ToolBatch,
-                            "tool_batch",
-                            "inline_model",
-                        );
-                        tool_node.payload_ref =
-                            encode_tool_calls(&state.session_id, &state.next_calls).map_err(
-                                |error| NodeExecutorError::Poll {
-                                    node_id: ticket.node_id.clone(),
-                                    reason: error.to_string(),
-                                },
-                            )?;
-                        tool_node.resource_scopes = state.next_resource_scopes.clone();
-                        vec![
-                            tool_node,
-                            dynamic_node(
+                            // A provider can hallucinate a native call even
+                            // when this request exposed zero schemas. Treat
+                            // that as an unusable terminal answer so the
+                            // existing governed final-answer recovery gets one
+                            // evidence-only retry. Do not execute the call,
+                            // and do not fail the whole graph before recovery.
+                            ModelStepIntent::FinalAnswer { text: final_text }
+                        }
+                        other => other,
+                    };
+                }
+                let observation = RuntimeObservation {
+                    goal_id: goal_id.clone(),
+                    kind: RuntimeObservationKind::GraphProgress,
+                    source: "runtime.model_step".to_string(),
+                    summary: model_intent_summary(&intent),
+                    fingerprint: None,
+                    evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
+                    metrics: BTreeMap::from([
+                        ("model_step".to_string(), state.iterations as i64),
+                        (
+                            "parallel_ready_work".to_string(),
+                            independent_tool_call_count(&intent) as i64,
+                        ),
+                    ]),
+                    // A provider intent only describes the next action. It is
+                    // not verified goal progress until the resulting tool,
+                    // agent, or synthesis evidence has committed.
+                    progress_delta: 0,
+                    novelty: model_intent_novelty(&intent),
+                };
+                let provider_observation = RuntimeObservation {
+                    goal_id: goal_id.clone(),
+                    kind: RuntimeObservationKind::ProviderProgress,
+                    source: "runtime.provider_stream".to_string(),
+                    summary: format!(
+                        "provider completed model step input_tokens={} output_tokens={} duration_ms={}",
+                        usage.input_tokens, usage.output_tokens, usage.duration_ms
+                    ),
+                    fingerprint: state.model.as_ref().map(|model| {
+                        format!("provider-step:{model}:{}", model_intent_kind(&intent))
+                    }),
+                    evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
+                    metrics: BTreeMap::from([
+                        ("input_tokens".to_string(), usage.input_tokens as i64),
+                        ("output_tokens".to_string(), usage.output_tokens as i64),
+                        ("duration_ms".to_string(), usage.duration_ms as i64),
+                    ]),
+                    progress_delta: i32::from(usage.output_tokens > 0),
+                    novelty: if usage.output_tokens > 0 { 70 } else { 0 },
+                };
+                let context_pressure_basis_points = context_pressure_basis_points(
+                    usage.input_tokens,
+                    state.safety_lease.context_window,
+                );
+                let context_observation = RuntimeObservation {
+                    goal_id: goal_id.clone(),
+                    kind: RuntimeObservationKind::ContextPressure,
+                    source: "runtime.context_ledger".to_string(),
+                    summary: format!(
+                        "model request consumed {} input tokens against a {} token context window",
+                        usage.input_tokens, state.safety_lease.context_window
+                    ),
+                    fingerprint: Some(format!(
+                        "context-pressure:{}:{}",
+                        state.safety_lease.context_window, context_pressure_basis_points
+                    )),
+                    evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
+                    metrics: BTreeMap::from([
+                        (
+                            "context_window".to_string(),
+                            state.safety_lease.context_window as i64,
+                        ),
+                        ("input_tokens".to_string(), usage.input_tokens as i64),
+                        (
+                            "pressure_basis_points".to_string(),
+                            context_pressure_basis_points,
+                        ),
+                    ]),
+                    progress_delta: 0,
+                    novelty: 20,
+                };
+                let strategy_observation = RuntimeObservation {
+                    goal_id: goal_id.clone(),
+                    kind: RuntimeObservationKind::StrategyHistory,
+                    source: "runtime.strategy_checkpoint".to_string(),
+                    summary: format!(
+                        "model intent {} has {} independent ready tool action(s)",
+                        model_intent_kind(&intent),
+                        independent_tool_call_count(&intent)
+                    ),
+                    fingerprint: Some(format!(
+                        "strategy:{}:{}",
+                        model_intent_kind(&intent),
+                        independent_tool_call_count(&intent)
+                    )),
+                    evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
+                    metrics: BTreeMap::from([
+                        (
+                            "parallel_ready_work".to_string(),
+                            independent_tool_call_count(&intent) as i64,
+                        ),
+                        ("model_step".to_string(), state.iterations as i64),
+                    ]),
+                    progress_delta: 0,
+                    novelty: 40,
+                };
+                let mut committed_result_ref = format!("{}:model-result", ticket.graph_id);
+                let reasoning_only_response = step
+                    .assistant_message
+                    .blocks
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Thinking { thinking, .. } if !thinking.trim().is_empty()))
+                    && step
+                        .assistant_message
+                        .blocks
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .all(|text| text.trim().is_empty());
+                // Parallel scheduling is performed from the concrete tool DAG
+                // after the model names its calls. Do not feed an early,
+                // planning-only Parallelize proposal back into the prompt: a
+                // stale proposal previously encouraged a completed protocol
+                // synthesis role to continue exploring.
+                let mut model_intervention = None;
+                let next = match intent {
+                    ModelStepIntent::FinalAnswer { text } => {
+                        let text = strip_trailing_simulated_tool_markup(text);
+                        let normal_reasoning_continuation = if reasoning_only_response
+                            && !force_text_only_response
+                            && !step.text_only_response
+                        {
+                            state.reasoning_only_attempts =
+                                state.reasoning_only_attempts.saturating_add(1);
+                            let continuation_budget =
+                                terminal_recovery_retry_budget(&state.safety_lease);
+                            if state.reasoning_only_attempts <= continuation_budget {
+                                let instruction = format!(
+                                    "Runtime continuation (mandatory): the previous model step produced private reasoning but no visible answer. Continue the same goal from retained evidence. If evidence is still missing, use the smallest relevant available tool; otherwise write the visible final answer now. Do not finish with reasoning only. Continuation attempt {}/{}.",
+                                    state.reasoning_only_attempts,
+                                    continuation_budget,
+                                );
+                                state.content.push_str("\n\n");
+                                state.content.push_str(&instruction);
+                                model_intervention =
+                                    Some(harness_contract::goal::RuntimeIntervention {
+                                        goal_id: state.goal_id.clone(),
+                                        kind: RuntimeInterventionKind::Replan,
+                                        reason: instruction,
+                                        evidence_refs: vec![format!(
+                                            "execution_node:{}",
+                                            ticket.node_id
+                                        )],
+                                        expected_graph_revision: None,
+                                    });
+                                Some(vec![dynamic_node(
+                                    ticket,
+                                    state.iterations,
+                                    "reasoning-continuation-model",
+                                    ExecutionNodeKind::InlineModel,
+                                    "inline_model",
+                                    "inline_model",
+                                )])
+                            } else {
+                                // Private reasoning without visible output is
+                                // not an infinite retry class. After the same
+                                // lease-derived allowance used elsewhere, use
+                                // the normal no-tool terminal recovery path.
+                                state.reasoning_only_attempts = 0;
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(next) = normal_reasoning_continuation {
+                            next
+                        } else if let Some(reason) =
+                            final_answer_recovery_reason(&text, self.services.workspace_root())
+                        {
+                            // An empty answer or simulated XML tool call is a
+                            // malformed provider turn, not proof that the
+                            // user goal failed. Give the model one explicit,
+                            // text-only recovery using committed evidence;
+                            // only then terminate honestly instead of leaving
+                            // the root graph failed without a receipt.
+                            state.assistant_messages.pop();
+                            state.pending_transcript.remove(&ticket.node_id);
+                            state.terminal_recovery_attempts =
+                                state.terminal_recovery_attempts.saturating_add(1);
+                            let recovery_retry_budget =
+                                terminal_recovery_retry_budget(&state.safety_lease);
+                            if state.terminal_recovery_attempts <= recovery_retry_budget {
+                                let instruction = format!(
+                                    "Runtime final-answer recovery (mandatory): the prior provider response was unusable ({reason}). Do not call tools or emit simulated tool markup. Use only already committed evidence and return a concise final answer now; name any remaining uncertainty explicitly. Recovery attempt {}/{}.",
+                                    state.terminal_recovery_attempts,
+                                    recovery_retry_budget,
+                                );
+                                state.content.push_str("\n\n");
+                                state.content.push_str(&instruction);
+                                state.force_text_only_next_model = true;
+                                model_intervention =
+                                    Some(harness_contract::goal::RuntimeIntervention {
+                                        goal_id: state.goal_id.clone(),
+                                        kind: RuntimeInterventionKind::Replan,
+                                        reason: instruction,
+                                        evidence_refs: vec![format!(
+                                            "execution_node:{}",
+                                            ticket.node_id
+                                        )],
+                                        expected_graph_revision: None,
+                                    });
+                                vec![dynamic_node(
+                                    ticket,
+                                    state.iterations,
+                                    "final-answer-recovery-model",
+                                    ExecutionNodeKind::InlineModel,
+                                    "inline_model",
+                                    "inline_model",
+                                )]
+                            } else {
+                                state.terminal_override = Some((
+                                    GoalCompletion::Blocked,
+                                    format!(
+                                        "Execution could not obtain a usable final answer after governed recovery: {reason}. Committed evidence was retained; provide a new constraint, provider, or explicit replan to continue."
+                                    ),
+                                ));
+                                model_intervention = Some(harness_contract::goal::RuntimeIntervention {
+                                    goal_id: state.goal_id.clone(),
+                                    kind: RuntimeInterventionKind::Block,
+                                    reason: format!(
+                                        "provider produced unusable final output after {} governed recovery attempt(s): {reason}",
+                                        recovery_retry_budget,
+                                    ),
+                                    evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
+                                    expected_graph_revision: None,
+                                });
+                                let mut node = dynamic_node(
+                                    ticket,
+                                    state.iterations,
+                                    "final-answer-block-synthesize",
+                                    ExecutionNodeKind::Synthesize,
+                                    crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND,
+                                    "inline_model",
+                                );
+                                node.executor_kind = crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND.to_string();
+                                vec![node]
+                            }
+                        } else {
+                            committed_result_ref = format!(
+                                "assistant_json:{}",
+                                serde_json::to_string(&text).map_err(|error| {
+                                    NodeExecutorError::Poll {
+                                        node_id: ticket.node_id.clone(),
+                                        reason: error.to_string(),
+                                    }
+                                })?
+                            );
+                            let mut node = dynamic_node(
                                 ticket,
                                 state.iterations,
-                                "model",
-                                ExecutionNodeKind::InlineModel,
+                                "synthesize",
+                                ExecutionNodeKind::Synthesize,
+                                crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND,
                                 "inline_model",
-                                "inline_model",
-                            ),
-                        ]
+                            );
+                            node.executor_kind =
+                                crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND
+                                    .to_string();
+                            vec![node]
+                        }
+                    }
+                    ModelStepIntent::ToolCalls { calls } => {
+                        let batches = tool_batches_for_turn(&calls).map_err(|reason| {
+                            NodeExecutorError::Poll {
+                                node_id: ticket.node_id.clone(),
+                                reason,
+                            }
+                        })?;
+                        state.next_calls.clear();
+                        state.next_resource_scopes.clear();
+                        // The next model node is added by the ToolBatch
+                        // checkpoint after the intervention policy sees real
+                        // tool evidence. This prevents the model from racing
+                        // ahead of the tool result and makes Runner the sole
+                        // owner of Continue/Retrieve/Replan/Switch application.
+                        let batch_count = batches.len();
+                        batches
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, calls)| {
+                                let mut tool_node = dynamic_node(
+                                    ticket,
+                                    state.iterations,
+                                    &format!("tools-{}", index + 1),
+                                    ExecutionNodeKind::ToolBatch,
+                                    "tool_batch",
+                                    "inline_model",
+                                );
+                                tool_node.payload_ref = encode_tool_calls_with_continuation(
+                                    &state.session_id,
+                                    &calls,
+                                    index + 1 < batch_count,
+                                )
+                                .map_err(|error| NodeExecutorError::Poll {
+                                    node_id: ticket.node_id.clone(),
+                                    reason: error.to_string(),
+                                })?;
+                                tool_node.resource_scopes = resource_scopes_for_tool_calls(&calls);
+                                Ok(tool_node)
+                            })
+                            .collect::<Result<Vec<_>, NodeExecutorError>>()?
                     }
                     ModelStepIntent::AgentProposal { calls }
                     | ModelStepIntent::TeamProposal { calls } => {
@@ -961,6 +1608,13 @@ where
                         ]
                     }
                     ModelStepIntent::Replan { reason } => {
+                        model_intervention = Some(harness_contract::goal::RuntimeIntervention {
+                            goal_id: state.goal_id.clone(),
+                            kind: RuntimeInterventionKind::Replan,
+                            reason: reason.clone(),
+                            evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
+                            expected_graph_revision: None,
+                        });
                         state.content.push_str("\n\nRuntime replan guidance: ");
                         state.content.push_str(&reason);
                         vec![dynamic_node(
@@ -974,26 +1628,298 @@ where
                     }
                 };
                 let edges = dynamic_edges(&ticket.node_id, &next);
-                Ok(
+                let mut outcome =
                     NodeExecutionOutcome::new(completed_result(Some(committed_result_ref), usage))
                         .with_replan(ExecutionGraphReplan {
                             nodes: next,
                             edges,
                             reason: "provider intent advanced the turn graph".to_string(),
-                        }),
-                )
+                        });
+                outcome.domain_events.push(
+                    self.services
+                        .goal_store()
+                        .observation_event(
+                            &observation,
+                            format!("{}:goal-observation", ticket.idempotency_key),
+                        )
+                        .map_err(|reason| NodeExecutorError::Poll {
+                            node_id: ticket.node_id.clone(),
+                            reason,
+                        })?,
+                );
+                outcome.domain_events.push(
+                    self.services
+                        .goal_store()
+                        .observation_event(
+                            &strategy_observation,
+                            format!("{}:strategy-observation", ticket.idempotency_key),
+                        )
+                        .map_err(|reason| NodeExecutorError::Poll {
+                            node_id: ticket.node_id.clone(),
+                            reason,
+                        })?,
+                );
+                outcome.domain_events.push(
+                    self.services
+                        .goal_store()
+                        .observation_event(
+                            &provider_observation,
+                            format!("{}:provider-observation", ticket.idempotency_key),
+                        )
+                        .map_err(|reason| NodeExecutorError::Poll {
+                            node_id: ticket.node_id.clone(),
+                            reason,
+                        })?,
+                );
+                outcome.domain_events.push(
+                    self.services
+                        .goal_store()
+                        .observation_event(
+                            &context_observation,
+                            format!("{}:context-observation", ticket.idempotency_key),
+                        )
+                        .map_err(|reason| NodeExecutorError::Poll {
+                            node_id: ticket.node_id.clone(),
+                            reason,
+                        })?,
+                );
+                if let Some(observation) = input_observation {
+                    outcome.domain_events.push(
+                        self.services
+                            .goal_store()
+                            .observation_event(
+                                &observation,
+                                format!("{}:input-observation", ticket.idempotency_key),
+                            )
+                            .map_err(|reason| NodeExecutorError::Poll {
+                                node_id: ticket.node_id.clone(),
+                                reason,
+                            })?,
+                    );
+                }
+                if let Some((_, revision, event)) = input_revision {
+                    outcome.domain_events.push(event);
+                    outcome.domain_events.push(
+                        self.services
+                            .goal_store()
+                            .intervention_event(
+                                &RuntimeIntervention {
+                                    goal_id: goal_id.clone(),
+                                    kind: RuntimeInterventionKind::Replan,
+                                    reason: format!(
+                                        "applied user goal revision {} at Runner checkpoint",
+                                        revision.revision,
+                                    ),
+                                    evidence_refs: vec![format!(
+                                        "goal_revision:{}",
+                                        revision.revision,
+                                    )],
+                                    expected_graph_revision: None,
+                                },
+                                format!("{}:input-replan", ticket.idempotency_key),
+                            )
+                            .map_err(|reason| NodeExecutorError::Poll {
+                                node_id: ticket.node_id.clone(),
+                                reason,
+                            })?,
+                    );
+                }
+                if let Some(intervention) = model_intervention {
+                    outcome.domain_events.push(
+                        self.services
+                            .goal_store()
+                            .intervention_event(
+                                &intervention,
+                                format!("{}:goal-intervention", ticket.idempotency_key),
+                            )
+                            .map_err(|reason| NodeExecutorError::Poll {
+                                node_id: ticket.node_id.clone(),
+                                reason,
+                            })?,
+                    );
+                }
+                Ok(outcome)
             }
             Err(error) => {
-                self.state.lock().await.failure = Some(error.to_string());
-                Err(NodeExecutorError::Poll {
-                    node_id: ticket.node_id.clone(),
-                    reason: error.to_string(),
-                })
+                // A provider failure is execution evidence, not an implicit
+                // graph terminal. Preserve it and let the same Goal policy
+                // that governs tools decide whether the next node retries,
+                // changes strategy, or produces an honest blocked result.
+                let reason = error.to_string();
+                let (goal_id, iteration) = {
+                    let mut state = self.state.lock().await;
+                    state.iterations = state.iterations.saturating_add(1);
+                    (state.goal_id.clone(), state.iterations)
+                };
+                let observation = RuntimeObservation {
+                    goal_id: goal_id.clone(),
+                    kind: RuntimeObservationKind::ProviderProgress,
+                    source: "runtime.provider_stream".to_string(),
+                    summary: format!("provider model step failed: {reason}"),
+                    // Keep the fingerprint stable across transport wording so
+                    // the policy detects a repeated failed execution path.
+                    fingerprint: Some("provider_failure".to_string()),
+                    evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
+                    metrics: BTreeMap::from([("failed_model_step".to_string(), 1)]),
+                    progress_delta: -1,
+                    novelty: 0,
+                };
+                let goal = self
+                    .services
+                    .goal_store()
+                    .get(&goal_id)
+                    .map_err(|reason| NodeExecutorError::Poll {
+                        node_id: ticket.node_id.clone(),
+                        reason,
+                    })?
+                    .ok_or_else(|| NodeExecutorError::Poll {
+                        node_id: ticket.node_id.clone(),
+                        reason: format!("goal {goal_id} disappeared before provider recovery"),
+                    })?;
+                let mut observations =
+                    self.services
+                        .goal_store()
+                        .observations(&goal_id)
+                        .map_err(|reason| NodeExecutorError::Poll {
+                            node_id: ticket.node_id.clone(),
+                            reason,
+                        })?;
+                observations.push(observation.clone());
+                let intervention = crate::execution_core::InterventionPolicy::default()
+                    .propose(&goal, &observations);
+                let (next, replan_reason, next_model_instruction) = {
+                    let mut state = self.state.lock().await;
+                    let (node, next_model_instruction) = match intervention.kind {
+                        RuntimeInterventionKind::Block => {
+                            state.terminal_override = Some((
+                                GoalCompletion::Blocked,
+                                format!(
+                                    "Execution blocked after repeated provider failures: {}\n\nCommitted goal and evidence state were retained. Provide a new provider, constraint, or explicit replan to continue.",
+                                    intervention.reason
+                                ),
+                            ));
+                            let mut node = dynamic_node(
+                                ticket,
+                                iteration,
+                                "provider-block-synthesize",
+                                ExecutionNodeKind::Synthesize,
+                                crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND,
+                                "inline_model",
+                            );
+                            node.executor_kind = crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND.to_string();
+                            (node, None)
+                        }
+                        RuntimeInterventionKind::Switch => {
+                            let instruction = "Runtime recovery strategy (mandatory): the prior provider path failed repeatedly. Reassess the objective from already committed goal/evidence, avoid repeating the failed transport path, reduce the next step to the smallest independently verifiable action, and state any remaining blocker explicitly.".to_string();
+                            state.content.push_str("\n\n");
+                            state.content.push_str(&instruction);
+                            state.content.push('\n');
+                            (
+                                dynamic_node(
+                                    ticket,
+                                    iteration,
+                                    "provider-recovery-model",
+                                    ExecutionNodeKind::InlineModel,
+                                    "inline_model",
+                                    "inline_model",
+                                ),
+                                Some(instruction),
+                            )
+                        }
+                        RuntimeInterventionKind::Replan => {
+                            let instruction = "Runtime recovery directive: a provider step failed. Replan from the committed goal and evidence before retrying; do not assume uncommitted output is valid.".to_string();
+                            state.content.push_str("\n\n");
+                            state.content.push_str(&instruction);
+                            state.content.push('\n');
+                            (
+                                dynamic_node(
+                                    ticket,
+                                    iteration,
+                                    "provider-replan-model",
+                                    ExecutionNodeKind::InlineModel,
+                                    "inline_model",
+                                    "inline_model",
+                                ),
+                                Some(instruction),
+                            )
+                        }
+                        _ => (
+                            dynamic_node(
+                                ticket,
+                                iteration,
+                                "provider-recovery-model",
+                                ExecutionNodeKind::InlineModel,
+                                "inline_model",
+                                "inline_model",
+                            ),
+                            None,
+                        ),
+                    };
+                    (
+                        node,
+                        format!(
+                            "Runner applied provider failure intervention: {:?}",
+                            intervention.kind
+                        ),
+                        next_model_instruction,
+                    )
+                };
+                if let Some(instruction) = next_model_instruction {
+                    let mut item = ContextItem::new(
+                        format!("runtime-provider-recovery:{}", ticket.node_id),
+                        ContextSourceKind::Task,
+                        ContextRole::Instruction,
+                        instruction,
+                    );
+                    item.authority = ContextAuthority::System;
+                    item.visibility = ContextVisibility::Private;
+                    item.evidence = vec![format!("execution_node:{}", ticket.node_id)];
+                    self.runtime.lock().await.push_next_model_context_item(item);
+                }
+                let mut outcome = NodeExecutionOutcome::new(completed_result(
+                    Some(format!(
+                        "{}:provider-failure:{}",
+                        ticket.graph_id,
+                        sha256_digest(&reason)
+                    )),
+                    ExecutionUsage::default(),
+                ));
+                outcome.domain_events.push(
+                    self.services
+                        .goal_store()
+                        .observation_event(
+                            &observation,
+                            format!("{}:provider-failure-observation", ticket.idempotency_key),
+                        )
+                        .map_err(|reason| NodeExecutorError::Poll {
+                            node_id: ticket.node_id.clone(),
+                            reason,
+                        })?,
+                );
+                outcome.domain_events.push(
+                    self.services
+                        .goal_store()
+                        .intervention_event(
+                            &intervention,
+                            format!("{}:provider-failure-intervention", ticket.idempotency_key),
+                        )
+                        .map_err(|reason| NodeExecutorError::Poll {
+                            node_id: ticket.node_id.clone(),
+                            reason,
+                        })?,
+                );
+                outcome.replan = Some(ExecutionGraphReplan {
+                    nodes: vec![next.clone()],
+                    edges: dynamic_edges(&ticket.node_id, &[next]),
+                    reason: replan_reason,
+                });
+                Ok(outcome)
             }
         }
     }
 
     async fn after_commit(&self, ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
+        tracing::debug!(node_id = %ticket.node_id, "publishing committed model transcript");
         let messages = self
             .state
             .lock()
@@ -1001,6 +1927,7 @@ where
             .pending_transcript
             .remove(&ticket.node_id)
             .unwrap_or_default();
+        tracing::debug!(node_id = %ticket.node_id, message_count = messages.len(), "model transcript staged for publication");
         self.runtime
             .lock()
             .await
@@ -1008,6 +1935,7 @@ where
             .await
             .messages
             .extend(messages);
+        tracing::debug!(node_id = %ticket.node_id, "committed model transcript published");
         Ok(())
     }
 }
@@ -1028,22 +1956,20 @@ where
         &self,
         ticket: &NodeExecutionTicket,
     ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
-        let (calls, prompter, iteration) = {
-            let mut state = self.state.lock().await;
+        let (prompter, iteration, session_id, model_lease) = {
+            let state = self.state.lock().await;
             (
-                std::mem::take(&mut state.next_calls),
                 state.prompter.clone(),
                 state.iterations,
+                state.session_id.clone(),
+                state.model.clone(),
             )
         };
-        let calls = if calls.is_empty() {
-            decode_tool_calls(&ticket.payload_ref).map_err(|error| NodeExecutorError::Poll {
+        let (calls, continue_with_tool_batch) =
+            decode_tool_batch(&ticket.payload_ref).map_err(|error| NodeExecutorError::Poll {
                 node_id: ticket.node_id.clone(),
                 reason: format!("tool batch persistent payload is invalid: {error}"),
-            })?
-        } else {
-            calls
-        };
+            })?;
         if calls.is_empty() {
             return Err(NodeExecutorError::Poll {
                 node_id: ticket.node_id.clone(),
@@ -1051,26 +1977,20 @@ where
             });
         }
         let result = if let Some(host) = self.services.tool_execution_host() {
-            let messages = calls
-                .iter()
-                .map(|call| {
-                    let outcome = host.execute_runtime_tool(&crate::RuntimeToolExecutionRequest {
-                        idempotency_key: format!("{}:{}", ticket.idempotency_key, call.id),
-                        tool_use_id: call.id.clone(),
-                        tool_name: call.name.clone(),
-                        input: call.input.clone(),
-                        category: crate::tool_orchestrator::ToolSafetyCategory::from_tool_name(
-                            &call.name,
-                        ),
-                    });
-                    ConversationMessage::tool_result(
-                        outcome.tool_use_id,
-                        outcome.tool_name,
-                        outcome.output.or(outcome.error).unwrap_or_default(),
-                        outcome.status != crate::RuntimeToolExecutionStatus::Executed,
-                    )
-                })
-                .collect::<Vec<_>>();
+            let raw_messages = execute_governed_runtime_tool_batch(
+                Arc::clone(host),
+                &calls,
+                &session_id,
+                model_lease.as_deref(),
+                ticket,
+            )
+            .await;
+            // Graph scheduling executes outside the legacy adapter. Before
+            // the next model node sees the result, route its raw output
+            // through the same durable evidence and context-ledger path used
+            // by normal conversation tool calls.
+            let messages =
+                compact_governed_tool_messages(&self.runtime, &calls, raw_messages).await;
             crate::conversation::ToolBatchStepResult {
                 failed: messages
                     .iter()
@@ -1100,18 +2020,271 @@ where
             })?
         };
         let tool_calls = result.messages.len() as u64;
+        let failed = result.failed;
+        let failed_tools = failed_tool_names(&result.messages);
+        let action_fingerprint = tool_batch_fingerprint(&calls);
+        let goal_id = self.state.lock().await.goal_id.clone();
+        let prior_observations =
+            self.services
+                .goal_store()
+                .observations(&goal_id)
+                .map_err(|reason| NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason,
+                })?;
+        let repeated_success = prior_observations.iter().any(|observation| {
+            observation.kind == RuntimeObservationKind::ToolProgress
+                && observation.progress_delta > 0
+                && observation.fingerprint.as_deref() == Some(action_fingerprint.as_str())
+        });
+        let coverage_keys = tool_batch_coverage_keys(&calls);
+        let scope_keys = tool_batch_scope_keys(&calls);
+        let covered_before = prior_observations
+            .iter()
+            .filter(|observation| observation.kind == RuntimeObservationKind::ToolProgress)
+            .flat_map(|observation| observation.evidence_refs.iter())
+            .filter_map(|reference| reference.strip_prefix("tool_coverage:"))
+            .collect::<BTreeSet<_>>();
+        let scopes_covered_before = prior_observations
+            .iter()
+            .filter(|observation| observation.kind == RuntimeObservationKind::ToolProgress)
+            .flat_map(|observation| observation.evidence_refs.iter())
+            .filter_map(|reference| reference.strip_prefix("tool_scope:"))
+            .collect::<BTreeSet<_>>();
+        let newly_covered = coverage_keys
+            .iter()
+            .filter(|coverage| !covered_before.contains(coverage.as_str()))
+            .count();
+        let newly_scoped = scope_keys
+            .iter()
+            .filter(|scope| !scopes_covered_before.contains(scope.as_str()))
+            .count();
+        let coverage_novelty = if coverage_keys.is_empty() {
+            50_u8
+        } else if newly_covered == 0 {
+            15_u8
+        } else {
+            u8::try_from(newly_covered.saturating_mul(100) / coverage_keys.len())
+                .unwrap_or(100)
+                .clamp(30, 100)
+        };
+        let low_novelty = failed == 0 && !coverage_keys.is_empty() && newly_covered == 0;
+        let bounded_evidence_role = self.state.lock().await.bounded_evidence_role;
+        // File-level receipts may be individually new while adding no new
+        // responsibility zone. A delegated role has a finite evidence
+        // contract, so repeated work inside already-covered zones is a
+        // saturation signal. Main turns retain their normal open exploration.
+        let scope_saturated =
+            bounded_evidence_role && failed == 0 && !scope_keys.is_empty() && newly_scoped == 0;
         let mut state = self.state.lock().await;
         state
             .pending_transcript
             .insert(ticket.node_id.clone(), result.messages.clone());
         state.tool_results.extend(result.messages);
-        Ok(NodeExecutionOutcome::new(completed_result(
+        state.last_verified_progress =
+            failed == 0 && !repeated_success && !low_novelty && !scope_saturated;
+        let observation = RuntimeObservation {
+            goal_id: state.goal_id.clone(),
+            kind: RuntimeObservationKind::ToolProgress,
+            source: "runtime.tool_batch".to_string(),
+            summary: if failed_tools.is_empty() && repeated_success {
+                format!(
+                    "tool batch reused an already-completed action calls={tool_calls}; retained receipt must be used before another identical request"
+                )
+            } else if failed_tools.is_empty() && scope_saturated {
+                format!(
+                    "tool batch completed calls={tool_calls} but added no new bounded evidence scope; retain receipts and synthesize"
+                )
+            } else if failed_tools.is_empty() {
+                format!(
+                    "tool batch completed calls={tool_calls} failed=0 coverage_new={newly_covered}/{} scope_new={newly_scoped}/{}",
+                    coverage_keys.len(),
+                    scope_keys.len()
+                )
+            } else {
+                format!(
+                    "tool batch completed calls={tool_calls} failed={failed} failed_tools={}",
+                    failed_tools.join(",")
+                )
+            },
+            fingerprint: Some(if failed_tools.is_empty() {
+                action_fingerprint
+            } else {
+                format!("tool_failure:{}", failed_tools.join(","))
+            }),
+            evidence_refs: calls
+                .iter()
+                .map(|call| format!("tool_call:{}", call.id))
+                .chain(
+                    coverage_keys
+                        .iter()
+                        .map(|coverage| format!("tool_coverage:{coverage}")),
+                )
+                .chain(scope_keys.iter().map(|scope| format!("tool_scope:{scope}")))
+                .collect(),
+            metrics: BTreeMap::from([
+                ("tool_calls".to_string(), tool_calls as i64),
+                ("failed_tool_calls".to_string(), failed as i64),
+                ("coverage_total".to_string(), coverage_keys.len() as i64),
+                ("coverage_new".to_string(), newly_covered as i64),
+                ("scope_coverage_total".to_string(), scope_keys.len() as i64),
+                ("scope_coverage_new".to_string(), newly_scoped as i64),
+            ]),
+            progress_delta: if failed > 0 {
+                -1
+            } else if repeated_success || low_novelty || scope_saturated {
+                0
+            } else {
+                1
+            },
+            novelty: if failed > 0 {
+                20
+            } else if repeated_success || scope_saturated {
+                5
+            } else {
+                coverage_novelty
+            },
+        };
+        let goal_id = state.goal_id.clone();
+        drop(state);
+        let intervention = (!continue_with_tool_batch)
+            .then(|| {
+                self.services
+                    .goal_store()
+                    .get(&goal_id)
+                    .map_err(|reason| NodeExecutorError::Poll {
+                        node_id: ticket.node_id.clone(),
+                        reason,
+                    })?
+                    .map(|goal| {
+                        let mut observations =
+                            self.services.goal_store().observations(&goal_id).map_err(
+                                |reason| NodeExecutorError::Poll {
+                                    node_id: ticket.node_id.clone(),
+                                    reason,
+                                },
+                            )?;
+                        observations.push(observation.clone());
+                        Ok(crate::execution_core::InterventionPolicy::default()
+                            .propose(&goal, &observations))
+                    })
+                    .transpose()
+            })
+            .transpose()?
+            .flatten();
+        if let Some(intervention) = intervention
+            .as_ref()
+            .filter(|intervention| intervention.kind != RuntimeInterventionKind::Continue)
+        {
+            self.state.lock().await.content.push_str(&format!(
+                "\n\nRuntime intervention ({:?}): {}",
+                intervention.kind, intervention.reason
+            ));
+        }
+        let next = {
+            let mut state = self.state.lock().await;
+            let kind = intervention
+                .as_ref()
+                .map_or(RuntimeInterventionKind::Continue, |value| value.kind);
+            let node = match kind {
+                RuntimeInterventionKind::Synthesize => {
+                    state.force_text_only_next_model = true;
+                    state.content.push_str(
+                        "\n\nRuntime evidence checkpoint: consecutive tool batches added no new evidence coverage. The next response must synthesize a final answer from retained receipts; tools are disabled for that response. State remaining uncertainty explicitly.\n",
+                    );
+                    dynamic_node(
+                        ticket,
+                        state.iterations,
+                        "policy-text-only-conclusion",
+                        ExecutionNodeKind::InlineModel,
+                        "inline_model",
+                        "inline_model",
+                    )
+                }
+                RuntimeInterventionKind::Block => {
+                    let reason = intervention
+                        .as_ref()
+                        .map(|value| value.reason.as_str())
+                        .unwrap_or("goal intervention blocked execution");
+                    state.terminal_override = Some((
+                        GoalCompletion::Blocked,
+                        format!(
+                            "Execution blocked: {reason}\n\nChecked evidence was retained and no further speculative work was performed."
+                        ),
+                    ));
+                    let mut node = dynamic_node(
+                        ticket,
+                        state.iterations,
+                        "policy-block-synthesize",
+                        ExecutionNodeKind::Synthesize,
+                        crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND,
+                        "inline_model",
+                    );
+                    node.executor_kind =
+                        crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND
+                            .to_string();
+                    node
+                }
+                _ => dynamic_node(
+                    ticket,
+                    state.iterations,
+                    "model",
+                    ExecutionNodeKind::InlineModel,
+                    "inline_model",
+                    "inline_model",
+                ),
+            };
+            node
+        };
+        let mut outcome = NodeExecutionOutcome::new(completed_result(
             Some(format!("{}:tool-results:{tool_calls}", ticket.graph_id)),
             ExecutionUsage {
                 tool_calls,
                 ..ExecutionUsage::default()
             },
-        )))
+        ));
+        outcome.domain_events.push(
+            self.services
+                .goal_store()
+                .observation_event(
+                    &observation,
+                    format!("{}:goal-observation", ticket.idempotency_key),
+                )
+                .map_err(|reason| NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason,
+                })?,
+        );
+        if let Some(intervention) = intervention
+            .as_ref()
+            .filter(|intervention| intervention.kind != RuntimeInterventionKind::Continue)
+        {
+            outcome.domain_events.push(
+                self.services
+                    .goal_store()
+                    .intervention_event(
+                        intervention,
+                        format!("{}:goal-intervention", ticket.idempotency_key),
+                    )
+                    .map_err(|reason| NodeExecutorError::Poll {
+                        node_id: ticket.node_id.clone(),
+                        reason,
+                    })?,
+            );
+        }
+        if !continue_with_tool_batch {
+            outcome.replan = Some(ExecutionGraphReplan {
+                nodes: vec![next.clone()],
+                edges: dynamic_edges(&ticket.node_id, &[next]),
+                reason: format!(
+                    "Runner applied goal intervention: {:?}",
+                    intervention
+                        .as_ref()
+                        .map_or(RuntimeInterventionKind::Continue, |value| value.kind)
+                ),
+            });
+        }
+        Ok(outcome)
     }
 
     async fn after_commit(&self, ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
@@ -1131,6 +2304,166 @@ where
             .extend(messages);
         Ok(())
     }
+}
+
+async fn compact_governed_tool_messages<C, T>(
+    runtime: &Arc<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
+    calls: &[ModelToolCall],
+    raw_messages: Vec<ConversationMessage>,
+) -> Vec<ConversationMessage>
+where
+    C: ApiClient,
+    T: ToolExecutor,
+{
+    let call_inputs = calls
+        .iter()
+        .map(|call| (call.id.as_str(), call.input.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let runtime = runtime.lock().await;
+    let mut messages = Vec::with_capacity(raw_messages.len());
+    for raw_message in raw_messages {
+        let Some((tool_use_id, tool_name, output, is_error)) =
+            raw_message.blocks.iter().find_map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    tool_name,
+                    output,
+                    is_error,
+                } => Some((
+                    tool_use_id.as_str(),
+                    tool_name.as_str(),
+                    output.as_str(),
+                    *is_error,
+                )),
+                _ => None,
+            })
+        else {
+            messages.push(raw_message);
+            continue;
+        };
+        let input = call_inputs.get(tool_use_id).copied().unwrap_or_default();
+        messages.push(
+            runtime
+                .prepare_governed_tool_result(tool_use_id, tool_name, input, output, is_error)
+                .await,
+        );
+    }
+    messages
+}
+
+/// Execute a ToolBatch using the already-governed plan rather than serialising
+/// every read-only request in the conversation adapter.  The plan is the
+/// authority for dependency, safety category, and concurrency: the host only
+/// receives fully-bound individual requests.  Results are returned in model
+/// call order even when their execution is concurrent.
+async fn execute_governed_runtime_tool_batch(
+    host: Arc<dyn crate::RuntimeExecutionHost>,
+    calls: &[ModelToolCall],
+    session_id: &str,
+    model_lease: Option<&str>,
+    ticket: &NodeExecutionTicket,
+) -> Vec<ConversationMessage> {
+    let requests = calls
+        .iter()
+        .map(|call| crate::tool_dispatch::ToolRequest {
+            tool_use_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            input: call.input.clone(),
+            depends_on: call.depends_on.clone(),
+        })
+        .collect::<Vec<_>>();
+    let plan = crate::tool_execution_plan::ToolExecutionPlan::from_requests(&requests);
+    let schedule = crate::execution_scheduler::schedule_tool_execution_plan(&requests, &plan);
+    let mut results = vec![None; calls.len()];
+
+    for batch in schedule.batches {
+        let parallel = batch.max_concurrency > 1
+            && batch.indices.len() > 1
+            && batch.indices.iter().all(|index| {
+                plan.tasks
+                    .get(*index)
+                    .is_some_and(|task| task.can_parallelize)
+            });
+        if parallel {
+            let limit = batch.max_concurrency.min(batch.indices.len()).max(1);
+            let completed = stream::iter(batch.indices.into_iter().map(|index| {
+                let host = Arc::clone(&host);
+                let request =
+                    bound_runtime_tool_request(&calls[index], session_id, model_lease, ticket);
+                async move {
+                    let joined =
+                        tokio::task::spawn_blocking(move || host.execute_runtime_tool(&request))
+                            .await;
+                    (index, joined)
+                }
+            }))
+            .buffer_unordered(limit)
+            .collect::<Vec<_>>()
+            .await;
+            for (index, joined) in completed {
+                results[index] = Some(match joined {
+                    Ok(outcome) => tool_outcome_message(outcome),
+                    Err(error) => ConversationMessage::tool_result(
+                        calls[index].id.clone(),
+                        calls[index].name.clone(),
+                        format!("governed tool worker failed to join: {error}"),
+                        true,
+                    ),
+                });
+            }
+        } else {
+            for index in batch.indices {
+                let request =
+                    bound_runtime_tool_request(&calls[index], session_id, model_lease, ticket);
+                results[index] = Some(tool_outcome_message(host.execute_runtime_tool(&request)));
+            }
+        }
+    }
+
+    results
+        .into_iter()
+        .enumerate()
+        .map(|(index, result)| {
+            result.unwrap_or_else(|| {
+                ConversationMessage::tool_result(
+                    calls[index].id.clone(),
+                    calls[index].name.clone(),
+                    "tool scheduler did not produce a result".to_string(),
+                    true,
+                )
+            })
+        })
+        .collect()
+}
+
+fn bound_runtime_tool_request(
+    call: &ModelToolCall,
+    session_id: &str,
+    model_lease: Option<&str>,
+    ticket: &NodeExecutionTicket,
+) -> crate::RuntimeToolExecutionRequest {
+    crate::RuntimeToolExecutionRequest {
+        idempotency_key: format!("{}:{}", ticket.idempotency_key, call.id),
+        tool_use_id: call.id.clone(),
+        tool_name: call.name.clone(),
+        input: call.input.clone(),
+        category: crate::tool_orchestrator::ToolSafetyCategory::from_tool_name(&call.name),
+        session_id: Some(session_id.to_string()),
+        model_lease: model_lease.map(ToString::to_string),
+        parent_execution: Some(harness_contract::execution_graph::ExecutionParentBinding {
+            execution_id: ticket.graph_id.clone(),
+            node_id: ticket.node_id.clone(),
+        }),
+    }
+}
+
+fn tool_outcome_message(outcome: crate::RuntimeToolExecutionOutcome) -> ConversationMessage {
+    ConversationMessage::tool_result(
+        outcome.tool_use_id,
+        outcome.tool_name,
+        outcome.output.or(outcome.error).unwrap_or_default(),
+        outcome.status != crate::RuntimeToolExecutionStatus::Executed,
+    )
 }
 
 struct TurnSynthesizeBackend<C: ApiClient, T: ToolExecutor> {
@@ -1156,23 +2489,48 @@ where
             .projection(&ticket.graph_id)
             .await
             .map_err(|error| error.to_string())?;
-        let final_answer = projection
-            .nodes
-            .iter()
-            .filter(|node| node.kind == ExecutionNodeKind::InlineModel)
-            .filter_map(|node| node.result_ref.as_deref())
-            .filter_map(|result_ref| result_ref.strip_prefix("assistant_json:"))
-            .last()
-            .ok_or_else(|| "synthesize has no committed FinalAnswer result_ref".to_string())
-            .and_then(|encoded| {
-                serde_json::from_str::<String>(encoded).map_err(|error| error.to_string())
-            })?;
+        let (ingress, goal_id, terminal_override) = {
+            let state = self.state.lock().await;
+            (
+                state.ingress.clone(),
+                state.goal_id.clone(),
+                state.terminal_override.clone(),
+            )
+        };
+        let (completion, final_answer) = match terminal_override {
+            Some((completion, answer)) => (completion, answer),
+            None => (
+                GoalCompletion::Satisfied,
+                projection
+                    .nodes
+                    .iter()
+                    .filter(|node| node.kind == ExecutionNodeKind::InlineModel)
+                    .filter_map(|node| node.result_ref.as_deref())
+                    .filter_map(|result_ref| result_ref.strip_prefix("assistant_json:"))
+                    .last()
+                    .ok_or_else(|| "synthesize has no committed FinalAnswer result_ref".to_string())
+                    .and_then(|encoded| {
+                        serde_json::from_str::<String>(encoded).map_err(|error| error.to_string())
+                    })?,
+            ),
+        };
         let digest = format!("{:x}", Sha256::digest(final_answer.as_bytes()));
-        let ingress = self.state.lock().await.ingress.clone();
         let mut outcome = NodeExecutionOutcome::new(completed_result(
             Some(format!("turn-result:{}:{digest}", ticket.graph_id)),
             ExecutionUsage::default(),
         ));
+        outcome.domain_events.push(
+            self.services
+                .goal_store()
+                .terminal_event(
+                    &goal_id,
+                    completion,
+                    vec![format!("execution_graph:{}", ticket.graph_id)],
+                    "terminal_synthesis".to_string(),
+                    format!("{}:goal-complete", ticket.idempotency_key),
+                )
+                .map_err(|error| format!("goal completion cannot commit: {error}"))?,
+        );
         if let Some(ingress) = ingress {
             let terminal = crate::runtime_event_store::SessionTerminalInput {
                 terminal_id: format!("turn-terminal:{}", ingress.request_id),
@@ -1188,7 +2546,7 @@ where
                 .push(crate::runtime_event_store::RuntimeTransactionEventInput {
                     event: crate::RuntimeEventInput {
                         stream_id: format!("session-terminal:{}", ingress.request_id),
-                        scope: crate::RuntimeEventScope::SessionCommand,
+                        scope: crate::RuntimeEventScope::SessionInput,
                         kind: "runtime.session.terminal_requested".to_string(),
                         status: Some("pending_delivery".to_string()),
                         actor: Some("SynthesizeNodeExecutor".to_string()),
@@ -1212,17 +2570,28 @@ where
             .projection(&ticket.graph_id)
             .await
             .map_err(|error| error.to_string())?;
-        let final_answer = projection
-            .nodes
-            .iter()
-            .filter(|node| node.kind == ExecutionNodeKind::InlineModel)
-            .filter_map(|node| node.result_ref.as_deref())
-            .filter_map(|result_ref| result_ref.strip_prefix("assistant_json:"))
-            .last()
-            .ok_or_else(|| "synthesize has no committed FinalAnswer result_ref".to_string())
-            .and_then(|encoded| {
-                serde_json::from_str::<String>(encoded).map_err(|error| error.to_string())
-            })?;
+        let (terminal_override, defer_post_turn_memory_maintenance) = {
+            let state = self.state.lock().await;
+            (state.terminal_override.clone(), state.ingress.is_some())
+        };
+        let terminal_completion = terminal_override
+            .as_ref()
+            .map(|(completion, _)| *completion)
+            .unwrap_or(GoalCompletion::Satisfied);
+        let final_answer = match terminal_override {
+            Some((_, answer)) => answer,
+            None => projection
+                .nodes
+                .iter()
+                .filter(|node| node.kind == ExecutionNodeKind::InlineModel)
+                .filter_map(|node| node.result_ref.as_deref())
+                .filter_map(|result_ref| result_ref.strip_prefix("assistant_json:"))
+                .last()
+                .ok_or_else(|| "synthesize has no committed FinalAnswer result_ref".to_string())
+                .and_then(|encoded| {
+                    serde_json::from_str::<String>(encoded).map_err(|error| error.to_string())
+                })?,
+        };
         let (
             content,
             assistant_messages,
@@ -1262,12 +2631,18 @@ where
                 input_tokens,
                 output_tokens,
                 wall_duration_ms,
+                terminal_completion,
+                defer_post_turn_memory_maintenance,
             )
             .await
             .map_err(|error| error.to_string())?;
         self.state.lock().await.summary = Some(summary);
         Ok(())
     }
+}
+
+fn sha256_digest(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
 fn dynamic_node(
@@ -1290,6 +2665,375 @@ fn dynamic_node(
         retry_policy: Default::default(),
         resource_scopes: Vec::new(),
     }
+}
+
+fn model_intent_summary(intent: &ModelStepIntent) -> String {
+    match intent {
+        ModelStepIntent::FinalAnswer { .. } => "model produced a terminal answer".to_string(),
+        ModelStepIntent::ToolCalls { calls } => {
+            format!("model requested {} tool call(s)", calls.len())
+        }
+        ModelStepIntent::AgentProposal { calls } => {
+            format!("model requested {} delegated agent action(s)", calls.len())
+        }
+        ModelStepIntent::TeamProposal { calls } => {
+            format!("model requested {} team action(s)", calls.len())
+        }
+        ModelStepIntent::ApprovalRequired { calls } => {
+            format!("model requested approval for {} action(s)", calls.len())
+        }
+        ModelStepIntent::Replan { reason } => format!("model requested replan: {reason}"),
+    }
+}
+
+fn final_answer_recovery_reason(text: &str, workspace_root: &std::path::Path) -> Option<String> {
+    if text.trim().is_empty() {
+        return Some("empty final answer".to_string());
+    }
+    let normalized = text.to_ascii_lowercase();
+    if ["<tool_call", "<function=", "<parameter=", "</tool_call>"]
+        .iter()
+        .any(|marker| normalized.contains(marker))
+    {
+        return Some("simulated tool-call markup in a final answer".to_string());
+    }
+    let missing = cited_workspace_paths(text)
+        .into_iter()
+        .filter(|path| looks_like_workspace_file_reference(path))
+        .filter(|path| !workspace_root.join(path).is_file())
+        .collect::<Vec<_>>();
+    (!missing.is_empty()).then(|| {
+        format!(
+            "final answer cited nonexistent workspace source path(s): {}",
+            missing.join(", ")
+        )
+    })
+}
+
+/// Bounds no-tool final-answer recovery using the same Runtime lease that
+/// governs the turn. This is intentionally not a global retry constant:
+/// complex work with already-committed evidence deserves more chances to
+/// convert a malformed provider response into a useful synthesis, while a
+/// pressured or explicitly constrained turn stops promptly.
+fn terminal_recovery_retry_budget(lease: &crate::execution_core::ExecutionBudgetLease) -> u8 {
+    use harness_contract::core::TaskComplexity;
+
+    let mut retries: u8 = match lease.complexity {
+        TaskComplexity::Trivial | TaskComplexity::Simple => 1,
+        TaskComplexity::Moderate => 2,
+        TaskComplexity::Complex | TaskComplexity::Strategic => 3,
+    };
+    if lease.resource_pressure_basis_points >= 8_500 {
+        retries = retries.min(1);
+    } else if lease
+        .provider_tokens_per_second
+        .is_some_and(|tokens_per_second| (1..12).contains(&tokens_per_second))
+    {
+        retries = retries.saturating_add(1).min(4);
+    }
+    if lease.explicit_user_limit.is_some_and(|limit| limit <= 2) {
+        retries = retries.min(1);
+    }
+    retries
+}
+
+/// A provider may emit a normal final answer and then append direct XML-like
+/// tool markup in the same text stream. The adapter can only execute a *pure*,
+/// declared XML response; executing a mixed prose block would turn generated
+/// text into a command channel. Preserve the already complete answer and drop
+/// only a suffix that begins with a tool marker after visible prose. A response
+/// that starts with markup remains invalid and follows governed recovery.
+fn strip_trailing_simulated_tool_markup(text: String) -> String {
+    let normalized = text.to_ascii_lowercase();
+    let start = ["<tool_call", "<function=", "<parameter="]
+        .iter()
+        .filter_map(|marker| normalized.find(marker))
+        .min();
+    let Some(start) = start else {
+        return text;
+    };
+    let suffix = &text[start..];
+    let lower_suffix = suffix.to_ascii_lowercase();
+    let is_direct_markup = lower_suffix.starts_with("<tool_call")
+        || lower_suffix.starts_with("<function=")
+        || lower_suffix.starts_with("<parameter=");
+    (start > 0 && is_direct_markup)
+        .then(|| text[..start].trim_end().to_string())
+        .unwrap_or(text)
+}
+
+fn looks_like_workspace_file_reference(path: &str) -> bool {
+    matches!(
+        path.rsplit_once('.').map(|(_, extension)| extension),
+        Some(
+            "rs" | "toml"
+                | "md"
+                | "json"
+                | "yaml"
+                | "yml"
+                | "ts"
+                | "tsx"
+                | "vue"
+                | "js"
+                | "mjs"
+                | "cjs"
+                | "py"
+                | "go"
+                | "java"
+                | "kt"
+                | "c"
+                | "h"
+                | "cc"
+                | "cpp"
+                | "hpp"
+        )
+    )
+}
+
+fn cited_workspace_paths(text: &str) -> Vec<String> {
+    let mut paths = std::collections::BTreeSet::new();
+    let mut remainder = text;
+    while let Some(index) = remainder.find("crates/") {
+        let candidate = &remainder[index..];
+        let length = candidate
+            .chars()
+            .take_while(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '/' | '_' | '-' | '.')
+            })
+            .map(char::len_utf8)
+            .sum();
+        if length > "crates/".len() {
+            paths.insert(candidate[..length].trim_end_matches('.').to_string());
+        }
+        remainder = &candidate["crates/".len()..];
+    }
+    paths.into_iter().collect()
+}
+
+fn model_intent_novelty(intent: &ModelStepIntent) -> u8 {
+    match intent {
+        ModelStepIntent::FinalAnswer { .. } => 60,
+        ModelStepIntent::ToolCalls { calls }
+        | ModelStepIntent::AgentProposal { calls }
+        | ModelStepIntent::TeamProposal { calls }
+        | ModelStepIntent::ApprovalRequired { calls } => {
+            // The action kind is novel to the graph, but it is still only a
+            // proposal until a downstream executor commits evidence.
+            50_u8.saturating_add(u8::try_from(calls.len().min(50)).unwrap_or(50))
+        }
+        ModelStepIntent::Replan { .. } => 40,
+    }
+}
+
+fn model_intent_kind(intent: &ModelStepIntent) -> &'static str {
+    match intent {
+        ModelStepIntent::FinalAnswer { .. } => "final_answer",
+        ModelStepIntent::ToolCalls { .. } => "tool_calls",
+        ModelStepIntent::AgentProposal { .. } => "agent_proposal",
+        ModelStepIntent::TeamProposal { .. } => "team_proposal",
+        ModelStepIntent::ApprovalRequired { .. } => "approval_required",
+        ModelStepIntent::Replan { .. } => "replan",
+    }
+}
+
+fn independent_tool_call_count(intent: &ModelStepIntent) -> usize {
+    match intent {
+        ModelStepIntent::ToolCalls { calls } | ModelStepIntent::ApprovalRequired { calls } => calls
+            .iter()
+            .filter(|call| call.depends_on.is_empty())
+            .count(),
+        _ => 0,
+    }
+}
+
+fn context_pressure_basis_points(input_tokens: u64, context_window: u32) -> i64 {
+    let window = u64::from(context_window.max(1));
+    i64::try_from(input_tokens.saturating_mul(10_000) / window).unwrap_or(i64::MAX)
+}
+
+fn failed_tool_names(messages: &[ConversationMessage]) -> Vec<String> {
+    let mut names = messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult {
+                tool_name,
+                is_error: true,
+                ..
+            } => Some(tool_name.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// A governed action is identified by its tool name and canonical input, not
+/// by the provider-generated call id. The id changes on every retry, so using
+/// it would hide repeated work from Goal/Intervention policy.
+fn tool_batch_fingerprint(calls: &[ModelToolCall]) -> String {
+    let mut actions = calls
+        .iter()
+        .map(|call| {
+            let input = serde_json::from_str::<serde_json::Value>(&call.input)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|_| call.input.clone());
+            format!("{}:{input}", call.name)
+        })
+        .collect::<Vec<_>>();
+    actions.sort();
+    format!("tool_action:{}", sha256_digest(&actions.join("\n")))
+}
+
+/// Derive stable evidence coverage keys without treating provider-generated
+/// call identifiers or superficial query variations as new investigation.
+/// Direct file reads retain file-level detail; broad discovery tools collapse
+/// to their workspace/crate zone so repeatedly globbing or grepping the same
+/// area becomes visible to the Goal policy as low-novelty work.
+fn tool_batch_coverage_keys(calls: &[ModelToolCall]) -> BTreeSet<String> {
+    calls
+        .iter()
+        .flat_map(tool_call_coverage_keys)
+        .collect::<BTreeSet<_>>()
+}
+
+/// Responsibility-zone coverage is intentionally coarser than file coverage.
+/// It is consulted only for a bounded delegated role, where reading another
+/// file in an already-investigated component is not by itself a reason to
+/// defer a supported conclusion.
+fn tool_batch_scope_keys(calls: &[ModelToolCall]) -> BTreeSet<String> {
+    calls
+        .iter()
+        .flat_map(|call| {
+            let value = serde_json::from_str::<serde_json::Value>(&call.input).ok();
+            let paths = value.as_ref().map(coverage_paths).unwrap_or_default();
+            if paths.is_empty() {
+                vec![format!("tool:{}", call.name.to_ascii_lowercase())]
+            } else {
+                paths.iter().map(|path| coverage_zone(path)).collect()
+            }
+        })
+        .collect()
+}
+
+fn tool_call_coverage_keys(call: &ModelToolCall) -> Vec<String> {
+    let value = serde_json::from_str::<serde_json::Value>(&call.input).ok();
+    let name = call.name.to_ascii_lowercase();
+    let paths = value.as_ref().map(coverage_paths).unwrap_or_default();
+    let is_discovery = matches!(
+        name.as_str(),
+        "workspace_snapshot"
+            | "glob_search"
+            | "glob_many"
+            | "grep_search"
+            | "grep_many"
+            | "lsp"
+            | "toolsearch"
+            | "tool_search"
+            | "runtime_capabilities"
+            | "tool_batch_readonly"
+    );
+    if is_discovery {
+        let zones = if paths.is_empty() {
+            vec!["workspace".to_string()]
+        } else {
+            paths.iter().map(|path| coverage_zone(path)).collect()
+        };
+        return zones
+            .into_iter()
+            .map(|zone| format!("discovery:{zone}"))
+            .collect();
+    }
+    if !paths.is_empty() {
+        return paths
+            .iter()
+            .map(|path| format!("evidence:{name}:{}", normalized_coverage_path(path)))
+            .collect();
+    }
+    vec![format!("tool:{name}")]
+}
+
+fn coverage_paths(value: &serde_json::Value) -> Vec<String> {
+    const PATH_FIELDS: &[&str] = &[
+        "path",
+        "file_path",
+        "file",
+        "files",
+        "paths",
+        "pattern",
+        "patterns",
+        "searches",
+        "uri",
+        "evidence_ref",
+    ];
+    let mut values = Vec::new();
+    if let Some(object) = value.as_object() {
+        for field in PATH_FIELDS {
+            if let Some(field_value) = object.get(*field) {
+                collect_coverage_strings(field_value, &mut values);
+            }
+        }
+    }
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn collect_coverage_strings(value: &serde_json::Value, output: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(value) => {
+            if let Ok(nested) = serde_json::from_str::<serde_json::Value>(value) {
+                collect_coverage_strings(&nested, output);
+            } else if !value.trim().is_empty() {
+                output.push(value.trim().to_string());
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_coverage_strings(value, output);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for field in ["path", "file_path", "file", "glob", "pattern", "uri"] {
+                if let Some(value) = values.get(field) {
+                    collect_coverage_strings(value, output);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalized_coverage_path(path: &str) -> String {
+    let path = path.replace('\\', "/");
+    path.find("crates/")
+        .map_or(path.clone(), |index| path[index..].to_string())
+}
+
+fn coverage_zone(path: &str) -> String {
+    let normalized = normalized_coverage_path(path);
+    let parts = normalized.split('/').collect::<Vec<_>>();
+    if parts.first() == Some(&"crates") && parts.len() >= 2 {
+        format!("crates/{}", parts[1])
+    } else if parts.first() == Some(&"docs") {
+        "docs".to_string()
+    } else {
+        "workspace".to_string()
+    }
+}
+
+fn explicit_model_step_limit(content: &str) -> Option<usize> {
+    ["max_steps=", "max model steps=", "最大模型步骤="]
+        .into_iter()
+        .find_map(|marker| {
+            let start = content.to_ascii_lowercase().find(marker)? + marker.len();
+            let digits = content[start..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>();
+            digits.parse::<usize>().ok().filter(|value| *value > 0)
+        })
 }
 
 /// The legacy conversation engine appends provider/tool messages during the
@@ -1350,6 +3094,70 @@ fn resource_scopes_for_tool_calls(calls: &[ModelToolCall]) -> Vec<String> {
     other.sort();
     other.dedup();
     other
+}
+
+/// Keep stateful runtime orchestration outside a workspace-tool batch.
+///
+/// A `runtime_orchestrate(request_team)` call may synchronously drive a child
+/// graph whose agents read or write the workspace. If it shares one parent
+/// ToolBatch with a file mutation, the graph-level lease would be retained
+/// across the entire child execution. We compile two ordered durable batches:
+/// normal tools retain their exact scopes; runtime control is governed by its
+/// own contract and does not claim filesystem ownership. Cross-batch
+/// dependencies are represented by this order and removed from the inner
+/// batch scheduler.
+fn tool_batches_for_turn(calls: &[ModelToolCall]) -> Result<Vec<Vec<ModelToolCall>>, String> {
+    let (runtime_control, regular): (Vec<_>, Vec<_>) = calls
+        .iter()
+        .cloned()
+        .partition(|call| call.name.eq_ignore_ascii_case("runtime_orchestrate"));
+    if runtime_control.is_empty() || regular.is_empty() {
+        return Ok(vec![calls.to_vec()]);
+    }
+
+    let runtime_ids = runtime_control
+        .iter()
+        .map(|call| call.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let regular_ids = regular
+        .iter()
+        .map(|call| call.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let regular_after_runtime = regular.iter().any(|call| {
+        call.depends_on
+            .iter()
+            .any(|dependency| runtime_ids.contains(dependency.as_str()))
+    });
+    let runtime_after_regular = runtime_control.iter().any(|call| {
+        call.depends_on
+            .iter()
+            .any(|dependency| regular_ids.contains(dependency.as_str()))
+    });
+    if regular_after_runtime && runtime_after_regular {
+        return Err(
+            "runtime_orchestrate and workspace tools contain a cross-batch dependency cycle"
+                .to_string(),
+        );
+    }
+
+    let mut ordered = if regular_after_runtime {
+        vec![runtime_control, regular]
+    } else {
+        // No explicit cross-batch dependency, or runtime control depends on
+        // evidence from regular tools: release workspace leases first.
+        vec![regular, runtime_control]
+    };
+    for batch in &mut ordered {
+        let ids = batch
+            .iter()
+            .map(|call| call.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        for call in batch {
+            call.depends_on
+                .retain(|dependency| ids.contains(dependency));
+        }
+    }
+    Ok(ordered)
 }
 
 fn resource_scopes_for_agent_packet(packet: &AgentTaskPacket) -> Vec<String> {
@@ -1425,6 +3233,113 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct RecoveringProviderClient {
+        attempts: Arc<AtomicUsize>,
+        saw_recovery_directive: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ApiClient for RecoveringProviderClient {
+        fn stream(
+            &mut self,
+            request: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt >= 2
+                && request
+                    .system_prompt
+                    .iter()
+                    .any(|fragment| fragment.contains("provider path failed repeatedly"))
+            {
+                self.saw_recovery_directive.store(true, Ordering::SeqCst);
+            }
+            if attempt < 2 {
+                return Box::pin(stream::iter(vec![Err(RuntimeError::new(
+                    "simulated provider transport failure",
+                ))]));
+            }
+            Box::pin(stream::iter(vec![
+                Ok(AssistantEvent::TextDelta(
+                    "recovered terminal answer".to_string(),
+                )),
+                Ok(AssistantEvent::MessageStop),
+            ]))
+        }
+    }
+
+    #[derive(Clone)]
+    struct ToolOnlyThenFinalClient {
+        attempts: Arc<AtomicUsize>,
+        saw_terminal_boundary: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ApiClient for ToolOnlyThenFinalClient {
+        fn stream(
+            &mut self,
+            request: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                self.saw_terminal_boundary.store(
+                    request
+                        .system_prompt
+                        .iter()
+                        .any(|fragment| fragment.contains("Terminal response boundary")),
+                    Ordering::SeqCst,
+                );
+                return Box::pin(stream::iter(vec![
+                    Ok(AssistantEvent::ToolUse {
+                        id: "hallucinated-tool".to_string(),
+                        name: "read_file".to_string(),
+                        input: r#"{\"path\":\"Cargo.toml\"}"#.to_string(),
+                    }),
+                    Ok(AssistantEvent::MessageStop),
+                ]));
+            }
+            Box::pin(stream::iter(vec![
+                Ok(AssistantEvent::TextDelta(
+                    "Recovered conclusion from retained evidence.".to_string(),
+                )),
+                Ok(AssistantEvent::MessageStop),
+            ]))
+        }
+    }
+
+    #[derive(Clone)]
+    struct ThinkingOnlyThenFinalClient {
+        attempts: Arc<AtomicUsize>,
+        saw_continuation: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ApiClient for ThinkingOnlyThenFinalClient {
+        fn stream(
+            &mut self,
+            request: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                return Box::pin(stream::iter(vec![
+                    Ok(AssistantEvent::ThinkingDelta(
+                        "I need to turn the retained evidence into a response.".to_string(),
+                    )),
+                    Ok(AssistantEvent::MessageStop),
+                ]));
+            }
+            self.saw_continuation.store(
+                request.system_prompt.iter().any(|fragment| {
+                    fragment.contains("previous model step produced private reasoning")
+                }),
+                Ordering::SeqCst,
+            );
+            Box::pin(stream::iter(vec![
+                Ok(AssistantEvent::TextDelta(
+                    "Visible conclusion from retained evidence.".to_string(),
+                )),
+                Ok(AssistantEvent::MessageStop),
+            ]))
+        }
+    }
+
     struct NoopToolExecutor;
 
     impl ToolExecutor for NoopToolExecutor {
@@ -1475,6 +3390,32 @@ mod tests {
     struct RecordingToolExecutor {
         executed: Arc<AtomicUsize>,
         order: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct ConcurrentRuntimeToolHost {
+        active: Arc<AtomicUsize>,
+        observed_peak: Arc<AtomicUsize>,
+    }
+
+    impl crate::RuntimeExecutionHost for ConcurrentRuntimeToolHost {
+        fn execute_runtime_tool(
+            &self,
+            request: &crate::RuntimeToolExecutionRequest,
+        ) -> crate::RuntimeToolExecutionOutcome {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.observed_peak.fetch_max(active, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            crate::RuntimeToolExecutionOutcome {
+                tool_use_id: request.tool_use_id.clone(),
+                tool_name: request.tool_name.clone(),
+                status: crate::RuntimeToolExecutionStatus::Executed,
+                category: request.category,
+                output: Some(format!("{} complete", request.tool_name)),
+                error: None,
+                evidence_ref: format!("tool:{}", request.tool_use_id),
+            }
+        }
     }
 
     impl ToolExecutor for RecordingToolExecutor {
@@ -1531,6 +3472,30 @@ mod tests {
             event.kind == "execution_graph.node_transitioned"
                 && event.payload.to_string().contains("turn-result:")
         }));
+        let goal_events = events
+            .iter()
+            .filter(|event| event.scope == crate::RuntimeEventScope::Goal)
+            .collect::<Vec<_>>();
+        assert!(goal_events.iter().any(|event| event.kind == "goal.created"));
+        assert!(goal_events
+            .iter()
+            .any(|event| event.kind == "goal.observation"));
+        assert_eq!(
+            goal_events
+                .iter()
+                .filter(|event| event.kind == "goal.completed")
+                .count(),
+            1,
+            "terminal synthesis must atomically settle exactly one goal"
+        );
+        let completed_goal = goal_events
+            .iter()
+            .find(|event| event.kind == "goal.completed")
+            .and_then(|event| event.payload.get("goal"))
+            .cloned()
+            .and_then(|value| serde_json::from_value::<GoalContract>(value).ok())
+            .expect("completed goal snapshot");
+        assert_eq!(completed_goal.completion, GoalCompletion::Satisfied);
         assert_eq!(
             events
                 .iter()
@@ -1557,6 +3522,127 @@ mod tests {
                 .count(),
             1,
             "FinalAnswer must be committed exactly once before Synthesize"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn provider_failures_replan_then_switch_to_a_real_recovery_request() {
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let saw_recovery_directive = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runtime = crate::ConversationRuntime::new(
+            Session::new(),
+            RecoveringProviderClient {
+                attempts: Arc::clone(&attempts),
+                saw_recovery_directive: Arc::clone(&saw_recovery_directive),
+            },
+            NoopToolExecutor,
+            PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
+            vec!["answer directly".to_string()],
+        )
+        .without_memory();
+
+        let (_runtime, result) = submit_owned_conversation_turn(
+            runtime,
+            Arc::clone(&services),
+            "recover the provider request",
+            &SharedPrompter::none(),
+        )
+        .await;
+        let summary = result.expect("recovery must retain the turn graph");
+        assert_eq!(summary.final_answer, "recovered terminal answer");
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert!(
+            saw_recovery_directive.load(Ordering::SeqCst),
+            "the switched strategy must reach the next provider request, not merely be recorded"
+        );
+        let events = services.event_store().all_events(300).expect("events");
+        assert!(events.iter().any(|event| {
+            event.kind == "goal.intervention" && event.payload.to_string().contains("\"switch\"")
+        }));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "goal.completed")
+                .count(),
+            1,
+            "provider recovery must still produce exactly one terminal goal completion"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn text_only_checkpoint_recovers_from_hallucinated_tool_call_without_execution() {
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let saw_terminal_boundary = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runtime = crate::ConversationRuntime::new(
+            Session::new(),
+            ToolOnlyThenFinalClient {
+                attempts: Arc::clone(&attempts),
+                saw_terminal_boundary: Arc::clone(&saw_terminal_boundary),
+            },
+            NoopToolExecutor,
+            PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
+            vec!["answer directly".to_string()],
+        )
+        .without_memory();
+        runtime.require_next_model_final_response();
+
+        let (_runtime, result) = submit_owned_conversation_turn(
+            runtime,
+            Arc::clone(&services),
+            "return a final answer from retained evidence",
+            &SharedPrompter::none(),
+        )
+        .await;
+        let summary = result.expect("terminal recovery must complete the graph");
+
+        assert_eq!(
+            summary.final_answer,
+            "Recovered conclusion from retained evidence."
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(saw_terminal_boundary.load(Ordering::SeqCst));
+        assert!(
+            summary.tool_results.is_empty(),
+            "the hallucinated call must not execute"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reasoning_only_normal_step_continues_before_terminal_recovery() {
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let saw_continuation = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runtime = crate::ConversationRuntime::new(
+            Session::new(),
+            ThinkingOnlyThenFinalClient {
+                attempts: Arc::clone(&attempts),
+                saw_continuation: Arc::clone(&saw_continuation),
+            },
+            NoopToolExecutor,
+            PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
+            vec!["answer directly".to_string()],
+        )
+        .without_memory();
+
+        let (_runtime, result) = submit_owned_conversation_turn(
+            runtime,
+            Arc::clone(&services),
+            "analyze the retained evidence and provide a visible answer",
+            &SharedPrompter::none(),
+        )
+        .await;
+        let summary = result.expect("reasoning-only continuation must complete the graph");
+
+        assert_eq!(
+            summary.final_answer,
+            "Visible conclusion from retained evidence."
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(
+            saw_continuation.load(Ordering::SeqCst),
+            "the second model step must receive the visible-answer continuation instruction"
         );
     }
 
@@ -1619,6 +3705,52 @@ mod tests {
             .any(|event| event.kind == "execution_graph.node_transitioned_and_replanned"));
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn governed_runtime_tool_batch_parallelizes_independent_reads_and_keeps_order() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let host: Arc<dyn crate::RuntimeExecutionHost> = Arc::new(ConcurrentRuntimeToolHost {
+            active: Arc::clone(&active),
+            observed_peak: Arc::clone(&peak),
+        });
+        let ticket = NodeExecutionTicket {
+            graph_id: "graph".to_string(),
+            node_id: "tools".to_string(),
+            executor_kind: "tool_batch".to_string(),
+            attempt: 1,
+            idempotency_key: "batch".to_string(),
+            payload_ref: String::new(),
+        };
+        let calls = vec![
+            ModelToolCall {
+                id: "read-a".to_string(),
+                name: "read_file".to_string(),
+                input: r#"{"path":"a"}"#.to_string(),
+                depends_on: Vec::new(),
+            },
+            ModelToolCall {
+                id: "read-b".to_string(),
+                name: "read_file".to_string(),
+                input: r#"{"path":"b"}"#.to_string(),
+                depends_on: Vec::new(),
+            },
+        ];
+
+        let messages =
+            execute_governed_runtime_tool_batch(host, &calls, "session", None, &ticket).await;
+
+        assert!(peak.load(Ordering::SeqCst) >= 2);
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            messages[0].blocks.as_slice(),
+            [ContentBlock::ToolResult { tool_use_id, .. }] if tool_use_id == "read-a"
+        ));
+        assert!(matches!(
+            messages[1].blocks.as_slice(),
+            [ContentBlock::ToolResult { tool_use_id, .. }] if tool_use_id == "read-b"
+        ));
+    }
+
     #[test]
     fn dynamic_tool_nodes_preserve_file_resource_scopes() {
         let same_file = resource_scopes_for_tool_calls(&[
@@ -1655,6 +3787,146 @@ mod tests {
     }
 
     #[test]
+    fn runtime_control_and_todo_updates_do_not_lock_the_workspace() {
+        let scopes = resource_scopes_for_tool_calls(&[
+            ModelToolCall {
+                id: "todo".into(),
+                name: "TodoWrite".into(),
+                input: r#"{"todos":[]}"#.into(),
+                depends_on: Vec::new(),
+            },
+            ModelToolCall {
+                id: "team".into(),
+                name: "runtime_orchestrate".into(),
+                input: r#"{"action":"request_team","intent":"review"}"#.into(),
+                depends_on: Vec::new(),
+            },
+        ]);
+
+        assert!(scopes.is_empty());
+    }
+
+    #[test]
+    fn coverage_collapses_broad_discovery_but_keeps_direct_files_distinct() {
+        let discovery = tool_batch_coverage_keys(&[
+            ModelToolCall {
+                id: "snapshot".into(),
+                name: "workspace_snapshot".into(),
+                input: r#"{"include_files":true}"#.into(),
+                depends_on: Vec::new(),
+            },
+            ModelToolCall {
+                id: "glob".into(),
+                name: "glob_search".into(),
+                input: r#"{"pattern":"**/*.rs"}"#.into(),
+                depends_on: Vec::new(),
+            },
+        ]);
+        assert_eq!(
+            discovery,
+            BTreeSet::from(["discovery:workspace".to_string()])
+        );
+
+        let direct = tool_batch_coverage_keys(&[
+            ModelToolCall {
+                id: "runtime".into(),
+                name: "read_file".into(),
+                input: r#"{"file_path":"/work/crates/runtime/src/lib.rs"}"#.into(),
+                depends_on: Vec::new(),
+            },
+            ModelToolCall {
+                id: "memory".into(),
+                name: "read_file".into(),
+                input: r#"{"file_path":"/work/crates/memory/src/lib.rs"}"#.into(),
+                depends_on: Vec::new(),
+            },
+        ]);
+        assert_eq!(direct.len(), 2);
+        assert!(direct.contains("evidence:read_file:crates/runtime/src/lib.rs"));
+        assert!(direct.contains("evidence:read_file:crates/memory/src/lib.rs"));
+    }
+
+    #[test]
+    fn bounded_scope_coverage_collapses_related_files_to_component_zone() {
+        let scopes = tool_batch_scope_keys(&[
+            ModelToolCall {
+                id: "runtime-lib".into(),
+                name: "read_file".into(),
+                input: r#"{"file_path":"/work/crates/runtime/src/lib.rs"}"#.into(),
+                depends_on: Vec::new(),
+            },
+            ModelToolCall {
+                id: "runtime-session".into(),
+                name: "read_file".into(),
+                input: r#"{"file_path":"/work/crates/runtime/src/session/session.rs"}"#.into(),
+                depends_on: Vec::new(),
+            },
+            ModelToolCall {
+                id: "memory".into(),
+                name: "read_file".into(),
+                input: r#"{"file_path":"/work/crates/memory/src/lib.rs"}"#.into(),
+                depends_on: Vec::new(),
+            },
+        ]);
+
+        assert_eq!(
+            scopes,
+            BTreeSet::from(["crates/memory".to_string(), "crates/runtime".to_string(),])
+        );
+    }
+
+    #[test]
+    fn runtime_orchestration_isolated_after_workspace_tool_batch() {
+        let calls = vec![
+            ModelToolCall {
+                id: "read".into(),
+                name: "read_file".into(),
+                input: r#"{"file_path":"Cargo.toml"}"#.into(),
+                depends_on: Vec::new(),
+            },
+            ModelToolCall {
+                id: "team".into(),
+                name: "runtime_orchestrate".into(),
+                input: r#"{"action":"request_team"}"#.into(),
+                depends_on: Vec::new(),
+            },
+        ];
+
+        let batches = tool_batches_for_turn(&calls).expect("batches");
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0][0].name, "read_file");
+        assert_eq!(batches[1][0].name, "runtime_orchestrate");
+        assert_eq!(
+            resource_scopes_for_tool_calls(&batches[0]),
+            vec!["read:Cargo.toml"]
+        );
+        assert!(resource_scopes_for_tool_calls(&batches[1]).is_empty());
+    }
+
+    #[test]
+    fn runtime_orchestration_dependency_runs_before_dependent_workspace_tools() {
+        let calls = vec![
+            ModelToolCall {
+                id: "team".into(),
+                name: "runtime_orchestrate".into(),
+                input: r#"{"action":"request_team"}"#.into(),
+                depends_on: Vec::new(),
+            },
+            ModelToolCall {
+                id: "read".into(),
+                name: "read_file".into(),
+                input: r#"{"file_path":"Cargo.toml"}"#.into(),
+                depends_on: vec!["team".into()],
+            },
+        ];
+
+        let batches = tool_batches_for_turn(&calls).expect("batches");
+        assert_eq!(batches[0][0].name, "runtime_orchestrate");
+        assert_eq!(batches[1][0].name, "read_file");
+        assert!(batches[1][0].depends_on.is_empty());
+    }
+
+    #[test]
     fn uncommitted_transcript_entries_are_rolled_back_to_commit_boundary() {
         let mut messages = vec![
             ConversationMessage::user_text("committed"),
@@ -1665,5 +3937,131 @@ mod tests {
         ];
         rollback_uncommitted_transcript(&mut messages, 1);
         assert_eq!(messages, vec![ConversationMessage::user_text("committed")]);
+    }
+
+    #[test]
+    fn turn_resolver_scope_requires_session_and_graph() {
+        let ticket = NodeExecutionTicket {
+            graph_id: "graph-a".to_string(),
+            node_id: "node-a".to_string(),
+            executor_kind: "inline_model".to_string(),
+            attempt: 1,
+            idempotency_key: "scope-test".to_string(),
+            payload_ref: r#"{"session_id":"shared-session"}"#.to_string(),
+        };
+
+        assert!(turn_scope_matches(&ticket, "shared-session", "graph-a"));
+        assert!(!turn_scope_matches(&ticket, "shared-session", "graph-b"));
+        assert!(!turn_scope_matches(&ticket, "other-session", "graph-a"));
+    }
+
+    #[test]
+    fn failed_tool_names_are_stable_and_deduplicated() {
+        let messages = vec![
+            ConversationMessage::tool_result("a", "runtime_orchestrate", "failed", true),
+            ConversationMessage::tool_result("b", "runtime_orchestrate", "failed", true),
+            ConversationMessage::tool_result("c", "read_file", "ok", false),
+        ];
+        assert_eq!(failed_tool_names(&messages), vec!["runtime_orchestrate"]);
+    }
+
+    #[test]
+    fn tool_batch_fingerprint_ignores_provider_generated_call_ids() {
+        let one = ModelToolCall {
+            id: "provider-a".into(),
+            name: "read_file".into(),
+            input: r#"{\"path\":\"Cargo.toml\"}"#.into(),
+            depends_on: Vec::new(),
+        };
+        let two = ModelToolCall {
+            id: "provider-b".into(),
+            ..one.clone()
+        };
+        assert_eq!(
+            tool_batch_fingerprint(&[one]),
+            tool_batch_fingerprint(&[two])
+        );
+    }
+
+    #[test]
+    fn unusable_final_output_requires_one_governed_recovery() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(workspace.path().join("crates/runtime/src"))
+            .expect("runtime source root");
+        std::fs::write(
+            workspace.path().join("crates/runtime/src/lib.rs"),
+            "pub mod runtime;",
+        )
+        .expect("runtime source");
+        assert_eq!(
+            final_answer_recovery_reason("   ", workspace.path()),
+            Some("empty final answer".to_string())
+        );
+        assert_eq!(
+            final_answer_recovery_reason("<tool_call><function=read_file>", workspace.path()),
+            Some("simulated tool-call markup in a final answer".to_string())
+        );
+        assert_eq!(
+            final_answer_recovery_reason("evidence: crates/runtime/src/lib.rs", workspace.path()),
+            None
+        );
+        assert_eq!(
+            final_answer_recovery_reason(
+                "evidence directory: crates/runtime/src/; file: crates/runtime/src/lib.rs",
+                workspace.path()
+            ),
+            None,
+            "directory references are not falsely validated as source files"
+        );
+        assert!(final_answer_recovery_reason(
+            "evidence: crates/runtime/src/missing.rs",
+            workspace.path()
+        )
+        .is_some());
+        assert_eq!(
+            strip_trailing_simulated_tool_markup(
+                "Verified conclusion.\n<tool_call><function=read_file></function></tool_call>"
+                    .to_string()
+            ),
+            "Verified conclusion."
+        );
+        assert_eq!(
+            strip_trailing_simulated_tool_markup(
+                "<tool_call><function=read_file></function></tool_call>".to_string()
+            ),
+            "<tool_call><function=read_file></function></tool_call>"
+        );
+        assert_eq!(
+            strip_trailing_simulated_tool_markup(
+                "Verified conclusion.\n<function=read_file><parameter=path>src/lib.rs".to_string()
+            ),
+            "Verified conclusion."
+        );
+    }
+
+    #[test]
+    fn terminal_recovery_budget_tracks_runtime_lease_conditions() {
+        use harness_contract::core::TaskComplexity;
+
+        let simple =
+            crate::execution_core::SafetyFusePolicy::derive(128_000, TaskComplexity::Simple, None);
+        let strategic = crate::execution_core::SafetyFusePolicy::derive(
+            128_000,
+            TaskComplexity::Strategic,
+            None,
+        );
+        let pressured = crate::execution_core::ExecutionBudgetLease {
+            resource_pressure_basis_points: 9_000,
+            ..strategic.clone()
+        };
+        let constrained = crate::execution_core::ExecutionBudgetLease {
+            explicit_user_limit: Some(2),
+            ..strategic.clone()
+        };
+
+        assert_eq!(terminal_recovery_retry_budget(&simple), 1);
+        assert_eq!(terminal_recovery_retry_budget(&strategic), 3);
+        assert_eq!(terminal_recovery_retry_budget(&pressured), 1);
+        assert_eq!(terminal_recovery_retry_budget(&constrained), 1);
     }
 }

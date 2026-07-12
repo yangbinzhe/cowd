@@ -4,7 +4,9 @@ use std::{
 };
 
 use harness_contract::turn::TurnJournalEnvelope;
-use memory::store::session::{SessionEvent, SessionListOptions, SessionListPage, SessionMessage};
+use memory::store::session::{
+    SessionEvent, SessionListOptions, SessionListPage, SessionMessage, SessionMissionOutboxRequest,
+};
 use memory::{
     MemoryError, SessionDomainEvent, SessionDomainEventPage, SessionDomainScope, SessionRecord,
     UnifiedSessionStore,
@@ -161,6 +163,23 @@ impl SessionKernel {
         Ok(true)
     }
 
+    /// Persist the Session authority record and its one-way Mission lifecycle
+    /// intent in the same SQLite transaction. Runtime bridge workers, not API
+    /// routes, materialize that intent into the Mission event stream.
+    pub(crate) async fn upsert_stored_session_with_mission_outbox(
+        &self,
+        record: &SessionRecord,
+        request: &SessionMissionOutboxRequest,
+    ) -> Result<bool, MemoryError> {
+        let Some(store) = self.unified_store.as_ref() else {
+            return Ok(false);
+        };
+        store
+            .upsert_session_with_mission_outbox(record, request)
+            .await?;
+        Ok(true)
+    }
+
     pub(crate) async fn update_stored_session(
         &self,
         record: &SessionRecord,
@@ -185,6 +204,16 @@ impl SessionKernel {
         } else {
             Ok(false)
         }
+    }
+
+    pub(crate) async fn delete_stored_session_with_mission_outbox(
+        &self,
+        request: &SessionMissionOutboxRequest,
+    ) -> Result<bool, MemoryError> {
+        let Some(store) = self.unified_store.as_ref() else {
+            return Ok(false);
+        };
+        store.delete_session_with_mission_outbox(request).await
     }
 
     pub(crate) async fn stored_message_count(
@@ -245,6 +274,12 @@ impl SessionKernel {
             .into_iter()
             .enumerate()
             .map(|(sequence, mut message)| {
+                let source_message_id = std::mem::take(&mut message.stable_message_id);
+                // `stable_message_id` is globally unique, not scoped by
+                // session. A branch retains the source provenance while
+                // receiving a deterministic identity in its own transcript.
+                message.stable_message_id =
+                    format!("branch:{target_session_id}:{source_message_id}");
                 message.session_id = target_session_id.to_string();
                 message.sequence = sequence;
                 message

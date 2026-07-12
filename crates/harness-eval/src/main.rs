@@ -1,8 +1,8 @@
 use harness_eval::{
-    default_report_root, run_eval, terminal_gate_report_with_report, HarnessEvalLevel,
-    HarnessEvalReportStore, HarnessEvalRunnerOptions,
+    default_report_root, run_eval, run_paired_performance, terminal_gate_report_with_report,
+    HarnessEvalLevel, HarnessEvalReportStore, HarnessEvalRunnerOptions, PairedPerformanceOptions,
 };
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -14,6 +14,79 @@ fn main() {
         return;
     }
     match args.first().map(String::as_str) {
+        Some("paired-performance") => {
+            let baseline_url = required_option(&args[1..], "--baseline-url");
+            let candidate_url = required_option(&args[1..], "--candidate-url");
+            let model = required_option(&args[1..], "--provider");
+            let output = required_option(&args[1..], "--output");
+            let pairs = option_value(&args[1..], "--pairs")
+                .as_deref()
+                .unwrap_or("5")
+                .parse::<usize>()
+                .unwrap_or_else(|_| {
+                    eprintln!("--pairs must be a positive integer");
+                    std::process::exit(2);
+                });
+            let timeout_secs = option_value(&args[1..], "--timeout-secs")
+                .as_deref()
+                .unwrap_or("600")
+                .parse::<u64>()
+                .unwrap_or_else(|_| {
+                    eprintln!("--timeout-secs must be an integer");
+                    std::process::exit(2);
+                });
+            let poll_interval_ms = option_value(&args[1..], "--poll-interval-ms")
+                .as_deref()
+                .unwrap_or("20")
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .unwrap_or_else(|| {
+                    eprintln!("--poll-interval-ms must be a positive integer");
+                    std::process::exit(2);
+                });
+            let token = std::env::var("COWD_API_TOKEN").ok();
+            let report = run_paired_performance(PairedPerformanceOptions {
+                baseline_url,
+                candidate_url,
+                model,
+                pairs,
+                token,
+                timeout: Duration::from_secs(timeout_secs),
+                // Public message polling is part of this end-to-end measurement.
+                // A 100 ms interval quantized sub-100 ms Runtime differences into
+                // an entire extra poll and produced false performance regressions.
+                poll_interval: Duration::from_millis(poll_interval_ms),
+            })
+            .unwrap_or_else(|error| {
+                eprintln!("paired performance evaluation failed: {error}");
+                std::process::exit(1);
+            });
+            let output = PathBuf::from(output);
+            if let Some(parent) = output.parent() {
+                std::fs::create_dir_all(parent).unwrap_or_else(|error| {
+                    eprintln!("cannot create paired performance report directory: {error}");
+                    std::process::exit(1);
+                });
+            }
+            std::fs::write(
+                &output,
+                serde_json::to_vec_pretty(&report).expect("paired performance json"),
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("cannot write paired performance report: {error}");
+                std::process::exit(1);
+            });
+            println!("paired-performance-report: {}", output.display());
+            if report["status"].as_str() != Some("passed") {
+                eprintln!(
+                    "paired performance release gate failed; see {}",
+                    output.display()
+                );
+                std::process::exit(1);
+            }
+            return;
+        }
         Some("review-report") => {
             let run_dir = option_value(&args[1..], "--run-dir")
                 .or_else(|| option_value(&args[1..], "--report-dir"))
@@ -100,7 +173,7 @@ fn main() {
 
 fn print_help() {
     println!(
-        "Usage:\n  harness-eval quick [--budget low]\n  harness-eval full [--budget full]\n  harness-eval deep-real --provider <model> --budget full --allow-real-model\n  harness-eval review-report --run-dir <dir> [--provider <model>] [--allow-real-model]\n  harness-eval terminal-gate [--evidence-dir <dir>] [--report-json <path>]"
+        "Usage:\n  harness-eval quick [--budget low]\n  harness-eval full [--budget full]\n  harness-eval deep-real --provider <model> --budget full --allow-real-model\n  harness-eval paired-performance --baseline-url <url> --candidate-url <url> --provider <model> --output <path> [--pairs 5] [--timeout-secs 600] [--poll-interval-ms 20]\n  harness-eval review-report --run-dir <dir> [--provider <model>] [--allow-real-model]\n  harness-eval terminal-gate [--evidence-dir <dir>] [--report-json <path>]"
     );
 }
 
@@ -108,6 +181,13 @@ fn option_value(args: &[String], key: &str) -> Option<String> {
     args.windows(2)
         .find(|pair| pair[0] == key)
         .map(|pair| pair[1].clone())
+}
+
+fn required_option(args: &[String], key: &str) -> String {
+    option_value(args, key).unwrap_or_else(|| {
+        eprintln!("paired-performance requires {key} <value>");
+        std::process::exit(2);
+    })
 }
 
 fn default_config_home() -> PathBuf {

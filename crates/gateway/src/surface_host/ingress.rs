@@ -1,10 +1,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use harness_contract::turn::{InputSourceKind, SessionInputEnvelope};
-use memory::SessionRecord;
+use memory::{SessionMissionOutboxOperation, SessionMissionOutboxRequest, SessionRecord};
 use sha2::{Digest, Sha256};
 use surface::{message::MessageActionKind, SurfaceActionRequest, SurfaceFrame, SurfaceSendRequest};
 use tokio::sync::Mutex;
@@ -12,18 +11,9 @@ use tokio::sync::Mutex;
 use crate::api_routes::AppState;
 use crate::runtime_service::RuntimeTurnOptions;
 
-const SURFACE_QUICK_WALL_CLOCK: Duration = Duration::from_secs(240);
-const SURFACE_MEDIA_WALL_CLOCK: Duration = Duration::from_secs(900);
-const SURFACE_DEEP_WALL_CLOCK: Duration = Duration::from_secs(900);
-const SURFACE_QUICK_MAX_ITERATIONS: usize = 12;
-const SURFACE_MEDIA_MAX_ITERATIONS: usize = 24;
-const SURFACE_DEEP_MAX_ITERATIONS: usize = 64;
-
 #[derive(Debug, Clone, Copy)]
 struct SurfaceTurnPolicy {
     profile: runtime::ContextProfile,
-    timeout: Duration,
-    max_iterations: usize,
 }
 
 pub(crate) fn spawn_surface_ingress_dispatcher(state: Arc<AppState>) {
@@ -221,10 +211,8 @@ async fn handle_surface_message(
             &session_id,
             accepted_turn.turn_id.clone(),
             runtime_content,
-            turn_policy.timeout,
             RuntimeTurnOptions {
                 profile: turn_policy.profile,
-                max_iterations: Some(turn_policy.max_iterations),
                 pre_messages,
             },
         )
@@ -494,23 +482,11 @@ fn surface_turn_policy(content: &str) -> SurfaceTurnPolicy {
     if profile != runtime::ContextProfile::DeepInvestigation
         && surface_content_has_media_attachment(content)
     {
-        return SurfaceTurnPolicy {
-            profile,
-            timeout: SURFACE_MEDIA_WALL_CLOCK,
-            max_iterations: SURFACE_MEDIA_MAX_ITERATIONS,
-        };
+        return SurfaceTurnPolicy { profile };
     }
     match profile {
-        runtime::ContextProfile::DeepInvestigation => SurfaceTurnPolicy {
-            profile,
-            timeout: SURFACE_DEEP_WALL_CLOCK,
-            max_iterations: SURFACE_DEEP_MAX_ITERATIONS,
-        },
-        _ => SurfaceTurnPolicy {
-            profile,
-            timeout: SURFACE_QUICK_WALL_CLOCK,
-            max_iterations: SURFACE_QUICK_MAX_ITERATIONS,
-        },
+        runtime::ContextProfile::DeepInvestigation => SurfaceTurnPolicy { profile },
+        _ => SurfaceTurnPolicy { profile },
     }
 }
 
@@ -680,6 +656,7 @@ async fn ensure_surface_runtime_session(
         .as_ref()
         .ok_or_else(|| "runtime service unavailable".to_string())?;
     if runtime_service.has_active_session(session_id) {
+        ensure_surface_mission_registration(state, surface, session_id, user_id, metadata).await?;
         return Ok(());
     }
     let model = default_surface_session_model(state);
@@ -724,23 +701,7 @@ async fn ensure_surface_runtime_session(
     runtime_service
         .register_runtime(session_id.to_string(), runtime)
         .map_err(|error| error.to_string())?;
-    if state.services.session.has_unified_store()
-        && state
-            .services
-            .session
-            .stored_session(session_id)
-            .await
-            .map_err(|error| error.to_string())?
-            .is_none()
-    {
-        let record = surface_session_record(surface, session_id, user_id, Some(model), metadata);
-        state
-            .services
-            .session
-            .upsert_stored_session(&record)
-            .await
-            .map_err(|error| error.to_string())?;
-    }
+    ensure_surface_mission_registration(state, surface, session_id, user_id, metadata).await?;
     state
         .services
         .session
@@ -756,6 +717,79 @@ async fn ensure_surface_runtime_session(
         .await
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+async fn ensure_surface_mission_registration(
+    state: &AppState,
+    surface: &str,
+    session_id: &str,
+    user_id: Option<&str>,
+    metadata: &serde_json::Value,
+) -> Result<(), String> {
+    if !state.services.session.has_unified_store() {
+        return Ok(());
+    }
+    let mut record = state
+        .services
+        .session
+        .stored_session(session_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .unwrap_or_else(|| {
+            surface_session_record(
+                surface,
+                session_id,
+                user_id,
+                Some(default_surface_session_model(state)),
+                metadata,
+            )
+        });
+    let mut record_metadata = record
+        .metadata_json
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    record_metadata["workspace_root"] =
+        serde_json::Value::String(state.workspace_root.display().to_string());
+    record.metadata_json = Some(record_metadata.to_string());
+    let runtime = state
+        .services
+        .runtime
+        .as_ref()
+        .ok_or_else(|| "runtime service unavailable".to_string())?;
+    let workspace_key = runtime.runtime_services().workspace_key().to_string();
+    let title = record_metadata
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("{} {}", surface, &session_id[..session_id.len().min(8)]));
+    let request = SessionMissionOutboxRequest {
+        request_id: format!(
+            "mission:{workspace_key}:register:{}:{}",
+            record.session_id, record.created_at
+        ),
+        session_id: record.session_id.clone(),
+        title,
+        workspace_key,
+        operation: SessionMissionOutboxOperation::Register,
+        created_at_ms: current_time_ms(),
+    };
+    state
+        .services
+        .session
+        .upsert_stored_session_with_mission_outbox(&record, &request)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn surface_system_prompt(surface: &str) -> Vec<String> {
@@ -1176,21 +1210,17 @@ mod tests {
     }
 
     #[test]
-    fn readme_followup_uses_deep_surface_budget() {
+    fn readme_followup_uses_deep_surface_profile_without_business_budget() {
         let policy = surface_turn_policy("我已经更新，看是否最新的readme还有问题");
 
         assert_eq!(policy.profile, runtime::ContextProfile::DeepInvestigation);
-        assert_eq!(policy.max_iterations, SURFACE_DEEP_MAX_ITERATIONS);
-        assert_eq!(policy.timeout, SURFACE_DEEP_WALL_CLOCK);
     }
 
     #[test]
-    fn short_surface_message_uses_quick_budget() {
+    fn short_surface_message_uses_quick_profile_without_business_budget() {
         let policy = surface_turn_policy("你好");
 
         assert_eq!(policy.profile, runtime::ContextProfile::SurfaceQuickReply);
-        assert_eq!(policy.max_iterations, SURFACE_QUICK_MAX_ITERATIONS);
-        assert_eq!(policy.timeout, SURFACE_QUICK_WALL_CLOCK);
     }
 
     #[test]
@@ -1200,8 +1230,6 @@ mod tests {
         );
 
         assert_eq!(policy.profile, runtime::ContextProfile::SurfaceQuickReply);
-        assert_eq!(policy.max_iterations, SURFACE_MEDIA_MAX_ITERATIONS);
-        assert_eq!(policy.timeout, SURFACE_MEDIA_WALL_CLOCK);
     }
 
     #[test]
@@ -1211,8 +1239,6 @@ mod tests {
         );
 
         assert_eq!(policy.profile, runtime::ContextProfile::DeepInvestigation);
-        assert_eq!(policy.max_iterations, SURFACE_DEEP_MAX_ITERATIONS);
-        assert_eq!(policy.timeout, SURFACE_DEEP_WALL_CLOCK);
     }
 
     #[test]

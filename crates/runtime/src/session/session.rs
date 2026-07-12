@@ -942,6 +942,7 @@ impl ConversationMessage {
             .unwrap_or((None, None));
 
         memory::store::session::SessionMessage {
+            stable_message_id: format!("runtime:{session_id}:{sequence}"),
             session_id: session_id.to_string(),
             sequence,
             role: self.role.role_str().to_string(),

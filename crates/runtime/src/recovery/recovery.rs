@@ -3,9 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    candidate_from_action, global_steward_runtime_service, MissionSessionCommandStatus,
-    RuntimeEventInput, RuntimeEventRef, RuntimeEventReplayer, RuntimeEventScope,
-    RuntimeRecoveryAction, RuntimeRecoveryActionKind, RuntimeRecoveryCandidate,
+    candidate_from_action, RuntimeEventInput, RuntimeEventRef, RuntimeEventReplayer,
+    RuntimeEventScope, RuntimeRecoveryAction, RuntimeRecoveryActionKind, RuntimeRecoveryCandidate,
     RuntimeReplayReport, RuntimeServices,
 };
 
@@ -74,49 +73,6 @@ fn augmented_candidates(
         .iter()
         .filter_map(candidate_from_action)
         .collect::<Vec<_>>();
-    for command in services
-        .mission_runtime()
-        .projection(
-            services.session_relations(),
-            services.agent_runtime(),
-            services.team_runtime(),
-        )
-        .session_commands
-    {
-        let (action, risk, precondition) = match command.status {
-            MissionSessionCommandStatus::Pending => (
-                RuntimeRecoveryActionKind::PreservePending,
-                "low",
-                "pending command must remain queued until dispatch policy accepts it",
-            ),
-            MissionSessionCommandStatus::Claimed | MissionSessionCommandStatus::Running => (
-                RuntimeRecoveryActionKind::MarkInterrupted,
-                "medium",
-                "claimed or running session command needs explicit recovery before retry",
-            ),
-            MissionSessionCommandStatus::Failed => (
-                RuntimeRecoveryActionKind::MarkInterrupted,
-                "medium",
-                "failed session command can be retried only after operator or steward review",
-            ),
-            MissionSessionCommandStatus::Completed
-            | MissionSessionCommandStatus::Cancelled
-            | MissionSessionCommandStatus::Interrupted => continue,
-        };
-        candidates.push(RuntimeRecoveryCandidate {
-            candidate_id: format!("recovery-candidate-session-command-{}", command.command_id),
-            owner: "runtime.session".to_string(),
-            source_stream_id: format!("session-command:{}", command.command_id),
-            scope: RuntimeEventScope::SessionCommand,
-            action,
-            risk: risk.to_string(),
-            precondition: precondition.to_string(),
-            reason: command.error.clone().unwrap_or_else(|| {
-                format!("session command status is {}", command.status.as_str())
-            }),
-            evidence_refs: command.evidence_refs.clone(),
-        });
-    }
     for agent in services.agent_runtime().list() {
         let (action, risk, precondition) = match agent.status {
             harness_contract::agent::AgentStatus::Prepared
@@ -173,7 +129,7 @@ impl RecoveryExecutor {
         let plan = RecoveryPlanner::plan(limit, services)?;
         let mut applied = Vec::new();
         let mut skipped = Vec::new();
-        let mut failed = Vec::new();
+        let failed = Vec::<RecoveryFailedAction>::new();
 
         let actions = executable_recovery_actions(&plan);
         for action in &actions {
@@ -190,13 +146,6 @@ impl RecoveryExecutor {
                         stream_id: action.stream_id.clone(),
                         action: action.action.clone(),
                         reason,
-                    });
-                }
-                RecoveryApplyOutcome::Failed(error) => {
-                    failed.push(RecoveryFailedAction {
-                        stream_id: action.stream_id.clone(),
-                        action: action.action.clone(),
-                        error,
                     });
                 }
             }
@@ -247,12 +196,11 @@ fn executable_recovery_actions(plan: &RecoveryPlan) -> Vec<RuntimeRecoveryAction
 enum RecoveryApplyOutcome {
     Applied(String),
     Skipped(String),
-    Failed(String),
 }
 
 fn apply_action(
     action: &RuntimeRecoveryAction,
-    services: &RuntimeServices,
+    _services: &RuntimeServices,
 ) -> RecoveryApplyOutcome {
     match action.action {
         RuntimeRecoveryActionKind::PreservePending => {
@@ -260,35 +208,6 @@ fn apply_action(
         }
         RuntimeRecoveryActionKind::ReplayOnly => {
             RecoveryApplyOutcome::Skipped("replay-only stream".to_string())
-        }
-        RuntimeRecoveryActionKind::PauseRecoveryRequired
-            if action.stream_id.starts_with("steward:") =>
-        {
-            let steward_id = action.stream_id.trim_start_matches("steward:");
-            match global_steward_runtime_service()
-                .mark_recovery_required(steward_id, action.reason.clone())
-            {
-                Ok(_) => RecoveryApplyOutcome::Applied("steward paused for recovery".to_string()),
-                Err(error) => RecoveryApplyOutcome::Failed(error),
-            }
-        }
-        RuntimeRecoveryActionKind::MarkInterrupted
-            if action.stream_id.starts_with("session-command:") =>
-        {
-            let command_id = action.stream_id.trim_start_matches("session-command:");
-            match services.mission_runtime().get_session_command(command_id) {
-                Some(command) => match services.mission_runtime().interrupt_session_command(
-                    &command.target_session_id,
-                    command_id,
-                    action.reason.clone(),
-                ) {
-                    Ok(_) => RecoveryApplyOutcome::Applied(
-                        "session command marked interrupted".to_string(),
-                    ),
-                    Err(error) => RecoveryApplyOutcome::Failed(error),
-                },
-                None => RecoveryApplyOutcome::Skipped("session command not found".to_string()),
-            }
         }
         RuntimeRecoveryActionKind::MarkInterrupted if action.stream_id.starts_with("team:") => {
             RecoveryApplyOutcome::Skipped(
@@ -323,98 +242,4 @@ fn record_recovery_event(report: &RecoveryExecutionReport, services: &RuntimeSer
             .collect(),
         payload: serde_json::json!(report),
     });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{StartMissionSessionRequest, StartStewardRuntimeRequest};
-
-    #[test]
-    fn recovery_executor_marks_session_command_and_steward() {
-        let _guard = crate::test_env_lock();
-        let services = RuntimeServices::in_memory().expect("runtime services");
-        let suffix = uuid::Uuid::new_v4();
-        let session_id = format!("recovery-session-{suffix}");
-        services
-            .mission_runtime()
-            .start_session(StartMissionSessionRequest {
-                title: "recovery session".to_string(),
-                session_id: Some(session_id.clone()),
-            })
-            .expect("session");
-        let command = services
-            .mission_runtime()
-            .enqueue_session_command(&session_id, &session_id, "recover me")
-            .expect("command");
-        services
-            .mission_runtime()
-            .mark_session_command_running(&session_id, &command.command_id)
-            .expect("running");
-        services
-            .event_store()
-            .append(RuntimeEventInput {
-                stream_id: format!("session-command:{}", command.command_id),
-                scope: RuntimeEventScope::SessionCommand,
-                kind: "mission.session.command_running".to_string(),
-                status: Some("running".to_string()),
-                actor: Some("test".to_string()),
-                refs: Vec::new(),
-                payload: serde_json::json!({}),
-            })
-            .expect("append command event");
-        let steward = global_steward_runtime_service()
-            .start(StartStewardRuntimeRequest {
-                mission_id: "recovery-test".to_string(),
-                root_session_id: Some(session_id.clone()),
-                profile_id: crate::AutonomyProfileId::Stewarded,
-                objective: "recover steward".to_string(),
-            })
-            .expect("steward");
-        services
-            .event_store()
-            .append(RuntimeEventInput {
-                stream_id: format!("steward:{}", steward.steward_id),
-                scope: RuntimeEventScope::Steward,
-                kind: "steward.started".to_string(),
-                status: Some("running".to_string()),
-                actor: Some("test".to_string()),
-                refs: Vec::new(),
-                payload: serde_json::json!({}),
-            })
-            .expect("append steward event");
-
-        let report = RecoveryExecutor::execute(1_000, &services).expect("recover");
-        assert!(report
-            .plan
-            .candidates
-            .iter()
-            .any(|candidate| candidate.owner == "runtime.session"
-                && candidate
-                    .source_stream_id
-                    .contains(command.command_id.as_str())));
-        assert!(report
-            .plan
-            .candidates
-            .iter()
-            .any(|candidate| candidate.owner == "runtime.steward_runtime"
-                && candidate
-                    .source_stream_id
-                    .contains(steward.steward_id.as_str())));
-        assert!(report.applied.iter().any(|action| {
-            action.stream_id == format!("session-command:{}", command.command_id)
-        }));
-        assert!(report
-            .applied
-            .iter()
-            .any(|action| action.stream_id == format!("steward:{}", steward.steward_id)));
-        assert_eq!(
-            services
-                .mission_runtime()
-                .get_session_command(&command.command_id)
-                .expect("command after")
-                .status,
-            crate::MissionSessionCommandStatus::Interrupted
-        );
-    }
 }

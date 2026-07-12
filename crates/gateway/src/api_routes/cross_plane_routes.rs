@@ -350,69 +350,84 @@ async fn cross_plane_action_execute_handler(
     let mut dispatch_outcome = None;
     let mut execution_graph = None;
 
-    if readiness.executable {
-        if mode == "dry_run" {
+    if mode == "dry_run" {
+        if readiness.decision.decision == PolicyDecisionKind::Allow {
             status = "planned";
             dispatch_status = "dry_run";
             audit_result = "dry_run";
             audit_summary = "dry_run_execution_plan".to_string();
-        } else {
-            let graph_key = idempotency_key
-                .clone()
-                .unwrap_or_else(|| format!("cross-plane-{}", uuid::Uuid::new_v4()));
-            let target = readiness.dispatch_target.clone().unwrap_or_default();
-            let executor = Arc::new(GatewayCrossPlaneExecutor::new(
-                state.services.surface.clone(),
-                target,
-                state.services.cross_plane.runtime_control(),
-            ));
-            match state
-                .services
-                .cross_plane
-                .execute_commit_graph(&readiness.action, &readiness.decision, &graph_key, executor)
-                .await
-            {
-                Ok(graph) => {
-                    dispatch_outcome = graph
-                        .nodes
-                        .iter()
-                        .find(|node| {
-                            node.kind
-                                == harness_contract::execution_graph::ExecutionNodeKind::ToolBatch
-                        })
-                        .and_then(|node| node.result_ref.as_deref())
-                        .and_then(|value| serde_json::from_str(value).ok());
-                    dispatched = dispatch_outcome.as_ref().is_some_and(
-                        |value: &runtime::CrossPlaneDispatchOutcome| value.status == "sent",
-                    );
-                    status = if dispatched { "dispatched" } else { "blocked" };
-                    dispatch_status = if dispatched {
-                        "sent"
-                    } else {
-                        "dispatch_failed"
-                    };
-                    audit_result = if dispatched {
-                        "dispatched"
-                    } else {
-                        "blocked_dispatch"
-                    };
-                    audit_summary = if dispatched {
-                        "execution_graph_dispatch_sent"
-                    } else {
-                        "execution_graph_dispatch_failed"
-                    }
-                    .to_string();
-                    execution_graph = Some(graph);
+        }
+    } else if readiness.executable {
+        let graph_key = idempotency_key
+            .clone()
+            .unwrap_or_else(|| format!("cross-plane-{}", uuid::Uuid::new_v4()));
+        let target = readiness.dispatch_target.clone().unwrap_or_default();
+        let executor = Arc::new(GatewayCrossPlaneExecutor::new(
+            state.services.surface.clone(),
+            target,
+            state.services.cross_plane.runtime_control(),
+        ));
+        match state
+            .services
+            .cross_plane
+            .execute_commit_graph(&readiness.action, &readiness.decision, &graph_key, executor)
+            .await
+        {
+            Ok(graph) => {
+                dispatch_outcome = graph
+                    .nodes
+                    .iter()
+                    .find(|node| {
+                        node.kind == harness_contract::execution_graph::ExecutionNodeKind::ToolBatch
+                    })
+                    .and_then(|node| node.result_ref.as_deref())
+                    .and_then(|value| serde_json::from_str(value).ok());
+                dispatched = dispatch_outcome.as_ref().is_some_and(
+                    |value: &runtime::CrossPlaneDispatchOutcome| value.status == "sent",
+                );
+                status = if dispatched { "dispatched" } else { "blocked" };
+                dispatch_status = if dispatched {
+                    "sent"
+                } else {
+                    "dispatch_failed"
+                };
+                audit_result = if dispatched {
+                    "dispatched"
+                } else {
+                    "blocked_dispatch"
+                };
+                audit_summary = if dispatched {
+                    "execution_graph_dispatch_sent"
+                } else {
+                    "execution_graph_dispatch_failed"
                 }
-                Err(error) => {
-                    readiness.blockers.push(format!("execution_graph:{error}"));
-                    readiness.executable = false;
-                    dispatch_status = "execution_graph_rejected";
-                    audit_result = "blocked_execution_graph";
-                    audit_summary = "commit_graph_registration_failed".to_string();
-                }
+                .to_string();
+                execution_graph = Some(graph);
+            }
+            Err(error) => {
+                readiness.blockers.push(format!("execution_graph:{error}"));
+                readiness.executable = false;
+                dispatch_status = "execution_graph_rejected";
+                audit_result = "blocked_execution_graph";
+                audit_summary = "commit_graph_registration_failed".to_string();
             }
         }
+    } else if readiness
+        .blockers
+        .iter()
+        .any(|blocker| blocker.starts_with("dispatch:payload_blocked:"))
+    {
+        dispatch_status = "payload_rejected";
+        audit_result = "blocked_payload_rejected";
+        audit_summary = "commit_payload_failed_workspace_validation".to_string();
+    } else if readiness
+        .adapter_capability
+        .as_ref()
+        .is_some_and(|capability| capability.live_supported && !capability.adapter_bound)
+    {
+        dispatch_status = "adapter_unavailable";
+        audit_result = "blocked_adapter_unavailable";
+        audit_summary = "commit_requires_bound_surface_adapter".to_string();
     }
 
     let (audit_record_id, receipt) =
@@ -520,7 +535,10 @@ async fn evaluate_action_readiness(
         target_platform.as_deref(),
         adapter_capability.as_ref(),
     );
-    let mut blockers = Vec::new();
+    let mut blockers = dispatch_target
+        .as_ref()
+        .map(|target| target.blockers.clone())
+        .unwrap_or_default();
     if decision.decision != PolicyDecisionKind::Allow {
         blockers.push(format!("policy:{}", decision.reason));
     }
@@ -530,6 +548,27 @@ async fn evaluate_action_readiness(
         }
     } else if let Some(target) = &target_platform {
         blockers.push(format!("platform:{target}:unconfigured"));
+    }
+    if mode == "commit" && dispatch_target.is_some() {
+        match &adapter_capability {
+            Some(capability) if capability.live_supported && capability.adapter_bound => {}
+            Some(capability) if !capability.live_supported => {
+                blockers.push(format!(
+                    "adapter:{}:{}:operation_unsupported",
+                    capability.platform, capability.operation
+                ));
+            }
+            Some(capability) => {
+                blockers.push(format!(
+                    "adapter:{}:{}:not_bound",
+                    capability.platform, capability.operation
+                ));
+            }
+            None if target_platform.is_some() => {
+                blockers.push("adapter:operation_unavailable".to_string());
+            }
+            None => {}
+        }
     }
     if mode == "commit" {
         if let Some(outbound) = dispatch_target
@@ -659,6 +698,17 @@ fn build_dispatch_target(
     target_platform: Option<&str>,
     adapter_capability: Option<&CrossPlaneAdapterCapability>,
 ) -> Option<CrossPlaneDispatchTarget> {
+    // A connector service action may be cross-plane without being an
+    // outbound user message. Only channel capabilities own a surface target,
+    // media payload validation, and sidecar delivery requirement.
+    if !action
+        .requested_capability
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("channel.")
+    {
+        return None;
+    }
     let operation = adapter_capability
         .map(|capability| capability.operation.clone())
         .or_else(|| operation_from_capability(&action.requested_capability));

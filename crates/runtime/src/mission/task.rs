@@ -768,6 +768,7 @@ mod tests {
                     graph_id: "graph-1".to_string(),
                     revision: 4,
                     objective: "Attach graph".to_string(),
+                    parent_execution: None,
                     nodes: Vec::new(),
                     commit_cursor: 9,
                     terminal_result_ref: None,

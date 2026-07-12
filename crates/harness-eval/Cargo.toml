@@ -10,6 +10,7 @@ fact-kernel = { path = "../fact-kernel" }
 harness-contract = { path = "../harness-contract" }
 memory = { path = "../memory" }
 runtime = { path = "../runtime" }
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tools = { path = "../tools" }

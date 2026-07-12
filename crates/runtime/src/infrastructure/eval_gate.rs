@@ -337,7 +337,7 @@ impl ScenarioCheck {
 pub struct ScenarioObservation {
     pub scenario_id: String,
     pub strategy_pattern: ExecutionPattern,
-    pub finalization_blocked: bool,
+    pub verification_blocked: bool,
     pub regression_allowed: bool,
     pub has_execution_graph: bool,
     pub execution_graph_quality_ok: bool,
@@ -470,7 +470,7 @@ fn evaluate_check(
 ) -> Option<FailedScenarioCheck> {
     match check.kind {
         ScenarioCheckKind::FinalizationBlocked => {
-            compare_bool(check, observation.finalization_blocked)
+            compare_bool(check, observation.verification_blocked)
         }
         ScenarioCheckKind::RegressionAllowed => compare_bool(check, observation.regression_allowed),
         ScenarioCheckKind::ExecutionGraphPresent => {
@@ -909,7 +909,7 @@ mod tests {
         let spec = ScenarioSpec::new("empty_answer", "answer this")
             .expect_mode(ExecutionPattern::Direct)
             .require(ScenarioCheck::bool(
-                "verification.finalization_blocked",
+                "verification.verification_blocked",
                 ScenarioCheckKind::FinalizationBlocked,
                 true,
                 "ai-verification/runtime-conversation",
@@ -918,7 +918,7 @@ mod tests {
         let observation = ScenarioObservation {
             scenario_id: "empty_answer".to_string(),
             strategy_pattern: ExecutionPattern::Direct,
-            finalization_blocked: false,
+            verification_blocked: false,
             regression_allowed: true,
             has_execution_graph: false,
             execution_graph_quality_ok: false,
@@ -955,7 +955,7 @@ mod tests {
         let observation = ScenarioObservation {
             scenario_id: "matrix_quality".to_string(),
             strategy_pattern: ExecutionPattern::Execute,
-            finalization_blocked: false,
+            verification_blocked: false,
             regression_allowed: false,
             has_execution_graph: false,
             execution_graph_quality_ok: false,

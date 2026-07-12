@@ -188,8 +188,7 @@ impl CrossPlaneService {
                 graph_id: graph_id.clone(),
                 backend,
             }));
-        let result = self
-            .runtime_services
+        self.runtime_services
             .graph_runner()
             .submit_graph(
                 graph,
@@ -199,40 +198,46 @@ impl CrossPlaneService {
             )
             .await
             .map(|receipt| receipt.graph)
-            .map_err(|error| error.to_string());
-        if let Ok(projection) = &result {
-            let outcome = projection
-                .nodes
-                .iter()
-                .find(|node| node.kind == ExecutionNodeKind::ToolBatch)
-                .and_then(|node| node.result_ref.as_deref())
-                .and_then(|value| serde_json::from_str::<CrossPlaneDispatchOutcome>(value).ok());
-            let (status, dispatch_status, audit_result, audit_summary, blockers) =
-                graph_receipt_state(outcome.as_ref());
-            let audit = CrossPlaneAuditRecord::new(
-                action.clone(),
-                decision.clone(),
-                audit_result,
-                audit_summary,
-            );
-            let receipt = CrossPlaneExecutionReceipt::new(
-                Some(idempotency_key.to_string()),
-                "commit",
-                status,
-                dispatch_status,
-                action.clone(),
-                decision.clone(),
-                blockers,
-                Some(audit.id.clone()),
-            )
-            .with_dispatch_outcome(outcome)
-            .with_execution_graph_id(Some(projection.graph_id.clone()));
-            self.runtime_services
-                .cross_plane()
-                .record_action_execution(audit, receipt)
-                .map_err(|error| error.to_string())?;
-        }
-        result
+            .map_err(|error| error.to_string())
+    }
+
+    /// Persist a message-delivery receipt after a caller has both executed a
+    /// graph and validated its dispatch target. Generic connector graphs must
+    /// not use this path: their node result is service data, not a message
+    /// delivery outcome.
+    pub(crate) fn record_message_dispatch_graph(
+        &self,
+        idempotency_key: String,
+        action: CrossPlaneAction,
+        decision: CrossPlanePolicyDecision,
+        evidence: CrossPlaneDecisionEvidence,
+        dispatch_target: CrossPlaneDispatchTarget,
+        projection: &harness_contract::execution_graph::ExecutionGraphProjection,
+    ) -> Result<CrossPlaneExecutionReceipt, runtime::CrossPlaneRuntimeError> {
+        let outcome = projection
+            .nodes
+            .iter()
+            .find(|node| node.kind == ExecutionNodeKind::ToolBatch)
+            .and_then(|node| node.result_ref.as_deref())
+            .and_then(|value| serde_json::from_str::<CrossPlaneDispatchOutcome>(value).ok());
+        let (status, dispatch_status, audit_result, audit_summary, blockers) =
+            graph_receipt_state(outcome.as_ref());
+        let (_, receipt) = self.record_action_execution(CrossPlaneExecutionRecord {
+            idempotency_key: Some(idempotency_key),
+            mode: "commit".to_string(),
+            status: status.to_string(),
+            dispatch_status: dispatch_status.to_string(),
+            action,
+            decision,
+            blockers,
+            dispatch_target: Some(dispatch_target),
+            dispatch_outcome: outcome,
+            evidence,
+            audit_result: audit_result.to_string(),
+            audit_summary: audit_summary.to_string(),
+            execution_graph_id: Some(projection.graph_id.clone()),
+        })?;
+        Ok(receipt)
     }
 }
 

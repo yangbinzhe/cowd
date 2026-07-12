@@ -642,6 +642,13 @@ impl CognitiveContextManager {
         self.orchestrator.set_active_session(session_id);
     }
 
+    /// Set the ownership scope used by automatic post-turn extraction.
+    /// Runtime's `MemoryKernel` derives this from the active turn context so
+    /// extractor output cannot retain the placeholder `session_` scope.
+    pub fn set_active_scope(&self, scope: MemoryScope) {
+        self.orchestrator.set_active_scope(scope);
+    }
+
     /// Get the current active session ID (if set).
     pub fn active_session_id(&self) -> Option<String> {
         self.orchestrator.active_session_id()

@@ -100,6 +100,7 @@ impl HarnessEvalReportStore {
         let responses_dir = run_dir.join("responses");
         let events_dir = run_dir.join("events");
         let run_evidence_dir = run_dir.join("run-evidence");
+        let live_scenarios_dir = run_dir.join("live-scenarios");
         let provider_rounds_dir = run_dir.join("provider-rounds");
         let tool_calls_dir = run_dir.join("tool-calls");
         let model_speed_dir = run_dir.join("model-speed");
@@ -110,6 +111,7 @@ impl HarnessEvalReportStore {
             &responses_dir,
             &events_dir,
             &run_evidence_dir,
+            &live_scenarios_dir,
             &provider_rounds_dir,
             &tool_calls_dir,
             &model_speed_dir,
@@ -132,7 +134,7 @@ impl HarnessEvalReportStore {
         report["report_package"] = serde_json::json!({
             "status": "written",
             "root": run_dir.display().to_string(),
-            "required_dirs": ["requests", "responses", "events", "run-evidence", "provider-rounds", "tool-calls", "model-speed", "quality-rubric", "evidence"],
+            "required_dirs": ["requests", "responses", "events", "run-evidence", "live-scenarios", "provider-rounds", "tool-calls", "model-speed", "quality-rubric", "evidence"],
             "summary": "summary.md",
             "full_report": "full-report.md",
             "full_analysis_report": "full-analysis-report.md",
@@ -142,6 +144,15 @@ impl HarnessEvalReportStore {
             "evidence_manifest": "evidence/evidence-manifest.json",
             "quality_rubric": "quality-rubric/quality-rubric.json"
         });
+        // Write full live API traces before serializing the human-facing
+        // report, then retain only a package reference in report.json.
+        write_live_scenario_artifacts(report, &live_scenarios_dir)?;
+        if report.get("live_gateway_scenario_details").is_some() {
+            report["live_gateway_scenario_details"] = serde_json::json!({
+                "stored": true,
+                "directory": "live-scenarios",
+            });
+        }
         report["report_gate"] = serde_json::to_value(evaluate_report_gate(report))
             .map_err(|error| error.to_string())?;
         let json_path = run_dir.join("report.json");
@@ -256,6 +267,14 @@ impl HarnessEvalReportStore {
         )
         .map_err(|error| error.to_string())?;
         fs::write(
+            evidence_dir.join("live-gateway-scenarios.json"),
+            serde_json::to_string_pretty(
+                report.get("live_gateway_scenarios").unwrap_or(&Value::Null),
+            )
+            .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        fs::write(
             evidence_dir.join("evidence-manifest.json"),
             serde_json::to_string_pretty(report.get("evidence_manifest").unwrap_or(&Value::Null))
                 .map_err(|error| error.to_string())?,
@@ -340,15 +359,42 @@ impl HarnessEvalReportStore {
         if options.allow_real_model {
             let provider_review = run_deep_real_provider_review(&options, &report);
             let provider_round_count = provider_review.provider_rounds.len();
-            report["execution_trace"]["rounds"] =
-                serde_json::to_value(&provider_review.provider_rounds)
-                    .map_err(|error| error.to_string())?;
-            report["execution_trace"]["provider_rounds"] = serde_json::json!(provider_round_count);
+            let mut rounds = report
+                .pointer("/execution_trace/rounds")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let reviewer_rounds = serde_json::to_value(&provider_review.provider_rounds)
+                .map_err(|error| error.to_string())?;
+            if let Some(items) = reviewer_rounds.as_array() {
+                rounds.extend(items.iter().cloned());
+            }
+            let existing_rounds = report
+                .pointer("/execution_trace/provider_rounds")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let existing_usage = report
+                .pointer("/execution_trace/total_usage")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or_else(|| empty_usage("unavailable"));
+            let combined_usage = merge_usage(&existing_usage, &provider_review.usage);
+            report["execution_trace"]["rounds"] = Value::Array(rounds);
+            report["execution_trace"]["provider_rounds"] =
+                serde_json::json!(existing_rounds.saturating_add(provider_round_count as u64));
             report["execution_trace"]["total_usage"] =
-                serde_json::to_value(&provider_review.usage).map_err(|error| error.to_string())?;
-            report["provider_round_details"] =
-                serde_json::to_value(&provider_review.provider_round_details)
-                    .map_err(|error| error.to_string())?;
+                serde_json::to_value(&combined_usage).map_err(|error| error.to_string())?;
+            let mut details = report
+                .get("provider_round_details")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let reviewer_details = serde_json::to_value(&provider_review.provider_round_details)
+                .map_err(|error| error.to_string())?;
+            if let Some(items) = reviewer_details.as_array() {
+                details.extend(items.iter().cloned());
+            }
+            report["provider_round_details"] = Value::Array(details);
             report["ai_reviewer"] = serde_json::json!({
                 "status": provider_review.status,
                 "report_source": "provider_round",
@@ -409,6 +455,30 @@ pub fn empty_usage(source: &str) -> HarnessEvalUsageSummary {
     HarnessEvalUsageSummary {
         usage_source: source.to_string(),
         ..HarnessEvalUsageSummary::default()
+    }
+}
+
+fn merge_usage(
+    left: &HarnessEvalUsageSummary,
+    right: &HarnessEvalUsageSummary,
+) -> HarnessEvalUsageSummary {
+    if right.total_tokens == 0 {
+        return left.clone();
+    }
+    if left.total_tokens == 0 {
+        return right.clone();
+    }
+    HarnessEvalUsageSummary {
+        input_tokens: left.input_tokens.saturating_add(right.input_tokens),
+        output_tokens: left.output_tokens.saturating_add(right.output_tokens),
+        cache_creation_input_tokens: left
+            .cache_creation_input_tokens
+            .saturating_add(right.cache_creation_input_tokens),
+        cache_read_input_tokens: left
+            .cache_read_input_tokens
+            .saturating_add(right.cache_read_input_tokens),
+        total_tokens: left.total_tokens.saturating_add(right.total_tokens),
+        usage_source: format!("{}+{}", left.usage_source, right.usage_source),
     }
 }
 
@@ -713,8 +783,8 @@ fn render_full_analysis_report(report: &Value) -> String {
          - ai_reviewer_status: `{}`\n\
          - provider_rounds: `{}`\n\n\
          ## Analysis\n\n\
-         This is a deterministic degraded analysis report generated because a real AI reviewer round was not available. \
-         The report is not a placeholder pass path: deep-real remains blocked unless `execution_trace.provider_rounds > 0` and the report gate passes.\n\n\
+         This is a structured evidence summary because an optional AI ReportReviewer was not requested or was unavailable. \
+         It is not an AI-authored quality judgment. Deep-real capability status remains bound to independent isolated Gateway scenario traces, canonical token/round metrics, and the report gate.\n\n\
          ## Evidence Package\n\n\
          - report: `report.json`\n\
          - trace: `execution-trace.json`\n\
@@ -752,6 +822,7 @@ fn analysis_context(report: &Value) -> Value {
         "reality_context_eval": report.get("reality_context_eval").cloned().unwrap_or(Value::Null),
         "mission_runtime_collaboration": report.get("mission_runtime_collaboration").cloned().unwrap_or(Value::Null),
         "real_tool_scenarios": report.get("real_tool_scenarios").cloned().unwrap_or(Value::Null),
+        "live_gateway_scenarios": report.get("live_gateway_scenarios").cloned().unwrap_or(Value::Null),
         "instructions": [
             "Use summaries in the human report and cite JSON artifact paths for details.",
             "Distinguish deterministic contract checks, real local tool execution, and real provider rounds.",
@@ -856,6 +927,44 @@ fn write_tool_call_artifacts(
     Ok(())
 }
 
+fn write_live_scenario_artifacts(report: &Value, root: &Path) -> Result<(), String> {
+    let live = report
+        .get("live_gateway_scenario_details")
+        .or_else(|| report.get("live_gateway_scenarios"))
+        .unwrap_or(&Value::Null);
+    fs::write(
+        root.join("suite.json"),
+        serde_json::to_string_pretty(live).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let Some(scenarios) = live.get("scenarios").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for (index, scenario) in scenarios.iter().enumerate() {
+        let id = scenario
+            .get("scenario_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unnamed");
+        let safe_id = id
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        fs::write(
+            root.join(format!("{:03}-{safe_id}.json", index + 1)),
+            serde_json::to_string_pretty(scenario).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 fn write_stable_ai_health(root: &Path, report: &StableAiHealthReport) -> Result<(), String> {
     let version = env!("CARGO_PKG_VERSION");
     fs::write(
@@ -869,6 +978,36 @@ fn write_stable_ai_health(root: &Path, report: &StableAiHealthReport) -> Result<
 mod tests {
     use super::*;
     use crate::runner::{run_eval, HarnessEvalRunnerOptions};
+
+    #[test]
+    fn reviewer_usage_is_appended_without_erasing_live_scenario_usage() {
+        let live = HarnessEvalUsageSummary {
+            input_tokens: 300,
+            output_tokens: 60,
+            cache_read_input_tokens: 10,
+            total_tokens: 370,
+            usage_source: "live_gateway_canonical_usage".to_string(),
+            ..HarnessEvalUsageSummary::default()
+        };
+        let reviewer = HarnessEvalUsageSummary {
+            input_tokens: 40,
+            output_tokens: 10,
+            total_tokens: 50,
+            usage_source: "provider".to_string(),
+            ..HarnessEvalUsageSummary::default()
+        };
+
+        let combined = merge_usage(&live, &reviewer);
+
+        assert_eq!(combined.input_tokens, 340);
+        assert_eq!(combined.output_tokens, 70);
+        assert_eq!(combined.cache_read_input_tokens, 10);
+        assert_eq!(combined.total_tokens, 420);
+        assert_eq!(
+            combined.usage_source,
+            "live_gateway_canonical_usage+provider"
+        );
+    }
 
     #[test]
     fn report_store_writes_lists_and_reads_smoke_report() {

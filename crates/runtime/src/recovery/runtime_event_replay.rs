@@ -124,11 +124,15 @@ pub fn candidate_from_action(action: &RuntimeRecoveryAction) -> Option<RuntimeRe
             "runtime.execution_graph"
         }
         RuntimeEventScope::Goal => "runtime.goal_runtime",
-        RuntimeEventScope::Session | RuntimeEventScope::SessionCommand => "runtime.session",
+        RuntimeEventScope::Session
+        | RuntimeEventScope::SessionInput
+        | RuntimeEventScope::SessionCommand => "runtime.session",
         RuntimeEventScope::Team => "runtime.team_projection",
         RuntimeEventScope::Agent => "runtime.agent_lifecycle",
         RuntimeEventScope::Approval => "runtime.approval_queue",
-        RuntimeEventScope::Steward => "runtime.steward_runtime",
+        // Steward events from prior builds have no active lifecycle owner.
+        // They remain replayable evidence only and can never restart work.
+        RuntimeEventScope::Steward => "runtime.agent_policy",
         RuntimeEventScope::Tool => "runtime.tool_host",
         RuntimeEventScope::Recovery => "runtime.recovery",
         RuntimeEventScope::CrossPlane => "runtime.cross_plane",
@@ -178,13 +182,9 @@ pub fn candidate_from_action(action: &RuntimeRecoveryAction) -> Option<RuntimeRe
 
 fn recovery_action(scope: RuntimeEventScope, status: &str) -> (RuntimeRecoveryActionKind, String) {
     match (scope, status) {
-        (RuntimeEventScope::Approval | RuntimeEventScope::SessionCommand, "pending") => (
+        (RuntimeEventScope::Approval | RuntimeEventScope::SessionInput, "pending") => (
             RuntimeRecoveryActionKind::PreservePending,
             "pending work must survive restart".to_string(),
-        ),
-        (RuntimeEventScope::Steward, "running" | "waiting_dependency" | "waiting_approval") => (
-            RuntimeRecoveryActionKind::PauseRecoveryRequired,
-            "steward must pause for recovery review after restart".to_string(),
         ),
         (
             RuntimeEventScope::ExecutionGraph
@@ -192,7 +192,7 @@ fn recovery_action(scope: RuntimeEventScope, status: &str) -> (RuntimeRecoveryAc
             | RuntimeEventScope::Goal
             | RuntimeEventScope::Team
             | RuntimeEventScope::Agent
-            | RuntimeEventScope::SessionCommand,
+            | RuntimeEventScope::SessionInput,
             "running" | "claimed",
         ) => (
             RuntimeRecoveryActionKind::MarkInterrupted,
@@ -233,20 +233,8 @@ mod tests {
                 payload: serde_json::json!({}),
             })
             .expect("approval append");
-        store
-            .append(RuntimeEventInput {
-                stream_id: "steward:s".to_string(),
-                scope: RuntimeEventScope::Steward,
-                kind: "steward.started".to_string(),
-                status: Some("running".to_string()),
-                actor: Some("test".to_string()),
-                refs: Vec::<RuntimeEventRef>::new(),
-                payload: serde_json::json!({}),
-            })
-            .expect("steward append");
-
         let report = RuntimeEventReplayer::report(&store, 100).expect("report");
-        assert_eq!(report.total_events, 2);
+        assert_eq!(report.total_events, 1);
         assert!(report.candidates.iter().any(|candidate| {
             candidate.owner == "runtime.approval_queue"
                 && candidate.action == RuntimeRecoveryActionKind::PreservePending
@@ -254,10 +242,6 @@ mod tests {
         assert!(report.actions.iter().any(|action| {
             action.stream_id == "approval:a"
                 && action.action == RuntimeRecoveryActionKind::PreservePending
-        }));
-        assert!(report.actions.iter().any(|action| {
-            action.stream_id == "steward:s"
-                && action.action == RuntimeRecoveryActionKind::PauseRecoveryRequired
         }));
     }
 }

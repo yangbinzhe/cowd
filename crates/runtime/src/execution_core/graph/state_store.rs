@@ -3,11 +3,12 @@ use std::sync::Arc;
 use harness_contract::execution_graph::{
     ExecutionGraph, ExecutionGraphProjection, ExecutionNodeProjection, ExecutionNodeStatus,
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::runtime_event_store::{RuntimeEventScope, RuntimeEventStore, RuntimeEventStoreError};
 
-use super::events::ExecutionGraphEvent;
+use super::{commit_service::execution_lineage_stream_id, events::ExecutionGraphEvent};
 
 #[derive(Debug, Error)]
 pub enum ExecutionStateStoreError {
@@ -26,6 +27,18 @@ pub enum ExecutionStateStoreError {
 #[derive(Clone)]
 pub struct ExecutionGraphStateStore {
     event_store: Arc<RuntimeEventStore>,
+}
+
+/// Durable, reverse lookup entry for one graph that was registered under a
+/// parent graph node. The canonical parent binding remains on the child graph;
+/// this event-backed index only makes root-to-descendant projections O(tree)
+/// instead of O(all execution graphs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionChildLink {
+    pub parent_execution_id: String,
+    pub parent_node_id: String,
+    pub child_execution_id: String,
+    pub child_objective: String,
 }
 
 impl ExecutionGraphStateStore {
@@ -101,6 +114,50 @@ impl ExecutionGraphStateStore {
             .map_err(|error| ExecutionStateStoreError::BlockingTask(error.to_string()))?
     }
 
+    pub fn child_links(
+        &self,
+        parent_execution_id: &str,
+    ) -> Result<Vec<ExecutionChildLink>, ExecutionStateStoreError> {
+        let stream_id = execution_lineage_stream_id(parent_execution_id);
+        let mut links = self
+            .event_store
+            .list_stream(&stream_id)
+            .map_err(|reason| ExecutionStateStoreError::Corrupt {
+                graph_id: parent_execution_id.to_string(),
+                reason,
+            })?
+            .into_iter()
+            .filter(|event| {
+                event.scope == RuntimeEventScope::Relation
+                    && event.kind == "execution.lineage.child_registered.v1"
+            })
+            .map(|event| serde_json::from_value::<ExecutionChildLink>(event.payload))
+            .collect::<Result<Vec<_>, _>>()?;
+        if links
+            .iter()
+            .any(|link| link.parent_execution_id != parent_execution_id)
+        {
+            return Err(ExecutionStateStoreError::Corrupt {
+                graph_id: parent_execution_id.to_string(),
+                reason: "execution lineage event belongs to another parent".to_string(),
+            });
+        }
+        links.sort_by(|left, right| left.child_execution_id.cmp(&right.child_execution_id));
+        links.dedup_by(|left, right| left.child_execution_id == right.child_execution_id);
+        Ok(links)
+    }
+
+    pub async fn child_links_async(
+        &self,
+        parent_execution_id: impl Into<String>,
+    ) -> Result<Vec<ExecutionChildLink>, ExecutionStateStoreError> {
+        let store = self.clone();
+        let parent_execution_id = parent_execution_id.into();
+        tokio::task::spawn_blocking(move || store.child_links(&parent_execution_id))
+            .await
+            .map_err(|error| ExecutionStateStoreError::BlockingTask(error.to_string()))?
+    }
+
     pub fn nonterminal_graph_ids(&self) -> Result<Vec<String>, ExecutionStateStoreError> {
         let mut graph_ids = Vec::new();
         for graph_id in self.graph_ids()? {
@@ -130,6 +187,7 @@ impl ExecutionGraphStateStore {
             graph_id: graph.id.clone(),
             revision: graph.revision,
             objective: graph.objective.clone(),
+            parent_execution: graph.parent_execution.clone(),
             nodes: graph
                 .nodes
                 .iter()
@@ -143,6 +201,9 @@ impl ExecutionGraphStateStore {
                         result_ref: result.and_then(|result| result.result_ref.clone()),
                         evidence_refs: result
                             .map(|result| result.evidence_refs.clone())
+                            .unwrap_or_default(),
+                        usage: result
+                            .map(|result| result.usage.clone())
                             .unwrap_or_default(),
                     }
                 })

@@ -1,7 +1,7 @@
 use super::{
     validate_protocol_request, OutputSpec, ProtocolAvailability, ProtocolCompileError,
     ProtocolCompileRequest, ProtocolGraphBuilder, ProtocolId, ProtocolSpec, RepairPolicy,
-    RepairTrigger, RoleDependencySpec, RoleSpec, StopPolicy,
+    RepairTrigger, RoleDependencySpec, RoleEvidenceMode, RoleSpec, StopPolicy,
 };
 use harness_contract::execution_graph::ExecutionGraph;
 
@@ -50,14 +50,16 @@ pub(crate) fn spec() -> ProtocolSpec {
                     &["change_summary", "change_evidence", "acceptance_mapping"],
                     false,
                 ),
-            ),
+            )
+            .with_evidence_mode(RoleEvidenceMode::Acquire),
             RoleSpec::agent(
                 "review",
                 "Independently review the implementation for defects, evidence gaps, and regressions.",
                 2,
                 4,
                 OutputSpec::evidence_backed(&["findings", "evidence", "regression_risk"], true),
-            ),
+            )
+            .with_evidence_mode(RoleEvidenceMode::UpstreamOnly),
             RoleSpec::agent(
                 "fix",
                 "Apply at most one bounded remediation and state what still requires verification.",
@@ -67,7 +69,8 @@ pub(crate) fn spec() -> ProtocolSpec {
                     &["remediation", "verification_plan", "remaining_risk"],
                     true,
                 ),
-            ),
+            )
+            .with_evidence_mode(RoleEvidenceMode::Acquire),
         ],
         dependencies: vec![
             RoleDependencySpec::all("review", "implement"),

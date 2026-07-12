@@ -3,7 +3,7 @@ use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -92,76 +92,37 @@ use crate::{RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventS
 use model_protocol::usage::TokenUsage;
 
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "COWD_AUTO_COMPACT_INPUT_TOKENS";
-const DEFAULT_RUNTIME_MAX_ITERATIONS: usize = 64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StreamIdleClass {
-    Direct,
-    Standard,
-    Deep,
-}
-
-fn stream_idle_timeout_for_messages(messages: &[ConversationMessage]) -> Duration {
-    match classify_stream_idle_prompt(&latest_user_prompt_text(messages)) {
-        StreamIdleClass::Direct => Duration::from_secs(240),
-        StreamIdleClass::Standard => Duration::from_secs(360),
-        StreamIdleClass::Deep => Duration::from_secs(600),
-    }
-}
-
-fn classify_stream_idle_prompt(prompt: &str) -> StreamIdleClass {
-    let lower = prompt.to_lowercase();
-    let deep_markers = [
-        "deep",
-        "architecture",
-        "refactor",
-        "multi-agent",
-        "what if",
-        "scenario",
-        "simulation",
-        "matrix",
-        "memory",
-        "harness",
-        "沉浸式",
-        "深度",
-        "架构",
-        "重构",
-        "全量",
-        "全盘",
-        "复杂",
-        "多agent",
-        "多 agent",
-        "跨session",
-        "跨 session",
-        "记忆",
-        "矩阵",
-        "推演",
-        "测试",
-        "验证",
-        "真实模型",
-    ];
-    if prompt.chars().count() > 500
-        || prompt.lines().count() > 6
-        || deep_markers.iter().any(|marker| lower.contains(marker))
-    {
-        return StreamIdleClass::Deep;
-    }
-
-    let direct_markers = [
-        "what is", "explain", "status", "help", "解释", "列出", "总结", "简单", "快速",
-    ];
-    if prompt.chars().count() <= 160 && direct_markers.iter().any(|marker| lower.contains(marker)) {
-        return StreamIdleClass::Direct;
-    }
-
-    StreamIdleClass::Standard
+fn provider_transport_policy(
+    context_window: u32,
+    request: &ApiRequest,
+) -> crate::ProviderTransportPolicy {
+    let prompt_chars = request
+        .system_prompt
+        .iter()
+        .map(|item| item.chars().count())
+        .sum::<usize>();
+    let message_chars = request
+        .messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .map(|block| match block {
+            ContentBlock::Text { text } => text.chars().count(),
+            ContentBlock::ToolResult { output, .. } => output.chars().count(),
+            _ => 0,
+        })
+        .sum::<usize>();
+    crate::ProviderTransportPolicy::derive(
+        context_window,
+        prompt_chars.saturating_add(message_chars),
+    )
 }
 
 fn latest_user_prompt_text(messages: &[ConversationMessage]) -> String {
     messages
         .iter()
         .rev()
-        .find(|message| matches!(message.role, crate::session::MessageRole::User))
+        .find(|message| message.role == crate::session::MessageRole::User)
         .map(|message| {
             message
                 .blocks
@@ -212,6 +173,246 @@ fn classify_model_step_intent(text: String, calls: Vec<ModelToolCall>) -> ModelS
     }
 }
 
+/// Compatibility recovery for providers that emit an authorized XML tool call
+/// in visible text after a short natural-language preamble. Provider adapters
+/// decode pure XML streams first; this second pass only accepts a contiguous
+/// trailing XML section, every call must name a tool exposed for *this* turn,
+/// and normal Tool DAG authorization still runs afterwards. It never turns an
+/// XML example embedded in a prose answer into an executable command.
+fn trailing_declared_xml_tool_calls(
+    text: &str,
+    available_tools: &[String],
+) -> Option<(String, Vec<ModelToolCall>)> {
+    let allowed = available_tools.iter().cloned().collect::<BTreeSet<_>>();
+    if allowed.is_empty() {
+        return None;
+    }
+    let start = text.to_ascii_lowercase().find("<tool_call>")?;
+    let prefix = text[..start].trim_end();
+    // XML examples in a normal answer are not commands. A provider fallback
+    // may have an optional short planning preamble, but it must not resemble a
+    // complete answer with citations or Markdown sections.
+    if prefix.contains('\n') || prefix.contains('`') || prefix.contains("##") {
+        return None;
+    }
+    let mut rest = text[start..].trim();
+    let mut calls = Vec::new();
+    while !rest.is_empty() {
+        rest = rest.strip_prefix("<tool_call>")?.trim_start();
+        let function_end = rest.find('>')?;
+        let function = &rest[..=function_end];
+        let name = function
+            .strip_prefix("<function=")?
+            .strip_suffix('>')?
+            .trim();
+        if !is_xml_tool_identifier(name) || !allowed.contains(name) {
+            return None;
+        }
+        rest = &rest[function_end + 1..];
+        let function_close = rest.find("</function>")?;
+        let mut parameters = rest[..function_close].trim();
+        let mut input = Map::new();
+        while !parameters.is_empty() {
+            let parameter_end = parameters.find('>')?;
+            let parameter = &parameters[..=parameter_end];
+            let key = parameter
+                .strip_prefix("<parameter=")?
+                .strip_suffix('>')?
+                .trim();
+            if !is_xml_tool_identifier(key) || input.contains_key(key) {
+                return None;
+            }
+            parameters = &parameters[parameter_end + 1..];
+            let close = parameters.find("</parameter>")?;
+            input.insert(
+                key.to_string(),
+                parse_xml_tool_value(parameters[..close].trim()),
+            );
+            parameters = parameters[close + "</parameter>".len()..].trim_start();
+        }
+        rest = rest[function_close + "</function>".len()..].trim_start();
+        rest = rest.strip_prefix("</tool_call>")?.trim_start();
+        calls.push(ModelToolCall {
+            id: format!("xml-text-tool-{}", calls.len()),
+            name: name.to_string(),
+            input: Value::Object(input).to_string(),
+            depends_on: Vec::new(),
+        });
+    }
+    (!calls.is_empty()).then(|| (prefix.to_string(), calls))
+}
+
+fn is_xml_tool_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+fn parse_xml_tool_value(value: &str) -> Value {
+    match value.to_ascii_lowercase().as_str() {
+        "true" => Value::Bool(true),
+        "false" => Value::Bool(false),
+        _ => serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string())),
+    }
+}
+
+/// An explicit user requirement to actually form a team is an acceptance
+/// constraint, not merely a prose preference. It takes precedence over a
+/// heuristic strategy recommendation: otherwise a correctly parsed user
+/// requirement can disappear just because the lightweight classifier chose a
+/// different execution pattern. Generic complex work remains model-directed
+/// and is never forced through this path.
+fn enforce_explicit_team_requirement(
+    objective: &str,
+    first_step: bool,
+    _decision: &crate::execution_core::RuntimeExecutionDecision,
+    intent: ModelStepIntent,
+) -> ModelStepIntent {
+    if !first_step || !explicit_team_execution_required(objective) {
+        return intent;
+    }
+
+    match intent {
+        ModelStepIntent::ToolCalls { mut calls } => {
+            if !calls.iter().any(is_runtime_team_orchestration_call) {
+                calls.push(required_team_orchestration_call(objective));
+            }
+            ModelStepIntent::ToolCalls { calls }
+        }
+        ModelStepIntent::FinalAnswer { .. } => ModelStepIntent::ToolCalls {
+            calls: vec![required_team_orchestration_call(objective)],
+        },
+        // Provider tool naming is not a reliable contract: an otherwise
+        // ordinary evidence tool can contain "agent", and a provider-native
+        // team helper may be classified as a proposal. Keep those calls in
+        // the regular ToolBatch, but add the one canonical Runtime request so
+        // the requirement is materialized by the team compiler.
+        ModelStepIntent::AgentProposal { mut calls }
+        | ModelStepIntent::TeamProposal { mut calls } => {
+            if !calls.iter().any(is_runtime_team_orchestration_call) {
+                calls.push(required_team_orchestration_call(objective));
+            }
+            ModelStepIntent::ToolCalls { calls }
+        }
+        // A human approval request is an explicit safety boundary. It is the
+        // only model intent that may defer an otherwise explicit team request.
+        ModelStepIntent::ApprovalRequired { calls } => ModelStepIntent::ApprovalRequired { calls },
+        ModelStepIntent::Replan { .. } => ModelStepIntent::ToolCalls {
+            calls: vec![required_team_orchestration_call(objective)],
+        },
+    }
+}
+
+fn apply_explicit_team_requirement(
+    enabled: bool,
+    objective: &str,
+    first_step: bool,
+    decision: &crate::execution_core::RuntimeExecutionDecision,
+    intent: ModelStepIntent,
+) -> ModelStepIntent {
+    if enabled {
+        enforce_explicit_team_requirement(objective, first_step, decision, intent)
+    } else {
+        intent
+    }
+}
+
+fn explicit_team_execution_required(objective: &str) -> bool {
+    let normalized = objective.to_ascii_lowercase();
+    let mentions_team = [
+        "团队",
+        "协作",
+        "多agent",
+        "多 agent",
+        "team",
+        "multi-agent",
+        "multi agent",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    let requires_execution = [
+        "实际启动",
+        "启动",
+        "创建",
+        "组建",
+        "必须",
+        "必须要",
+        "must",
+        "actually",
+        "launch",
+        "start",
+        "create",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    let explicitly_disabled = [
+        "不要组队",
+        "不要团队",
+        "不要启动团队",
+        "不要启动协作",
+        "不启动团队",
+        "无需团队",
+        "不需要团队",
+        "don't use team",
+        "do not use team",
+        "do not start a team",
+        "single agent",
+        "single-agent",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    mentions_team && requires_execution && !explicitly_disabled
+}
+
+fn is_runtime_team_orchestration_call(call: &ModelToolCall) -> bool {
+    if !call.name.eq_ignore_ascii_case("runtime_orchestrate") {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(&call.input)
+        .ok()
+        .and_then(|input| {
+            input
+                .get("action")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .is_some_and(|action| action == "request_team")
+}
+
+/// Stateful tool execution normally means a guarded `Execute` turn. A team
+/// orchestration call is the one exception: retargeting it to `Execute` would
+/// make the leased strategy reject the very `request_team` action we exposed
+/// to the provider. Keep the decision and the typed action aligned.
+fn tool_batch_pattern(calls: &[ModelToolCall]) -> harness_contract::core::ExecutionPattern {
+    if calls.iter().any(is_runtime_team_orchestration_call) {
+        harness_contract::core::ExecutionPattern::Collaborate
+    } else {
+        harness_contract::core::ExecutionPattern::Execute
+    }
+}
+
+fn required_team_orchestration_call(objective: &str) -> ModelToolCall {
+    ModelToolCall {
+        id: "runtime-required-team".to_string(),
+        name: "runtime_orchestrate".to_string(),
+        input: serde_json::json!({
+            "intent": objective,
+            "action": "request_team",
+            "reason": "the user explicitly requires an actually started collaboration team",
+            "template_hint": "research_synthesis",
+            "constraints": {
+                "max_parallel_agents": 3,
+                "risk": "low",
+                "requires_write": false,
+                "surface_latency_sensitive": false,
+            }
+        })
+        .to_string(),
+        depends_on: Vec::new(),
+    }
+}
+
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiRequest {
@@ -230,6 +431,12 @@ pub struct ProviderContextInventory {
 /// Streamed events emitted while processing a single assistant turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssistantEvent {
+    /// The provider/model that actually accepted this request. This is emitted
+    /// only after the provider has produced a protocol event, so it is never
+    /// mistaken for a configured fallback that was merely considered.
+    ProviderModel {
+        model: String,
+    },
     TextDelta(String),
     /// P1-7: Extended thinking delta (reasoning model output)
     ThinkingDelta(String),
@@ -384,8 +591,12 @@ pub trait ApiClient {
 
     /// Convenience: collect all events synchronously (backward compat).
     fn stream_collect(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        let mut pinned = self.stream(request);
-        let collect = async move {
+        // Provider streams create their producer task when `stream` is called.
+        // Build the stream *inside* the runtime that will poll it so synchronous
+        // callers (evaluation, diagnostics, CLI checks) retain the same
+        // cancellation and streaming behavior as an ordinary Runtime turn.
+        let collect = async {
+            let mut pinned = self.stream(request);
             use futures::StreamExt;
             let mut events = Vec::new();
             while let Some(event) = pinned.next().await {
@@ -537,6 +748,11 @@ pub struct TurnSummary {
     /// The terminal answer selected by the execution graph synthesizer.
     /// Callers must not infer the result from the session transcript.
     pub final_answer: String,
+    /// Canonical goal outcome committed by the graph terminal. Text alone is
+    /// insufficient here: a blocked execution may intentionally produce an
+    /// honest explanatory message, which must not be reported as success to a
+    /// parent Agent or protocol reducer.
+    pub terminal_completion: harness_contract::goal::GoalCompletion,
     pub assistant_messages: Vec<ConversationMessage>,
     pub tool_results: Vec<ConversationMessage>,
     pub prompt_cache_events: Vec<PromptCacheEvent>,
@@ -577,6 +793,10 @@ pub struct ModelStepResult {
     pub prompt_cache_events: Vec<PromptCacheEvent>,
     pub model: Option<String>,
     pub wall_duration_ms: u64,
+    /// Whether this response was requested under the one-shot, zero-tool
+    /// terminal checkpoint. Graph owners must enforce the boundary from the
+    /// returned step rather than infer it from local scheduling state.
+    pub text_only_response: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -744,11 +964,15 @@ fn normalize_image_media_type(path: &Path, media_type: &str) -> Option<String> {
 pub struct ConversationRuntime<C, T> {
     session: Arc<RwLock<Session>>, // tokio::sync::RwLock
     session_input_stream: crate::session_input::SessionInputStream,
+    /// Inputs consumed at a provider checkpoint. The graph-owned host drains
+    /// this compact receipt list and converts relevant corrections into Goal
+    /// observations/revisions in the same graph commit; raw input remains in
+    /// the durable Session store.
+    consumed_session_inputs: std::sync::Mutex<Vec<crate::session_input::SessionInputRecord>>,
     api_client: C,
     tool_executor: Arc<T>,
     permission_policy: PermissionPolicy,
     system_prompt: Vec<String>,
-    max_iterations: usize,
     usage_tracker: UsageTracker,
     model_performance_registry: std::sync::Mutex<ModelPerformanceRegistry>,
     hook_runner: HookRunner,
@@ -773,6 +997,10 @@ pub struct ConversationRuntime<C, T> {
     tool_callback: Option<Arc<dyn ToolCallback>>,
     /// Optional managed SQLite session store for messages and domain events.
     session_store: Option<Arc<memory::session_store::UnifiedSessionStore>>,
+    /// Whether the in-memory transcript may also write message rows directly.
+    /// Gateway ingress owns durable user/terminal writes through its outboxes;
+    /// disabling this for an ingress turn prevents a second transcript writer.
+    transcript_persistence: bool,
     /// Durable execution lifecycle store. Session-domain events never use it.
     runtime_event_store: Option<Arc<RuntimeEventStore>>,
     /// Optional event log for time-travel debugging and session rebuild.
@@ -809,12 +1037,25 @@ pub struct ConversationRuntime<C, T> {
     runtime_control_policy: RuntimeControlPolicy,
     /// Runtime-owned context supplied by outer orchestration layers.
     external_context_items: std::sync::Mutex<Vec<ContextItem>>,
+    /// One-shot instructions injected by an owner checkpoint for exactly the
+    /// next provider request. They become part of that request's durable
+    /// context envelope, but never mutate the user transcript or leak into
+    /// unrelated later model steps.
+    next_model_context_items: std::sync::Mutex<Vec<ContextItem>>,
+    /// One governed checkpoint can require a conclusion from evidence already
+    /// held by the turn. It affects only the next provider request.
+    next_model_text_only: AtomicBool,
     /// Bounded short-term tool trace context for subsequent turns.
     tool_trace_context_items: std::sync::Mutex<Vec<ContextItem>>,
     /// Governance observations produced by tool calls in the active turn.
     turn_tool_observations: std::sync::Mutex<Vec<ToolObservation>>,
     /// Revisioned tool set visible to the next provider request.
     tool_exposure_state: std::sync::Mutex<Option<ToolExposureState>>,
+    /// Provider visibility changes must be monotonically ordered. A governed
+    /// text-only checkpoint temporarily withdraws every schema; the next
+    /// normal model step must be able to restore the catalog rather than be
+    /// rejected as an older projection by the provider client.
+    tool_exposure_revision: AtomicU64,
     /// Stable evidence projections emitted during the active turn.
     turn_evidence_audits: std::sync::Mutex<Vec<EvidenceAuditProjection>>,
     /// Per-turn component accounting and tool-result lease consumption.
@@ -834,6 +1075,11 @@ pub struct ConversationRuntime<C, T> {
     default_semaphore: Arc<Semaphore>,
     /// Maximum duration for a single tool execution. `None` means no timeout.
     tool_timeout: Option<Duration>,
+    /// Only the root user turn may turn an explicit team requirement into a
+    /// mandatory orchestration call. Delegated AgentTask turns retain their
+    /// inherited wording as context but remain leaf protocol work unless a
+    /// future packet explicitly grants subdelegation.
+    explicit_team_escalation: bool,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -964,11 +1210,11 @@ where
         Self {
             session,
             session_input_stream: crate::session_input::SessionInputStream::new(session_id),
+            consumed_session_inputs: std::sync::Mutex::new(Vec::new()),
             api_client,
             tool_executor,
             permission_policy,
             system_prompt,
-            max_iterations: DEFAULT_RUNTIME_MAX_ITERATIONS,
             usage_tracker,
             model_performance_registry: std::sync::Mutex::new(ModelPerformanceRegistry::new()),
             hook_runner: HookRunner::from_feature_config(feature_config),
@@ -1006,6 +1252,7 @@ where
             memory_status,
             tool_callback: None,
             session_store: None,
+            transcript_persistence: true,
             runtime_event_store: None,
             event_log: None,
             tool_output_sandbox: memory::ToolOutputSandbox::new()
@@ -1031,9 +1278,12 @@ where
             context_profile: std::sync::Mutex::new(ContextProfile::MainTurn),
             runtime_control_policy,
             external_context_items: std::sync::Mutex::new(Vec::new()),
+            next_model_context_items: std::sync::Mutex::new(Vec::new()),
+            next_model_text_only: AtomicBool::new(false),
             tool_trace_context_items: std::sync::Mutex::new(Vec::new()),
             turn_tool_observations: std::sync::Mutex::new(Vec::new()),
             tool_exposure_state: std::sync::Mutex::new(None),
+            tool_exposure_revision: AtomicU64::new(0),
             turn_evidence_audits: std::sync::Mutex::new(Vec::new()),
             turn_context_ledger: std::sync::Mutex::new(crate::context_ledger::ContextLedger::new(
                 initial_budget_plan.effective_context_budget,
@@ -1052,32 +1302,28 @@ where
             )),
             default_semaphore: Arc::new(Semaphore::new(8)),
             tool_timeout: Some(Duration::from_secs(120)),
+            explicit_team_escalation: true,
         }
-    }
-
-    #[must_use]
-    pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
-        self.max_iterations = max_iterations;
-        self
-    }
-
-    #[must_use]
-    pub fn max_iterations(&self) -> usize {
-        self.max_iterations
-    }
-
-    /// Update the maximum model/tool loop iterations for subsequent turns.
-    ///
-    /// Gateway uses this to apply surface-specific execution budgets without
-    /// rebuilding the whole runtime session.
-    pub fn set_max_iterations(&mut self, max_iterations: usize) {
-        self.max_iterations = max_iterations;
     }
 
     #[must_use]
     pub fn with_tool_timeout(mut self, timeout: Duration) -> Self {
         self.tool_timeout = Some(timeout);
         self
+    }
+
+    #[must_use]
+    pub fn with_explicit_team_escalation(mut self, enabled: bool) -> Self {
+        self.explicit_team_escalation = enabled;
+        self
+    }
+
+    /// Provider context capacity bound to this runtime instance. Execution
+    /// safety derives its lease from this value rather than Gateway prompt
+    /// classes or a fixed whole-turn iteration limit.
+    #[must_use]
+    pub const fn model_context_window(&self) -> u32 {
+        self.model_context_window
     }
 
     /// Return a human-readable description of memory subsystem health.
@@ -1134,6 +1380,29 @@ where
         if let Ok(mut guard) = self.external_context_items.lock() {
             guard.push(item);
         }
+    }
+
+    /// Add a checkpoint-owned instruction to the next provider request only.
+    /// This is intentionally distinct from persistent external context: graph
+    /// recovery may steer one request without accumulating hidden prompt
+    /// state across the remainder of a session.
+    pub(crate) fn push_next_model_context_item(&self, item: ContextItem) {
+        if let Ok(mut guard) = self.next_model_context_items.lock() {
+            guard.push(item);
+        }
+    }
+
+    fn take_next_model_context_items(&self) -> Vec<ContextItem> {
+        self.next_model_context_items
+            .lock()
+            .map(|mut guard| std::mem::take(&mut *guard))
+            .unwrap_or_default()
+    }
+
+    /// Require one text-only provider response after a governed evidence
+    /// checkpoint. The normal dynamic tool exposure is restored afterwards.
+    pub(crate) fn require_next_model_final_response(&self) {
+        self.next_model_text_only.store(true, Ordering::SeqCst);
     }
 
     /// Remove runtime-owned context items from a given source.
@@ -1768,6 +2037,12 @@ where
         self
     }
 
+    /// Select whether `dual_write_message` may persist transcript rows. Runtime
+    /// domain events and context/evidence persistence remain enabled.
+    pub fn set_transcript_persistence(&mut self, enabled: bool) {
+        self.transcript_persistence = enabled;
+    }
+
     /// Attach the durable store that owns tool, graph, agent, and task execution state.
     #[must_use]
     pub fn with_runtime_event_store(mut self, store: Arc<RuntimeEventStore>) -> Self {
@@ -1901,6 +2176,11 @@ where
         let consumed = self
             .session_input_stream
             .consume_for_checkpoint(turn_id, checkpoint, 32);
+        if !consumed.is_empty() {
+            if let Ok(mut pending) = self.consumed_session_inputs.lock() {
+                pending.extend(consumed.iter().cloned());
+            }
+        }
         if let Some(instruction) = crate::turn_inbox::checkpoint_instruction(checkpoint, &consumed)
         {
             effective_system_prompt.push(instruction);
@@ -1925,6 +2205,15 @@ where
             });
         }
         consumed.len()
+    }
+
+    /// Drain compact receipts for inputs consumed during the current provider
+    /// step. This does not mutate routing or create tasks; the graph host is
+    /// the only caller allowed to decide whether a correction revises a Goal.
+    pub fn take_consumed_session_inputs(&self) -> Vec<crate::session_input::SessionInputRecord> {
+        self.consumed_session_inputs
+            .lock()
+            .map_or_else(|_| Vec::new(), |mut pending| std::mem::take(&mut *pending))
     }
 
     /// P0: Enable AAAK symbolic index mode for memory context injection.
@@ -2177,6 +2466,9 @@ where
             )));
         }
 
+        let text_only_response = self.next_model_text_only.swap(false, Ordering::SeqCst);
+        let explicitly_forbids_tool_use =
+            harness_contract::strategy::prompt_explicitly_forbids_tool_use(user_input);
         let mut system_prompt = self.prepare_reality_context(user_input).await;
         let evidence = crate::evidence_planner::plan_evidence_with_understanding(
             user_input,
@@ -2186,6 +2478,16 @@ where
         system_prompt.push(crate::execution_core::runtime_execution_guidance_prompt(
             &decision,
         ));
+        if text_only_response {
+            system_prompt.push(
+                "## Terminal response boundary\nThis request is a text-only terminal checkpoint. The executable tool set for this request is empty, regardless of any earlier capability inventory or historical tool receipts in the context. Do not emit native function calls, XML tool markup, JSON commands, new plans, or more work. Use only retained evidence receipts to produce the best final answer now. State unresolved facts explicitly instead of performing another search.".to_string(),
+            );
+        }
+        if explicitly_forbids_tool_use {
+            system_prompt.push(
+                "## User-selected execution boundary\nThe user explicitly prohibited tool calls for this request. The executable tool set is empty. Answer from the supplied prompt and retained conversation evidence only; do not emit native function calls, XML tool markup, or JSON commands.".to_string(),
+            );
+        }
         self.record_runtime_policy_decision(&decision, self.session().messages.len());
         self.record_context_event(
             "evidence_plan",
@@ -2217,11 +2519,41 @@ where
         }
 
         let inventory = self.api_client.context_inventory();
+        let available_tools = self.tool_executor.available_tool_names();
         let exposure = tool_exposure_for_pattern(
             decision.pattern(),
-            self.tool_executor.available_tool_names(),
+            available_tools.clone(),
             inventory.tool_schema_tokens,
         );
+        let mut exposure = if text_only_response || explicitly_forbids_tool_use {
+            ToolExposureState {
+                catalog_revision: exposure.catalog_revision,
+                bootstrap: Default::default(),
+                active: Default::default(),
+                deferred: available_tools.iter().cloned().collect(),
+                reason: if text_only_response {
+                    "governed low-novelty checkpoint requires a text-only conclusion".to_string()
+                } else {
+                    "user explicitly prohibited tool calls for this request".to_string()
+                },
+                revision: exposure.revision.saturating_add(1),
+                fallback_full: false,
+            }
+        } else {
+            exposure
+        };
+        exposure.revision = self
+            .tool_exposure_revision
+            .fetch_add(1, Ordering::SeqCst)
+            .saturating_add(1);
+        // A text-only checkpoint is a one-request overlay. Keep the normal
+        // catalog state for discovery/projection, while still sending an
+        // explicit empty schema set for this provider request.
+        if !text_only_response && !explicitly_forbids_tool_use {
+            if let Ok(mut state) = self.tool_exposure_state.lock() {
+                *state = Some(exposure.clone());
+            }
+        }
         self.api_client
             .configure_tool_exposure(exposure.projection(inventory.tool_schema_tokens));
 
@@ -2235,9 +2567,12 @@ where
             let mut request = request.clone();
             request.model.clone_from(&model);
             self.record_provider_context_request(&request, self.session().messages.len());
-            let idle_timeout = stream_idle_timeout_for_messages(&request.messages);
+            let transport_policy = provider_transport_policy(self.model_context_window, &request);
+            let idle_timeout = transport_policy.idle_timeout;
+            let heartbeat_grace = transport_policy.heartbeat_grace;
             let mut stream = self.api_client.stream(request);
             let mut text = String::new();
+            let mut effective_model = None;
             let mut thinking = String::new();
             let mut signature = None;
             let mut calls = Vec::new();
@@ -2250,14 +2585,28 @@ where
                     Ok(Some(event)) => event,
                     Ok(None) => break,
                     Err(_) => {
-                        failed = Some(RuntimeError::new(format!(
-                            "stream idle timed out after {}s",
-                            idle_timeout.as_secs()
-                        )));
-                        break;
+                        // An upstream stream can be temporarily quiet while it
+                        // flushes a heartbeat or a long reasoning segment.
+                        // Give the provider a bounded, policy-derived grace
+                        // period before declaring a real transport stall.
+                        match tokio::time::timeout(heartbeat_grace, stream.next()).await {
+                            Ok(Some(event)) => event,
+                            Ok(None) => break,
+                            Err(_) => {
+                                failed = Some(RuntimeError::new(format!(
+                                    "stream stalled after {}s idle plus {}s heartbeat grace",
+                                    idle_timeout.as_secs(),
+                                    heartbeat_grace.as_secs()
+                                )));
+                                break;
+                            }
+                        }
                     }
                 };
                 match event {
+                    Ok(AssistantEvent::ProviderModel { model }) => {
+                        effective_model = Some(model);
+                    }
                     Ok(AssistantEvent::TextDelta(delta)) => {
                         text.push_str(&delta);
                         if let Some(ref cowd) = self.cowd_bus {
@@ -2314,6 +2663,20 @@ where
                 continue;
             }
 
+            // Some OpenAI-compatible providers emit a short planning preamble
+            // followed by XML tool calls as text instead of native tool-use
+            // stream events. Recover only fully declared, trailing calls here,
+            // before persisting the assistant message or deciding the next
+            // graph step. The Tool DAG remains the authority for execution.
+            if !text_only_response && calls.is_empty() {
+                if let Some((clean_text, recovered_calls)) =
+                    trailing_declared_xml_tool_calls(&text, &available_tools)
+                {
+                    text = clean_text;
+                    calls = recovered_calls;
+                }
+            }
+
             let mut blocks = Vec::new();
             if !thinking.is_empty() {
                 blocks.push(ContentBlock::Thinking {
@@ -2353,14 +2716,25 @@ where
                 &assistant_message,
                 calls.len(),
             );
-            let intent = classify_model_step_intent(text, calls);
+            let classified = classify_model_step_intent(text, calls);
+            let intent = apply_explicit_team_requirement(
+                self.explicit_team_escalation,
+                user_input,
+                first_step,
+                &decision,
+                classified,
+            );
             return Ok(ModelStepResult {
                 intent,
                 assistant_message,
                 usage,
                 prompt_cache_events: cache_events,
-                model: Some(model),
+                // Preserve the model that actually produced the provider
+                // stream, not merely the outer candidate requested before a
+                // transport fallback may have been selected.
+                model: effective_model.or(Some(model)),
                 wall_duration_ms: millis_since(started_at).max(1),
+                text_only_response,
             });
         }
         Err(last_error.unwrap_or_else(|| RuntimeError::new("all provider fallbacks exhausted")))
@@ -2412,13 +2786,29 @@ where
         if plan.tasks.iter().any(|task| {
             task.safety_category != crate::tool_orchestrator::ToolSafetyCategory::ReadOnly
         }) {
+            let target_pattern = tool_batch_pattern(calls);
             decision
                 .strategy
                 .retarget(
-                    harness_contract::core::ExecutionPattern::Execute,
-                    "provider emitted a governed tool intent; execute through ToolBatch",
+                    target_pattern,
+                    if target_pattern == harness_contract::core::ExecutionPattern::Collaborate {
+                        "provider requested a governed team lifecycle through ToolBatch"
+                    } else {
+                        "provider emitted a governed tool intent; execute through ToolBatch"
+                    },
                 )
                 .map_err(RuntimeError::new)?;
+            if target_pattern == harness_contract::core::ExecutionPattern::Collaborate
+                && !decision
+                    .strategy
+                    .modifiers
+                    .contains(&harness_contract::core::ExecutionModifier::Parallel)
+            {
+                decision
+                    .strategy
+                    .modifiers
+                    .push(harness_contract::core::ExecutionModifier::Parallel);
+            }
             if !decision
                 .strategy
                 .modifiers
@@ -2510,7 +2900,10 @@ where
         input_tokens: u64,
         output_tokens: u64,
         wall_duration_ms: u64,
+        terminal_completion: harness_contract::goal::GoalCompletion,
+        defer_post_turn_memory_maintenance: bool,
     ) -> Result<TurnSummary, RuntimeError> {
+        let finalize_started = Instant::now();
         if final_answer.trim().is_empty() {
             return Err(RuntimeError::new("model produced an empty final answer"));
         }
@@ -2525,21 +2918,37 @@ where
                 observed: true,
             },
         );
-        let kernel = RuntimeAiKernel::begin_turn_with_execution_decision(
+        let mut kernel = RuntimeAiKernel::begin_turn_with_execution_decision(
             self.session().session_id.clone(),
             user_input.to_string(),
             self.context_profile(),
             &self.system_prompt,
             decision,
         );
+        if !matches!(
+            terminal_completion,
+            harness_contract::goal::GoalCompletion::Satisfied
+        ) {
+            kernel.record_terminal_blocked(
+                "the execution graph reached a non-satisfied terminal completion",
+            );
+        }
         let failed_tools = count_failed_tool_results(&tool_results);
         let ai_kernel_trace = kernel.finalize(
             &final_answer,
             tool_results.len().saturating_sub(failed_tools),
             failed_tools,
         );
+        let compaction_started = Instant::now();
         let auto_compaction = self.maybe_auto_compact().await;
-        let _ = self.run_memory_post_turn().await;
+        let compaction_elapsed = compaction_started.elapsed();
+        let memory_started = Instant::now();
+        if defer_post_turn_memory_maintenance {
+            self.schedule_memory_post_turn().await;
+        } else {
+            let _ = self.run_memory_post_turn().await;
+        }
+        let memory_elapsed = memory_started.elapsed();
         let usage = self.usage_tracker.cumulative_usage();
         let telemetry = crate::cowd_event::RunModelTelemetry {
             model: model.clone(),
@@ -2574,8 +2983,18 @@ where
             auto_compaction.clone(),
         );
         self.remember_context_turn_report(context_turn_report.clone());
+        let mut assistant_messages = assistant_messages;
+        if !matches!(
+            terminal_completion,
+            harness_contract::goal::GoalCompletion::Satisfied
+        ) {
+            assistant_messages.push(ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: final_answer.clone(),
+            }]));
+        }
         let summary = TurnSummary {
             final_answer,
+            terminal_completion,
             assistant_messages,
             tool_results,
             prompt_cache_events,
@@ -2593,11 +3012,14 @@ where
             cowd.emit(crate::cowd_event::CowdEvent::RunModelTelemetry {
                 telemetry: summary.model_telemetry.clone(),
             });
-            cowd.emit(crate::cowd_event::CowdEvent::TurnComplete {
-                assistant_text: summary.final_answer.clone(),
-                iterations: summary.iterations as u32,
-            });
         }
+        tracing::debug!(
+            total_ms = finalize_started.elapsed().as_millis(),
+            compaction_ms = compaction_elapsed.as_millis(),
+            memory_post_turn_ms = memory_elapsed.as_millis(),
+            post_turn_memory_deferred = defer_post_turn_memory_maintenance,
+            "graph turn finalization completed"
+        );
         Ok(summary)
     }
 
@@ -3035,6 +3457,7 @@ where
                         &combined,
                         is_error,
                         elapsed_ms,
+                        None,
                     )
                     .await;
                 self.maybe_index_tool_output(
@@ -4090,6 +4513,7 @@ where
     /// hot path has zero cost.
     async fn prepare_reality_context(&self, user_input: &str) -> Vec<String> {
         let _perf_start = std::time::Instant::now();
+        let next_model_context_items = self.take_next_model_context_items();
 
         // P5.2: Global invalidation (file changes, max age).
         self.cached_prompt.check_global();
@@ -4117,9 +4541,11 @@ where
             } else {
                 Vec::new()
             };
+            let mut dynamic_items = evolution_context_items;
+            dynamic_items.extend(next_model_context_items);
             let envelope = self.build_context_envelope(
                 user_input,
-                evolution_context_items,
+                dynamic_items,
                 Vec::new(),
                 unavailable_sources,
             );
@@ -4224,9 +4650,11 @@ where
                             token_estimate: 0,
                         })
                         .collect();
+                    let mut dynamic_items = evolution_context_items;
+                    dynamic_items.extend(next_model_context_items);
                     let envelope = self.build_context_envelope(
                         user_input,
-                        evolution_context_items,
+                        dynamic_items,
                         omissions,
                         Vec::new(),
                     );
@@ -4366,6 +4794,7 @@ where
                     .collect::<Vec<_>>();
                 let mut dynamic_items = dynamic_items;
                 dynamic_items.extend(evolution_context_items);
+                dynamic_items.extend(next_model_context_items);
                 let mut knowledge_report = None;
                 if let Some(activation) = knowledge_activation {
                     knowledge_report = Some(activation.report.clone());
@@ -4386,9 +4815,11 @@ where
                 } else {
                     Vec::new()
                 };
+                let mut dynamic_items = evolution_context_items;
+                dynamic_items.extend(next_model_context_items);
                 let envelope = self.build_context_envelope(
                     user_input,
-                    evolution_context_items,
+                    dynamic_items,
                     Vec::new(),
                     unavailable_sources,
                 );
@@ -4401,11 +4832,38 @@ where
     ///
     /// Errors are logged and swallowed so a memory failure never aborts a turn.
     async fn run_memory_post_turn(&self) -> Result<(), RuntimeError> {
-        let Some(mgr) = self.memory_manager.as_ref() else {
+        let Some((mgr, memory_ctx, mem_messages, callback)) = self.memory_post_turn_work().await
+        else {
             return Ok(());
         };
+        Self::complete_memory_post_turn(mgr, memory_ctx, mem_messages, callback).await;
+        Ok(())
+    }
+
+    /// Gateway ingress already has a durable terminal receipt before this
+    /// maintenance runs. Keep extraction, drift, and index work off the
+    /// surface-critical path, while retaining the exact same maintenance
+    /// implementation and telemetry used by synchronous Agent turns.
+    async fn schedule_memory_post_turn(&self) {
+        let Some((mgr, memory_ctx, mem_messages, callback)) = self.memory_post_turn_work().await
+        else {
+            return;
+        };
+        tokio::spawn(async move {
+            Self::complete_memory_post_turn(mgr, memory_ctx, mem_messages, callback).await;
+        });
+    }
+
+    async fn memory_post_turn_work(
+        &self,
+    ) -> Option<(
+        Arc<CognitiveContextManager>,
+        MemoryTurnContext,
+        Vec<MemMessage>,
+        Option<Arc<dyn MemoryCallback>>,
+    )> {
+        let mgr = Arc::clone(self.memory_manager.as_ref()?);
         let memory_ctx = self.memory_turn_context("primary");
-        let kernel = MemoryKernel::new(Arc::clone(mgr));
 
         // Convert session messages to memory's Message type for post-turn extraction.
         // DESIGN: Tool blocks are excluded (same rationale as prepare_reality_context).
@@ -4463,6 +4921,16 @@ where
             })
             .collect();
 
+        Some((mgr, memory_ctx, mem_messages, self.memory_callback.clone()))
+    }
+
+    async fn complete_memory_post_turn(
+        mgr: Arc<CognitiveContextManager>,
+        memory_ctx: MemoryTurnContext,
+        mem_messages: Vec<MemMessage>,
+        callback: Option<Arc<dyn MemoryCallback>>,
+    ) {
+        let kernel = MemoryKernel::new(Arc::clone(&mgr));
         let start = Instant::now();
         let mut maintenance_messages = mem_messages;
         let post_turn_result = kernel
@@ -4478,7 +4946,7 @@ where
             tracing::warn!(%e, "post_turn: memory kernel failed");
         }
 
-        if let Some(cb) = &self.memory_callback {
+        if let Some(cb) = callback {
             let layers_data = mgr.list_layers().await;
             let total_entries: usize = layers_data
                 .iter()
@@ -4499,8 +4967,6 @@ where
             let vector_count = mgr.vector_index_count();
             cb.on_memory_stats(total_entries, vector_count, layer_names);
         }
-
-        Ok(())
     }
 
     /// Write a message to the durable SQLite session store via a spawned
@@ -4779,6 +5245,7 @@ where
         output: &str,
         is_error: bool,
         duration_ms: u64,
+        source_evidence_ref: Option<&str>,
     ) -> (EvidenceRef, Option<EvidenceAccessRef>) {
         let content_hash = model_protocol::prompt_cache::stable_hash_bytes(output.as_bytes());
         let evidence_id = format!("tool-raw-{tool_use_id}-{content_hash:016x}");
@@ -4802,6 +5269,7 @@ where
             "line_count": output.lines().count(),
             "byte_count": output.len(),
             "content_hash": format!("{content_hash:016x}"),
+            "source_evidence_ref": source_evidence_ref,
             "raw": output,
         });
         let created_at_ms = std::time::SystemTime::now()
@@ -4854,6 +5322,61 @@ where
             let _ = ledger.register_evidence_hash(evidence_id);
         }
         (evidence_ref, Some(access))
+    }
+
+    /// Produce a bounded model receipt for an outcome already executed by the
+    /// graph-owned tool host. The graph remains responsible for publication;
+    /// this method only persists raw evidence and updates context governance.
+    pub(crate) async fn prepare_governed_tool_result(
+        &self,
+        tool_use_id: &str,
+        tool_name: &str,
+        input: &str,
+        output: &str,
+        is_error: bool,
+    ) -> ConversationMessage {
+        let input_hash = format!(
+            "{:016x}",
+            model_protocol::prompt_cache::stable_hash_bytes(input.as_bytes())
+        );
+        let source_evidence_ref = format!("runtime-tool:{tool_use_id}");
+        let (raw_ref, raw_access) = self
+            .record_tool_raw_evidence(
+                tool_use_id,
+                tool_name,
+                &input_hash,
+                output,
+                is_error,
+                0,
+                Some(&source_evidence_ref),
+            )
+            .await;
+        self.maybe_index_tool_output(tool_use_id, tool_name, output, raw_access.as_ref());
+        let receipt =
+            self.tool_model_receipt(tool_name, output, is_error, &raw_ref, raw_access.as_ref());
+        self.push_turn_evidence_audit(crate::context_evidence::audit_projection(
+            &receipt,
+            raw_access.as_ref(),
+        ));
+        let summary = receipt.summary;
+        self.emit_tool_completed(
+            tool_use_id,
+            tool_name,
+            output,
+            if is_error { Some(1) } else { Some(0) },
+        );
+        self.push_turn_tool_observation(ToolObservation::new(
+            tool_name.to_string(),
+            tool_use_id.to_string(),
+            raw_ref,
+            summary.clone(),
+        ));
+        ConversationMessage::tool_result(
+            tool_use_id.to_string(),
+            tool_name.to_string(),
+            summary,
+            is_error,
+        )
     }
 
     fn tool_model_receipt(
@@ -5061,7 +5584,7 @@ where
             },
             "verification": {
                 "can_finalize": trace.verification_report.can_finalize,
-                "finalization_blocked": trace.finalization_blocked,
+                "verification_blocked": trace.verification_blocked,
                 "severity": format!("{:?}", trace.verification_report.severity),
                 "blocking_reasons": trace.verification_report.blocking_reasons,
                 "claim_count": trace.verification_report.claim_count,
@@ -5231,6 +5754,9 @@ where
                     message: msg.clone(),
                 });
             }
+        }
+        if !self.transcript_persistence {
+            return;
         }
         if let Some(ref store) = self.session_store {
             let session_id = self.session().session_id;
@@ -5696,7 +6222,7 @@ fn strategy_experience_record(trace: &RuntimeAiKernelTrace) -> StrategyExperienc
     StrategyExperienceRecord::from_decision(
         &trace.execution_decision.strategy,
         succeeded,
-        trace.finalization_blocked,
+        trace.verification_blocked,
         context_pressure,
         multi_agent_positive_lift,
         now_ms(),
@@ -5923,16 +6449,20 @@ impl<T: ToolExecutor> WaveExecutor for ToolWaveExecutor<T> {
 mod tests {
 
     use super::{
-        build_cc_memory_config_with_budget, image_user_message_from_path, prepared_vision_payload,
-        preview_chars, rate_per_second, stream_idle_timeout_for_messages, vision_user_message,
-        ApiClient, ApiRequest, AssistantEvent, CognitiveContextManager, ConversationRuntime,
-        RuntimeError, StaticToolExecutor, DEFAULT_RUNTIME_MAX_ITERATIONS,
+        apply_explicit_team_requirement, build_cc_memory_config_with_budget,
+        enforce_explicit_team_requirement, image_user_message_from_path,
+        is_runtime_team_orchestration_call, prepared_vision_payload, preview_chars,
+        provider_transport_policy, rate_per_second, required_team_orchestration_call,
+        tool_batch_pattern, trailing_declared_xml_tool_calls, vision_user_message, ApiClient,
+        ApiRequest, AssistantEvent, CognitiveContextManager, ConversationRuntime, ModelStepIntent,
+        ModelToolCall, RuntimeError, StaticToolExecutor,
     };
     use crate::config::RuntimeFeatureConfig;
     use crate::context_runtime::{
         ContextAuthority, ContextItem, ContextMode, ContextProfile, ContextRole, ContextSourceKind,
         ResumeContextPacket, ResumeContextSource,
     };
+    use crate::execution_core::build_runtime_execution_decision;
     use crate::permissions::{PermissionMode, PermissionPolicy};
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
     use crate::{resolve_context_budget_tokens, RuntimeBudgetInputs, RuntimeBudgetPlan};
@@ -5942,7 +6472,147 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use std::time::Duration;
+
+    #[test]
+    fn recovers_declared_trailing_xml_tool_calls_after_planning_preamble() {
+        let text = "I will inspect the target file first.\n<tool_call><function=read_file><parameter=path>README.md</parameter></function></tool_call>";
+        let (cleaned, calls) = trailing_declared_xml_tool_calls(
+            text,
+            &["read_file".to_string(), "list_files".to_string()],
+        )
+        .expect("declared trailing tool call should be recovered");
+
+        assert_eq!(cleaned, "I will inspect the target file first.");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&calls[0].input).unwrap()["path"],
+            "README.md"
+        );
+    }
+
+    #[test]
+    fn does_not_recover_unknown_or_prose_xml_examples_as_tool_calls() {
+        let unknown =
+            "I will proceed. <tool_call><function=delete_everything></function></tool_call>";
+        assert!(trailing_declared_xml_tool_calls(unknown, &["read_file".to_string()]).is_none());
+
+        let prose = "Here is an XML example:\n\n```xml\n<tool_call><function=read_file></function></tool_call>\n```";
+        assert!(trailing_declared_xml_tool_calls(prose, &["read_file".to_string()]).is_none());
+    }
+
+    #[test]
+    fn explicit_collaboration_requirement_becomes_a_runtime_team_tool_call() {
+        let objective = "这是复杂架构审查，必须实际启动一个多 Agent 协作团队完成分析。";
+        let decision = build_runtime_execution_decision(objective, None);
+        let intent = enforce_explicit_team_requirement(
+            objective,
+            true,
+            &decision,
+            ModelStepIntent::FinalAnswer {
+                text: "我会开始分析。".to_string(),
+            },
+        );
+        let ModelStepIntent::ToolCalls { calls } = intent else {
+            panic!("explicit team requirement must materialize an orchestration call");
+        };
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "runtime_orchestrate");
+        let input: serde_json::Value = serde_json::from_str(&calls[0].input).unwrap();
+        assert_eq!(input["action"], "request_team");
+    }
+
+    #[test]
+    fn explicit_team_requirement_overrides_a_non_collaboration_strategy_hint() {
+        let objective = "先自主选择并实际启动合适的协作团队，分别完成三个独立审查。";
+        let decision = build_runtime_execution_decision(objective, None);
+
+        let intent = enforce_explicit_team_requirement(
+            objective,
+            true,
+            &decision,
+            ModelStepIntent::FinalAnswer {
+                text: "我会开始分析。".to_string(),
+            },
+        );
+
+        let ModelStepIntent::ToolCalls { calls } = intent else {
+            panic!("an explicit team requirement must override the heuristic");
+        };
+        assert!(calls.iter().any(is_runtime_team_orchestration_call));
+    }
+
+    #[test]
+    fn explicit_team_requirement_cannot_be_bypassed_by_agent_named_tool_calls() {
+        let objective = "必须实际启动协作团队，再分析这些模块。";
+        let decision = build_runtime_execution_decision(objective, None);
+        let intent = enforce_explicit_team_requirement(
+            objective,
+            true,
+            &decision,
+            ModelStepIntent::AgentProposal {
+                calls: vec![ModelToolCall {
+                    id: "provider-agent-helper".to_string(),
+                    name: "agent_helper".to_string(),
+                    input: "{}".to_string(),
+                    depends_on: Vec::new(),
+                }],
+            },
+        );
+
+        let ModelStepIntent::ToolCalls { calls } = intent else {
+            panic!("provider-specific agent proposals must enter the canonical tool batch");
+        };
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().any(is_runtime_team_orchestration_call));
+    }
+
+    #[test]
+    fn team_orchestration_tool_batch_keeps_the_collaboration_strategy() {
+        let calls = vec![required_team_orchestration_call("必须实际启动团队")];
+        assert_eq!(
+            tool_batch_pattern(&calls),
+            harness_contract::core::ExecutionPattern::Collaborate
+        );
+    }
+
+    #[test]
+    fn ordinary_complex_work_keeps_model_directed_team_choice() {
+        let objective = "分析 runtime、memory 和 gateway 的边界。";
+        let decision = build_runtime_execution_decision(objective, None);
+        let intent = enforce_explicit_team_requirement(
+            objective,
+            true,
+            &decision,
+            ModelStepIntent::FinalAnswer {
+                text: "普通复杂分析。".to_string(),
+            },
+        );
+        assert!(matches!(intent, ModelStepIntent::FinalAnswer { .. }));
+    }
+
+    #[test]
+    fn explicit_team_requirement_recognizes_negative_start_constraint() {
+        assert!(!super::explicit_team_execution_required(
+            "请单人完成审查，不要启动团队。"
+        ));
+    }
+
+    #[test]
+    fn delegated_leaf_turn_does_not_force_a_second_team_from_inherited_wording() {
+        let objective = "必须实际启动协作团队，再分析这些模块。";
+        let decision = build_runtime_execution_decision(objective, None);
+        let intent = apply_explicit_team_requirement(
+            false,
+            objective,
+            true,
+            &decision,
+            ModelStepIntent::FinalAnswer {
+                text: "leaf evidence".to_string(),
+            },
+        );
+        assert!(matches!(intent, ModelStepIntent::FinalAnswer { .. }));
+    }
 
     #[test]
     fn prepared_vision_payload_becomes_user_image_message() {
@@ -5996,24 +6666,22 @@ mod tests {
     }
 
     #[test]
-    fn stream_idle_timeout_policy_expands_for_complex_tasks() {
-        let direct = vec![ConversationMessage::user_text(
-            "解释一下这个函数有什么用".to_string(),
-        )];
-        let standard = vec![ConversationMessage::user_text(
-            "分析当前实现并给出修订建议".to_string(),
-        )];
-        let deep = vec![ConversationMessage::user_text(
-            "请进行深度架构分析，模拟 what if 场景，验证 memory matrix harness 多Agent协同并输出完整报告".to_string(),
-        )];
+    fn provider_transport_policy_scales_with_actual_request_size() {
+        let small = ApiRequest {
+            system_prompt: vec!["system".to_string()],
+            messages: vec![ConversationMessage::user_text("status".to_string())],
+            model: "test".to_string(),
+        };
+        let large = ApiRequest {
+            system_prompt: vec!["system".repeat(5_000)],
+            messages: vec![ConversationMessage::user_text("evidence".repeat(10_000))],
+            model: "test".to_string(),
+        };
 
-        let direct_timeout = stream_idle_timeout_for_messages(&direct);
-        let standard_timeout = stream_idle_timeout_for_messages(&standard);
-        let deep_timeout = stream_idle_timeout_for_messages(&deep);
-
-        assert!(direct_timeout < standard_timeout);
-        assert!(standard_timeout < deep_timeout);
-        assert_eq!(deep_timeout, Duration::from_secs(600));
+        assert!(
+            provider_transport_policy(1_000_000, &large).idle_timeout
+                > provider_transport_policy(32_768, &small).idle_timeout
+        );
     }
 
     #[test]
@@ -6176,25 +6844,6 @@ mod tests {
         let wall_speed = rate_per_second(8_562, 178_350).expect("wall speed");
 
         assert!((wall_speed - 48.01).abs() < 0.2);
-    }
-
-    #[test]
-    fn max_iterations_accessor_tracks_runtime_budget_updates() {
-        let mut runtime = ConversationRuntime::new(
-            Session::new(),
-            MockApi,
-            StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
-            vec!["system".to_string()],
-        )
-        .without_memory();
-
-        let original = runtime.max_iterations();
-        assert_eq!(original, DEFAULT_RUNTIME_MAX_ITERATIONS);
-        runtime.set_max_iterations(8);
-        assert_eq!(runtime.max_iterations(), 8);
-        runtime.set_max_iterations(original);
-        assert_eq!(runtime.max_iterations(), original);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -6416,6 +7065,184 @@ mod tests {
         ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
             Box::pin(futures::stream::iter(vec![Ok(AssistantEvent::MessageStop)]))
         }
+    }
+
+    struct RuntimeAwareApi(Arc<std::sync::atomic::AtomicBool>);
+
+    impl ApiClient for RuntimeAwareApi {
+        fn stream(
+            &mut self,
+            _request: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            self.0.store(
+                tokio::runtime::Handle::try_current().is_ok(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            Box::pin(futures::stream::iter(vec![Ok(AssistantEvent::MessageStop)]))
+        }
+    }
+
+    #[test]
+    fn synchronous_stream_collection_creates_the_stream_inside_tokio() {
+        let observed_runtime = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut api = RuntimeAwareApi(Arc::clone(&observed_runtime));
+        let events = api
+            .stream_collect(ApiRequest {
+                system_prompt: Vec::new(),
+                messages: Vec::new(),
+                model: "test".to_string(),
+            })
+            .expect("synchronous collection should succeed");
+
+        assert_eq!(events, vec![AssistantEvent::MessageStop]);
+        assert!(
+            observed_runtime.load(std::sync::atomic::Ordering::SeqCst),
+            "ApiClient::stream must be constructed with an active Tokio runtime"
+        );
+    }
+
+    #[derive(Clone)]
+    struct ExposureRecordingApi {
+        projections: Arc<std::sync::Mutex<Vec<harness_contract::tool::ToolExposureProjection>>>,
+    }
+
+    impl ApiClient for ExposureRecordingApi {
+        fn stream(
+            &mut self,
+            _request: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            Box::pin(futures::stream::iter(vec![
+                Ok(AssistantEvent::TextDelta("bounded conclusion".to_string())),
+                Ok(AssistantEvent::MessageStop),
+            ]))
+        }
+
+        fn configure_tool_exposure(
+            &mut self,
+            projection: harness_contract::tool::ToolExposureProjection,
+        ) {
+            self.projections.lock().unwrap().push(projection);
+        }
+    }
+
+    struct ExposureToolExecutor;
+
+    impl crate::ToolExecutor for ExposureToolExecutor {
+        fn execute(&self, _name: &str, _input: &str) -> Result<String, crate::ToolError> {
+            Err(crate::ToolError::new("test executor must not run"))
+        }
+
+        fn available_tool_names(&self) -> Vec<String> {
+            vec!["read_file".to_string(), "grep_search".to_string()]
+        }
+    }
+
+    #[tokio::test]
+    async fn text_only_checkpoint_hides_tools_for_exactly_one_model_request() {
+        let projections = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let api = ExposureRecordingApi {
+            projections: Arc::clone(&projections),
+        };
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            api,
+            ExposureToolExecutor,
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+
+        runtime.require_next_model_final_response();
+        runtime
+            .execute_model_step("summarize checked evidence", true)
+            .await
+            .unwrap();
+        runtime
+            .execute_model_step("summarize checked evidence", false)
+            .await
+            .unwrap();
+
+        let projections = projections.lock().unwrap();
+        assert_eq!(projections.len(), 2);
+        assert!(projections[0].active_ids.is_empty());
+        assert_eq!(projections[0].deferred_ids.len(), 2);
+        assert!(!projections[1].active_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn governed_tool_results_persist_raw_evidence_and_bound_model_receipt() {
+        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        let session = Session::new();
+        let session_id = session.session_id.clone();
+        store
+            .create_session(&memory::SessionRecord {
+                session_id: session_id.clone(),
+                platform: "test".to_string(),
+                chat_id: "test-chat".to_string(),
+                user_id: None,
+                model: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                last_activity: "2026-01-01T00:00:00Z".to_string(),
+                message_count: 0,
+                reset_policy: "None".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .unwrap();
+        let runtime = ConversationRuntime::new(
+            session,
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory()
+        .with_session_store(Arc::clone(&store));
+        let raw = format!("first\n{}\nlast", "middle-evidence ".repeat(8_000));
+
+        let receipt = runtime
+            .prepare_governed_tool_result(
+                "governed-read-1",
+                "read_file",
+                r#"{"path":"README.md"}"#,
+                &raw,
+                false,
+            )
+            .await;
+
+        let output = receipt
+            .blocks
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::ToolResult { output, .. } => Some(output),
+                _ => None,
+            })
+            .expect("governed receipt must be a tool result");
+        assert!(
+            output.contains("tool://tool-raw-governed-read-1-"),
+            "unexpected governed receipt: {output}"
+        );
+        assert!(
+            output.len() < raw.len() / 10,
+            "model must receive a receipt, not raw output"
+        );
+        let events = store
+            .session_domain_events_page(&session_id, 0, 20)
+            .await
+            .expect("durable tool evidence");
+        assert!(events.events.iter().any(|event| {
+            event.kind == "tool.observation.raw"
+                && event.payload.get("raw").and_then(serde_json::Value::as_str)
+                    == Some(raw.as_str())
+        }));
+        let audit = runtime.turn_evidence_audits();
+        assert_eq!(audit.len(), 1);
+        assert!(audit[0].access.is_some());
+        assert!(audit[0].omitted_tokens > 0);
     }
 
     #[test]

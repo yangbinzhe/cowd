@@ -459,13 +459,20 @@ impl GatewayApiClient {
         &self,
         session_id: &str,
         tx: mpsc::SyncSender<CowdEvent>,
-    ) -> Result<(), GatewayApiError> {
+        after_commit_cursor: Option<u64>,
+    ) -> Result<Option<u64>, GatewayApiError> {
+        let suffix = after_commit_cursor
+            .map(|cursor| format!("?from_cursor={cursor}"))
+            .unwrap_or_default();
         let url = format!(
-            "{}/api/sessions/{}/stream",
+            "{}/api/sessions/{}/stream{suffix}",
             self.base_url,
             url_encode(session_id)
         );
         let mut request = self.client.get(url);
+        if let Some(cursor) = after_commit_cursor {
+            request = request.header("Last-Event-ID", cursor.to_string());
+        }
         if let Some(token) = self
             .auth_token
             .as_deref()
@@ -482,18 +489,20 @@ impl GatewayApiClient {
 
         let mut buffer = String::new();
         let mut stream = response.bytes_stream();
+        let mut latest_cursor = after_commit_cursor;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(GatewayApiError::Http)?;
             buffer.push_str(&String::from_utf8_lossy(&chunk));
             while let Some(index) = buffer.find("\n\n") {
                 let frame = buffer[..index].to_string();
                 buffer.drain(..index + 2);
+                latest_cursor = gateway_sse_frame_commit_cursor(&frame).or(latest_cursor);
                 if let Some(event) = gateway_sse_frame_to_cowd_event(&frame) {
                     let _ = tx.send(event);
                 }
             }
         }
-        Ok(())
+        Ok(latest_cursor)
     }
 
     pub async fn attach_session(
@@ -683,6 +692,115 @@ impl GatewayApiClient {
         .await
     }
 
+    pub async fn execution_projection(
+        &self,
+        execution_id: &str,
+        full: bool,
+    ) -> Result<harness_contract::projection::ExecutionProjection, GatewayApiError> {
+        let scope = if full { "full" } else { "summary" };
+        let value = self
+            .get_json(&format!(
+                "/api/runtime/executions/{}?detail_scope={scope}",
+                url_encode(execution_id)
+            ))
+            .await?;
+        serde_json::from_value(value).map_err(|error| GatewayApiError::Url(error.to_string()))
+    }
+
+    pub async fn execution_projection_delta(
+        &self,
+        execution_id: &str,
+        cursor: u64,
+        full: bool,
+    ) -> Result<harness_contract::projection::ProjectionDelta, GatewayApiError> {
+        let scope = if full { "full" } else { "summary" };
+        let value = self
+            .get_json(&format!(
+                "/api/runtime/executions/{}/events?cursor={cursor}&detail_scope={scope}",
+                url_encode(execution_id)
+            ))
+            .await?;
+        serde_json::from_value(value).map_err(|error| GatewayApiError::Url(error.to_string()))
+    }
+
+    pub async fn subscribe_execution_projection_events(
+        &self,
+        execution_id: &str,
+        after_cursor: u64,
+        full: bool,
+        tx: mpsc::SyncSender<CowdEvent>,
+    ) -> Result<u64, GatewayApiError> {
+        let scope = if full { "full" } else { "summary" };
+        let url = format!(
+            "{}/api/runtime/executions/{}/events?cursor={after_cursor}&detail_scope={scope}",
+            self.base_url,
+            url_encode(execution_id),
+        );
+        let mut request = self
+            .client
+            .get(url)
+            .header("Accept", "text/event-stream")
+            .header("Last-Event-ID", after_cursor.to_string());
+        if let Some(token) = self
+            .auth_token
+            .as_deref()
+            .filter(|token| !token.trim().is_empty())
+        {
+            request = request.bearer_auth(token.trim());
+        }
+        let response = request.send().await.map_err(GatewayApiError::Http)?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(GatewayApiError::Status(status, body));
+        }
+
+        let mut buffer = String::new();
+        let mut stream = response.bytes_stream();
+        let mut latest_cursor = after_cursor;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(GatewayApiError::Http)?;
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(index) = buffer.find("\n\n") {
+                let frame = buffer[..index].to_string();
+                buffer.drain(..index + 2);
+                if let Some(cursor) = gateway_sse_frame_commit_cursor(&frame) {
+                    latest_cursor = latest_cursor.max(cursor);
+                }
+                if let Some(delta) = gateway_sse_frame_projection_delta(&frame) {
+                    latest_cursor = latest_cursor.max(delta.target_cursor);
+                    let _ = tx.send(CowdEvent::ExecutionProjectionDelta { delta });
+                } else if gateway_sse_frame_event_name(&frame) == Some("projection_resync") {
+                    let _ = tx.send(CowdEvent::Warning {
+                        message: format!(
+                            "Execution projection requires snapshot resync for {execution_id}"
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(latest_cursor)
+    }
+
+    pub async fn execute_projection_command(
+        &self,
+        execution_id: &str,
+        request: &harness_contract::projection::ExecutionCommandRequest,
+    ) -> Result<harness_contract::projection::ExecutionCommandReceipt, GatewayApiError> {
+        let body = serde_json::to_value(request)
+            .map_err(|error| GatewayApiError::Url(error.to_string()))?;
+        let value = self
+            .post_json(
+                &format!(
+                    "/api/runtime/executions/{}/commands",
+                    url_encode(execution_id)
+                ),
+                body,
+            )
+            .await?;
+        serde_json::from_value(value).map_err(|error| GatewayApiError::Url(error.to_string()))
+    }
+
     pub async fn current_context(
         &self,
         session_id: Option<&str>,
@@ -751,12 +869,11 @@ impl GatewayApiClient {
             .await
     }
 
-    pub async fn tick_mission_steward_scheduler(
+    pub async fn tick_mission_schedules(
         &self,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json("/api/mission/control/stewards/scheduler", body)
-            .await
+        self.post_json("/api/mission/schedules/tick", body).await
     }
 
     pub async fn apply_runtime_recovery(&self) -> Result<serde_json::Value, GatewayApiError> {
@@ -770,17 +887,6 @@ impl GatewayApiClient {
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json(&format!("/api/mission/sessions/{}", url_encode(session_id)))
             .await
-    }
-
-    pub async fn mission_session_inbox(
-        &self,
-        session_id: &str,
-    ) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!(
-            "/api/mission/sessions/{}/inbox",
-            url_encode(session_id)
-        ))
-        .await
     }
 
     pub async fn mission_approvals(&self) -> Result<serde_json::Value, GatewayApiError> {
@@ -840,62 +946,6 @@ impl GatewayApiClient {
         body: serde_json::Value,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json("/api/mission/proxies", body).await
-    }
-
-    pub async fn route_mission_command(
-        &self,
-        body: serde_json::Value,
-    ) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json("/api/mission/route", body).await
-    }
-
-    pub async fn consume_mission_session_command(
-        &self,
-        session_id: &str,
-        command_id: &str,
-        mode: &str,
-    ) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json(
-            &format!(
-                "/api/mission/sessions/{}/inbox/{}/consume",
-                url_encode(session_id),
-                url_encode(command_id)
-            ),
-            serde_json::json!({ "mode": mode }),
-        )
-        .await
-    }
-
-    pub async fn cancel_mission_session_command(
-        &self,
-        session_id: &str,
-        command_id: &str,
-    ) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json(
-            &format!(
-                "/api/mission/sessions/{}/inbox/{}/cancel",
-                url_encode(session_id),
-                url_encode(command_id)
-            ),
-            serde_json::json!({}),
-        )
-        .await
-    }
-
-    pub async fn retry_mission_session_command(
-        &self,
-        session_id: &str,
-        command_id: &str,
-    ) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json(
-            &format!(
-                "/api/mission/sessions/{}/inbox/{}/retry",
-                url_encode(session_id),
-                url_encode(command_id)
-            ),
-            serde_json::json!({}),
-        )
-        .await
     }
 
     pub async fn runtime_agent_input(
@@ -2040,7 +2090,13 @@ pub fn gateway_sse_json_to_cowd_event(value: &serde_json::Value) -> Option<CowdE
                 .and_then(serde_json::Value::as_i64)
                 .map(|code| code as i32),
         }),
-        "TurnComplete" | "turn_complete" => Some(CowdEvent::TurnComplete {
+        // A model loop completion is only rendering progress. The durable
+        // SessionRuntimeBridge emits TerminalCommitted after the transcript
+        // write succeeds; only that event is allowed to settle TUI state.
+        "TurnComplete" | "turn_complete" => Some(CowdEvent::Warning {
+            message: "Model output ready; awaiting durable terminal commit".to_string(),
+        }),
+        "TerminalCommitted" | "terminal_committed" => Some(CowdEvent::TurnComplete {
             assistant_text: value
                 .get("assistant_text")
                 .or_else(|| value.get("response"))
@@ -2150,6 +2206,38 @@ pub fn gateway_sse_frame_to_cowd_event(frame: &str) -> Option<CowdEvent> {
         .and_then(|value| gateway_sse_json_to_cowd_event(&value))
 }
 
+fn gateway_sse_frame_commit_cursor(frame: &str) -> Option<u64> {
+    frame
+        .lines()
+        .find_map(|line| line.strip_prefix("id:"))
+        .map(str::trim)
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn gateway_sse_frame_event_name(frame: &str) -> Option<&str> {
+    frame
+        .lines()
+        .find_map(|line| line.strip_prefix("event:"))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn gateway_sse_frame_projection_delta(
+    frame: &str,
+) -> Option<harness_contract::projection::ProjectionDelta> {
+    if gateway_sse_frame_event_name(frame) != Some("projection_delta") {
+        return None;
+    }
+    let data = frame
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    serde_json::from_str(&data).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2196,9 +2284,18 @@ mod tests {
         ));
         assert!(matches!(
             gateway_sse_json_to_cowd_event(&serde_json::json!({
-                "type": "TurnComplete"
+                "type": "TerminalCommitted",
+                "terminal_id": "terminal-1",
+                "response": "done"
             })),
             Some(CowdEvent::TurnComplete { .. })
+        ));
+        assert!(matches!(
+            gateway_sse_json_to_cowd_event(&serde_json::json!({
+                "type": "TurnComplete",
+                "assistant_text": "draft"
+            })),
+            Some(CowdEvent::Warning { .. })
         ));
         assert!(matches!(
             gateway_sse_json_to_cowd_event(&serde_json::json!({
@@ -2220,6 +2317,34 @@ mod tests {
             })),
             Some(CowdEvent::TokenUsage { .. })
         ));
+    }
+
+    #[test]
+    fn gateway_sse_frame_reads_durable_commit_cursor_from_event_id() {
+        assert_eq!(
+            gateway_sse_frame_commit_cursor("id: 73\ndata: {\"type\":\"TerminalCommitted\"}"),
+            Some(73)
+        );
+        assert_eq!(
+            gateway_sse_frame_commit_cursor("data: {\"type\":\"TextDelta\"}"),
+            None
+        );
+    }
+
+    #[test]
+    fn gateway_sse_frame_parses_canonical_projection_delta_only_from_named_event() {
+        let delta = serde_json::json!({
+            "schema_version": 1,
+            "execution_id": "graph-1",
+            "base_cursor": 4,
+            "target_cursor": 5,
+            "events": []
+        });
+        let frame = format!("id: 5\nevent: projection_delta\ndata: {delta}");
+        let parsed = gateway_sse_frame_projection_delta(&frame).expect("projection delta");
+        assert_eq!(parsed.execution_id, "graph-1");
+        assert_eq!(parsed.target_cursor, 5);
+        assert!(gateway_sse_frame_projection_delta(&format!("data: {delta}")).is_none());
     }
 
     #[test]
@@ -2256,7 +2381,6 @@ mod tests {
             "pending_approvals",
             "mission_projection",
             "mission_session_detail",
-            "mission_session_inbox",
             "mission_approvals",
             "mission_relations",
             "submit_mission_approval",
@@ -2264,10 +2388,6 @@ mod tests {
             "decide_mission_approval",
             "add_mission_relation",
             "upsert_mission_proxy",
-            "route_mission_command",
-            "consume_mission_session_command",
-            "cancel_mission_session_command",
-            "retry_mission_session_command",
             "runtime_agent_input",
             "runtime_agent_interrupt",
             "runtime_agent_shutdown",

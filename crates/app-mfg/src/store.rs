@@ -502,9 +502,6 @@ mod workflow_tests {
             .unwrap();
         let expected_revision = planned.revision;
         planned
-            .set_node_terminal_result("planner", "planned")
-            .unwrap();
-        planned
             .set_node_terminal_result("mfg_researcher", "researched")
             .unwrap();
         planned

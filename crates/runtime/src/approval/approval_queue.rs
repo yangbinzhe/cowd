@@ -431,6 +431,9 @@ fn restore_requests(event_store: &RuntimeEventStore) -> BTreeMap<String, GlobalA
     let Ok(events) = event_store.list_scope(RuntimeEventScope::Approval, 100_000) else {
         return requests;
     };
+    // `list_scope` is newest-first for query consumers; replay in the
+    // append-only commit order so a submission is materialized before its
+    // decision.
     for event in events.into_iter().rev() {
         match event.kind.as_str() {
             "approval.submitted" => {
@@ -523,6 +526,36 @@ mod tests {
         );
         assert!(queue.pending().is_empty());
         assert_eq!(queue.projection()["pending_count"], 0);
+    }
+
+    #[test]
+    fn refresh_preserves_durable_approved_status() {
+        let queue = queue();
+        let request = queue
+            .submit(SubmitGlobalApprovalRequest {
+                source: session_source(),
+                action: "apply_patch".to_string(),
+                summary: "modify runtime file".to_string(),
+                risk: TaskRisk::Medium,
+                evidence_refs: Vec::new(),
+                timeout_policy: ApprovalTimeoutPolicy::Pending,
+            })
+            .expect("approval submitted");
+        queue
+            .decide(GlobalApprovalDecision {
+                approval_id: request.approval_id.clone(),
+                approved: true,
+                decided_by: "human".to_string(),
+                reason: "reviewed".to_string(),
+            })
+            .expect("approval decided");
+
+        queue.refresh();
+
+        assert_eq!(
+            queue.get(&request.approval_id).map(|value| value.status),
+            Some(GlobalApprovalStatus::Approved)
+        );
     }
 
     #[test]

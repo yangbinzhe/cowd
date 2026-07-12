@@ -313,6 +313,23 @@ mod tests {
             .await
             .unwrap();
         services.approval_queue().refresh();
+        let approval_events = services
+            .event_store()
+            .list_scope(runtime::RuntimeEventScope::Approval, 20)
+            .unwrap();
+        assert!(approval_events
+            .iter()
+            .any(|event| event.kind == "approval.submitted"));
+        assert!(approval_events
+            .iter()
+            .any(|event| event.kind == "approval.decided"));
+        assert_eq!(
+            services
+                .approval_queue()
+                .get(&approval_id)
+                .map(|request| request.status),
+            Some(runtime::GlobalApprovalStatus::Approved)
+        );
         let reconciled = services
             .graph_state_store()
             .load_async(graph_id)

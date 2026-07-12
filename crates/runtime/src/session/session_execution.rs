@@ -11,6 +11,9 @@ use async_trait::async_trait;
 use harness_contract::execution_graph::{
     ExecutionNodeKind, ExecutionNodeResult, ExecutionNodeSpec, ExecutionNodeStatus,
 };
+use harness_contract::turn::{
+    SessionDispatchAction, SessionDispatchCommand, SessionDispatchReceipt, SessionResultPacket,
+};
 use memory::{
     OutboxFailureClass, SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest,
     UnifiedSessionStore,
@@ -56,17 +59,6 @@ pub enum SessionDispatchMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CrossSessionMessage {
-    pub from_session_id: String,
-    pub target_ref: String,
-    pub command: String,
-    #[serde(default)]
-    pub actor: Option<String>,
-    #[serde(default)]
-    pub evidence_refs: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRecoveryCandidate {
     pub scope: String,
     pub session_id: Option<String>,
@@ -84,6 +76,33 @@ struct SessionDispatchPayload {
     message_id: String,
     session_id: String,
     sequence: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct HandoffDispatchAccepted {
+    handoff: harness_contract::turn::SessionHandoff,
+    request_id: String,
+    receipt: SessionDispatchReceipt,
+    source_graph_id: String,
+    source_node_id: String,
+}
+
+/// Durable handoff completion and the single source graph node that may
+/// consume it. The packet is committed before this value is returned, so a
+/// failed wake-up can be retried from the correlation stream without loss.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionHandoffResolution {
+    pub packet: SessionResultPacket,
+    pub source_graph_id: String,
+    pub source_node_id: String,
+}
+
+fn dispatch_target_stream(request_id: &str) -> String {
+    format!("session-handoff-target:{request_id}")
+}
+
+fn dispatch_correlation_stream(correlation_id: &str) -> String {
+    format!("session-handoff-correlation:{correlation_id}")
 }
 
 impl SessionDispatchPayload {
@@ -106,15 +125,17 @@ fn validate_session_dispatch_payload(payload_ref: &str) -> Result<(), String> {
                     .map_err(|error| error.to_string())
             });
     }
-    if let Some(payload) = payload_ref.strip_prefix("session_input:") {
-        let message: CrossSessionMessage =
+    if let Some(payload) = payload_ref.strip_prefix("session_handoff:") {
+        let command: SessionDispatchCommand =
             serde_json::from_str(payload).map_err(|error| error.to_string())?;
-        if message.from_session_id.trim().is_empty()
-            || message.target_ref.trim().trim_start_matches('@').is_empty()
-            || message.command.trim().is_empty()
+        validate_handoff_command(&command)?;
+        if command.handoff.source_session_id.trim().is_empty()
+            || command.handoff.target_session_id.trim().is_empty()
+            || command.handoff.objective.trim().is_empty()
+            || command.handoff.correlation_id.trim().is_empty()
         {
             return Err(
-                "SessionDispatch requires source session, target stream and command".to_string(),
+                "SessionDispatch requires source, target, objective, and correlation".to_string(),
             );
         }
         return Ok(());
@@ -224,7 +245,12 @@ impl NodeExecutor for SessionDispatchNodeExecutor {
                 node_id: ticket.node_id.clone(),
             })?;
         let routed = router
-            .route_dispatch_payload(&ticket.payload_ref, &ticket.idempotency_key)
+            .route_dispatch_payload(
+                &ticket.payload_ref,
+                &ticket.graph_id,
+                &ticket.node_id,
+                &ticket.idempotency_key,
+            )
             .await
             .map_err(|reason| NodeExecutorError::Poll {
                 node_id: ticket.node_id.clone(),
@@ -232,7 +258,11 @@ impl NodeExecutor for SessionDispatchNodeExecutor {
             })?;
         Ok(NodeExecutionOutcome {
             result: ExecutionNodeResult {
-                status: ExecutionNodeStatus::Completed,
+                status: if ticket.payload_ref.starts_with("session_handoff:") {
+                    ExecutionNodeStatus::WaitingExternal
+                } else {
+                    ExecutionNodeStatus::Completed
+                },
                 result_ref: Some(routed.clone()),
                 failure: None,
                 usage: Default::default(),
@@ -242,7 +272,7 @@ impl NodeExecutor for SessionDispatchNodeExecutor {
             domain_events: vec![RuntimeTransactionEventInput {
                 event: RuntimeEventInput {
                     stream_id: format!("session-dispatch:{}", ticket.idempotency_key),
-                    scope: RuntimeEventScope::SessionCommand,
+                    scope: RuntimeEventScope::SessionInput,
                     kind: "session.input.materialized".to_string(),
                     status: Some("completed".to_string()),
                     actor: Some("SessionDispatchNodeExecutor".to_string()),
@@ -276,6 +306,7 @@ pub enum SessionInputRouterError {
 /// Workspace-scoped bridge from Memory ingress to the canonical graph runner.
 pub struct SessionInputRouter {
     store: Arc<UnifiedSessionStore>,
+    event_store: Arc<crate::RuntimeEventStore>,
     worker_id: String,
     lease_ms: u64,
     max_attempts: u32,
@@ -285,18 +316,31 @@ impl SessionInputRouter {
     pub fn install(
         store: Arc<UnifiedSessionStore>,
         workspace_key: &str,
+        event_store: Arc<crate::RuntimeEventStore>,
     ) -> Result<Arc<Self>, NodeExecutorError> {
         Ok(Arc::new(Self {
             store,
+            event_store,
             worker_id: format!("session-router:{workspace_key}"),
             lease_ms: 30_000,
             max_attempts: 5,
         }))
     }
 
+    /// The canonical session authority shared by ingress and all in-process
+    /// execution children. Exposing this handle does not transfer lifecycle
+    /// ownership: callers may append durable evidence, but only the router
+    /// materializes SessionInput work into Runtime graphs.
+    #[must_use]
+    pub fn session_store(&self) -> Arc<UnifiedSessionStore> {
+        Arc::clone(&self.store)
+    }
+
     async fn route_dispatch_payload(
         &self,
         payload_ref: &str,
+        source_graph_id: &str,
+        source_node_id: &str,
         idempotency_key: &str,
     ) -> Result<String, String> {
         if let Some(payload) = payload_ref.strip_prefix("session_ingress:") {
@@ -322,13 +366,12 @@ impl SessionInputRouter {
             return Ok(format!("session-ingress-confirmed:{}", ingress.request_id));
         }
 
-        if let Some(payload) = payload_ref.strip_prefix("session_input:") {
-            let message: CrossSessionMessage =
+        if let Some(payload) = payload_ref.strip_prefix("session_handoff:") {
+            let command: SessionDispatchCommand =
                 serde_json::from_str(payload).map_err(|error| error.to_string())?;
-            let target = message.target_ref.trim().trim_start_matches('@');
-            if target.is_empty() {
-                return Err("SessionDispatch target session is empty".to_string());
-            }
+            validate_handoff_command(&command)?;
+            let handoff = command.handoff;
+            let target = handoff.target_session_id.as_str();
             if self
                 .store
                 .get_session(target)
@@ -342,7 +385,7 @@ impl SessionInputRouter {
             }
             let stable = stable_digest(&format!(
                 "{idempotency_key}:{}:{target}:{}",
-                message.from_session_id, message.command
+                handoff.source_session_id, handoff.correlation_id
             ));
             let request = SessionRuntimeOutboxRequest {
                 request_id: format!("cross-session-request:{stable}"),
@@ -351,13 +394,33 @@ impl SessionInputRouter {
                 created_at_ms: now_ms(),
             };
             let record = self
-                .persist_input(target, &message.command, &request)
+                .persist_input(target, &handoff.objective, &request)
                 .await
                 .map_err(|error| error.to_string())?;
-            return Ok(format!(
-                "session-routed:{}:{}:{}",
-                record.session_id, record.request_id, record.sequence
-            ));
+            let receipt = SessionDispatchReceipt {
+                command_id: command.command_id,
+                source_node_id: source_node_id.to_string(),
+                target_session_id: record.session_id,
+                target_turn_id: Some(request.turn_id.clone()),
+                accepted_revision: record.revision,
+                status: match command.action {
+                    SessionDispatchAction::Enqueue => "queued",
+                    SessionDispatchAction::Interrupt => "interrupt_queued",
+                    SessionDispatchAction::Cancel => "cancel_queued",
+                    SessionDispatchAction::Approve => "approval_queued",
+                    SessionDispatchAction::Replan => "replan_queued",
+                }
+                .to_string(),
+                reason: None,
+            };
+            self.record_handoff_acceptance(
+                &handoff,
+                &request,
+                &receipt,
+                source_graph_id,
+                source_node_id,
+            )?;
+            return serde_json::to_string(&receipt).map_err(|error| error.to_string());
         }
 
         let payload = SessionDispatchPayload::parse(payload_ref)?;
@@ -378,6 +441,248 @@ impl SessionInputRouter {
             ));
         }
         Ok(format!("session-dispatch-confirmed:{}", payload.request_id))
+    }
+
+    /// Returns a durable result packet only for inputs created by a typed
+    /// SessionHandoff. Regular user ingress deliberately has no cross-session
+    /// observer and therefore produces no packet.
+    pub fn record_target_terminal(
+        &self,
+        record: &SessionRuntimeOutboxRecord,
+        graph_id: &str,
+        commit_cursor: u64,
+    ) -> Result<Option<SessionHandoffResolution>, String> {
+        let accepted_stream = dispatch_target_stream(&record.request_id);
+        let Some(accepted) = self.event_store.latest_for_stream(&accepted_stream)? else {
+            return Ok(None);
+        };
+        let accepted: HandoffDispatchAccepted = serde_json::from_value(accepted.payload)
+            .map_err(|error| format!("invalid durable SessionHandoff acceptance: {error}"))?;
+        let result_stream = dispatch_correlation_stream(&accepted.handoff.correlation_id);
+        let terminal_key = format!("terminal:{commit_cursor}");
+        if let Some(existing) = self
+            .event_store
+            .event_by_idempotency_key(&result_stream, &terminal_key)
+            .map_err(|error| error.to_string())?
+        {
+            let packet = serde_json::from_value(existing.payload)
+                .map_err(|error| format!("invalid durable SessionResultPacket: {error}"))?;
+            return Ok(Some(SessionHandoffResolution {
+                packet,
+                source_graph_id: accepted.source_graph_id,
+                source_node_id: accepted.source_node_id,
+            }));
+        }
+        let graph = crate::execution_core::ExecutionGraphStateStore::new(Arc::clone(
+            &self.event_store,
+        ))
+        .load(graph_id)
+        .map_err(|error| {
+            format!(
+                "cannot emit a SessionResultPacket without the target's durable execution graph: {error}"
+            )
+        })?;
+        let terminal = graph
+            .nodes
+            .iter()
+            .rev()
+            .filter(|node| node.kind == ExecutionNodeKind::Synthesize)
+            .filter_map(|node| graph.node_results.get(&node.id))
+            .find(|result| result.status == ExecutionNodeStatus::Completed)
+            .ok_or_else(|| {
+                "target graph has no completed Synthesize node; refusing to fabricate a handoff result"
+                    .to_string()
+            })?;
+        let result_ref = terminal.result_ref.clone().ok_or_else(|| {
+            "target Synthesize node has no durable terminal result reference".to_string()
+        })?;
+        let mut evidence_refs = graph
+            .node_results
+            .values()
+            .flat_map(|result| result.evidence_refs.iter())
+            .map(|reference| reference.evidence_ref.0.id.clone())
+            .collect::<Vec<_>>();
+        evidence_refs.push(format!("runtime-commit:{commit_cursor}"));
+        evidence_refs.sort();
+        evidence_refs.dedup();
+        let unresolved = graph
+            .nodes
+            .iter()
+            .filter_map(|node| {
+                let status = graph.node_statuses.get(&node.id).copied()?;
+                (!matches!(status, ExecutionNodeStatus::Completed))
+                    .then(|| format!("execution_node:{}:{status:?}", node.id))
+            })
+            .collect::<Vec<_>>();
+        let conflict_refs = graph
+            .node_results
+            .values()
+            .filter_map(|result| result.failure.as_ref())
+            .map(|failure| format!("execution_failure:{}", failure.kind))
+            .collect::<Vec<_>>();
+        let (input_tokens, output_tokens) =
+            graph
+                .node_results
+                .values()
+                .fold((0_u64, 0_u64), |(input, output), result| {
+                    (
+                        input.saturating_add(result.usage.input_tokens),
+                        output.saturating_add(result.usage.output_tokens),
+                    )
+                });
+        let goal_id = format!("goal:{graph_id}");
+        let packet = SessionResultPacket {
+            correlation_id: accepted.handoff.correlation_id.clone(),
+            source_session_id: accepted.handoff.source_session_id.clone(),
+            target_session_id: accepted.handoff.target_session_id.clone(),
+            goal_id: (self
+                .event_store
+                .stream_revision(&goal_id)
+                .map_err(|error| error.to_string())?
+                > 0)
+            .then_some(goal_id),
+            result_ref: Some(result_ref),
+            evidence_refs,
+            unresolved,
+            conflict_refs,
+            input_tokens,
+            output_tokens,
+        };
+        let revision = self
+            .event_store
+            .stream_revision(&result_stream)
+            .map_err(|error| error.to_string())?;
+        self.event_store
+            .append_batch_if_revision(
+                result_stream.clone(),
+                revision,
+                format!(
+                    "session-handoff-result:{}:{commit_cursor}",
+                    packet.correlation_id
+                ),
+                vec![RuntimeTransactionEventInput {
+                    event: RuntimeEventInput {
+                        stream_id: result_stream,
+                        scope: RuntimeEventScope::SessionInput,
+                        kind: "session.handoff.result.v1".to_string(),
+                        status: Some("completed".to_string()),
+                        actor: Some("SessionInputRouter".to_string()),
+                        refs: vec![RuntimeEventRef {
+                            kind: "execution_graph".to_string(),
+                            id: graph_id.to_string(),
+                        }],
+                        payload: serde_json::to_value(&packet)
+                            .map_err(|error| error.to_string())?,
+                    },
+                    idempotency_key: Some(terminal_key),
+                    schema_version: 1,
+                }],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(Some(SessionHandoffResolution {
+            packet,
+            source_graph_id: accepted.source_graph_id,
+            source_node_id: accepted.source_node_id,
+        }))
+    }
+
+    pub fn handoff_result(
+        &self,
+        correlation_id: &str,
+    ) -> Result<Option<SessionResultPacket>, String> {
+        let stream_id = dispatch_correlation_stream(correlation_id);
+        self.event_store
+            .latest_for_stream(&stream_id)?
+            .map(|event| serde_json::from_value(event.payload).map_err(|error| error.to_string()))
+            .transpose()
+    }
+
+    /// Reconstruct every completed cross-session handoff from the durable
+    /// acceptance and result streams. This is intentionally event-store based:
+    /// a Gateway restart must not strand a source graph after its target turn
+    /// has already produced a terminal result.
+    pub fn completed_handoff_resolutions(&self) -> Result<Vec<SessionHandoffResolution>, String> {
+        let mut resolutions = Vec::new();
+        for stream_id in self
+            .event_store
+            .stream_ids_for_scope(RuntimeEventScope::SessionInput)
+            .map_err(|error| error.to_string())?
+        {
+            if !stream_id.starts_with("session-handoff-target:") {
+                continue;
+            }
+            let Some(event) = self.event_store.latest_for_stream(&stream_id)? else {
+                continue;
+            };
+            if event.kind != "session.handoff.accepted.v1" {
+                continue;
+            }
+            let accepted: HandoffDispatchAccepted = serde_json::from_value(event.payload)
+                .map_err(|error| format!("invalid durable SessionHandoff acceptance: {error}"))?;
+            let Some(packet) = self.handoff_result(&accepted.handoff.correlation_id)? else {
+                continue;
+            };
+            resolutions.push(SessionHandoffResolution {
+                packet,
+                source_graph_id: accepted.source_graph_id,
+                source_node_id: accepted.source_node_id,
+            });
+        }
+        resolutions
+            .sort_by(|left, right| left.packet.correlation_id.cmp(&right.packet.correlation_id));
+        Ok(resolutions)
+    }
+
+    fn record_handoff_acceptance(
+        &self,
+        handoff: &harness_contract::turn::SessionHandoff,
+        request: &SessionRuntimeOutboxRequest,
+        receipt: &SessionDispatchReceipt,
+        source_graph_id: &str,
+        source_node_id: &str,
+    ) -> Result<(), String> {
+        let stream_id = dispatch_target_stream(&request.request_id);
+        if self
+            .event_store
+            .event_by_idempotency_key(&stream_id, &receipt.command_id)
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let accepted = HandoffDispatchAccepted {
+            handoff: handoff.clone(),
+            request_id: request.request_id.clone(),
+            receipt: receipt.clone(),
+            source_graph_id: source_graph_id.to_string(),
+            source_node_id: source_node_id.to_string(),
+        };
+        let revision = self
+            .event_store
+            .stream_revision(&stream_id)
+            .map_err(|error| error.to_string())?;
+        self.event_store
+            .append_batch_if_revision(
+                stream_id.clone(),
+                revision,
+                format!("session-handoff-accept:{}", receipt.command_id),
+                vec![RuntimeTransactionEventInput {
+                    event: RuntimeEventInput {
+                        stream_id,
+                        scope: RuntimeEventScope::SessionInput,
+                        kind: "session.handoff.accepted.v1".to_string(),
+                        status: Some(receipt.status.clone()),
+                        actor: Some("SessionDispatchNodeExecutor".to_string()),
+                        refs: Vec::new(),
+                        payload: serde_json::to_value(accepted)
+                            .map_err(|error| error.to_string())?,
+                    },
+                    idempotency_key: Some(receipt.command_id.clone()),
+                    schema_version: 1,
+                }],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     pub async fn persist_input(
@@ -534,6 +839,31 @@ impl SessionInputRouter {
         }
         Ok(report)
     }
+}
+
+/// A handoff creates a new target input rather than mutating an existing
+/// target turn. Its expected revision is therefore intentionally fixed at
+/// zero. Controls for an existing target turn (cancel/approval) go through
+/// MissionCommand, where the owning aggregate has a real revision to check.
+fn validate_handoff_command(command: &SessionDispatchCommand) -> Result<(), String> {
+    if command.expected_target_revision != 0 {
+        return Err(
+            "new SessionHandoff requires expected_target_revision=0; existing target control must use MissionCommand"
+                .to_string(),
+        );
+    }
+    if !matches!(
+        command.action,
+        SessionDispatchAction::Enqueue
+            | SessionDispatchAction::Interrupt
+            | SessionDispatchAction::Replan
+    ) {
+        return Err(
+            "SessionHandoff only transports enqueue, interrupt, or replan input; cancel and approval use MissionCommand"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 #[must_use]
@@ -705,7 +1035,7 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeat_prevents_second_worker_reclaim_during_long_execution() {
-        let (store, _services, _router) = fixture().await;
+        let (store, services, _router) = fixture().await;
         let request = SessionRuntimeOutboxRequest {
             request_id: "long-r1".into(),
             turn_id: "long-t1".into(),
@@ -714,12 +1044,14 @@ mod tests {
         };
         let router_a = Arc::new(SessionInputRouter {
             store: Arc::clone(&store),
+            event_store: Arc::clone(services.event_store()),
             worker_id: "worker-a".into(),
             lease_ms: 30,
             max_attempts: 3,
         });
         let router_b = SessionInputRouter {
             store: Arc::clone(&store),
+            event_store: Arc::clone(services.event_store()),
             worker_id: "worker-b".into(),
             lease_ms: 30,
             max_attempts: 3,
@@ -794,7 +1126,7 @@ mod tests {
             }
         }
 
-        let (store, _services, _router) = fixture().await;
+        let (store, services, _router) = fixture().await;
         let request = SessionRuntimeOutboxRequest {
             request_id: "ack-loss-r1".into(),
             turn_id: "ack-loss-t1".into(),
@@ -803,12 +1135,14 @@ mod tests {
         };
         let router_a = SessionInputRouter {
             store: Arc::clone(&store),
+            event_store: Arc::clone(services.event_store()),
             worker_id: "worker-a".into(),
             lease_ms: 5,
             max_attempts: 3,
         };
         let router_b = SessionInputRouter {
             store: Arc::clone(&store),
+            event_store: Arc::clone(services.event_store()),
             worker_id: "worker-b".into(),
             lease_ms: 20,
             max_attempts: 3,
@@ -833,8 +1167,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_dispatch_routes_into_the_real_target_session_stream() {
-        let (store, services, _router) = fixture().await;
+    async fn session_dispatch_routes_into_the_real_target_session_stream_without_fabricating_a_result(
+    ) {
+        let (store, services, router) = fixture().await;
         let now = chrono::Utc::now().to_rfc3339();
         store
             .create_session(&SessionRecord {
@@ -855,18 +1190,35 @@ mod tests {
             })
             .await
             .unwrap();
-        let message = CrossSessionMessage {
-            from_session_id: "s1".into(),
-            target_ref: "@s2".into(),
-            command: "review the active change".into(),
-            actor: Some("test".into()),
+        let handoff = harness_contract::turn::SessionHandoff {
+            handoff_id: "handoff-test".into(),
+            source_session_id: "s1".into(),
+            target_session_id: "s2".into(),
+            objective: "review the active change".into(),
+            acceptance: vec![],
+            scope: vec![],
+            context_lens: vec![],
             evidence_refs: vec![],
+            permission_lease: "test".into(),
+            deadline_at_ms: None,
+            priority: 128,
+            correlation_id: "correlation-test".into(),
+            result_contract: "return result".into(),
+        };
+        let command = harness_contract::turn::SessionDispatchCommand {
+            command_id: "dispatch-test".into(),
+            action: harness_contract::turn::SessionDispatchAction::Enqueue,
+            handoff,
+            expected_target_revision: 0,
         };
         let mut graph = ExecutionGraph::new("cross-session dispatch");
         let node = ExecutionNodeSpec::new(
             ExecutionNodeKind::SessionDispatch,
             SESSION_DISPATCH_EXECUTOR,
-            format!("session_input:{}", serde_json::to_string(&message).unwrap()),
+            format!(
+                "session_handoff:{}",
+                serde_json::to_string(&command).unwrap()
+            ),
         );
         graph
             .node_statuses
@@ -874,7 +1226,8 @@ mod tests {
         graph.nodes.push(node);
         let report = services.graph_runner().start(graph).await.unwrap();
         assert_eq!(report.failed, 0);
-        assert_eq!(report.completed, 1);
+        assert_eq!(report.completed, 0);
+        assert_eq!(report.waiting, 1);
         let claimed = store
             .claim_session_runtime_outbox("target-worker", now_ms(), 1_000, 8)
             .await
@@ -885,5 +1238,175 @@ mod tests {
         assert!(messages[0]
             .content_json
             .contains("review the active change"));
+        let error = router
+            .record_target_terminal(&claimed[0], "target-graph", 99)
+            .expect_err("a missing target graph must not become a fake successful handoff");
+        assert!(error.contains("without the target's durable execution graph"));
+        assert!(router
+            .handoff_result("correlation-test")
+            .expect("read result")
+            .is_none());
+    }
+
+    #[test]
+    fn handoff_rejects_controls_that_need_an_existing_target_owner() {
+        let command = harness_contract::turn::SessionDispatchCommand {
+            command_id: "invalid-handoff-control".to_string(),
+            action: harness_contract::turn::SessionDispatchAction::Cancel,
+            handoff: harness_contract::turn::SessionHandoff {
+                handoff_id: "handoff".to_string(),
+                source_session_id: "source".to_string(),
+                target_session_id: "target".to_string(),
+                objective: "do not execute".to_string(),
+                acceptance: Vec::new(),
+                scope: Vec::new(),
+                context_lens: Vec::new(),
+                evidence_refs: Vec::new(),
+                permission_lease: "test".to_string(),
+                deadline_at_ms: None,
+                priority: 1,
+                correlation_id: "correlation".to_string(),
+                result_contract: "result".to_string(),
+            },
+            expected_target_revision: 0,
+        };
+        let error = validate_handoff_command(&command).expect_err("invalid handoff control");
+        assert!(error.contains("cancel and approval use MissionCommand"));
+    }
+
+    struct TerminalSynthesizeBackend;
+
+    struct TerminalSynthesizeResolver {
+        graph_id: String,
+    }
+
+    impl crate::execution_core::graph::executors::SynthesizeBackendResolver
+        for TerminalSynthesizeResolver
+    {
+        fn resolve(
+            &self,
+            ticket: &NodeExecutionTicket,
+        ) -> Option<Arc<dyn crate::execution_core::graph::executors::SynthesizeBackend>> {
+            (ticket.graph_id == self.graph_id).then(|| {
+                Arc::new(TerminalSynthesizeBackend)
+                    as Arc<dyn crate::execution_core::graph::executors::SynthesizeBackend>
+            })
+        }
+    }
+
+    #[async_trait]
+    impl crate::execution_core::graph::executors::SynthesizeBackend for TerminalSynthesizeBackend {
+        async fn synthesize(
+            &self,
+            ticket: &NodeExecutionTicket,
+        ) -> Result<NodeExecutionOutcome, String> {
+            Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
+                status: ExecutionNodeStatus::Completed,
+                result_ref: Some(format!("durable-target-result:{}", ticket.graph_id)),
+                evidence_refs: Vec::new(),
+                failure: None,
+                usage: harness_contract::execution_graph::ExecutionUsage {
+                    input_tokens: 13,
+                    output_tokens: 29,
+                    ..Default::default()
+                },
+                finished_at_ms: now_ms(),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn handoff_result_uses_the_completed_target_graph_result_and_usage() {
+        let (store, services, router) = fixture().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        store
+            .create_session(&SessionRecord {
+                session_id: "target-session".into(),
+                platform: "test".into(),
+                chat_id: "target-chat".into(),
+                user_id: None,
+                model: None,
+                created_at: now.clone(),
+                last_activity: now,
+                message_count: 0,
+                reset_policy: "manual".into(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".into(),
+            })
+            .await
+            .unwrap();
+        let handoff = harness_contract::turn::SessionHandoff {
+            handoff_id: "handoff-real-terminal".into(),
+            source_session_id: "s1".into(),
+            target_session_id: "target-session".into(),
+            objective: "complete target task".into(),
+            acceptance: Vec::new(),
+            scope: Vec::new(),
+            context_lens: Vec::new(),
+            evidence_refs: vec!["evidence:handoff".into()],
+            permission_lease: "test".into(),
+            deadline_at_ms: None,
+            priority: 128,
+            correlation_id: "correlation-real-terminal".into(),
+            result_contract: "return durable synthesis".into(),
+        };
+        let command = harness_contract::turn::SessionDispatchCommand {
+            command_id: "dispatch-real-terminal".into(),
+            action: harness_contract::turn::SessionDispatchAction::Enqueue,
+            handoff,
+            expected_target_revision: 0,
+        };
+        let mut source = ExecutionGraph::new("source dispatch");
+        let source_node = ExecutionNodeSpec::new(
+            ExecutionNodeKind::SessionDispatch,
+            SESSION_DISPATCH_EXECUTOR,
+            format!(
+                "session_handoff:{}",
+                serde_json::to_string(&command).unwrap()
+            ),
+        );
+        source
+            .node_statuses
+            .insert(source_node.id.clone(), ExecutionNodeStatus::Planned);
+        source.nodes.push(source_node);
+        services.graph_runner().start(source).await.unwrap();
+        let claimed = store
+            .claim_session_runtime_outbox("target-worker", now_ms(), 1_000, 8)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+
+        let mut target = ExecutionGraph::new("target execution");
+        target.id = "target-real-graph".to_string();
+        let terminal = ExecutionNodeSpec::new(
+            ExecutionNodeKind::Synthesize,
+            crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND,
+            "target terminal payload",
+        );
+        target.nodes.push(terminal);
+        services
+            .synthesize_executor()
+            .install_resolver(Arc::new(TerminalSynthesizeResolver {
+                graph_id: target.id.clone(),
+            }));
+        let report = services.graph_runner().start(target.clone()).await.unwrap();
+        assert_eq!(report.completed, 1);
+        let resolution = router
+            .record_target_terminal(&claimed[0], &target.id, 777)
+            .expect("durable target result")
+            .expect("cross-session resolution");
+        assert_eq!(
+            resolution.packet.result_ref.as_deref(),
+            Some("durable-target-result:target-real-graph")
+        );
+        assert_eq!(resolution.packet.input_tokens, 13);
+        assert_eq!(resolution.packet.output_tokens, 29);
+        assert!(resolution
+            .packet
+            .evidence_refs
+            .contains(&"runtime-commit:777".to_string()));
     }
 }

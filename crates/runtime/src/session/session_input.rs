@@ -3,13 +3,13 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use harness_contract::turn::{
-    InputRoutingDecision, InputRoutingReason, SessionInputEnvelope, SessionInputId,
-    SessionInputProjection, SessionInputReceipt, SessionInputStatus, TurnId, TurnInboxItem,
-    TurnInboxSnapshot, TurnInputCheckpoint,
+    InputRelationProposal, InputRoutingDecision, InputRoutingReason, SessionInputEnvelope,
+    SessionInputId, SessionInputProjection, SessionInputReceipt, SessionInputStatus, TurnId,
+    TurnInboxItem, TurnInboxSnapshot, TurnInputCheckpoint,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::input_classifier::{classify_session_input, RuntimeInputState};
+use crate::input_classifier::{classify_session_input, propose_input_relation, RuntimeInputState};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionInputRecord {
@@ -17,6 +17,7 @@ pub struct SessionInputRecord {
     pub status: SessionInputStatus,
     pub decision: InputRoutingDecision,
     pub reason: InputRoutingReason,
+    pub relation_proposal: Option<InputRelationProposal>,
     pub active_turn_id: Option<TurnId>,
     pub evidence_refs: Vec<String>,
     pub checkpoint: Option<TurnInputCheckpoint>,
@@ -31,6 +32,7 @@ impl SessionInputRecord {
             session_id: self.envelope.session_id.clone(),
             status: self.status,
             decision: self.decision,
+            relation_proposal: self.relation_proposal.clone(),
             reason: Some(self.reason.clone()),
             active_turn_id: self.active_turn_id.clone(),
             evidence_refs: self.evidence_refs.clone(),
@@ -45,6 +47,7 @@ impl SessionInputRecord {
             session_id: self.envelope.session_id.clone(),
             status: self.status,
             decision: self.decision,
+            relation_proposal: self.relation_proposal.clone(),
             content_preview: self.envelope.content_preview.clone(),
             checkpoint: self.checkpoint,
             created_at: self.envelope.created_at,
@@ -161,6 +164,7 @@ impl SessionInputStream {
                 session_id: envelope.session_id,
                 status: SessionInputStatus::RejectedDuplicate,
                 decision: InputRoutingDecision::RejectDuplicate,
+                relation_proposal: None,
                 reason: Some(InputRoutingReason::new(
                     "duplicate_idempotency_key",
                     "input with the same idempotency key was already accepted",
@@ -173,6 +177,7 @@ impl SessionInputStream {
         }
 
         let (decision, reason) = classify_session_input(&envelope, &state);
+        let relation_proposal = propose_input_relation(&envelope);
         let status = status_for_decision(decision);
         let active_turn_id = match decision {
             InputRoutingDecision::SupplementCurrentTurn
@@ -189,6 +194,7 @@ impl SessionInputStream {
             session_id: envelope.session_id.clone(),
             status,
             decision,
+            relation_proposal: relation_proposal.clone(),
             reason: Some(reason.clone()),
             active_turn_id: active_turn_id.clone(),
             evidence_refs: evidence_refs.clone(),
@@ -202,6 +208,7 @@ impl SessionInputStream {
             status,
             decision,
             reason,
+            relation_proposal,
             active_turn_id,
             evidence_refs,
             checkpoint: None,
@@ -563,10 +570,29 @@ mod tests {
             SessionInputEnvelope::text("s1", InputSourceKind::Webui, "next, write tests");
 
         let receipt = stream.admit(envelope, state);
+        let reclassified = stream
+            .reclassify_input(
+                &receipt.input_id,
+                InputRoutingDecision::EnqueueNextStep,
+                "runtime strategy accepted the new-task proposal",
+            )
+            .expect("strategy reclassification");
         let drained = stream.drain_queued_next_for_dispatch(4);
         let drained_again = stream.drain_queued_next_for_dispatch(4);
 
-        assert_eq!(receipt.decision, InputRoutingDecision::EnqueueNextStep);
+        assert_eq!(
+            receipt.decision,
+            InputRoutingDecision::SupplementCurrentTurn
+        );
+        assert_eq!(
+            receipt
+                .relation_proposal
+                .as_ref()
+                .expect("new task proposal")
+                .candidate,
+            harness_contract::turn::InputRelationKind::NewTask
+        );
+        assert_eq!(reclassified.decision, InputRoutingDecision::EnqueueNextStep);
         assert_eq!(drained.len(), 1);
         assert!(drained_again.is_empty());
         assert_eq!(stream.projection().consumed_count, 1);

@@ -102,6 +102,9 @@ pub struct SessionListPage {
 /// of `ContentBlock` objects (text, tool_use, tool_result, etc.).
 #[derive(Debug, Clone)]
 pub struct SessionMessage {
+    /// Immutable cross-surface identity. Sequence is ordering metadata, not a
+    /// durable identity: clients must use this value for replay and dedupe.
+    pub stable_message_id: String,
     pub session_id: String,
     pub sequence: usize,
     pub role: String,
@@ -225,6 +228,73 @@ pub struct SessionRuntimeOutboxHealth {
     pub blocked: usize,
 }
 
+/// Intent written by the Session authority and materialized by the Runtime
+/// bridge into the workspace Mission aggregate.  This is deliberately a
+/// separate outbox from ingress: Session records are owned by this SQLite
+/// store, while Mission events are owned by RuntimeEventStore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMissionOutboxOperation {
+    Register,
+    Start,
+    Close,
+}
+
+impl SessionMissionOutboxOperation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Register => "register",
+            Self::Start => "start",
+            Self::Close => "close",
+        }
+    }
+
+    fn parse(value: &str) -> rusqlite::Result<Self> {
+        match value {
+            "register" => Ok(Self::Register),
+            "start" => Ok(Self::Start),
+            "close" => Ok(Self::Close),
+            other => Err(rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                format!("unknown session mission outbox operation `{other}`").into(),
+            )),
+        }
+    }
+}
+
+/// Stable request identity for one Session -> Mission lifecycle intent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMissionOutboxRequest {
+    pub request_id: String,
+    pub session_id: String,
+    pub title: String,
+    pub workspace_key: String,
+    pub operation: SessionMissionOutboxOperation,
+    pub created_at_ms: u64,
+}
+
+/// Persisted Mission lifecycle work item. `revision` protects transitions so
+/// a stale bridge process cannot acknowledge or fail another worker's lease.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMissionOutboxRecord {
+    pub request_id: String,
+    pub session_id: String,
+    pub title: String,
+    pub workspace_key: String,
+    pub operation: SessionMissionOutboxOperation,
+    pub status: OutboxStatus,
+    pub attempts: u32,
+    pub next_attempt_at_ms: u64,
+    pub claim_owner: Option<String>,
+    pub claim_expires_at_ms: Option<u64>,
+    pub failure_class: Option<OutboxFailureClass>,
+    pub last_error: Option<String>,
+    pub revision: u64,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
 fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE;").map_err(sql_err)?;
 
@@ -338,6 +408,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
 
     ensure_messages_schema(conn)?;
     ensure_session_runtime_outbox_schema(conn)?;
+    ensure_session_mission_outbox_schema(conn)?;
     migrate_legacy_session_domain_events(conn)?;
 
     let existing_session_columns = {
@@ -439,9 +510,48 @@ fn ensure_session_event_sequence_constraint(conn: &Connection) -> Result<()> {
         )
         .map_err(sql_err)?;
     if duplicate_groups > 0 {
-        return Err(MemoryError::Store(format!(
-            "session_events contains {duplicate_groups} duplicate (session_id, sequence) groups; refusing to create the durable sequence constraint"
-        )));
+        // Legacy writers could race while allocating sequence numbers. Keep
+        // every event and derive one stable session-local order from the
+        // existing sequence, timestamp, and row id; then keep JSON payload
+        // sequence metadata consistent with the durable column. This runs in
+        // the schema transaction before the unique index is created.
+        conn.execute_batch(
+            r"
+            WITH resequenced AS (
+                SELECT
+                    id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY session_id
+                        ORDER BY sequence ASC, created_at_ms ASC, id ASC
+                    ) - 1 AS next_sequence
+                  FROM session_events
+            )
+            UPDATE session_events
+               SET sequence = (
+                       SELECT next_sequence
+                         FROM resequenced
+                        WHERE resequenced.id = session_events.id
+                   ),
+                   event_json = CASE
+                       WHEN json_valid(event_json) THEN json_set(
+                           event_json,
+                           '$.sequence',
+                           (
+                               SELECT next_sequence
+                                 FROM resequenced
+                                WHERE resequenced.id = session_events.id
+                           )
+                       )
+                       ELSE event_json
+                   END
+             WHERE id IN (SELECT id FROM resequenced);
+            ",
+        )
+        .map_err(sql_err)?;
+        tracing::warn!(
+            duplicate_groups,
+            "repaired legacy duplicate session event sequences before enforcing uniqueness"
+        );
     }
     conn.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_session_events_session_sequence \
@@ -682,6 +792,47 @@ fn ensure_session_runtime_outbox_schema(conn: &Connection) -> Result<()> {
     .map_err(sql_err)
 }
 
+fn ensure_session_mission_outbox_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS session_mission_outbox (
+            request_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            workspace_key TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            status TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at_ms INTEGER NOT NULL,
+            claim_owner TEXT,
+            claim_expires_at_ms INTEGER,
+            failure_class TEXT,
+            last_error TEXT,
+            revision INTEGER NOT NULL DEFAULT 0,
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_session_mission_outbox_claim
+            ON session_mission_outbox(workspace_key, status, next_attempt_at_ms, claim_expires_at_ms, created_at_ms);
+        CREATE INDEX IF NOT EXISTS idx_session_mission_outbox_session
+            ON session_mission_outbox(workspace_key, session_id, created_at_ms);
+        CREATE TABLE IF NOT EXISTS session_mission_outbox_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            actor TEXT,
+            reason TEXT,
+            from_status TEXT NOT NULL,
+            to_status TEXT NOT NULL,
+            attempts INTEGER NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            FOREIGN KEY (request_id) REFERENCES session_mission_outbox(request_id) ON DELETE CASCADE
+        );
+        "#,
+    )
+    .map_err(sql_err)
+}
+
 fn migrate_legacy_session_domain_events(conn: &Connection) -> Result<()> {
     conn.execute(
         r#"
@@ -768,15 +919,16 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
 
 fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMessage> {
     Ok(SessionMessage {
-        session_id: row.get(0)?,
-        sequence: row.get::<_, i64>(1)? as usize,
-        role: row.get(2)?,
-        content_json: row.get(3)?,
-        blocks_count: row.get::<_, i64>(4)? as usize,
-        tool_use_id: row.get(5)?,
-        tool_name: row.get(6)?,
-        token_usage_json: row.get(7)?,
-        created_at_ms: row.get::<_, i64>(8)? as u64,
+        stable_message_id: row.get(0)?,
+        session_id: row.get(1)?,
+        sequence: row.get::<_, i64>(2)? as usize,
+        role: row.get(3)?,
+        content_json: row.get(4)?,
+        blocks_count: row.get::<_, i64>(5)? as usize,
+        tool_use_id: row.get(6)?,
+        tool_name: row.get(7)?,
+        token_usage_json: row.get(8)?,
+        created_at_ms: row.get::<_, i64>(9)? as u64,
     })
 }
 
@@ -863,6 +1015,140 @@ fn validate_outbox_identity(
         ));
     }
     Ok(())
+}
+
+fn row_to_mission_outbox(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMissionOutboxRecord> {
+    Ok(SessionMissionOutboxRecord {
+        request_id: row.get(0)?,
+        session_id: row.get(1)?,
+        title: row.get(2)?,
+        workspace_key: row.get(3)?,
+        operation: SessionMissionOutboxOperation::parse(&row.get::<_, String>(4)?)?,
+        status: OutboxStatus::parse(&row.get::<_, String>(5)?)?,
+        attempts: row.get::<_, i64>(6)? as u32,
+        next_attempt_at_ms: row.get::<_, i64>(7)? as u64,
+        claim_owner: row.get(8)?,
+        claim_expires_at_ms: row.get::<_, Option<i64>>(9)?.map(|value| value as u64),
+        failure_class: row
+            .get::<_, Option<String>>(10)?
+            .as_deref()
+            .map(OutboxFailureClass::parse)
+            .transpose()?,
+        last_error: row.get(11)?,
+        revision: row.get::<_, i64>(12)? as u64,
+        created_at_ms: row.get::<_, i64>(13)? as u64,
+        updated_at_ms: row.get::<_, i64>(14)? as u64,
+    })
+}
+
+fn query_mission_outbox(
+    conn: &Connection,
+    request_id: &str,
+) -> Result<Option<SessionMissionOutboxRecord>> {
+    conn.query_row(
+        r"SELECT request_id, session_id, title, workspace_key, operation, status,
+                  attempts, next_attempt_at_ms, claim_owner, claim_expires_at_ms,
+                  failure_class, last_error, revision, created_at_ms, updated_at_ms
+             FROM session_mission_outbox WHERE request_id = ?1",
+        params![request_id],
+        row_to_mission_outbox,
+    )
+    .optional()
+    .map_err(sql_err)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_mission_outbox_history(
+    tx: &rusqlite::Transaction<'_>,
+    record: &SessionMissionOutboxRecord,
+    action: &str,
+    actor: Option<&str>,
+    reason: Option<&str>,
+    from_status: &str,
+    to_status: &str,
+    now_ms: u64,
+) -> Result<()> {
+    tx.execute(
+        r"INSERT INTO session_mission_outbox_history
+            (request_id, action, actor, reason, from_status, to_status, attempts, created_at_ms)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            record.request_id,
+            action,
+            actor,
+            reason,
+            from_status,
+            to_status,
+            record.attempts as i64,
+            now_ms as i64,
+        ],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
+fn validate_mission_outbox_request(request: &SessionMissionOutboxRequest) -> Result<()> {
+    if request.request_id.trim().is_empty()
+        || request.session_id.trim().is_empty()
+        || request.title.trim().is_empty()
+        || request.workspace_key.trim().is_empty()
+    {
+        return Err(MemoryError::Store(
+            "session/mission outbox identities must be non-empty".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn insert_mission_outbox(
+    tx: &rusqlite::Transaction<'_>,
+    request: &SessionMissionOutboxRequest,
+) -> Result<SessionMissionOutboxRecord> {
+    if let Some(existing) = query_mission_outbox(tx, &request.request_id)? {
+        if existing.session_id == request.session_id
+            && existing.workspace_key == request.workspace_key
+            && existing.operation == request.operation
+        {
+            // A title is mutable presentation metadata, not part of the
+            // Session -> Mission lifecycle identity. Surface registration and
+            // Runtime hydration may legitimately supply different display
+            // titles for the same durable register intent.
+            return Ok(existing);
+        }
+        return Err(MemoryError::Store(format!(
+            "mission outbox request_id `{}` is already bound to another lifecycle intent",
+            request.request_id
+        )));
+    }
+    tx.execute(
+        r"INSERT INTO session_mission_outbox
+            (request_id, session_id, title, workspace_key, operation, status, attempts,
+             next_attempt_at_ms, revision, created_at_ms, updated_at_ms)
+           VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, 0, ?6, ?6)",
+        params![
+            request.request_id,
+            request.session_id,
+            request.title,
+            request.workspace_key,
+            request.operation.as_str(),
+            request.created_at_ms as i64,
+        ],
+    )
+    .map_err(sql_err)?;
+    let record = query_mission_outbox(tx, &request.request_id)?.ok_or_else(|| {
+        MemoryError::Store("mission outbox insert produced no readable row".to_string())
+    })?;
+    append_mission_outbox_history(
+        tx,
+        &record,
+        "enqueue",
+        None,
+        None,
+        "none",
+        OutboxStatus::Pending.as_str(),
+        request.created_at_ms,
+    )?;
+    Ok(record)
 }
 
 // ---------------------------------------------------------------------------
@@ -1176,12 +1462,28 @@ impl SqliteSessionStore {
     pub fn upsert_session(&self, session: &SessionRecord) -> Result<()> {
         let conn = self.conn()?;
         conn.execute(
-            r"INSERT OR REPLACE INTO sessions
+            r"INSERT INTO sessions
                (session_id, platform, chat_id, user_id, model,
                 created_at, last_activity, message_count, reset_policy, metadata_json,
                 input_tokens, output_tokens, estimated_cost_usd, status,
                 created_at_ms, updated_at_ms)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+               ON CONFLICT(session_id) DO UPDATE SET
+                 platform = excluded.platform,
+                 chat_id = excluded.chat_id,
+                 user_id = excluded.user_id,
+                 model = excluded.model,
+                 created_at = excluded.created_at,
+                 last_activity = excluded.last_activity,
+                 message_count = excluded.message_count,
+                 reset_policy = excluded.reset_policy,
+                 metadata_json = excluded.metadata_json,
+                 input_tokens = excluded.input_tokens,
+                 output_tokens = excluded.output_tokens,
+                 estimated_cost_usd = excluded.estimated_cost_usd,
+                 status = excluded.status,
+                 created_at_ms = excluded.created_at_ms,
+                 updated_at_ms = excluded.updated_at_ms",
             params![
                 session.session_id,
                 session.platform,
@@ -1205,6 +1507,72 @@ impl SqliteSessionStore {
         Ok(())
     }
 
+    /// Atomically persist a Session record and enqueue its Mission lifecycle
+    /// registration. The Runtime bridge is the only consumer of this intent;
+    /// callers never need to dual-write the Session and Mission stores.
+    pub fn upsert_session_with_mission_outbox(
+        &self,
+        session: &SessionRecord,
+        request: &SessionMissionOutboxRequest,
+    ) -> Result<SessionMissionOutboxRecord> {
+        validate_mission_outbox_request(request)?;
+        if request.session_id != session.session_id {
+            return Err(MemoryError::Store(
+                "session/mission outbox session identity does not match record".to_string(),
+            ));
+        }
+        let mut conn = self.conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_err)?;
+        tx.execute(
+            r"INSERT INTO sessions
+               (session_id, platform, chat_id, user_id, model,
+                created_at, last_activity, message_count, reset_policy, metadata_json,
+                input_tokens, output_tokens, estimated_cost_usd, status,
+                created_at_ms, updated_at_ms)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+               ON CONFLICT(session_id) DO UPDATE SET
+                 platform = excluded.platform,
+                 chat_id = excluded.chat_id,
+                 user_id = excluded.user_id,
+                 model = excluded.model,
+                 created_at = excluded.created_at,
+                 last_activity = excluded.last_activity,
+                 message_count = excluded.message_count,
+                 reset_policy = excluded.reset_policy,
+                 metadata_json = excluded.metadata_json,
+                 input_tokens = excluded.input_tokens,
+                 output_tokens = excluded.output_tokens,
+                 estimated_cost_usd = excluded.estimated_cost_usd,
+                 status = excluded.status,
+                 created_at_ms = excluded.created_at_ms,
+                 updated_at_ms = excluded.updated_at_ms",
+            params![
+                session.session_id,
+                session.platform,
+                session.chat_id,
+                session.user_id,
+                session.model,
+                session.created_at,
+                session.last_activity,
+                session.message_count,
+                session.reset_policy,
+                session.metadata_json,
+                session.input_tokens,
+                session.output_tokens,
+                session.estimated_cost_usd,
+                session.status,
+                iso_to_ms(&session.created_at),
+                iso_to_ms(&session.last_activity),
+            ],
+        )
+        .map_err(sql_err)?;
+        let record = insert_mission_outbox(&tx, request)?;
+        tx.commit().map_err(sql_err)?;
+        Ok(record)
+    }
+
     /// Permanently remove a session and all its memory associations.
     pub fn delete_session(&self, session_id: &str) -> Result<()> {
         let mut conn = self.conn()?;
@@ -1222,6 +1590,51 @@ impl SqliteSessionStore {
         .map_err(sql_err)?;
         tx.commit().map_err(sql_err)?;
         Ok(())
+    }
+
+    /// Atomically delete the Session authority record and enqueue a Mission
+    /// close intent. The outbox deliberately has no foreign key to `sessions`:
+    /// deleting the record must not erase the close command before Runtime has
+    /// materialized it.
+    pub fn delete_session_with_mission_outbox(
+        &self,
+        request: &SessionMissionOutboxRequest,
+    ) -> Result<bool> {
+        validate_mission_outbox_request(request)?;
+        if request.operation != SessionMissionOutboxOperation::Close {
+            return Err(MemoryError::Store(
+                "session deletion requires a close mission outbox operation".to_string(),
+            ));
+        }
+        let mut conn = self.conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_err)?;
+        let exists = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id = ?1)",
+                params![request.session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(sql_err)?
+            != 0;
+        if !exists {
+            tx.commit().map_err(sql_err)?;
+            return Ok(false);
+        }
+        tx.execute(
+            "DELETE FROM session_memories WHERE session_id = ?1",
+            params![request.session_id],
+        )
+        .map_err(sql_err)?;
+        tx.execute(
+            "DELETE FROM sessions WHERE session_id = ?1",
+            params![request.session_id],
+        )
+        .map_err(sql_err)?;
+        insert_mission_outbox(&tx, request)?;
+        tx.commit().map_err(sql_err)?;
+        Ok(true)
     }
 
     /// List all session records ordered by `last_activity DESC`.
@@ -1479,7 +1892,11 @@ impl SqliteSessionStore {
     /// unique constraint).
     pub fn insert_message(&self, msg: &SessionMessage) -> Result<()> {
         let conn = self.conn()?;
-        let message_id = legacy_message_id(&msg.session_id, msg.sequence);
+        let message_id = if msg.stable_message_id.trim().is_empty() {
+            legacy_message_id(&msg.session_id, msg.sequence)
+        } else {
+            msg.stable_message_id.clone()
+        };
         conn.execute(
             r"INSERT INTO messages
                 (stable_message_id, session_id, sequence, role, content_json, blocks_count,
@@ -1534,21 +1951,22 @@ impl SqliteSessionStore {
             .map_err(sql_err)?;
         let existing = tx
             .query_row(
-                "SELECT session_id, sequence, role, content_json, blocks_count,
+                "SELECT stable_message_id, session_id, sequence, role, content_json, blocks_count,
                         tool_use_id, tool_name, token_usage_json, created_at_ms
                  FROM messages WHERE stable_message_id = ?1",
                 params![message_id],
                 |row| {
                     Ok(SessionMessage {
-                        session_id: row.get(0)?,
-                        sequence: row.get::<_, i64>(1)? as usize,
-                        role: row.get(2)?,
-                        content_json: row.get(3)?,
-                        blocks_count: row.get::<_, i64>(4)? as usize,
-                        tool_use_id: row.get(5)?,
-                        tool_name: row.get(6)?,
-                        token_usage_json: row.get(7)?,
-                        created_at_ms: row.get::<_, i64>(8)? as u64,
+                        stable_message_id: row.get(0)?,
+                        session_id: row.get(1)?,
+                        sequence: row.get::<_, i64>(2)? as usize,
+                        role: row.get(3)?,
+                        content_json: row.get(4)?,
+                        blocks_count: row.get::<_, i64>(5)? as usize,
+                        tool_use_id: row.get(6)?,
+                        tool_name: row.get(7)?,
+                        token_usage_json: row.get(8)?,
+                        created_at_ms: row.get::<_, i64>(9)? as u64,
                     })
                 },
             )
@@ -1589,6 +2007,7 @@ impl SqliteSessionStore {
         tx.commit().map_err(sql_err)?;
         Ok((
             SessionMessage {
+                stable_message_id: message_id.to_string(),
                 session_id: session_id.to_string(),
                 sequence,
                 role: "assistant".to_string(),
@@ -1626,7 +2045,11 @@ impl SqliteSessionStore {
                 .map_err(sql_err)?;
             for msg in messages {
                 stmt.execute(params![
-                    legacy_message_id(&msg.session_id, msg.sequence),
+                    if msg.stable_message_id.trim().is_empty() {
+                        legacy_message_id(&msg.session_id, msg.sequence)
+                    } else {
+                        msg.stable_message_id.clone()
+                    },
                     msg.session_id,
                     msg.sequence as i64,
                     msg.role,
@@ -2163,6 +2586,252 @@ impl SqliteSessionStore {
         Ok(records)
     }
 
+    /// Claim due Session -> Mission lifecycle intents for one Runtime
+    /// workspace. A gateway serving another workspace can never materialize
+    /// these rows because the workspace key is part of the claim predicate.
+    pub fn claim_session_mission_outbox(
+        &self,
+        workspace_key: &str,
+        worker_id: &str,
+        now_ms: u64,
+        lease_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<SessionMissionOutboxRecord>> {
+        if workspace_key.trim().is_empty()
+            || worker_id.trim().is_empty()
+            || lease_ms == 0
+            || limit == 0
+        {
+            return Err(MemoryError::Store(
+                "mission outbox claim requires workspace, worker, positive lease and positive limit"
+                    .to_string(),
+            ));
+        }
+        let expires_at = now_ms.saturating_add(lease_ms);
+        let mut conn = self.conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_err)?;
+        let candidates = {
+            let mut stmt = tx
+                .prepare(
+                    r"SELECT request_id, revision, status
+                        FROM session_mission_outbox
+                       WHERE workspace_key = ?1
+                         AND ((status IN ('pending', 'retry_scheduled') AND next_attempt_at_ms <= ?2)
+                           OR (status = 'claimed' AND claim_expires_at_ms <= ?2))
+                       ORDER BY next_attempt_at_ms ASC, created_at_ms ASC, request_id ASC
+                       LIMIT ?3",
+                )
+                .map_err(sql_err)?;
+            let rows = stmt
+                .query_map(params![workspace_key, now_ms as i64, limit as i64], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)? as u64,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(sql_err)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(sql_err)?
+        };
+        let mut claimed = Vec::with_capacity(candidates.len());
+        for (request_id, revision, from_status) in candidates {
+            let changed = tx
+                .execute(
+                    r"UPDATE session_mission_outbox
+                          SET status = 'claimed', attempts = attempts + 1,
+                              claim_owner = ?1, claim_expires_at_ms = ?2,
+                              updated_at_ms = ?3, revision = revision + 1
+                        WHERE request_id = ?4 AND workspace_key = ?5 AND revision = ?6
+                          AND ((status IN ('pending', 'retry_scheduled') AND next_attempt_at_ms <= ?3)
+                            OR (status = 'claimed' AND claim_expires_at_ms <= ?3))",
+                    params![
+                        worker_id,
+                        expires_at as i64,
+                        now_ms as i64,
+                        request_id,
+                        workspace_key,
+                        revision as i64,
+                    ],
+                )
+                .map_err(sql_err)?;
+            if changed == 1 {
+                let record = query_mission_outbox(&tx, &request_id)?.ok_or_else(|| {
+                    MemoryError::Store(format!("claimed mission outbox `{request_id}` disappeared"))
+                })?;
+                append_mission_outbox_history(
+                    &tx,
+                    &record,
+                    if from_status == "claimed" {
+                        "reclaim"
+                    } else {
+                        "claim"
+                    },
+                    Some(worker_id),
+                    None,
+                    &from_status,
+                    OutboxStatus::Claimed.as_str(),
+                    now_ms,
+                )?;
+                claimed.push(record);
+            }
+        }
+        tx.commit().map_err(sql_err)?;
+        Ok(claimed)
+    }
+
+    /// Acknowledge an applied Mission lifecycle intent.
+    pub fn ack_session_mission_outbox(
+        &self,
+        request_id: &str,
+        worker_id: &str,
+        expected_revision: u64,
+        now_ms: u64,
+    ) -> Result<SessionMissionOutboxRecord> {
+        self.transition_claimed_mission_outbox(
+            request_id,
+            worker_id,
+            expected_revision,
+            now_ms,
+            |tx, current| {
+                tx.execute(
+                    r"UPDATE session_mission_outbox
+                          SET status = 'materialized', claim_owner = NULL,
+                              claim_expires_at_ms = NULL, failure_class = NULL,
+                              last_error = NULL, updated_at_ms = ?1,
+                              revision = revision + 1
+                        WHERE request_id = ?2 AND status = 'claimed'
+                          AND claim_owner = ?3 AND revision = ?4",
+                    params![
+                        now_ms as i64,
+                        request_id,
+                        worker_id,
+                        expected_revision as i64
+                    ],
+                )
+                .map_err(sql_err)?;
+                Ok(("ack", OutboxStatus::Materialized, current.status))
+            },
+        )
+    }
+
+    /// Record a failed Session -> Mission application. Transient Runtime
+    /// failures retry with bounded attempts; invalid payloads remain visible
+    /// as blocked rows rather than spinning indefinitely.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fail_session_mission_outbox(
+        &self,
+        request_id: &str,
+        worker_id: &str,
+        expected_revision: u64,
+        failure_class: OutboxFailureClass,
+        error: &str,
+        retry_at_ms: u64,
+        max_attempts: u32,
+        now_ms: u64,
+    ) -> Result<SessionMissionOutboxRecord> {
+        self.transition_claimed_mission_outbox(
+            request_id,
+            worker_id,
+            expected_revision,
+            now_ms,
+            |tx, current| {
+                let retry = failure_class == OutboxFailureClass::Retryable
+                    && current.attempts < max_attempts.max(1);
+                let next = if retry {
+                    OutboxStatus::RetryScheduled
+                } else {
+                    OutboxStatus::BlockedMaterialization
+                };
+                tx.execute(
+                    r"UPDATE session_mission_outbox
+                          SET status = ?1, next_attempt_at_ms = ?2,
+                              claim_owner = NULL, claim_expires_at_ms = NULL,
+                              failure_class = ?3, last_error = ?4,
+                              updated_at_ms = ?5, revision = revision + 1
+                        WHERE request_id = ?6 AND status = 'claimed'
+                          AND claim_owner = ?7 AND revision = ?8",
+                    params![
+                        next.as_str(),
+                        if retry { retry_at_ms } else { now_ms } as i64,
+                        failure_class.as_str(),
+                        error,
+                        now_ms as i64,
+                        request_id,
+                        worker_id,
+                        expected_revision as i64,
+                    ],
+                )
+                .map_err(sql_err)?;
+                Ok((if retry { "retry" } else { "block" }, next, current.status))
+            },
+        )
+    }
+
+    pub fn get_session_mission_outbox(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<SessionMissionOutboxRecord>> {
+        let conn = self.conn()?;
+        query_mission_outbox(&conn, request_id)
+    }
+
+    fn transition_claimed_mission_outbox<F>(
+        &self,
+        request_id: &str,
+        worker_id: &str,
+        expected_revision: u64,
+        now_ms: u64,
+        transition: F,
+    ) -> Result<SessionMissionOutboxRecord>
+    where
+        F: FnOnce(
+            &rusqlite::Transaction<'_>,
+            &SessionMissionOutboxRecord,
+        ) -> Result<(&'static str, OutboxStatus, OutboxStatus)>,
+    {
+        let mut conn = self.conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_err)?;
+        let current = query_mission_outbox(&tx, request_id)?.ok_or_else(|| {
+            MemoryError::Store(format!("mission outbox `{request_id}` not found"))
+        })?;
+        if current.status != OutboxStatus::Claimed
+            || current.claim_owner.as_deref() != Some(worker_id)
+            || current.revision != expected_revision
+        {
+            return Err(MemoryError::Store(format!(
+                "mission outbox `{request_id}` claim owner/status/revision mismatch"
+            )));
+        }
+        let (action, to_status, from_status) = transition(&tx, &current)?;
+        let updated = query_mission_outbox(&tx, request_id)?.ok_or_else(|| {
+            MemoryError::Store(format!(
+                "transitioned mission outbox `{request_id}` disappeared"
+            ))
+        })?;
+        if updated.revision != expected_revision + 1 || updated.status != to_status {
+            return Err(MemoryError::Store(format!(
+                "mission outbox `{request_id}` transition lost an optimistic update"
+            )));
+        }
+        append_mission_outbox_history(
+            &tx,
+            &updated,
+            action,
+            Some(worker_id),
+            updated.last_error.as_deref(),
+            from_status.as_str(),
+            to_status.as_str(),
+            now_ms,
+        )?;
+        tx.commit().map_err(sql_err)?;
+        Ok(updated)
+    }
+
     fn transition_claimed_outbox<F>(
         &self,
         request_id: &str,
@@ -2224,7 +2893,7 @@ impl SqliteSessionStore {
         let conn = self.conn()?;
         let mut stmt = conn
             .prepare(
-                r"SELECT session_id, sequence, role, content_json,
+                r"SELECT stable_message_id, session_id, sequence, role, content_json,
                           blocks_count, tool_use_id, tool_name,
                           token_usage_json, created_at_ms
                    FROM messages
@@ -2260,7 +2929,7 @@ impl SqliteSessionStore {
         let conn = self.conn()?;
         let mut stmt = conn
             .prepare(
-                r"SELECT session_id, sequence, role, content_json,
+                r"SELECT stable_message_id, session_id, sequence, role, content_json,
                           blocks_count, tool_use_id, tool_name,
                           token_usage_json, created_at_ms
                    FROM messages
@@ -2287,7 +2956,7 @@ impl SqliteSessionStore {
         let conn = self.conn()?;
         let mut stmt = conn
             .prepare(
-                "SELECT session_id, sequence, role, content_json, blocks_count,
+                "SELECT stable_message_id, session_id, sequence, role, content_json, blocks_count,
                         tool_use_id, tool_name, token_usage_json, created_at_ms
                  FROM messages WHERE session_id = ?1 ORDER BY sequence ASC",
             )
@@ -2350,7 +3019,7 @@ impl SqliteSessionStore {
         if let Some(sid) = session_id {
             let mut stmt = conn
                 .prepare(
-                    r"SELECT m.session_id, m.sequence, m.role, m.content_json,
+                    r"SELECT m.stable_message_id, m.session_id, m.sequence, m.role, m.content_json,
                               m.blocks_count, m.tool_use_id, m.tool_name,
                               m.token_usage_json, m.created_at_ms
                        FROM messages m
@@ -2371,7 +3040,7 @@ impl SqliteSessionStore {
         } else {
             let mut stmt = conn
                 .prepare(
-                    r"SELECT m.session_id, m.sequence, m.role, m.content_json,
+                    r"SELECT m.stable_message_id, m.session_id, m.sequence, m.role, m.content_json,
                               m.blocks_count, m.tool_use_id, m.tool_name,
                               m.token_usage_json, m.created_at_ms
                        FROM messages m
@@ -3770,6 +4439,7 @@ mod tests {
             .contains("resume survives migration"));
         store
             .insert_message(&SessionMessage {
+                stable_message_id: "legacy:new-write".to_string(),
                 session_id: "legacy".to_string(),
                 sequence: 1,
                 role: "assistant".to_string(),
@@ -3785,7 +4455,7 @@ mod tests {
     }
 
     #[test]
-    fn open_rejects_legacy_duplicate_event_sequences_without_silent_rewrite() {
+    fn open_repairs_legacy_duplicate_event_sequences_without_dropping_events() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("duplicate-events.db");
         let conn = Connection::open(&path).unwrap();
@@ -3827,11 +4497,27 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let error = match SqliteSessionStore::open(&path) {
-            Ok(_) => panic!("duplicate event sequences must block migration"),
-            Err(error) => error.to_string(),
-        };
-        assert!(error.contains("duplicate (session_id, sequence)"));
+        let store = SqliteSessionStore::open(&path).expect("legacy events are resequenced");
+        let events = store.get_events("duplicate-session", 0).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| {
+                    serde_json::from_str::<serde_json::Value>(&event.event_json)
+                        .ok()
+                        .and_then(|value| value["sequence"].as_u64())
+                })
+                .collect::<Vec<_>>(),
+            vec![Some(0), Some(1)]
+        );
     }
 
     #[test]
@@ -3849,6 +4535,7 @@ mod tests {
 
     fn outbox_message(session_id: &str) -> SessionMessage {
         SessionMessage {
+            stable_message_id: format!("outbox:{session_id}:0"),
             session_id: session_id.to_string(),
             sequence: 0,
             role: "user".to_string(),
@@ -3921,6 +4608,135 @@ mod tests {
             .get_session_runtime_outbox("request-2")
             .unwrap()
             .is_none());
+    }
+
+    fn mission_outbox_request(
+        session_id: &str,
+        operation: SessionMissionOutboxOperation,
+    ) -> SessionMissionOutboxRequest {
+        SessionMissionOutboxRequest {
+            request_id: format!("mission:workspace-a:{:?}:{session_id}", operation),
+            session_id: session_id.to_string(),
+            title: format!("Session {session_id}"),
+            workspace_key: "workspace-a".to_string(),
+            operation,
+            created_at_ms: 100,
+        }
+    }
+
+    #[test]
+    fn session_and_mission_registration_are_atomic_idempotent_and_workspace_scoped() {
+        let (store, _dir) = make_store();
+        let record = make_record("s-mission-outbox");
+        let request =
+            mission_outbox_request("s-mission-outbox", SessionMissionOutboxOperation::Register);
+
+        let first = store
+            .upsert_session_with_mission_outbox(&record, &request)
+            .unwrap();
+        let duplicate = store
+            .upsert_session_with_mission_outbox(&record, &request)
+            .unwrap();
+        assert_eq!(first, duplicate);
+        assert!(store.get_session("s-mission-outbox").unwrap().is_some());
+        assert!(store
+            .claim_session_mission_outbox("workspace-other", "worker", 100, 50, 10)
+            .unwrap()
+            .is_empty());
+        let claimed = store
+            .claim_session_mission_outbox("workspace-a", "worker", 100, 50, 10)
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        let done = store
+            .ack_session_mission_outbox(&request.request_id, "worker", claimed[0].revision, 101)
+            .unwrap();
+        assert_eq!(done.status, OutboxStatus::Materialized);
+    }
+
+    #[test]
+    fn mission_registration_ignores_display_title_drift_for_the_same_lifecycle_intent() {
+        let (store, _dir) = make_store();
+        let record = make_record("s-mission-title");
+        let request =
+            mission_outbox_request("s-mission-title", SessionMissionOutboxOperation::Register);
+        let first = store
+            .upsert_session_with_mission_outbox(&record, &request)
+            .unwrap();
+
+        let mut hydrated_record = record;
+        hydrated_record.metadata_json = Some(r#"{"title":"Runtime hydrated title"}"#.to_string());
+        let mut hydrated_request = request;
+        hydrated_request.title = "Runtime hydrated title".to_string();
+        let duplicate = store
+            .upsert_session_with_mission_outbox(&hydrated_record, &hydrated_request)
+            .unwrap();
+
+        assert_eq!(first.request_id, duplicate.request_id);
+        assert_eq!(first.title, duplicate.title);
+    }
+
+    #[test]
+    fn session_mission_upsert_preserves_existing_ingress_message_and_runtime_outbox() {
+        let (store, _dir) = make_store();
+        let record = make_record("s-mission-preserve-ingress");
+        let mission = mission_outbox_request(
+            "s-mission-preserve-ingress",
+            SessionMissionOutboxOperation::Register,
+        );
+        store
+            .upsert_session_with_mission_outbox(&record, &mission)
+            .unwrap();
+        let ingress = SessionRuntimeOutboxRequest {
+            request_id: "ingress-preserve".to_string(),
+            turn_id: "turn-preserve".to_string(),
+            message_id: "message-preserve".to_string(),
+            created_at_ms: 101,
+        };
+        store
+            .append_ingress_with_runtime_outbox(
+                &record.session_id,
+                "user",
+                Some(r#"[{"type":"text","text":"preserve this turn"}]"#),
+                101,
+                &ingress,
+            )
+            .unwrap();
+
+        let mut refreshed = record;
+        refreshed.metadata_json = Some(r#"{"title":"Refreshed session"}"#.to_string());
+        let mut refreshed_mission = mission;
+        refreshed_mission.title = "Refreshed session".to_string();
+        store
+            .upsert_session_with_mission_outbox(&refreshed, &refreshed_mission)
+            .unwrap();
+
+        assert_eq!(store.get_message_count(&refreshed.session_id).unwrap(), 1);
+        assert!(store
+            .get_session_runtime_outbox(&ingress.request_id)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn session_delete_queues_close_without_foreign_key_loss() {
+        let (store, _dir) = make_store();
+        let record = make_record("s-mission-close");
+        store
+            .upsert_session_with_mission_outbox(
+                &record,
+                &mission_outbox_request("s-mission-close", SessionMissionOutboxOperation::Register),
+            )
+            .unwrap();
+        let close = mission_outbox_request("s-mission-close", SessionMissionOutboxOperation::Close);
+        assert!(store.delete_session_with_mission_outbox(&close).unwrap());
+        assert!(store.get_session("s-mission-close").unwrap().is_none());
+        let claimed = store
+            .claim_session_mission_outbox("workspace-a", "worker", 100, 50, 10)
+            .unwrap();
+        assert!(claimed.iter().any(|record| {
+            record.request_id == close.request_id
+                && record.operation == SessionMissionOutboxOperation::Close
+        }));
     }
 
     #[test]

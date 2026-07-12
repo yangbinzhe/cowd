@@ -172,11 +172,21 @@ impl ExecutionGraphRunner {
         &self,
         graph: ExecutionGraph,
     ) -> Result<ExecutionRunReport, ExecutionRunnerError> {
+        let registered = self.register(graph).await?;
+        self.run_until_quiescent(&registered.id).await
+    }
+
+    /// Persist a valid graph without executing its first node. Callers that
+    /// need live surface attachment use this boundary to publish the durable
+    /// graph identity before any provider or tool work begins.
+    pub async fn register(
+        &self,
+        graph: ExecutionGraph,
+    ) -> Result<ExecutionGraph, ExecutionRunnerError> {
         self.ensure_mutation_allowed()?;
         validate_execution_graph(&graph)?;
         self.registry.validate_graph(&graph)?;
-        let registered = self.commit_service.register_graph_async(graph).await?.graph;
-        self.run_until_quiescent(&registered.id).await
+        Ok(self.commit_service.register_graph_async(graph).await?.graph)
     }
 
     pub async fn run_until_quiescent(
@@ -214,6 +224,11 @@ impl ExecutionGraphRunner {
                 let result =
                     joined.map_err(|error| ExecutionRunnerError::Join(error.to_string()))?;
                 let (node_id, outcome) = match result {
+                    Err(ExecutionRunnerError::Resource { node_id, reason }) => {
+                        self.block_unstarted_resource_node(graph_id, &node_id, reason)
+                            .await?;
+                        continue;
+                    }
                     Ok(value) => value,
                     Err(ExecutionRunnerError::Executor(error)) => {
                         let node_id = executor_error_node_id(&error).to_string();
@@ -244,41 +259,46 @@ impl ExecutionGraphRunner {
                     Err(error) => return Err(error),
                 };
                 validate_outcome(&node_id, &outcome)?;
-                let _coordination = self.coordination.lock().await;
-                let current = self.state_store.load_async(graph_id).await?;
-                if current.node_statuses.get(&node_id) != Some(&ExecutionNodeStatus::Running) {
-                    continue;
-                }
-                if let Some(replan) = outcome.replan {
-                    self.registry.validate_nodes(&replan.nodes)?;
-                    self.commit_service
-                        .transition_node_with_replan_async(
-                            current,
-                            node_id.clone(),
-                            outcome.result,
-                            outcome.domain_events,
-                            replan.nodes,
-                            replan.edges,
-                            replan.reason,
-                        )
-                        .await?;
-                } else {
-                    self.commit_service
-                        .transition_node_async(
-                            current,
-                            node_id.clone(),
-                            outcome.result.status,
-                            Some(outcome.result),
-                            outcome.domain_events,
-                        )
-                        .await?;
-                }
-                let committed_executor = self
-                    .active
-                    .lock()
-                    .await
-                    .get(&(graph_id.to_string(), node_id.clone()))
-                    .map(|active| (Arc::clone(&active.executor), active.ticket.clone()));
+                // Durable graph state must be serialized, but executor callbacks are
+                // process-local follow-up work. Holding the graph coordination lock
+                // while an executor publishes its transcript can deadlock unrelated
+                // graph progress and leave a durable successor permanently Ready.
+                let committed_executor = {
+                    let _coordination = self.coordination.lock().await;
+                    let current = self.state_store.load_async(graph_id).await?;
+                    if current.node_statuses.get(&node_id) != Some(&ExecutionNodeStatus::Running) {
+                        continue;
+                    }
+                    if let Some(replan) = outcome.replan {
+                        self.registry.validate_nodes(&replan.nodes)?;
+                        self.commit_service
+                            .transition_node_with_replan_async(
+                                current,
+                                node_id.clone(),
+                                outcome.result,
+                                outcome.domain_events,
+                                replan.nodes,
+                                replan.edges,
+                                replan.reason,
+                            )
+                            .await?;
+                    } else {
+                        self.commit_service
+                            .transition_node_async(
+                                current,
+                                node_id.clone(),
+                                outcome.result.status,
+                                Some(outcome.result),
+                                outcome.domain_events,
+                            )
+                            .await?;
+                    }
+                    self.active
+                        .lock()
+                        .await
+                        .get(&(graph_id.to_string(), node_id.clone()))
+                        .map(|active| (Arc::clone(&active.executor), active.ticket.clone()))
+                };
                 if let Some((executor, ticket)) = committed_executor {
                     let after_commit = executor.after_commit(&ticket).await;
                     self.active
@@ -351,36 +371,41 @@ impl ExecutionGraphRunner {
             return Err(error.into());
         }
         drop(_coordination);
-        let poll_gate = self.coordination.lock().await;
-        let current = self.state_store.load_async(graph_id).await?;
-        if current.node_statuses.get(&ticket.node_id) != Some(&ExecutionNodeStatus::Running) {
-            self.active
-                .lock()
-                .await
-                .remove(&(ticket.graph_id.clone(), ticket.node_id.clone()));
-            return Ok((
-                ticket.node_id.clone(),
-                NodeExecutionOutcome::new(ExecutionNodeResult {
-                    // This outcome is only an internal wake-up value. The command's
-                    // already-committed graph status remains authoritative and the
-                    // caller discards this result because the node is no longer running.
-                    status: ExecutionNodeStatus::Cancelled,
-                    result_ref: None,
-                    evidence_refs: Vec::new(),
-                    failure: None,
-                    usage: Default::default(),
-                    finished_at_ms: now_ms(),
-                }),
-            ));
-        }
-        let mut poll = Box::pin(executor.poll_or_await(&ticket));
-        match self.commit_service.begin_execution_effect(&ticket)? {
+        // The coordination gate protects the state check and durable effect
+        // intent. It must not cover executor work: a ToolBatch may submit a
+        // child execution graph (for example `runtime_orchestrate`), which
+        // correctly needs the same Runner to make progress. Holding the gate
+        // across that await creates a parent/child re-entrancy deadlock.
+        let effect_state = {
+            let _poll_gate = self.coordination.lock().await;
+            let current = self.state_store.load_async(graph_id).await?;
+            if current.node_statuses.get(&ticket.node_id) != Some(&ExecutionNodeStatus::Running) {
+                self.active
+                    .lock()
+                    .await
+                    .remove(&(ticket.graph_id.clone(), ticket.node_id.clone()));
+                return Ok((
+                    ticket.node_id.clone(),
+                    NodeExecutionOutcome::new(ExecutionNodeResult {
+                        // This outcome is only an internal wake-up value. The command's
+                        // already-committed graph status remains authoritative and the
+                        // caller discards this result because the node is no longer running.
+                        status: ExecutionNodeStatus::Cancelled,
+                        result_ref: None,
+                        evidence_refs: Vec::new(),
+                        failure: None,
+                        usage: Default::default(),
+                        finished_at_ms: now_ms(),
+                    }),
+                ));
+            }
+            self.commit_service.begin_execution_effect(&ticket)?
+        };
+        match effect_state {
             ExecutionEffectState::Completed(outcome) => {
-                drop(poll_gate);
                 return Ok((ticket.node_id.clone(), outcome));
             }
             ExecutionEffectState::Uncertain => {
-                drop(poll_gate);
                 return Err(NodeExecutorError::Uncertain {
                     node_id: ticket.node_id.clone(),
                     reason: format!(
@@ -392,13 +417,7 @@ impl ExecutionGraphRunner {
             }
             ExecutionEffectState::Fresh => {}
         }
-        let first_poll = futures::poll!(&mut poll);
-        drop(poll_gate);
-        let outcome = match first_poll {
-            std::task::Poll::Ready(outcome) => outcome,
-            std::task::Poll::Pending => poll.await,
-        };
-        let outcome = outcome?;
+        let outcome = executor.poll_or_await(&ticket).await?;
         self.commit_service
             .commit_execution_effect(&ticket, &outcome)?;
         Ok((ticket.node_id.clone(), outcome))
@@ -433,22 +452,12 @@ impl ExecutionGraphRunner {
         for scope in &node.resource_scopes {
             if let Some(path) = scope.strip_prefix("read:") {
                 scope_requests.push(ScopeLockRequest {
-                    scope: ScopedResource::file(&self.workspace_id, path).map_err(|error| {
-                        ExecutionRunnerError::Resource {
-                            node_id: node.id.clone(),
-                            reason: error.to_string(),
-                        }
-                    })?,
+                    scope: self.scoped_resource_for_path(&node.id, path)?,
                     mode: ScopeLockMode::Read,
                 });
             } else if let Some(path) = scope.strip_prefix("write:") {
                 scope_requests.push(ScopeLockRequest {
-                    scope: ScopedResource::file(&self.workspace_id, path).map_err(|error| {
-                        ExecutionRunnerError::Resource {
-                            node_id: node.id.clone(),
-                            reason: error.to_string(),
-                        }
-                    })?,
+                    scope: self.scoped_resource_for_path(&node.id, path)?,
                     mode: ScopeLockMode::Write,
                 });
             } else if let Some(path) = scope.strip_prefix("worktree:") {
@@ -496,6 +505,77 @@ impl ExecutionGraphRunner {
         })
     }
 
+    fn scoped_resource_for_path(
+        &self,
+        node_id: &str,
+        path: &str,
+    ) -> Result<ScopedResource, ExecutionRunnerError> {
+        let requested = Path::new(path.trim());
+        let relative = if requested.is_absolute() {
+            requested.strip_prefix(&self.workspace_root).map_err(|_| {
+                ExecutionRunnerError::Resource {
+                    node_id: node_id.to_string(),
+                    reason: format!(
+                        "absolute resource scope `{}` is outside workspace `{}`",
+                        requested.display(),
+                        self.workspace_root.display()
+                    ),
+                }
+            })?
+        } else {
+            requested
+        };
+        if relative.as_os_str().is_empty() || relative == Path::new(".") {
+            return ScopedResource::workspace(&self.workspace_id).map_err(|error| {
+                ExecutionRunnerError::Resource {
+                    node_id: node_id.to_string(),
+                    reason: error.to_string(),
+                }
+            });
+        }
+        ScopedResource::file(&self.workspace_id, relative).map_err(|error| {
+            ExecutionRunnerError::Resource {
+                node_id: node_id.to_string(),
+                reason: error.to_string(),
+            }
+        })
+    }
+
+    async fn block_unstarted_resource_node(
+        &self,
+        graph_id: &str,
+        node_id: &str,
+        reason: String,
+    ) -> Result<(), ExecutionRunnerError> {
+        let _coordination = self.coordination.lock().await;
+        let current = self.state_store.load_async(graph_id).await?;
+        if current.node_statuses.get(node_id) != Some(&ExecutionNodeStatus::Ready) {
+            return Ok(());
+        }
+        self.commit_service
+            .transition_node_async(
+                current,
+                node_id.to_string(),
+                ExecutionNodeStatus::Blocked,
+                Some(ExecutionNodeResult {
+                    status: ExecutionNodeStatus::Blocked,
+                    result_ref: None,
+                    evidence_refs: Vec::new(),
+                    failure: Some(harness_contract::execution_graph::ExecutionFailure {
+                        kind: "resource_acquisition_failed".to_string(),
+                        message: reason,
+                        retryable: false,
+                        evidence_refs: Vec::new(),
+                    }),
+                    usage: Default::default(),
+                    finished_at_ms: now_ms(),
+                }),
+                Vec::new(),
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn command(
         &self,
         graph_id: &str,
@@ -534,6 +614,7 @@ impl ExecutionGraphRunner {
             ExecutionGraphCommand::Resume { .. }
                 | ExecutionGraphCommand::Advance { .. }
                 | ExecutionGraphCommand::SubmitApproval { approved: true, .. }
+                | ExecutionGraphCommand::ResolveExternal { .. }
         ) {
             self.run_until_quiescent(graph_id).await?;
             return self

@@ -1,7 +1,7 @@
 use super::{
     validate_protocol_request, OutputSpec, ProtocolAvailability, ProtocolCompileError,
     ProtocolCompileRequest, ProtocolGraphBuilder, ProtocolId, ProtocolSpec, RepairPolicy,
-    RepairTrigger, RoleDependencySpec, RoleSpec, StopPolicy,
+    RepairTrigger, RoleDependencySpec, RoleEvidenceMode, RoleSpec, StopPolicy,
 };
 use harness_contract::execution_graph::ExecutionGraph;
 
@@ -73,7 +73,8 @@ pub(crate) fn spec() -> ProtocolSpec {
                 2,
                 4,
                 OutputSpec::evidence_backed(&["proposal", "constraints", "risks"], true),
-            ),
+            )
+            .with_evidence_mode(RoleEvidenceMode::Acquire),
             RoleSpec::agent(
                 "critic",
                 "Cross-review another proposal for counterexamples, missing evidence, and risk.",
@@ -83,14 +84,16 @@ pub(crate) fn spec() -> ProtocolSpec {
                     &["counterexamples", "missing_evidence", "risks"],
                     true,
                 ),
-            ),
+            )
+            .with_evidence_mode(RoleEvidenceMode::UpstreamOnly),
             RoleSpec::agent(
                 "evidence_gap",
                 "Identify unresolved evidence gaps and request the bounded evidence needed to decide.",
                 1,
                 1,
                 OutputSpec::evidence_backed(&["evidence_gaps", "evidence_requests", "confidence"], true),
-            ),
+            )
+            .with_evidence_mode(RoleEvidenceMode::Acquire),
             RoleSpec::agent(
                 "arbiter",
                 "Select, combine, or leave unresolved based on evidence quality, constraints, counterexamples, and risk rather than votes.",
@@ -105,7 +108,8 @@ pub(crate) fn spec() -> ProtocolSpec {
                     ],
                     true,
                 ),
-            ),
+            )
+            .with_evidence_mode(RoleEvidenceMode::UpstreamOnly),
             RoleSpec::agent(
                 "repair",
                 "Perform at most one evidence- or constraint-driven revision, or explicitly report that no revision is needed.",
@@ -115,7 +119,8 @@ pub(crate) fn spec() -> ProtocolSpec {
                     &["revision", "repair_status", "remaining_unresolved"],
                     true,
                 ),
-            ),
+            )
+            .with_evidence_mode(RoleEvidenceMode::Acquire),
         ],
         dependencies: vec![
             RoleDependencySpec::cross_fanout("critic", "proposer"),

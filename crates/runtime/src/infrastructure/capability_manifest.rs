@@ -250,10 +250,10 @@ impl RuntimeCapabilityCatalog {
                         operation(
                             "dispatch_session",
                             "runtime.session_execution",
-                            "Turn a pending mission command into a runtime turn dispatch request.",
+                            "Submit a typed SessionHandoff graph and await its correlated result.",
                             "A background or parallel session should continue executing real work.",
-                            "Session lease state must be active/background and command idempotency must hold.",
-                            &["command_id", "turn_request", "session_command_summary"],
+                            "Target session visibility, permission lease, and handoff idempotency must hold.",
+                            &["handoff_id", "correlation_id", "execution_graph"],
                         ),
                         operation(
                             "link_sessions",
@@ -341,10 +341,10 @@ impl RuntimeCapabilityCatalog {
                 ),
                 action_contract(
                     "dispatch_session",
-                    "request_session_link",
+                    "dispatch_session",
                     "A background or related session should run or receive work from the current mission.",
-                    &["intent", "session_id or target_ref"],
-                    &["session_commands", "relation_projection"],
+                    &["intent", "session_id", "target_session_id"],
+                    &["session_handoff", "execution_graph", "correlation_result"],
                 ),
                 action_contract(
                     "request_arbiter",
@@ -673,7 +673,7 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
             "available": runtime_orchestrate_available,
             "blocked_reasons": orchestration_blocked_reasons,
             "required_permission": "workspace-write",
-            "side_effects": ["mission_evidence", "team_runtime", "session_command", "approval_orchestration"],
+            "side_effects": ["mission_evidence", "team_runtime", "session_input", "approval_orchestration"],
             "actions": runtime_orchestration_actions(),
             "runtime_action_contract": RuntimeCapabilityCatalog::current().action_contracts,
             "recommendation": execution_decision.recommended_actions,
@@ -884,27 +884,23 @@ fn runtime_budget_controls(profile: Option<&str>) -> Value {
     json!({
         "profile": profile.unwrap_or("auto"),
         "turn": {
-            "adaptive_wall_clock_seconds": {
-                "direct_or_quick": 240,
-                "standard": 480,
-                "deep_or_yolo": 900
+            "safety_fuse": {
+                "owner": "runtime.execution_core",
+                "derivation": "provider context, goal complexity, explicit user constraints, progress and evidence novelty",
+                "business_completion_owner": "goal acceptance plus terminal synthesize",
+                "gateway_wall_clock_deadline": false
             },
-            "stream_idle_seconds": {
-                "direct_or_quick": 240,
-                "standard": 360,
-                "deep_or_yolo": 600
+            "provider_transport": {
+                "owner": "runtime.provider",
+                "uses": ["connect", "idle", "heartbeat", "stall recovery"],
+                "productive_stream_is_not_a_turn_timeout": true
             },
-            "max_iterations": {
-                "direct_or_quick": 12,
-                "standard": 32,
-                "deep_or_yolo": 64
-            },
-            "partial_answer_preserved": true
+            "terminal_writer": "execution graph synthesize"
         },
         "supervision": {
             "slow_but_productive_output_allowed": true,
-            "low_novelty_tool_loop": "supervisor first asks for fallback synthesis; if ignored and tools continue, runtime stops the loop on the next iteration",
-            "preferred_recovery": ["batch_evidence", "narrow_scope", "delegate_independent_domains", "staged_answer_with_remaining_risks"]
+            "low_novelty_tool_loop": "observation and intervention policy propose retrieve, replan, switch, synthesize, or block; Runner applies the proposal",
+            "preferred_recovery": ["batch_evidence", "narrow_scope", "delegate_independent_domains", "honest_block_with_checked_evidence"]
         },
         "tools": {
             "per_tool_timeout_registry": true,
@@ -1093,7 +1089,7 @@ mod tests {
         assert!(response["action_plane"]["recipes"].is_array());
         assert!(response["execution_decision"]["strategy"]["pattern"].is_string());
         assert!(response["execution_decision"]["lease"]["lease_id"].is_string());
-        assert!(response["budget_controls"]["turn"]["max_iterations"].is_object());
+        assert!(response["budget_controls"]["turn"]["safety_fuse"].is_object());
         assert_eq!(
             response["model_router"]["registry"],
             "ModelPerformanceRegistry"
@@ -1229,7 +1225,7 @@ mod tests {
             Some("DeepInvestigation"),
             Some("budget_controls"),
         );
-        assert!(budget["backend_capabilities"]["turn"]["adaptive_wall_clock_seconds"].is_object());
+        assert!(budget["backend_capabilities"]["turn"]["safety_fuse"].is_object());
         assert!(
             budget["backend_capabilities"]["subagents"]["timeout_secs_supported"]
                 .as_bool()
@@ -1282,10 +1278,7 @@ mod tests {
         }));
         assert!(catalog.action_contracts.iter().any(|contract| {
             contract.runtime_action == "dispatch_session"
-                && contract
-                    .expected_projection
-                    .iter()
-                    .any(|item| item == "session_commands")
+                && contract.tool_action == "dispatch_session"
         }));
     }
 }

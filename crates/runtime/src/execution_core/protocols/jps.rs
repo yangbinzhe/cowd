@@ -1,7 +1,7 @@
 use super::{
     validate_protocol_request, OutputSpec, ProtocolAvailability, ProtocolCompileError,
     ProtocolCompileRequest, ProtocolGraphBuilder, ProtocolId, ProtocolSpec, RepairPolicy,
-    RoleDependencySpec, RoleSpec, StopPolicy,
+    RoleDependencySpec, RoleEvidenceMode, RoleSpec, StopPolicy,
 };
 use harness_contract::execution_graph::ExecutionGraph;
 
@@ -22,19 +22,10 @@ pub fn compile(request: &ProtocolCompileRequest) -> Result<ExecutionGraph, Proto
     validate_protocol_request(&spec, request)?;
     let mut builder = ProtocolGraphBuilder::new(&spec, request);
 
-    let frame = builder.add_agent("frame", 0, &[])?;
     let solutions = (0..request.fanout)
-        .map(|slot| builder.add_agent("solution", slot, std::slice::from_ref(&frame)))
+        .map(|slot| builder.add_agent("solution", slot, &[]))
         .collect::<Result<Vec<_>, _>>()?;
-    let evaluation = builder.add_agent("evaluation", 0, &solutions)?;
-    let conflict_inputs = solutions
-        .iter()
-        .cloned()
-        .chain(std::iter::once(evaluation.clone()))
-        .collect::<Vec<_>>();
-    let conflict_matrix = builder.add_agent("conflict_matrix", 0, &conflict_inputs)?;
-    let synthesis_inputs = vec![evaluation, conflict_matrix];
-    let synthesis = builder.add_agent("decision_synthesis", 0, &synthesis_inputs)?;
+    let synthesis = builder.add_agent("decision_synthesis", 0, &solutions)?;
     builder.add_terminal_chain(&[synthesis]);
     builder.finish()
 }
@@ -43,55 +34,31 @@ pub(crate) fn spec() -> ProtocolSpec {
     ProtocolSpec {
         id: ProtocolId::Jps,
         version: 1,
-        summary: "Joint problem solving through a shared frame, independent solutions, evidence scoring, and conflict synthesis.".to_string(),
+        summary: "Parallel evidence lanes with one bounded decision synthesis that reconciles tradeoffs, contradictions, and unresolved evidence.".to_string(),
         availability: ProtocolAvailability::Available,
         roles: vec![
             RoleSpec::agent(
-                "frame",
-                "Frame the problem, constraints, and unknowns before solutions are proposed.",
-                1,
-                1,
-                OutputSpec::structured(&["problem_frame", "constraints", "unknowns"], true),
-            ),
-            RoleSpec::agent(
                 "solution",
-                "Produce an independent solution with tradeoffs and supporting evidence.",
+                "Independently acquire the minimum concrete evidence for one solution lane, then return a solution, tradeoffs, risks, and source-backed evidence. Do not wait for a framing role; the objective is the shared frame.",
                 2,
                 4,
                 OutputSpec::evidence_backed(&["solution", "tradeoffs", "evidence"], true),
-            ),
+            )
+            .with_evidence_mode(RoleEvidenceMode::Acquire),
             RoleSpec::agent(
-                "evaluation",
-                "Evaluate solution evidence quality, confidence, and remaining gaps.",
-                1,
-                1,
-                OutputSpec::evidence_backed(&["evidence_scorecard", "confidence", "gaps"], true),
-            ),
-            RoleSpec::agent(
-                "conflict_matrix",
-                "Produce a typed conflict matrix and explicit resolution options.",
+                "decision_synthesis",
+                "Synthesize the independent evidence lanes into one decision. Reconcile contradictions, assess evidence confidence, and preserve unsupported claims as explicit unresolved items instead of re-reading the workspace.",
                 1,
                 1,
                 OutputSpec::evidence_backed(
-                    &["conflict_matrix", "disputed_assumptions", "resolution_options"],
+                    &["decision", "rationale", "conflict_resolution", "unresolved"],
                     true,
                 ),
-            ),
-            RoleSpec::agent(
-                "decision_synthesis",
-                "Synthesize a constrained decision while preserving unresolved conflicts.",
-                1,
-                1,
-                OutputSpec::evidence_backed(&["decision", "rationale", "unresolved"], true),
-            ),
+            )
+            .with_evidence_mode(RoleEvidenceMode::UpstreamOnly),
         ],
         dependencies: vec![
-            RoleDependencySpec::all("solution", "frame"),
-            RoleDependencySpec::all("evaluation", "solution"),
-            RoleDependencySpec::all("conflict_matrix", "solution"),
-            RoleDependencySpec::all("conflict_matrix", "evaluation"),
-            RoleDependencySpec::all("decision_synthesis", "evaluation"),
-            RoleDependencySpec::all("decision_synthesis", "conflict_matrix"),
+            RoleDependencySpec::all("decision_synthesis", "solution"),
         ],
         verify_after_roles: vec!["decision_synthesis".to_string()],
         output: OutputSpec::evidence_backed(&["decision", "rationale", "unresolved"], true),

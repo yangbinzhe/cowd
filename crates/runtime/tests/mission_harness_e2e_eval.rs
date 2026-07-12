@@ -4,10 +4,10 @@ use runtime::eval_gate::{
     ScenarioCheck, ScenarioCheckKind, ScenarioObservation, ScenarioSpec, ScenarioSuite,
 };
 use runtime::{
-    ApprovalSource, ApprovalSourceKind, ApprovalTimeoutPolicy, AutonomyProfileId, MissionRuntime,
-    RuntimeEventInput, RuntimeEventScope, RuntimeEventStore, StartMissionSessionRequest,
-    StartStewardRuntimeRequest, StewardActionStatus, StewardRuntimeService,
-    TickStewardRuntimeRequest,
+    ApprovalSource, ApprovalSourceKind, ApprovalTimeoutPolicy, AutonomyProfileId,
+    CollaborationTemplateId, MissionRuntime, RuntimeEventInput, RuntimeEventScope,
+    RuntimeEventStore, StartMissionSessionRequest, StewardActionRequest, StewardActionStatus,
+    StewardAgent,
 };
 use serde::Serialize;
 
@@ -58,43 +58,31 @@ fn mission_harness_quick_eval_covers_core_runtime_loop_and_writes_report() {
         .expect("approval submitted");
     assert_eq!(approval.status, runtime::GlobalApprovalStatus::Pending);
 
-    let command = mission
-        .enqueue_session_command(
-            &session.session_id,
-            &session.session_id,
-            "summarize evidence and blockers".to_string(),
-        )
-        .expect("session command enqueued");
-    let claimed = mission
-        .claim_session_command(&session.session_id, &command.command_id)
-        .expect("session command claimed");
-    assert_eq!(
-        claimed.status,
-        runtime::MissionSessionCommandStatus::Claimed
-    );
-
-    let steward_runtime = StewardRuntimeService::new();
-    let steward = steward_runtime
-        .start(StartStewardRuntimeRequest {
-            mission_id: "mission-eval".to_string(),
-            root_session_id: Some(session.session_id.clone()),
-            profile_id: AutonomyProfileId::Stewarded,
-            objective: "supervise mission harness eval".to_string(),
-        })
-        .expect("steward starts");
-    let steward_decision = steward_runtime
-        .tick(
-            &steward.steward_id,
-            TickStewardRuntimeRequest {
-                action: Some("read evidence".to_string()),
-                summary: Some("inspect runtime event evidence".to_string()),
+    let steward_decision = StewardAgent::new()
+        .evaluate_action(
+            StewardActionRequest {
+                steward_id: "policy-eval".to_string(),
+                profile_id: AutonomyProfileId::Stewarded,
+                source: ApprovalSource {
+                    kind: ApprovalSourceKind::Steward,
+                    session_id: Some(session.session_id.clone()),
+                    agent_id: None,
+                    team_id: Some(team_id.clone()),
+                    mission_id: Some("mission-eval".to_string()),
+                },
+                action: "read evidence".to_string(),
+                summary: "inspect runtime event evidence".to_string(),
                 risk: TaskRisk::Low,
                 requested_tool: Some("read_file".to_string()),
-                ..TickStewardRuntimeRequest::default()
+                template_id: Some(CollaborationTemplateId::ExecuteReview),
+                requires_write: false,
+                is_critical_operation: false,
+                evidence_refs: vec!["mission-eval".to_string()],
+                timeout_policy: ApprovalTimeoutPolicy::Pending,
             },
             services.approval_queue(),
         )
-        .expect("steward ticks");
+        .expect("policy evaluates action");
     assert_eq!(steward_decision.status, StewardActionStatus::Delegated);
 
     let event_store = RuntimeEventStore::open_in_memory().expect("event store opens");
@@ -109,8 +97,7 @@ fn mission_harness_quick_eval_covers_core_runtime_loop_and_writes_report() {
             payload: serde_json::json!({
                 "team_id": team_id,
                 "approval_id": approval.approval_id,
-                "command_id": command.command_id,
-                "steward_id": steward.steward_id,
+                "policy_actor": steward_decision.steward_id,
             }),
         })
         .expect("event appends");
@@ -134,7 +121,7 @@ fn mission_harness_quick_eval_covers_core_runtime_loop_and_writes_report() {
     let observation = ScenarioObservation {
         scenario_id: "mission_harness_quick".to_string(),
         strategy_pattern: strategy.pattern,
-        finalization_blocked: false,
+        verification_blocked: false,
         regression_allowed: true,
         has_execution_graph: true,
         execution_graph_quality_ok: true,
@@ -167,14 +154,14 @@ fn mission_harness_quick_eval_covers_core_runtime_loop_and_writes_report() {
                 evidence: approval.approval_id,
             },
             CapabilityResult {
-                capability: "session_inbox",
+                capability: "session_input",
                 status: "passed",
-                evidence: command.command_id,
+                evidence: "runtime.session_input_stream".to_string(),
             },
             CapabilityResult {
-                capability: "steward_runtime",
+                capability: "steward_policy",
                 status: "passed",
-                evidence: steward.steward_id,
+                evidence: steward_decision.steward_id,
             },
             CapabilityResult {
                 capability: "runtime_event_store",

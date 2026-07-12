@@ -264,6 +264,9 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
             .and_then(|value| value.get("real_provider_enabled"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
+    let live = report.get("live_gateway_scenarios").unwrap_or(&Value::Null);
+    let live_provider_rounds = live_gateway_provider_rounds(live);
+    let live_total_tokens = live_gateway_total_tokens(live);
 
     let mut items = Vec::new();
     items.push(HarnessEvalReportGateItem::new(
@@ -332,7 +335,7 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
             && mission_runtime
                 .pointer("/mission_projection/schema_version")
                 .and_then(Value::as_u64)
-                == Some(2),
+                .is_some_and(|version| version >= 2),
         true,
         format!(
             "status={}, projection_v={}",
@@ -440,12 +443,13 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
     ));
     items.push(HarnessEvalReportGateItem::new(
         "real_model_claim_has_provider_rounds",
-        !real_model_claimed || runtime_provider_rounds(trace) > 0,
+        !real_model_claimed || runtime_provider_rounds(trace) > 0 || live_provider_rounds > 0,
         true,
         format!(
-            "real_model_claimed={}, provider_rounds={}",
+            "real_model_claimed={}, trace_provider_rounds={}, live_provider_rounds={}",
             real_model_claimed,
-            runtime_provider_rounds(trace)
+            runtime_provider_rounds(trace),
+            live_provider_rounds
         ),
         "deep/real reports may not claim real model evidence with zero provider rounds",
     ));
@@ -535,9 +539,11 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
         ));
         items.push(HarnessEvalReportGateItem::new(
             "token_usage_nonzero_or_estimated",
-            total_tokens > 0 && usage_source != "unavailable",
+            (total_tokens > 0 || live_total_tokens > 0) && usage_source != "unavailable",
             true,
-            format!("total_tokens={total_tokens}, usage_source={usage_source}"),
+            format!(
+                "trace_total_tokens={total_tokens}, live_total_tokens={live_total_tokens}, usage_source={usage_source}"
+            ),
             "record provider usage or explicit deterministic/estimated fallback",
         ));
         items.push(HarnessEvalReportGateItem::new(
@@ -555,6 +561,44 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
                 tool_log_count
             ),
             "tool events, observations, and report trace must share one count",
+        ));
+    }
+
+    if level == "deep" {
+        let live = report.get("live_gateway_scenarios").unwrap_or(&Value::Null);
+        let live_scenarios = live
+            .get("scenarios")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let all_traces_complete = live_scenarios.iter().all(|scenario| {
+            scenario.get("status").and_then(Value::as_str) == Some("passed")
+                && scenario
+                    .pointer("/production_trace/session_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.is_empty())
+                && scenario
+                    .pointer("/production_trace/terminal_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.is_empty())
+                && scenario
+                    .pointer("/production_trace/execution_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.is_empty())
+        });
+        items.push(HarnessEvalReportGateItem::new(
+            "deep_live_gateway_scenarios",
+            live.get("status").and_then(Value::as_str) == Some("passed")
+                && live_scenarios.len() >= 3
+                && all_traces_complete,
+            true,
+            format!(
+                "live_status={}, scenarios={}, complete_traces={}",
+                live.get("status").and_then(Value::as_str).unwrap_or("missing"),
+                live_scenarios.len(),
+                all_traces_complete
+            ),
+            "run deep evaluation against an explicit isolated COWD_EVAL_GATEWAY_URL and retain durable session, terminal, execution and cursor traces for every live scenario",
         ));
     }
 
@@ -628,6 +672,78 @@ fn runtime_provider_rounds(trace: &Value) -> u64 {
         .get("provider_rounds")
         .and_then(Value::as_u64)
         .unwrap_or_default()
+}
+
+fn live_gateway_provider_rounds(live: &Value) -> u64 {
+    live.get("scenarios")
+        .and_then(Value::as_array)
+        .map(|scenarios| {
+            scenarios
+                .iter()
+                .map(|scenario| {
+                    scenario
+                        .pointer("/metrics/model_rounds")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default()
+                })
+                .sum()
+        })
+        .unwrap_or_default()
+}
+
+fn live_gateway_total_tokens(live: &Value) -> u64 {
+    live.get("scenarios")
+        .and_then(Value::as_array)
+        .map(|scenarios| {
+            scenarios
+                .iter()
+                .map(|scenario| {
+                    scenario
+                        .pointer("/metrics/total_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default()
+                })
+                .sum()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn gate_accepts_real_gateway_model_metrics_without_report_reviewer() {
+        let report = json!({
+            "level": "deep",
+            "authorized_real_model": true,
+            "execution_trace": {
+                "provider_rounds": 0,
+                "total_usage": {"total_tokens": 0, "usage_source": "deterministic_smoke"}
+            },
+            "live_gateway_scenarios": {
+                "status": "passed",
+                "scenarios": [{
+                    "status": "passed",
+                    "metrics": {"model_rounds": 2, "total_tokens": 321}
+                }]
+            }
+        });
+
+        let gate = evaluate_report_gate(&report);
+        let item = |name: &str| {
+            gate.items
+                .iter()
+                .find(|item| item.name == name)
+                .expect("gate item")
+        };
+        assert_eq!(
+            item("real_model_claim_has_provider_rounds").status,
+            "passed"
+        );
+        assert_eq!(item("token_usage_nonzero_or_estimated").status, "passed");
+    }
 }
 
 #[derive(Debug, Serialize)]

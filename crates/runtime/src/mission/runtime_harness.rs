@@ -51,7 +51,7 @@ pub struct RuntimeAiKernelTrace {
     pub tool_transaction: Option<ToolTransactionPlan>,
     pub tool_receipt: Option<ToolTransactionReceipt>,
     pub verification_report: VerificationReport,
-    pub finalization_blocked: bool,
+    pub verification_blocked: bool,
     pub trajectory: Trajectory,
     pub bench_result: BenchCaseResult,
     pub regression_gate: RegressionGateVerdict,
@@ -206,6 +206,20 @@ impl RuntimeAiKernel {
         self.checkpoint_created = true;
     }
 
+    /// A graph may reach a durable terminal Block without a usable model
+    /// answer. Preserve the explanatory text for the surface, but never let
+    /// that system-generated explanation satisfy the verification ledger or
+    /// suppress the corresponding growth signal.
+    pub fn record_terminal_blocked(&mut self, reason: impl Into<String>) {
+        self.verification.add_claim(Claim::required(
+            ClaimKind::Limitation,
+            format!("runtime terminal blocked completion: {}", reason.into()),
+        ));
+        // Keep the required limitation pending. `NotRun` is an advisory
+        // observation in the generic verification ledger, whereas a terminal
+        // Block must make `can_finalize` false and feed the growth blocker.
+    }
+
     pub fn finalize(
         mut self,
         assistant_text: &str,
@@ -237,7 +251,7 @@ impl RuntimeAiKernel {
             )
         });
         let verification_report = self.verification.report();
-        let finalization_blocked = !verification_report.can_finalize;
+        let verification_blocked = !verification_report.can_finalize;
         let prompt_plan = self.context_epoch.prompt_assembly_plan();
         let context_alignment = self
             .context_envelope_id
@@ -442,7 +456,7 @@ impl RuntimeAiKernel {
             tool_transaction: self.tool_transaction,
             tool_receipt,
             verification_report,
-            finalization_blocked,
+            verification_blocked,
             trajectory,
             bench_result,
             regression_gate,
@@ -523,17 +537,6 @@ fn build_initial_execution_graph(
     strategy: &StrategyDecision,
     compile_target: RuntimeCompileTarget,
 ) -> Option<ExecutionGraph> {
-    // Protocol, team, and mission graphs require canonical runtime identities,
-    // leases, and an active Runner. This trace-only facade must not fabricate
-    // look-alike AgentTask graphs; runtime_orchestrate owns their compilation.
-    if matches!(
-        compile_target,
-        RuntimeCompileTarget::DeliberationGraph
-            | RuntimeCompileTarget::TeamGraph
-            | RuntimeCompileTarget::MissionGraph
-    ) {
-        return None;
-    }
     if compile_target == RuntimeCompileTarget::InlineModel
         && !strategy
             .modifiers
@@ -546,9 +549,6 @@ fn build_initial_execution_graph(
         RuntimeCompileTarget::InlineModel => (ExecutionNodeKind::InlineModel, "respond"),
         RuntimeCompileTarget::EvidenceGraph => (ExecutionNodeKind::ToolBatch, "gather-evidence"),
         RuntimeCompileTarget::ExecutionGraph => (ExecutionNodeKind::ToolBatch, "execute"),
-        RuntimeCompileTarget::DeliberationGraph
-        | RuntimeCompileTarget::TeamGraph
-        | RuntimeCompileTarget::MissionGraph => unreachable!("handled before trace graph build"),
     };
     let mut first = ExecutionNodeSpec::new(first_kind, "runtime", first_label);
     first.id = first_label.to_string();
@@ -720,7 +720,7 @@ mod tests {
         assert!(!kernel.context_epoch().selected.is_empty());
         let trace = kernel.finalize("done", 0, 0);
         assert!(trace.verification_report.can_finalize);
-        assert!(!trace.finalization_blocked);
+        assert!(!trace.verification_blocked);
         assert!(trace.bench_result.passed);
         assert!(trace.regression_gate.allowed);
         assert!(!trace.learning_record.has_blocker());
@@ -750,18 +750,18 @@ mod tests {
             ),
             (
                 "权衡两个架构方案并解决冲突",
-                RuntimeCompileTarget::DeliberationGraph,
-                None,
+                RuntimeCompileTarget::EvidenceGraph,
+                Some("gather-evidence"),
             ),
             (
                 "使用多 Agent 并行审查 runtime gateway memory",
-                RuntimeCompileTarget::TeamGraph,
-                None,
+                RuntimeCompileTarget::EvidenceGraph,
+                Some("gather-evidence"),
             ),
             (
                 "后台持续推进这项长期 mission 任务",
-                RuntimeCompileTarget::MissionGraph,
-                None,
+                RuntimeCompileTarget::EvidenceGraph,
+                Some("gather-evidence"),
             ),
         ];
 
@@ -823,7 +823,7 @@ mod tests {
 
         let trace = kernel.finalize("", 0, 0);
 
-        assert!(trace.finalization_blocked);
+        assert!(trace.verification_blocked);
         assert!(!trace.regression_gate.allowed);
         assert!(trace.learning_record.has_blocker());
     }

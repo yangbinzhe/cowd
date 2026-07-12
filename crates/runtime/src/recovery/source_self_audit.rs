@@ -110,7 +110,7 @@ fn runtime_host_uses_runtime_service(repo_root: &Path) -> SourceSelfAuditCheck {
         passed,
         "external inbound execution must go through RuntimeService",
         vec![path],
-        "submit through RuntimeService::run_turn_with_timeout -> StandardRuntimeHost::submit_turn and preserve turn receipts",
+        "submit through RuntimeService::run_turn -> StandardRuntimeHost::submit_turn and preserve turn receipts",
     )
 }
 
