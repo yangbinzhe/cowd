@@ -1,5 +1,16 @@
 //! Matrix structured fact engine contracts.
 
+// Test assertions intentionally use unwrap/expect; normal library builds remain strict.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
+
 #[path = "metric/attention.rs"]
 mod attention;
 #[path = "source/change.rs"]
@@ -28,6 +39,8 @@ mod ontology;
 mod quality;
 #[path = "entity/relation.rs"]
 mod relation;
+#[path = "source/scenario.rs"]
+mod scenario;
 #[path = "source/source.rs"]
 mod source;
 #[path = "source/source_pack.rs"]
@@ -49,9 +62,9 @@ pub use data_plane::{
 pub use entity::{normalize_key, MatrixEntity, MatrixEntityInput, MatrixSourceKey};
 pub use evidence::{MatrixEvidencePacket, MatrixEvidenceSourceRef};
 pub use fact::{
-    MatrixFact, MatrixFactInput, AI_EVAL_RESULT_FACT, AI_GROWTH_SIGNAL_FACT,
-    AI_STRATEGY_DECISION_FACT, AI_TOOL_TRANSACTION_RESULT_FACT, AI_VERIFICATION_RESULT_FACT,
-    AI_WORKGRAPH_QUALITY_FACT, KNOWLEDGE_CANON_RULE_FACT, KNOWLEDGE_CONFLICT_FACT,
+    MatrixFact, MatrixFactInput, AI_EVAL_RESULT_FACT, AI_EXECUTION_GRAPH_QUALITY_FACT,
+    AI_GROWTH_SIGNAL_FACT, AI_STRATEGY_DECISION_FACT, AI_TOOL_TRANSACTION_RESULT_FACT,
+    AI_VERIFICATION_RESULT_FACT, KNOWLEDGE_CANON_RULE_FACT, KNOWLEDGE_CONFLICT_FACT,
     KNOWLEDGE_CONSTRAINT_FACT, KNOWLEDGE_PROCESS_STEP_FACT,
 };
 pub use metric::{MatrixMetricDefinition, MatrixMetricState, MatrixMetricStatus};
@@ -66,6 +79,10 @@ pub use ontology::{
 };
 pub use quality::MatrixQualityGateDecision;
 pub use relation::{MatrixImpactHop, MatrixImpactTrace, MatrixRelation, MatrixRelationInput};
+pub use scenario::{
+    MatrixScenarioOutputContract, MatrixScenarioResult, MatrixScenarioRun, MatrixScenarioRunStatus,
+    MatrixScenarioSpec, MatrixSnapshotRef,
+};
 pub use source::{
     MatrixSourceKind, MatrixSourceSnapshot, MatrixSourceSnapshotApplyReport,
     MatrixSourceSnapshotInput, MatrixSourceSnapshotPlan,
@@ -75,7 +92,7 @@ pub use source_pack::{
     MatrixSourcePackValidation, MatrixSourceRelationMapping,
 };
 
-pub const MATRIX_SCHEMA_VERSION: i64 = 18;
+pub const MATRIX_SCHEMA_VERSION: i64 = 19;
 
 #[must_use]
 pub fn matrix_reference(kind: &str, id: &str) -> String {
@@ -93,6 +110,6 @@ mod tests {
 
     #[test]
     fn matrix_schema_version_is_owned_by_matrix_contract() {
-        assert_eq!(MATRIX_SCHEMA_VERSION, 18);
+        assert_eq!(MATRIX_SCHEMA_VERSION, 19);
     }
 }

@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
 //! LongMemEval R@5 benchmark harness (mempalace 96.6% target).
 //!
 //! Tests retrieval recall using verbatim-stored entries.

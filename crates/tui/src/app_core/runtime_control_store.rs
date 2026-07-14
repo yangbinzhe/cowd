@@ -104,6 +104,54 @@ pub struct SurfaceEventSummary {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MessageConnectorSummary {
+    pub connector: String,
+    pub name: String,
+    pub configuration_status: String,
+    pub runtime_status: String,
+    pub enabled: bool,
+    pub configured: bool,
+    pub capability_count: u64,
+    pub missing_required_count: u64,
+    pub consecutive_failures: u64,
+    pub restart_count: u64,
+    pub circuit_open: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MessageEndpointSummary {
+    pub endpoint_id: String,
+    pub connector: String,
+    pub kind: String,
+    pub status: String,
+    pub configured: bool,
+    pub capability_count: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MessageRouteSummary {
+    pub route_id: String,
+    pub connector: String,
+    pub policy: String,
+    pub status: String,
+    pub configured: bool,
+    pub capability_count: u64,
+    pub runtime_status: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MessageBindingSummary {
+    pub binding_id: String,
+    pub connector: String,
+    pub endpoint: String,
+    pub direction: String,
+    pub status: String,
+    pub runtime_session_id: Option<String>,
+    pub resource_count: u64,
+    pub last_seen_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CowdKernelSummary {
     pub capability_count: u64,
     pub projection_capability_count: u64,
@@ -111,6 +159,40 @@ pub struct CowdKernelSummary {
     pub cli_is_minimal_control: bool,
     pub release_gate_status: String,
     pub release_gate_failed_checks: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GatewayCapabilityRouteSummary {
+    pub id: String,
+    pub domain: String,
+    pub title: String,
+    pub method: String,
+    pub path: String,
+    pub risk: String,
+    pub criticality: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GatewayOpenAiToolSummary {
+    pub name: String,
+    pub description: String,
+    pub parameter_count: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GatewayCapabilityContractSummary {
+    pub kind: String,
+    pub schema_version: u64,
+    pub owner: String,
+    pub route_count: u64,
+    pub capability_count: u64,
+    pub p1_count: u64,
+    pub ai_visible_count: u64,
+    pub openapi_path_count: u64,
+    pub openai_tool_count: u64,
+    pub route_contract_parity: bool,
+    pub sample_routes: Vec<GatewayCapabilityRouteSummary>,
+    pub sample_tools: Vec<GatewayOpenAiToolSummary>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -169,14 +251,14 @@ pub struct MissionControlSummary {
     pub agent_count: u64,
     pub pending_approvals: u64,
     pub relation_count: u64,
+    pub execution_graph_count: u64,
+    pub conflict_count: u64,
+    pub evidence_count: u64,
+    pub capability_action_count: u64,
     pub event_count: u64,
-    pub command_pending: u64,
-    pub command_claimed: u64,
-    pub command_running: u64,
-    pub command_completed: u64,
-    pub command_failed: u64,
-    pub command_cancelled: u64,
-    pub command_total: u64,
+    pub control_ready_count: u64,
+    pub control_blocked_count: u64,
+    pub control_requires_approval_count: u64,
     pub sessions: Vec<MissionSessionSummary>,
 }
 
@@ -198,6 +280,10 @@ pub struct RuntimeControlSnapshot {
     pub memory_total_entries: Option<usize>,
     pub memory_vector_count: Option<usize>,
     pub memory_layer_counts: [usize; 5],
+    pub memory_context_envelope_status: Option<String>,
+    pub memory_context_envelope_compression: Option<String>,
+    pub memory_context_envelope_used_ratio: Option<u64>,
+    pub memory_context_envelope_checkpoint: Option<String>,
     pub cross_plane_grants_active: Option<u64>,
     pub cross_plane_actions_24h: Option<u64>,
     pub connector_accounts: Vec<ConnectorAccountSummary>,
@@ -207,7 +293,12 @@ pub struct RuntimeControlSnapshot {
     pub surfaces: Vec<SurfaceSummary>,
     pub surface_health: Option<SurfaceHealthSummary>,
     pub surface_events: Vec<SurfaceEventSummary>,
+    pub message_connectors: Vec<MessageConnectorSummary>,
+    pub message_endpoints: Vec<MessageEndpointSummary>,
+    pub message_routes: Vec<MessageRouteSummary>,
+    pub message_bindings: Vec<MessageBindingSummary>,
     pub cowd_kernel: Option<CowdKernelSummary>,
+    pub gateway_capability_contract: Option<GatewayCapabilityContractSummary>,
     pub structured_data: Option<StructuredDataSummary>,
     pub reality_core: Option<RealityCoreSummary>,
     pub fact_flow: Option<FactFlowSummary>,
@@ -270,6 +361,10 @@ impl RuntimeControlSnapshot {
             memory_total_entries: app.memory_total_entries,
             memory_vector_count: app.memory_vector_count,
             memory_layer_counts: app.memory_layer_counts,
+            memory_context_envelope_status: app.memory_context_envelope_status.clone(),
+            memory_context_envelope_compression: app.memory_context_envelope_compression.clone(),
+            memory_context_envelope_used_ratio: app.memory_context_envelope_used_ratio,
+            memory_context_envelope_checkpoint: app.memory_context_envelope_checkpoint.clone(),
             cross_plane_grants_active: app.gateway_cross_plane_grants_active,
             cross_plane_actions_24h: app.gateway_cross_plane_actions_24h,
             connector_accounts: app.gateway_connector_accounts.clone(),
@@ -279,7 +374,12 @@ impl RuntimeControlSnapshot {
             surfaces: app.gateway_surfaces.clone(),
             surface_health: app.gateway_surface_health.clone(),
             surface_events: app.gateway_surface_events.clone(),
+            message_connectors: app.gateway_message_connectors.clone(),
+            message_endpoints: app.gateway_message_endpoints.clone(),
+            message_routes: app.gateway_message_routes.clone(),
+            message_bindings: app.gateway_message_bindings.clone(),
             cowd_kernel: app.gateway_cowd_kernel.clone(),
+            gateway_capability_contract: app.gateway_capability_contract.clone(),
             structured_data: app.gateway_structured_data.clone(),
             reality_core: app.gateway_reality_core.clone(),
             fact_flow: app.gateway_fact_flow.clone(),
@@ -315,6 +415,10 @@ impl RuntimeControlSnapshot {
         app.memory_total_entries = self.memory_total_entries;
         app.memory_vector_count = self.memory_vector_count;
         app.memory_layer_counts = self.memory_layer_counts;
+        app.memory_context_envelope_status = self.memory_context_envelope_status.clone();
+        app.memory_context_envelope_compression = self.memory_context_envelope_compression.clone();
+        app.memory_context_envelope_used_ratio = self.memory_context_envelope_used_ratio;
+        app.memory_context_envelope_checkpoint = self.memory_context_envelope_checkpoint.clone();
         app.gateway_cross_plane_grants_active = self.cross_plane_grants_active;
         app.gateway_cross_plane_actions_24h = self.cross_plane_actions_24h;
         app.gateway_connector_accounts = self.connector_accounts.clone();
@@ -324,7 +428,12 @@ impl RuntimeControlSnapshot {
         app.gateway_surfaces = self.surfaces.clone();
         app.gateway_surface_health = self.surface_health.clone();
         app.gateway_surface_events = self.surface_events.clone();
+        app.gateway_message_connectors = self.message_connectors.clone();
+        app.gateway_message_endpoints = self.message_endpoints.clone();
+        app.gateway_message_routes = self.message_routes.clone();
+        app.gateway_message_bindings = self.message_bindings.clone();
         app.gateway_cowd_kernel = self.cowd_kernel.clone();
+        app.gateway_capability_contract = self.gateway_capability_contract.clone();
         app.gateway_structured_data = self.structured_data.clone();
         app.gateway_reality_core = self.reality_core.clone();
         app.gateway_fact_flow = self.fact_flow.clone();
@@ -427,6 +536,25 @@ impl RuntimeControlSnapshot {
             .and_then(serde_json::Value::as_u64)
             .map(|value| value as usize);
         self.memory_layer_counts = memory_layer_counts_from_json(value);
+        let envelope = value
+            .get("context_envelope_projection")
+            .or_else(|| value.pointer("/memory/context_envelope_projection"));
+        self.memory_context_envelope_status = envelope
+            .and_then(|item| item.get("status"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        self.memory_context_envelope_compression = envelope
+            .and_then(|item| item.get("compression_status"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        self.memory_context_envelope_used_ratio = envelope
+            .and_then(|item| item.get("used_ratio"))
+            .and_then(serde_json::Value::as_f64)
+            .map(|ratio| (ratio * 100.0).round().clamp(0.0, 100.0) as u64);
+        self.memory_context_envelope_checkpoint = envelope
+            .and_then(|item| item.get("latest_checkpoint_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
     }
 
     pub fn ingest_cross_plane_summary(&mut self, value: &serde_json::Value) {
@@ -494,6 +622,106 @@ impl RuntimeControlSnapshot {
                 .unwrap_or("unknown")
                 .to_string(),
             release_gate_failed_checks,
+        });
+    }
+
+    pub fn ingest_gateway_capability_contract(
+        &mut self,
+        contract: &serde_json::Value,
+        openai_tools: &serde_json::Value,
+    ) {
+        let coverage = contract.get("coverage").unwrap_or(&serde_json::Value::Null);
+        let tools = openai_tools
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let sample_tools = tools
+            .iter()
+            .filter_map(gateway_openai_tool_summary)
+            .take(8)
+            .collect::<Vec<_>>();
+        let sample_routes = contract
+            .get("capabilities")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|item| {
+                        item.pointer("/surface_visibility/tui")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false)
+                    })
+                    .filter_map(gateway_capability_route_summary)
+                    .take(14)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let contract_tool_count = coverage
+            .get("openai_tool_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        let actual_tool_count = openai_tools
+            .get("tool_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(tools.len() as u64);
+        if contract_tool_count != 0 && actual_tool_count != contract_tool_count {
+            self.degrade(format!(
+                "gateway openai tools count mismatch: contract={contract_tool_count}, tools={actual_tool_count}"
+            ));
+        }
+        self.gateway_capability_contract = Some(GatewayCapabilityContractSummary {
+            kind: contract
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("gateway.capability_contract")
+                .to_string(),
+            schema_version: contract
+                .get("schema_version")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            owner: contract
+                .get("owner")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("gateway")
+                .to_string(),
+            route_count: coverage
+                .get("route_count")
+                .and_then(serde_json::Value::as_u64)
+                .or_else(|| {
+                    contract
+                        .get("route_count")
+                        .and_then(serde_json::Value::as_u64)
+                })
+                .unwrap_or_default(),
+            capability_count: coverage
+                .get("capability_count")
+                .and_then(serde_json::Value::as_u64)
+                .or_else(|| {
+                    contract
+                        .get("capability_count")
+                        .and_then(serde_json::Value::as_u64)
+                })
+                .unwrap_or_default(),
+            p1_count: coverage
+                .get("p1_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            ai_visible_count: coverage
+                .get("ai_visible_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            openapi_path_count: coverage
+                .get("openapi_path_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            openai_tool_count: actual_tool_count,
+            route_contract_parity: coverage
+                .get("route_contract_parity")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            sample_routes,
+            sample_tools,
         });
     }
 
@@ -628,6 +856,27 @@ impl RuntimeControlSnapshot {
                 .or_else(|| projection.pointer("/relations/relation_count"))
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or_default(),
+            execution_graph_count: mission
+                .pointer("/execution_graph_projection/count")
+                .or_else(|| projection.pointer("/execution_graphs/count"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            conflict_count: mission
+                .pointer("/conflict_projection/count")
+                .or_else(|| projection.pointer("/conflicts/count"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            evidence_count: mission
+                .pointer("/evidence_projection/count")
+                .or_else(|| projection.pointer("/evidence/count"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            capability_action_count: mission
+                .pointer("/capability_projection/action_contracts")
+                .or_else(|| projection.pointer("/capabilities/action_contracts"))
+                .and_then(serde_json::Value::as_array)
+                .map(|items| items.len() as u64)
+                .unwrap_or_default(),
             event_count: mission
                 .get("events")
                 .and_then(serde_json::Value::as_array)
@@ -639,34 +888,28 @@ impl RuntimeControlSnapshot {
                         .map(|events| events.len() as u64)
                 })
                 .unwrap_or_default(),
-            command_pending: mission
-                .pointer("/session_command_summary/pending")
+            control_ready_count: projection
+                .pointer("/control_readiness/ready_count")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or_default(),
-            command_claimed: mission
-                .pointer("/session_command_summary/claimed")
+            control_blocked_count: projection
+                .pointer("/control_readiness/blocked_count")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or_default(),
-            command_running: mission
-                .pointer("/session_command_summary/running")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or_default(),
-            command_completed: mission
-                .pointer("/session_command_summary/completed")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or_default(),
-            command_failed: mission
-                .pointer("/session_command_summary/failed")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or_default(),
-            command_cancelled: mission
-                .pointer("/session_command_summary/cancelled")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or_default(),
-            command_total: mission
-                .get("session_commands")
+            control_requires_approval_count: projection
+                .pointer("/control_readiness/actions")
                 .and_then(serde_json::Value::as_array)
-                .map(|commands| commands.len() as u64)
+                .map(|actions| {
+                    actions
+                        .iter()
+                        .filter(|action| {
+                            action
+                                .get("requires_approval")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false)
+                        })
+                        .count() as u64
+                })
                 .unwrap_or_default(),
             sessions,
         });
@@ -836,6 +1079,58 @@ impl RuntimeControlSnapshot {
         self.surface_events.truncate(24);
     }
 
+    pub fn ingest_message_connectors(&mut self, value: &serde_json::Value) {
+        self.message_connectors = value
+            .get("connectors")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(message_connector_from_json)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+    }
+
+    pub fn ingest_message_endpoints(&mut self, value: &serde_json::Value) {
+        self.message_endpoints = value
+            .get("endpoints")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(message_endpoint_from_json)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+    }
+
+    pub fn ingest_message_routes(&mut self, value: &serde_json::Value) {
+        self.message_routes = value
+            .get("routes")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(message_route_from_json)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+    }
+
+    pub fn ingest_message_bindings(&mut self, value: &serde_json::Value) {
+        self.message_bindings = value
+            .get("bindings")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(message_binding_from_json)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+    }
+
     pub fn begin_surface_event_refresh(&mut self) {
         self.surface_events.clear();
     }
@@ -863,25 +1158,6 @@ impl RuntimeControlLocalStore {
 
     pub fn apply_to_app(&self, app: &mut App) {
         self.snapshot.apply_to_app(app);
-    }
-
-    pub fn apply_approval_response(&mut self, approval_id: &str) {
-        self.snapshot
-            .approval_items
-            .retain(|approval| approval.id != approval_id);
-        self.snapshot.pending_approvals = Some(self.snapshot.approval_items.len() as u64);
-    }
-
-    pub fn apply_task_status(&mut self, task_id: &str, status: &str) {
-        for task in &mut self.snapshot.tasks {
-            if task.id == task_id {
-                task.status = status.to_string();
-                if matches!(status, "completed" | "cancelled" | "canceled") {
-                    task.blocker_reason = None;
-                }
-            }
-        }
-        self.snapshot.task_count = Some(self.snapshot.tasks.len() as u64);
     }
 
     pub fn apply_connector_resource_state(&mut self, reference: &str, state: &str) {
@@ -1108,6 +1384,72 @@ fn structured_samples(value: &serde_json::Value, keys: &[&str]) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+fn gateway_capability_route_summary(
+    value: &serde_json::Value,
+) -> Option<GatewayCapabilityRouteSummary> {
+    let http = value.get("http")?;
+    Some(GatewayCapabilityRouteSummary {
+        id: value
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+            .to_string(),
+        domain: value
+            .get("domain")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("gateway")
+            .to_string(),
+        title: value
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+            .to_string(),
+        method: http
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("GET")
+            .to_string(),
+        path: http
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+            .to_string(),
+        risk: value
+            .get("risk")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        criticality: http
+            .get("criticality")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("p2")
+            .to_string(),
+    })
+}
+
+fn gateway_openai_tool_summary(value: &serde_json::Value) -> Option<GatewayOpenAiToolSummary> {
+    let function = value.get("function")?;
+    let parameters = function
+        .get("parameters")
+        .and_then(|item| item.get("properties"))
+        .and_then(serde_json::Value::as_object)
+        .map(|properties| properties.len() as u64)
+        .unwrap_or_default();
+    Some(GatewayOpenAiToolSummary {
+        name: function
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+            .to_string(),
+        description: function
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        parameter_count: parameters,
+    })
 }
 
 fn reality_component_status(value: &serde_json::Value, component: &str) -> String {
@@ -1398,6 +1740,112 @@ fn surface_event_summary_from_json(
     })
 }
 
+fn message_connector_from_json(value: &serde_json::Value) -> Option<MessageConnectorSummary> {
+    let connector = json_string(value, &["connector", "id", "platform_type"])?;
+    let runtime = value.get("runtime").unwrap_or(&serde_json::Value::Null);
+    Some(MessageConnectorSummary {
+        name: json_string(value, &["name"]).unwrap_or_else(|| connector.clone()),
+        configuration_status: json_string(value, &["configuration_status", "status"])
+            .unwrap_or_else(|| "unknown".to_string()),
+        runtime_status: json_string(runtime, &["status"]).unwrap_or_else(|| {
+            if runtime.is_null() {
+                "not_running".to_string()
+            } else {
+                "unknown".to_string()
+            }
+        }),
+        enabled: value
+            .get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        configured: value
+            .get("configured")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        capability_count: json_array_len(value, "capabilities"),
+        missing_required_count: json_array_len(value, "missing_required"),
+        consecutive_failures: runtime
+            .get("consecutive_failures")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+        restart_count: runtime
+            .get("restart_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+        circuit_open: runtime
+            .get("circuit_open")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        connector,
+    })
+}
+
+fn message_endpoint_from_json(value: &serde_json::Value) -> Option<MessageEndpointSummary> {
+    let endpoint_id = json_string(value, &["endpoint_id", "id"])?;
+    Some(MessageEndpointSummary {
+        connector: json_string(value, &["connector"]).unwrap_or_else(|| "unknown".to_string()),
+        kind: json_string(value, &["kind"]).unwrap_or_else(|| "unknown".to_string()),
+        status: json_string(value, &["status"]).unwrap_or_else(|| "unknown".to_string()),
+        configured: value
+            .get("configured")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        capability_count: json_array_len(value, "capabilities"),
+        endpoint_id,
+    })
+}
+
+fn message_route_from_json(value: &serde_json::Value) -> Option<MessageRouteSummary> {
+    let route_id = json_string(value, &["route_id", "id"])?;
+    let runtime = value.get("runtime").unwrap_or(&serde_json::Value::Null);
+    Some(MessageRouteSummary {
+        connector: json_string(value, &["connector"]).unwrap_or_else(|| "unknown".to_string()),
+        policy: json_string(value, &["policy"]).unwrap_or_else(|| "origin".to_string()),
+        status: json_string(value, &["status"]).unwrap_or_else(|| "unknown".to_string()),
+        configured: value
+            .get("configured")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        capability_count: json_array_len(value, "capabilities"),
+        runtime_status: json_string(runtime, &["status"]).unwrap_or_else(|| {
+            if runtime.is_null() {
+                "not_running".to_string()
+            } else {
+                "unknown".to_string()
+            }
+        }),
+        route_id,
+    })
+}
+
+fn message_binding_from_json(value: &serde_json::Value) -> Option<MessageBindingSummary> {
+    let binding_id = json_string(value, &["binding_id", "id"])?;
+    Some(MessageBindingSummary {
+        connector: json_string(value, &["connector"]).unwrap_or_else(|| "unknown".to_string()),
+        endpoint: json_string(value, &["endpoint"]).unwrap_or_else(|| "-".to_string()),
+        direction: json_string(value, &["direction"]).unwrap_or_else(|| "unknown".to_string()),
+        status: json_string(value, &["status", "outbound_status"])
+            .unwrap_or_else(|| "unknown".to_string()),
+        runtime_session_id: json_string(value, &["runtime_session_id", "source_session_id"]),
+        resource_count: value
+            .get("resource_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+        last_seen_at_ms: value
+            .get("last_seen_at_ms")
+            .and_then(serde_json::Value::as_u64),
+        binding_id,
+    })
+}
+
+fn json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .filter_map(|key| value.get(*key).and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .find(|item| !item.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn truncate_json(value: &serde_json::Value) -> String {
     let rendered = value.to_string();
     if rendered.chars().count() <= 96 {
@@ -1514,6 +1962,26 @@ pub async fn refresh_runtime_control_snapshot(
             ));
         }
     }
+    let (gateway_contract, openai_tools) = tokio::join!(
+        projection.gateway_capability_contract(),
+        projection.gateway_openai_tools()
+    );
+    match (gateway_contract, openai_tools) {
+        (Ok(contract), Ok(tools)) => snapshot.ingest_gateway_capability_contract(&contract, &tools),
+        (contract, tools) => {
+            let mut reasons = Vec::new();
+            if let Err(err) = contract {
+                reasons.push(format!("contract: {err}"));
+            }
+            if let Err(err) = tools {
+                reasons.push(format!("openai tools: {err}"));
+            }
+            snapshot.degrade(format!(
+                "gateway capability contract unavailable: {}",
+                reasons.join("; ")
+            ));
+        }
+    }
     let (sources, facts, evidence, watermarks) = tokio::join!(
         projection.structured_sources(),
         projection.structured_facts(),
@@ -1559,6 +2027,44 @@ pub async fn refresh_runtime_control_snapshot(
     match projection.connector_resources(None, 20, 0).await {
         Ok(value) => snapshot.ingest_connector_resources(&value),
         Err(err) => snapshot.degrade(format!("connector resources unavailable: {err}")),
+    }
+    let (message_connectors, message_endpoints, message_routes, message_bindings) = tokio::join!(
+        projection.message_connectors(),
+        projection.message_endpoints(),
+        projection.message_routes(),
+        projection.message_bindings()
+    );
+    match (
+        message_connectors,
+        message_endpoints,
+        message_routes,
+        message_bindings,
+    ) {
+        (Ok(connectors), Ok(endpoints), Ok(routes), Ok(bindings)) => {
+            snapshot.ingest_message_connectors(&connectors);
+            snapshot.ingest_message_endpoints(&endpoints);
+            snapshot.ingest_message_routes(&routes);
+            snapshot.ingest_message_bindings(&bindings);
+        }
+        (connectors, endpoints, routes, bindings) => {
+            let mut reasons = Vec::new();
+            if let Err(err) = connectors {
+                reasons.push(format!("connectors: {err}"));
+            }
+            if let Err(err) = endpoints {
+                reasons.push(format!("endpoints: {err}"));
+            }
+            if let Err(err) = routes {
+                reasons.push(format!("routes: {err}"));
+            }
+            if let Err(err) = bindings {
+                reasons.push(format!("bindings: {err}"));
+            }
+            snapshot.degrade(format!(
+                "message plane projection unavailable: {}",
+                reasons.join("; ")
+            ));
+        }
     }
     match projection.surface_registry().await {
         Ok(value) => snapshot.ingest_surface_registry(&value),
@@ -1621,6 +2127,85 @@ mod tests {
             "sessions": ["s1", "s2"],
             "leases": {"total": 0, "items": []},
         })
+    }
+
+    #[test]
+    fn snapshot_ingests_gateway_capability_contract_summary() {
+        let mut snapshot = RuntimeControlSnapshot::from_gateway_snapshot(&gateway_snapshot());
+        snapshot.ingest_gateway_capability_contract(
+            &serde_json::json!({
+                "kind": "gateway.capability_contract",
+                "schema_version": 1,
+                "owner": "gateway",
+                "route_count": 2,
+                "capability_count": 2,
+                "coverage": {
+                    "route_count": 2,
+                    "capability_count": 2,
+                    "p1_count": 1,
+                    "ai_visible_count": 2,
+                    "openapi_path_count": 2,
+                    "openai_tool_count": 1,
+                    "route_contract_parity": true
+                },
+                "capabilities": [
+                    {
+                        "id": "gateway.surface.get",
+                        "domain": "surface",
+                        "title": "Surface registry",
+                        "risk": "external",
+                        "http": {"method": "GET", "path": "/api/surfaces", "criticality": "p1"},
+                        "surface_visibility": {"tui": true}
+                    },
+                    {
+                        "id": "gateway.hidden.get",
+                        "domain": "gateway",
+                        "title": "Hidden",
+                        "risk": "read",
+                        "http": {"method": "GET", "path": "/api/hidden", "criticality": "p2"},
+                        "surface_visibility": {"tui": false}
+                    }
+                ]
+            }),
+            &serde_json::json!({
+                "kind": "gateway.openai_tools",
+                "tool_count": 1,
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "gateway_get_api_sessions",
+                            "description": "List sessions",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"limit": {"type": "integer"}}
+                            }
+                        }
+                    }
+                ]
+            }),
+        );
+
+        let contract = snapshot
+            .gateway_capability_contract
+            .as_ref()
+            .expect("contract summary");
+        assert_eq!(contract.kind, "gateway.capability_contract");
+        assert_eq!(contract.route_count, 2);
+        assert_eq!(contract.capability_count, 2);
+        assert!(contract.route_contract_parity);
+        assert_eq!(contract.sample_routes.len(), 1);
+        assert_eq!(contract.sample_routes[0].path, "/api/surfaces");
+        assert_eq!(contract.sample_tools[0].name, "gateway_get_api_sessions");
+        assert_eq!(contract.sample_tools[0].parameter_count, 1);
+
+        let mut app = App::new("test-model", "session-test");
+        snapshot.apply_to_app(&mut app);
+        let restored = RuntimeControlSnapshot::from_app(&app);
+        assert_eq!(
+            restored.gateway_capability_contract,
+            snapshot.gateway_capability_contract
+        );
     }
 
     #[test]
@@ -1711,6 +2296,87 @@ mod tests {
             snapshot.connector_degraded_reasons[0],
             "resource directory unavailable"
         );
+    }
+
+    #[test]
+    fn snapshot_extracts_message_plane_and_round_trips_through_app() {
+        let mut snapshot = RuntimeControlSnapshot::from_gateway_snapshot(&gateway_snapshot());
+        snapshot.ingest_message_connectors(&serde_json::json!({
+            "kind": "message.connector.registry",
+            "connectors": [{
+                "connector": "feishu",
+                "name": "feishu",
+                "configuration_status": "configured",
+                "configured": true,
+                "enabled": true,
+                "missing_required": [],
+                "capabilities": ["message.send.text", "message.send.image"],
+                "runtime": {
+                    "status": "ready",
+                    "consecutive_failures": 0,
+                    "restart_count": 1,
+                    "circuit_open": false
+                }
+            }]
+        }));
+        snapshot.ingest_message_endpoints(&serde_json::json!({
+            "kind": "message.endpoint.directory",
+            "endpoints": [{
+                "endpoint_id": "message:feishu:user",
+                "connector": "feishu",
+                "kind": "User",
+                "configured": true,
+                "status": "configured",
+                "capabilities": ["message.send.text"]
+            }]
+        }));
+        snapshot.ingest_message_routes(&serde_json::json!({
+            "kind": "message.delivery.routes",
+            "routes": [{
+                "route_id": "message:feishu:default",
+                "connector": "feishu",
+                "policy": "origin",
+                "status": "configured",
+                "configured": true,
+                "capabilities": ["message.send.text"],
+                "runtime": {"status": "ready"}
+            }]
+        }));
+        snapshot.ingest_message_bindings(&serde_json::json!({
+            "kind": "message.conversation.bindings",
+            "bindings": [{
+                "binding_id": "message:feishu:user-1:thread-1",
+                "connector": "feishu",
+                "endpoint": "user-1",
+                "direction": "inbound",
+                "status": "processed",
+                "runtime_session_id": "session-feishu",
+                "resource_count": 2,
+                "last_seen_at_ms": 42
+            }]
+        }));
+
+        assert_eq!(snapshot.message_connectors.len(), 1);
+        assert_eq!(snapshot.message_connectors[0].runtime_status, "ready");
+        assert_eq!(snapshot.message_connectors[0].capability_count, 2);
+        assert_eq!(snapshot.message_endpoints[0].kind, "User");
+        assert_eq!(snapshot.message_routes[0].runtime_status, "ready");
+        assert_eq!(
+            snapshot.message_bindings[0].runtime_session_id.as_deref(),
+            Some("session-feishu")
+        );
+        assert_eq!(snapshot.message_bindings[0].resource_count, 2);
+
+        let mut app = App::new("model", "session-message-plane");
+        snapshot.apply_to_app(&mut app);
+        assert_eq!(app.gateway_message_connectors.len(), 1);
+        assert_eq!(app.gateway_message_bindings[0].status, "processed");
+
+        let restored = RuntimeControlSnapshot::from_app(&app);
+        assert_eq!(restored.message_connectors, snapshot.message_connectors);
+        assert_eq!(restored.message_endpoints, snapshot.message_endpoints);
+        assert_eq!(restored.message_routes, snapshot.message_routes);
+        assert_eq!(restored.message_bindings, snapshot.message_bindings);
     }
 
     #[test]
@@ -1833,6 +2499,14 @@ mod tests {
         let mut snapshot = RuntimeControlSnapshot::from_gateway_snapshot(&gateway_snapshot());
         snapshot.ingest_mission_projection(&serde_json::json!({
             "envelope": {"service": "mission"},
+            "control_readiness": {
+                "ready_count": 5,
+                "blocked_count": 2,
+                "actions": [
+                    {"action": "session.dispatch", "requires_approval": false},
+                    {"action": "approval.decide", "requires_approval": true}
+                ]
+            },
             "mission": {
                 "kind": "mission.runtime",
                 "active_session_id": "session-a",
@@ -1853,17 +2527,17 @@ mod tests {
                     }
                 ],
                 "events": [{"sequence": 1}, {"sequence": 2}],
-                "session_command_summary": {
-                    "pending": 2,
-                    "claimed": 1,
-                    "running": 1,
-                    "completed": 3,
-                    "failed": 1,
-                    "cancelled": 0
-                },
-                "session_commands": [{"command_id": "a"}, {"command_id": "b"}],
                 "approval_projection": {"pending_count": 3},
-                "relation_projection": {"relation_count": 4}
+                "relation_projection": {"relation_count": 4},
+                "execution_graph_projection": {"count": 2},
+                "conflict_projection": {"count": 1},
+                "evidence_projection": {"count": 5},
+                "capability_projection": {
+                    "action_contracts": [
+                        {"runtime_action": "use_team_template"},
+                        {"runtime_action": "parallel_tool_batch"}
+                    ]
+                }
             }
         }));
 
@@ -1879,14 +2553,14 @@ mod tests {
         assert_eq!(mission.agent_count, 2);
         assert_eq!(mission.pending_approvals, 3);
         assert_eq!(mission.relation_count, 4);
+        assert_eq!(mission.execution_graph_count, 2);
+        assert_eq!(mission.conflict_count, 1);
+        assert_eq!(mission.evidence_count, 5);
+        assert_eq!(mission.capability_action_count, 2);
         assert_eq!(mission.event_count, 2);
-        assert_eq!(mission.command_pending, 2);
-        assert_eq!(mission.command_claimed, 1);
-        assert_eq!(mission.command_running, 1);
-        assert_eq!(mission.command_completed, 3);
-        assert_eq!(mission.command_failed, 1);
-        assert_eq!(mission.command_cancelled, 0);
-        assert_eq!(mission.command_total, 2);
+        assert_eq!(mission.control_ready_count, 5);
+        assert_eq!(mission.control_blocked_count, 2);
+        assert_eq!(mission.control_requires_approval_count, 1);
     }
 
     #[test]
@@ -1941,14 +2615,14 @@ mod tests {
                 agent_count: 2,
                 pending_approvals: 0,
                 relation_count: 0,
+                execution_graph_count: 0,
+                conflict_count: 0,
+                evidence_count: 0,
+                capability_action_count: 0,
                 event_count: 1,
-                command_pending: 0,
-                command_claimed: 0,
-                command_running: 0,
-                command_completed: 0,
-                command_failed: 0,
-                command_cancelled: 0,
-                command_total: 0,
+                control_ready_count: 2,
+                control_blocked_count: 1,
+                control_requires_approval_count: 0,
                 sessions: vec![MissionSessionSummary {
                     session_id: "session-cowd-structured".to_string(),
                     title: "structured task".to_string(),
@@ -2130,7 +2804,7 @@ mod tests {
     }
 
     #[test]
-    fn local_store_applies_runtime_mutations_and_receipt_limits() {
+    fn local_store_records_receipts_without_mutating_gateway_lifecycle() {
         let mut app = App::new("claude-sonnet-4-6", "session-local-store");
         app.gateway_approval_items = vec![ApprovalSummary {
             id: "approval-1".to_string(),
@@ -2161,8 +2835,6 @@ mod tests {
         }];
 
         let mut store = RuntimeControlLocalStore::from_app(&app);
-        store.apply_approval_response("approval-1");
-        store.apply_task_status("task-1", "completed");
         store.apply_connector_resource_state("service://local.docs/document/1", "stale");
         store.push_action_receipt(
             "failed",
@@ -2173,10 +2845,13 @@ mod tests {
         );
         store.apply_to_app(&mut app);
 
-        assert_eq!(app.gateway_pending_approvals, Some(0));
-        assert!(app.gateway_approval_items.is_empty());
-        assert_eq!(app.gateway_tasks[0].status, "completed");
-        assert_eq!(app.gateway_tasks[0].blocker_reason, None);
+        assert_eq!(app.gateway_pending_approvals, Some(1));
+        assert_eq!(app.gateway_approval_items.len(), 1);
+        assert_eq!(app.gateway_tasks[0].status, "blocked");
+        assert_eq!(
+            app.gateway_tasks[0].blocker_reason.as_deref(),
+            Some("waiting")
+        );
         assert_eq!(app.gateway_connector_resources[0].indexed_state, "stale");
         assert_eq!(app.gateway_action_receipts.len(), 1);
         assert_eq!(

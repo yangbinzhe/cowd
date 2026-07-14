@@ -243,7 +243,7 @@ fn evidence_health(app: &App) -> String {
         .map(Vec::len)
         .unwrap_or_default();
     let memory_count = app
-        .latest_workgraph_summary
+        .latest_execution_graph_summary
         .as_ref()
         .map(|summary| summary.memory_candidates)
         .unwrap_or_default();
@@ -351,11 +351,12 @@ mod tests {
             "selected": [{"id": "a"}, {"id": "b"}],
             "omitted": []
         }));
-        app.latest_workgraph_summary = Some(crate::RuntimeWorkGraphSummary {
+        app.latest_execution_graph_summary = Some(crate::RuntimeExecutionGraphSummary {
             graph_id: None,
             board_id: None,
             status: "ready".into(),
             agent_tasks: 0,
+            child_executions: 0,
             memory_candidates: 3,
             conflicts: 0,
             completion_rate: None,

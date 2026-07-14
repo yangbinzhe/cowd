@@ -49,7 +49,14 @@ pub struct RewooEvidenceResult {
 
 #[must_use]
 pub fn rewoo_plan_for_intent(intent: &str) -> RewooEvidencePlan {
-    let evidence_plan = plan_evidence(intent);
+    rewoo_plan_for_intent_with_evidence_plan(intent, plan_evidence(intent))
+}
+
+#[must_use]
+pub fn rewoo_plan_for_intent_with_evidence_plan(
+    intent: &str,
+    evidence_plan: EvidencePlan,
+) -> RewooEvidencePlan {
     let steps = evidence_plan
         .recommended_calls
         .iter()

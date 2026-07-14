@@ -1,19 +1,25 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
-    extract::{Path, Query, State as AxumState},
+    extract::{Extension, Path, Query, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
-use memory::store::session::{SessionEvent, SessionListOptions, SessionRecord};
+use memory::store::session::{
+    SessionEvent, SessionListOptions, SessionMissionOutboxOperation, SessionMissionOutboxRequest,
+    SessionRecord,
+};
 use serde::{Deserialize, Serialize};
 
-use super::{abort_active_turn, new_api_session_record, AppState, ErrorResponse};
+use super::{
+    new_api_session_record, surface_actor_id, AppState, AuthenticatedPrincipal, ErrorResponse,
+};
 use crate::services::{
     SessionMessageCounts, SessionStatsSnapshot, SessionTokenCounts, SessionUpdateRequest,
 };
@@ -43,6 +49,8 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         )
         .route("/api/sessions/:id/events", get(get_session_events))
         .route("/api/sessions/:id/runs", get(get_session_runs))
+        .route("/api/sessions/:id/turns", get(get_session_turns))
+        .route("/api/sessions/:id/turns/:turn_id", get(get_session_turn))
         .route("/api/sessions/:id/projection", get(get_session_projection))
         .route("/api/sessions/:id/compact", post(compact_session_handler))
         .route("/api/sessions/:id/stats", get(get_session_stats_handler))
@@ -109,15 +117,73 @@ fn default_session_model(state: &AppState) -> String {
         .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string())
 }
 
+fn session_provider_registry(
+    state: &AppState,
+) -> Result<Arc<runtime::ProviderRegistry>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .runtime
+        .as_ref()
+        .map(|service| service.provider_registry())
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "runtime provider registry unavailable".to_string(),
+                }),
+            )
+        })
+}
+
+fn session_tool_host(
+    state: &AppState,
+) -> Result<Arc<tools::ToolHost>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .runtime
+        .as_ref()
+        .map(|service| service.tool_host())
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "runtime tool host unavailable".to_string(),
+                }),
+            )
+        })
+}
+
+fn session_runtime_services(
+    state: &AppState,
+) -> Result<Arc<runtime::RuntimeServices>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .runtime
+        .as_ref()
+        .map(|service| service.runtime_services())
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "runtime services unavailable".to_string(),
+                }),
+            )
+        })
+}
+
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GetEventsParams {
     #[serde(default)]
     from_seq: Option<usize>,
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    include_payload: Option<bool>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SearchMessagesParams {
     q: String,
     #[serde(default = "default_search_limit")]
@@ -125,19 +191,21 @@ struct SearchMessagesParams {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SessionAttachRequest {
-    actor_id: String,
     surface: String,
     #[serde(default)]
     role: Option<String>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SessionDetachRequest {
-    actor_id: String,
+    surface: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SessionReplayParams {
     #[serde(default)]
     from_sequence: Option<usize>,
@@ -152,13 +220,15 @@ fn default_search_limit() -> usize {
 async fn attach_session_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(body): Json<SessionAttachRequest>,
 ) -> Json<serde_json::Value> {
+    let actor_id = surface_actor_id(&principal, &body.surface);
     Json(
         state
             .services
             .session
-            .attach_session_value(&id, &body.actor_id, &body.surface, body.role.as_deref())
+            .attach_session_value(&id, &actor_id, &body.surface, body.role.as_deref())
             .await,
     )
 }
@@ -166,13 +236,15 @@ async fn attach_session_handler(
 async fn detach_session_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(body): Json<SessionDetachRequest>,
 ) -> Json<serde_json::Value> {
+    let actor_id = surface_actor_id(&principal, &body.surface);
     Json(
         state
             .services
             .session
-            .detach_session_value(&id, &body.actor_id)
+            .detach_session_value(&id, &actor_id)
             .await,
     )
 }
@@ -228,9 +300,8 @@ struct SearchMessagesResponse {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CancelSessionTurnRequest {
-    #[serde(default)]
-    actor_id: Option<String>,
     #[serde(default)]
     reason: Option<String>,
 }
@@ -367,6 +438,8 @@ async fn create_session(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(body): Json<CreateSessionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let provider_registry = session_provider_registry(&state)?;
+    let tool_host = session_tool_host(&state)?;
     let session_id = uuid::Uuid::new_v4().to_string();
     tracing::info!(%session_id, "API session create requested");
 
@@ -378,6 +451,9 @@ async fn create_session(
     let runtime = if let Some(store) = state.services.session.unified_store() {
         crate::runtime_factory::create_runtime_entry_with_session_store(
             store.clone(),
+            session_runtime_services(&state)?,
+            Arc::clone(&provider_registry),
+            Arc::clone(&tool_host),
             session,
             &session_id,
             model.clone(),
@@ -391,6 +467,9 @@ async fn create_session(
         )
     } else {
         crate::runtime_factory::create_runtime_entry(
+            session_runtime_services(&state)?,
+            Arc::clone(&provider_registry),
+            Arc::clone(&tool_host),
             session,
             &session_id,
             model.clone(),
@@ -431,30 +510,115 @@ async fn create_session(
 
     let mut info = active_session_info(session_id.clone());
     if state.services.session.has_unified_store() {
-        let record = new_api_session_record(&session_id, Some(model));
-        state
-            .services
-            .session
-            .upsert_stored_session(&record)
-            .await
-            .map_err(|error| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("failed to persist session: {error}"),
-                    }),
-                )
-            })?;
+        let mut record = new_api_session_record(&session_id, Some(model));
+        persist_session_with_mission_registration(&state, &mut record, "API session").await?;
         info = session_info_from_record(record);
     }
 
     Ok((StatusCode::CREATED, Json(info)))
 }
 
+fn mission_outbox_request(
+    state: &AppState,
+    record: &SessionRecord,
+    title: &str,
+    operation: SessionMissionOutboxOperation,
+) -> Result<SessionMissionOutboxRequest, (StatusCode, Json<ErrorResponse>)> {
+    let services = session_runtime_services(state)?;
+    let operation_name = match operation {
+        SessionMissionOutboxOperation::Register => "register",
+        SessionMissionOutboxOperation::Start => "start",
+        SessionMissionOutboxOperation::Close => "close",
+    };
+    Ok(SessionMissionOutboxRequest {
+        request_id: format!(
+            "mission:{}:{operation_name}:{}:{}",
+            services.workspace_key(),
+            record.session_id,
+            record.created_at,
+        ),
+        session_id: record.session_id.clone(),
+        title: title.to_string(),
+        workspace_key: services.workspace_key().to_string(),
+        operation,
+        created_at_ms: current_time_ms(),
+    })
+}
+
+fn bind_session_workspace(record: &mut SessionRecord, state: &AppState) {
+    let mut metadata = record
+        .metadata_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    metadata["workspace_root"] =
+        serde_json::Value::String(state.workspace_root.display().to_string());
+    record.metadata_json = Some(metadata.to_string());
+}
+
+fn session_title(record: &SessionRecord) -> String {
+    record
+        .metadata_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        .and_then(|value| {
+            value
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "Session {}",
+                &record.session_id[..record.session_id.len().min(8)]
+            )
+        })
+}
+
+fn current_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+async fn persist_session_with_mission_registration(
+    state: &AppState,
+    record: &mut SessionRecord,
+    title: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    bind_session_workspace(record, state);
+    let request = mission_outbox_request(
+        state,
+        record,
+        title,
+        SessionMissionOutboxOperation::Register,
+    )?;
+    state
+        .services
+        .session
+        .upsert_stored_session_with_mission_outbox(record, &request)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to persist session and Mission registration: {error}"),
+                }),
+            )
+        })?;
+    Ok(())
+}
+
 async fn branch_session_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let provider_registry = session_provider_registry(&state)?;
+    let tool_host = session_tool_host(&state)?;
     if id.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -511,6 +675,9 @@ async fn branch_session_handler(
     let runtime = if let Some(store) = state.services.session.unified_store() {
         crate::runtime_factory::create_runtime_entry_with_session_store(
             store.clone(),
+            session_runtime_services(&state)?,
+            Arc::clone(&provider_registry),
+            Arc::clone(&tool_host),
             session,
             &branch_id,
             model.clone(),
@@ -524,6 +691,9 @@ async fn branch_session_handler(
         )
     } else {
         crate::runtime_factory::create_runtime_entry(
+            session_runtime_services(&state)?,
+            Arc::clone(&provider_registry),
+            Arc::clone(&tool_host),
             session,
             &branch_id,
             model.clone(),
@@ -574,19 +744,12 @@ async fn branch_session_handler(
             })
             .to_string(),
         );
-        state
-            .services
-            .session
-            .upsert_stored_session(&record)
-            .await
-            .map_err(|error| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("failed to persist branch session: {error}"),
-                    }),
-                )
-            })?;
+        persist_session_with_mission_registration(
+            &state,
+            &mut record,
+            &format!("{} / branch", source_title),
+        )
+        .await?;
         copied_messages = state
             .services
             .session
@@ -655,6 +818,8 @@ async fn ensure_session_handler(
     Path(id): Path<String>,
     Json(body): Json<CreateSessionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let provider_registry = session_provider_registry(&state)?;
+    let tool_host = session_tool_host(&state)?;
     if id.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -679,6 +844,9 @@ async fn ensure_session_handler(
         let runtime = if let Some(store) = state.services.session.unified_store() {
             crate::runtime_factory::create_runtime_entry_with_session_store(
                 store.clone(),
+                session_runtime_services(&state)?,
+                Arc::clone(&provider_registry),
+                Arc::clone(&tool_host),
                 session,
                 &id,
                 model.clone(),
@@ -692,6 +860,9 @@ async fn ensure_session_handler(
             )
         } else {
             crate::runtime_factory::create_runtime_entry(
+                session_runtime_services(&state)?,
+                Arc::clone(&provider_registry),
+                Arc::clone(&tool_host),
                 session,
                 &id,
                 model.clone(),
@@ -739,22 +910,31 @@ async fn ensure_session_handler(
                 .flatten()
                 .is_none()
         {
-            let record = new_api_session_record(&id, Some(model));
+            let mut record = new_api_session_record(&id, Some(model));
+            persist_session_with_mission_registration(&state, &mut record, "Ensured API session")
+                .await?;
+        }
+        created = true;
+    }
+    if state.services.session.has_unified_store() {
+        if let Some(mut record) =
             state
                 .services
                 .session
-                .upsert_stored_session(&record)
+                .stored_session(&id)
                 .await
                 .map_err(|error| {
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(ErrorResponse {
-                            error: format!("failed to persist session: {error}"),
+                            error: format!("failed to load ensured session: {error}"),
                         }),
                     )
-                })?;
+                })?
+        {
+            persist_session_with_mission_registration(&state, &mut record, "Ensured API session")
+                .await?;
         }
-        created = true;
     }
 
     Ok(Json(serde_json::json!({
@@ -804,6 +984,7 @@ async fn get_session(
 async fn cancel_session_turn_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(body): Json<CancelSessionTurnRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     if id.trim().is_empty() {
@@ -837,19 +1018,14 @@ async fn cancel_session_turn_handler(
         ));
     }
 
-    let actor_id = body
-        .actor_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("unknown");
+    let actor_id = format!("principal:{}", principal.0.claims().principal_id);
     let reason = body
         .reason
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("user_requested");
-    let aborted_run_id = abort_active_turn(&id);
+    let aborted_run_id: Option<String> = None;
     let event = serde_json::json!({
         "type": "TurnCancelRequested",
         "session_id": id,
@@ -860,19 +1036,6 @@ async fn cancel_session_turn_handler(
         "run_id": aborted_run_id,
     });
     state.event_bus().broadcast(&id, &event.to_string()).await;
-    state
-        .services
-        .session
-        .append_timeline_event(&id, "TurnCancelRequested", event.clone())
-        .await
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("failed to persist cancel request: {error}"),
-                }),
-            )
-        })?;
 
     Ok(Json(serde_json::json!({
         "ok": true,
@@ -894,19 +1057,42 @@ async fn delete_session(
         .runtime
         .as_ref()
         .is_some_and(|runtime_service| runtime_service.remove_active_runtime_if_present(&id));
-    let removed_stored = state
+    let removed_stored = if let Some(record) = state
         .services
         .session
-        .delete_stored_session(&id)
+        .stored_session(&id)
         .await
         .map_err(|error| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
-                    error: format!("failed to delete session: {error}"),
+                    error: format!("failed to load session before deletion: {error}"),
                 }),
             )
-        })?;
+        })? {
+        let title = session_title(&record);
+        let request = mission_outbox_request(
+            &state,
+            &record,
+            &title,
+            SessionMissionOutboxOperation::Close,
+        )?;
+        state
+            .services
+            .session
+            .delete_stored_session_with_mission_outbox(&request)
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("failed to delete session and queue Mission close: {error}"),
+                    }),
+                )
+            })?
+    } else {
+        false
+    };
 
     if removed_active || removed_stored {
         Ok(StatusCode::NO_CONTENT)
@@ -927,6 +1113,7 @@ async fn get_session_events(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let from_seq = params.from_seq.unwrap_or(0);
     let limit = params.limit.unwrap_or(100).min(500);
+    let include_payload = params.include_payload.unwrap_or(false);
     let Some((total, stored_events)) = state
         .services
         .session
@@ -953,6 +1140,8 @@ async fn get_session_events(
         .map(|event| {
             let payload = serde_json::from_str::<serde_json::Value>(&event.event_json)
                 .unwrap_or_else(|_| serde_json::json!({ "raw": event.event_json }));
+            let payload =
+                session_event_payload_for_response(&event.event_type, payload, include_payload);
             serde_json::json!({
                 "session_id": event.session_id,
                 "type": event.event_type,
@@ -971,7 +1160,107 @@ async fn get_session_events(
         "from_seq": from_seq,
         "limit": limit,
         "has_more": has_more,
+        "include_payload": include_payload,
     })))
+}
+
+fn session_event_payload_for_response(
+    event_type: &str,
+    payload: serde_json::Value,
+    include_payload: bool,
+) -> serde_json::Value {
+    if include_payload {
+        return payload;
+    }
+    if event_type == "ContextEnvelope" {
+        return slim_context_envelope_payload(&payload);
+    }
+    if event_type == "ContextTurnReport" {
+        return slim_context_turn_report_payload(&payload);
+    }
+
+    let serialized = payload.to_string();
+    if serialized.chars().count() <= 4_000 {
+        return payload;
+    }
+
+    serde_json::json!({
+        "type": payload.get("type").cloned().unwrap_or_else(|| serde_json::Value::String(event_type.to_string())),
+        "kind": payload.get("kind").cloned().unwrap_or(serde_json::Value::Null),
+        "status": payload.get("status").cloned().unwrap_or(serde_json::Value::Null),
+        "summary": payload.get("summary").cloned().or_else(|| payload.get("message").cloned()).unwrap_or(serde_json::Value::Null),
+        "run_id": payload.get("run_id").cloned().unwrap_or(serde_json::Value::Null),
+        "turn_id": payload.get("turn_id").cloned().unwrap_or(serde_json::Value::Null),
+        "payload_truncated": true,
+        "payload_size_chars": serialized.chars().count(),
+        "payload_preview": take_chars(&serialized, 1_200),
+        "full_payload_hint": "repeat the request with include_payload=true to retrieve full event evidence",
+    })
+}
+
+fn slim_context_envelope_payload(payload: &serde_json::Value) -> serde_json::Value {
+    let envelope = payload.get("envelope").unwrap_or(payload);
+    serde_json::json!({
+        "type": payload.get("type").cloned().unwrap_or_else(|| serde_json::Value::String("ContextEnvelope".to_string())),
+        "envelope_id": payload
+            .get("envelope_id")
+            .cloned()
+            .or_else(|| envelope.get("id").cloned())
+            .unwrap_or(serde_json::Value::Null),
+        "session_id": payload
+            .get("session_id")
+            .cloned()
+            .or_else(|| envelope.pointer("/identity/session_id").cloned())
+            .unwrap_or(serde_json::Value::Null),
+        "agent_id": payload
+            .get("agent_id")
+            .cloned()
+            .or_else(|| envelope.pointer("/identity/agent_id").cloned())
+            .unwrap_or(serde_json::Value::Null),
+        "profile": payload
+            .get("profile")
+            .cloned()
+            .or_else(|| envelope.get("profile").cloned())
+            .unwrap_or(serde_json::Value::Null),
+        "budget": payload
+            .get("budget")
+            .cloned()
+            .or_else(|| envelope.get("budget").cloned())
+            .unwrap_or(serde_json::Value::Null),
+        "diagnostics": payload
+            .get("diagnostics")
+            .cloned()
+            .or_else(|| envelope.get("diagnostics").cloned())
+            .unwrap_or(serde_json::Value::Null),
+        "selected_count": envelope.get("selected").and_then(serde_json::Value::as_array).map_or(0, Vec::len),
+        "omitted_count": envelope.get("omitted").and_then(serde_json::Value::as_array).map_or(0, Vec::len),
+        "payload_truncated": true,
+        "full_payload_hint": "repeat the request with include_payload=true to retrieve full ContextEnvelope evidence",
+    })
+}
+
+fn slim_context_turn_report_payload(payload: &serde_json::Value) -> serde_json::Value {
+    let report = payload.get("context_turn_report").unwrap_or(payload);
+    let knowledge = report.get("knowledge").unwrap_or(&serde_json::Value::Null);
+    serde_json::json!({
+        "type": payload.get("type").cloned().unwrap_or_else(|| serde_json::Value::String("ContextTurnReport".to_string())),
+        "report_id": report.get("report_id").cloned().unwrap_or(serde_json::Value::Null),
+        "session_id": report.get("session_id").cloned().unwrap_or(serde_json::Value::Null),
+        "turn_id": report.get("turn_id").cloned().unwrap_or(serde_json::Value::Null),
+        "input_token_estimate": report.get("input_token_estimate").cloned().unwrap_or(serde_json::Value::Null),
+        "governance_decision": report.get("governance_decision").cloned().unwrap_or(serde_json::Value::Null),
+        "knowledge": {
+            "activation_plan_id": knowledge.get("activation_plan_id").cloned().unwrap_or(serde_json::Value::Null),
+            "active_pack_count": knowledge.get("active_pack_ids").and_then(serde_json::Value::as_array).map_or(0, Vec::len),
+            "blocked_namespace_count": knowledge.get("blocked_namespaces").and_then(serde_json::Value::as_array).map_or(0, Vec::len),
+        },
+        "payload_truncated": true,
+        "full_payload_hint": "repeat the request with include_payload=true to retrieve full ContextTurnReport evidence",
+    })
+}
+
+fn take_chars(value: &str, limit: usize) -> String {
+    value.chars().take(limit).collect()
 }
 
 fn runtime_run_event_json(event: SessionEvent) -> serde_json::Value {
@@ -1095,6 +1384,59 @@ fn collect_payloads_by_types(
         .collect()
 }
 
+fn runtime_tool_payload_from_event(event: &serde_json::Value) -> Option<serde_json::Value> {
+    let event_type = event.get("type").and_then(serde_json::Value::as_str)?;
+    let payload = event.get("payload").unwrap_or(&serde_json::Value::Null);
+    if matches!(
+        event_type,
+        "ToolStart" | "ToolProgress" | "ToolComplete" | "ToolFailure"
+    ) {
+        return Some(payload.clone());
+    }
+    if event_type != "RuntimeEvent" {
+        return None;
+    }
+    let scope = payload.get("scope").and_then(serde_json::Value::as_str)?;
+    if scope != "tool" {
+        return None;
+    }
+    let mut tool_payload = payload
+        .get("payload")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if let Some(object) = tool_payload.as_object_mut() {
+        object.insert(
+            "runtime_event_kind".to_string(),
+            payload
+                .get("kind")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        );
+        object.insert(
+            "runtime_event_status".to_string(),
+            payload
+                .get("status")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        );
+        object.insert(
+            "runtime_event_id".to_string(),
+            payload
+                .get("event_id")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        );
+    }
+    Some(tool_payload)
+}
+
+fn collect_tool_timeline(events: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    events
+        .iter()
+        .filter_map(runtime_tool_payload_from_event)
+        .collect()
+}
+
 fn payload_type_contains(payload: &serde_json::Value, needles: &[&str]) -> bool {
     payload
         .get("type")
@@ -1108,6 +1450,221 @@ fn payload_type_contains(payload: &serde_json::Value, needles: &[&str]) -> bool 
         .unwrap_or(false)
 }
 
+#[derive(Default)]
+struct TurnProjectionAccumulator {
+    turn_id: String,
+    status: String,
+    submitted_at_ms: Option<u64>,
+    started_at_ms: Option<u64>,
+    completed_at_ms: Option<u64>,
+    user_preview: Option<String>,
+    assistant_preview: Option<String>,
+    tool_calls: Vec<serde_json::Value>,
+    approvals: Vec<serde_json::Value>,
+    context_events: Vec<serde_json::Value>,
+    usage: Vec<serde_json::Value>,
+    evidence_refs: BTreeSet<String>,
+    event_sequences: Vec<usize>,
+}
+
+impl TurnProjectionAccumulator {
+    fn new(turn_id: impl Into<String>) -> Self {
+        Self {
+            turn_id: turn_id.into(),
+            status: "pending".to_string(),
+            ..Self::default()
+        }
+    }
+
+    fn observe_event(&mut self, event: &serde_json::Value) {
+        if let Some(sequence) = event.get("sequence").and_then(serde_json::Value::as_u64) {
+            self.event_sequences.push(sequence as usize);
+        }
+        let event_type = event
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let payload = event.get("payload").unwrap_or(&serde_json::Value::Null);
+        if event_type == "TurnJournal" {
+            self.observe_turn_journal(event, payload);
+            return;
+        }
+        if let Some(tool_payload) = runtime_tool_payload_from_event(event) {
+            self.tool_calls.push(tool_payload);
+        } else {
+            match event_type {
+                "ApprovalRequested" | "ApprovalResolved" | "RiskApproval" => {
+                    self.approvals.push(payload.clone());
+                }
+                "ContextEnvelope" | "ContextTurnReport" | "ContextRecommendationAction" => {
+                    self.context_events.push(payload.clone());
+                }
+                "TokenUsage" | "RunModelTelemetry" => {
+                    self.usage.push(payload.clone());
+                }
+                "SurfaceMessageProcessed" => {
+                    if let Some(preview) = payload
+                        .get("response_preview")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                    {
+                        self.assistant_preview = Some(preview.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        collect_projection_evidence_refs(payload, &mut self.evidence_refs);
+    }
+
+    fn observe_turn_journal(&mut self, event: &serde_json::Value, payload: &serde_json::Value) {
+        let created_at_ms = event
+            .get("created_at_ms")
+            .and_then(serde_json::Value::as_u64);
+        match payload.get("phase").and_then(serde_json::Value::as_str) {
+            Some("submitted") => {
+                self.status = "pending".to_string();
+                self.submitted_at_ms = self.submitted_at_ms.or(created_at_ms);
+                if let Some(preview) = payload
+                    .get("payload")
+                    .and_then(|inner| inner.get("prompt_preview"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    self.user_preview = Some(preview.to_string());
+                }
+            }
+            Some("running") => {
+                self.status = "running".to_string();
+                self.started_at_ms = self.started_at_ms.or(created_at_ms);
+            }
+            Some("completed") => {
+                self.status = "completed".to_string();
+                self.completed_at_ms = self.completed_at_ms.or(created_at_ms);
+            }
+            Some("failed") => {
+                self.status = "failed".to_string();
+                self.completed_at_ms = self.completed_at_ms.or(created_at_ms);
+            }
+            Some("cancelled") => {
+                self.status = "cancelled".to_string();
+                self.completed_at_ms = self.completed_at_ms.or(created_at_ms);
+            }
+            _ => {}
+        }
+        collect_projection_evidence_refs(payload, &mut self.evidence_refs);
+    }
+
+    fn into_value(self) -> serde_json::Value {
+        serde_json::json!({
+            "turn_id": self.turn_id,
+            "status": self.status,
+            "submitted_at_ms": self.submitted_at_ms,
+            "started_at_ms": self.started_at_ms,
+            "completed_at_ms": self.completed_at_ms,
+            "user_preview": self.user_preview,
+            "assistant_preview": self.assistant_preview,
+            "tool_calls": self.tool_calls,
+            "approvals": self.approvals,
+            "context_events": self.context_events,
+            "usage": self.usage,
+            "evidence_refs": self.evidence_refs.into_iter().collect::<Vec<_>>(),
+            "event_sequences": self.event_sequences,
+        })
+    }
+}
+
+fn collect_projection_evidence_refs(payload: &serde_json::Value, out: &mut BTreeSet<String>) {
+    for key in [
+        "evidence_ref",
+        "evidence_id",
+        "raw_ref",
+        "full_output_ref",
+        "output_ref",
+        "context_report_id",
+    ] {
+        if let Some(value) = payload.get(key).and_then(serde_json::Value::as_str) {
+            out.insert(value.to_string());
+        }
+    }
+    if let Some(values) = payload
+        .get("evidence_refs")
+        .and_then(serde_json::Value::as_array)
+    {
+        for value in values {
+            if let Some(value) = value.as_str() {
+                out.insert(value.to_string());
+            }
+        }
+    }
+    if let Some(object) = payload.as_object() {
+        for value in object.values() {
+            if value.is_object() {
+                collect_projection_evidence_refs(value, out);
+            }
+        }
+    }
+}
+
+fn turn_id_from_event_value(event: &serde_json::Value) -> Option<String> {
+    let payload = event.get("payload").unwrap_or(&serde_json::Value::Null);
+    payload
+        .get("turn_id")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            payload
+                .get("payload")
+                .and_then(|inner| inner.get("turn_id"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| {
+            payload
+                .get("turn")
+                .and_then(|turn| turn.get("turn_id"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| {
+            payload
+                .get("receipt")
+                .and_then(|turn| turn.get("turn_id"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(ToString::to_string)
+}
+
+fn turn_projection_from_event_values(
+    session_id: &str,
+    events: &[serde_json::Value],
+) -> serde_json::Value {
+    let mut turns: BTreeMap<String, TurnProjectionAccumulator> = BTreeMap::new();
+    let mut unbound_events = Vec::new();
+    for event in events {
+        if let Some(turn_id) = turn_id_from_event_value(event) {
+            turns
+                .entry(turn_id.clone())
+                .or_insert_with(|| TurnProjectionAccumulator::new(turn_id))
+                .observe_event(event);
+        } else {
+            unbound_events.push(event.clone());
+        }
+    }
+    let mut turn_accumulators = turns.into_values().collect::<Vec<_>>();
+    turn_accumulators
+        .sort_by_key(|turn| turn.event_sequences.first().copied().unwrap_or(usize::MAX));
+    let turn_values = turn_accumulators
+        .into_iter()
+        .map(TurnProjectionAccumulator::into_value)
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "kind": "session.turn_projection",
+        "source": "gateway.session_events.turn_journal",
+        "session_id": session_id,
+        "turn_count": turn_values.len(),
+        "turns": turn_values,
+        "unbound_event_count": unbound_events.len(),
+        "unbound_events": unbound_events.into_iter().rev().take(20).collect::<Vec<_>>(),
+    })
+}
+
 fn session_run_projection_from_events(
     session_id: &str,
     stored_events: Vec<SessionEvent>,
@@ -1117,6 +1674,7 @@ fn session_run_projection_from_events(
         .iter()
         .map(session_event_value)
         .collect::<Vec<_>>();
+    let turn_projection = turn_projection_from_event_values(session_id, &events);
     let runs = stored_events
         .iter()
         .filter(|event| event.event_type == "RuntimeRun")
@@ -1125,10 +1683,8 @@ fn session_run_projection_from_events(
         .collect::<Vec<_>>();
     let runtime_run_count = runs.len();
     let run_graph = runtime_run_tree_summary(&runs);
-    let tool_timeline = collect_payloads_by_types(
-        &events,
-        &["ToolStart", "ToolProgress", "ToolComplete", "PartialAnswer"],
-    );
+    let mut tool_timeline = collect_tool_timeline(&events);
+    tool_timeline.extend(collect_payloads_by_types(&events, &["PartialAnswer"]));
     let token_usage = collect_payloads_by_types(&events, &["TokenUsage"]);
     let latest_model_telemetry = latest_payload_by_type(&events, "RunModelTelemetry")
         .and_then(|payload| payload.get("telemetry").cloned().or(Some(payload)));
@@ -1180,8 +1736,14 @@ fn session_run_projection_from_events(
         .filter(|event| {
             payload_type_contains(
                 event.get("payload").unwrap_or(&serde_json::Value::Null),
-                &["agent", "team", "mission", "workgraph", "collaboration"],
-            ) || payload_type_contains(event, &["agent", "team", "mission", "workgraph"])
+                &[
+                    "agent",
+                    "team",
+                    "mission",
+                    "execution_graph",
+                    "collaboration",
+                ],
+            ) || payload_type_contains(event, &["agent", "team", "mission", "execution_graph"])
         })
         .take(50)
         .cloned()
@@ -1202,6 +1764,7 @@ fn session_run_projection_from_events(
         "kind": "session.run_projection",
         "source": "gateway.session_events",
         "session_id": session_id,
+        "turn_projection": turn_projection,
         "view_modes": {
             "default": "full_evidence",
             "pure_available": true,
@@ -1293,6 +1856,116 @@ async fn get_session_runs(
         "limit": limit,
         "has_more": has_more,
     })))
+}
+
+async fn get_session_turns(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<GetEventsParams>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let from_seq = params.from_seq.unwrap_or(0);
+    let limit = params.limit.unwrap_or(2_000).min(10_000);
+    let Some((total, stored_events)) = state
+        .services
+        .session
+        .stored_events_page(&id, from_seq, limit)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to load session turn events: {error}"),
+                }),
+            )
+        })?
+    else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "session store not available".to_string(),
+            }),
+        ));
+    };
+
+    let events = stored_events
+        .iter()
+        .map(session_event_value)
+        .collect::<Vec<_>>();
+    let next_seq = events
+        .last()
+        .and_then(|event| event["sequence"].as_u64())
+        .map(|sequence| sequence as usize + 1);
+    let has_more = next_seq.is_some_and(|next| next < total);
+    let mut projection = turn_projection_from_event_values(&id, &events);
+    projection["paging"] = serde_json::json!({
+        "total": total,
+        "from_seq": from_seq,
+        "next_seq": next_seq,
+        "limit": limit,
+        "has_more": has_more,
+    });
+    Ok(Json(projection))
+}
+
+async fn get_session_turn(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path((id, turn_id)): Path<(String, String)>,
+    Query(params): Query<GetEventsParams>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let from_seq = params.from_seq.unwrap_or(0);
+    let limit = params.limit.unwrap_or(2_000).min(10_000);
+    let Some((_total, stored_events)) = state
+        .services
+        .session
+        .stored_events_page(&id, from_seq, limit)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to load session turn events: {error}"),
+                }),
+            )
+        })?
+    else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "session store not available".to_string(),
+            }),
+        ));
+    };
+
+    let events = stored_events
+        .iter()
+        .map(session_event_value)
+        .collect::<Vec<_>>();
+    let projection = turn_projection_from_event_values(&id, &events);
+    let turn = projection
+        .get("turns")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|turns| {
+            turns
+                .iter()
+                .find(|turn| {
+                    turn.get("turn_id").and_then(serde_json::Value::as_str) == Some(&turn_id)
+                })
+                .cloned()
+        });
+    match turn {
+        Some(turn) => Ok(Json(serde_json::json!({
+            "kind": "session.turn_projection.item",
+            "session_id": id,
+            "turn_id": turn_id,
+            "turn": turn,
+        }))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("turn {turn_id} not found in session {id}"),
+            }),
+        )),
+    }
 }
 
 async fn get_session_projection(
@@ -1635,6 +2308,138 @@ mod tests {
             sequence,
             created_at_ms: 1_000 + sequence as u64,
         }
+    }
+
+    #[test]
+    fn turn_projection_builds_stable_turns_from_journal() {
+        let events = vec![
+            session_event(
+                0,
+                "TurnJournal",
+                serde_json::json!({
+                    "session_id": "session-v31",
+                    "turn_id": "turn-1",
+                    "event_id": "evt-1",
+                    "sequence": 0,
+                    "event_type": "turn.submitted",
+                    "phase": "submitted",
+                    "source": "gateway.runtime_service",
+                    "idempotency_key": "session-v31:turn-1:turn.submitted",
+                    "payload": {
+                        "prompt_preview": "analyse this",
+                        "task_id": "task-1"
+                    },
+                    "created_at": "2026-07-05T00:00:00Z"
+                }),
+            ),
+            session_event(
+                1,
+                "TurnJournal",
+                serde_json::json!({
+                    "session_id": "session-v31",
+                    "turn_id": "turn-1",
+                    "event_id": "evt-2",
+                    "sequence": 1,
+                    "event_type": "turn.running",
+                    "phase": "running",
+                    "source": "gateway.runtime_service",
+                    "idempotency_key": "session-v31:turn-1:turn.running",
+                    "payload": {},
+                    "created_at": "2026-07-05T00:00:01Z"
+                }),
+            ),
+            session_event(
+                2,
+                "SurfaceMessageProcessed",
+                serde_json::json!({
+                    "type": "SurfaceMessageProcessed",
+                    "turn_id": "turn-1",
+                    "response_preview": "done"
+                }),
+            ),
+            session_event(
+                3,
+                "TurnJournal",
+                serde_json::json!({
+                    "session_id": "session-v31",
+                    "turn_id": "turn-1",
+                    "event_id": "evt-3",
+                    "sequence": 3,
+                    "event_type": "turn.completed",
+                    "phase": "completed",
+                    "source": "gateway.runtime_service",
+                    "idempotency_key": "session-v31:turn-1:turn.completed",
+                    "payload": {
+                        "context_report_id": "ctx-report-1"
+                    },
+                    "created_at": "2026-07-05T00:00:02Z"
+                }),
+            ),
+        ];
+        let values = events.iter().map(session_event_value).collect::<Vec<_>>();
+        let projection = turn_projection_from_event_values("session-v31", &values);
+
+        assert_eq!(projection["kind"], "session.turn_projection");
+        assert_eq!(projection["turn_count"], 1);
+        assert_eq!(projection["turns"][0]["turn_id"], "turn-1");
+        assert_eq!(projection["turns"][0]["status"], "completed");
+        assert_eq!(projection["turns"][0]["user_preview"], "analyse this");
+        assert_eq!(projection["turns"][0]["assistant_preview"], "done");
+        assert_eq!(
+            projection["turns"][0]["event_sequences"],
+            serde_json::json!([0, 1, 2, 3])
+        );
+        assert!(projection["turns"][0]["evidence_refs"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("ctx-report-1")));
+    }
+
+    #[test]
+    fn session_run_projection_includes_tool_contract_runtime_events() {
+        let events = vec![session_event(
+            0,
+            "RuntimeEvent",
+            serde_json::json!({
+                "event_id": "event-tool-1",
+                "session_id": "session-v31",
+                "sequence": 0,
+                "scope": "tool",
+                "kind": "tool.invocation.completed",
+                "status": "completed",
+                "payload": {
+                    "contract_version": 2,
+                    "invocation_id": "tool-inv-1",
+                    "tool_call_id": "tool-1",
+                    "tool_name": "read",
+                    "turn_index": 1,
+                    "status": "completed",
+                    "advertised_registration_id": "tool-reg:v2:read_only:read",
+                    "effective_registration_id": "tool-reg:v2:read_only:read",
+                    "model_visible_preview": "ok",
+                    "full_output_ref": "tool://raw-1",
+                    "raw_output_tokens": 100,
+                    "preview_tokens": 10,
+                    "context_saved_tokens": 90,
+                    "context_saved_ratio": 9000,
+                    "stale_registration": false
+                },
+                "created_at_ms": 1000
+            }),
+        )];
+
+        let projection = session_run_projection_from_events("session-v31", events, None);
+
+        assert_eq!(projection["tool_timeline"].as_array().unwrap().len(), 1);
+        assert_eq!(projection["tool_timeline"][0]["contract_version"], 2);
+        assert_eq!(
+            projection["tool_timeline"][0]["full_output_ref"],
+            "tool://raw-1"
+        );
+        assert_eq!(
+            projection["tool_timeline"][0]["runtime_event_kind"],
+            "tool.invocation.completed"
+        );
     }
 
     #[test]

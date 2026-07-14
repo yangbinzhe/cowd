@@ -92,7 +92,7 @@ pub(in crate::api_routes) fn value_loop_summary(
         let stage_id = value_loop_stage_id(event);
         if let Some(stage) = stages.iter_mut().find(|stage| stage.spec.id == stage_id) {
             stage.event_count += 1;
-            stage.latest_sequence = Some(event.sequence);
+            stage.latest_sequence = usize::try_from(event.sequence).ok();
             stage.latest_kind = Some(event.kind.clone());
             if runtime_event_failed(event) {
                 stage.failed_count += 1;
@@ -113,7 +113,7 @@ pub(in crate::api_routes) fn value_loop_summary(
             "task.completed" | "task.cancelled" | "task.blocked" => {
                 open_tasks = open_tasks.saturating_sub(1);
             }
-            "agent.workgraph.reviewed" => {
+            "agent.execution_graph.reviewed" => {
                 if let Some(verdict) = event.payload.get("value_verdict") {
                     positive_agent_lift |= verdict
                         .get("positive_lift")
@@ -252,16 +252,16 @@ fn value_loop_stage_id(event: &RuntimeEvent) -> &'static str {
     if is_channel_event(event) {
         return "channel";
     }
-    match event.scope {
-        memory::RuntimeEventScope::Session
-        | memory::RuntimeEventScope::Message
-        | memory::RuntimeEventScope::Turn => "intake",
-        memory::RuntimeEventScope::Context => "context",
-        memory::RuntimeEventScope::Memory => "memory",
-        memory::RuntimeEventScope::Policy | memory::RuntimeEventScope::Approval => "governance",
-        memory::RuntimeEventScope::Task => "task",
-        memory::RuntimeEventScope::Tool | memory::RuntimeEventScope::Scheduler => "execution",
-        memory::RuntimeEventScope::Agent | memory::RuntimeEventScope::Workgraph => "agent",
+    match event.scope.as_str() {
+        "session" | "message" | "turn" | "session_input" => "intake",
+        "context" => "context",
+        "memory" | "mfg" => "memory",
+        "policy" | "approval" => "governance",
+        "application_task" | "task" | "goal" => "task",
+        "tool" | "schedule" | "worker" | "execution_node" => "execution",
+        "agent" | "team" | "execution_graph" => "agent",
+        "mission" | "relation" | "steward" | "recovery" => "governance",
+        _ => "execution",
     }
 }
 
@@ -285,7 +285,7 @@ fn value_loop_next_action(stage_id: &str) -> &'static str {
         "governance" => "record runtime policy, approval, or permission decision",
         "task" => "bind execution to a task lifecycle event",
         "execution" => "record tool, scheduler, or channel execution evidence",
-        "agent" => "record agent collaboration, workgraph, or single-agent decision evidence",
+        "agent" => "record agent collaboration, execution graph, or single-agent decision evidence",
         _ => "record runtime evidence for this stage",
     }
 }
@@ -326,93 +326,79 @@ mod tests {
     use super::*;
     use crate::api_routes::runtime_routes::control::agent_value::agent_value_summary;
 
-    fn event(sequence: usize, scope: memory::RuntimeEventScope, kind: &str) -> RuntimeEvent {
-        RuntimeEvent::new(
-            "value-loop-session",
-            sequence,
-            scope,
-            kind,
-            serde_json::json!({}),
-            sequence as u64,
-        )
+    fn event(sequence: usize, scope: &str, kind: &str) -> RuntimeEvent {
+        RuntimeEvent {
+            sequence: sequence as u64,
+            commit_cursor: None,
+            stream_id: None,
+            scope: scope.to_string(),
+            kind: kind.to_string(),
+            status: None,
+            refs: Vec::new(),
+            payload: serde_json::json!({}),
+            created_at_ms: sequence as u64,
+            source: "test",
+        }
     }
 
-    fn reviewed_workgraph_event(
+    fn reviewed_execution_graph_event(
         sequence: usize,
         value_score: u16,
         positive_lift: bool,
     ) -> RuntimeEvent {
-        let mut event = RuntimeEvent::new(
-            "agent-value-session",
+        let mut event = event(
             sequence,
-            memory::RuntimeEventScope::Workgraph,
-            "agent.workgraph.reviewed",
-            serde_json::json!({
-                "graph": {
-                    "graph_id": "graph-agent-value",
-                    "nodes": [
-                        {"kind": "AgentTask", "node_id": "worker-1"},
-                        {"kind": "AgentTask", "node_id": "worker-2"},
-                        {"kind": "Synthesis", "node_id": "synthesis"}
-                    ]
-                },
-                "scorecard": {
-                    "completion_rate": 1.0,
-                    "synthesis_lift": if positive_lift { 1.25 } else { 1.0 },
-                    "complementarity_score": if positive_lift { 0.75 } else { 0.0 },
-                    "conflict_count": 0
-                },
-                "value_verdict": {
-                    "positive_lift": positive_lift,
-                    "continue_multi_agent": positive_lift,
-                    "value_score": value_score,
-                    "reasons": if positive_lift {
-                        vec!["positive_multi_agent_lift"]
-                    } else {
-                        vec!["no_synthesis_lift", "no_complementarity"]
-                    }
-                }
-            }),
-            sequence as u64,
+            "execution_graph",
+            "agent.execution_graph.reviewed",
         );
+        event.payload = serde_json::json!({
+            "graph": {
+                "graph_id": "graph-agent-value",
+                "nodes": [
+                    {"kind": "AgentTask", "node_id": "worker-1"},
+                    {"kind": "AgentTask", "node_id": "worker-2"},
+                    {"kind": "Synthesis", "node_id": "synthesis"}
+                ]
+            },
+            "scorecard": {
+                "completion_rate": 1.0,
+                "synthesis_lift": if positive_lift { 1.25 } else { 1.0 },
+                "complementarity_score": if positive_lift { 0.75 } else { 0.0 },
+                "conflict_count": 0
+            },
+            "value_verdict": {
+                "positive_lift": positive_lift,
+                "continue_multi_agent": positive_lift,
+                "value_score": value_score,
+                "reasons": if positive_lift {
+                    vec!["positive_multi_agent_lift"]
+                } else {
+                    vec!["no_synthesis_lift", "no_complementarity"]
+                }
+            }
+        });
         event.status = Some("completed".to_string());
         event
     }
 
     #[test]
     fn value_loop_summary_marks_complete_closed_loop() {
-        let mut workgraph = event(
-            6,
-            memory::RuntimeEventScope::Workgraph,
-            "agent.workgraph.reviewed",
-        );
-        workgraph.payload = serde_json::json!({
+        let mut execution_graph = event(6, "execution_graph", "agent.execution_graph.reviewed");
+        execution_graph.payload = serde_json::json!({
             "value_verdict": {
                 "positive_lift": true,
                 "value_score": 76
             }
         });
         let events = vec![
-            event(0, memory::RuntimeEventScope::Message, "message.received"),
-            event(
-                1,
-                memory::RuntimeEventScope::Context,
-                "context.envelope.built",
-            ),
-            event(
-                2,
-                memory::RuntimeEventScope::Memory,
-                "memory.recall.completed",
-            ),
-            event(
-                3,
-                memory::RuntimeEventScope::Policy,
-                "runtime.policy.decided",
-            ),
-            event(4, memory::RuntimeEventScope::Task, "task.started"),
-            event(5, memory::RuntimeEventScope::Tool, "tool.completed"),
-            workgraph,
-            event(7, memory::RuntimeEventScope::Task, "task.completed"),
+            event(0, "message", "message.received"),
+            event(1, "context", "context.envelope.built"),
+            event(2, "memory", "memory.recall.completed"),
+            event(3, "policy", "runtime.policy.decided"),
+            event(4, "task", "task.started"),
+            event(5, "tool", "tool.completed"),
+            execution_graph,
+            event(7, "task", "task.completed"),
         ];
 
         let summary = value_loop_summary(&events, false, None);
@@ -432,16 +418,12 @@ mod tests {
 
     #[test]
     fn value_loop_summary_surfaces_missing_and_degraded_stages() {
-        let mut failed_tool = event(2, memory::RuntimeEventScope::Tool, "tool.failed");
+        let mut failed_tool = event(2, "tool", "tool.failed");
         failed_tool.status = Some("failed".to_string());
-        let mut degraded_memory = event(
-            1,
-            memory::RuntimeEventScope::Memory,
-            "memory.recall.completed",
-        );
+        let mut degraded_memory = event(1, "memory", "memory.recall.completed");
         degraded_memory.status = Some("degraded".to_string());
         let events = vec![
-            event(0, memory::RuntimeEventScope::Message, "message.received"),
+            event(0, "message", "message.received"),
             degraded_memory,
             failed_tool,
         ];
@@ -465,12 +447,8 @@ mod tests {
 
     #[test]
     fn value_loop_summary_tracks_optional_channel_stage() {
-        let mut channel_event = event(
-            0,
-            memory::RuntimeEventScope::Tool,
-            "channel.feishu.message.sent",
-        );
-        channel_event.refs = vec![memory::RuntimeRef {
+        let mut channel_event = event(0, "tool", "channel.feishu.message.sent");
+        channel_event.refs = vec![RuntimeTimelineRef {
             ref_type: "feishu".to_string(),
             id: "chat-1".to_string(),
             label: Some("Feishu".to_string()),
@@ -495,7 +473,7 @@ mod tests {
             min_collaboration_score: 70,
             ..AgentControlPolicy::default()
         };
-        let event = reviewed_workgraph_event(4, 76, true);
+        let event = reviewed_execution_graph_event(4, 76, true);
 
         let summary = agent_value_summary(&[event], &policy, false, None);
 
@@ -514,7 +492,7 @@ mod tests {
             require_positive_lift: true,
             ..AgentControlPolicy::default()
         };
-        let event = reviewed_workgraph_event(4, 48, false);
+        let event = reviewed_execution_graph_event(4, 48, false);
 
         let summary = agent_value_summary(&[event], &policy, false, None);
 
@@ -539,7 +517,7 @@ mod tests {
     #[test]
     fn agent_value_summary_requires_review_for_unresolved_conflict() {
         let policy = AgentControlPolicy::default();
-        let mut event = reviewed_workgraph_event(4, 82, false);
+        let mut event = reviewed_execution_graph_event(4, 82, false);
         event.payload["scorecard"]["conflict_count"] = serde_json::json!(2);
         event.payload["value_verdict"]["reasons"] = serde_json::json!(["excessive_conflict"]);
 

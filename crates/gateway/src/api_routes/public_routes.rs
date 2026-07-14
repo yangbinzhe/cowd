@@ -2,14 +2,21 @@ use std::sync::Arc;
 
 use axum::{
     extract::State as AxumState,
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
 
-use super::{AppState, ErrorResponse};
+use super::capability_contract::{
+    gateway_capability_contract, gateway_openai_tools, gateway_openapi_document,
+};
+use super::route_manifest::gateway_route_manifest;
+use super::{
+    authenticated_human_principal, cookie_value, issue_web_session, web_session_principal,
+    AppState, ErrorResponse, WEB_SESSION_COOKIE,
+};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -17,6 +24,17 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route("/healthz", get(gateway_health_handler))
         .route("/readyz", get(gateway_ready_handler))
         .route("/api/webui/manifest", get(webui_manifest_handler))
+        // Schema and route inventory are static documentation, not runtime
+        // control data. Keeping them public allows typed clients to generate
+        // against a Gateway before a local human credential exists; all
+        // operational endpoints remain behind the authenticated router.
+        .route("/api/gateway/route-manifest", get(route_manifest_handler))
+        .route(
+            "/api/gateway/capability-contract",
+            get(capability_contract_handler),
+        )
+        .route("/api/gateway/openapi.json", get(openapi_handler))
+        .route("/api/gateway/openai-tools", get(openai_tools_handler))
         .route("/api/auth/login", post(login_handler))
         .route("/api/auth/verify", get(verify_handler))
         .route("/api/auth/logout", post(logout_handler))
@@ -63,6 +81,32 @@ async fn webui_manifest_handler(
     )
 }
 
+async fn route_manifest_handler() -> Json<serde_json::Value> {
+    let routes = gateway_route_manifest();
+    Json(serde_json::json!({
+        "kind": "gateway.route_manifest",
+        "schema_version": 1,
+        "route_count": routes.len(),
+        "routes": routes,
+    }))
+}
+
+async fn capability_contract_handler() -> Json<serde_json::Value> {
+    Json(
+        serde_json::to_value(gateway_capability_contract()).unwrap_or_else(
+            |_| serde_json::json!({"kind":"gateway.capability_contract","status":"error"}),
+        ),
+    )
+}
+
+async fn openapi_handler() -> Json<serde_json::Value> {
+    Json(gateway_openapi_document())
+}
+
+async fn openai_tools_handler() -> Json<serde_json::Value> {
+    Json(gateway_openai_tools())
+}
+
 #[derive(Deserialize)]
 struct LoginRequest {
     token: String,
@@ -80,11 +124,34 @@ async fn login_handler(
             }),
         )),
         Some(expected) if expected == &body.token => {
+            let session = issue_web_session(&state.config_home, &body.token).map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("authentication_authority_error:{error}"),
+                    }),
+                )
+            })?;
+            let cookie = HeaderValue::from_str(&format!(
+                "{WEB_SESSION_COOKIE}={session}; HttpOnly; SameSite=Strict; Path=/api; Max-Age=300"
+            ))
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("browser_session_cookie_error:{error}"),
+                    }),
+                )
+            })?;
             tracing::info!("API login successful");
-            Ok(Json(serde_json::json!({
-                "success": true,
-                "token": body.token,
-            })))
+            Ok((
+                [(header::SET_COOKIE, cookie)],
+                Json(serde_json::json!({
+                    "success": true,
+                    "auth_required": true,
+                    "session_kind": "broker_signed_http_only_cookie",
+                })),
+            ))
         }
         Some(_) => Err((
             StatusCode::UNAUTHORIZED,
@@ -114,22 +181,60 @@ async fn verify_handler(
         .and_then(|value| value.to_str().ok());
 
     match auth_header {
-        Some(header) if header == format!("Bearer {auth_token}") => Ok(Json(serde_json::json!({
-            "valid": true,
-            "auth_required": true,
-        }))),
+        Some(value) if value == format!("Bearer {auth_token}") => {
+            authenticated_human_principal(&state.config_home, auth_token).map_err(|error| {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(ErrorResponse {
+                        error: format!("invalid_bearer_credential:{error}"),
+                    }),
+                )
+            })?;
+            Ok(Json(serde_json::json!({
+                "valid": true,
+                "auth_required": true,
+                "transport": "bearer",
+            })))
+        }
+        _ if cookie_value(&headers, WEB_SESSION_COOKIE).is_some() => {
+            web_session_principal(&state.config_home, &headers, state.auth_token.as_deref())
+                .map_err(|error| {
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        Json(ErrorResponse {
+                            error: format!("invalid_browser_session:{error}"),
+                        }),
+                    )
+                })?;
+            Ok(Json(serde_json::json!({
+                "valid": true,
+                "auth_required": true,
+                "transport": "browser_session",
+            })))
+        }
         _ => Err((
             StatusCode::UNAUTHORIZED,
             Json(ErrorResponse {
-                error: "invalid or missing token".to_string(),
+                error: "invalid or missing credential".to_string(),
             }),
         )),
     }
 }
 
-async fn logout_handler() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "success": true,
-        "token_cleared": true,
-    }))
+async fn logout_handler() -> (
+    [(axum::http::header::HeaderName, HeaderValue); 1],
+    Json<serde_json::Value>,
+) {
+    (
+        [(
+            header::SET_COOKIE,
+            HeaderValue::from_static(
+                "cowd_web_session=; HttpOnly; SameSite=Strict; Path=/api; Max-Age=0",
+            ),
+        )],
+        Json(serde_json::json!({
+            "success": true,
+            "browser_session_cleared": true,
+        })),
+    )
 }

@@ -5,8 +5,15 @@
     dead_code
 )]
 #![deny(deprecated)]
-#[path = "static/agent_static.rs"]
-mod agent_static;
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
 mod api_routes;
 #[path = "core/bootstrap.rs"]
 mod bootstrap;
@@ -64,6 +71,8 @@ mod services;
 mod session_kernel;
 #[path = "kernel/session_lifecycle_kernel.rs"]
 mod session_lifecycle_kernel;
+#[path = "runtime/session_runtime_bridge.rs"]
+mod session_runtime_bridge;
 #[path = "static/skill_static.rs"]
 mod skill_static;
 #[path = "core/suggestions.rs"]
@@ -73,6 +82,14 @@ mod surface_host;
 mod task_kernel;
 
 pub use boundary_policy::{GatewayBoundaryPolicy, GatewayResponsibility};
+
+/// Feature-gated black-box integration harness. This intentionally exposes
+/// only a fully assembled API router, never Gateway internals or mutation
+/// shortcuts.
+#[cfg(feature = "test-support")]
+pub mod test_support {
+    pub use crate::api_routes::test_support::GatewayTestHarness;
+}
 
 use std::collections::BTreeSet;
 use std::env;
@@ -89,7 +106,6 @@ use std::sync::{LazyLock, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use model_protocol::provider_config::{ProviderConfig, ProvidersConfig};
 use model_protocol::usage::TokenUsage;
 #[cfg(test)]
 use provider as provider_crate;
@@ -112,8 +128,8 @@ use runtime::ContextProfile;
 use runtime::PromptCacheEvent;
 use runtime::{
     check_base_commit, format_stale_base_warning, load_system_prompt, resolve_expected_base,
-    resolve_sandbox_status, CompactionConfig, ConfigLoader, ContentBlock, ConversationMessage,
-    MessageRole, PermissionMode, PermissionPolicy, ResolvedPermissionMode, ResumeContextPacket,
+    resolve_sandbox_status, ConfigLoader, ContentBlock, ConversationMessage, MessageRole,
+    PermissionMode, PermissionPolicy, ResolvedPermissionMode, ResumeContextPacket,
     ResumeContextSource, Session, UsageTracker,
 };
 #[cfg(test)]
@@ -122,6 +138,16 @@ use runtime_bootstrap::GatewayToolRegistry;
 use runtime_entry::GatewayRuntimeEntry;
 use serde_json::json;
 use services::GatewayServices;
+
+#[cfg(test)]
+static TEST_PROCESS_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+#[cfg(test)]
+pub(crate) fn test_process_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    TEST_PROCESS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 #[cfg(test)]
 pub(crate) use entry::env_entry::resolve_tui_model;
@@ -288,6 +314,10 @@ fn wait_for_gateway_start(
     Err("gateway process did not become ready before timeout".into())
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "a process-wide runtime is required by synchronous CLI adapters; construction failure aborts startup before serving work"
+)]
 pub(crate) static SHARED_RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -382,8 +412,8 @@ fn build_surface_configs(gw: &runtime::GatewayConfig) -> Vec<surface::SurfaceMan
         .iter()
         .filter(|p| p.enabled && p.platform_type != "api_server")
         .map(|p| {
-            let id = surface::normalize_surface_id(&p.platform_type);
-            let required = surface::channel::channel_required_fields(&id)
+            let id = surface::message::normalize_message_connector(&p.platform_type);
+            let required = surface::message::message_connector_required_fields(&id)
                 .into_iter()
                 .map(str::to_string)
                 .collect::<Vec<_>>();
@@ -396,9 +426,9 @@ fn build_surface_configs(gw: &runtime::GatewayConfig) -> Vec<surface::SurfaceMan
                 entry: Some(format!("./cowd-edge-{id}-message")),
                 transport: surface::SurfaceTransport::StdioJsonl,
                 lifecycle: surface::SurfaceLifecycle::Managed,
-                capabilities: surface::channel::channel_transport_capabilities(&id)
+                capabilities: surface::message::message_connector_capabilities(&id)
                     .into_iter()
-                    .map(|capability| format!("message.{capability}"))
+                    .map(str::to_string)
                     .collect(),
                 routes: Vec::new(),
                 resources: Vec::new(),
@@ -471,6 +501,10 @@ pub fn backend_entry() {
     exit_on_error(run_backend_entry())
 }
 
+#[allow(
+    clippy::exit,
+    reason = "top-level CLI boundary must preserve command exit status for scripts"
+)]
 fn exit_on_error(result: Result<(), Box<dyn std::error::Error>>) {
     if let Err(error) = result {
         let message = error.to_string();
@@ -568,7 +602,7 @@ fn run_static_entry() -> Result<(), Box<dyn std::error::Error>> {
         bootstrap::run_bootstrap()?;
         // 引导完成后询问是否继续启动
         print!("按 Enter 键启动 Cowd 或 Ctrl+C 退出... ");
-        io::stdout().flush().unwrap();
+        io::stdout().flush()?;
         let mut input = String::new();
         io::stdin().read_line(&mut input).ok();
     }
@@ -623,7 +657,6 @@ fn run_static_entry() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
         } => print_static_tool_command(args.as_deref(), output_format)?,
         CliAction::Setup { output_format } => print_setup(output_format)?,
-        CliAction::State { output_format } => mcp_serve::run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
         CliAction::Export {
             session_reference,
@@ -932,9 +965,6 @@ pub(crate) enum CliAction {
         output_format: CliOutputFormat,
     },
     Setup {
-        output_format: CliOutputFormat,
-    },
-    State {
         output_format: CliOutputFormat,
     },
     Init {
@@ -1806,6 +1836,10 @@ fn dump_manifests_at_path(
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(
+    clippy::exit,
+    reason = "legacy resume CLI reports structured command failures through conventional exit statuses"
+)]
 fn resume_session(session_path: &Path, commands: &[String], output_format: CliOutputFormat) {
     let session_reference = session_path.display().to_string();
     let (handle, session) = match load_session_reference(&session_reference) {
@@ -1923,7 +1957,7 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                 }
                 if let Ok(store) = get_unified_store() {
                     if let Err(error) = sync_cli_session_to_unified_store(
-                        store,
+                        &store,
                         &handle,
                         session.model.as_deref(),
                         &session,
@@ -1933,11 +1967,12 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                 }
                 if output_format == CliOutputFormat::Json {
                     if let Some(value) = json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&value)
-                                .expect("resume command json output")
-                        );
+                        match serde_json::to_string_pretty(&value) {
+                            Ok(json) => println!("{json}"),
+                            Err(error) => {
+                                eprintln!("failed to render resume command JSON: {error}")
+                            }
+                        }
                     } else if let Some(message) = message {
                         println!("{message}");
                     }
@@ -2116,28 +2151,6 @@ fn render_resume_usage() -> String {
     )
 }
 
-fn format_compact_report(removed: usize, resulting_messages: usize, skipped: bool) -> String {
-    if skipped {
-        format!(
-            "Compact
-  Result           skipped
-  Reason           session below compaction threshold
-  Messages kept    {resulting_messages}"
-        )
-    } else {
-        format!(
-            "Compact
-  Result           compacted
-  Messages removed {removed}
-  Messages kept    {resulting_messages}"
-        )
-    }
-}
-
-fn format_auto_compaction_notice(removed: usize) -> String {
-    format!("[auto-compacted: removed {removed} messages]")
-}
-
 #[allow(clippy::too_many_lines)]
 fn run_resume_command(
     session_path: &Path,
@@ -2151,29 +2164,14 @@ fn run_resume_command(
             message: Some(render_terminal_help()),
             json: Some(serde_json::json!({ "kind": "help", "text": render_terminal_help() })),
         }),
-        SlashCommand::Compact => {
-            let result = runtime::compact_session(
-                session,
-                CompactionConfig {
-                    max_estimated_tokens: 0,
-                    ..CompactionConfig::default()
-                },
-            );
-            let removed = result.removed_message_count;
-            let kept = result.compacted_session.messages.len();
-            let skipped = removed == 0;
-            Ok(ResumeCommandOutcome {
-                session: result.compacted_session,
-                session_path: None,
-                message: Some(format_compact_report(removed, kept, skipped)),
-                json: Some(serde_json::json!({
-                    "kind": "compact",
-                    "skipped": skipped,
-                    "removed_messages": removed,
-                    "kept_messages": kept,
-                })),
-            })
-        }
+        // Offline JSONL resume has no Runtime, Memory checkpoint builder, or
+        // transactional session store. Keeping the former local text-summary
+        // path would create a second, lossy compaction representation. The
+        // command remains available to Gateway-backed surfaces only.
+        SlashCommand::Compact => Err(
+            "local /compact is unavailable; open the session through the Gateway so semantic checkpoint compaction can run"
+                .into(),
+        ),
         SlashCommand::Clear { confirm } => {
             if !confirm {
                 return Ok(ResumeCommandOutcome {
@@ -2360,16 +2358,8 @@ fn run_resume_command(
             })
         }
         SlashCommand::Agents { args } => {
-            let cwd = env::current_dir()?;
-            let agent_service = GatewayServices::baseline().agent;
-            let message = agent_service.command_text(&cwd, args.as_deref())?;
-            let json = agent_service.command_json(&cwd, args.as_deref())?;
-            Ok(ResumeCommandOutcome {
-                session: session.clone(),
-                session_path: None,
-                message: Some(message),
-                json: Some(json),
-            })
+            let _ = args;
+            Err("resumed /agents is unavailable without the Runtime Definition service; start the Gateway and use the Agents workspace".into())
         }
         SlashCommand::Skills { args } => {
             if let SkillSlashDispatch::Invoke(_) = classify_skills_slash_command(args.as_deref()) {
@@ -2528,12 +2518,10 @@ fn run_resume_command(
         | SlashCommand::Tag { .. }
         | SlashCommand::OutputStyle { .. }
         | SlashCommand::AddDir { .. }
-        | SlashCommand::AgentProfile { .. }
         | SlashCommand::Handoff { .. }
         | SlashCommand::SubAgent { .. }
         | SlashCommand::Pipeline { .. }
         | SlashCommand::Closet { .. }
-        | SlashCommand::SandboxSearch { .. }
         | SlashCommand::Retry
         | SlashCommand::Undo
         | SlashCommand::NewSession
@@ -2564,6 +2552,10 @@ fn detect_broad_cwd() -> Option<PathBuf> {
 /// Enforce the broad-CWD policy: when running from home or root, either
 /// require the --allow-broad-cwd flag, or prompt for confirmation (interactive),
 /// or exit with an error (non-interactive).
+#[allow(
+    clippy::exit,
+    reason = "interactive CLI cancellation must terminate before a broad workspace can be used"
+)]
 fn enforce_broad_cwd_policy(
     allow_broad_cwd: bool,
     output_format: CliOutputFormat,
@@ -3163,106 +3155,6 @@ fn parse_titled_body(value: &str) -> Option<(String, String)> {
     Some((title.to_string(), body.to_string()))
 }
 
-/// Fallback: load providers directly from the active Cowd config home.
-/// when ConfigLoader merge loses them.
-fn fallback_init_providers_from_user_config() {
-    let user_cfg = runtime::cowd_dirs::config_home_dir().join("config.yaml");
-    if !user_cfg.exists() {
-        return;
-    }
-    let raw = match std::fs::read_to_string(&user_cfg) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    let yaml_val: serde_yaml::Value = match serde_yaml::from_str(&raw) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    let providers_yaml = match yaml_val.get("providers") {
-        Some(v) => v,
-        None => return,
-    };
-    let providers_map = match providers_yaml.as_mapping() {
-        Some(m) => m,
-        None => return,
-    };
-
-    let mut providers = std::collections::HashMap::new();
-    for (key, value) in providers_map {
-        let name = match key.as_str() {
-            Some(s) => s.to_string(),
-            None => continue,
-        };
-        let entry = match value.as_mapping() {
-            Some(m) => m,
-            None => continue,
-        };
-        let base_url = entry
-            .get("base_url")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let api_key = entry
-            .get("api_key")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let models: Vec<String> = entry
-            .get("models")
-            .and_then(|v| v.as_sequence())
-            .map(|seq| {
-                seq.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let protocol = entry
-            .get("protocol")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-
-        providers.insert(
-            name.clone(),
-            ProviderConfig {
-                name: name.clone(),
-                base_url,
-                api_key,
-                models,
-                protocol,
-            },
-        );
-    }
-
-    runtime::init_global_providers(ProvidersConfig { providers });
-    tracing::warn!(
-        path = %user_cfg.display(),
-        "[init] fallback: loaded {} providers from Cowd config home",
-        runtime::list_all_providers().len()
-    );
-}
-
-fn init_runtime_providers_for_cwd(cwd: &Path) {
-    let loader = runtime::ConfigLoader::default_for(cwd);
-    match loader.load() {
-        Ok(cfg) => {
-            let providers = cfg.providers().clone();
-            tracing::debug!(
-                "[init] merged providers count: {}",
-                providers.providers.len()
-            );
-            if !providers.is_empty() {
-                runtime::init_global_providers(providers);
-            } else {
-                fallback_init_providers_from_user_config();
-            }
-        }
-        Err(e) => {
-            tracing::warn!("failed to load config for provider registry: {e}");
-            fallback_init_providers_from_user_config();
-        }
-    }
-}
-
 fn gateway_auth_token_from_platform(platform: &runtime::GatewayPlatformConfig) -> Option<String> {
     // Prefer flat auth_token key (legacy format).
     let flat = platform.extra.get("auth_token").and_then(|v| v.as_str());
@@ -3414,6 +3306,126 @@ pub(crate) fn session_db_resume_context_packet(session: &Session) -> Option<Resu
     })
 }
 
+/// Resolve the newest complete semantic checkpoint through the same
+/// Session-domain store that Runtime used to persist it. RuntimeFactory is
+/// currently synchronous, so the short SQLite lookup is isolated in its own
+/// current-thread runtime rather than blocking an existing Tokio worker.
+pub(crate) fn semantic_checkpoint_resume_context_packet(
+    store: std::sync::Arc<memory::UnifiedSessionStore>,
+    session_id: &str,
+) -> Option<ResumeContextPacket> {
+    let session_id = session_id.to_string();
+    let lookup_session_id = session_id.clone();
+    let page = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()?
+            .block_on(store.session_domain_events_page(&lookup_session_id, 0, 4_096))
+            .ok()
+    })
+    .join()
+    .ok()
+    .flatten()?;
+    let checkpoint = page
+        .events
+        .into_iter()
+        .rev()
+        .find(|event| event.kind == "memory.semantic_checkpoint.created")
+        .and_then(|event| event.payload.get("checkpoint").cloned())
+        .and_then(|value| {
+            serde_json::from_value::<memory::compression::session::SessionSemanticCheckpoint>(
+                value,
+            )
+            .map_err(|error| {
+                tracing::warn!(%error, %session_id, "ignoring malformed semantic checkpoint during resume");
+                error
+            })
+            .ok()
+        })?;
+    if checkpoint.schema_version == 0
+        || checkpoint.schema_version
+            > memory::compression::session::SESSION_SEMANTIC_CHECKPOINT_SCHEMA_VERSION
+    {
+        tracing::warn!(
+            %session_id,
+            checkpoint_schema = checkpoint.schema_version,
+            supported_schema = memory::compression::session::SESSION_SEMANTIC_CHECKPOINT_SCHEMA_VERSION,
+            "ignoring unsupported semantic checkpoint during resume"
+        );
+        return None;
+    }
+
+    let mut recent_decisions = checkpoint
+        .decisions
+        .iter()
+        .map(|value| format!("decision: {value}"))
+        .collect::<Vec<_>>();
+    recent_decisions.extend(
+        checkpoint
+            .user_rules
+            .iter()
+            .map(|value| format!("user rule (must preserve): {value}")),
+    );
+    recent_decisions.extend(
+        checkpoint
+            .constraints
+            .iter()
+            .map(|value| format!("constraint: {value}")),
+    );
+    recent_decisions.extend(
+        checkpoint
+            .file_changes
+            .iter()
+            .map(|value| format!("file change: {value}")),
+    );
+    recent_decisions.extend(checkpoint.evidence_refs.iter().map(|reference| {
+        format!(
+            "durable evidence reference: {}",
+            serde_json::to_string(reference).unwrap_or_else(|_| "unserializable".to_string())
+        )
+    }));
+    recent_decisions.push(format!(
+        "resume cursor: {}",
+        serde_json::to_string(&checkpoint.resume_cursor).unwrap_or_default()
+    ));
+
+    Some(ResumeContextPacket {
+        session_id,
+        handoff_summary: (!checkpoint.summary.trim().is_empty()).then_some(checkpoint.summary),
+        active_task: checkpoint.goal,
+        recent_decisions,
+        blockers: checkpoint.unresolved,
+        source: ResumeContextSource::SessionDb,
+    })
+}
+
+pub(crate) fn merge_resume_context_packets(
+    session_packet: Option<ResumeContextPacket>,
+    checkpoint_packet: Option<ResumeContextPacket>,
+) -> Option<ResumeContextPacket> {
+    match (session_packet, checkpoint_packet) {
+        (None, None) => None,
+        (Some(packet), None) | (None, Some(packet)) => Some(packet),
+        (Some(mut session), Some(checkpoint)) => {
+            if checkpoint.handoff_summary.is_some() {
+                session.handoff_summary = checkpoint.handoff_summary;
+            }
+            if checkpoint.active_task.is_some() {
+                session.active_task = checkpoint.active_task;
+            }
+            session.recent_decisions.extend(checkpoint.recent_decisions);
+            session.recent_decisions.sort();
+            session.recent_decisions.dedup();
+            session.blockers.extend(checkpoint.blockers);
+            session.blockers.sort();
+            session.blockers.dedup();
+            session.source = ResumeContextSource::SessionDb;
+            Some(session)
+        }
+    }
+}
+
 pub(crate) fn handoff_resume_context_packet(handoff: &memory::HandoffData) -> ResumeContextPacket {
     let active_task = handoff.task_states.first().map(|task| {
         format!(
@@ -3543,23 +3555,29 @@ pub(crate) fn runtime_capability_context_item(
         })
         .collect::<Vec<_>>();
     let runtime_query = if has_tool("runtime_capabilities") {
-        "runtime_capabilities=available"
+        "runtime_capabilities=registered"
     } else {
-        "runtime_capabilities=unavailable"
+        "runtime_capabilities=not_registered"
+    };
+    let runtime_orchestration = if has_tool("runtime_orchestrate") {
+        "runtime_orchestrate=registered"
+    } else {
+        "runtime_orchestrate=not_registered"
     };
     let allowed_state = allowed_tools.map_or_else(
         || "allowed_tools=all available registry tools".to_string(),
         |allowed| format!("allowed_tools=restricted count={}", allowed.len()),
     );
     let content = format!(
-        "# Active runtime capability map\n\
+        "# Runtime capability catalog\n\
 model_context_window={model_ctx}\n\
-available_tool_count={}\n\
+registered_tool_count={}\n\
 {allowed_state}\n\
 {runtime_query}\n\
-batch_readonly_tools={}\n\
-prepared_readonly_tools={}\n\
-Guidance: for independent read-only evidence, request multiple tool calls together or use tool_batch_readonly/read_many/grep_many when available; distinguish model-callable tools from runtime-owned collaboration/subagent affordances; for complex architecture or validation work, shape the task so runtime orchestration can attach collaborators when available; when a path repeats, query runtime_capabilities or re-plan before continuing.",
+{runtime_orchestration}\n\
+registered_batch_readonly_tools={}\n\
+registered_prepared_readonly_tools={}\n\
+Important: this is a filtered backend catalog, not the current provider function schema set. Runtime injects the authoritative per-request function-call contract separately. Call only functions in that contract; use ToolSearch to activate eligible deferred candidates. For independent read-only evidence, request multiple active calls together. Distinguish model-callable tools from runtime-owned collaboration/subagent affordances; for complex work, use active runtime orchestration when present. When a path repeats, re-plan from retained evidence rather than querying the same capability catalog again.",
         tool_definitions.len(),
         if batch_tools.is_empty() {
             "none".to_string()
@@ -3603,6 +3621,7 @@ fn workspace_git_snapshot(root: &Path, file_limit: usize) -> WorkspaceGitSnapsho
 
 fn git_current_branch(root: &Path) -> Option<String> {
     let output = Command::new("git")
+        .args(["-c", &format!("safe.directory={}", root.display())])
         .args(["-C"])
         .arg(root)
         .args(["branch", "--show-current"])
@@ -3617,6 +3636,7 @@ fn git_current_branch(root: &Path) -> Option<String> {
 
 fn git_changed_files(root: &Path, file_limit: usize) -> (Vec<String>, bool) {
     let output = match Command::new("git")
+        .args(["-c", &format!("safe.directory={}", root.display())])
         .args(["-C"])
         .arg(root)
         .args(["status", "--short", "--untracked-files=no"])
@@ -4200,20 +4220,18 @@ fn first_visible_line(text: &str) -> &str {
 }
 
 fn format_bash_result(icon: &str, parsed: &serde_json::Value) -> String {
-    use std::fmt::Write as _;
-
     let mut lines = vec![format!("{icon} \x1b[38;5;245mbash\x1b[0m")];
     if let Some(task_id) = parsed
         .get("backgroundTaskId")
         .and_then(|value| value.as_str())
     {
-        write!(&mut lines[0], " backgrounded ({task_id})").expect("write to string");
+        lines[0].push_str(&format!(" backgrounded ({task_id})"));
     } else if let Some(status) = parsed
         .get("returnCodeInterpretation")
         .and_then(|value| value.as_str())
         .filter(|status| !status.is_empty())
     {
-        write!(&mut lines[0], " {status}").expect("write to string");
+        lines[0].push_str(&format!(" {status}"));
     }
 
     if let Some(stdout) = parsed.get("stdout").and_then(|value| value.as_str()) {
@@ -4694,8 +4712,8 @@ mod tests {
         build_system_prompt_for_mode, cli_turn_context_profile, collect_session_prompt_history,
         create_managed_session_handle, discover_local_session_import_candidates, ensure_yolo_task,
         filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
-        format_commit_skipped_report, format_compact_report, format_connected_line,
-        format_cost_report, format_history_timestamp, format_issue_report, format_model_report,
+        format_commit_skipped_report, format_connected_line, format_cost_report,
+        format_history_timestamp, format_issue_report, format_model_report,
         format_model_switch_report, format_permissions_report, format_permissions_switch_report,
         format_pr_report, format_resume_report, format_startup_banner,
         format_startup_banner_with_task, format_status_report, format_tool_call_start,
@@ -4713,16 +4731,17 @@ mod tests {
         render_session_markdown, render_setup_json, render_setup_report, render_terminal_help,
         resolve_model_alias_with_config, resolve_session_reference, resolve_tui_model,
         response_to_events, resume_supported_slash_commands, run_resume_command,
-        runtime_capability_context_item, session_db_path, session_db_resume_context_packet,
-        short_tool_id, slash_command_completion_candidates_with_sessions, status_context,
-        strip_ansi_for_tui, suggestions::format_unknown_slash_command,
-        summarize_tool_payload_for_markdown, sync_cli_session_to_unified_store,
-        try_resolve_bare_skill_prompt, validate_no_args, workspace_context_item,
-        write_mcp_server_fixture, CliAction, CliOutputFormat, GatewayAction,
-        GatewayApprovalSlashCommand, GatewayContextSlashCommand, GatewayCrossPlaneSlashCommand,
-        GatewayTaskSlashCommand, GatewayToolExecutor, GitWorkspaceSummary, LocalHelpTopic,
-        SessionHandle, SessionPromptHistoryEntry, SlashCommand, StatusUsage, DEFAULT_MODEL,
-        LATEST_SESSION_REFERENCE, SHARED_RT, STUB_COMMANDS,
+        runtime_capability_context_item, semantic_checkpoint_resume_context_packet,
+        session_db_path, session_db_resume_context_packet, short_tool_id,
+        slash_command_completion_candidates_with_sessions, status_context, strip_ansi_for_tui,
+        suggestions::format_unknown_slash_command, summarize_tool_payload_for_markdown,
+        sync_cli_session_to_unified_store, try_resolve_bare_skill_prompt, validate_no_args,
+        workspace_context_item, write_mcp_server_fixture, CliAction, CliOutputFormat,
+        GatewayAction, GatewayApprovalSlashCommand, GatewayContextSlashCommand,
+        GatewayCrossPlaneSlashCommand, GatewayTaskSlashCommand, GatewayToolExecutor,
+        GitWorkspaceSummary, LocalHelpTopic, SessionHandle, SessionPromptHistoryEntry,
+        SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, SHARED_RT,
+        STUB_COMMANDS,
     };
     use crate::provider_crate::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use crate::runtime_bootstrap::GatewayToolRegistry as TestToolRegistry;
@@ -4748,7 +4767,7 @@ mod tests {
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -5159,10 +5178,7 @@ mod tests {
     }
 
     fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::test_process_env_lock()
     }
 
     fn with_current_dir<T>(cwd: &Path, f: impl FnOnce() -> T) -> T {
@@ -6449,7 +6465,7 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 1,
             audit: Vec::new(),
-            agent_graph: None,
+            execution_graph: None,
             strategy: None,
         };
 
@@ -6595,10 +6611,12 @@ mod tests {
             "expected at least 39 resume-supported commands, got {}",
             names.len()
         );
-        // Verify key resume commands still exist
+        // Verify key offline-resume commands still exist. `/compact` is
+        // intentionally absent: semantic compaction requires a live Gateway
+        // Runtime and durable session store.
         assert!(names.contains(&"help"));
         assert!(names.contains(&"status"));
-        assert!(names.contains(&"compact"));
+        assert!(!names.contains(&"compact"));
     }
 
     #[test]
@@ -6700,6 +6718,100 @@ mod tests {
     }
 
     #[test]
+    fn semantic_checkpoint_resume_restores_all_runtime_critical_fields() {
+        let store = std::sync::Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            store
+                .create_session(&memory::SessionRecord {
+                    session_id: "resume-semantic".to_string(),
+                    platform: "test".to_string(),
+                    chat_id: "resume-semantic".to_string(),
+                    user_id: None,
+                    model: None,
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                    last_activity: "2026-01-01T00:00:00Z".to_string(),
+                    message_count: 0,
+                    reset_policy: "manual".to_string(),
+                    metadata_json: None,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    estimated_cost_usd: 0.0,
+                    status: "active".to_string(),
+                })
+                .await
+                .expect("create session");
+        });
+        let checkpoint: memory::compression::session::SessionSemanticCheckpoint =
+            serde_json::from_value(serde_json::json!({
+                "schema_version": 2,
+                "checkpoint_id": "checkpoint-resume-1",
+                "session_id": "resume-semantic",
+                "agent_id": "primary",
+                "project_id": "project-a",
+                "task_id": "task-a",
+                "team_id": null,
+                "summary": "Implement the evidence boundary",
+                "user_rules": ["never copy raw evidence"],
+                "goal": "finish the V2 compensation",
+                "constraints": ["keep SessionStore canonical"],
+                "decisions": ["use typed handoff references"],
+                "evidence_refs": [],
+                "unresolved": ["verify restart path"],
+                "file_changes": ["crates/runtime/src/context/evidence/raw.rs"],
+                "resume_cursor": {
+                    "message_index": 17,
+                    "event_sequence": 9,
+                    "checkpoint_id": "checkpoint-resume-1"
+                },
+                "token_stats": {"before": 1200, "after": 240, "message_count": 9},
+                "source_range": {
+                    "session_id": "resume-semantic",
+                    "message_start": 0,
+                    "message_end_exclusive": 9,
+                    "event_start": 0,
+                    "event_end_exclusive": 9,
+                    "raw_refs": []
+                },
+                "facts": []
+            }))
+            .expect("checkpoint fixture");
+        let event = memory::SessionDomainEvent::new(
+            "resume-semantic",
+            0,
+            memory::SessionDomainScope::Memory,
+            "memory.semantic_checkpoint.created",
+            serde_json::json!({"checkpoint": checkpoint}),
+            1,
+        );
+        runtime.block_on(async {
+            store
+                .append_session_domain_event_allocating_sequence(&event)
+                .await
+                .expect("persist checkpoint");
+        });
+
+        let packet = semantic_checkpoint_resume_context_packet(store, "resume-semantic")
+            .expect("checkpoint resume packet");
+        let context = runtime::ContextRuntimeKernel::resume_item(&packet).content;
+        for expected in [
+            "Implement the evidence boundary",
+            "finish the V2 compensation",
+            "never copy raw evidence",
+            "keep SessionStore canonical",
+            "use typed handoff references",
+            "verify restart path",
+            "crates/runtime/src/context/evidence/raw.rs",
+            "checkpoint-resume-1",
+        ] {
+            assert!(
+                context.contains(expected),
+                "missing restored field: {expected}"
+            );
+        }
+    }
+
+    #[test]
     fn workspace_context_item_summarizes_runtime_workspace() {
         let root =
             std::env::temp_dir().join(format!("cowd-workspace-context-{}", uuid::Uuid::new_v4()));
@@ -6720,12 +6832,17 @@ mod tests {
         )
         .expect("tracked file");
         let git_add = Command::new("git")
+            .args(["-c", &format!("safe.directory={}", root.display())])
             .args(["-C"])
             .arg(&root)
             .args(["add", "src/lib.rs"])
             .output()
             .expect("run git add");
-        assert!(git_add.status.success());
+        assert!(
+            git_add.status.success(),
+            "git add failed: {}",
+            String::from_utf8_lossy(&git_add.stderr)
+        );
         let session = runtime::Session::new().with_workspace_root(root.clone());
 
         let item = workspace_context_item(&session, 200_000);
@@ -6768,19 +6885,10 @@ mod tests {
 
         assert_eq!(item.source, runtime::ContextSourceKind::RuntimeHeader);
         assert_eq!(item.role, runtime::ContextRole::Orientation);
-        assert!(item.content.contains("runtime_capabilities=available"));
+        assert!(item.content.contains("runtime_capabilities=registered"));
+        assert!(item.content.contains("runtime_orchestrate=not_registered"));
         assert!(item.content.contains("read_many"));
         assert!(item.content.contains("tool_batch_readonly"));
-    }
-
-    #[test]
-    fn compact_report_uses_structured_output() {
-        let compacted = format_compact_report(8, 5, false);
-        assert!(compacted.contains("Compact"));
-        assert!(compacted.contains("Result           compacted"));
-        assert!(compacted.contains("Messages removed 8"));
-        let skipped = format_compact_report(0, 3, true);
-        assert!(skipped.contains("Result           skipped"));
     }
 
     #[test]
@@ -7197,28 +7305,21 @@ UU conflicted.rs",
     }
 
     #[test]
-    fn resume_agents_command_returns_structured_catalog_json() {
+    fn resume_agents_command_requires_runtime_definition_service() {
         let _guard = env_lock();
         let root = temp_dir();
         fs::create_dir_all(&root).expect("root dir");
         let session_path = root.join("session.json");
         let session = Session::new();
-        let outcome = with_current_dir(&root, || {
+        let error = with_current_dir(&root, || {
             run_resume_command(
                 &session_path,
                 &session,
                 &SlashCommand::Agents { args: None },
             )
-            .expect("resume agents should work")
+            .expect_err("resume cannot construct a separate definition catalog")
         });
-        let json = outcome.json.expect("agents json should exist");
-        assert_eq!(json["kind"], "agents");
-        assert_eq!(json["action"], "list");
-        assert!(json
-            .get("agents")
-            .and_then(serde_json::Value::as_array)
-            .is_some());
-        assert!(json.get("text").is_none());
+        assert!(error.to_string().contains("Runtime Definition service"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -7243,13 +7344,9 @@ UU conflicted.rs",
             let target_handle =
                 create_managed_session_handle("resume-switch-target").expect("target handle");
             let target = Session::new().with_workspace_root(root.clone());
-            sync_cli_session_to_unified_store(
-                get_unified_store().expect("store should open"),
-                &target_handle,
-                None,
-                &target,
-            )
-            .expect("target session should sync");
+            let store = get_unified_store().expect("store should open");
+            sync_cli_session_to_unified_store(&store, &target_handle, None, &target)
+                .expect("target session should sync");
             (active_path, active, target_handle)
         });
 
@@ -8221,26 +8318,47 @@ UU conflicted.rs",
         assert!(allowed.contains("mcp__alpha__echo"));
         assert!(allowed.contains("MCPTool"));
 
-        let executor = GatewayToolExecutor::new(
-            None,
-            false,
-            state.tool_registry.clone(),
-            state.mcp_state.clone(),
-        );
+        let tool_host = Arc::new(tools::ToolHost::new(
+            "bootstrap-mcp-test",
+            &workspace,
+            state.tool_host_snapshot(),
+        ));
+        let executor =
+            GatewayToolExecutor::from_tool_host(None, false, tool_host, state.mcp_state.clone());
 
-        let tool_output = executor
+        let authorize_and_execute = |tool_name: &str, input: &str| {
+            let value: serde_json::Value =
+                serde_json::from_str(input).expect("tool input should be valid JSON");
+            let descriptor = executor
+                .describe_tool_effect(tool_name, &value)
+                .expect("registered tool should describe its effect");
+            let authorization = runtime::ToolPolicy
+                .authorize(
+                    &descriptor,
+                    format!("gateway-mcp-test:{tool_name}"),
+                    PermissionMode::DangerFullAccess,
+                    30,
+                )
+                .expect("test permission should authorize tool")
+                .authorization;
+            executor.execute_authorized(&authorization, tool_name, input)
+        };
+
+        assert!(executor
             .execute("mcp__alpha__echo", r#"{"text":"hello"}"#)
+            .is_err());
+
+        let tool_output = authorize_and_execute("mcp__alpha__echo", r#"{"text":"hello"}"#)
             .expect("discovered mcp tool should execute");
         let tool_json: serde_json::Value =
             serde_json::from_str(&tool_output).expect("tool output should be json");
-        assert_eq!(tool_json["structuredContent"]["echoed"], "hello");
+        assert_eq!(tool_json["output"]["structuredContent"]["echoed"], "hello");
 
-        let wrapped_output = executor
-            .execute(
-                "MCPTool",
-                r#"{"qualifiedName":"mcp__alpha__echo","arguments":{"text":"wrapped"}}"#,
-            )
-            .expect("generic mcp wrapper should execute");
+        let wrapped_output = authorize_and_execute(
+            "MCPTool",
+            r#"{"qualifiedName":"mcp__alpha__echo","arguments":{"text":"wrapped"}}"#,
+        )
+        .expect("generic mcp wrapper should execute");
         let wrapped_json: serde_json::Value =
             serde_json::from_str(&wrapped_output).expect("wrapped output should be json");
         assert_eq!(wrapped_json["structuredContent"]["echoed"], "wrapped");
@@ -8265,19 +8383,17 @@ UU conflicted.rs",
             "mcp__alpha__echo"
         );
 
-        let listed = executor
-            .execute("ListMcpResourcesTool", r#"{"server":"alpha"}"#)
+        let listed = authorize_and_execute("ListMcpResourcesTool", r#"{"server":"alpha"}"#)
             .expect("resources should list");
         let listed_json: serde_json::Value =
             serde_json::from_str(&listed).expect("resource output should be json");
         assert_eq!(listed_json["resources"][0]["uri"], "file://guide.txt");
 
-        let read = executor
-            .execute(
-                "ReadMcpResourceTool",
-                r#"{"server":"alpha","uri":"file://guide.txt"}"#,
-            )
-            .expect("resource should read");
+        let read = authorize_and_execute(
+            "ReadMcpResourceTool",
+            r#"{"server":"alpha","uri":"file://guide.txt"}"#,
+        )
+        .expect("resource should read");
         let read_json: serde_json::Value =
             serde_json::from_str(&read).expect("resource read output should be json");
         assert_eq!(
@@ -8323,12 +8439,13 @@ UU conflicted.rs",
             &runtime_config,
         )
         .expect("runtime plugin state should load");
-        let executor = GatewayToolExecutor::new(
-            None,
-            false,
-            state.tool_registry.clone(),
-            state.mcp_state.clone(),
-        );
+        let tool_host = Arc::new(tools::ToolHost::new(
+            "bootstrap-mcp-unsupported-test",
+            &workspace,
+            state.tool_host_snapshot(),
+        ));
+        let executor =
+            GatewayToolExecutor::from_tool_host(None, false, tool_host, state.mcp_state.clone());
 
         let search_output = executor
             .execute("ToolSearch", r#"{"query":"remote","max_results":5}"#)
@@ -8383,8 +8500,23 @@ UU conflicted.rs",
             &runtime_config,
         )
         .expect("plugin state should load");
+        let test_tool_host = Arc::new(tools::ToolHost::new(
+            "runtime-plugin-lifecycle",
+            &workspace,
+            tools::ToolHostSnapshot::new(
+                Arc::new(runtime_plugin_state.tool_registry.clone()),
+                Arc::new(tools::lsp_client::LspRegistry::new()),
+                None,
+            ),
+        ));
         let mut runtime = create_runtime_entry_with_bootstrap_state(
             None,
+            runtime::RuntimeServices::in_memory().expect("test runtime services"),
+            Arc::new(
+                runtime::ProviderRegistry::new(runtime_config.providers().clone())
+                    .expect("provider registry"),
+            ),
+            test_tool_host,
             Session::new(),
             "runtime-plugin-lifecycle",
             DEFAULT_MODEL.to_string(),
@@ -8466,6 +8598,7 @@ UU conflicted.rs",
     }
 }
 
+#[cfg(test)]
 fn write_mcp_server_fixture(script_path: &Path) {
     let script = [
             "#!/usr/bin/env python3",

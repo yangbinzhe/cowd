@@ -1,10 +1,10 @@
 //! Mission evidence bus for team, agent, approval, tool, and recovery outputs.
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{record_runtime_event, RuntimeEventInput, RuntimeEventRef, RuntimeEventScope};
+use crate::{RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MissionEvidenceRef {
@@ -19,15 +19,19 @@ pub struct MissionEvidenceRef {
     pub created_at_ms: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MissionEvidenceBus {
     evidence: Mutex<Vec<MissionEvidenceRef>>,
+    event_store: Arc<RuntimeEventStore>,
 }
 
 impl MissionEvidenceBus {
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(event_store: Arc<RuntimeEventStore>) -> Self {
+        Self {
+            evidence: Mutex::new(Vec::new()),
+            event_store,
+        }
     }
 
     pub fn record(&self, evidence: MissionEvidenceRef) -> MissionEvidenceRef {
@@ -48,7 +52,7 @@ impl MissionEvidenceBus {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(evidence.clone());
-        record_event(&evidence);
+        record_event(&self.event_store, &evidence);
         evidence
     }
 
@@ -73,15 +77,29 @@ impl MissionEvidenceBus {
             .cloned()
             .collect()
     }
+
+    #[must_use]
+    pub fn list_all(&self) -> Vec<MissionEvidenceRef> {
+        self.evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    #[must_use]
+    pub fn projection(&self) -> serde_json::Value {
+        let mut evidence = self.list_all();
+        evidence.sort_by(|left, right| right.created_at_ms.cmp(&left.created_at_ms));
+        serde_json::json!({
+            "kind": "runtime.mission_evidence",
+            "count": evidence.len(),
+            "latest": evidence.into_iter().take(100).collect::<Vec<_>>(),
+        })
+    }
 }
 
-pub fn global_mission_evidence_bus() -> &'static MissionEvidenceBus {
-    static BUS: OnceLock<MissionEvidenceBus> = OnceLock::new();
-    BUS.get_or_init(MissionEvidenceBus::new)
-}
-
-fn record_event(evidence: &MissionEvidenceRef) {
-    let _ = record_runtime_event(RuntimeEventInput {
+fn record_event(event_store: &RuntimeEventStore, evidence: &MissionEvidenceRef) {
+    let _ = event_store.append(RuntimeEventInput {
         stream_id: evidence
             .team_id
             .as_ref()

@@ -7,7 +7,8 @@ pub(in crate::api_routes) fn agent_value_summary(
     degraded_reason: Option<&str>,
 ) -> Value {
     let latest = events.iter().rev().find(|event| {
-        event.kind == "agent.workgraph.reviewed" || event.kind == "agent.workgraph.planned"
+        event.kind == "agent.execution_graph.reviewed"
+            || event.kind == "agent.execution_graph.planned"
     });
     let mut reasons: Vec<String> = degraded_reason.map(str::to_string).into_iter().collect();
 
@@ -24,10 +25,10 @@ pub(in crate::api_routes) fn agent_value_summary(
     }
 
     let Some(event) = latest else {
-        reasons.push("no agent workgraph evidence in selected timeline".to_string());
+        reasons.push("no agent execution graph evidence in selected timeline".to_string());
         return serde_json::json!({
             "status": if degraded { "degraded" } else { "unproven" },
-            "recommendation": "collect_workgraph_review",
+            "recommendation": "collect_execution_graph_review",
             "policy": agent_policy_json(policy),
             "latest": null,
             "policy_passed": false,
@@ -106,10 +107,10 @@ pub(in crate::api_routes) fn agent_value_summary(
         reasons.push(format!("{conflict_count} conflict(s) require review"));
     }
     if event_failed {
-        reasons.push("latest workgraph event failed".to_string());
+        reasons.push("latest execution graph event failed".to_string());
     }
     if event_degraded {
-        reasons.push("latest workgraph evidence is degraded".to_string());
+        reasons.push("latest execution graph evidence is degraded".to_string());
     }
     for reason in verdict
         .get("reasons")
@@ -142,7 +143,7 @@ pub(in crate::api_routes) fn agent_value_summary(
     } else if status == "insufficient" {
         "prefer_single_agent_or_review_only"
     } else if status == "degraded" {
-        "repair_workgraph_evidence"
+        "repair_execution_graph_evidence"
     } else {
         "collect_more_collaboration_evidence"
     };

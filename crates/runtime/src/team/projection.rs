@@ -1,0 +1,177 @@
+use std::sync::Arc;
+
+use harness_contract::agent::AgentTaskPacket;
+use harness_contract::execution_graph::{ExecutionGraph, ExecutionNodeKind, ExecutionNodeStatus};
+use harness_contract::team::{TeamRunResult, TeamTaskTrace};
+use serde::{Deserialize, Serialize};
+
+use crate::{AgentRuntime, ExecutionGraphStateStore};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamProjection {
+    pub team_id: String,
+    pub session_id: String,
+    pub graph_id: String,
+    pub graph_revision: u64,
+    pub status: String,
+    pub tasks: Vec<TeamTaskTrace>,
+    pub terminal_result: Option<TeamRunResult>,
+}
+
+/// Read-only Team facade. The graph and AgentRuntime are the sources of truth.
+pub struct TeamProjectionReader {
+    graphs: ExecutionGraphStateStore,
+    agents: Arc<AgentRuntime>,
+}
+
+impl TeamProjectionReader {
+    #[must_use]
+    pub fn new(graphs: ExecutionGraphStateStore, agents: Arc<AgentRuntime>) -> Self {
+        Self { graphs, agents }
+    }
+
+    pub fn project(&self, graph_id: &str) -> Result<TeamProjection, String> {
+        let graph = self
+            .graphs
+            .load(graph_id)
+            .map_err(|error| error.to_string())?;
+        self.project_graph(graph)
+    }
+
+    pub fn list(&self) -> Result<Vec<TeamProjection>, String> {
+        let mut projections = Vec::new();
+        for graph_id in self.graphs.graph_ids().map_err(|error| error.to_string())? {
+            let graph = self
+                .graphs
+                .load(&graph_id)
+                .map_err(|error| error.to_string())?;
+            let declares_team = graph.nodes.iter().any(|node| {
+                node.kind == ExecutionNodeKind::AgentTask
+                    && serde_json::from_str::<serde_json::Value>(&node.payload_ref)
+                        .ok()
+                        .and_then(|value| value.get("team_id").cloned())
+                        .and_then(|value| value.as_str().map(str::to_string))
+                        .is_some_and(|team_id| !team_id.trim().is_empty())
+            });
+            match self.project_graph(graph) {
+                Ok(projection) => projections.push(projection),
+                Err(error) if declares_team => return Err(error),
+                Err(_) => {}
+            }
+        }
+        projections.sort_by(|left, right| left.graph_id.cmp(&right.graph_id));
+        Ok(projections)
+    }
+
+    fn project_graph(&self, graph: ExecutionGraph) -> Result<TeamProjection, String> {
+        let mut tasks = Vec::new();
+        let mut team_id = None;
+        let mut session_id = None;
+        for node in graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == ExecutionNodeKind::AgentTask)
+        {
+            let packet: AgentTaskPacket = serde_json::from_str(&node.payload_ref)
+                .map_err(|error| format!("invalid team AgentTask packet {}: {error}", node.id))?;
+            let packet_team = packet
+                .team_id
+                .clone()
+                .ok_or_else(|| format!("AgentTask {} is not bound to a team", node.id))?;
+            if let Some(existing) = &team_id {
+                if existing != &packet_team {
+                    return Err(format!(
+                        "graph {} contains multiple team identities",
+                        graph.id
+                    ));
+                }
+            } else {
+                team_id = Some(packet_team);
+            }
+            if let Some(existing) = &session_id {
+                if existing != &packet.session_id {
+                    return Err(format!(
+                        "graph {} contains multiple team session identities",
+                        graph.id
+                    ));
+                }
+            } else {
+                session_id = Some(packet.session_id.clone());
+            }
+            let returned = self.agents.terminal_return(&packet.agent_id);
+            tasks.push(TeamTaskTrace {
+                task_id: packet.task_id,
+                role_id: node.id.rsplit(':').next().unwrap_or_default().to_string(),
+                agent_id: packet.agent_id,
+                run_id: packet.run_id,
+                node_id: node.id.clone(),
+                status: graph
+                    .node_statuses
+                    .get(&node.id)
+                    .map(|status| format!("{status:?}").to_ascii_lowercase())
+                    .unwrap_or_else(|| "planned".into()),
+                result_ref: graph
+                    .node_results
+                    .get(&node.id)
+                    .and_then(|result| result.result_ref.clone()),
+                evidence_refs: returned.map(|item| item.evidence_refs).unwrap_or_default(),
+                failure: graph.node_results.get(&node.id).and_then(|result| {
+                    result
+                        .failure
+                        .as_ref()
+                        .map(|failure| failure.message.clone())
+                }),
+            });
+        }
+        let team_id = team_id.ok_or_else(|| format!("graph {} has no team AgentTask", graph.id))?;
+        let session_id =
+            session_id.ok_or_else(|| format!("graph {} has no team session identity", graph.id))?;
+        let final_node = graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == ExecutionNodeKind::Synthesize);
+        let terminal_result = final_node.and_then(|node| {
+            graph.node_results.get(&node.id).and_then(|result| {
+                result.result_ref.as_ref().map(|result_ref| TeamRunResult {
+                    team_id: team_id.clone(),
+                    graph_id: graph.id.clone(),
+                    graph_revision: graph.revision,
+                    result_ref: result_ref.clone(),
+                    evidence_refs: result.evidence_refs.clone(),
+                })
+            })
+        });
+        let status = if graph
+            .node_statuses
+            .values()
+            .any(|status| *status == ExecutionNodeStatus::Failed)
+        {
+            "failed"
+        } else if graph
+            .node_statuses
+            .values()
+            .any(|status| *status == ExecutionNodeStatus::Blocked)
+        {
+            "blocked"
+        } else if graph
+            .node_statuses
+            .values()
+            .all(|status| status.is_terminal())
+            && !graph.nodes.is_empty()
+        {
+            "completed"
+        } else {
+            "running"
+        }
+        .to_string();
+        Ok(TeamProjection {
+            team_id,
+            session_id,
+            graph_id: graph.id,
+            graph_revision: graph.revision,
+            status,
+            tasks,
+            terminal_result,
+        })
+    }
+}

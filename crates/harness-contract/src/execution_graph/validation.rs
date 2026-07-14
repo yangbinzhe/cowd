@@ -1,0 +1,108 @@
+use std::collections::{BTreeMap, BTreeSet};
+
+use thiserror::Error;
+
+use super::{ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind};
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum ExecutionGraphValidationError {
+    #[error("execution graph objective is empty")]
+    EmptyObjective,
+    #[error("duplicate execution node `{0}`")]
+    DuplicateNode(String),
+    #[error("execution node `{0}` has no payload reference")]
+    MissingPayload(String),
+    #[error("execution node `{0}` has no executor binding")]
+    MissingExecutor(String),
+    #[error("execution edge references missing node `{0}`")]
+    MissingNode(String),
+    #[error("execution graph contains a dependency cycle")]
+    Cycle,
+    #[error("timer executor is unavailable before schedule support is installed")]
+    TimerUnavailable,
+}
+
+pub fn validate_execution_graph(
+    graph: &ExecutionGraph,
+) -> Result<Vec<Vec<String>>, ExecutionGraphValidationError> {
+    if graph.objective.trim().is_empty() {
+        return Err(ExecutionGraphValidationError::EmptyObjective);
+    }
+    let mut ids = BTreeSet::new();
+    for node in &graph.nodes {
+        if !ids.insert(node.id.clone()) {
+            return Err(ExecutionGraphValidationError::DuplicateNode(
+                node.id.clone(),
+            ));
+        }
+        if node.payload_ref.trim().is_empty() {
+            return Err(ExecutionGraphValidationError::MissingPayload(
+                node.id.clone(),
+            ));
+        }
+        if node.executor_kind.trim().is_empty() {
+            return Err(ExecutionGraphValidationError::MissingExecutor(
+                node.id.clone(),
+            ));
+        }
+        if node.kind == ExecutionNodeKind::Timer {
+            return Err(ExecutionGraphValidationError::TimerUnavailable);
+        }
+    }
+    let mut indegree = ids
+        .iter()
+        .map(|id| (id.clone(), 0usize))
+        .collect::<BTreeMap<_, _>>();
+    let mut outgoing = BTreeMap::<String, Vec<String>>::new();
+    for edge in graph
+        .edges
+        .iter()
+        .filter(|edge| edge.kind == ExecutionEdgeKind::DependsOn)
+    {
+        if !ids.contains(&edge.from) {
+            return Err(ExecutionGraphValidationError::MissingNode(
+                edge.from.clone(),
+            ));
+        }
+        if !ids.contains(&edge.to) {
+            return Err(ExecutionGraphValidationError::MissingNode(edge.to.clone()));
+        }
+        let count = indegree
+            .get_mut(&edge.to)
+            .ok_or_else(|| ExecutionGraphValidationError::MissingNode(edge.to.clone()))?;
+        *count += 1;
+        outgoing
+            .entry(edge.from.clone())
+            .or_default()
+            .push(edge.to.clone());
+    }
+    let mut frontier = indegree
+        .iter()
+        .filter_map(|(id, count)| (*count == 0).then_some(id.clone()))
+        .collect::<Vec<_>>();
+    let mut batches = Vec::new();
+    let mut visited = 0usize;
+    while !frontier.is_empty() {
+        frontier.sort();
+        let batch = frontier;
+        visited += batch.len();
+        let mut next = Vec::new();
+        for id in &batch {
+            for target in outgoing.get(id).into_iter().flatten() {
+                let count = indegree
+                    .get_mut(target)
+                    .ok_or_else(|| ExecutionGraphValidationError::MissingNode(target.clone()))?;
+                *count -= 1;
+                if *count == 0 {
+                    next.push(target.clone());
+                }
+            }
+        }
+        batches.push(batch);
+        frontier = next;
+    }
+    if visited != graph.nodes.len() {
+        return Err(ExecutionGraphValidationError::Cycle);
+    }
+    Ok(batches)
+}

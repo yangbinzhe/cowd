@@ -10,6 +10,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
+use crate::components::base::terminal_len;
 use crate::components::RenderContext;
 
 // ─── Toast Variant ────────────────────────────────────────────────────
@@ -197,8 +198,13 @@ impl ToastManager {
             // Calculate toast height:
             // border(2) + title_line(1 if title exists else 0) + message + bottom spacing(1)
             let title_h = if toast.title.is_some() { 1u16 } else { 0u16 };
-            let msg_lines = toast.message.lines().count().max(1) as u16;
-            let toast_h = 2u16 + title_h + 1u16 + msg_lines + 1u16;
+            let msg_lines = terminal_len(toast.message.lines().count().max(1));
+            let toast_h = 2u16
+                .saturating_add(title_h)
+                .saturating_add(1)
+                .saturating_add(msg_lines)
+                .saturating_add(1)
+                .min(area.height.saturating_sub(y.saturating_sub(area.y)));
 
             let toast_rect = Rect::new(x, y, max_w, toast_h);
 

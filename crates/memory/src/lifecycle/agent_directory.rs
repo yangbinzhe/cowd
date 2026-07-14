@@ -1,13 +1,7 @@
-//! AgentDirectory — sub-agent mutual discovery registry.
-//!
-//! Provides a global, thread-safe registry where sub-agents can discover
-//! each other and query "who can help with X" based on declared capabilities.
+//! AgentDirectory — runtime-scoped agent capability registry.
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::OnceLock;
-
-static DIRECTORY: OnceLock<AgentDirectory> = OnceLock::new();
 
 /// Quality / reputation score accumulated by an agent across tasks.
 #[derive(Debug, Clone, Copy, Default)]
@@ -78,27 +72,17 @@ pub enum AgentStatus {
     Offline,
 }
 
-/// Thread-safe global registry of active sub-agents.
-///
-/// Use `AgentDirectory::global()` to access the singleton.
+/// Thread-safe registry of active agents, owned by its RuntimeServices scope.
 pub struct AgentDirectory {
     agents: Mutex<HashMap<String, AgentInfo>>,
 }
 
 impl AgentDirectory {
     /// Create an empty directory instance.
-    ///
-    /// Most runtime callers should use `AgentDirectory::global()`. A dedicated
-    /// instance is useful when a caller needs explicit lifecycle isolation.
     pub fn new() -> Self {
         Self {
             agents: Mutex::new(HashMap::new()),
         }
-    }
-
-    /// Obtain a reference to the global singleton directory.
-    pub fn global() -> &'static Self {
-        DIRECTORY.get_or_init(Self::new)
     }
 
     /// Register a new agent in the directory.

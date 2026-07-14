@@ -2,12 +2,14 @@
 
 use std::collections::BTreeMap;
 
-use memory::{RuntimeEvent, RuntimeEventScope, RuntimeRef};
+use harness_contract::core::ExecutionModifier;
+use memory::{SessionDomainEvent, SessionDomainRef, SessionDomainScope};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::execution_core::RuntimeExecutionDecision;
 use crate::tool_dispatch::ToolRequest;
-use crate::tool_execution_plan::{ToolExecutionMode, ToolExecutionPlan};
+use crate::tool_execution_plan::{ToolExecutionMode, ToolExecutionPlan, ToolExecutionPlanTask};
 use crate::tool_orchestrator::ToolSafetyCategory;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,16 +69,16 @@ impl ToolSchedule {
         sequence: usize,
         created_at_ms: u64,
         requests: &[ToolRequest],
-    ) -> RuntimeEvent {
+    ) -> SessionDomainEvent {
         let payload = serde_json::json!({
             "batch_count": self.batches.len(),
             "batches": self.batches,
             "tool_count": requests.len(),
         });
-        let mut event = RuntimeEvent::new(
+        let mut event = SessionDomainEvent::new(
             session_id,
             sequence,
-            RuntimeEventScope::Tool,
+            SessionDomainScope::Tool,
             "tool.schedule.created",
             payload,
             created_at_ms,
@@ -84,7 +86,7 @@ impl ToolSchedule {
         event.status = Some("planned".to_string());
         event.refs = requests
             .iter()
-            .map(|request| RuntimeRef {
+            .map(|request| SessionDomainRef {
                 ref_type: "tool_call".to_string(),
                 id: request.tool_use_id.clone(),
                 label: Some(request.tool_name.clone()),
@@ -97,6 +99,14 @@ impl ToolSchedule {
 #[must_use]
 pub fn schedule_tool_requests(requests: &[ToolRequest]) -> ToolSchedule {
     let plan = ToolExecutionPlan::from_requests(requests);
+    schedule_tool_execution_plan(requests, &plan)
+}
+
+#[must_use]
+pub fn schedule_tool_execution_plan(
+    requests: &[ToolRequest],
+    plan: &ToolExecutionPlan,
+) -> ToolSchedule {
     let mut parallel_read = Vec::new();
     let mut limited_write = Vec::new();
     let mut limited_network = Vec::new();
@@ -161,6 +171,53 @@ pub fn schedule_tool_requests(requests: &[ToolRequest]) -> ToolSchedule {
     ToolSchedule { batches }
 }
 
+#[must_use]
+pub fn schedule_tool_requests_for_decision(
+    requests: &[ToolRequest],
+    decision: &RuntimeExecutionDecision,
+) -> ToolSchedule {
+    let plan = ToolExecutionPlan::from_requests(requests);
+    schedule_tool_execution_plan_for_decision(requests, &plan, decision)
+}
+
+#[must_use]
+pub fn schedule_tool_execution_plan_for_decision(
+    requests: &[ToolRequest],
+    plan: &ToolExecutionPlan,
+    decision: &RuntimeExecutionDecision,
+) -> ToolSchedule {
+    if decision.modifiers().contains(&ExecutionModifier::Parallel) {
+        return schedule_tool_execution_plan(requests, plan);
+    }
+
+    let batches = plan
+        .tasks
+        .iter()
+        .enumerate()
+        .map(|(index, task)| ExecutionBatch {
+            mode: execution_batch_mode(task),
+            indices: vec![index],
+            max_concurrency: 1,
+            reason: "strategy decision requires original-order serial execution".to_string(),
+            scope_groups: build_scope_groups(&[index], requests),
+        })
+        .collect();
+
+    ToolSchedule { batches }
+}
+
+fn execution_batch_mode(task: &ToolExecutionPlanTask) -> ExecutionBatchMode {
+    if task.execution_mode == ToolExecutionMode::Wave || !task.depends_on.is_empty() {
+        return ExecutionBatchMode::Wave;
+    }
+    match task.safety_category {
+        ToolSafetyCategory::ReadOnly => ExecutionBatchMode::ParallelRead,
+        ToolSafetyCategory::Network => ExecutionBatchMode::LimitedNetwork,
+        ToolSafetyCategory::WriteLocal => ExecutionBatchMode::LimitedWrite,
+        ToolSafetyCategory::Destructive => ExecutionBatchMode::SerialDestructive,
+    }
+}
+
 fn push_batch(
     batches: &mut Vec<ExecutionBatch>,
     mode: ExecutionBatchMode,
@@ -221,6 +278,8 @@ fn request_scope(request: &ToolRequest) -> String {
 mod tests {
     use super::*;
 
+    use crate::execution_core::build_runtime_execution_decision;
+
     fn request(id: &str, name: &str, input: &str) -> ToolRequest {
         ToolRequest {
             tool_use_id: id.to_string(),
@@ -228,6 +287,12 @@ mod tests {
             input: input.to_string(),
             depends_on: Vec::new(),
         }
+    }
+
+    fn decision_with_modifiers(modifiers: &[ExecutionModifier]) -> RuntimeExecutionDecision {
+        let mut decision = build_runtime_execution_decision("explain this function", None);
+        decision.strategy.modifiers = modifiers.to_vec();
+        decision
     }
 
     #[test]
@@ -285,6 +350,20 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_reuses_registered_tool_classification_from_execution_plan() {
+        let requests = vec![request("plugin-read", "company_catalog_lookup", "{}")];
+        let plan = ToolExecutionPlan::from_requests_with_classifier(&requests, |name, _| {
+            (name == "company_catalog_lookup").then_some(ToolSafetyCategory::ReadOnly)
+        });
+        let decision = decision_with_modifiers(&[ExecutionModifier::Parallel]);
+
+        let schedule = schedule_tool_execution_plan_for_decision(&requests, &plan, &decision);
+
+        assert_eq!(schedule.batches.len(), 1);
+        assert_eq!(schedule.batches[0].mode, ExecutionBatchMode::ParallelRead);
+    }
+
+    #[test]
     fn schedule_runtime_event_refs_all_tools() {
         let requests = vec![
             request("read-1", "read_file", r#"{"path":"README.md"}"#),
@@ -293,7 +372,7 @@ mod tests {
         let schedule = schedule_tool_requests(&requests);
         let event = schedule.to_runtime_event("session-1", 9, 123, &requests);
 
-        assert_eq!(event.scope, RuntimeEventScope::Tool);
+        assert_eq!(event.scope, SessionDomainScope::Tool);
         assert_eq!(event.kind, "tool.schedule.created");
         assert_eq!(event.refs.len(), 2);
         assert_eq!(event.payload["batch_count"], 2);
@@ -322,5 +401,74 @@ mod tests {
         let write = &schedule.batches[1];
         assert_eq!(write.mode, ExecutionBatchMode::LimitedWrite);
         assert_eq!(write.scope_groups[0].scope, "file:src/lib.rs");
+    }
+
+    #[test]
+    fn decision_scheduler_preserves_strict_order_without_parallel_modifier() {
+        let requests = [
+            request(
+                "write-1",
+                "write_file",
+                r#"{"path":"src/lib.rs","content":"x"}"#,
+            ),
+            request("read-1", "read_file", r#"{"path":"README.md"}"#),
+            request("net-1", "WebSearch", r#"{"query":"rust"}"#),
+            request("shell-1", "bash", r#"{"command":"rm -rf target"}"#),
+        ];
+        let decision = decision_with_modifiers(&[]);
+
+        let schedule = schedule_tool_requests_for_decision(&requests, &decision);
+
+        assert_eq!(schedule.batches.len(), requests.len());
+        assert_eq!(
+            schedule
+                .batches
+                .iter()
+                .map(|batch| batch.indices.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![0], vec![1], vec![2], vec![3]]
+        );
+        assert_eq!(
+            schedule
+                .batches
+                .iter()
+                .map(|batch| batch.mode)
+                .collect::<Vec<_>>(),
+            vec![
+                ExecutionBatchMode::LimitedWrite,
+                ExecutionBatchMode::ParallelRead,
+                ExecutionBatchMode::LimitedNetwork,
+                ExecutionBatchMode::SerialDestructive,
+            ]
+        );
+        assert!(schedule
+            .batches
+            .iter()
+            .all(|batch| batch.max_concurrency == 1));
+    }
+
+    #[test]
+    fn decision_scheduler_reuses_grouped_concurrency_with_parallel_modifier() {
+        let requests = [
+            request(
+                "write-1",
+                "write_file",
+                r#"{"path":"src/lib.rs","content":"x"}"#,
+            ),
+            request("read-1", "read_file", r#"{"path":"README.md"}"#),
+            request("net-1", "WebSearch", r#"{"query":"rust"}"#),
+            request("read-2", "grep_search", r#"{"pattern":"fn"}"#),
+        ];
+        let decision = decision_with_modifiers(&[ExecutionModifier::Parallel]);
+
+        let schedule = schedule_tool_requests_for_decision(&requests, &decision);
+        let existing = schedule_tool_requests(&requests);
+
+        assert_eq!(schedule, existing);
+        assert_eq!(schedule.batches[0].mode, ExecutionBatchMode::ParallelRead);
+        assert_eq!(schedule.batches[0].indices, vec![1, 3]);
+        assert_eq!(schedule.batches[0].max_concurrency, usize::MAX);
+        assert_eq!(schedule.batches[1].indices, vec![2]);
+        assert_eq!(schedule.batches[2].indices, vec![0]);
     }
 }

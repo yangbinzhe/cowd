@@ -71,39 +71,38 @@ pub trait MemoryExtractionSource: Send + Sync {
 // Constants – preference-signal keywords (lower-case)
 // ---------------------------------------------------------------------------
 
-/// English and Chinese preference-signal fragments scanned in user messages.
+/// English and Chinese markers that explicitly state a durable preference.
+///
+/// A task-local imperative such as "don't use a tool for this answer" is not
+/// a user preference. Persisting it would pollute later sessions and can
+/// invert an explicit later request. Auto-extraction therefore requires a
+/// durability marker; callers that intentionally manage durable preferences
+/// can still write `UserExplicit` entries through the normal memory API.
 const PREF_SIGNALS: &[&str] = &[
     // English
     "i like",
     "i prefer",
-    "i always",
-    "i usually",
+    "my preference",
     "please always",
     "please never",
     "always use",
     "never use",
-    "don't use",
-    "do not use",
-    "stop using",
-    "i want",
-    "i need",
-    "make sure",
-    "ensure that",
     "remember that",
-    "keep in mind",
+    "in future",
+    "going forward",
+    "from now on",
     // Chinese
     "我喜欢",
     "我偏好",
-    "我希望",
     "请总是",
     "请始终",
-    "不要",
-    "别再",
-    "请不要",
     "记住",
-    "确保",
     "每次都",
-    "我需要",
+    "以后",
+    "今后",
+    "长期",
+    "一律",
+    "默认使用",
 ];
 
 /// English and Chinese decision-signal fragments scanned in assistant messages.
@@ -998,6 +997,37 @@ mod tests {
             .iter()
             .find(|e| e.category == MemoryCategory::UserPreference);
         assert!(pref.is_some(), "expected a UserPreference entry");
+    }
+
+    #[tokio::test]
+    async fn task_local_negative_instruction_is_not_promoted_to_a_preference() {
+        let ex = default_extractor();
+        let messages = vec![
+            Message::user("只回答 7 乘以 8 的结果。不要调用工具，不要组队；本题结束后无需沿用。"),
+            Message::assistant("7 乘以 8 等于 56。该回答遵守了当前题目的局部约束。"),
+        ];
+
+        let entries = ex.extract(&messages).await.unwrap();
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.category != MemoryCategory::UserPreference),
+            "single-turn task constraints must not become cross-session preferences: {entries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_durable_preference_is_still_extracted() {
+        let ex = default_extractor();
+        let messages = vec![
+            Message::user("请记住：以后所有代码评审都需要先列风险，再给出结论。这是我的长期偏好。"),
+            Message::assistant("我会将这项长期评审偏好作为后续工作的默认约束。"),
+        ];
+
+        let entries = ex.extract(&messages).await.unwrap();
+        assert!(entries
+            .iter()
+            .any(|entry| entry.category == MemoryCategory::UserPreference));
     }
 
     #[tokio::test]

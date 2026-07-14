@@ -293,6 +293,43 @@ impl SmartApprovalGate {
         }
     }
 
+    /// Require a concrete user approval for a strategy-leased critical action.
+    ///
+    /// Unlike [`Self::evaluate`], this does not infer safety from the tool name.
+    /// The strategy engine has already classified the whole operation as
+    /// critical, so an auto-pass is only valid when SOLO mode explicitly opts
+    /// out of honoring critical approvals.
+    pub async fn require_explicit_approval(&self, action: &str, input: &str) -> ApprovalGateResult {
+        let approval_key = explicit_strategy_approval_key(action, input);
+        if self.session_approved.lock().await.contains(&approval_key) {
+            return ApprovalGateResult::AutoPass {
+                reason: AutoPassReason::CachedApproval {
+                    persistence: ApprovalPersistence::Session,
+                },
+            };
+        }
+        let config = self.config.read().await;
+        if config.solo_mode && !config.solo_honor_critical {
+            return ApprovalGateResult::AutoPass {
+                reason: AutoPassReason::SoloBypass,
+            };
+        }
+        drop(config);
+
+        let command = input.chars().take(2_000).collect::<String>();
+        let request = ApprovalRequest {
+            id: format!("strategy-approval-{}", uuid::Uuid::new_v4()),
+            command: command.clone(),
+            normalized_command: command,
+            risk_level: RuntimeRiskLevel::Critical,
+            matched_patterns: vec![format!("runtime_strategy_critical_operation:{action}")],
+            description: format!("Critical runtime strategy action requires approval: {action}"),
+            timestamp: chrono::Utc::now(),
+            timeout_secs: 120,
+        };
+        self.request_approval(request).await
+    }
+
     /// Return a kernel-level risk receipt without blocking for user approval.
     pub async fn policy_receipt(&self, tool_name: &str, input: &str) -> RiskGateReceipt {
         let scope = approval_permission_scope(tool_name, input);
@@ -471,10 +508,24 @@ impl SmartApprovalGate {
 
         let mut pending = self.pending.write().await;
         if let Some((request, sender)) = pending.remove(request_id) {
-            // Record the approval decision in the detector's cache
-            self.detector
-                .record_approval(&request.command, persistence)
-                .await;
+            if matches!(verdict, ApprovalVerdict::Approved) {
+                self.detector
+                    .record_approval(&request.command, persistence.clone())
+                    .await;
+                if let Some(action) = request
+                    .matched_patterns
+                    .iter()
+                    .find_map(|pattern| {
+                        pattern.strip_prefix("runtime_strategy_critical_operation:")
+                    })
+                    .filter(|_| !matches!(&persistence, ApprovalPersistence::Once))
+                {
+                    self.session_approved
+                        .lock()
+                        .await
+                        .insert(explicit_strategy_approval_key(action, &request.command));
+                }
+            }
 
             // Send the verdict through the oneshot channel
             let _ = sender.send(verdict.clone());
@@ -520,6 +571,10 @@ impl SmartApprovalGate {
         let pending = self.pending.read().await;
         pending.values().map(|(req, _)| req.clone()).collect()
     }
+}
+
+fn explicit_strategy_approval_key(action: &str, input: &str) -> String {
+    format!("{action}:{}", input.chars().take(512).collect::<String>())
 }
 
 fn approval_permission_scope(tool_name: &str, input: &str) -> PermissionScope {
@@ -606,6 +661,84 @@ mod tests {
                 reason: AutoPassReason::ReadOnlyCommand
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn explicit_strategy_approval_waits_for_a_real_decision() {
+        let gate = Arc::new(make_gate(ApprovalConfig::default()));
+        let pending_gate = Arc::clone(&gate);
+        let approval = tokio::spawn(async move {
+            pending_gate
+                .require_explicit_approval(
+                    "runtime_strategy_tool_batch",
+                    r#"{"tool":"write_file"}"#,
+                )
+                .await
+        });
+
+        let request = loop {
+            if let Some(request) = gate.get_pending_requests().await.into_iter().next() {
+                break request;
+            }
+            tokio::task::yield_now().await;
+        };
+        gate.resolve_approval(
+            &request.id,
+            ApprovalVerdict::Approved,
+            ApprovalPersistence::Session,
+        )
+        .await
+        .expect("pending strategy approval should resolve");
+
+        assert!(matches!(
+            approval.await.expect("approval task should join"),
+            ApprovalGateResult::Approved { .. }
+        ));
+        assert!(matches!(
+            gate.require_explicit_approval(
+                "runtime_strategy_tool_batch",
+                r#"{"tool":"write_file"}"#,
+            )
+            .await,
+            ApprovalGateResult::AutoPass {
+                reason: AutoPassReason::CachedApproval { .. }
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn denied_approval_is_never_cached_as_allowed() {
+        let gate = Arc::new(make_gate(ApprovalConfig::default()));
+        let pending_gate = Arc::clone(&gate);
+        let approval = tokio::spawn(async move {
+            pending_gate
+                .evaluate("bash", r#"{"command":"rm -rf /tmp/cowd-denied"}"#)
+                .await
+        });
+        let request = loop {
+            if let Some(request) = gate.get_pending_requests().await.into_iter().next() {
+                break request;
+            }
+            tokio::task::yield_now().await;
+        };
+        gate.resolve_approval(
+            &request.id,
+            ApprovalVerdict::Denied {
+                reason: "operator denied".to_string(),
+            },
+            ApprovalPersistence::Once,
+        )
+        .await
+        .expect("pending approval should resolve");
+        assert!(matches!(
+            approval.await.expect("approval task should join"),
+            ApprovalGateResult::Denied { .. }
+        ));
+
+        let verdict = gate
+            .detector()
+            .detect_with_config("rm -rf /tmp/cowd-denied", &ApprovalConfig::default());
+        assert!(matches!(verdict, SmartApprovalVerdict::NeedsApproval(_)));
     }
 
     #[tokio::test]

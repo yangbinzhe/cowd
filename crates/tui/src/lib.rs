@@ -1,3 +1,13 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
+
 #[path = "rendering/accessibility.rs"]
 pub mod accessibility;
 #[path = "app_core/action_coverage.rs"]
@@ -44,6 +54,7 @@ pub mod scroll_state;
 pub mod skin;
 #[path = "app_core/state.rs"]
 pub mod state;
+#[cfg(test)]
 pub mod test_utils;
 pub mod theme;
 pub mod workbench;
@@ -56,5 +67,5 @@ pub use app::{App, DelegateTask, FileEntry, MemoryEntry, SkillSummary};
 pub use boundary_policy::{TuiBackendAccess, TuiBoundaryPolicy};
 #[allow(unused_imports)]
 pub use events::{cowd_event_channel, CowdEventReceiver};
-pub use protocol::{CowdEvent, RuntimePolicyDecisionSummary, RuntimeWorkGraphSummary};
+pub use protocol::{CowdEvent, RuntimeExecutionGraphSummary, RuntimePolicyDecisionSummary};
 pub use runner::{run_gateway_tui, terminal_entry, GatewayTuiConfig};

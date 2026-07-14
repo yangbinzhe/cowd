@@ -76,6 +76,22 @@ impl MemoryService {
                     })
                 });
             let vector_count = mgr.vector_index_count();
+            let scope_migrations = mgr
+                .legacy_scope_migration_reports()
+                .await
+                .map(|reports| {
+                    serde_json::json!({
+                        "held_count": reports.len(),
+                        "reports": reports,
+                    })
+                })
+                .unwrap_or_else(|error| {
+                    serde_json::json!({
+                        "held_count": null,
+                        "reports": [],
+                        "error": error.to_string(),
+                    })
+                });
             let search_mode = mgr.search_mode_label();
             let semantic_supported = mgr.embedding_capability().supports_semantic();
             let capabilities =
@@ -97,6 +113,7 @@ impl MemoryService {
                 "session_store": true,
                 "context_health": context_health_json(mgr.ctx_health()),
                 "kernel_health": kernel_health,
+                "scope_migration": scope_migrations,
                 "runtime": kernel.runtime_snapshot().await.ok(),
                 "performance": mgr.performance_report(),
             })
@@ -547,7 +564,14 @@ fn knowledge_namespace_for_entry(entry: &MemoryEntry) -> KnowledgeNamespace {
             memory::MemoryScope::Global => KnowledgeNamespace::SharedLibrary("global".to_string()),
             memory::MemoryScope::Session(session) => KnowledgeNamespace::Corpus(session.clone()),
             memory::MemoryScope::Task(task) => KnowledgeNamespace::Corpus(task.clone()),
-            memory::MemoryScope::Agent(agent) => KnowledgeNamespace::Corpus(agent.clone()),
+            memory::MemoryScope::AgentDefinitionLineage(agent) => {
+                KnowledgeNamespace::Corpus(agent.clone())
+            }
+            memory::MemoryScope::AgentInstance(agent) => KnowledgeNamespace::Corpus(agent.clone()),
+            memory::MemoryScope::TeamRun(team) => KnowledgeNamespace::Corpus(team.clone()),
+            memory::MemoryScope::LegacyUnresolvedAgent(agent) => {
+                KnowledgeNamespace::Corpus(format!("held-{agent}"))
+            }
         }
     }
 }
@@ -593,10 +617,6 @@ fn memory_capabilities_json(
                 RealityCapabilityStatus::Disabled,
                 "memory manager is not configured"
             ),
-            "aaak_index": capability_probe_json(
-                RealityCapabilityStatus::Disabled,
-                "memory manager is not configured"
-            ),
             "knowledge_fabric": capability_probe_json(
                 RealityCapabilityStatus::Disabled,
                 "memory manager is not configured"
@@ -619,16 +639,12 @@ fn memory_capabilities_json(
         )
     } else {
         format!(
-            "semantic embedding backend is not configured; search_mode={search_mode}; recall is using keyword/AAAK sources while vector_count={vector_count}"
+            "semantic embedding backend is not configured; search_mode={search_mode}; recall is using keyword sources while vector_count={vector_count}"
         )
     };
 
     serde_json::json!({
         "vector_semantic": capability_probe_json(vector_status, vector_reason),
-        "aaak_index": capability_probe_json(
-            RealityCapabilityStatus::EnabledAndWired,
-            "AAAK compact navigation is exposed as a recall source and omission pointer for deep context recovery"
-        ),
         "knowledge_fabric": capability_probe_json(
             RealityCapabilityStatus::EnabledAndWired,
             "KnowledgeFabric uses durable storage/knowledge.sqlite and feeds activation evidence through runtime context assembly"

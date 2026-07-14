@@ -665,8 +665,11 @@ impl Session {
             text: text.into(),
         };
         self.prompt_history.push(entry);
-        let entry_ref = self.prompt_history.last().expect("entry was just pushed");
-        self.append_persisted_prompt_entry(entry_ref)
+        if let Some(entry_ref) = self.prompt_history.last() {
+            self.append_persisted_prompt_entry(entry_ref)
+        } else {
+            Ok(())
+        }
     }
 
     fn render_jsonl_snapshot(&self) -> Result<String, SessionError> {
@@ -942,6 +945,7 @@ impl ConversationMessage {
             .unwrap_or((None, None));
 
         memory::store::session::SessionMessage {
+            stable_message_id: format!("runtime:{session_id}:{sequence}"),
             session_id: session_id.to_string(),
             sequence,
             role: self.role.role_str().to_string(),

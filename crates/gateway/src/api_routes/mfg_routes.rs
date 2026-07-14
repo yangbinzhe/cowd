@@ -40,6 +40,93 @@ use cockpit::*;
 use decision::*;
 use incidents::*;
 
+/// Public MFG bridge intent. Gateway authentication owns the effective actor;
+/// an actor field in an HTTP body is rejected by this closed schema.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct MfgCrossPlaneBridgeIntent {
+    #[serde(default = "default_mfg_bridge_mode")]
+    mode: String,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+    #[serde(default)]
+    actor_identity_ref: Option<String>,
+    #[serde(default)]
+    source_channel: Option<String>,
+    #[serde(default)]
+    requested_capability: Option<String>,
+    #[serde(default)]
+    provider_account: Option<String>,
+    #[serde(default)]
+    target_ref: Option<String>,
+    #[serde(default)]
+    resource_ref: Option<String>,
+}
+
+impl MfgCrossPlaneBridgeIntent {
+    pub(super) fn into_request(self, actor_principal: String) -> MfgCrossPlaneBridgeRequest {
+        MfgCrossPlaneBridgeRequest {
+            mode: self.mode,
+            idempotency_key: self.idempotency_key,
+            actor_principal,
+            actor_identity_ref: self.actor_identity_ref,
+            source_channel: self.source_channel,
+            requested_capability: self.requested_capability,
+            provider_account: self.provider_account,
+            target_ref: self.target_ref,
+            resource_ref: self.resource_ref,
+        }
+    }
+}
+
+/// Public MFG delivery intent. It cannot deserialize service-owned actor data.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct MfgCockpitReportDeliveryIntent {
+    #[serde(default = "default_mfg_bridge_mode")]
+    mode: String,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+    #[serde(default)]
+    actor_identity_ref: Option<String>,
+    #[serde(default)]
+    source_channel: Option<String>,
+    #[serde(default)]
+    requested_capability: Option<String>,
+    #[serde(default)]
+    provider_account: Option<String>,
+    #[serde(default)]
+    target_ref: Option<String>,
+    #[serde(default)]
+    resource_ref: Option<String>,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    template_id: Option<String>,
+}
+
+impl MfgCockpitReportDeliveryIntent {
+    pub(super) fn into_request(self, actor_principal: String) -> MfgCockpitReportDeliveryRequest {
+        MfgCockpitReportDeliveryRequest {
+            mode: self.mode,
+            idempotency_key: self.idempotency_key,
+            actor_principal,
+            actor_identity_ref: self.actor_identity_ref,
+            source_channel: self.source_channel,
+            requested_capability: self.requested_capability,
+            provider_account: self.provider_account,
+            target_ref: self.target_ref,
+            resource_ref: self.resource_ref,
+            channel: self.channel,
+            template_id: self.template_id,
+        }
+    }
+}
+
+fn default_mfg_bridge_mode() -> String {
+    "dry_run".to_string()
+}
+
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/apps/mfg/app", get(mfg_app_handler))
@@ -375,8 +462,6 @@ struct MfgCockpitReportScheduleRunRequest {
     #[serde(default = "default_matrix_bridge_mode")]
     mode: String,
     #[serde(default)]
-    actor_principal: Option<String>,
-    #[serde(default)]
     actor_identity_ref: Option<String>,
     #[serde(default)]
     source_channel: Option<String>,
@@ -465,8 +550,6 @@ struct MfgCockpitReportDeliveryRetryRequest {
     idempotency_key: Option<String>,
     #[serde(default)]
     force: bool,
-    #[serde(default)]
-    actor_principal: Option<String>,
     #[serde(default)]
     actor_identity_ref: Option<String>,
     #[serde(default)]
@@ -1732,4 +1815,36 @@ async fn mfg_execution_feedback_handler(
         "kind": "mfg.action_execution",
         "execution": execution,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MfgCockpitReportDeliveryIntent, MfgCrossPlaneBridgeIntent};
+
+    #[test]
+    fn mfg_effect_intents_reject_client_supplied_actor_principals() {
+        let bridge = serde_json::from_str::<MfgCrossPlaneBridgeIntent>(
+            r#"{"actor_principal":"user:forged","mode":"dry_run"}"#,
+        );
+        let delivery = serde_json::from_str::<MfgCockpitReportDeliveryIntent>(
+            r#"{"actor_principal":"user:forged","mode":"dry_run"}"#,
+        );
+
+        assert!(bridge.is_err());
+        assert!(delivery.is_err());
+    }
+
+    #[test]
+    fn mfg_effect_intents_construct_server_owned_actor() {
+        let intent: MfgCrossPlaneBridgeIntent =
+            serde_json::from_str(r#"{"requested_capability":"channel.feishu.send"}"#)
+                .expect("valid MFG bridge intent");
+        let request = intent.into_request("principal:verified-human".to_string());
+
+        assert_eq!(request.actor_principal, "principal:verified-human");
+        assert_eq!(
+            request.requested_capability.as_deref(),
+            Some("channel.feishu.send")
+        );
+    }
 }

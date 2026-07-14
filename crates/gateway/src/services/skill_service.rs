@@ -105,7 +105,11 @@ impl SkillService {
     }
 
     pub(super) fn contracts(&self) -> Vec<ServiceEnvelope> {
-        vec![self.catalog_envelope(), self.envelope("projection")]
+        vec![
+            self.catalog_envelope(),
+            self.envelope("projection"),
+            self.envelope("evolution_skill_draft"),
+        ]
     }
 
     pub(crate) fn command_text(
@@ -363,6 +367,21 @@ impl SkillService {
             "action": maintenance_action_wire(&action),
             "reason": maintenance_action_reason(&action),
         }))
+    }
+
+    pub(crate) fn evolution_skill_draft(
+        &self,
+        proposal: &runtime::EvolutionProposal,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "skills.evolution_draft",
+            "schema_version": 1,
+            "envelope": self.envelope("evolution_skill_draft"),
+            "proposal_id": proposal.proposal_id,
+            "draft": proposal.to_skill_draft(),
+            "owner": "gateway.skill_service",
+            "mainline_modified": false,
+        })
     }
 
     pub(crate) fn runs(&self, config_home: &Path) -> Result<serde_json::Value, SkillServiceError> {

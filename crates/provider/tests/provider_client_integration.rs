@@ -1,7 +1,17 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
 use std::ffi::OsString;
 use std::sync::{Mutex, OnceLock};
 
-use provider::{read_xai_base_url, ApiError, AuthSource, ProviderClient, ProviderKind};
+use model_protocol::provider_config::ProviderConfig;
+use provider::{
+    read_xai_base_url, ApiError, AuthSource, OpenAiWireProtocol, ProviderClient, ProviderKind,
+};
 
 #[test]
 fn provider_client_routes_grok_aliases_through_xai() {
@@ -53,6 +63,44 @@ fn read_xai_base_url_prefers_env_override() {
     let _xai_base_url = EnvVarGuard::set("XAI_BASE_URL", Some("https://example.xai.test/v1"));
 
     assert_eq!(read_xai_base_url(), "https://example.xai.test/v1");
+}
+
+#[test]
+fn provider_client_configured_protocol_selects_responses_without_detection() {
+    let client = ProviderClient::from_config(&ProviderConfig {
+        name: "openai".to_string(),
+        base_url: "https://api.openai.com/v1".to_string(),
+        api_key: "sk-test".to_string(),
+        models: vec!["gpt-4.1".to_string()],
+        protocol: Some("responses".to_string()),
+    })
+    .expect("responses provider should build");
+
+    match client {
+        ProviderClient::OpenAi(openai) => {
+            assert_eq!(openai.wire_protocol(), OpenAiWireProtocol::Responses);
+        }
+        other => panic!("expected OpenAI responses client, got {other:?}"),
+    }
+}
+
+#[test]
+fn provider_client_missing_protocol_uses_local_detection() {
+    let client = ProviderClient::from_config(&ProviderConfig {
+        name: "deepseek".to_string(),
+        base_url: "https://api.deepseek.com/v1".to_string(),
+        api_key: "sk-test".to_string(),
+        models: vec!["deepseek-v4-pro".to_string()],
+        protocol: None,
+    })
+    .expect("detected completions provider should build");
+
+    match client {
+        ProviderClient::OpenAi(openai) => {
+            assert_eq!(openai.wire_protocol(), OpenAiWireProtocol::Completions);
+        }
+        other => panic!("expected OpenAI completions client, got {other:?}"),
+    }
 }
 
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {

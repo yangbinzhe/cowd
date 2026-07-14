@@ -3,6 +3,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::Command,
+    sync::{Arc, RwLock},
 };
 
 use chrono::{DateTime, Utc};
@@ -88,6 +89,46 @@ pub struct ResourceHint {
     pub guardrails: Vec<String>,
 }
 
+/// Bounded attachment metadata that may enter a model request.
+///
+/// `ResourceHint` remains the full UI/diagnostic projection. This type makes
+/// the request boundary explicit so installed capability inventories and
+/// remediation detail cannot grow every prompt linearly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResourcePromptHint {
+    pub resource_id: String,
+    pub uri: String,
+    pub name: String,
+    pub kind: ResourceKind,
+    pub detected_mime: Option<String>,
+    pub size_bytes: u64,
+    pub native_model_support: String,
+    pub recommended_directions: Vec<String>,
+    pub guardrails: Vec<String>,
+}
+
+impl ResourceHint {
+    #[must_use]
+    pub fn prompt_hint(&self, envelope: &ResourceEnvelope) -> ResourcePromptHint {
+        ResourcePromptHint {
+            resource_id: self.resource_id.clone(),
+            uri: envelope.uri.clone(),
+            name: envelope.original_name.clone(),
+            kind: self.kind,
+            detected_mime: envelope.detected_mime.clone(),
+            size_bytes: envelope.size_bytes,
+            native_model_support: self.native_model_support.clone(),
+            recommended_directions: self
+                .recommended_directions
+                .iter()
+                .take(3)
+                .cloned()
+                .collect(),
+            guardrails: self.guardrails.iter().take(2).cloned().collect(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceEvidence {
     pub resource_id: String,
@@ -114,6 +155,16 @@ pub struct ResourceCapabilitySnapshot {
 
 impl Default for ResourceCapabilitySnapshot {
     fn default() -> Self {
+        Self::core_runtime()
+    }
+}
+
+impl ResourceCapabilitySnapshot {
+    /// A stable, no-I/O baseline used on the request path. Dynamic service
+    /// discovery belongs to a refreshed runtime snapshot, never attachment
+    /// rendering.
+    #[must_use]
+    pub fn core_runtime() -> Self {
         Self {
             tools: vec![
                 "read_file".to_string(),
@@ -124,37 +175,106 @@ impl Default for ResourceCapabilitySnapshot {
                 "vision_analyze".to_string(),
                 "execute_code".to_string(),
             ],
-            skills: list_installed_names(cowd_dirs::user_skills_dir()),
-            plugins: list_installed_names(cowd_dirs::user_plugins_dir()),
+            skills: Vec::new(),
+            plugins: Vec::new(),
             mcp_resources: vec![
                 "ListMcpResources".to_string(),
                 "ReadMcpResource".to_string(),
             ],
-            local_commands: detect_local_commands(&[
-                "file",
-                "ffprobe",
-                "ffmpeg",
-                "pdftotext",
-                "pdfinfo",
-                "pandoc",
-                "python3",
-                "unzip",
-            ]),
+            local_commands: Vec::new(),
             provider_native: vec!["image_input_when_supported".to_string()],
         }
+    }
+
+    /// Performs optional environment discovery outside the request path.
+    #[must_use]
+    pub fn discover_environment() -> Self {
+        let mut snapshot = Self::core_runtime();
+        snapshot.skills = list_installed_names(cowd_dirs::user_skills_dir());
+        snapshot.plugins = list_installed_names(cowd_dirs::user_plugins_dir());
+        snapshot.local_commands = detect_local_commands(&[
+            "file",
+            "ffprobe",
+            "ffmpeg",
+            "pdftotext",
+            "pdfinfo",
+            "pandoc",
+            "python3",
+            "unzip",
+        ]);
+        snapshot
+    }
+}
+
+/// Runtime-owned capability snapshot for attachment advice. It is refreshed
+/// when service/plugin configuration changes; rendering only clones the most
+/// recently validated state and never scans disks or shells out.
+#[derive(Clone, Debug)]
+pub struct ResourceCapabilityIndex {
+    snapshot: Arc<RwLock<ResourceCapabilitySnapshot>>,
+}
+
+impl Default for ResourceCapabilityIndex {
+    fn default() -> Self {
+        Self::new(ResourceCapabilitySnapshot::default())
+    }
+}
+
+impl ResourceCapabilityIndex {
+    #[must_use]
+    pub fn new(snapshot: ResourceCapabilitySnapshot) -> Self {
+        Self {
+            snapshot: Arc::new(RwLock::new(snapshot)),
+        }
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> ResourceCapabilitySnapshot {
+        self.snapshot
+            .read()
+            .map(|snapshot| snapshot.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+    }
+
+    pub fn refresh(&self, snapshot: ResourceCapabilitySnapshot) {
+        if let Ok(mut current) = self.snapshot.write() {
+            *current = snapshot;
+        }
+    }
+
+    #[must_use]
+    pub fn refresh_from_environment(&self) -> ResourceCapabilitySnapshot {
+        let snapshot = ResourceCapabilitySnapshot::discover_environment();
+        self.refresh(snapshot.clone());
+        snapshot
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct ResourceStore {
     root: PathBuf,
+    capabilities: ResourceCapabilityIndex,
 }
 
 impl ResourceStore {
     #[must_use]
     pub fn default_for_config_home(config_home: &Path) -> Self {
+        Self::for_config_home_with_capabilities(config_home, ResourceCapabilityIndex::default())
+    }
+
+    /// Builds a resource store backed by the Gateway-owned capability index.
+    ///
+    /// Callers on a service request path must pass the shared index rather than
+    /// creating a fresh one. That keeps attachment rendering free of discovery
+    /// I/O while allowing lifecycle reloads to atomically publish a new view.
+    #[must_use]
+    pub fn for_config_home_with_capabilities(
+        config_home: &Path,
+        capabilities: ResourceCapabilityIndex,
+    ) -> Self {
         Self {
             root: config_home.join("storage").join("resources"),
+            capabilities,
         }
     }
 
@@ -166,6 +286,15 @@ impl ResourceStore {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    #[must_use]
+    pub fn capability_index(&self) -> &ResourceCapabilityIndex {
+        &self.capabilities
+    }
+
+    pub fn refresh_capabilities(&self, snapshot: ResourceCapabilitySnapshot) {
+        self.capabilities.refresh(snapshot);
     }
 
     pub fn register_resource_from_path(
@@ -232,7 +361,8 @@ impl ResourceStore {
             }),
         };
         self.write_metadata(&envelope)?;
-        let hint = resource_hint(&envelope, &ResourceCapabilitySnapshot::default());
+        let capabilities = self.capabilities.snapshot();
+        let hint = resource_hint(&envelope, &capabilities);
         self.append_evidence(ResourceEvidence {
             resource_id: envelope.id.clone(),
             turn_id: None,
@@ -447,59 +577,27 @@ pub fn resource_hint(
 }
 
 #[must_use]
-pub fn render_resource_context_markdown(resources: &[(ResourceEnvelope, ResourceHint)]) -> String {
+pub fn render_resource_context_markdown(resources: &[ResourcePromptHint]) -> String {
     if resources.is_empty() {
         return String::new();
     }
     let mut rendered = String::from("\n\n## Attached Resources\n\n");
-    for (envelope, hint) in resources {
-        rendered.push_str(&format!("### {}\n", envelope.uri));
-        rendered.push_str(&format!("- name: {}\n", envelope.original_name));
-        rendered.push_str(&format!("- kind: {}\n", envelope.kind.as_str()));
-        if let Some(mime) = &envelope.detected_mime {
+    for hint in resources {
+        rendered.push_str(&format!("### {}\n", hint.uri));
+        rendered.push_str(&format!("- name: {}\n", hint.name));
+        rendered.push_str(&format!("- kind: {}\n", hint.kind.as_str()));
+        if let Some(mime) = &hint.detected_mime {
             rendered.push_str(&format!("- detected_mime: {mime}\n"));
         }
-        rendered.push_str(&format!("- size: {} bytes\n", envelope.size_bytes));
+        rendered.push_str(&format!("- size: {} bytes\n", hint.size_bytes));
         rendered.push_str("- status: stored\n");
-        rendered.push_str("- available_paths:\n");
+        rendered.push_str(&format!(
+            "- native_model_support: {}\n",
+            hint.native_model_support
+        ));
+        rendered.push_str("- recommended_directions:\n");
         for direction in &hint.recommended_directions {
             rendered.push_str(&format!("  - {direction}\n"));
-        }
-        if !hint.available_local_commands.is_empty() {
-            rendered.push_str(&format!(
-                "- available_local_commands: {}\n",
-                hint.available_local_commands.join(", ")
-            ));
-        }
-        if !hint.available_tools.is_empty() {
-            rendered.push_str(&format!(
-                "- available_tools: {}\n",
-                hint.available_tools.join(", ")
-            ));
-        }
-        if !hint.available_skills.is_empty() {
-            rendered.push_str(&format!(
-                "- available_skills: {}\n",
-                hint.available_skills.join(", ")
-            ));
-        }
-        if !hint.available_plugins.is_empty() {
-            rendered.push_str(&format!(
-                "- available_plugins: {}\n",
-                hint.available_plugins.join(", ")
-            ));
-        }
-        if !hint.missing_capabilities.is_empty() {
-            rendered.push_str("- missing_capabilities:\n");
-            for capability in &hint.missing_capabilities {
-                rendered.push_str(&format!("  - {capability}\n"));
-            }
-        }
-        if !hint.permission_required.is_empty() {
-            rendered.push_str("- permission_required:\n");
-            for permission in &hint.permission_required {
-                rendered.push_str(&format!("  - {permission}\n"));
-            }
         }
         if !hint.guardrails.is_empty() {
             rendered.push_str("- guardrails:\n");
@@ -510,7 +608,7 @@ pub fn render_resource_context_markdown(resources: &[(ResourceEnvelope, Resource
         rendered.push('\n');
     }
     rendered.push_str(
-        "Resource handling principle: use native model support, tools, skills, plugins, MCP, local commands, or a permissioned install path to inspect resources as far as possible. Do not invent unseen content, and do not stop at a bare unsupported-file error when a safe capability path can be attempted.\n",
+        "Resource handling principle: use native support or an actually exposed tool first. Query runtime capabilities only when a narrower parser/skill/plugin path is needed. Do not invent unseen content.\n",
     );
     rendered
 }
@@ -720,7 +818,9 @@ mod tests {
             .register_resource_from_path(&input, "test", None, None, None)
             .expect("register resource");
 
-        let rendered = render_resource_context_markdown(&[pair]);
+        let prompt_hint = pair.1.prompt_hint(&pair.0);
+
+        let rendered = render_resource_context_markdown(&[prompt_hint]);
 
         assert!(rendered.contains("## Attached Resources"));
         assert!(rendered.contains("resource://res_"));
@@ -753,7 +853,7 @@ mod tests {
                 .register_resource_from_path(&path, "test", None, None, None)
                 .expect("register resource");
             assert_eq!(envelope.kind, expected_kind, "{name} kind");
-            pairs.push((envelope, hint));
+            pairs.push(hint.prompt_hint(&envelope));
         }
 
         let rendered = render_resource_context_markdown(&pairs);
@@ -763,6 +863,49 @@ mod tests {
         assert!(rendered.contains("kind: markdown"));
         assert!(rendered.contains("kind: binary"));
         assert!(rendered.contains("Resource handling principle"));
+    }
+
+    #[test]
+    fn prompt_hint_excludes_capability_inventory_and_is_bounded() {
+        let envelope = ResourceEnvelope {
+            id: "res_test".to_string(),
+            uri: "resource://res_test".to_string(),
+            source: "test".to_string(),
+            source_message_id: None,
+            session_id: None,
+            original_name: "report.pdf".to_string(),
+            declared_mime: None,
+            detected_mime: Some("application/pdf".to_string()),
+            kind: ResourceKind::Pdf,
+            size_bytes: 42,
+            sha256: "sha256:test".to_string(),
+            storage_path: PathBuf::from("/tmp/report.pdf"),
+            created_at: Utc::now(),
+            metadata: serde_json::json!({}),
+        };
+        let hint = ResourceHint {
+            resource_id: envelope.id.clone(),
+            kind: ResourceKind::Pdf,
+            confidence: "high".to_string(),
+            native_model_support: "not assumed".to_string(),
+            recommended_directions: (0..8).map(|index| format!("direction-{index}")).collect(),
+            available_tools: vec!["tool-secret-inventory".to_string()],
+            available_skills: vec!["skill-secret-inventory".to_string()],
+            available_plugins: vec!["plugin-secret-inventory".to_string()],
+            available_mcp_resources: vec!["mcp-secret-inventory".to_string()],
+            available_local_commands: vec!["command-secret-inventory".to_string()],
+            missing_capabilities: Vec::new(),
+            permission_required: Vec::new(),
+            safe_next_steps: Vec::new(),
+            guardrails: (0..5).map(|index| format!("guardrail-{index}")).collect(),
+        };
+
+        let rendered = render_resource_context_markdown(&[hint.prompt_hint(&envelope)]);
+        assert!(rendered.contains("direction-2"));
+        assert!(!rendered.contains("direction-3"));
+        assert!(rendered.contains("guardrail-1"));
+        assert!(!rendered.contains("guardrail-2"));
+        assert!(!rendered.contains("secret-inventory"));
     }
 
     #[test]
@@ -779,5 +922,22 @@ mod tests {
             .expect_err("oversized resource should be rejected");
 
         assert!(error.contains("resource is too large"));
+    }
+
+    #[test]
+    fn capability_index_refreshes_without_attachment_path_discovery() {
+        let index = ResourceCapabilityIndex::default();
+        assert!(index.snapshot().skills.is_empty());
+        index.refresh(ResourceCapabilitySnapshot {
+            tools: vec!["read_file".to_string()],
+            skills: vec!["transcribe".to_string()],
+            plugins: vec!["document-reader".to_string()],
+            mcp_resources: Vec::new(),
+            local_commands: vec!["pdftotext".to_string()],
+            provider_native: Vec::new(),
+        });
+        let snapshot = index.snapshot();
+        assert_eq!(snapshot.skills, vec!["transcribe"]);
+        assert_eq!(snapshot.local_commands, vec!["pdftotext"]);
     }
 }

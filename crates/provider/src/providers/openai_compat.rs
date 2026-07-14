@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -27,6 +27,20 @@ const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(128);
 const DEFAULT_MAX_RETRIES: u32 = 8;
+// Some DeepSeek-compatible deployments emit a documented DSML envelope in
+// `content` instead of OpenAI's structured `tool_calls`. This is intentionally
+// narrow: generic XML-shaped model text must remain text and never become an
+// executable tool invocation.
+const DSML_TOOL_CALLS_OPEN: &str = "<｜｜DSML｜｜tool_calls>";
+const DSML_TOOL_CALLS_CLOSE: &str = "</｜｜DSML｜｜tool_calls>";
+const DSML_INVOKE_OPEN: &str = "<｜｜DSML｜｜invoke ";
+const DSML_INVOKE_CLOSE: &str = "</｜｜DSML｜｜invoke>";
+const DSML_PARAMETER_OPEN: &str = "<｜｜DSML｜｜parameter ";
+const DSML_PARAMETER_CLOSE: &str = "</｜｜DSML｜｜parameter>";
+const COMPAT_TOOL_USE_FENCE_OPEN: &str = "```tool_use";
+const COMPAT_JSON_FENCE_OPEN: &str = "```json";
+const COMPAT_TOOL_CALL_OPEN: &str = "<tool_call>";
+const COMPAT_TOOL_CALL_CLOSE: &str = "</tool_call>";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenAiCompatConfig {
@@ -34,6 +48,14 @@ pub struct OpenAiCompatConfig {
     pub api_key_env: &'static str,
     pub base_url_env: &'static str,
     pub default_base_url: &'static str,
+    pub wire_protocol: OpenAiWireProtocol,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OpenAiWireProtocol {
+    #[default]
+    Completions,
+    Responses,
 }
 
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
@@ -50,6 +72,7 @@ impl OpenAiCompatConfig {
             api_key_env: "XAI_API_KEY",
             base_url_env: "XAI_BASE_URL",
             default_base_url: DEFAULT_XAI_BASE_URL,
+            wire_protocol: OpenAiWireProtocol::Completions,
         }
     }
 
@@ -60,6 +83,7 @@ impl OpenAiCompatConfig {
             api_key_env: "OPENAI_API_KEY",
             base_url_env: "OPENAI_BASE_URL",
             default_base_url: DEFAULT_OPENAI_BASE_URL,
+            wire_protocol: OpenAiWireProtocol::Completions,
         }
     }
 
@@ -74,6 +98,7 @@ impl OpenAiCompatConfig {
             api_key_env: "DASHSCOPE_API_KEY",
             base_url_env: "DASHSCOPE_BASE_URL",
             default_base_url: DEFAULT_DASHSCOPE_BASE_URL,
+            wire_protocol: OpenAiWireProtocol::Completions,
         }
     }
 
@@ -86,6 +111,7 @@ impl OpenAiCompatConfig {
             api_key_env: "MOONSHOT_API_KEY",
             base_url_env: "MOONSHOT_BASE_URL",
             default_base_url: DEFAULT_MOONSHOT_BASE_URL,
+            wire_protocol: OpenAiWireProtocol::Completions,
         }
     }
 
@@ -98,7 +124,14 @@ impl OpenAiCompatConfig {
             api_key_env: "DEEPSEEK_API_KEY",
             base_url_env: "DEEPSEEK_BASE_URL",
             default_base_url: DEFAULT_DEEPSEEK_BASE_URL,
+            wire_protocol: OpenAiWireProtocol::Completions,
         }
+    }
+
+    #[must_use]
+    pub const fn with_wire_protocol(mut self, wire_protocol: OpenAiWireProtocol) -> Self {
+        self.wire_protocol = wire_protocol;
+        self
     }
 
     #[must_use]
@@ -157,10 +190,25 @@ impl OpenAiCompatClient {
         base_url: impl Into<String>,
         provider_name: impl Into<String>,
     ) -> Self {
+        Self::new_custom_with_protocol(
+            api_key,
+            base_url,
+            provider_name,
+            OpenAiWireProtocol::Completions,
+        )
+    }
+
+    #[must_use]
+    pub fn new_custom_with_protocol(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+        provider_name: impl Into<String>,
+        wire_protocol: OpenAiWireProtocol,
+    ) -> Self {
         Self {
             http: build_http_client_or_default(),
             api_key: api_key.into(),
-            config: OpenAiCompatConfig::openai(),
+            config: OpenAiCompatConfig::openai().with_wire_protocol(wire_protocol),
             base_url: base_url.into(),
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
@@ -202,6 +250,11 @@ impl OpenAiCompatClient {
         self.override_provider_name
             .as_deref()
             .unwrap_or(self.config.provider_name)
+    }
+
+    #[must_use]
+    pub const fn wire_protocol(&self) -> OpenAiWireProtocol {
+        self.config.wire_protocol
     }
 
     pub async fn send_message(
@@ -246,10 +299,36 @@ impl OpenAiCompatClient {
                 });
             }
         }
-        let payload = serde_json::from_str::<ChatCompletionResponse>(&body).map_err(|error| {
-            ApiError::json_deserialize(self.provider_name(), &request.model, &body, error)
-        })?;
-        let mut normalized = normalize_response(&request.model, payload)?;
+        let mut normalized = match self.wire_protocol() {
+            OpenAiWireProtocol::Completions => {
+                let payload =
+                    serde_json::from_str::<ChatCompletionResponse>(&body).map_err(|error| {
+                        ApiError::json_deserialize(
+                            self.provider_name(),
+                            &request.model,
+                            &body,
+                            error,
+                        )
+                    })?;
+                normalize_chat_completion_response(
+                    &request.model,
+                    payload,
+                    request.tools.as_deref().unwrap_or_default(),
+                )?
+            }
+            OpenAiWireProtocol::Responses => {
+                let payload =
+                    serde_json::from_str::<ResponsesApiResponse>(&body).map_err(|error| {
+                        ApiError::json_deserialize(
+                            self.provider_name(),
+                            &request.model,
+                            &body,
+                            error,
+                        )
+                    })?;
+                normalize_responses_response(&request.model, payload)
+            }
+        };
         if normalized.request_id.is_none() {
             normalized.request_id = request_id;
         }
@@ -267,10 +346,17 @@ impl OpenAiCompatClient {
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
             response,
-            parser: OpenAiSseParser::with_context(self.provider_name(), request.model.clone()),
+            parser: OpenAiSseParser::with_context(
+                self.provider_name(),
+                request.model.clone(),
+                self.wire_protocol(),
+            ),
             pending: VecDeque::new(),
             done: false,
-            state: StreamState::new(request.model.clone()),
+            state: StreamState::new(
+                request.model.clone(),
+                request.tools.as_deref().unwrap_or_default(),
+            ),
         })
     }
 
@@ -309,12 +395,21 @@ impl OpenAiCompatClient {
         &self,
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
-        let request_url = chat_completions_endpoint(&self.base_url);
+        let request_url = match self.wire_protocol() {
+            OpenAiWireProtocol::Completions => chat_completions_endpoint(&self.base_url),
+            OpenAiWireProtocol::Responses => responses_endpoint(&self.base_url),
+        };
+        let request_body = match self.wire_protocol() {
+            OpenAiWireProtocol::Completions => {
+                build_chat_completion_request(request, self.config())
+            }
+            OpenAiWireProtocol::Responses => build_responses_request(request),
+        };
         self.http
             .post(&request_url)
             .header("content-type", "application/json")
             .bearer_auth(&self.api_key)
-            .json(&build_chat_completion_request(request, self.config()))
+            .json(&request_body)
             .send()
             .await
             .map_err(ApiError::from)
@@ -447,14 +542,20 @@ struct OpenAiSseParser {
     buffer: Vec<u8>,
     provider: String,
     model: String,
+    wire_protocol: OpenAiWireProtocol,
 }
 
 impl OpenAiSseParser {
-    fn with_context(provider: impl Into<String>, model: impl Into<String>) -> Self {
+    fn with_context(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        wire_protocol: OpenAiWireProtocol,
+    ) -> Self {
         Self {
             buffer: Vec::new(),
             provider: provider.into(),
             model: model.into(),
+            wire_protocol,
         }
     }
 
@@ -463,7 +564,15 @@ impl OpenAiSseParser {
         let mut events = Vec::new();
 
         while let Some(frame) = next_sse_frame(&mut self.buffer) {
-            if let Some(event) = parse_sse_frame(&frame, &self.provider, &self.model)? {
+            let event = match self.wire_protocol {
+                OpenAiWireProtocol::Completions => {
+                    parse_chat_sse_frame(&frame, &self.provider, &self.model)?
+                }
+                OpenAiWireProtocol::Responses => {
+                    parse_responses_sse_frame(&frame, &self.provider, &self.model)?
+                }
+            };
+            if let Some(event) = event {
                 events.push(event);
             }
         }
@@ -487,10 +596,16 @@ struct StreamState {
     stop_reason: Option<String>,
     usage: Option<Usage>,
     tool_calls: BTreeMap<u32, ToolCallState>,
+    exposed_tool_names: BTreeSet<String>,
+    // Hold only a possible provider tool-frame prefix for ordinary text. Once
+    // a frame begins, buffer it until it can be strictly validated against
+    // the current request's exposed tool contracts.
+    dsml_prefix: String,
+    dsml_frame: Option<String>,
 }
 
 impl StreamState {
-    fn new(model: String) -> Self {
+    fn new(model: String, tools: &[ToolDefinition]) -> Self {
         Self {
             model,
             message_started: false,
@@ -502,6 +617,9 @@ impl StreamState {
             stop_reason: None,
             usage: None,
             tool_calls: BTreeMap::new(),
+            exposed_tool_names: tools.iter().map(|tool| tool.name.clone()).collect(),
+            dsml_prefix: String::new(),
+            dsml_frame: None,
         }
     }
 
@@ -531,10 +649,10 @@ impl StreamState {
 
         if let Some(usage) = chunk.usage {
             self.usage = Some(Usage {
-                input_tokens: usage.prompt_tokens,
+                input_tokens: usage.normalized_input_tokens(),
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 0,
-                output_tokens: usage.completion_tokens,
+                output_tokens: usage.normalized_output_tokens(),
             });
         }
 
@@ -574,26 +692,7 @@ impl StreamState {
             }
 
             if let Some(content) = choice.delta.content.filter(|value| !value.is_empty()) {
-                // Close the reasoning block if it was started before the visible content.
-                if self.reasoning_started && !self.reasoning_finished {
-                    self.reasoning_finished = true;
-                    events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                        index: 0,
-                    }));
-                }
-                if !self.text_started {
-                    self.text_started = true;
-                    events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
-                        index: self.reasoning_started as u32,
-                        content_block: OutputContentBlock::Text {
-                            text: String::new(),
-                        },
-                    }));
-                }
-                events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
-                    index: self.reasoning_started as u32,
-                    delta: ContentBlockDelta::TextDelta { text: content },
-                }));
+                self.ingest_text_content(content, &mut events);
             }
 
             for tool_call in choice.delta.tool_calls {
@@ -644,6 +743,17 @@ impl StreamState {
         self.finished = true;
 
         let mut events = Vec::new();
+        if let Some(frame) = self.dsml_frame.take() {
+            if let Some(calls) = parse_compat_tool_calls(&frame, &self.exposed_tool_names) {
+                self.emit_dsml_tool_calls(calls, &mut events);
+            } else {
+                self.emit_text_content(frame, &mut events);
+            }
+        }
+        if !self.dsml_prefix.is_empty() {
+            let pending_text = std::mem::take(&mut self.dsml_prefix);
+            self.emit_text_content(pending_text, &mut events);
+        }
         // Close reasoning block if started but not yet finished.
         if self.reasoning_started && !self.reasoning_finished {
             self.reasoning_finished = true;
@@ -696,6 +806,111 @@ impl StreamState {
             events.push(StreamEvent::MessageStop(MessageStopEvent {}));
         }
         Ok(events)
+    }
+
+    fn ingest_text_content(&mut self, content: String, events: &mut Vec<StreamEvent>) {
+        if let Some(frame) = self.dsml_frame.as_mut() {
+            frame.push_str(&content);
+            return;
+        }
+
+        self.dsml_prefix.push_str(&content);
+        if let Some(marker_offset) = first_compat_tool_marker(&self.dsml_prefix) {
+            let frame = self.dsml_prefix.split_off(marker_offset);
+            if !self.dsml_prefix.is_empty() {
+                let preceding_text = std::mem::take(&mut self.dsml_prefix);
+                self.emit_text_content(preceding_text, events);
+            }
+            self.dsml_frame = Some(frame);
+            return;
+        }
+
+        let retained = longest_compat_tool_prefix_suffix(&self.dsml_prefix);
+        let released_len = self.dsml_prefix.len().saturating_sub(retained.len());
+        if released_len > 0 {
+            let released = self.dsml_prefix[..released_len].to_string();
+            self.dsml_prefix = retained;
+            self.emit_text_content(released, events);
+        }
+    }
+
+    fn emit_dsml_tool_calls(&mut self, calls: Vec<DsmlToolCall>, events: &mut Vec<StreamEvent>) {
+        self.close_visible_content(events);
+        let mut index = self.next_synthetic_tool_index();
+        for call in calls {
+            events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                index,
+                content_block: OutputContentBlock::ToolUse {
+                    id: call.id,
+                    name: call.name,
+                    input: json!({}),
+                },
+            }));
+            events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                index,
+                delta: ContentBlockDelta::InputJsonDelta {
+                    partial_json: call.input.to_string(),
+                },
+            }));
+            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                index,
+            }));
+            index = index.saturating_add(1);
+        }
+        self.stop_reason = Some("tool_use".to_string());
+    }
+
+    fn next_synthetic_tool_index(&self) -> u32 {
+        let mut highest = self
+            .tool_calls
+            .values()
+            .map(ToolCallState::block_index)
+            .max();
+        if self.reasoning_started {
+            highest = Some(highest.unwrap_or(0).max(0));
+        }
+        if self.text_started {
+            highest = Some(highest.unwrap_or(0).max(self.reasoning_started as u32));
+        }
+        highest.map_or(0, |index| index.saturating_add(1))
+    }
+
+    fn close_visible_content(&mut self, events: &mut Vec<StreamEvent>) {
+        if self.reasoning_started && !self.reasoning_finished {
+            self.reasoning_finished = true;
+            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                index: 0,
+            }));
+        }
+        if self.text_started && !self.text_finished {
+            self.text_finished = true;
+            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                index: self.reasoning_started as u32,
+            }));
+        }
+    }
+
+    fn emit_text_content(&mut self, content: String, events: &mut Vec<StreamEvent>) {
+        // Close the reasoning block if it was started before visible content.
+        if self.reasoning_started && !self.reasoning_finished {
+            self.reasoning_finished = true;
+            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                index: 0,
+            }));
+        }
+        if !self.text_started {
+            self.text_started = true;
+            events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                index: self.reasoning_started as u32,
+                content_block: OutputContentBlock::Text {
+                    text: String::new(),
+                },
+            }));
+        }
+        events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            index: self.reasoning_started as u32,
+            delta: ContentBlockDelta::TextDelta { text: content },
+        }));
     }
 }
 
@@ -813,6 +1028,77 @@ struct OpenAiUsage {
     prompt_tokens: u32,
     #[serde(default)]
     completion_tokens: u32,
+    #[serde(default)]
+    input_tokens: u32,
+    #[serde(default)]
+    output_tokens: u32,
+}
+
+impl OpenAiUsage {
+    const fn normalized_input_tokens(&self) -> u32 {
+        if self.input_tokens > 0 {
+            self.input_tokens
+        } else {
+            self.prompt_tokens
+        }
+    }
+
+    const fn normalized_output_tokens(&self) -> u32 {
+        if self.output_tokens > 0 {
+            self.output_tokens
+        } else {
+            self.completion_tokens
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesApiResponse {
+    id: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    output: Vec<ResponsesOutputItem>,
+    #[serde(default)]
+    usage: Option<OpenAiUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesOutputItem {
+    #[serde(rename = "type")]
+    item_type: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    call_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+    #[serde(default)]
+    content: Vec<ResponsesContentPart>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesContentPart {
+    #[serde(rename = "type")]
+    part_type: String,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesStreamFrame {
+    #[serde(rename = "type")]
+    event_type: String,
+    #[serde(default)]
+    response: Option<ResponsesApiResponse>,
+    #[serde(default)]
+    item: Option<ResponsesOutputItem>,
+    #[serde(default)]
+    delta: Option<String>,
+    #[serde(default)]
+    output_index: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -995,6 +1281,129 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
     }
 
     payload
+}
+
+fn build_responses_request(request: &MessageRequest) -> Value {
+    let wire_model = strip_routing_prefix(&request.model);
+    let mut input = Vec::new();
+    if let Some(system) = request.system.as_ref().filter(|value| !value.is_empty()) {
+        input.push(json!({
+            "role": "system",
+            "content": [{"type": "input_text", "text": system}],
+        }));
+    }
+    for message in &request.messages {
+        input.extend(translate_message_for_responses(message));
+    }
+
+    let mut payload = json!({
+        "model": wire_model,
+        "max_output_tokens": request.max_tokens,
+        "input": input,
+        "stream": request.stream,
+    });
+
+    if let Some(tools) = &request.tools {
+        payload["tools"] = Value::Array(
+            tools
+                .iter()
+                .map(responses_tool_definition)
+                .collect::<Vec<_>>(),
+        );
+    }
+    if let Some(tool_choice) = &request.tool_choice {
+        payload["tool_choice"] = responses_tool_choice(tool_choice);
+    }
+    if !is_reasoning_model(&request.model) {
+        if let Some(temperature) = request.temperature {
+            payload["temperature"] = json!(temperature);
+        }
+        if let Some(top_p) = request.top_p {
+            payload["top_p"] = json!(top_p);
+        }
+    }
+    if let Some(stop) = &request.stop {
+        if !stop.is_empty() {
+            payload["stop"] = json!(stop);
+        }
+    }
+    if let Some(effort) = &request.reasoning_effort {
+        payload["reasoning"] = json!({ "effort": effort });
+    }
+
+    payload
+}
+
+fn translate_message_for_responses(message: &InputMessage) -> Vec<Value> {
+    match message.role.as_str() {
+        "assistant" => translate_assistant_message_for_responses(message),
+        _ => translate_user_message_for_responses(message),
+    }
+}
+
+fn translate_assistant_message_for_responses(message: &InputMessage) -> Vec<Value> {
+    let mut entries = Vec::new();
+    let mut content = Vec::new();
+    for block in &message.content {
+        match block {
+            InputContentBlock::Text { text } if !text.is_empty() => content.push(json!({
+                "type": "output_text",
+                "text": text,
+            })),
+            InputContentBlock::ToolUse { id, name, input } => entries.push(json!({
+                "type": "function_call",
+                "call_id": id,
+                "name": name,
+                "arguments": input.to_string(),
+            })),
+            InputContentBlock::Text { .. }
+            | InputContentBlock::Image { .. }
+            | InputContentBlock::ToolResult { .. }
+            | InputContentBlock::Thinking { .. }
+            | InputContentBlock::RedactedThinking { .. } => {}
+        }
+    }
+    if !content.is_empty() {
+        entries.insert(0, json!({ "role": "assistant", "content": content }));
+    }
+    entries
+}
+
+fn translate_user_message_for_responses(message: &InputMessage) -> Vec<Value> {
+    let mut entries = Vec::new();
+    let mut content = Vec::new();
+    for block in &message.content {
+        match block {
+            InputContentBlock::Text { text } if !text.is_empty() => content.push(json!({
+                "type": "input_text",
+                "text": text,
+            })),
+            InputContentBlock::Image { source } => {
+                let image_url = format!("data:{};base64,{}", source.media_type, source.data);
+                content.push(json!({
+                    "type": "input_image",
+                    "image_url": image_url,
+                }));
+            }
+            InputContentBlock::ToolResult {
+                tool_use_id,
+                content: result_content,
+                ..
+            } => entries.push(json!({
+                "type": "function_call_output",
+                "call_id": tool_use_id,
+                "output": flatten_tool_result_content(result_content),
+            })),
+            InputContentBlock::Text { .. }
+            | InputContentBlock::ToolUse { .. }
+            | InputContentBlock::Thinking { .. }
+            | InputContentBlock::RedactedThinking { .. } => {}
+        }
+    }
+    if !content.is_empty() {
+        entries.insert(0, json!({ "role": "user", "content": content }));
+    }
+    entries
 }
 
 fn translate_message(message: &InputMessage) -> Vec<Value> {
@@ -1249,13 +1658,37 @@ fn openai_tool_choice(tool_choice: &ToolChoice) -> Value {
     }
 }
 
+fn responses_tool_definition(tool: &ToolDefinition) -> Value {
+    let mut parameters = tool.input_schema.clone();
+    normalize_object_schema(&mut parameters);
+    json!({
+        "type": "function",
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": parameters,
+        "strict": true,
+    })
+}
+
+fn responses_tool_choice(tool_choice: &ToolChoice) -> Value {
+    match tool_choice {
+        ToolChoice::Auto => Value::String("auto".to_string()),
+        ToolChoice::Any => Value::String("required".to_string()),
+        ToolChoice::Tool { name } => json!({
+            "type": "function",
+            "name": name,
+        }),
+    }
+}
+
 fn should_request_stream_usage(config: OpenAiCompatConfig) -> bool {
     matches!(config.provider_name, "OpenAI")
 }
 
-fn normalize_response(
+fn normalize_chat_completion_response(
     model: &str,
     response: ChatCompletionResponse,
+    exposed_tools: &[ToolDefinition],
 ) -> Result<MessageResponse, ApiError> {
     let choice = response
         .choices
@@ -1278,7 +1711,19 @@ fn normalize_response(
         });
     }
     if let Some(text) = choice.message.content.filter(|value| !value.is_empty()) {
-        content.push(OutputContentBlock::Text { text });
+        let exposed_tool_names = exposed_tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<BTreeSet<_>>();
+        if let Some(calls) = parse_compat_tool_calls(&text, &exposed_tool_names) {
+            content.extend(calls.into_iter().map(|call| OutputContentBlock::ToolUse {
+                id: call.id,
+                name: call.name,
+                input: call.input,
+            }));
+        } else {
+            content.push(OutputContentBlock::Text { text });
+        }
     }
     for tool_call in choice.message.tool_calls {
         content.push(OutputContentBlock::ToolUse {
@@ -1302,20 +1747,327 @@ fn normalize_response(
             input_tokens: response
                 .usage
                 .as_ref()
-                .map_or(0, |usage| usage.prompt_tokens),
+                .map_or(0, OpenAiUsage::normalized_input_tokens),
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
             output_tokens: response
                 .usage
                 .as_ref()
-                .map_or(0, |usage| usage.completion_tokens),
+                .map_or(0, OpenAiUsage::normalized_output_tokens),
         },
         request_id: None,
     })
 }
 
+fn normalize_responses_response(model: &str, response: ResponsesApiResponse) -> MessageResponse {
+    let mut content = Vec::new();
+    let mut has_tool_call = false;
+    for item in response.output {
+        match item.item_type.as_str() {
+            "message" => {
+                for part in item.content {
+                    if matches!(part.part_type.as_str(), "output_text" | "text") {
+                        if let Some(text) = part.text.filter(|value| !value.is_empty()) {
+                            content.push(OutputContentBlock::Text { text });
+                        }
+                    }
+                }
+            }
+            "function_call" => {
+                has_tool_call = true;
+                content.push(OutputContentBlock::ToolUse {
+                    id: item
+                        .call_id
+                        .or(item.id)
+                        .unwrap_or_else(|| "call_0".to_string()),
+                    name: item.name.unwrap_or_else(|| "unknown_tool".to_string()),
+                    input: parse_tool_arguments(item.arguments.as_deref().unwrap_or("{}")),
+                });
+            }
+            _ => {}
+        }
+    }
+    MessageResponse {
+        id: response.id,
+        kind: "message".to_string(),
+        role: "assistant".to_string(),
+        content,
+        model: response.model.unwrap_or_else(|| model.to_string()),
+        stop_reason: Some(if has_tool_call {
+            "tool_use".to_string()
+        } else {
+            "end_turn".to_string()
+        }),
+        stop_sequence: None,
+        usage: response
+            .usage
+            .as_ref()
+            .map_or_else(Usage::default, |usage| Usage {
+                input_tokens: usage.normalized_input_tokens(),
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                output_tokens: usage.normalized_output_tokens(),
+            }),
+        request_id: None,
+    }
+}
+
 fn parse_tool_arguments(arguments: &str) -> Value {
     serde_json::from_str(arguments).unwrap_or_else(|_| json!({ "raw": arguments }))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct DsmlToolCall {
+    id: String,
+    name: String,
+    input: Value,
+}
+
+fn parse_dsml_tool_calls(
+    text: &str,
+    exposed_tool_names: &BTreeSet<String>,
+) -> Option<Vec<DsmlToolCall>> {
+    let body = text
+        .trim()
+        .strip_prefix(DSML_TOOL_CALLS_OPEN)?
+        .strip_suffix(DSML_TOOL_CALLS_CLOSE)?;
+    let mut remaining = body.trim();
+    let mut calls = Vec::new();
+
+    while !remaining.is_empty() {
+        let after_open = remaining.strip_prefix(DSML_INVOKE_OPEN)?;
+        let tag_end = after_open.find('>')?;
+        let attributes = parse_dsml_attributes(&after_open[..tag_end])?;
+        if attributes.len() != 1 {
+            return None;
+        }
+        let name = attributes.get("name")?.clone();
+        if !exposed_tool_names.contains(&name) {
+            return None;
+        }
+        let after_tag = &after_open[tag_end + 1..];
+        let (parameters, after_close) = after_tag.split_once(DSML_INVOKE_CLOSE)?;
+        let mut parameter_source = parameters.trim();
+        let mut input = serde_json::Map::new();
+        while !parameter_source.is_empty() {
+            let after_parameter_open = parameter_source.strip_prefix(DSML_PARAMETER_OPEN)?;
+            let parameter_tag_end = after_parameter_open.find('>')?;
+            let parameter_attributes =
+                parse_dsml_attributes(&after_parameter_open[..parameter_tag_end])?;
+            if parameter_attributes.len() != 2 {
+                return None;
+            }
+            let parameter_name = parameter_attributes.get("name")?.clone();
+            let is_string = match parameter_attributes.get("string")?.as_str() {
+                "true" => true,
+                "false" => false,
+                _ => return None,
+            };
+            let parameter_after_tag = &after_parameter_open[parameter_tag_end + 1..];
+            let (value, after_parameter_close) =
+                parameter_after_tag.split_once(DSML_PARAMETER_CLOSE)?;
+            let value = if is_string {
+                Value::String(value.to_string())
+            } else {
+                serde_json::from_str(value).ok()?
+            };
+            if input.insert(parameter_name, value).is_some() {
+                return None;
+            }
+            parameter_source = after_parameter_close.trim();
+        }
+        calls.push(DsmlToolCall {
+            id: format!("dsml-tool-{}", calls.len()),
+            name,
+            input: Value::Object(input),
+        });
+        remaining = after_close.trim();
+    }
+
+    (!calls.is_empty()).then_some(calls)
+}
+
+fn parse_compat_tool_calls(
+    text: &str,
+    exposed_tool_names: &BTreeSet<String>,
+) -> Option<Vec<DsmlToolCall>> {
+    parse_dsml_tool_calls(text, exposed_tool_names)
+        .or_else(|| parse_fenced_tool_call(text, exposed_tool_names))
+        .or_else(|| parse_tagged_tool_call(text, exposed_tool_names))
+}
+
+fn parse_fenced_tool_call(
+    text: &str,
+    exposed_tool_names: &BTreeSet<String>,
+) -> Option<Vec<DsmlToolCall>> {
+    let trimmed = text.trim();
+    if let Some(body) = trimmed
+        .strip_prefix(COMPAT_TOOL_USE_FENCE_OPEN)
+        .and_then(|body| body.strip_suffix("```"))
+    {
+        let body = body.trim_start_matches(['\r', '\n']).trim();
+        let (name, arguments) = body.split_once('\n')?;
+        let name = name.trim();
+        if !exposed_tool_names.contains(name) {
+            return None;
+        }
+        let input = serde_json::from_str::<Value>(arguments.trim()).ok()?;
+        if !input.is_object() {
+            return None;
+        }
+        return Some(vec![DsmlToolCall {
+            id: "compat-tool-0".to_string(),
+            name: name.to_string(),
+            input,
+        }]);
+    }
+
+    let body = trimmed
+        .strip_prefix(COMPAT_JSON_FENCE_OPEN)?
+        .strip_suffix("```")?
+        .trim_start_matches(['\r', '\n'])
+        .trim();
+    let value = serde_json::from_str::<Value>(body).ok()?;
+    let object = value.as_object()?;
+    if object.len() != 2 || !object.contains_key("tool") || !object.contains_key("arguments") {
+        return None;
+    }
+    let name = object.get("tool")?.as_str()?;
+    if !exposed_tool_names.contains(name) {
+        return None;
+    }
+    let input = object.get("arguments")?.clone();
+    if !input.is_object() {
+        return None;
+    }
+    Some(vec![DsmlToolCall {
+        id: "compat-tool-0".to_string(),
+        name: name.to_string(),
+        input,
+    }])
+}
+
+fn parse_tagged_tool_call(
+    text: &str,
+    exposed_tool_names: &BTreeSet<String>,
+) -> Option<Vec<DsmlToolCall>> {
+    let mut body = text
+        .trim()
+        .strip_prefix(COMPAT_TOOL_CALL_OPEN)?
+        .strip_suffix(COMPAT_TOOL_CALL_CLOSE)?
+        .trim();
+    let mut name = None;
+    let mut input = serde_json::Map::new();
+    while !body.is_empty() {
+        let tag_end = body.find('>')?;
+        let tag = body.strip_prefix('<')?[..tag_end.saturating_sub(1)].trim();
+        if tag.is_empty()
+            || !tag
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            return None;
+        }
+        let after_open = &body[tag_end + 1..];
+        let close = format!("</{tag}>");
+        let (raw_value, remaining) = after_open.split_once(&close)?;
+        if raw_value.contains('<') || raw_value.contains('>') {
+            return None;
+        }
+        match tag {
+            "tool_name" => {
+                if name.replace(raw_value.trim().to_string()).is_some() {
+                    return None;
+                }
+            }
+            "parameters" => {
+                let parameters = serde_json::from_str::<Value>(raw_value.trim()).ok()?;
+                let parameters = parameters.as_object()?;
+                for (key, value) in parameters {
+                    if input.insert(key.clone(), value.clone()).is_some() {
+                        return None;
+                    }
+                }
+            }
+            parameter_name => {
+                if input
+                    .insert(
+                        parameter_name.to_string(),
+                        Value::String(raw_value.trim().to_string()),
+                    )
+                    .is_some()
+                {
+                    return None;
+                }
+            }
+        }
+        body = remaining.trim();
+    }
+    let name = name?;
+    if !exposed_tool_names.contains(&name) {
+        return None;
+    }
+    Some(vec![DsmlToolCall {
+        id: "compat-tool-0".to_string(),
+        name,
+        input: Value::Object(input),
+    }])
+}
+
+fn parse_dsml_attributes(source: &str) -> Option<BTreeMap<String, String>> {
+    let mut attributes = BTreeMap::new();
+    for token in source.split_whitespace() {
+        let (key, value) = token.split_once('=')?;
+        let value = value.strip_prefix('"')?.strip_suffix('"')?;
+        if key.is_empty()
+            || value.contains('<')
+            || value.contains('>')
+            || attributes
+                .insert(key.to_string(), value.to_string())
+                .is_some()
+        {
+            return None;
+        }
+    }
+    (!attributes.is_empty()).then_some(attributes)
+}
+
+fn compat_tool_markers() -> [&'static str; 4] {
+    [
+        DSML_TOOL_CALLS_OPEN,
+        COMPAT_TOOL_USE_FENCE_OPEN,
+        COMPAT_JSON_FENCE_OPEN,
+        COMPAT_TOOL_CALL_OPEN,
+    ]
+}
+
+fn first_compat_tool_marker(text: &str) -> Option<usize> {
+    compat_tool_markers()
+        .iter()
+        .filter_map(|marker| text.find(marker))
+        .min()
+}
+
+fn longest_compat_tool_prefix_suffix(text: &str) -> String {
+    let max_marker_prefix = compat_tool_markers()
+        .iter()
+        .map(|marker| marker.len().saturating_sub(1))
+        .max()
+        .unwrap_or(0);
+    let max_len = text.len().min(max_marker_prefix);
+    for length in (1..=max_len).rev() {
+        if !text.is_char_boundary(text.len() - length) {
+            continue;
+        }
+        let suffix = &text[text.len() - length..];
+        if compat_tool_markers()
+            .iter()
+            .any(|marker| marker.starts_with(suffix))
+        {
+            return suffix.to_string();
+        }
+    }
+    String::new()
 }
 
 fn next_sse_frame(buffer: &mut Vec<u8>) -> Option<String> {
@@ -1336,7 +2088,7 @@ fn next_sse_frame(buffer: &mut Vec<u8>) -> Option<String> {
     Some(String::from_utf8_lossy(&frame[..frame_len]).into_owned())
 }
 
-fn parse_sse_frame(
+fn parse_chat_sse_frame(
     frame: &str,
     provider: &str,
     model: &str,
@@ -1400,6 +2152,155 @@ fn parse_sse_frame(
         })
 }
 
+fn parse_responses_sse_frame(
+    frame: &str,
+    provider: &str,
+    model: &str,
+) -> Result<Option<ChatCompletionChunk>, ApiError> {
+    let trimmed = frame.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let mut data_lines = Vec::new();
+    for line in trimmed.lines() {
+        if line.starts_with(':') {
+            continue;
+        }
+        if let Some(data) = line.strip_prefix("data:") {
+            data_lines.push(data.trim_start());
+        }
+    }
+    if data_lines.is_empty() {
+        return Ok(None);
+    }
+    let payload = data_lines.join("\n");
+    if payload == "[DONE]" {
+        return Ok(None);
+    }
+    if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&payload) {
+        if let Some(err_obj) = raw.get("error") {
+            let msg = err_obj
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("provider returned an error in stream")
+                .to_string();
+            let code = err_obj
+                .get("code")
+                .and_then(serde_json::Value::as_u64)
+                .map(|c| c as u16);
+            let status = reqwest::StatusCode::from_u16(code.unwrap_or(400))
+                .unwrap_or(reqwest::StatusCode::BAD_REQUEST);
+            return Err(ApiError::Api {
+                status,
+                error_type: err_obj
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .map(str::to_owned),
+                message: Some(msg),
+                request_id: None,
+                body: payload.clone(),
+                retryable: false,
+                suggested_action: None,
+            });
+        }
+    }
+
+    let frame = serde_json::from_str::<ResponsesStreamFrame>(&payload).map_err(|error| {
+        tracing::warn!(error = %error, "responses stream chunk parse error");
+        ApiError::json_deserialize(provider, model, &payload, error)
+    })?;
+    Ok(responses_stream_frame_to_chunk(frame, model))
+}
+
+fn responses_stream_frame_to_chunk(
+    frame: ResponsesStreamFrame,
+    fallback_model: &str,
+) -> Option<ChatCompletionChunk> {
+    match frame.event_type.as_str() {
+        "response.created" => frame.response.map(|response| ChatCompletionChunk {
+            id: response.id,
+            model: response.model.or_else(|| Some(fallback_model.to_string())),
+            choices: Vec::new(),
+            usage: None,
+        }),
+        "response.output_text.delta" => frame.delta.map(|delta| ChatCompletionChunk {
+            id: "responses_stream".to_string(),
+            model: Some(fallback_model.to_string()),
+            choices: vec![ChunkChoice {
+                delta: ChunkDelta {
+                    content: Some(delta),
+                    ..ChunkDelta::default()
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        }),
+        "response.function_call_arguments.delta" => {
+            frame.delta.map(|arguments| ChatCompletionChunk {
+                id: "responses_stream".to_string(),
+                model: Some(fallback_model.to_string()),
+                choices: vec![ChunkChoice {
+                    delta: ChunkDelta {
+                        tool_calls: vec![DeltaToolCall {
+                            index: frame.output_index.unwrap_or(0),
+                            id: None,
+                            function: DeltaFunction {
+                                name: None,
+                                arguments: Some(arguments),
+                            },
+                        }],
+                        ..ChunkDelta::default()
+                    },
+                    finish_reason: None,
+                }],
+                usage: None,
+            })
+        }
+        "response.output_item.added" => frame.item.and_then(|item| {
+            (item.item_type == "function_call").then(|| ChatCompletionChunk {
+                id: "responses_stream".to_string(),
+                model: Some(fallback_model.to_string()),
+                choices: vec![ChunkChoice {
+                    delta: ChunkDelta {
+                        tool_calls: vec![DeltaToolCall {
+                            index: frame.output_index.unwrap_or(0),
+                            id: item.call_id.or(item.id),
+                            function: DeltaFunction {
+                                name: item.name,
+                                arguments: item.arguments,
+                            },
+                        }],
+                        ..ChunkDelta::default()
+                    },
+                    finish_reason: None,
+                }],
+                usage: None,
+            })
+        }),
+        "response.completed" => frame.response.map(|response| {
+            let has_tool_call = response
+                .output
+                .iter()
+                .any(|item| item.item_type == "function_call");
+            ChatCompletionChunk {
+                id: response.id,
+                model: response.model.or_else(|| Some(fallback_model.to_string())),
+                choices: vec![ChunkChoice {
+                    delta: ChunkDelta::default(),
+                    finish_reason: Some(if has_tool_call {
+                        "tool_calls".to_string()
+                    } else {
+                        "stop".to_string()
+                    }),
+                }],
+                usage: response.usage,
+            }
+        }),
+        _ => None,
+    }
+}
+
 fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
     match std::env::var(key) {
         Ok(value) if !value.is_empty() => Ok(Some(value)),
@@ -1427,6 +2328,15 @@ fn chat_completions_endpoint(base_url: &str) -> String {
         trimmed.to_string()
     } else {
         format!("{trimmed}/chat/completions")
+    }
+}
+
+fn responses_endpoint(base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    if trimmed.ends_with("/responses") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/responses")
     }
 }
 
@@ -1496,9 +2406,10 @@ impl StringExt for String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_chat_completion_request, chat_completions_endpoint, is_reasoning_model,
-        normalize_finish_reason, openai_tool_choice, parse_tool_arguments, OpenAiCompatClient,
-        OpenAiCompatConfig,
+        build_chat_completion_request, build_responses_request, chat_completions_endpoint,
+        is_reasoning_model, normalize_finish_reason, openai_tool_choice, parse_compat_tool_calls,
+        parse_dsml_tool_calls, parse_tool_arguments, responses_endpoint, OpenAiCompatClient,
+        OpenAiCompatConfig, OpenAiWireProtocol,
     };
     use crate::error::ApiError;
     use crate::types::{
@@ -1581,6 +2492,55 @@ mod tests {
             content[1]["image_url"]["url"],
             json!("data:image/png;base64,aW1hZ2U=")
         );
+    }
+
+    #[test]
+    fn responses_request_translation_uses_responses_shape() {
+        let payload = build_responses_request(&MessageRequest {
+            model: "openai/gpt-5".to_string(),
+            max_tokens: 128,
+            messages: vec![
+                InputMessage {
+                    role: "user".to_string(),
+                    content: vec![
+                        InputContentBlock::Text {
+                            text: "inspect".to_string(),
+                        },
+                        InputContentBlock::Image {
+                            source: ImageSource::base64("image/png", "aW1hZ2U="),
+                        },
+                    ],
+                },
+                InputMessage::user_tool_result("call_1", "done", false),
+            ],
+            system: Some("Use tools when needed.".to_string()),
+            tools: Some(vec![ToolDefinition {
+                name: "inspect_repo".to_string(),
+                description: Some("Inspect repository".to_string()),
+                input_schema: json!({"type": "object"}),
+            }]),
+            tool_choice: Some(ToolChoice::Auto),
+            stream: true,
+            reasoning_effort: Some("medium".to_string()),
+            ..Default::default()
+        });
+
+        assert_eq!(payload["model"], json!("gpt-5"));
+        assert_eq!(payload["max_output_tokens"], json!(128));
+        assert_eq!(payload["input"][0]["role"], json!("system"));
+        assert_eq!(
+            payload["input"][1]["content"][0]["type"],
+            json!("input_text")
+        );
+        assert_eq!(
+            payload["input"][1]["content"][1]["type"],
+            json!("input_image")
+        );
+        assert_eq!(payload["input"][2]["type"], json!("function_call_output"));
+        assert_eq!(payload["tools"][0]["type"], json!("function"));
+        assert_eq!(payload["tools"][0]["name"], json!("inspect_repo"));
+        assert_eq!(payload["tools"][0]["strict"], json!(true));
+        assert_eq!(payload["reasoning"]["effort"], json!("medium"));
     }
 
     #[test]
@@ -1740,6 +2700,23 @@ mod tests {
             chat_completions_endpoint("https://api.x.ai/v1/chat/completions"),
             "https://api.x.ai/v1/chat/completions"
         );
+        assert_eq!(
+            responses_endpoint("https://api.openai.com/v1"),
+            "https://api.openai.com/v1/responses"
+        );
+        assert_eq!(
+            responses_endpoint("https://api.openai.com/v1/responses"),
+            "https://api.openai.com/v1/responses"
+        );
+    }
+
+    #[test]
+    fn config_can_select_responses_wire_protocol() {
+        let client = OpenAiCompatClient::new(
+            "openai-test-key",
+            OpenAiCompatConfig::openai().with_wire_protocol(OpenAiWireProtocol::Responses),
+        );
+        assert_eq!(client.wire_protocol(), OpenAiWireProtocol::Responses);
     }
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -1756,10 +2733,277 @@ mod tests {
     }
 
     #[test]
+    fn streaming_xml_shaped_text_is_never_promoted_to_a_tool_use() {
+        use super::{ChatCompletionChunk, ChunkChoice, ChunkDelta, StreamState};
+        use crate::types::{
+            ContentBlockDelta, ContentBlockDeltaEvent, OutputContentBlock, StreamEvent,
+        };
+
+        let tool = ToolDefinition {
+            name: "read_file".to_string(),
+            description: Some("read a source file".to_string()),
+            input_schema: json!({"type":"object"}),
+        };
+        let mut state = StreamState::new("step-3.7-flash".to_string(), &[tool]);
+        let initial = state
+            .ingest_chunk(ChatCompletionChunk {
+                id: "message-1".to_string(),
+                model: Some("step-3.7-flash".to_string()),
+                choices: vec![ChunkChoice {
+                    delta: ChunkDelta {
+                        content: Some(
+                            "<tool_call><function=read_file><parameter=path>crates/runtime/src/lib.rs</parameter></function></tool_call>".to_string(),
+                        ),
+                        ..ChunkDelta::default()
+                    },
+                    finish_reason: Some("stop".to_string()),
+                }],
+                usage: None,
+            })
+            .expect("stream chunk");
+        assert!(initial.iter().all(|event| !matches!(
+            event,
+            StreamEvent::ContentBlockStart(start)
+                if matches!(&start.content_block, OutputContentBlock::ToolUse { .. })
+        )));
+
+        let terminal = state.finish().expect("stream finish");
+        assert!(terminal.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                delta: ContentBlockDelta::TextDelta { text },
+                ..
+            }) if text.contains("<function=read_file>")
+        )));
+        assert!(terminal.iter().all(|event| !matches!(
+            event,
+            StreamEvent::ContentBlockStart(start)
+                if matches!(&start.content_block, OutputContentBlock::ToolUse { .. })
+        )));
+    }
+
+    #[test]
+    fn strict_dsml_parser_accepts_only_exposed_tools_and_typed_parameters() {
+        let exposed = std::collections::BTreeSet::from([
+            "ListMcpResources".to_string(),
+            "ReadMcpResource".to_string(),
+        ]);
+        let calls = parse_dsml_tool_calls(
+            "<｜｜DSML｜｜tool_calls>\n<｜｜DSML｜｜invoke name=\"ListMcpResources\"></｜｜DSML｜｜invoke>\n<｜｜DSML｜｜invoke name=\"ReadMcpResource\"><｜｜DSML｜｜parameter name=\"uri\" string=\"true\">file://workspace/Cargo.toml</｜｜DSML｜｜parameter><｜｜DSML｜｜parameter name=\"line\" string=\"false\">12</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke>\n</｜｜DSML｜｜tool_calls>",
+            &exposed,
+        )
+        .expect("strict DSML frame");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "ListMcpResources");
+        assert_eq!(calls[0].input, json!({}));
+        assert_eq!(calls[1].id, "dsml-tool-1");
+        assert_eq!(
+            calls[1].input,
+            json!({"uri":"file://workspace/Cargo.toml", "line": 12})
+        );
+        assert!(parse_dsml_tool_calls(
+            "<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"shell\"></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>",
+            &exposed,
+        )
+        .is_none());
+        assert!(parse_dsml_tool_calls(
+            "<tool_call><function=ReadMcpResource></tool_call>",
+            &exposed,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn compatibility_parser_accepts_only_exact_exposed_tool_frames() {
+        let exposed = std::collections::BTreeSet::from([
+            "ToolSearch".to_string(),
+            "workspace_snapshot".to_string(),
+        ]);
+
+        let json_call = parse_compat_tool_calls(
+            "```json\n{\"tool\":\"ToolSearch\",\"arguments\":{\"pattern\":\"//!\",\"glob\":\"*.rs\"}}\n```",
+            &exposed,
+        )
+        .expect("strict fenced JSON tool frame");
+        assert_eq!(json_call[0].name, "ToolSearch");
+        assert_eq!(json_call[0].input, json!({"pattern":"//!", "glob":"*.rs"}));
+
+        let tool_use = parse_compat_tool_calls(
+            "```tool_use\nToolSearch\n{\"pattern\":\"RuntimeHost\"}\n```",
+            &exposed,
+        )
+        .expect("strict tool_use frame");
+        assert_eq!(tool_use[0].name, "ToolSearch");
+        assert_eq!(tool_use[0].input, json!({"pattern":"RuntimeHost"}));
+
+        let tagged = parse_compat_tool_calls(
+            "<tool_call><tool_name>workspace_snapshot</tool_name><path>crates/memory</path><parameters>{\"include_files\":true}</parameters></tool_call>",
+            &exposed,
+        )
+        .expect("strict tagged tool frame");
+        assert_eq!(tagged[0].name, "workspace_snapshot");
+        assert_eq!(
+            tagged[0].input,
+            json!({"path":"crates/memory", "include_files":true})
+        );
+
+        assert!(parse_compat_tool_calls(
+            "```json\n{\"tool\":\"shell\",\"arguments\":{}}\n```",
+            &exposed,
+        )
+        .is_none());
+        assert!(parse_compat_tool_calls(
+            "```json\n{\"tool\":\"ToolSearch\",\"arguments\":{},\"comment\":\"run it\"}\n```",
+            &exposed,
+        )
+        .is_none());
+        assert!(parse_compat_tool_calls(
+            "Use this example: <tool_call><tool_name>ToolSearch</tool_name><parameters>{}</parameters></tool_call>",
+            &exposed,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn streaming_compatibility_frame_becomes_tool_use_without_leaking_text() {
+        use super::{ChatCompletionChunk, ChunkChoice, ChunkDelta, StreamState};
+        use crate::types::{ContentBlockDelta, OutputContentBlock, StreamEvent};
+
+        let tool = ToolDefinition {
+            name: "ToolSearch".to_string(),
+            description: Some("search tools".to_string()),
+            input_schema: json!({"type":"object"}),
+        };
+        let mut state = StreamState::new("deepseek-v4-flash".to_string(), &[tool]);
+        for content in ["```tool_", "use\nToolSearch\n{\"pattern\":\"read\"}\n```"] {
+            let events = state
+                .ingest_chunk(ChatCompletionChunk {
+                    id: "message-compat".to_string(),
+                    model: Some("deepseek-v4-flash".to_string()),
+                    choices: vec![ChunkChoice {
+                        delta: ChunkDelta {
+                            content: Some(content.to_string()),
+                            ..ChunkDelta::default()
+                        },
+                        finish_reason: Some("stop".to_string()),
+                    }],
+                    usage: None,
+                })
+                .expect("stream chunk");
+            assert!(events.iter().all(|event| !matches!(
+                event,
+                StreamEvent::ContentBlockDelta(delta)
+                    if matches!(&delta.delta, ContentBlockDelta::TextDelta { text } if text.contains("tool_use"))
+            )));
+        }
+
+        let terminal = state.finish().expect("stream finish");
+        assert!(terminal.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockStart(start)
+                if matches!(&start.content_block, OutputContentBlock::ToolUse { name, .. }
+                    if name == "ToolSearch")
+        )));
+        assert!(terminal.iter().any(|event| matches!(
+            event,
+            StreamEvent::MessageDelta(delta) if delta.delta.stop_reason.as_deref() == Some("tool_use")
+        )));
+    }
+
+    #[test]
+    fn streaming_strict_dsml_frame_becomes_tool_use_without_leaking_text() {
+        use super::{ChatCompletionChunk, ChunkChoice, ChunkDelta, StreamState};
+        use crate::types::{ContentBlockDelta, OutputContentBlock, StreamEvent};
+
+        let tool = ToolDefinition {
+            name: "ListMcpResources".to_string(),
+            description: Some("list resources".to_string()),
+            input_schema: json!({"type":"object"}),
+        };
+        let mut state = StreamState::new("deepseek-v4-flash".to_string(), &[tool]);
+        for content in [
+            "<｜｜DSML｜｜tool_",
+            "calls><｜｜DSML｜｜invoke name=\"ListMcpResources\"></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>",
+        ] {
+            let events = state
+                .ingest_chunk(ChatCompletionChunk {
+                    id: "message-dsml".to_string(),
+                    model: Some("deepseek-v4-flash".to_string()),
+                    choices: vec![ChunkChoice {
+                        delta: ChunkDelta {
+                            content: Some(content.to_string()),
+                            ..ChunkDelta::default()
+                        },
+                        finish_reason: Some("stop".to_string()),
+                    }],
+                    usage: None,
+                })
+                .expect("stream chunk");
+            assert!(events.iter().all(|event| !matches!(
+                event,
+                StreamEvent::ContentBlockDelta(delta)
+                    if matches!(&delta.delta, ContentBlockDelta::TextDelta { text } if text.contains("DSML"))
+            )));
+        }
+        let terminal = state.finish().expect("stream finish");
+        assert!(terminal.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockStart(start)
+                if matches!(&start.content_block, OutputContentBlock::ToolUse { name, input, .. }
+                    if name == "ListMcpResources" && input == &json!({}))
+        )));
+        assert!(terminal.iter().all(|event| !matches!(
+            event,
+            StreamEvent::ContentBlockDelta(delta)
+                if matches!(&delta.delta, ContentBlockDelta::TextDelta { text } if text.contains("DSML"))
+        )));
+        assert!(terminal.iter().any(|event| matches!(
+            event,
+            StreamEvent::MessageDelta(delta) if delta.delta.stop_reason.as_deref() == Some("tool_use")
+        )));
+    }
+
+    #[test]
+    fn streaming_plain_text_with_tools_is_released_immediately() {
+        use super::{ChatCompletionChunk, ChunkChoice, ChunkDelta, StreamState};
+        use crate::types::{ContentBlockDelta, ContentBlockDeltaEvent, StreamEvent};
+
+        let tool = ToolDefinition {
+            name: "read_file".to_string(),
+            description: Some("read a source file".to_string()),
+            input_schema: json!({"type":"object"}),
+        };
+        let mut state = StreamState::new("step-3.7-flash".to_string(), &[tool]);
+        let events = state
+            .ingest_chunk(ChatCompletionChunk {
+                id: "message-plain".to_string(),
+                model: Some("step-3.7-flash".to_string()),
+                choices: vec![ChunkChoice {
+                    delta: ChunkDelta {
+                        content: Some("ordinary answer".to_string()),
+                        ..ChunkDelta::default()
+                    },
+                    finish_reason: None,
+                }],
+                usage: None,
+            })
+            .expect("stream chunk");
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                delta: ContentBlockDelta::TextDelta { text },
+                ..
+            }) if text == "ordinary answer"
+        )));
+    }
+
+    #[test]
     fn tuning_params_included_in_payload_when_set() {
         let request = MessageRequest {
             model: "gpt-4o".to_string(),
             max_tokens: 1024,
+            context_window_limit: None,
             messages: vec![],
             system: None,
             tools: None,

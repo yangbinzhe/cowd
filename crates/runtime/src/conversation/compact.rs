@@ -36,6 +36,18 @@ pub struct CompactionResult {
     pub source_message_end: usize,
 }
 
+/// A deterministic compaction boundary. Runtime builds the semantic checkpoint
+/// after this plan is chosen, then applies that one checkpoint summary through
+/// `apply_compaction_summary`; it must not synthesize a second summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionPlan {
+    pub source_message_start: usize,
+    pub source_message_end: usize,
+    pub removed_message_count: usize,
+    pub existing_summary: Option<String>,
+    pub preserved_messages: Vec<ConversationMessage>,
+}
+
 /// Roughly estimates the token footprint of the current session transcript.
 #[must_use]
 pub fn estimate_session_tokens(session: &Session) -> usize {
@@ -98,9 +110,10 @@ pub fn get_compact_continuation_message(
 }
 
 /// Compacts a session by summarizing older messages and preserving the recent tail.
+#[cfg(test)]
 #[must_use]
 pub fn compact_session(session: &Session, config: CompactionConfig) -> CompactionResult {
-    if !should_compact(session, config) {
+    let Some(plan) = plan_session_compaction(session, config) else {
         return CompactionResult {
             summary: String::new(),
             formatted_summary: String::new(),
@@ -109,6 +122,25 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
             source_message_start: 0,
             source_message_end: 0,
         };
+    };
+
+    let removed = &session.messages[plan.source_message_start..plan.source_message_end];
+    let summary = merge_compact_summaries(
+        plan.existing_summary.as_deref(),
+        &summarize_messages(removed),
+    );
+    apply_compaction_summary(session, plan, summary)
+}
+
+/// Choose the message range to compact while retaining tool call/result pairs.
+/// This is pure and does not create any synthetic summary content.
+#[must_use]
+pub fn plan_session_compaction(
+    session: &Session,
+    config: CompactionConfig,
+) -> Option<CompactionPlan> {
+    if !should_compact(session, config) {
+        return None;
     }
 
     let existing_summary = session
@@ -164,31 +196,46 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         }
         k
     };
-    let removed = &session.messages[compacted_prefix_len..keep_from];
-    let preserved = session.messages[keep_from..].to_vec();
-    let summary =
-        merge_compact_summaries(existing_summary.as_deref(), &summarize_messages(removed));
+    Some(CompactionPlan {
+        source_message_start: compacted_prefix_len,
+        source_message_end: keep_from,
+        removed_message_count: keep_from.saturating_sub(compacted_prefix_len),
+        existing_summary,
+        preserved_messages: session.messages[keep_from..].to_vec(),
+    })
+}
+
+/// Apply exactly one caller-provided semantic summary to a previously planned
+/// boundary. The caller owns checkpoint construction and durability; this
+/// module only maintains transcript structure and pairing invariants.
+#[must_use]
+pub fn apply_compaction_summary(
+    session: &Session,
+    plan: CompactionPlan,
+    summary: String,
+) -> CompactionResult {
     let formatted_summary = format_compact_summary(&summary);
-    let continuation = get_compact_continuation_message(&summary, true, !preserved.is_empty());
+    let continuation =
+        get_compact_continuation_message(&summary, true, !plan.preserved_messages.is_empty());
 
     let mut compacted_messages = vec![ConversationMessage {
         role: MessageRole::System,
         blocks: vec![ContentBlock::Text { text: continuation }],
         usage: None,
     }];
-    compacted_messages.extend(preserved);
+    compacted_messages.extend(plan.preserved_messages.clone());
 
     let mut compacted_session = session.clone();
     compacted_session.messages = compacted_messages;
-    compacted_session.record_compaction(summary.clone(), removed.len());
+    compacted_session.record_compaction(summary.clone(), plan.removed_message_count);
 
     CompactionResult {
         summary,
         formatted_summary,
         compacted_session,
-        removed_message_count: removed.len(),
-        source_message_start: compacted_prefix_len,
-        source_message_end: keep_from,
+        removed_message_count: plan.removed_message_count,
+        source_message_start: plan.source_message_start,
+        source_message_end: plan.source_message_end,
     }
 }
 
@@ -202,6 +249,7 @@ fn compacted_summary_prefix_len(session: &Session) -> usize {
     )
 }
 
+#[cfg(test)]
 fn summarize_messages(messages: &[ConversationMessage]) -> String {
     let user_messages = messages
         .iter()
@@ -291,6 +339,7 @@ fn summarize_messages(messages: &[ConversationMessage]) -> String {
     lines.join("\n")
 }
 
+#[cfg(test)]
 fn merge_compact_summaries(existing_summary: Option<&str>, new_summary: &str) -> String {
     let Some(existing_summary) = existing_summary else {
         return new_summary.to_string();
@@ -326,6 +375,7 @@ fn merge_compact_summaries(existing_summary: Option<&str>, new_summary: &str) ->
     lines.join("\n")
 }
 
+#[cfg(test)]
 fn summarize_block(block: &ContentBlock) -> String {
     let raw = match block {
         ContentBlock::Text { text } => text.clone(),
@@ -353,6 +403,7 @@ fn summarize_block(block: &ContentBlock) -> String {
     truncate_summary(&raw, 160)
 }
 
+#[cfg(test)]
 fn collect_recent_role_summaries(
     messages: &[ConversationMessage],
     role: MessageRole,
@@ -371,6 +422,7 @@ fn collect_recent_role_summaries(
         .collect()
 }
 
+#[cfg(test)]
 fn infer_pending_work(messages: &[ConversationMessage]) -> Vec<String> {
     messages
         .iter()
@@ -392,6 +444,7 @@ fn infer_pending_work(messages: &[ConversationMessage]) -> Vec<String> {
         .collect()
 }
 
+#[cfg(test)]
 fn collect_key_files(messages: &[ConversationMessage]) -> Vec<String> {
     let mut files = messages
         .iter()
@@ -410,6 +463,7 @@ fn collect_key_files(messages: &[ConversationMessage]) -> Vec<String> {
     files.into_iter().take(8).collect()
 }
 
+#[cfg(test)]
 fn infer_current_work(messages: &[ConversationMessage]) -> Option<String> {
     messages
         .iter()
@@ -430,6 +484,7 @@ fn first_text_block(message: &ConversationMessage) -> Option<&str> {
     })
 }
 
+#[cfg(test)]
 fn has_interesting_extension(candidate: &str) -> bool {
     std::path::Path::new(candidate)
         .extension()
@@ -441,6 +496,7 @@ fn has_interesting_extension(candidate: &str) -> bool {
         })
 }
 
+#[cfg(test)]
 fn extract_file_candidates(content: &str) -> Vec<String> {
     content
         .split_whitespace()
@@ -457,6 +513,7 @@ fn extract_file_candidates(content: &str) -> Vec<String> {
         .collect()
 }
 
+#[cfg(test)]
 fn truncate_summary(content: &str, max_chars: usize) -> String {
     if content.chars().count() <= max_chars {
         return content.to_string();
@@ -539,6 +596,7 @@ fn extract_existing_compacted_summary(message: &ConversationMessage) -> Option<S
     Some(summary.trim().to_string())
 }
 
+#[cfg(test)]
 fn extract_summary_highlights(summary: &str) -> Vec<String> {
     let mut lines = Vec::new();
     let mut in_timeline = false;
@@ -561,6 +619,7 @@ fn extract_summary_highlights(summary: &str) -> Vec<String> {
     lines
 }
 
+#[cfg(test)]
 fn extract_summary_timeline(summary: &str) -> Vec<String> {
     let mut lines = Vec::new();
     let mut in_timeline = false;
@@ -586,8 +645,9 @@ fn extract_summary_timeline(summary: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_key_files, compact_session, format_compact_summary,
-        get_compact_continuation_message, infer_pending_work, should_compact, CompactionConfig,
+        apply_compaction_summary, collect_key_files, compact_session, format_compact_summary,
+        get_compact_continuation_message, infer_pending_work, plan_session_compaction,
+        should_compact, CompactionConfig,
     };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
@@ -672,6 +732,46 @@ mod tests {
             result.removed_message_count > 0,
             "compaction must remove at least one message"
         );
+    }
+
+    #[test]
+    fn runtime_path_applies_one_caller_supplied_semantic_checkpoint() {
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage::user_text("old request ".repeat(80)),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "old result ".repeat(80),
+            }]),
+            ConversationMessage::user_text("recent request"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "recent result".to_string(),
+            }]),
+        ];
+        let plan = plan_session_compaction(
+            &session,
+            CompactionConfig {
+                preserve_recent_messages: 2,
+                max_estimated_tokens: 1,
+                priority_threshold: 3,
+                keep_high_priority: true,
+            },
+        )
+        .expect("a boundary should be planned");
+        let result = apply_compaction_summary(
+            &session,
+            plan,
+            "## Active Task\nSemantic checkpoint only\n\n## Critical Context\nPreserve decision A"
+                .to_string(),
+        );
+        assert_eq!(
+            result.summary,
+            "## Active Task\nSemantic checkpoint only\n\n## Critical Context\nPreserve decision A"
+        );
+        assert!(!result.summary.contains("Conversation summary:"));
+        assert!(matches!(
+            &result.compacted_session.messages[0].blocks[0],
+            ContentBlock::Text { text } if text.contains("Semantic checkpoint only")
+        ));
     }
 
     #[test]

@@ -8,7 +8,7 @@
 //   - Composite reputation scores (when available)
 //   - Keyboard navigation (j/k/↑/↓, Enter detail, Tab toggle)
 //
-// Data source: `App::delegate_tasks` and runtime workgraph summaries.
+// Data source: `App::delegate_tasks` and runtime execution graph summaries.
 // Reputation scores are read from each AgentInfo's optional field and
 // formatted via `ReputationScore::composite()`.
 
@@ -49,6 +49,17 @@ pub struct ReputationScore {
     pub composite: f64,
 }
 
+/// Read-only Runtime projection of a runnable Team template. The TUI can
+/// choose this revision for a run but never edits roles or constructs nodes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamTemplateInfo {
+    pub template_id: String,
+    pub revision: u64,
+    pub name: String,
+    pub role_count: usize,
+    pub result_fields: Vec<String>,
+}
+
 impl ReputationScore {
     fn composite(&self) -> f64 {
         self.composite
@@ -75,17 +86,20 @@ pub struct AgentTeamPanel {
     /// Whether the panel is visible (Tab toggles).
     pub visible: bool,
     /// Scroll offset for long lists.
-    pub scroll_offset: u16,
+    pub scroll_offset: usize,
     /// Index of the agent whose detail view is expanded (None = collapsed).
     pub detail_idx: Option<usize>,
-    /// Latest workgraph summary emitted by the runtime.
-    pub workgraph_summary: Option<crate::RuntimeWorkGraphSummary>,
+    /// Latest execution graph summary emitted by the runtime.
+    pub execution_graph_summary: Option<crate::RuntimeExecutionGraphSummary>,
     /// Delegated task summaries from the current App state.
     pub delegate_tasks: Vec<DelegateTask>,
     /// Last operator action status.
     pub last_action_status: Option<String>,
     /// Last Gateway receipt summary.
     pub last_action_receipt: Option<String>,
+    /// Runtime-owned template catalog loaded when the panel opens.
+    pub team_templates: Vec<TeamTemplateInfo>,
+    pub selected_template_idx: usize,
 }
 
 impl AgentTeamPanel {
@@ -98,10 +112,12 @@ impl AgentTeamPanel {
             visible: false,
             scroll_offset: 0,
             detail_idx: None,
-            workgraph_summary: None,
+            execution_graph_summary: None,
             delegate_tasks: Vec::new(),
             last_action_status: None,
             last_action_receipt: None,
+            team_templates: Vec::new(),
+            selected_template_idx: 0,
         }
     }
 
@@ -126,7 +142,7 @@ impl AgentTeamPanel {
             self.detail_idx = None;
         }
         self.sync();
-        self.workgraph_summary = app.latest_workgraph_summary.clone();
+        self.execution_graph_summary = app.latest_execution_graph_summary.clone();
         self.delegate_tasks = app.delegate_tasks.clone();
     }
 
@@ -149,15 +165,15 @@ impl AgentTeamPanel {
                     self.selected_idx += 1;
                 }
                 let max_visible = 10usize;
-                if self.selected_idx >= self.scroll_offset as usize + max_visible {
-                    self.scroll_offset = (self.selected_idx.saturating_sub(max_visible - 1)) as u16;
+                if self.selected_idx >= self.scroll_offset + max_visible {
+                    self.scroll_offset = self.selected_idx.saturating_sub(max_visible - 1);
                 }
                 true
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.selected_idx = self.selected_idx.saturating_sub(1);
-                if self.selected_idx < self.scroll_offset as usize {
-                    self.scroll_offset = self.selected_idx as u16;
+                if self.selected_idx < self.scroll_offset {
+                    self.scroll_offset = self.selected_idx;
                 }
                 true
             }
@@ -178,6 +194,59 @@ impl AgentTeamPanel {
     #[must_use]
     pub fn selected_agent_id_owned(&self) -> Option<String> {
         self.selected_agent().map(|agent| agent.agent_id.clone())
+    }
+
+    pub fn set_team_templates(&mut self, payload: &serde_json::Value) {
+        self.team_templates = payload
+            .get("templates")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|template| {
+                let revision_ref = template.get("revision_ref")?;
+                let template_id = revision_ref.get("template_id")?.as_str()?.to_string();
+                let revision = revision_ref.get("revision")?.as_u64()?;
+                Some(TeamTemplateInfo {
+                    template_id,
+                    revision,
+                    name: template
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("Unnamed Team")
+                        .to_string(),
+                    role_count: template
+                        .get("role_count")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|value| usize::try_from(value).ok())
+                        .unwrap_or(0),
+                    result_fields: template
+                        .get("result_fields")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|fields| {
+                            fields
+                                .iter()
+                                .filter_map(|field| field.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                })
+            })
+            .collect();
+        self.selected_template_idx = self
+            .selected_template_idx
+            .min(self.team_templates.len().saturating_sub(1));
+    }
+
+    #[must_use]
+    pub fn selected_team_template(&self) -> Option<&TeamTemplateInfo> {
+        self.team_templates.get(self.selected_template_idx)
+    }
+
+    pub fn select_next_team_template(&mut self) {
+        if !self.team_templates.is_empty() {
+            self.selected_template_idx =
+                (self.selected_template_idx + 1) % self.team_templates.len();
+        }
     }
 
     pub fn record_action_result(&mut self, label: &str, result: Result<serde_json::Value, String>) {
@@ -354,14 +423,17 @@ impl AgentTeamPanel {
 
     fn render_collaboration_lines(&self) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-        if let Some(summary) = self.workgraph_summary.as_ref() {
+        if let Some(summary) = self.execution_graph_summary.as_ref() {
             lines.push(Line::from(vec![
-                Span::styled("Workgraph: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Execution graph: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(summary.status.clone(), Style::default().fg(Color::Yellow)),
                 Span::styled(
                     format!(
-                        "  tasks {} memory {} conflicts {}",
-                        summary.agent_tasks, summary.memory_candidates, summary.conflicts
+                        "  tasks {} children {} memory {} conflicts {}",
+                        summary.agent_tasks,
+                        summary.child_executions,
+                        summary.memory_candidates,
+                        summary.conflicts
                     ),
                     Style::default().fg(Color::DarkGray),
                 ),
@@ -387,7 +459,7 @@ impl AgentTeamPanel {
             ]));
         } else {
             lines.push(Line::from(Span::styled(
-                "Workgraph: no collaboration summary yet",
+                "Execution graph: no collaboration summary yet",
                 Style::default().fg(Color::DarkGray),
             )));
         }
@@ -408,6 +480,24 @@ impl AgentTeamPanel {
                     Span::styled(preview(&task.description, 56), Style::default()),
                 ]));
             }
+        }
+        if let Some(template) = self.selected_team_template() {
+            lines.push(Line::from(vec![
+                Span::styled("Team template: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}@{}", template.template_id, template.revision),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(
+                    format!("  {} roles", template.role_count),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        } else {
+            lines.push(Line::from(Span::styled(
+                "Team template: no runnable Runtime template loaded",
+                Style::default().fg(Color::DarkGray),
+            )));
         }
         lines.push(Line::raw(""));
         lines
@@ -482,7 +572,7 @@ impl Component for AgentTeamPanel {
             lines.push(Line::raw(""));
 
             let total = self.agents.len();
-            let visible_start = self.scroll_offset as usize;
+            let visible_start = self.scroll_offset;
             // Estimate how many lines remain after header
             let header_consumed = 2;
             let max_visible = inner_height.saturating_sub(header_consumed + 1);
@@ -568,7 +658,7 @@ impl Component for AgentTeamPanel {
         // ── Keyboard hint bar ──────────────────────────────────
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
-            "j↓ k↑  Enter detail  i input  ! interrupt  X shutdown  Tab toggle  Esc hide",
+            "j↓ k↑ agent  n next template  t start template  i input  ! interrupt  X shutdown  Tab toggle  Esc hide",
             Style::default().fg(Color::DarkGray),
         )));
         if let Some(status) = &self.last_action_status {
@@ -618,15 +708,15 @@ impl Component for AgentTeamPanel {
                 }
                 // Auto-scroll
                 let max_visible = 10usize;
-                if self.selected_idx >= self.scroll_offset as usize + max_visible {
-                    self.scroll_offset = (self.selected_idx.saturating_sub(max_visible - 1)) as u16;
+                if self.selected_idx >= self.scroll_offset + max_visible {
+                    self.scroll_offset = self.selected_idx.saturating_sub(max_visible - 1);
                 }
                 EventResult::Consumed
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.selected_idx = self.selected_idx.saturating_sub(1);
-                if self.selected_idx < self.scroll_offset as usize {
-                    self.scroll_offset = self.selected_idx as u16;
+                if self.selected_idx < self.scroll_offset {
+                    self.scroll_offset = self.selected_idx;
                 }
                 EventResult::Consumed
             }
@@ -639,7 +729,7 @@ impl Component for AgentTeamPanel {
                 self.selected_idx = self.agents.len().saturating_sub(1);
                 // Scroll to bottom
                 if self.selected_idx >= 10 {
-                    self.scroll_offset = (self.selected_idx.saturating_sub(9)) as u16;
+                    self.scroll_offset = self.selected_idx.saturating_sub(9);
                 }
                 EventResult::Consumed
             }
@@ -715,7 +805,7 @@ mod tests {
     struct AgentDirectory;
 
     impl AgentDirectory {
-        fn global() -> Self {
+        fn new() -> Self {
             Self
         }
 
@@ -796,7 +886,7 @@ mod tests {
     #[test]
     fn sync_populates_agents() {
         let _guard = agent_directory_test_guard();
-        let dir = AgentDirectory::global();
+        let dir = AgentDirectory::new();
         dir.clear_all();
         dir.register(dummy_agent(
             "test-1",
@@ -816,7 +906,7 @@ mod tests {
     #[test]
     fn selected_agent_returns_correct_entry() {
         let _guard = agent_directory_test_guard();
-        let dir = AgentDirectory::global();
+        let dir = AgentDirectory::new();
         dir.clear_all();
         dir.register(dummy_agent(
             "alpha",
@@ -918,7 +1008,7 @@ mod tests {
     #[test]
     fn render_with_agents() {
         let _guard = agent_directory_test_guard();
-        let dir = AgentDirectory::global();
+        let dir = AgentDirectory::new();
         dir.clear_all();
         dir.register(dummy_agent(
             "agent-1",
@@ -952,7 +1042,7 @@ mod tests {
     #[test]
     fn keyboard_navigation_jk() {
         let _guard = agent_directory_test_guard();
-        let dir = AgentDirectory::global();
+        let dir = AgentDirectory::new();
         dir.clear_all();
         dir.register(dummy_agent("a", "Planner", AgentStatus::Active, vec![]));
         dir.register(dummy_agent("b", "Executor", AgentStatus::Busy, vec![]));
@@ -1011,7 +1101,7 @@ mod tests {
     #[test]
     fn keyboard_gg_jumps() {
         let _guard = agent_directory_test_guard();
-        let dir = AgentDirectory::global();
+        let dir = AgentDirectory::new();
         dir.clear_all();
         dir.register(dummy_agent("a", "P", AgentStatus::Active, vec![]));
         dir.register(dummy_agent("b", "E", AgentStatus::Active, vec![]));
@@ -1043,7 +1133,7 @@ mod tests {
     #[test]
     fn enter_toggles_detail() {
         let _guard = agent_directory_test_guard();
-        let dir = AgentDirectory::global();
+        let dir = AgentDirectory::new();
         dir.clear_all();
         dir.register(dummy_agent(
             "det",
@@ -1074,7 +1164,7 @@ mod tests {
     #[test]
     fn esc_collapses_detail_then_hides() {
         let _guard = agent_directory_test_guard();
-        let dir = AgentDirectory::global();
+        let dir = AgentDirectory::new();
         dir.clear_all();
         dir.register(dummy_agent("esc", "Executor", AgentStatus::Active, vec![]));
 
@@ -1149,9 +1239,9 @@ mod tests {
     }
 
     #[test]
-    fn sync_from_app_renders_workgraph_and_delegate_tasks() {
+    fn sync_from_app_renders_execution_graph_and_delegate_tasks() {
         let _guard = agent_directory_test_guard();
-        let dir = AgentDirectory::global();
+        let dir = AgentDirectory::new();
         dir.clear_all();
         dir.register(dummy_agent(
             "planner-1",
@@ -1161,11 +1251,12 @@ mod tests {
         ));
 
         let mut app = App::new("m", "s");
-        app.latest_workgraph_summary = Some(crate::RuntimeWorkGraphSummary {
+        app.latest_execution_graph_summary = Some(crate::RuntimeExecutionGraphSummary {
             graph_id: Some("graph-1".to_string()),
             board_id: Some("board-1".to_string()),
             status: "running".to_string(),
             agent_tasks: 3,
+            child_executions: 0,
             memory_candidates: 2,
             conflicts: 1,
             completion_rate: Some(0.5),
@@ -1184,8 +1275,11 @@ mod tests {
 
         let lines = render_panel(&mut panel, 92, 20);
         let joined = lines.join("\n");
-        assert!(joined.contains("Workgraph:"), "{joined}");
-        assert!(joined.contains("tasks 3 memory 2 conflicts 1"), "{joined}");
+        assert!(joined.contains("Execution graph:"), "{joined}");
+        assert!(
+            joined.contains("tasks 3 children 0 memory 2 conflicts 1"),
+            "{joined}"
+        );
         assert!(joined.contains("lift 1.25"), "{joined}");
         assert!(joined.contains("Delegates:"), "{joined}");
         assert!(
@@ -1199,7 +1293,7 @@ mod tests {
     #[test]
     fn sync_resets_detail_when_roster_changes() {
         let _guard = agent_directory_test_guard();
-        let dir = AgentDirectory::global();
+        let dir = AgentDirectory::new();
         dir.clear_all();
         dir.register(dummy_agent("x", "E", AgentStatus::Active, vec![]));
 
@@ -1231,7 +1325,7 @@ mod tests {
     #[test]
     fn selection_clamped_after_roster_shrinks() {
         let _guard = agent_directory_test_guard();
-        let dir = AgentDirectory::global();
+        let dir = AgentDirectory::new();
         dir.clear_all();
         dir.register(dummy_agent("a", "P", AgentStatus::Active, vec![]));
         dir.register(dummy_agent("b", "E", AgentStatus::Active, vec![]));
@@ -1252,7 +1346,7 @@ mod tests {
     #[test]
     fn scroll_offset_tracks_selection_on_j() {
         let _guard = agent_directory_test_guard();
-        let dir = AgentDirectory::global();
+        let dir = AgentDirectory::new();
         dir.clear_all();
         for i in 0..15 {
             dir.register(dummy_agent(

@@ -13,6 +13,7 @@ use ratatui::{
     Frame,
 };
 
+use crate::components::base::terminal_len;
 use crate::components::RenderContext;
 
 /// The kind of dialog being displayed.
@@ -402,19 +403,23 @@ impl DialogManager {
             | DialogKind::Confirm { title, .. }
             | DialogKind::Select { title, .. }
             | DialogKind::Prompt { title, .. }
-            | DialogKind::RevertConfirm { title, .. } => title.len() as u16,
+            | DialogKind::RevertConfirm { title, .. } => terminal_len(title.chars().count()),
             DialogKind::Permission { tool_name, .. } => {
-                format!(" Permission: {tool_name} ").len() as u16
+                terminal_len(format!(" Permission: {tool_name} ").chars().count())
             }
         };
 
         let content_w = match &dialog.kind {
-            DialogKind::Alert { message, .. } | DialogKind::Confirm { message, .. } => {
-                message.lines().map(|l| l.len() as u16).max().unwrap_or(0)
-            }
-            DialogKind::Select { items, .. } => {
-                items.iter().map(|i| i.len() as u16).max().unwrap_or(0)
-            }
+            DialogKind::Alert { message, .. } | DialogKind::Confirm { message, .. } => message
+                .lines()
+                .map(|line| terminal_len(line.chars().count()))
+                .max()
+                .unwrap_or(0),
+            DialogKind::Select { items, .. } => items
+                .iter()
+                .map(|item| terminal_len(item.chars().count()))
+                .max()
+                .unwrap_or(0),
             DialogKind::Prompt {
                 placeholder, input, ..
             } => {
@@ -424,9 +429,11 @@ impl DialogManager {
                 } else {
                     input.len() + 1 // +1 for cursor block
                 };
-                (visible + 2) as u16 // +2 for "  " prefix
+                terminal_len(visible.saturating_add(2)) // +2 for "  " prefix
             }
-            DialogKind::Permission { input_preview, .. } => input_preview.len().max(50) as u16,
+            DialogKind::Permission { input_preview, .. } => {
+                terminal_len(input_preview.chars().count().max(50))
+            }
             DialogKind::RevertConfirm { files, .. } => {
                 let max_file_len = files
                     .iter()
@@ -435,7 +442,7 @@ impl DialogManager {
                     })
                     .max()
                     .unwrap_or(0);
-                max_file_len.max(20) as u16
+                terminal_len(max_file_len.max(20))
             }
         };
 
@@ -449,7 +456,7 @@ impl DialogManager {
         };
 
         let text_w = title_w.max(content_w).max(buttons_w);
-        let w = text_w + 6; // 2 borders + 4 inner padding
+        let w = text_w.saturating_add(6); // 2 borders + 4 inner padding
         w.max(20).min(max_w)
     }
 
@@ -461,13 +468,15 @@ impl DialogManager {
             // Confirm: border(2) + title line + blank + message + blank + buttons
             DialogKind::Confirm { .. } => 7,
             // Select: border(2) + title + items + blank + hint
-            DialogKind::Select { items, .. } => (items.len() as u16 + 5).max(6),
+            DialogKind::Select { items, .. } => terminal_len(items.len()).saturating_add(5).max(6),
             // Prompt: border(2) + title + blank + input + blank + hint
             DialogKind::Prompt { .. } => 7,
             // Permission: border(2) + title + preview + blank + 3 buttons + hint + spare
             DialogKind::Permission { .. } => 10,
             // RevertConfirm: border(2) + title + blank + "Files changed:" + blank + file lines + blank + buttons
-            DialogKind::RevertConfirm { files, .. } => (files.len() as u16 + 8).max(7),
+            DialogKind::RevertConfirm { files, .. } => {
+                terminal_len(files.len()).saturating_add(8).max(7)
+            }
         }
     }
 

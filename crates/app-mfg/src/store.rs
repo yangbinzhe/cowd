@@ -11,7 +11,7 @@ use crate::{
     MfgCockpitProfile, MfgCockpitProjection, MfgCockpitReportDeliveryReceipt,
     MfgCockpitReportRequest, MfgCockpitReportSnapshot, MfgCrossPlaneBridgeReceipt,
     MfgDomainSeedResult, MfgIncident, MfgMemoryCase, MfgOperationalAnalysis, MfgPlaybook,
-    MfgSkillRun,
+    MfgSkillRun, MfgWorkflowGraph,
 };
 
 /// Application-layer store facade for MFG.
@@ -35,6 +35,12 @@ impl MfgStore {
     ) -> Result<Self, MfgRepositoryError> {
         Ok(Self {
             repository: MfgRepository::open_storage_handle(handle)?,
+        })
+    }
+
+    pub fn in_memory() -> Result<Self, MfgRepositoryError> {
+        Ok(Self {
+            repository: MfgRepository::in_memory()?,
         })
     }
 
@@ -335,5 +341,188 @@ impl MfgStore {
     ) -> Result<MfgCockpitReportSnapshot, MfgRepositoryError> {
         self.repository
             .attach_cockpit_report_delivery(report_id, receipt)
+    }
+
+    pub fn save_workflow_graph(
+        &self,
+        graph: &MfgWorkflowGraph,
+        expected_revision: Option<u64>,
+    ) -> Result<MfgWorkflowGraph, MfgRepositoryError> {
+        self.repository
+            .save_workflow_graph(graph, expected_revision)
+    }
+
+    pub fn create_incident_workflow(
+        &self,
+        incident: &MfgIncident,
+        packet: &MatrixEvidencePacket,
+    ) -> Result<(MfgIncident, MfgWorkflowGraph), MfgRepositoryError> {
+        self.repository.create_incident_workflow(incident, packet)
+    }
+
+    pub fn plan_incident_workflow_skills(
+        &self,
+        incident_id: &str,
+        plan: &crate::MfgSkillPlan,
+    ) -> Result<MfgWorkflowGraph, MfgRepositoryError> {
+        self.repository
+            .plan_incident_workflow_skills(incident_id, plan)
+    }
+
+    pub fn complete_incident_workflow_skill(
+        &self,
+        incident_id: &str,
+        run: &MfgSkillRun,
+    ) -> Result<MfgWorkflowGraph, MfgRepositoryError> {
+        self.repository
+            .complete_incident_workflow_skill(incident_id, run)
+    }
+
+    pub fn record_skill_run_and_complete_workflow(
+        &self,
+        run: &MfgSkillRun,
+    ) -> Result<(MfgSkillRun, MfgWorkflowGraph), MfgRepositoryError> {
+        self.repository.record_skill_run_and_complete_workflow(run)
+    }
+
+    pub fn get_workflow_graph(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Option<MfgWorkflowGraph>, MfgRepositoryError> {
+        self.repository.get_workflow_graph(workflow_id)
+    }
+
+    pub fn workflow_graph_for_incident(
+        &self,
+        incident_id: &str,
+    ) -> Result<Option<MfgWorkflowGraph>, MfgRepositoryError> {
+        self.repository.workflow_graph_for_incident(incident_id)
+    }
+
+    pub fn workflow_graph_for_task(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<MfgWorkflowGraph>, MfgRepositoryError> {
+        self.repository.workflow_graph_for_task(task_id)
+    }
+
+    pub fn list_workflow_graphs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<MfgWorkflowGraph>, MfgRepositoryError> {
+        self.repository.list_workflow_graphs(limit)
+    }
+}
+
+#[cfg(test)]
+mod workflow_tests {
+    use super::*;
+    use crate::{run_server_manufacturing_skill, server_manufacturing_skill_pack, MfgSkillPlan};
+
+    #[test]
+    fn workflow_store_isolates_incidents_and_task_lookup() {
+        let store = MfgStore::in_memory().unwrap();
+        let mut first_incident = MfgIncident::new("GPU shortage");
+        first_incident.task_id = Some("task-gpu".to_string());
+        let mut second_incident = MfgIncident::new("DIMM quality");
+        second_incident.task_id = Some("task-dimm".to_string());
+        let first = MfgWorkflowGraph::for_incident(&first_incident).unwrap();
+        let second = MfgWorkflowGraph::for_incident(&second_incident).unwrap();
+
+        store.save_workflow_graph(&first, None).unwrap();
+        store.save_workflow_graph(&second, None).unwrap();
+
+        assert_eq!(
+            store
+                .workflow_graph_for_task("task-gpu")
+                .unwrap()
+                .unwrap()
+                .incident_id,
+            first_incident.incident_id
+        );
+        assert_eq!(
+            store
+                .workflow_graph_for_incident(&second_incident.incident_id)
+                .unwrap()
+                .unwrap()
+                .workflow_id,
+            second.workflow_id
+        );
+        assert_eq!(store.list_workflow_graphs(10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn workflow_store_rejects_stale_writer() {
+        let store = MfgStore::in_memory().unwrap();
+        let incident = MfgIncident::new("Supplier recovery");
+        let graph = MfgWorkflowGraph::for_incident(&incident).unwrap();
+        store.save_workflow_graph(&graph, None).unwrap();
+
+        let mut current = store
+            .get_workflow_graph(&graph.workflow_id)
+            .unwrap()
+            .unwrap();
+        let stale = current.clone();
+        let expected = current.revision;
+        current
+            .add_evidence("planner", "decision", "mfg:decision:1", "expedite")
+            .unwrap();
+        store.save_workflow_graph(&current, Some(expected)).unwrap();
+
+        let error = store
+            .save_workflow_graph(&stale, Some(expected))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MfgRepositoryError::WorkflowRevisionConflict { .. }
+        ));
+    }
+
+    #[test]
+    fn workflow_store_owns_the_incident_skill_lifecycle() {
+        let store = MfgStore::in_memory().unwrap();
+        let incident = MfgIncident::new("GPU supply risk");
+        let packet = MatrixEvidencePacket::new("GPU supply risk affects weekly build");
+        let (incident, graph) = store.create_incident_workflow(&incident, &packet).unwrap();
+        assert_eq!(
+            incident.workflow_graph_id.as_deref(),
+            Some(graph.workflow_id.as_str())
+        );
+        assert!(store.get_incident(&incident.incident_id).unwrap().is_some());
+
+        let skill = server_manufacturing_skill_pack().remove(0);
+        let plan = MfgSkillPlan {
+            incident_id: incident.incident_id.clone(),
+            selected_skills: vec![skill.clone()],
+            evidence_requirements: skill.required_evidence.clone(),
+            planned_agent_nodes: vec![crate::skill_agent_node_id(&skill.skill_id)],
+        };
+        let mut planned = store
+            .plan_incident_workflow_skills(&incident.incident_id, &plan)
+            .unwrap();
+        let expected_revision = planned.revision;
+        planned
+            .set_node_terminal_result("mfg_researcher", "researched")
+            .unwrap();
+        planned
+            .set_node_terminal_result("mfg_reviewer", "reviewed")
+            .unwrap();
+        let planned = store
+            .save_workflow_graph(&planned, Some(expected_revision))
+            .unwrap();
+        let run = run_server_manufacturing_skill(&incident, &skill, None, Some(&packet));
+        let (recorded_run, completed) = store.record_skill_run_and_complete_workflow(&run).unwrap();
+
+        assert!(completed.revision > planned.revision);
+        assert_eq!(completed.incident_id, incident.incident_id);
+        assert_eq!(recorded_run.execution_id, run.execution_id);
+        assert!(store
+            .get_skill_run(run.execution_id.as_deref().unwrap())
+            .unwrap()
+            .is_some());
+        assert!(completed
+            .evidence
+            .iter()
+            .any(|item| item.kind == "mfg_skill_run"));
     }
 }

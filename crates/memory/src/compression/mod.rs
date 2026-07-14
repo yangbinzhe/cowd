@@ -472,13 +472,11 @@ mod tests {
     }
 
     // ===================================================================
-    // Task 10: Smart tool output pruning tests
-    // These verify that different tool types get appropriate summaries.
-    // Currently MicroCompactor uses generic truncation for ALL tools.
+    // V2: tool output remains lossless until canonical raw durability exists.
     // ===================================================================
 
     #[test]
-    fn test_terminal_output_summarized_with_exit_code() {
+    fn test_terminal_output_without_durable_ref_is_preserved() {
         use crate::compression::micro::MicroCompactor;
         let compactor = MicroCompactor::new();
 
@@ -497,15 +495,7 @@ mod tests {
         compactor.compact(&mut msgs);
 
         let tool_content = &msgs[1].content;
-        assert!(
-            tool_content.len() < terminal_output.len(),
-            "Terminal tool output should be compressed"
-        );
-        assert!(
-            tool_content.contains("exit"),
-            "RED: Terminal summary should mention exit code. \
-             Currently uses generic truncation without exit code awareness."
-        );
+        assert_eq!(tool_content, terminal_output);
     }
 
     #[test]
@@ -530,7 +520,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_tool_falls_back_to_generic_truncation() {
+    fn test_unknown_tool_without_durable_ref_is_preserved() {
         use crate::compression::micro::MicroCompactor;
         let compactor = MicroCompactor::new();
 
@@ -544,9 +534,6 @@ mod tests {
         compactor.compact(&mut msgs);
 
         let tool_content = &msgs[1].content;
-        assert!(
-            tool_content.len() < long_content.len(),
-            "Long unknown tool output should still be compacted"
-        );
+        assert_eq!(tool_content, &long_content);
     }
 }

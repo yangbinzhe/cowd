@@ -15,9 +15,9 @@ use crossterm::event::{Event, KeyCode, KeyEventKind, MouseEventKind};
 /// - `auto_scroll`: when true, the view auto-follows new content (streaming).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ScrollState {
-    pub offset: u16,
-    pub content_height: u16,
-    pub viewport_height: u16,
+    pub offset: usize,
+    pub content_height: usize,
+    pub viewport_height: usize,
     pub auto_scroll: bool,
 }
 
@@ -135,7 +135,7 @@ impl ScrollState {
     /// Called post-render to sync the actual rendered content height.
     /// This prevents ghost scroll space by ensuring the offset never
     /// exceeds the real content bounds.
-    pub fn set_content_size(&mut self, lines: u16) {
+    pub fn set_content_size(&mut self, lines: usize) {
         self.content_height = lines;
         self.clamp();
     }
@@ -147,13 +147,7 @@ impl ScrollState {
     /// If `auto_scroll` is true, snaps to bottom.
     pub fn clamp(&mut self) {
         if self.auto_scroll {
-            let total = self.content_height as usize;
-            let vh = self.viewport_height as usize;
-            if total > vh {
-                self.offset = (total - vh) as u16;
-            } else {
-                self.offset = 0;
-            }
+            self.offset = self.content_height.saturating_sub(self.viewport_height);
         } else {
             let max_offset = self.content_height.saturating_sub(self.viewport_height);
             if self.offset > max_offset {
@@ -360,9 +354,25 @@ mod tests {
         s.scroll_up();
         assert_eq!(s.offset, 0);
 
-        // Saturates at u16::MAX
-        s.offset = u16::MAX;
+        // Saturates at usize::MAX
+        s.offset = usize::MAX;
         s.scroll_down();
-        assert_eq!(s.offset, u16::MAX);
+        assert_eq!(s.offset, usize::MAX);
+    }
+
+    #[test]
+    fn long_content_keeps_an_unbounded_logical_offset() {
+        let mut state = ScrollState::new();
+        state.viewport_height = 10;
+        state.set_content_size(70_000);
+        state.scroll_to_bottom();
+        state.clamp();
+
+        assert_eq!(state.offset, 69_990);
+
+        state.scroll_page_up();
+        assert_eq!(state.offset, 69_981);
+        state.scroll_to_top();
+        assert_eq!(state.offset, 0);
     }
 }

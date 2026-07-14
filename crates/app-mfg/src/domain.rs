@@ -531,73 +531,73 @@ fn server_manufacturing_metric_dependencies() -> Vec<MatrixMetricDependency> {
 
 fn server_manufacturing_facts() -> Vec<MatrixFact> {
     vec![
-        fact(
-            "fact-smfg-shortage-gpu-w30",
-            "snapshot-smfg-w30",
-            "supply.material_shortage",
-            vec!["component:gpu-h100", "mfg:entity:entity-component-gpu-h100"],
-            "material_shortage_risk",
-            json!({"week": "2026-W30", "entity_id": "entity-component-gpu-h100"}),
-            json!({"short_qty": 128}),
-            "connector:erp:material-shortage",
-            0.94,
-        ),
-        fact(
-            "fact-smfg-commit-gpu-alpha-w30",
-            "snapshot-smfg-w30",
-            "supply.commit_variance",
-            vec![
+        fact(FactSeed {
+            fact_id: "fact-smfg-shortage-gpu-w30",
+            snapshot_id: "snapshot-smfg-w30",
+            fact_type: "supply.material_shortage",
+            entity_refs: vec!["component:gpu-h100", "mfg:entity:entity-component-gpu-h100"],
+            metric_key: "material_shortage_risk",
+            dimensions: json!({"week": "2026-W30", "entity_id": "entity-component-gpu-h100"}),
+            measures: json!({"short_qty": 128}),
+            source_ref: "connector:erp:material-shortage",
+            confidence: 0.94,
+        }),
+        fact(FactSeed {
+            fact_id: "fact-smfg-commit-gpu-alpha-w30",
+            snapshot_id: "snapshot-smfg-w30",
+            fact_type: "supply.commit_variance",
+            entity_refs: vec![
                 "supplier:supplier-gpu-alpha",
                 "mfg:entity:entity-supplier-gpu-alpha",
             ],
-            "supplier_commit_variance",
-            json!({"week": "2026-W30", "entity_id": "entity-supplier-gpu-alpha"}),
-            json!({"commit_gap_qty": 96}),
-            "connector:srm:supplier-commit",
-            0.9,
-        ),
-        fact(
-            "fact-smfg-load-final-assembly-w30",
-            "snapshot-smfg-w30",
-            "manufacturing.work_center_load",
-            vec![
+            metric_key: "supplier_commit_variance",
+            dimensions: json!({"week": "2026-W30", "entity_id": "entity-supplier-gpu-alpha"}),
+            measures: json!({"commit_gap_qty": 96}),
+            source_ref: "connector:srm:supplier-commit",
+            confidence: 0.9,
+        }),
+        fact(FactSeed {
+            fact_id: "fact-smfg-load-final-assembly-w30",
+            snapshot_id: "snapshot-smfg-w30",
+            fact_type: "manufacturing.work_center_load",
+            entity_refs: vec![
                 "work_center:final-assembly-line-1",
                 "mfg:entity:entity-work-center-final-assembly",
             ],
-            "work_center_load",
-            json!({"week": "2026-W30", "entity_id": "entity-work-center-final-assembly"}),
-            json!({"load_hours": 188, "capacity_hours": 160}),
-            "connector:mes:capacity",
-            0.88,
-        ),
-        fact(
-            "fact-smfg-order-risk-co-0001-w30",
-            "snapshot-smfg-w30",
-            "fulfillment.order_delivery_risk",
-            vec![
+            metric_key: "work_center_load",
+            dimensions: json!({"week": "2026-W30", "entity_id": "entity-work-center-final-assembly"}),
+            measures: json!({"load_hours": 188, "capacity_hours": 160}),
+            source_ref: "connector:mes:capacity",
+            confidence: 0.88,
+        }),
+        fact(FactSeed {
+            fact_id: "fact-smfg-order-risk-co-0001-w30",
+            snapshot_id: "snapshot-smfg-w30",
+            fact_type: "fulfillment.order_delivery_risk",
+            entity_refs: vec![
                 "customer_order:co-2026-0001",
                 "mfg:entity:entity-order-co-2026-0001",
             ],
-            "order_delivery_risk",
-            json!({"week": "2026-W30", "entity_id": "entity-order-co-2026-0001"}),
-            json!({"orders_at_risk": 1, "revenue_at_risk": 4800000}),
-            "connector:erp:customer-order",
-            0.91,
-        ),
-        fact(
-            "fact-smfg-quality-dimm-w30",
-            "snapshot-smfg-w30",
-            "quality.escape_risk",
-            vec![
+            metric_key: "order_delivery_risk",
+            dimensions: json!({"week": "2026-W30", "entity_id": "entity-order-co-2026-0001"}),
+            measures: json!({"orders_at_risk": 1, "revenue_at_risk": 4800000}),
+            source_ref: "connector:erp:customer-order",
+            confidence: 0.91,
+        }),
+        fact(FactSeed {
+            fact_id: "fact-smfg-quality-dimm-w30",
+            snapshot_id: "snapshot-smfg-w30",
+            fact_type: "quality.escape_risk",
+            entity_refs: vec![
                 "component:dimm-ddr5-64g",
                 "mfg:entity:entity-component-dimm-64g",
             ],
-            "quality_escape_risk",
-            json!({"week": "2026-W30", "entity_id": "entity-component-dimm-64g"}),
-            json!({"defect_ppm": 420}),
-            "connector:qms:quality-trend",
-            0.86,
-        ),
+            metric_key: "quality_escape_risk",
+            dimensions: json!({"week": "2026-W30", "entity_id": "entity-component-dimm-64g"}),
+            measures: json!({"defect_ppm": 420}),
+            source_ref: "connector:qms:quality-trend",
+            confidence: 0.86,
+        }),
     ]
 }
 
@@ -668,30 +668,32 @@ fn metric(
     }
 }
 
-fn fact(
-    fact_id: &str,
-    snapshot_id: &str,
-    fact_type: &str,
-    entity_refs: Vec<&str>,
-    metric_key: &str,
+struct FactSeed<'a> {
+    fact_id: &'a str,
+    snapshot_id: &'a str,
+    fact_type: &'a str,
+    entity_refs: Vec<&'a str>,
+    metric_key: &'a str,
     dimensions: Value,
     measures: Value,
-    source_ref: &str,
+    source_ref: &'a str,
     confidence: f32,
-) -> MatrixFact {
+}
+
+fn fact(seed: FactSeed<'_>) -> MatrixFact {
     MatrixFact::from_input(MatrixFactInput {
-        fact_id: Some(fact_id.to_string()),
-        snapshot_id: Some(snapshot_id.to_string()),
-        fact_type: fact_type.to_string(),
-        entity_refs: entity_refs.into_iter().map(str::to_string).collect(),
-        metric_key: Some(metric_key.to_string()),
-        dimensions,
-        measures,
+        fact_id: Some(seed.fact_id.to_string()),
+        snapshot_id: Some(seed.snapshot_id.to_string()),
+        fact_type: seed.fact_type.to_string(),
+        entity_refs: seed.entity_refs.into_iter().map(str::to_string).collect(),
+        metric_key: Some(seed.metric_key.to_string()),
+        dimensions: seed.dimensions,
+        measures: seed.measures,
         event_time: None,
         valid_from: None,
         valid_to: None,
-        source_ref: Some(source_ref.to_string()),
-        confidence: Some(confidence),
+        source_ref: Some(seed.source_ref.to_string()),
+        confidence: Some(seed.confidence),
         raw_hash: None,
     })
 }
@@ -728,5 +730,34 @@ fn source_key(source_system: &str, source_key: &str, source_ref: &str) -> Matrix
         source_system: source_system.to_string(),
         source_key: source_key.to_string(),
         source_ref: Some(source_ref.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seed_plan_preserves_builtin_fact_identity_and_count() {
+        let plan = server_manufacturing_seed_plan();
+
+        assert_eq!(plan.facts.len(), 5);
+        assert_eq!(
+            plan.facts
+                .iter()
+                .map(|fact| fact.fact_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "fact-smfg-shortage-gpu-w30",
+                "fact-smfg-commit-gpu-alpha-w30",
+                "fact-smfg-load-final-assembly-w30",
+                "fact-smfg-order-risk-co-0001-w30",
+                "fact-smfg-quality-dimm-w30",
+            ]
+        );
+        assert_eq!(
+            plan.facts[0].metric_key.as_deref(),
+            Some("material_shortage_risk")
+        );
     }
 }

@@ -2,7 +2,12 @@
 
 use super::activation::RuntimeSkillCandidateSource;
 use super::SkillActivationRecord;
-use crate::agent_collaboration::{MemoryPulseCandidate, MemoryPulseKind};
+use chrono::Utc;
+use memory::{
+    MaintenanceCandidate, MaintenanceCandidateAction, MaintenanceCandidateStatus,
+    SessionDomainEvent, SessionDomainRef, SessionDomainScope,
+};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SkillMemoryPolicy {
@@ -27,15 +32,18 @@ impl Default for SkillMemoryPolicy {
 pub fn memory_candidate_from_skill_activation(
     activation: &SkillActivationRecord,
     policy: &SkillMemoryPolicy,
-) -> Option<MemoryPulseCandidate> {
+) -> Option<MaintenanceCandidate> {
     if activation.candidates.is_empty() && policy.capture_no_match {
-        return Some(MemoryPulseCandidate {
-            kind: MemoryPulseKind::Remember,
-            content: format!(
+        return Some(maintenance_candidate(
+            MaintenanceCandidateAction::Remember,
+            "Review skill activation gap",
+            format!(
                 "skill activation gap; source=runtime_skill; query={}; no matching skill candidates",
                 activation.query
             ),
-        });
+            0.7,
+            activation,
+        ));
     }
 
     let selected_name = activation.selected.as_ref()?;
@@ -43,32 +51,116 @@ pub fn memory_candidate_from_skill_activation(
         candidate.name == *selected_name && candidate.source == RuntimeSkillCandidateSource::Profile
     })?;
     if policy.capture_low_confidence && selected.score <= policy.low_confidence_score {
-        return Some(MemoryPulseCandidate {
-            kind: MemoryPulseKind::Refresh,
-            content: format!(
+        return Some(maintenance_candidate(
+            MaintenanceCandidateAction::Refresh,
+            "Refresh low-confidence skill activation",
+            format!(
                 "low confidence skill activation; source=runtime_skill; query={}; selected={}; score={}; reasons={}",
                 activation.query,
                 selected.name,
                 selected.score,
                 selected.reasons.join(",")
             ),
-        });
+            0.55,
+            activation,
+        ));
     }
 
     if policy.capture_selected {
-        return Some(MemoryPulseCandidate {
-            kind: MemoryPulseKind::Refresh,
-            content: format!(
+        return Some(maintenance_candidate(
+            MaintenanceCandidateAction::Refresh,
+            "Refresh selected skill activation",
+            format!(
                 "skill selected for task; source=runtime_skill; query={}; selected={}; score={}; reasons={}",
                 activation.query,
                 selected.name,
                 selected.score,
                 selected.reasons.join(",")
             ),
-        });
+            0.6,
+            activation,
+        ));
     }
 
     None
+}
+
+/// Project a runtime-owned Skill memory candidate into the canonical session
+/// timeline. The candidate is derived from a durable activation decision; it
+/// is never accepted from a Surface payload.
+#[must_use]
+pub fn skill_memory_candidate_session_event(
+    activation: &SkillActivationRecord,
+    candidate: &MaintenanceCandidate,
+    sequence: usize,
+) -> Option<SessionDomainEvent> {
+    let selected = activation.selected.as_deref()?.trim();
+    if selected.is_empty() {
+        return None;
+    }
+    let mut event = SessionDomainEvent::new(
+        activation.session_id.clone(),
+        sequence,
+        SessionDomainScope::Context,
+        "skill_memory_candidate",
+        serde_json::json!({
+            "source": "conversation_runtime.skill_memory_candidate",
+            "turn_index": activation.turn_index,
+            "query": activation.query,
+            "selected": selected,
+            "source_event": "skill_candidates",
+            "candidate": {
+                "id": candidate.id,
+                "kind": format!("{:?}", candidate.kind),
+                "status": format!("{:?}", candidate.status),
+                "summary": candidate.summary,
+                "content": candidate.reason,
+                "confidence": candidate.confidence,
+                "source": candidate.source,
+                "source_ref": candidate.source_ref,
+            }
+        }),
+        now_ms(),
+    );
+    event.refs.push(SessionDomainRef {
+        ref_type: "skill".to_string(),
+        id: selected.to_string(),
+        label: Some("memory_candidate_source".to_string()),
+    });
+    Some(event)
+}
+
+fn maintenance_candidate(
+    action: MaintenanceCandidateAction,
+    summary: &str,
+    reason: String,
+    confidence: f32,
+    activation: &SkillActivationRecord,
+) -> MaintenanceCandidate {
+    let now = Utc::now();
+    MaintenanceCandidate {
+        id: Uuid::new_v4().to_string(),
+        kind: action.candidate_kind(),
+        status: MaintenanceCandidateStatus::Open,
+        entry_ids: Vec::new(),
+        summary: summary.to_string(),
+        reason: format!("memory_action={}; {reason}", action.as_str()),
+        confidence,
+        source: Some("runtime_skill".to_string()),
+        source_ref: Some(format!(
+            "skill_activation:{}:{}",
+            activation.session_id, activation.turn_index
+        )),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[cfg(test)]
@@ -84,8 +176,19 @@ mod tests {
             memory_candidate_from_skill_activation(&activation, &SkillMemoryPolicy::default())
                 .unwrap();
 
-        assert_eq!(candidate.kind, MemoryPulseKind::Remember);
-        assert!(candidate.content.contains("skill activation gap"));
+        assert_eq!(
+            candidate.kind,
+            memory::MaintenanceCandidateKind::RelationshipRefresh
+        );
+        assert_eq!(candidate.status, MaintenanceCandidateStatus::Open);
+        assert!(candidate.entry_ids.is_empty());
+        assert_eq!(candidate.source.as_deref(), Some("runtime_skill"));
+        assert_eq!(
+            candidate.source_ref.as_deref(),
+            Some("skill_activation:s1:1")
+        );
+        assert!(candidate.reason.contains("memory_action=remember"));
+        assert!(candidate.reason.contains("skill activation gap"));
     }
 
     #[test]
@@ -107,8 +210,14 @@ mod tests {
             memory_candidate_from_skill_activation(&activation, &SkillMemoryPolicy::default())
                 .unwrap();
 
-        assert_eq!(candidate.kind, MemoryPulseKind::Refresh);
-        assert!(candidate.content.contains("selected=release"));
+        assert_eq!(
+            candidate.kind,
+            memory::MaintenanceCandidateKind::RelationshipRefresh
+        );
+        assert_eq!(candidate.status, MaintenanceCandidateStatus::Open);
+        assert!(candidate.entry_ids.is_empty());
+        assert!(candidate.reason.contains("memory_action=refresh"));
+        assert!(candidate.reason.contains("selected=release"));
     }
 
     #[test]
@@ -130,5 +239,42 @@ mod tests {
             memory_candidate_from_skill_activation(&activation, &SkillMemoryPolicy::default());
 
         assert!(candidate.is_none());
+    }
+
+    #[test]
+    fn selected_runtime_skill_candidate_projects_to_session_evidence() {
+        let activation = SkillActivationRecord::new(
+            "s1",
+            4,
+            "prepare release",
+            vec![RuntimeSkillCandidate {
+                name: "release".to_string(),
+                score: 12,
+                reasons: vec!["name:release".to_string()],
+                path: None,
+                source: RuntimeSkillCandidateSource::Profile,
+            }],
+        );
+        let candidate =
+            memory_candidate_from_skill_activation(&activation, &SkillMemoryPolicy::default())
+                .expect("selected runtime skill produces a memory candidate");
+
+        let event = skill_memory_candidate_session_event(&activation, &candidate, 9)
+            .expect("selected skill has session evidence");
+
+        assert_eq!(event.kind, "skill_memory_candidate");
+        assert_eq!(
+            event.payload["source"],
+            "conversation_runtime.skill_memory_candidate"
+        );
+        assert_eq!(event.payload["selected"], "release");
+        assert!(event.payload["candidate"]["content"]
+            .as_str()
+            .expect("candidate content")
+            .contains("source=runtime_skill"));
+        assert!(event
+            .refs
+            .iter()
+            .any(|reference| reference.ref_type == "skill" && reference.id == "release"));
     }
 }

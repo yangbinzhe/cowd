@@ -9,7 +9,7 @@ use runtime::{ConfigLoader, McpServerManager, ToolError};
 use serde_json::json;
 use tools::{permissions::PermissionMode as ToolPermissionMode, RuntimeToolDefinition};
 
-pub(crate) type GatewayToolRegistry = tools::GlobalToolRegistry;
+pub(crate) type GatewayToolRegistry = tools::ToolCatalog;
 pub(crate) type RuntimePluginStateBuildOutput = (
     Option<Arc<Mutex<RuntimeMcpState>>>,
     Vec<RuntimeToolDefinition>,
@@ -22,11 +22,198 @@ pub(crate) struct RuntimeBootstrapState {
     pub(crate) mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
 }
 
+impl RuntimeBootstrapState {
+    pub(crate) fn tool_host_snapshot(&self) -> tools::ToolHostSnapshot {
+        let mcp = self.mcp_state.as_ref().map(|state| {
+            Arc::new(BootstrapMcpService {
+                state: Arc::clone(state),
+            }) as Arc<dyn mcp::McpService>
+        });
+        tools::ToolHostSnapshot::new(
+            Arc::new(self.tool_registry.clone()),
+            Arc::new(tools::lsp_client::LspRegistry::new()),
+            mcp,
+        )
+    }
+}
+
+#[derive(Clone)]
+struct BootstrapMcpService {
+    state: Arc<Mutex<RuntimeMcpState>>,
+}
+
+impl mcp::McpService for BootstrapMcpService {
+    fn list_servers(&self) -> Result<Vec<mcp::McpServerProjection>, mcp::McpServiceError> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pending = state
+            .pending_servers
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut names = state.server_names();
+        names.extend(pending.iter().cloned());
+        names.sort();
+        names.dedup();
+        Ok(names
+            .into_iter()
+            .map(|name| mcp::McpServerProjection {
+                enabled: true,
+                status: if pending.contains(&name) {
+                    "error"
+                } else {
+                    "connected"
+                }
+                .to_string(),
+                name,
+                transport: mcp::McpTransportKind::ManagedProxy,
+                auth_state: None,
+            })
+            .collect())
+    }
+
+    fn server(&self, name: &str) -> Result<mcp::McpServerProjection, mcp::McpServiceError> {
+        self.list_servers()?
+            .into_iter()
+            .find(|server| server.name == name)
+            .ok_or_else(|| mcp::McpServiceError::NotFound(name.to_string()))
+    }
+
+    fn health(&self) -> Result<serde_json::Value, mcp::McpServiceError> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(json!({
+            "ok": state.pending_servers.is_empty(),
+            "pending_servers": state.pending_servers(),
+            "degraded": state.degraded_report(),
+        }))
+    }
+
+    fn reload_config(&self) -> Result<serde_json::Value, mcp::McpServiceError> {
+        Ok(json!({
+            "ok": false,
+            "status": "snapshot_pinned",
+            "hint": "reload through the Gateway runtime configuration owner"
+        }))
+    }
+
+    fn list_tools(
+        &self,
+        server: Option<&str>,
+    ) -> Result<Vec<mcp::McpToolProjection>, mcp::McpServiceError> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(state
+            .tool_definitions
+            .iter()
+            .filter_map(|tool| {
+                let (tool_server, raw_name) = tool
+                    .qualified_name
+                    .strip_prefix("mcp__")?
+                    .split_once("__")?;
+                if server.is_some_and(|requested| requested != tool_server) {
+                    return None;
+                }
+                Some(mcp::McpToolProjection {
+                    server: tool_server.to_string(),
+                    name: raw_name.to_string(),
+                    description: tool.tool.description.clone(),
+                    input_schema: tool.tool.input_schema.clone().unwrap_or_else(|| json!({})),
+                })
+            })
+            .collect())
+    }
+
+    fn list_resources(
+        &self,
+        server: Option<&str>,
+    ) -> Result<Vec<mcp::McpResourceProjection>, mcp::McpServiceError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let names = server.map_or_else(|| state.server_names(), |name| vec![name.to_string()]);
+        let mut resources = Vec::new();
+        for name in names {
+            let output = state
+                .list_resources_for_server(&name)
+                .map_err(|error| mcp::McpServiceError::Request(error.to_string()))?;
+            let value: serde_json::Value = serde_json::from_str(&output)
+                .map_err(|error| mcp::McpServiceError::Request(error.to_string()))?;
+            for resource in value["resources"].as_array().into_iter().flatten() {
+                resources.push(mcp::McpResourceProjection {
+                    server: name.clone(),
+                    uri: resource["uri"].as_str().unwrap_or_default().to_string(),
+                    name: resource["name"].as_str().map(str::to_string),
+                    mime_type: resource["mimeType"]
+                        .as_str()
+                        .or_else(|| resource["mime_type"].as_str())
+                        .map(str::to_string),
+                    content: None,
+                });
+            }
+        }
+        Ok(resources)
+    }
+
+    fn read_resource(
+        &self,
+        server: &str,
+        uri: &str,
+    ) -> Result<mcp::McpResourceProjection, mcp::McpServiceError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let output = state
+            .read_resource(server, uri)
+            .map_err(|error| mcp::McpServiceError::Request(error.to_string()))?;
+        let value = serde_json::from_str(&output)
+            .map_err(|error| mcp::McpServiceError::Request(error.to_string()))?;
+        Ok(mcp::McpResourceProjection {
+            server: server.to_string(),
+            uri: uri.to_string(),
+            name: None,
+            mime_type: None,
+            content: Some(value),
+        })
+    }
+
+    fn call_tool(
+        &self,
+        request: mcp::McpToolCallRequest,
+    ) -> Result<mcp::McpToolCallReceipt, mcp::McpServiceError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let qualified_name = format!("mcp__{}__{}", request.server, request.tool);
+        let output = state
+            .call_tool(&qualified_name, Some(request.input))
+            .map_err(|error| mcp::McpServiceError::Request(error.to_string()))?;
+        let output = serde_json::from_str(&output)
+            .map_err(|error| mcp::McpServiceError::Request(error.to_string()))?;
+        Ok(mcp::McpToolCallReceipt {
+            server: request.server,
+            tool: request.tool,
+            ok: true,
+            output,
+        })
+    }
+}
+
 pub(crate) struct RuntimeMcpState {
     runtime: tokio::runtime::Runtime,
     manager: McpServerManager,
     pending_servers: Vec<String>,
     degraded_report: Option<runtime::McpDegradedReport>,
+    tool_definitions: Vec<runtime::ManagedMcpTool>,
 }
 
 pub(crate) fn assemble_runtime_state() -> Result<RuntimeBootstrapState, Box<dyn std::error::Error>>
@@ -214,6 +401,7 @@ impl RuntimeMcpState {
                 manager,
                 pending_servers,
                 degraded_report,
+                tool_definitions: discovery.tools.clone(),
             },
             discovery,
         )))
@@ -353,9 +541,44 @@ fn assemble_mcp_tool_state(
 fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
     vec![
         RuntimeToolDefinition {
+            name: "runtime_config_view".to_string(),
+            description: Some(
+                "Return a read-only, redacted view of the active model route, context window, permission mode, provider protocol, and runtime policy. Use only when configuration or provider behavior is relevant; secrets, headers, environment values, and configuration paths are never returned.".to_string(),
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "detail": {
+                        "type": "string",
+                        "enum": ["summary", "providers", "policy"],
+                        "description": "Optional focused projection. Defaults to summary."
+                    }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: ToolPermissionMode::ReadOnly,
+        },
+        RuntimeToolDefinition {
+            name: "runtime_resource_capabilities".to_string(),
+            description: Some(
+                "Query a bounded, current capability projection for an attached resource type. Use this only after an attachment is relevant and a narrower parser, skill, plugin, MCP resource, or local command is needed. Returned names are discovery candidates, not proof that inspection succeeded.".to_string(),
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "resource_kind": { "type": "string", "enum": ["image", "audio", "video", "pdf", "text", "markdown", "csv", "document", "archive", "code", "binary", "unknown"] },
+                    "mime": { "type": "string" },
+                    "intent": { "type": "string" }
+                },
+                "required": ["resource_kind", "intent"],
+                "additionalProperties": false
+            }),
+            required_permission: ToolPermissionMode::ReadOnly,
+        },
+        RuntimeToolDefinition {
             name: "runtime_capabilities".to_string(),
             description: Some(
-                "Return Cowd runtime capability guidance, execution modes, evidence planning, batch/parallel tool advice, and orchestration suggestions for the current task.".to_string(),
+                "Return Cowd runtime capability guidance, execution patterns, evidence planning, batch/parallel tool advice, and orchestration suggestions for the current task.".to_string(),
             ),
             input_schema: json!({
                 "type": "object",
@@ -365,7 +588,7 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
                     "profile": { "type": "string" },
                     "detail": {
                         "type": "string",
-                        "enum": ["summary", "execution_modes", "team_templates", "agent_catalog", "orchestration_options", "budget_controls", "policy_gates"]
+                        "enum": ["summary", "execution_patterns", "team_templates", "agent_catalog", "orchestration_options", "runtime_action_contract", "capability_catalog", "action_selection", "budget_controls", "policy_gates"]
                     }
                 },
                 "required": ["intent"],
@@ -376,7 +599,7 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
         RuntimeToolDefinition {
             name: "runtime_orchestrate".to_string(),
             description: Some(
-                "Submit a controlled runtime orchestration request. Use plan_only first for complex work; runtime validates policy, risk, budget, and permissions before execution.".to_string(),
+                "Submit a controlled stateful runtime orchestration request. Executable lifecycle actions create runtime-owned graph receipts; dispatch_session creates a typed cross-session handoff graph. Deliberation/reflexion return strategy packets; risk_gate returns an approval packet. Use runtime_capabilities for read-only planning first.".to_string(),
             ),
             input_schema: json!({
                 "type": "object",
@@ -386,8 +609,13 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
                         "type": "string",
                         "description": "Optional in gateway/API sessions because Cowd auto-binds the active session_id. Required only for detached/offline runtime_orchestrate calls."
                     },
+                    "target_session_id": {
+                        "type": "string",
+                        "description": "Required only for dispatch_session; the source is session_id."
+                    },
                     "action": {
                         "type": "string",
+                        "description": "executable_lifecycle: request_team, request_subagent, request_verification, request_background_review, dispatch_session; executable_tool_dag: request_parallel_tools, request_rewoo_evidence; strategy_packet: request_deliberation, request_reflexion_retry; approval_packet: request_risk_gate",
                         "enum": [
                             "plan_only",
                             "request_team",
@@ -399,11 +627,14 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
                             "request_reflexion_retry",
                             "request_background_review",
                             "request_risk_gate",
-                            "request_session_link"
+                            "dispatch_session"
                         ]
                     },
                     "reason": { "type": "string" },
-                    "template_hint": { "type": "string" },
+                    "template_hint": {
+                        "type": "string",
+                        "description": "Optional published builtin Team template path such as cowd/parallel-research-synthesis. Choose only the high-level template; Runtime resolves its immutable roles, cardinalities, dependencies, and focus partitions. Do not attempt to provide role ids or a graph in this tool call."
+                    },
                     "capabilities": { "type": "array", "items": { "type": "string" } },
                     "evidence_refs": { "type": "array", "items": { "type": "string" } },
                     "surface": { "type": "string" },
@@ -419,6 +650,23 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
                     }
                 },
                 "required": ["intent"],
+                "additionalProperties": false
+            }),
+            required_permission: ToolPermissionMode::WorkspaceWrite,
+        },
+        RuntimeToolDefinition {
+            name: "evidence_retrieve".to_string(),
+            description: Some(
+                "Retrieve selected chunks from an immutable tool evidence reference returned by a prior tool receipt. Use a focused query when the raw result is large.".to_string(),
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "evidence_ref": { "type": "string", "description": "tool:// evidence reference from a prior receipt" },
+                    "query": { "type": "string", "description": "Optional FTS query; omit to read the first chunks" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 16 }
+                },
+                "required": ["evidence_ref"],
                 "additionalProperties": false
             }),
             required_permission: ToolPermissionMode::ReadOnly,
@@ -544,5 +792,15 @@ mod tests {
         assert!(capability_tool.input_schema["properties"]["detail"]["enum"]
             .as_array()
             .is_some_and(|items| items.iter().any(|item| item == "budget_controls")));
+
+        let evidence_tool = tools
+            .iter()
+            .find(|tool| tool.name == "evidence_retrieve")
+            .expect("evidence retrieval tool");
+        assert_eq!(
+            evidence_tool.required_permission,
+            ToolPermissionMode::ReadOnly
+        );
+        assert_eq!(evidence_tool.input_schema["required"][0], "evidence_ref");
     }
 }

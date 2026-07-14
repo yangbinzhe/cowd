@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
 //! Integration tests for [`memory::project_scope`].
 //!
 //! Tests project registration, idempotent re-registration, active-project

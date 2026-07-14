@@ -14,6 +14,12 @@ CONFIG_HOME="$TMP_DIR/config"
 HOME_DIR="$TMP_DIR/home"
 LOG="$TMP_DIR/gateway.log"
 FAILED=0
+API_TOKEN="skill-surface-$$_credential"
+AUTH_BROKER_BIN="${COWD_AUTH_BROKER_BIN:-$TARGET_ROOT/debug/cowd-auth-broker}"
+
+curl() {
+  command curl -H "Authorization: Bearer $API_TOKEN" "$@"
+}
 
 cleanup() {
   if [[ "$FAILED" == "1" && "${COWD_SKILL_SURFACE_KEEP_TMP:-}" == "1" ]]; then
@@ -46,8 +52,19 @@ on_error() {
 }
 trap on_error ERR
 
+capture_json() {
+  local name="$1"
+  shift
+  curl -fsS "$@" | tee "$TMP_DIR/$name.json"
+}
+
 if ! command -v tmux >/dev/null 2>&1; then
   echo "tmux is required for skill surface scenario" >&2
+  exit 1
+fi
+
+if [[ ! -x "$AUTH_BROKER_BIN" ]]; then
+  echo "cowd-auth-broker is required at $AUTH_BROKER_BIN" >&2
   exit 1
 fi
 
@@ -88,7 +105,8 @@ gateway:
       host: "127.0.0.1"
       port: $PORT
       auth:
-        enabled: false
+        enabled: true
+        token: "$API_TOKEN"
 EOF
 cp "$CONFIG_HOME/config.yaml" "$HOME_DIR/.cowd/config.yaml"
 cp "$CONFIG_HOME/config.yaml" "$WORKDIR/.cowd/config.yaml"
@@ -96,6 +114,7 @@ cp "$CONFIG_HOME/config.yaml" "$WORKDIR/.cowd/config.yaml"
 tmux new-session -d -s "$SESSION" \
   "bash -lc \"cd '$WORKDIR' && \
     export COWD_CONFIG_HOME='$CONFIG_HOME' && \
+    export COWD_AUTH_BROKER_BIN='$AUTH_BROKER_BIN' && \
     export HOME='$HOME_DIR' && \
     '$BIN' gateway run >'$LOG' 2>&1\""
 
@@ -106,18 +125,18 @@ for _ in {1..100}; do
   sleep 0.25
 done
 
-curl -fsS "$BASE_URL/healthz" | rg -q '"gateway":"gateway-runtime-host"'
+capture_json healthz "$BASE_URL/healthz" | rg -q '"gateway":"gateway-runtime-host"'
 
-catalog_json="$(curl -fsS "$BASE_URL/api/skills/catalog")"
+catalog_json="$(capture_json skills_catalog "$BASE_URL/api/skills/catalog")"
 printf '%s' "$catalog_json" | rg -q '"kind":"skills.catalog"'
 printf '%s' "$catalog_json" | rg -q '"id":"mfg:supply-risk-analyst"'
 printf '%s' "$catalog_json" | rg -q '"id":"local:release"'
 
-mfg_catalog_json="$(curl -fsS "$BASE_URL/api/skills/catalog?scope=mfg")"
+mfg_catalog_json="$(capture_json skills_catalog_mfg "$BASE_URL/api/skills/catalog?scope=mfg")"
 printf '%s' "$mfg_catalog_json" | rg -q '"scope":"mfg"'
 printf '%s' "$mfg_catalog_json" | rg -vq '"scope":"local"'
 
-webui_projection_json="$(curl -fsS "$BASE_URL/api/skills/projection?surface=webui&query=prepare%20git%20release%20changelog")"
+webui_projection_json="$(capture_json skills_projection_webui "$BASE_URL/api/skills/projection?surface=webui&query=prepare%20git%20release%20changelog")"
 printf '%s' "$webui_projection_json" | rg -q '"kind":"skills.projection"'
 printf '%s' "$webui_projection_json" | rg -q '"surface":"webui"'
 printf '%s' "$webui_projection_json" | rg -q '"governance.bulk"'
@@ -125,52 +144,52 @@ printf '%s' "$webui_projection_json" | rg -F -q '"tool_fact_model":"tool.executi
 printf '%s' "$webui_projection_json" | rg -q '"kind":"skills.activation"'
 printf '%s' "$webui_projection_json" | rg -q '"name":"release"'
 
-tui_projection_json="$(curl -fsS "$BASE_URL/api/skills/projection?surface=tui")"
+tui_projection_json="$(capture_json skills_projection_tui "$BASE_URL/api/skills/projection?surface=tui")"
 printf '%s' "$tui_projection_json" | rg -q '"surface":"tui"'
 printf '%s' "$tui_projection_json" | rg -q '"skill.maintenance.evaluate"'
-printf '%s' "$tui_projection_json" | rg -vq '"run.watch"'
+printf '%s' "$tui_projection_json" | rg -q '"run.watch"'
 
-cli_projection_json="$(curl -fsS "$BASE_URL/api/skills/projection?surface=cli")"
+cli_projection_json="$(capture_json skills_projection_cli "$BASE_URL/api/skills/projection?surface=cli")"
 printf '%s' "$cli_projection_json" | rg -q '"surface":"cli"'
 printf '%s' "$cli_projection_json" | rg -q '"skill.import"'
 printf '%s' "$cli_projection_json" | rg -vq '"skill.run"'
 
-curl -fsS "$BASE_URL/api/skills/mfg:supply-risk-analyst" | rg -q '"kind":"skills.detail"'
-curl -fsS "$BASE_URL/api/skills/local:release" | rg -q '"kind":"skills.detail"'
+capture_json skill_detail_mfg "$BASE_URL/api/skills/mfg:supply-risk-analyst" | rg -q '"kind":"skills.detail"'
+capture_json skill_detail_local "$BASE_URL/api/skills/local:release" | rg -q '"kind":"skills.detail"'
 
-curl -fsS "$BASE_URL/api/apps/mfg/domain/server-manufacturing/seed" -X POST | rg -q '"metric_dependency_count":5'
+capture_json mfg_seed "$BASE_URL/api/apps/mfg/domain/server-manufacturing/seed" -X POST | rg -q '"metric_dependency_count":5'
 
-fact_json="$(curl -fsS "$BASE_URL/api/matrix/facts/ingest" \
+fact_json="$(capture_json matrix_fact_ingest "$BASE_URL/api/matrix/facts/ingest" \
   -H 'content-type: application/json' \
   -d '{"request_id":"skill-surface-fact","session_id":"session-skill-surface","facts":[{"fact_id":"fact-skill-surface-gpu-shortage","snapshot_id":"snapshot-skill-surface","fact_type":"supply.material_shortage","entity_refs":["component:gpu-a"],"metric_key":"material_shortage_risk","dimensions":{"week":"2026-W24"},"measures":{"short_qty":42},"source_ref":"connector:local.docs:gpu-shortage","confidence":0.91}]}')"
 attention_id="$(printf '%s' "$fact_json" | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data["attention"][0]["attention_id"])')"
 
-packet_json="$(curl -fsS "$BASE_URL/api/matrix/evidence/build" \
+packet_json="$(capture_json matrix_evidence_packet "$BASE_URL/api/matrix/evidence/build" \
   -H 'content-type: application/json' \
   -d "{\"request_id\":\"skill-surface-packet\",\"session_id\":\"session-skill-surface\",\"attention_id\":\"$attention_id\",\"problem_statement\":\"GPU shortage and delivery risk for server build plan\"}")"
 printf '%s' "$packet_json" | rg -q '"kind":"matrix.evidence.packet"'
 printf '%s' "$packet_json" | python3 -c 'import json,sys; data=json.load(sys.stdin); refs=(data.get("packet") or {}).get("source_refs") or []; assert refs, "expected structured evidence packet source_refs"; assert any((item.get("reference") or item.get("kind")) for item in refs), "expected structured evidence refs to carry reference or kind"'
 packet_id="$(printf '%s' "$packet_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["packet"]["packet_id"])')"
 
-incident_json="$(curl -fsS "$BASE_URL/api/apps/mfg/incidents" \
+incident_json="$(capture_json mfg_incident "$BASE_URL/api/apps/mfg/incidents" \
   -H 'content-type: application/json' \
   -d '{"request_id":"skill-surface-incident","session_id":"session-skill-surface","title":"GPU shortage and delivery risk","evidence_packet_id":"'"$packet_id"'"}')"
 printf '%s' "$incident_json" | rg -q '"kind":"mfg.incident"'
 incident_id="$(printf '%s' "$incident_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["incident"]["incident_id"])')"
 
-curl -fsS "$BASE_URL/api/apps/mfg/incidents/$incident_id/analyze" -X POST | rg -q '"kind":"mfg.operational_analysis"'
+capture_json mfg_incident_analysis "$BASE_URL/api/apps/mfg/incidents/$incident_id/analyze" -X POST | rg -q '"kind":"mfg.operational_analysis"'
 
-plan_json="$(curl -fsS "$BASE_URL/api/apps/mfg/incidents/$incident_id/skills/plan" \
+plan_json="$(capture_json mfg_skill_plan "$BASE_URL/api/apps/mfg/incidents/$incident_id/skills/plan" \
   -H 'content-type: application/json' \
   -d '{"request_id":"skill-surface-plan","session_id":"session-skill-surface","limit":3}')"
 printf '%s' "$plan_json" | rg -q '"kind":"mfg.skill.plan"'
 printf '%s' "$plan_json" | rg -q '"supply-risk-analyst"'
 
-run_json="$(curl -fsS "$BASE_URL/api/apps/mfg/incidents/$incident_id/skills/supply-risk-analyst/run" \
+run_json="$(capture_json mfg_skill_run "$BASE_URL/api/apps/mfg/incidents/$incident_id/skills/supply-risk-analyst/run" \
   -H 'content-type: application/json' \
   -d '{"request_id":"skill-surface-run","session_id":"session-skill-surface"}')"
 printf '%s' "$run_json" | rg -q '"kind":"mfg.skill.run"'
 skill_run_id="$(printf '%s' "$run_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["skill_run"]["execution_id"])')"
 
-curl -fsS "$BASE_URL/api/apps/mfg/incidents/$incident_id/skills" | rg -q '"kind":"mfg.skill.run_list"'
-curl -fsS "$BASE_URL/api/apps/mfg/skill-runs/$skill_run_id" | rg -q '"kind":"mfg.skill.run"'
+capture_json mfg_skill_runs "$BASE_URL/api/apps/mfg/incidents/$incident_id/skills" | rg -q '"kind":"mfg.skill.run_list"'
+capture_json mfg_skill_run_detail "$BASE_URL/api/apps/mfg/skill-runs/$skill_run_id" | rg -q '"kind":"mfg.skill.run"'

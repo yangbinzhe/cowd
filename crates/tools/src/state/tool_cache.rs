@@ -1,7 +1,7 @@
-//! Small in-process cache for idempotent read-only tool results.
+//! Workspace-scoped cache owned by [`crate::ToolHost`].
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -16,11 +16,19 @@ pub struct ToolCacheStats {
     pub scope_epochs: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CacheKey {
+    workspace_id: String,
+    scope: String,
+    tool_name: String,
+    canonical_input: String,
+    schema_revision: u64,
+}
+
 #[derive(Debug, Clone)]
 struct CacheEntry {
     epoch: u64,
     scope_epoch: u64,
-    scope: String,
     value: String,
 }
 
@@ -30,97 +38,120 @@ struct ToolCacheState {
     hits: usize,
     misses: usize,
     invalidations: usize,
-    entries: HashMap<String, CacheEntry>,
+    entries: HashMap<CacheKey, CacheEntry>,
     scope_epochs: HashMap<String, u64>,
 }
 
-static TOOL_CACHE: OnceLock<Mutex<ToolCacheState>> = OnceLock::new();
-
-#[must_use]
-pub fn get_cached_tool_result(tool_name: &str, input: &str) -> Option<String> {
-    get_cached_tool_result_scoped(tool_name, input, "*")
+/// One cache instance belongs to one `ToolHost`; it never reads process state.
+#[derive(Default)]
+pub struct ToolCache {
+    state: Mutex<ToolCacheState>,
 }
 
-#[must_use]
-pub fn get_cached_tool_result_scoped(tool_name: &str, input: &str, scope: &str) -> Option<String> {
-    let key = cache_key(tool_name, input);
-    let mut guard = cache_state().lock().ok()?;
-    let epoch = guard.epoch;
-    let scope_epoch = guard.scope_epoch(scope);
-    let value = guard
-        .entries
-        .get(&key)
-        .filter(|entry| entry.epoch == epoch)
-        .filter(|entry| entry.scope == scope && entry.scope_epoch == scope_epoch)
-        .map(|entry| entry.value.clone());
-    if value.is_some() {
-        guard.hits += 1;
-    } else {
-        guard.misses += 1;
-    }
-    value
-}
-
-pub fn put_cached_tool_result(tool_name: &str, input: &str, value: &str) {
-    put_cached_tool_result_scoped(tool_name, input, "*", value);
-}
-
-pub fn put_cached_tool_result_scoped(tool_name: &str, input: &str, scope: &str, value: &str) {
-    let key = cache_key(tool_name, input);
-    if let Ok(mut guard) = cache_state().lock() {
-        let epoch = guard.epoch;
-        let scope_epoch = guard.scope_epoch(scope);
-        guard.entries.insert(
-            key,
-            CacheEntry {
-                epoch,
-                scope_epoch,
-                scope: scope.to_string(),
-                value: value.to_string(),
-            },
-        );
+impl std::fmt::Debug for ToolCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ToolCache")
+            .field("stats", &self.stats())
+            .finish()
     }
 }
 
-pub fn invalidate_tool_cache_scope(scope: &str) {
-    if let Ok(mut guard) = cache_state().lock() {
-        let next_epoch = guard.scope_epoch(scope).saturating_add(1);
-        guard.scope_epochs.insert(scope.to_string(), next_epoch);
-        guard.invalidations = guard.invalidations.saturating_add(1);
+impl ToolCache {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
     }
-}
 
-pub fn invalidate_tool_cache() {
-    if let Ok(mut guard) = cache_state().lock() {
-        guard.epoch = guard.epoch.saturating_add(1);
-        guard.invalidations = guard.invalidations.saturating_add(1);
-        guard.entries.clear();
+    #[must_use]
+    pub fn get(
+        &self,
+        workspace_id: &str,
+        scope: &str,
+        tool_name: &str,
+        input: &str,
+        schema_revision: u64,
+    ) -> Option<String> {
+        let key = cache_key(workspace_id, scope, tool_name, input, schema_revision);
+        let mut state = self.state.lock().ok()?;
+        let epoch = state.epoch;
+        let scope_epoch = state.scope_epoch(scope);
+        let value = state
+            .entries
+            .get(&key)
+            .filter(|entry| entry.epoch == epoch && entry.scope_epoch == scope_epoch)
+            .map(|entry| entry.value.clone());
+        if value.is_some() {
+            state.hits = state.hits.saturating_add(1);
+        } else {
+            state.misses = state.misses.saturating_add(1);
+        }
+        value
     }
-}
 
-#[must_use]
-pub fn tool_cache_stats() -> ToolCacheStats {
-    let guard = cache_state()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    ToolCacheStats {
-        hits: guard.hits,
-        misses: guard.misses,
-        invalidations: guard.invalidations,
-        entries: guard.entries.len(),
-        epoch: guard.epoch,
-        scope_epochs: guard.scope_epochs.len(),
+    pub fn put(
+        &self,
+        workspace_id: &str,
+        scope: &str,
+        tool_name: &str,
+        input: &str,
+        schema_revision: u64,
+        value: &str,
+    ) {
+        let key = cache_key(workspace_id, scope, tool_name, input, schema_revision);
+        if let Ok(mut state) = self.state.lock() {
+            let epoch = state.epoch;
+            let scope_epoch = state.scope_epoch(scope);
+            state.entries.insert(
+                key,
+                CacheEntry {
+                    epoch,
+                    scope_epoch,
+                    value: value.to_string(),
+                },
+            );
+        }
     }
-}
 
-pub fn reset_tool_cache_for_tests() {
-    if let Ok(mut guard) = cache_state().lock() {
-        *guard = ToolCacheState::default();
+    pub fn invalidate_scope(&self, scope: &str) {
+        if let Ok(mut state) = self.state.lock() {
+            let next_epoch = state.scope_epoch(scope).saturating_add(1);
+            state.scope_epochs.insert(scope.to_string(), next_epoch);
+            state.invalidations = state.invalidations.saturating_add(1);
+        }
     }
-}
 
-fn cache_state() -> &'static Mutex<ToolCacheState> {
-    TOOL_CACHE.get_or_init(|| Mutex::new(ToolCacheState::default()))
+    pub fn invalidate_all(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.epoch = state.epoch.saturating_add(1);
+            state.invalidations = state.invalidations.saturating_add(1);
+            state.entries.clear();
+            state.scope_epochs.clear();
+        }
+    }
+
+    #[must_use]
+    pub fn stats(&self) -> ToolCacheStats {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ToolCacheStats {
+            hits: state.hits,
+            misses: state.misses,
+            invalidations: state.invalidations,
+            entries: state.entries.len(),
+            epoch: state.epoch,
+            scope_epochs: state.scope_epochs.len(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn reset(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            *state = ToolCacheState::default();
+        }
+    }
 }
 
 impl ToolCacheState {
@@ -129,12 +160,20 @@ impl ToolCacheState {
     }
 }
 
-fn cache_key(tool_name: &str, input: &str) -> String {
-    let cwd = std::env::current_dir()
-        .ok()
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    format!("v1::{cwd}::{tool_name}::{}", canonical_json(input))
+fn cache_key(
+    workspace_id: &str,
+    scope: &str,
+    tool_name: &str,
+    input: &str,
+    schema_revision: u64,
+) -> CacheKey {
+    CacheKey {
+        workspace_id: workspace_id.to_string(),
+        scope: scope.to_string(),
+        tool_name: tool_name.to_string(),
+        canonical_input: canonical_json(input),
+        schema_revision,
+    }
 }
 
 fn canonical_json(input: &str) -> String {
@@ -146,51 +185,46 @@ fn canonical_json(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
 
-    static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    #[test]
+    fn instances_and_workspaces_are_isolated() {
+        let first = ToolCache::new();
+        let second = ToolCache::new();
+        first.put(
+            "workspace-a",
+            "file:a",
+            "read_file",
+            r#"{"path":"a"}"#,
+            1,
+            "a",
+        );
 
-    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-        TEST_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        assert_eq!(
+            first
+                .get("workspace-a", "file:a", "read_file", r#"{"path":"a"}"#, 1)
+                .as_deref(),
+            Some("a")
+        );
+        assert!(first
+            .get("workspace-b", "file:a", "read_file", r#"{"path":"a"}"#, 1)
+            .is_none());
+        assert!(second
+            .get("workspace-a", "file:a", "read_file", r#"{"path":"a"}"#, 1)
+            .is_none());
     }
 
     #[test]
-    fn cache_hits_then_invalidates() {
-        let _guard = test_lock();
-        reset_tool_cache_for_tests();
-        assert!(get_cached_tool_result("read_file", r#"{"path":"a"}"#).is_none());
-        put_cached_tool_result("read_file", r#"{"path":"a"}"#, "ok");
-        assert_eq!(
-            get_cached_tool_result("read_file", r#"{"path":"a"}"#).as_deref(),
-            Some("ok")
-        );
-        invalidate_tool_cache();
-        assert!(get_cached_tool_result("read_file", r#"{"path":"a"}"#).is_none());
-        let stats = tool_cache_stats();
-        assert_eq!(stats.hits, 1);
-        assert_eq!(stats.invalidations, 1);
-    }
+    fn scope_and_schema_revision_invalidate_reads() {
+        let cache = ToolCache::new();
+        cache.put("workspace", "file:a", "read_file", "{}", 7, "old");
+        cache.invalidate_scope("file:a");
+        assert!(cache
+            .get("workspace", "file:a", "read_file", "{}", 7)
+            .is_none());
 
-    #[test]
-    fn scoped_cache_invalidation_only_expires_matching_scope() {
-        let _guard = test_lock();
-        reset_tool_cache_for_tests();
-        put_cached_tool_result_scoped("read_file", r#"{"path":"a"}"#, "file:a", "a");
-        put_cached_tool_result_scoped("read_file", r#"{"path":"b"}"#, "file:b", "b");
-
-        invalidate_tool_cache_scope("file:a");
-
-        assert!(get_cached_tool_result_scoped("read_file", r#"{"path":"a"}"#, "file:a").is_none());
-        assert_eq!(
-            get_cached_tool_result_scoped("read_file", r#"{"path":"b"}"#, "file:b").as_deref(),
-            Some("b")
-        );
-        let stats = tool_cache_stats();
-        assert_eq!(stats.invalidations, 1);
-        assert_eq!(stats.scope_epochs, 1);
-        reset_tool_cache_for_tests();
+        cache.put("workspace", "file:a", "read_file", "{}", 7, "old");
+        assert!(cache
+            .get("workspace", "file:a", "read_file", "{}", 8)
+            .is_none());
     }
 }

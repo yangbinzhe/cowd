@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use connector::{SourceReadPlan, SourceRecordBatch};
+use connector::{
+    SourceConnectorState, SourceEventBatch, SourceIncrementalRunRequest,
+    SourceIncrementalRunResult, SourceReadPlan, SourceRecordBatch, SourceWatermark,
+};
 use surface::{
     SurfaceActionRequest, SurfaceFrame, SurfaceOperationResult, SurfaceRegistrySnapshot,
     SurfaceRuntimeSnapshot, SurfaceSendRequest, SurfaceSupervisorEvent,
@@ -8,10 +11,12 @@ use surface::{
 use tokio::sync::broadcast;
 
 use crate::surface_host::{
-    SurfaceDeliveryEvent, SurfaceHost, SurfaceHostHealth, SurfaceInboxReceipt, SurfaceInboxRecord,
-    SurfaceMessageSnapshot, SurfaceOutboxRecord, SurfaceResourceSummary, SurfaceRouteSummary,
-    SurfaceStaticFile,
+    SurfaceDeliveryEvent, SurfaceDiscoveryReport, SurfaceHost, SurfaceHostHealth,
+    SurfaceInboxReceipt, SurfaceInboxRecord, SurfaceMessageSnapshot, SurfaceOutboxRecord,
+    SurfaceResourceSummary, SurfaceRouteSummary, SurfaceStaticFile, SurfaceTriggerEventReceipt,
+    SurfaceTriggerEventRecord,
 };
+use harness_contract::managed_agent::ManagedAgentTriggerEvent;
 
 use super::{service_envelope, ServiceEnvelope};
 
@@ -64,6 +69,21 @@ impl SurfaceService {
 
     pub(crate) fn runtime_snapshot(&self, id: &str) -> Option<SurfaceRuntimeSnapshot> {
         self.host.runtime_snapshot(id)
+    }
+
+    pub(crate) fn set_configs(
+        &self,
+        configs: std::collections::BTreeMap<String, serde_json::Value>,
+    ) {
+        self.host.set_configs(configs);
+    }
+
+    pub(crate) fn set_webui_static_resource(&self, dir: Option<&std::path::Path>) {
+        self.host.set_webui_static_resource(dir);
+    }
+
+    pub(crate) async fn reload_manifests(&self) -> SurfaceDiscoveryReport {
+        self.host.reload_manifests().await
     }
 
     pub(crate) fn has_surface(&self, id: &str) -> bool {
@@ -150,6 +170,51 @@ impl SurfaceService {
         self.host.mark_inbox_failed(idempotency_key, error)
     }
 
+    pub(crate) fn record_trigger_event_received(
+        &self,
+        surface: &str,
+        event_type: &str,
+        trigger: &ManagedAgentTriggerEvent,
+        payload: &serde_json::Value,
+    ) -> Result<SurfaceTriggerEventReceipt, String> {
+        self.host
+            .record_trigger_event_received(surface, event_type, trigger, payload)
+    }
+
+    pub(crate) fn mark_trigger_event_dispatching(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<SurfaceTriggerEventRecord>, String> {
+        self.host.mark_trigger_event_dispatching(idempotency_key)
+    }
+
+    pub(crate) fn mark_trigger_event_accepted(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<SurfaceTriggerEventRecord, String> {
+        self.host.mark_trigger_event_accepted(idempotency_key)
+    }
+
+    pub(crate) fn mark_trigger_event_failed(
+        &self,
+        idempotency_key: &str,
+        error: impl Into<String>,
+    ) -> Result<SurfaceTriggerEventRecord, String> {
+        self.host.mark_trigger_event_failed(idempotency_key, error)
+    }
+
+    pub(crate) fn retry_trigger_event(
+        &self,
+        surface: &str,
+        idempotency_key: &str,
+    ) -> Result<SurfaceTriggerEventRecord, String> {
+        self.host.retry_trigger_event(surface, idempotency_key)
+    }
+
+    pub(crate) fn due_trigger_event_retries(&self) -> Vec<SurfaceTriggerEventRecord> {
+        self.host.due_trigger_event_retries()
+    }
+
     pub(crate) fn inbox(&self, surface: &str) -> Vec<SurfaceInboxRecord> {
         self.host.inbox(surface)
     }
@@ -158,12 +223,48 @@ impl SurfaceService {
         self.host.outbox(surface)
     }
 
+    pub(crate) fn trigger_events(&self, surface: &str) -> Vec<SurfaceTriggerEventRecord> {
+        self.host.trigger_events(surface)
+    }
+
+    pub(crate) fn all_inbox(&self) -> Vec<SurfaceInboxRecord> {
+        self.host.all_inbox()
+    }
+
+    pub(crate) fn all_outbox(&self) -> Vec<SurfaceOutboxRecord> {
+        self.host.all_outbox()
+    }
+
     pub(crate) fn delivery_events(&self, surface: &str) -> Vec<SurfaceDeliveryEvent> {
         self.host.delivery_events(surface)
     }
 
     pub(crate) fn message_snapshot(&self, surface: &str) -> SurfaceMessageSnapshot {
         self.host.message_snapshot(surface)
+    }
+
+    pub(crate) fn message_store_root(&self) -> std::path::PathBuf {
+        self.host.message_store_root().to_path_buf()
+    }
+
+    pub(crate) fn archive_dead_letters(
+        &self,
+        surface: &str,
+        older_than_ms: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<SurfaceOutboxRecord>, String> {
+        self.host
+            .archive_dead_letters(surface, older_than_ms, limit)
+    }
+
+    pub(crate) fn purge_archived_events(
+        &self,
+        surface: &str,
+        older_than_ms: Option<i64>,
+        limit: usize,
+    ) -> Result<usize, String> {
+        self.host
+            .purge_archived_events(surface, older_than_ms, limit)
     }
 
     pub(crate) fn replay_inbox_message(
@@ -238,6 +339,106 @@ impl SurfaceService {
             ));
         }
         Ok(batch)
+    }
+
+    pub(crate) async fn source_state(
+        &self,
+        adapter_id: &str,
+    ) -> Result<SourceConnectorState, String> {
+        let surface = source_connector_surface_id(adapter_id);
+        let result = self
+            .action(SurfaceActionRequest {
+                surface: surface.clone(),
+                action: "source.state".to_string(),
+                payload: serde_json::json!({ "adapter_id": adapter_id }),
+            })
+            .await?;
+        let payload = self.source_action_payload(&surface, result)?;
+        serde_json::from_value::<SourceConnectorState>(
+            payload
+                .get("state")
+                .cloned()
+                .unwrap_or_else(|| payload.clone()),
+        )
+        .map_err(|error| format!("source connector `{surface}` returned invalid state: {error}"))
+    }
+
+    pub(crate) async fn source_incremental_run(
+        &self,
+        request: &SourceIncrementalRunRequest,
+    ) -> Result<SourceIncrementalRunResult, String> {
+        let surface = source_connector_surface_id(&request.adapter_id);
+        let result = self
+            .action(SurfaceActionRequest {
+                surface: surface.clone(),
+                action: "source.incremental.run".to_string(),
+                payload: serde_json::json!({ "request": request }),
+            })
+            .await?;
+        let payload = self.source_action_payload(&surface, result)?;
+        serde_json::from_value::<SourceIncrementalRunResult>(payload).map_err(|error| {
+            format!("source connector `{surface}` returned invalid incremental result: {error}")
+        })
+    }
+
+    pub(crate) async fn source_event_poll(
+        &self,
+        adapter_id: &str,
+        payload: serde_json::Value,
+    ) -> Result<SourceEventBatch, String> {
+        let surface = source_connector_surface_id(adapter_id);
+        let result = self
+            .action(SurfaceActionRequest {
+                surface: surface.clone(),
+                action: "source.event.poll".to_string(),
+                payload,
+            })
+            .await?;
+        let payload = self.source_action_payload(&surface, result)?;
+        serde_json::from_value::<SourceEventBatch>(payload).map_err(|error| {
+            format!("source connector `{surface}` returned invalid event batch: {error}")
+        })
+    }
+
+    pub(crate) async fn commit_source_watermark(
+        &self,
+        adapter_id: &str,
+        watermark: &SourceWatermark,
+    ) -> Result<SourceWatermark, String> {
+        let surface = source_connector_surface_id(adapter_id);
+        let result = self
+            .action(SurfaceActionRequest {
+                surface: surface.clone(),
+                action: "source.watermark.commit".to_string(),
+                payload: serde_json::json!({ "watermark": watermark }),
+            })
+            .await?;
+        let payload = self.source_action_payload(&surface, result)?;
+        serde_json::from_value::<SourceWatermark>(
+            payload
+                .get("watermark")
+                .cloned()
+                .unwrap_or_else(|| payload.clone()),
+        )
+        .map_err(|error| {
+            format!("source connector `{surface}` returned invalid committed watermark: {error}")
+        })
+    }
+
+    fn source_action_payload(
+        &self,
+        surface: &str,
+        result: SurfaceOperationResult,
+    ) -> Result<serde_json::Value, String> {
+        if let Some(error) = result.error {
+            return Err(format!(
+                "source connector `{surface}` failed: {}",
+                error.message
+            ));
+        }
+        result
+            .payload
+            .ok_or_else(|| format!("source connector `{surface}` returned no payload"))
     }
 
     pub(crate) async fn callback(

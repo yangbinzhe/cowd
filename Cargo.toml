@@ -2,6 +2,7 @@
 members = [
     "crates/harness-contract",
     "crates/app-mfg",
+    "crates/auth-broker",
     "crates/approval",
     "crates/cli",
     "crates/fact-kernel",
@@ -16,6 +17,7 @@ members = [
     "crates/provider",
     "crates/connector",
     "crates/runtime",
+    "crates/sandbox-launcher",
     "crates/session",
     "crates/skill/service",
     "crates/storage",
@@ -27,6 +29,7 @@ resolver = "2"
 default-members = [
     "crates/harness-contract",
     "crates/app-mfg",
+    "crates/auth-broker",
     "crates/approval",
     "crates/cli",
     "crates/fact-kernel",
@@ -41,6 +44,7 @@ default-members = [
     "crates/provider",
     "crates/connector",
     "crates/runtime",
+    "crates/sandbox-launcher",
     "crates/session",
     "crates/skill/service",
     "crates/storage",
@@ -49,7 +53,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.9.438"
+version = "0.9.483"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -60,8 +64,10 @@ serde_json = "1"
 serde_yaml = "0.9"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+cron = "0.12"
 tracing = "0.1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "stream", "rustls-tls"] }
 uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
 memory = { path = "crates/memory" }

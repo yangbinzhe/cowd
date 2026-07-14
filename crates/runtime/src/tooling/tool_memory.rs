@@ -1,7 +1,9 @@
 //! Policy-gated conversion from tool invocation facts to memory candidates.
 
-use crate::agent_collaboration::{MemoryPulseCandidate, MemoryPulseKind};
 use crate::tool_invocation::{ToolFailureKind, ToolInvocationRecord, ToolInvocationStatus};
+use chrono::Utc;
+use memory::{MaintenanceCandidate, MaintenanceCandidateAction, MaintenanceCandidateStatus};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ToolMemoryCandidatePolicy {
@@ -24,12 +26,15 @@ impl Default for ToolMemoryCandidatePolicy {
 pub fn memory_candidate_from_tool_invocation(
     invocation: &ToolInvocationRecord,
     policy: &ToolMemoryCandidatePolicy,
-) -> Option<MemoryPulseCandidate> {
+) -> Option<MaintenanceCandidate> {
     if policy.capture_failures && is_memory_worthy_failure(invocation.failure_kind) {
-        return Some(MemoryPulseCandidate {
-            kind: MemoryPulseKind::Remember,
-            content: format_candidate_content("tool failure pattern", invocation),
-        });
+        return Some(maintenance_candidate(
+            MaintenanceCandidateAction::Remember,
+            "Review tool failure pattern",
+            format_candidate_content("tool failure pattern", invocation),
+            0.7,
+            invocation.evidence_reference(),
+        ));
     }
 
     let is_slow_success = invocation.status == ToolInvocationStatus::Completed
@@ -37,13 +42,39 @@ pub fn memory_candidate_from_tool_invocation(
             .duration_ms
             .is_some_and(|duration_ms| duration_ms >= policy.slow_tool_ms);
     if policy.capture_slow_tools && is_slow_success {
-        return Some(MemoryPulseCandidate {
-            kind: MemoryPulseKind::Refresh,
-            content: format_candidate_content("slow tool observation", invocation),
-        });
+        return Some(maintenance_candidate(
+            MaintenanceCandidateAction::Refresh,
+            "Refresh slow tool observation",
+            format_candidate_content("slow tool observation", invocation),
+            0.6,
+            invocation.evidence_reference(),
+        ));
     }
 
     None
+}
+
+fn maintenance_candidate(
+    action: MaintenanceCandidateAction,
+    summary: &str,
+    reason: String,
+    confidence: f32,
+    source_ref: String,
+) -> MaintenanceCandidate {
+    let now = Utc::now();
+    MaintenanceCandidate {
+        id: Uuid::new_v4().to_string(),
+        kind: action.candidate_kind(),
+        status: MaintenanceCandidateStatus::Open,
+        entry_ids: Vec::new(),
+        summary: summary.to_string(),
+        reason: format!("memory_action={}; {reason}", action.as_str()),
+        confidence,
+        source: Some("tool_invocation".to_string()),
+        source_ref: Some(source_ref),
+        created_at: now,
+        updated_at: now,
+    }
 }
 
 fn is_memory_worthy_failure(kind: Option<ToolFailureKind>) -> bool {
@@ -110,10 +141,21 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(candidate.kind, MemoryPulseKind::Remember);
-        assert!(candidate.content.contains("tool failure pattern"));
-        assert!(candidate.content.contains("tool=bash"));
-        assert!(!candidate.content.contains("test failed"));
+        assert_eq!(
+            candidate.kind,
+            memory::MaintenanceCandidateKind::RelationshipRefresh
+        );
+        assert_eq!(candidate.status, MaintenanceCandidateStatus::Open);
+        assert!(candidate.entry_ids.is_empty());
+        assert_eq!(candidate.source.as_deref(), Some("tool_invocation"));
+        assert_eq!(
+            candidate.source_ref.as_deref(),
+            Some(invocation.invocation_id.as_str())
+        );
+        assert!(candidate.reason.contains("memory_action=remember"));
+        assert!(candidate.reason.contains("tool failure pattern"));
+        assert!(candidate.reason.contains("tool=bash"));
+        assert!(!candidate.reason.contains("test failed"));
     }
 
     #[test]
@@ -135,8 +177,14 @@ mod tests {
 
         let candidate = memory_candidate_from_tool_invocation(&invocation, &policy).unwrap();
 
-        assert_eq!(candidate.kind, MemoryPulseKind::Refresh);
-        assert!(candidate.content.contains("slow tool observation"));
-        assert!(candidate.content.contains("duration 30ms"));
+        assert_eq!(
+            candidate.kind,
+            memory::MaintenanceCandidateKind::RelationshipRefresh
+        );
+        assert_eq!(candidate.status, MaintenanceCandidateStatus::Open);
+        assert!(candidate.entry_ids.is_empty());
+        assert!(candidate.reason.contains("memory_action=refresh"));
+        assert!(candidate.reason.contains("slow tool observation"));
+        assert!(candidate.reason.contains("duration 30ms"));
     }
 }

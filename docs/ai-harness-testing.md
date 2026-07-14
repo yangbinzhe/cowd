@@ -86,6 +86,16 @@ Modes:
 - `routing`: simple/complex/high-risk route behavior
 - `all-light`: all of the above
 
+Optional live tuning:
+
+- `COWD_AI_HARNESS_LIVE_TIMEOUT`: outer timeout for the selected live lane.
+- `COWD_AI_HARNESS_LIVE_MAX_TOKENS`: minimum `max_tokens` per live probe.
+
+The live provider probe uses a wider default output budget for OpenAI-compatible
+reasoning models such as DeepSeek, Qwen, Step, and GLM. This avoids false
+failures where a real model spends the tiny fixed budget before emitting the
+strict JSON body.
+
 ## Full Deep Verification
 
 ```bash

@@ -2,20 +2,24 @@
 // Gateway foreground mode is a gateway process with an internal runtime host providing:
 //   - HTTP API (0.0.0.0:8642) + SSE streaming
 //   - Surface registry (builtin TUI/WebUI plus external JSONL sidecars)
-// Shared state: ActiveSessions, CognitiveContextManager, GlobalToolRegistry, SessionEventBus
+// Shared state: ActiveSessions, CognitiveContextManager, ToolCatalog, SessionEventBus
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
-use axum::http::HeaderValue;
-use axum::{http::StatusCode, response::IntoResponse};
+use async_trait::async_trait;
+use axum::{
+    http::{header, HeaderValue, StatusCode, Uri},
+    response::{IntoResponse, Response},
+};
 use serde::Serialize;
 use session::SessionLeaseRegistry;
 use tokio::net::TcpListener;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
-use tower_http::services::{ServeDir, ServeFile};
 
 use crate::api_routes;
 use crate::event_bus::SessionEventBus;
@@ -29,11 +33,139 @@ use memory::UnifiedSessionStore;
 use runtime::mcp_tool_bridge::{McpConnectionStatus, McpToolInfo, McpToolRegistry};
 use runtime::{McpServerManager, RuntimeConfig};
 use surface::SurfaceManifest;
-use tools::GlobalToolRegistry;
 
 use runtime::session_lifecycle::{
     EvictionPolicy, SessionLifecycleConfig, SessionLifecycleManager, SessionStatus,
 };
+
+pub mod config_reload;
+
+/// Gateway composition adapter for paired Definition evaluation. It owns no
+/// scoring, candidate state, or release decision: `harness-eval` loads and
+/// scores frozen scenarios while Runtime performs both real Agent runs.
+#[derive(Clone)]
+struct GatewayEvolutionScenarioExecutor {
+    runtime: Arc<OnceLock<Weak<runtime::RuntimeServices>>>,
+}
+
+#[async_trait]
+impl harness_eval::DefinitionEvolutionScenarioExecutor for GatewayEvolutionScenarioExecutor {
+    async fn execute(
+        &self,
+        candidate_id: &str,
+        scenario: &harness_contract::evaluation::EvaluationScenarioSpec,
+        sample_index: u32,
+    ) -> Result<
+        (
+            harness_contract::evaluation::EvaluationScenarioObservation,
+            harness_contract::evaluation::EvaluationScenarioObservation,
+        ),
+        String,
+    > {
+        let runtime = self
+            .runtime
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| "runtime_evaluation_executor_not_bound".to_string())?;
+        runtime
+            .execute_evolution_scenario(candidate_id, scenario, sample_index)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// Gateway owns the broker process lifetime but never opens its authority
+/// directory or signing key.  The child receives enrollment material once on
+/// stdin, then serves only its protected Unix socket.
+struct AuthBrokerProcess {
+    child: Child,
+    socket_path: PathBuf,
+}
+
+impl AuthBrokerProcess {
+    fn start(config_home: &Path, credential: &str) -> Result<Self, String> {
+        let root = config_home.join("auth-broker");
+        std::fs::create_dir_all(&root)
+            .map_err(|error| format!("failed to create auth broker root: {error}"))?;
+        let socket_path = auth_broker::BrokerClient::default_socket(&root);
+        if socket_path.exists() {
+            std::fs::remove_file(&socket_path)
+                .map_err(|error| format!("failed to remove stale auth broker socket: {error}"))?;
+        }
+        let binary = auth_broker_binary()?;
+        let mut child = Command::new(binary)
+            .arg("--root")
+            .arg(&root)
+            .arg("--socket")
+            .arg(&socket_path)
+            .arg("--credential-stdin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|error| format!("failed to spawn auth broker: {error}"))?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "auth broker stdin is unavailable".to_string())?;
+        stdin
+            .write_all(credential.as_bytes())
+            .and_then(|_| stdin.write_all(b"\n"))
+            .and_then(|_| stdin.flush())
+            .map_err(|error| format!("failed to enroll auth broker: {error}"))?;
+        drop(stdin);
+
+        let client = auth_broker::BrokerClient::new(&socket_path);
+        for _ in 0..40 {
+            if client.trust_metadata().is_ok() {
+                return Ok(Self { child, socket_path });
+            }
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|error| format!("failed to inspect auth broker: {error}"))?
+            {
+                return Err(format!("auth broker exited during startup: {status}"));
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        Err("auth broker did not become ready within one second".to_string())
+    }
+
+    fn shutdown(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+fn auth_broker_binary() -> Result<PathBuf, String> {
+    if let Some(path) = std::env::var_os("COWD_AUTH_BROKER_BIN") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(format!(
+            "COWD_AUTH_BROKER_BIN does not point to a file: {}",
+            path.display()
+        ));
+    }
+    let current = std::env::current_exe()
+        .map_err(|error| format!("failed to locate current executable: {error}"))?;
+    let binary_name = if cfg!(windows) {
+        "cowd-auth-broker.exe"
+    } else {
+        "cowd-auth-broker"
+    };
+    let candidate = current.with_file_name(binary_name);
+    candidate.is_file().then_some(candidate.clone()).ok_or_else(|| {
+        format!(
+            "auth broker binary is missing; install it beside Gateway or set COWD_AUTH_BROKER_BIN ({})",
+            candidate.display()
+        )
+    })
+}
 
 #[derive(Clone, Default)]
 struct RuntimeMcpServiceAdapter {
@@ -45,7 +177,7 @@ impl RuntimeMcpServiceAdapter {
         let registry = McpToolRegistry::new();
         for (server_name, server_config) in config.mcp().servers() {
             let single_server = BTreeMap::from([(server_name.clone(), server_config.clone())]);
-            let mut manager = McpServerManager::from_servers(&single_server);
+            let manager = McpServerManager::from_servers(&single_server);
             if manager.server_names().is_empty() {
                 registry.register_server(
                     server_name,
@@ -60,7 +192,20 @@ impl RuntimeMcpServiceAdapter {
                 continue;
             }
 
-            let discovery = manager.discover_tools_best_effort().await;
+            let discovery = match registry.install_server_manager(server_name, manager) {
+                Ok(discovery) => discovery,
+                Err(error) => {
+                    registry.register_server(
+                        server_name,
+                        McpConnectionStatus::Error,
+                        vec![],
+                        vec![],
+                        Some(error.clone()),
+                    );
+                    tracing::warn!(server = server_name, error = %error, "failed to start MCP server worker");
+                    continue;
+                }
+            };
             let failed = discovery
                 .failed_servers
                 .iter()
@@ -87,8 +232,10 @@ impl RuntimeMcpServiceAdapter {
                 vec![],
                 failed.map(|failure| failure.error.clone()),
             );
-            if status == McpConnectionStatus::Connected {
-                registry.set_server_manager(server_name, manager);
+            if status != McpConnectionStatus::Connected {
+                if let Err(error) = registry.remove_server_manager(server_name) {
+                    tracing::warn!(server = server_name, error = %error, "failed to stop unhealthy MCP server worker");
+                }
             }
         }
         Self { registry }
@@ -137,8 +284,9 @@ impl mcp::McpService for RuntimeMcpServiceAdapter {
     fn reload_config(&self) -> Result<serde_json::Value, mcp::McpServiceError> {
         Ok(serde_json::json!({
             "ok": true,
-            "status": "reload_not_required",
-            "source": "runtime_mcp_service_adapter"
+            "status": "managed_by_gateway_config_reload",
+            "source": "runtime_mcp_service_adapter",
+            "hint": "use POST /api/runtime/config/reload to rebuild the MCP service from current config"
         }))
     }
 
@@ -382,6 +530,26 @@ fn emit_startup_diagnostics(diagnostics: &StartupDiagnostics) {
     );
 }
 
+fn emit_execution_startup_recovery(report: &runtime::ExecutionStartupRecoveryReport) {
+    tracing::info!(
+        examined_graphs = report.examined_graphs,
+        recovered_graphs = report.recovered_graphs,
+        advanced_graphs = report.advanced_graphs,
+        terminal_graphs = report.terminal_graphs,
+        waiting_graphs = report.waiting_graphs,
+        blocked_graphs = report.blocked_graphs,
+        error_count = report.errors.len(),
+        "execution graph startup recovery completed"
+    );
+    for error in &report.errors {
+        tracing::warn!(
+            graph_id = %error.graph_id,
+            error = %error.error,
+            "execution graph startup recovery reported an error"
+        );
+    }
+}
+
 // ── PID file guard ──────────────────────────────────────────────
 
 struct PidFileGuard;
@@ -407,6 +575,61 @@ async fn webui_not_configured_handler() -> impl IntoResponse {
             "message": "WebUI static assets are optional; configure gateway.webui_dir with a directory containing index.html to enable browser UI.",
         })),
     )
+}
+
+async fn webui_static_fallback_handler(state: Arc<api_routes::AppState>, uri: Uri) -> Response {
+    match state.services.surface.resolve_static("webui", uri.path()) {
+        Ok(Some(file)) => match tokio::fs::read(&file.file_path).await {
+            Ok(bytes) => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, content_type_for_path(&file.file_path))],
+                bytes,
+            )
+                .into_response(),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("failed to read WebUI asset: {error}"),
+                })),
+            )
+                .into_response(),
+        },
+        Ok(None) => webui_not_configured_handler().await.into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "ok": false,
+                "error": error,
+            })),
+        )
+            .into_response(),
+    }
+}
+
+fn content_type_for_path(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "html" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "wasm" => "application/wasm",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        _ => "application/octet-stream",
+    }
 }
 
 fn build_cors_layer(explicit_origins: Vec<HeaderValue>) -> CorsLayer {
@@ -474,7 +697,6 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
 
     // 1. Initialise shared state
     let sessions = Arc::new(ActiveSessions::default());
-    let tools = Arc::new(GlobalToolRegistry::builtin());
 
     let cognitive: Option<Arc<CognitiveContextManager>> = match &config.memory_config {
         Some(mem_cfg) => {
@@ -492,9 +714,14 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
 
     let event_bus = SessionEventBus::new();
     let lease_registry = Arc::new(SessionLeaseRegistry::default());
-    let lifecycle_kernel = Arc::new(SessionLifecycleKernel::new());
-
-    let unified_store = crate::get_unified_store().ok().map(|s| Arc::new(s.clone()));
+    let unified_store = crate::get_unified_store().ok().map(Arc::new);
+    let lifecycle_kernel = Arc::new(
+        unified_store
+            .as_ref()
+            .map_or_else(SessionLifecycleKernel::new, |store| {
+                SessionLifecycleKernel::with_store(Arc::clone(store))
+            }),
+    );
     let session_kernel = Arc::new(SessionKernel::new(
         sessions.clone(),
         unified_store.clone(),
@@ -508,16 +735,48 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                 .map(|home| home.join(".cowd"))
         })
         .unwrap_or_else(|| std::path::PathBuf::from(".cowd"));
+    let mut auth_broker = config
+        .auth_token
+        .as_deref()
+        .map(|credential| AuthBrokerProcess::start(&approval_dir, credential))
+        .transpose()?;
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let runtime_config = runtime::ConfigLoader::new(&workspace_root, &approval_dir)
-        .load()
-        .unwrap_or_else(|error| {
+    let config_load =
+        runtime::ConfigLoader::new(&workspace_root, &approval_dir).load_with_diagnostics();
+    let (runtime_config, config_diagnostics) = config_load.map_or_else(
+        |error| {
             tracing::warn!(%error, "failed to load runtime config for MCP service");
-            RuntimeConfig::empty()
-        });
-    let mcp_service =
+            (RuntimeConfig::empty(), Vec::new())
+        },
+        |loaded| (loaded.config, loaded.diagnostics),
+    );
+    for diagnostic in &config_diagnostics {
+        tracing::warn!(code = %diagnostic.code, message = %diagnostic.message, "runtime config diagnostic");
+    }
+    let provider_registry = Arc::new(
+        runtime::ProviderRegistry::new(runtime_config.providers().clone()).map_err(|rejected| {
+            format!(
+                "failed to initialize provider registry: {}",
+                rejected.diagnostics.errors.join("; ")
+            )
+        })?,
+    );
+    let upgrade_coordinator = Arc::new(runtime::UpgradeCoordinator::new());
+    let runtime_bootstrap = crate::runtime_bootstrap::assemble_runtime_state_with_loader(
+        &workspace_root,
+        &runtime::ConfigLoader::new(&workspace_root, &approval_dir),
+        &runtime_config,
+    )
+    .map_err(|error| format!("failed to build tool catalog: {error}"))?;
+    let tools = Arc::new(runtime_bootstrap.tool_registry.clone());
+    if let Some(mcp_state) = runtime_bootstrap.mcp_state {
+        let _ = mcp_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .shutdown();
+    }
+    let runtime_mcp_service =
         Arc::new(RuntimeMcpServiceAdapter::from_runtime_config(&runtime_config).await);
-    let _ = tools::set_mcp_service(mcp_service);
     let storage_config = storage::StorageConfig::default_for_config_home(&approval_dir);
     storage_config
         .layout
@@ -603,14 +862,118 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         roots = ?surface_discovery.roots,
         "surface host discovery completed"
     );
-    let services = Arc::new(crate::services::GatewayServices::new_with_config_home(
-        Arc::new(RuntimeService::new(
+    let tool_host = Arc::new(tools::ToolHost::new(
+        format!("workspace:{}", workspace_root.display()),
+        &workspace_root,
+        tools::ToolHostSnapshot::new(
+            Arc::clone(&tools),
+            Arc::new(tools::lsp_client::LspRegistry::new()),
+            Some(runtime_mcp_service),
+        ),
+    ));
+    let gateway_runtime_tool_host = Arc::new(
+        crate::gateway_tool_executor::GatewayToolExecutor::from_tool_host(
+            None,
+            false,
+            Arc::clone(&tool_host),
+            None,
+        ),
+    );
+    let runtime_tool_host: Arc<dyn runtime::RuntimeExecutionHost> =
+        gateway_runtime_tool_host.clone();
+    // The evaluator is assembled at the composition root. Its weak Runtime
+    // reference is bound only after RuntimeServices exists, avoiding a
+    // dependency cycle while keeping Gateway out of scoring and release
+    // authorization.
+    let evolution_runtime = Arc::new(OnceLock::<Weak<runtime::RuntimeServices>>::new());
+    let evolution_scenarios = Arc::new(harness_eval::FileDefinitionEvolutionScenarioCatalog::new(
+        approval_dir.join("runtime").join("evolution-scenarios"),
+    ));
+    let evolution_executor = Arc::new(GatewayEvolutionScenarioExecutor {
+        runtime: Arc::clone(&evolution_runtime),
+    });
+    let evolution_eval_runner: Arc<dyn runtime::EvolutionEvalRunner> =
+        Arc::new(harness_eval::DefinitionEvolutionEvalRunner::new(Arc::new(
+            harness_eval::RuntimeDefinitionEvolutionWorkload::new(
+                evolution_scenarios,
+                evolution_executor,
+            ),
+        )));
+    let mut runtime_services_builder =
+        runtime::RuntimeServices::builder(&approval_dir, &workspace_root)
+            .provider_registry(Arc::clone(&provider_registry))
+            .tool_execution_host(runtime_tool_host)
+            .evolution_eval_runner(evolution_eval_runner)
+            .mission_schedule_policy(
+                runtime_config
+                    .runtime_control()
+                    .policy
+                    .mission_schedule
+                    .clone(),
+            );
+    let startup_skill_assets = crate::services::runtime_skill_assets_for_workspace(&workspace_root);
+    runtime_services_builder =
+        runtime_services_builder.skill_catalog(runtime::RuntimeSkillCatalog::new(
+            startup_skill_assets.profiles,
+            startup_skill_assets.prompt_assets,
+        ));
+    if let Some(memory_manager) = cognitive.as_ref() {
+        runtime_services_builder =
+            runtime_services_builder.memory_manager(Arc::clone(memory_manager));
+    }
+    if let Some(store) = unified_store.as_ref() {
+        runtime_services_builder = runtime_services_builder.session_store(Arc::clone(store));
+    }
+    let runtime_services = runtime_services_builder
+        .build()
+        .map_err(|error| format!("failed to initialize runtime services: {error}"))?;
+    evolution_runtime
+        .set(Arc::downgrade(&runtime_services))
+        .map_err(|_| "failed to bind Runtime evolution evaluation executor".to_string())?;
+    run_legacy_execution_startup_migration(&runtime_services, &approval_dir)?;
+    gateway_runtime_tool_host
+        .bind_runtime_services(Arc::clone(&runtime_services))
+        .map_err(|error| format!("failed to bind runtime services: {error}"))?;
+    let startup_recovery = runtime_services
+        .recover_execution_graphs_on_startup()
+        .await
+        .map_err(|error| format!("failed to recover execution graphs on startup: {error}"))?;
+    emit_execution_startup_recovery(&startup_recovery);
+    let runtime_service = Arc::new(
+        RuntimeService::new(
             sessions.clone(),
             lease_registry.clone(),
             session_kernel.clone(),
             lifecycle_kernel.clone(),
             started_at,
-        )),
+            Arc::clone(&provider_registry),
+            Arc::clone(&upgrade_coordinator),
+            runtime_services,
+        )
+        .map_err(|error| format!("failed to initialize runtime session bridge: {error}"))?
+        .with_tool_host(tool_host)
+        .with_approval_gate(approval_gate.clone()),
+    );
+    let session_bridge_store = unified_store.clone().ok_or_else(|| {
+        "durable UnifiedSessionStore is required for the Runtime session bridge".to_string()
+    })?;
+    let session_runtime_bridge = crate::session_runtime_bridge::SessionRuntimeBridge::start(
+        Arc::clone(&runtime_service),
+        session_bridge_store,
+        Arc::clone(&event_bus),
+    )?;
+    let weak_runtime_service = Arc::downgrade(&runtime_service);
+    upgrade_coordinator.register_collector(Arc::new(
+        runtime::ClosureUpgradeInventoryCollector::new("active_turns", move || {
+            weak_runtime_service.upgrade().map_or_else(
+                || Ok(Vec::new()),
+                |service| Ok(service.upgrade_turn_carriers()),
+            )
+        }),
+    ));
+    let config_reload = runtime_service.config_reload();
+    let services = Arc::new(crate::services::GatewayServices::new_with_config_home(
+        Arc::clone(&runtime_service),
         task_kernel.clone(),
         surface_host.clone(),
         cognitive.clone(),
@@ -633,6 +996,13 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         services: services,
         session_lease_registry: Some(lease_registry.clone()),
     });
+    let mission_schedule_timer = spawn_runtime_schedule_timer(runtime_service.runtime_services());
+    config_reload::initialize_config_reload_status(&config_reload, &app_state);
+    let _config_reload_watcher = config_reload::spawn_config_reload_watcher(
+        config_reload,
+        app_state.clone(),
+        Duration::from_secs(2),
+    );
     crate::surface_host::spawn_surface_ingress_dispatcher(app_state.clone());
 
     // 2. Build HTTP router (reuse api_routes + SSE)
@@ -655,14 +1025,20 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         let cors = build_cors_layer(cors_origin_values);
 
         let router = api_routes::api_router(app_state.clone());
-        if let (true, Some(webui_dir), Some(index_path)) = (
-            static_webui.available,
-            static_webui.configured_path.clone(),
-            static_webui.index_path.clone(),
-        ) {
-            tracing::info!(path = %webui_dir.display(), "serving configured WebUI assets");
+        let fallback_state = app_state.clone();
+        if static_webui.available {
+            tracing::info!(
+                path = %static_webui
+                    .configured_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+                "serving configured WebUI assets through dynamic surface fallback"
+            );
             router
-                .fallback_service(ServeDir::new(webui_dir).fallback(ServeFile::new(index_path)))
+                .fallback(move |uri: Uri| {
+                    webui_static_fallback_handler(fallback_state.clone(), uri)
+                })
                 .layer(cors)
         } else {
             tracing::info!(
@@ -670,7 +1046,11 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                 config_key = static_webui.config_key,
                 "WebUI assets disabled; serving gateway API only"
             );
-            router.fallback(webui_not_configured_handler).layer(cors)
+            router
+                .fallback(move |uri: Uri| {
+                    webui_static_fallback_handler(fallback_state.clone(), uri)
+                })
+                .layer(cors)
         }
     };
 
@@ -695,11 +1075,21 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         #[cfg(unix)]
         {
             let mut sigterm =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("failed to install SIGTERM handler");
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                    Ok(signal) => signal,
+                    Err(error) => {
+                        tracing::error!("failed to install SIGTERM handler: {error}");
+                        return;
+                    }
+                };
             let mut sigint =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-                    .expect("failed to install SIGINT handler");
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+                    Ok(signal) => signal,
+                    Err(error) => {
+                        tracing::error!("failed to install SIGINT handler: {error}");
+                        return;
+                    }
+                };
             tokio::select! {
                 _ = sigterm.recv() => tracing::info!("SIGTERM received, shutting down"),
                 _ = sigint.recv() => tracing::info!("SIGINT received, shutting down"),
@@ -707,10 +1097,10 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         }
         #[cfg(not(unix))]
         {
-            tokio::signal::ctrl_c()
-                .await
-                .expect("failed to install ctrl_c handler");
-            tracing::info!("shutdown signal received");
+            match tokio::signal::ctrl_c().await {
+                Ok(()) => tracing::info!("shutdown signal received"),
+                Err(error) => tracing::error!("failed to install ctrl_c handler: {error}"),
+            }
         }
     };
 
@@ -722,11 +1112,72 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     // ── Cleanup after shutdown ──
     tracing::info!("cleaning up runtime host resources...");
 
+    session_runtime_bridge.shutdown().await;
+    mission_schedule_timer.abort();
+    let _ = mission_schedule_timer.await;
+    if let Some(broker) = auth_broker.as_mut() {
+        broker.shutdown();
+    }
+
     tracing::info!("surface host shutdown complete");
 
     // PID file is cleaned up by PidFileGuard drop
     tracing::info!("runtime host shutdown complete");
     Ok(())
+}
+
+/// The timer is an event source only. It claims due Mission schedules and
+/// Managed Agent triggers, then sends both through Runtime's canonical
+/// Binding/graph paths. GraphRunner and the Managed Agent dispatcher retain
+/// ownership of all execution state, retry and terminal transitions.
+fn spawn_runtime_schedule_timer(
+    runtime_services: Arc<runtime::RuntimeServices>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let policy = runtime_services.mission_schedule_policy();
+            if policy.enabled {
+                if let Err(error) = runtime_services
+                    .dispatch_due_mission_schedules(epoch_millis())
+                    .await
+                {
+                    tracing::warn!(%error, "mission schedule timer dispatch failed");
+                }
+            }
+            // Managed Agents have independent trigger definitions. They do
+            // not become inert merely because Mission scheduling is disabled;
+            // the existing interval is only the shared wake-up cadence.
+            if let Err(error) = runtime_services
+                .dispatch_managed_agents("gateway-runtime-scheduler", 16)
+                .await
+            {
+                tracing::warn!(%error, "managed Agent timer dispatch failed");
+            }
+            tokio::time::sleep(Duration::from_millis(policy.tick_interval_ms)).await;
+        }
+    })
+}
+
+fn epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn run_legacy_execution_startup_migration(
+    runtime_services: &Arc<runtime::RuntimeServices>,
+    config_home: &std::path::Path,
+) -> Result<(), String> {
+    let migration_root = config_home.join("migrations");
+    let legacy_inventory = migration_root.join("v3-active-inventory.json");
+    let legacy_receipt = migration_root.join("v3-clean-shutdown-receipt.json");
+    if !legacy_inventory.exists() && !legacy_receipt.exists() {
+        return Ok(());
+    }
+    runtime_services
+        .import_legacy_execution_receipt(&legacy_receipt, env!("CARGO_PKG_VERSION"))
+        .map_err(|error| format!("legacy execution migration failed; startup blocked: {error}"))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -768,6 +1219,34 @@ mod tests {
         assert!(config.memory_config.is_none());
         assert!(config.surface_configs.is_empty());
         assert!(config.auth_token.is_none());
+    }
+
+    #[test]
+    fn startup_migration_missing_receipt_fails_and_blocks_runtime_mutation() {
+        let root = temp_webui_dir("migration-missing-receipt");
+        let workspace = root.join("workspace");
+        let config_home = root.join("home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(config_home.join("migrations")).unwrap();
+        fs::write(
+            config_home
+                .join("migrations")
+                .join("v3-active-inventory.json"),
+            b"{}",
+        )
+        .unwrap();
+        let services = runtime::RuntimeServices::builder(&config_home, &workspace)
+            .build()
+            .unwrap();
+
+        let result = run_legacy_execution_startup_migration(&services, &config_home);
+
+        assert!(result.unwrap_err().contains("startup blocked"));
+        assert!(matches!(
+            services.ensure_mutation_allowed(),
+            Err(runtime::RuntimeServicesError::UpgradeRecoveryRequired)
+        ));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]

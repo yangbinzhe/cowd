@@ -103,11 +103,11 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
 
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
+        let result = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("bash tokio rt");
-        let result = rt.block_on(execute_bash_async(input, sandbox_status, cwd));
+            .map_err(|error| io::Error::other(format!("build bash runtime: {error}")))
+            .and_then(|runtime| runtime.block_on(execute_bash_async(input, sandbox_status, cwd)));
         let _ = tx.send(result);
     });
     rx.recv()

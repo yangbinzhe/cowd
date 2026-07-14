@@ -39,8 +39,28 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route("/api/surfaces/:id/inbox", get(get_surface_inbox_handler))
         .route("/api/surfaces/:id/outbox", get(get_surface_outbox_handler))
         .route(
+            "/api/surfaces/:id/messages",
+            get(get_surface_messages_handler),
+        )
+        .route(
+            "/api/surfaces/:id/messages/archive",
+            post(archive_surface_messages_handler),
+        )
+        .route(
+            "/api/surfaces/:id/messages/purge-archived-events",
+            post(purge_archived_surface_messages_handler),
+        )
+        .route(
             "/api/surfaces/:id/deliveries",
             get(get_surface_deliveries_handler),
+        )
+        .route(
+            "/api/surfaces/:id/trigger-events",
+            get(get_surface_trigger_events_handler),
+        )
+        .route(
+            "/api/surfaces/:id/trigger-events/retry",
+            post(retry_surface_trigger_event_handler),
         )
         .route(
             "/api/surfaces/:id/inbox/:message_id/replay",
@@ -68,6 +88,8 @@ struct SurfaceSendBody {
     thread: Option<String>,
     text: String,
     #[serde(default)]
+    idempotency_key: Option<String>,
+    #[serde(default)]
     metadata: serde_json::Value,
 }
 
@@ -82,6 +104,31 @@ struct SurfaceActionBody {
 struct DeadLetterBody {
     #[serde(default = "default_dead_letter_reason")]
     reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArchiveMessagesBody {
+    #[serde(default)]
+    older_than_ms: Option<i64>,
+    #[serde(default = "default_archive_limit")]
+    limit: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct PurgeMessagesBody {
+    #[serde(default)]
+    older_than_ms: Option<i64>,
+    #[serde(default = "default_archive_limit")]
+    limit: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct TriggerEventRetryBody {
+    idempotency_key: String,
+}
+
+fn default_archive_limit() -> usize {
+    100
 }
 
 fn default_dead_letter_reason() -> String {
@@ -187,6 +234,37 @@ async fn get_surface_status_handler(
         "surface": normalized,
         "runtime": runtime,
         "events": events,
+    })))
+}
+
+async fn get_surface_trigger_events_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let surface = surface::normalize_surface_id(&id);
+    let events = state.services.surface.trigger_events(&surface);
+    Json(serde_json::json!({
+        "kind": "surface.trigger_events",
+        "surface": surface,
+        "events": events,
+    }))
+}
+
+async fn retry_surface_trigger_event_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<TriggerEventRetryBody>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let surface = surface::normalize_surface_id(&id);
+    let event = state
+        .services
+        .surface
+        .retry_trigger_event(&surface, &body.idempotency_key)
+        .map_err(|error| api_error(StatusCode::CONFLICT, error))?;
+    Ok(Json(serde_json::json!({
+        "kind": "surface.trigger_event.retry_accepted",
+        "surface": surface,
+        "event": event,
     })))
 }
 
@@ -298,6 +376,7 @@ async fn send_surface_handler(
             recipient: body.recipient,
             thread: body.thread,
             text: body.text,
+            idempotency_key: body.idempotency_key,
             metadata: body.metadata,
         })
         .await
@@ -358,6 +437,74 @@ async fn get_surface_outbox_handler(
         "surface": surface,
         "outbox": state.services.surface.outbox(&id),
         "dead_letters": state.services.surface.message_snapshot(&id).dead_letters,
+    })))
+}
+
+async fn get_surface_messages_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    if !state.services.surface.has_surface(&id) {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            format!("surface `{id}` not found"),
+        ));
+    }
+    let snapshot = state.services.surface.message_snapshot(&id);
+    Ok(Json(serde_json::json!({
+        "kind": "surface.messages",
+        "surface": surface::normalize_surface_id(&id),
+        "message_root": state.services.surface.message_store_root(),
+        "snapshot": snapshot,
+    })))
+}
+
+async fn archive_surface_messages_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<ArchiveMessagesBody>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    if !state.services.surface.has_surface(&id) {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            format!("surface `{id}` not found"),
+        ));
+    }
+    let archived = state
+        .services
+        .surface
+        .archive_dead_letters(&id, body.older_than_ms, body.limit.clamp(1, 1000))
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
+    Ok(Json(serde_json::json!({
+        "kind": "surface.messages.archive",
+        "surface": surface::normalize_surface_id(&id),
+        "archived_count": archived.len(),
+        "archived": archived,
+        "snapshot": state.services.surface.message_snapshot(&id),
+    })))
+}
+
+async fn purge_archived_surface_messages_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<PurgeMessagesBody>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    if !state.services.surface.has_surface(&id) {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            format!("surface `{id}` not found"),
+        ));
+    }
+    let purged_count = state
+        .services
+        .surface
+        .purge_archived_events(&id, body.older_than_ms, body.limit.clamp(1, 1000))
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
+    Ok(Json(serde_json::json!({
+        "kind": "surface.messages.purge_archived_events",
+        "surface": surface::normalize_surface_id(&id),
+        "purged_count": purged_count,
+        "snapshot": state.services.surface.message_snapshot(&id),
     })))
 }
 

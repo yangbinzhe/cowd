@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::MemoryError;
 use crate::maintenance::{MaintenanceCandidate, MaintenanceQueue};
-use crate::runtime_event::{RuntimeEvent, RuntimeEventScope};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryPulseConfig {
@@ -30,70 +29,6 @@ pub struct MemoryPulseBatch {
     pub source_event_id: String,
     pub source_ref: String,
     pub candidates: Vec<MaintenanceCandidate>,
-}
-
-impl MemoryPulseBatch {
-    pub fn from_runtime_event(event: &RuntimeEvent) -> Option<Self> {
-        let ai_kernel_task_trace = event.scope == RuntimeEventScope::Task
-            && event.kind == "runtime.harness_contract.trace";
-        if !ai_kernel_task_trace
-            && !matches!(
-                event.scope,
-                RuntimeEventScope::Agent | RuntimeEventScope::Workgraph | RuntimeEventScope::Memory
-            )
-        {
-            return None;
-        }
-
-        let candidates = runtime_event_candidates(event)?;
-        if candidates.is_empty() {
-            return None;
-        }
-
-        Some(Self {
-            source_event_id: event.event_id.clone(),
-            source_ref: runtime_event_source_ref(event),
-            candidates,
-        })
-    }
-}
-
-fn runtime_event_candidates(event: &RuntimeEvent) -> Option<Vec<MaintenanceCandidate>> {
-    let payload = &event.payload;
-    if let Some(value) = payload.get("maintenance_candidates") {
-        return serde_json::from_value::<Vec<MaintenanceCandidate>>(value.clone()).ok();
-    }
-    if let Some(value) = payload.get("candidates") {
-        return serde_json::from_value::<Vec<MaintenanceCandidate>>(value.clone()).ok();
-    }
-    if let Some(value) = payload
-        .get("review_packet")
-        .and_then(|packet| packet.get("maintenance_candidates"))
-    {
-        return serde_json::from_value::<Vec<MaintenanceCandidate>>(value.clone()).ok();
-    }
-    None
-}
-
-fn runtime_event_source_ref(event: &RuntimeEvent) -> String {
-    event
-        .refs
-        .iter()
-        .find(|reference| {
-            matches!(
-                reference.ref_type.as_str(),
-                "workgraph" | "collaboration_board" | "agent_runtime_run"
-            )
-        })
-        .map(|reference| reference.id.clone())
-        .or_else(|| {
-            event
-                .payload
-                .get("board_id")
-                .and_then(|value| value.as_str())
-                .map(ToString::to_string)
-        })
-        .unwrap_or_else(|| event.event_id.clone())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,7 +127,6 @@ mod tests {
     use crate::maintenance::{
         MaintenanceCandidateFilter, MaintenanceCandidateKind, MaintenanceCandidateStatus,
     };
-    use crate::runtime_event::{RuntimeEventScope, RuntimeRef};
 
     fn candidate(id: &str) -> MaintenanceCandidate {
         MaintenanceCandidate {
@@ -273,57 +207,6 @@ mod tests {
     }
 
     #[test]
-    fn memory_pulse_batch_extracts_candidates_from_runtime_event() {
-        let event = RuntimeEvent {
-            event_id: "event-memory".to_string(),
-            session_id: "session-1".to_string(),
-            sequence: 4,
-            scope: RuntimeEventScope::Workgraph,
-            kind: "agent.workgraph.reviewed".to_string(),
-            span_id: None,
-            parent_span_id: None,
-            correlation_id: None,
-            status: Some("completed".to_string()),
-            refs: vec![RuntimeRef {
-                ref_type: "collaboration_board".to_string(),
-                id: "board-1".to_string(),
-                label: None,
-            }],
-            payload: serde_json::json!({
-                "maintenance_candidates": [candidate("from-event")]
-            }),
-            created_at_ms: 42,
-        };
-
-        let batch = MemoryPulseBatch::from_runtime_event(&event).unwrap();
-        assert_eq!(batch.source_event_id, "event-memory");
-        assert_eq!(batch.source_ref, "board-1");
-        assert_eq!(batch.candidates.len(), 1);
-        assert_eq!(batch.candidates[0].id, "from-event");
-    }
-
-    #[test]
-    fn memory_pulse_batch_extracts_candidates_from_ai_kernel_task_trace() {
-        let mut ai_candidate = candidate("from-ai-growth");
-        ai_candidate.source = Some("ai_growth".to_string());
-        let event = RuntimeEvent::new(
-            "session-1",
-            8,
-            RuntimeEventScope::Task,
-            "runtime.harness_contract.trace",
-            serde_json::json!({
-                "maintenance_candidates": [ai_candidate]
-            }),
-            88,
-        );
-
-        let batch = MemoryPulseBatch::from_runtime_event(&event).unwrap();
-        assert_eq!(batch.source_event_id, event.event_id);
-        assert_eq!(batch.source_ref, event.event_id);
-        assert_eq!(batch.candidates[0].id, "from-ai-growth");
-    }
-
-    #[test]
     fn memory_pulse_preserves_ai_growth_candidate_source() {
         let mut ai_candidate = candidate("preserve-ai-source");
         ai_candidate.source = Some("ai_growth".to_string());
@@ -346,19 +229,5 @@ mod tests {
             queued[0].source_ref.as_deref(),
             Some("runtime:event:event-ai")
         );
-    }
-
-    #[test]
-    fn memory_pulse_batch_ignores_irrelevant_runtime_event() {
-        let event = RuntimeEvent::new(
-            "session-1",
-            7,
-            RuntimeEventScope::Tool,
-            "tool.completed",
-            serde_json::json!({"maintenance_candidates": [candidate("ignored")]}),
-            77,
-        );
-
-        assert!(MemoryPulseBatch::from_runtime_event(&event).is_none());
     }
 }

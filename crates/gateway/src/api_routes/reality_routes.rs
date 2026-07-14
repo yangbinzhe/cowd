@@ -46,6 +46,7 @@ async fn reality_status_handler(AxumState(state): AxumState<Arc<AppState>>) -> i
                 &state.services.matrix,
                 &state.services.growth,
                 &state.services.context,
+                &state.services.session,
                 &state.services.audit,
             )
             .await,
@@ -64,6 +65,7 @@ async fn reality_capabilities_handler(
             &state.services.matrix,
             &state.services.growth,
             &state.services.context,
+            &state.services.session,
             &state.services.audit,
         )
         .await;
@@ -375,6 +377,7 @@ async fn reality_governance_handler(
             &state.services.matrix,
             &state.services.growth,
             &state.services.context,
+            &state.services.session,
             &state.services.audit,
         )
         .await;

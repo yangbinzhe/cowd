@@ -15,6 +15,12 @@ HOME_DIR="$TMP_DIR/home"
 GATEWAY_LOG="$TMP_DIR/gateway.log"
 SESSION_ID="runtime-surface-session-$$"
 SCENARIO_API_KEY="${ANTHROPIC_API_KEY:-test-dummy-key-for-runtime-surface-scenario}"
+API_TOKEN="runtime-surface-$$_credential"
+AUTH_BROKER_BIN="${COWD_AUTH_BROKER_BIN:-$TARGET_ROOT/debug/cowd-auth-broker}"
+
+curl() {
+  command curl -H "Authorization: Bearer $API_TOKEN" "$@"
+}
 
 cleanup() {
   if [[ "$FAILED" == "1" && "${COWD_RUNTIME_SURFACE_KEEP_TMP:-}" == "1" ]]; then
@@ -75,6 +81,11 @@ if [[ ! -x "$BIN" ]]; then
   exit 1
 fi
 
+if [[ ! -x "$AUTH_BROKER_BIN" ]]; then
+  echo "cowd-auth-broker is required at $AUTH_BROKER_BIN" >&2
+  exit 1
+fi
+
 mkdir -p "$WORKDIR/.cowd" "$CONFIG_HOME" "$HOME_DIR/.cowd"
 
 cat >"$CONFIG_HOME/config.yaml" <<EOF
@@ -99,7 +110,8 @@ gateway:
       host: "127.0.0.1"
       port: $PORT
       auth:
-        enabled: false
+        enabled: true
+        token: "$API_TOKEN"
 EOF
 cp "$CONFIG_HOME/config.yaml" "$HOME_DIR/.cowd/config.yaml"
 cp "$CONFIG_HOME/config.yaml" "$WORKDIR/.cowd/config.yaml"
@@ -107,6 +119,7 @@ cp "$CONFIG_HOME/config.yaml" "$WORKDIR/.cowd/config.yaml"
 tmux new-session -d -s "$GATEWAY_SESSION" \
   "bash -lc \"cd '$WORKDIR' && \
     export COWD_CONFIG_HOME='$CONFIG_HOME' && \
+    export COWD_AUTH_BROKER_BIN='$AUTH_BROKER_BIN' && \
     export HOME='$HOME_DIR' && \
     '$BIN' gateway run >'$GATEWAY_LOG' 2>&1\""
 
@@ -124,7 +137,7 @@ curl -fsS "$BASE_URL/api/sessions/$SESSION_ID/ensure" \
   -d '{"model":"claude-sonnet-4-6"}' >"$TMP_DIR/ensure-session.json"
 curl -fsS "$BASE_URL/api/runtime/session-leases/acquire" \
   -H 'content-type: application/json' \
-  -d "{\"session_id\":\"$SESSION_ID\",\"owner\":\"script:runtime-surface-live\",\"mode\":\"collaborative\"}" \
+  -d "{\"session_id\":\"$SESSION_ID\",\"mode\":\"collaborative\"}" \
   >"$TMP_DIR/acquire-lease.json"
 python3 - "$TMP_DIR/acquire-lease.json" "$SESSION_ID" <<'PY'
 import json, sys

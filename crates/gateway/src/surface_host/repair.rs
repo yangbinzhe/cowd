@@ -79,6 +79,8 @@ pub(super) fn managed_actions(circuit_open: bool) -> Vec<SurfaceSupervisorAction
         return vec![
             SurfaceSupervisorAction::Repair,
             SurfaceSupervisorAction::HealthCheck,
+            SurfaceSupervisorAction::ArchiveDeadLetters,
+            SurfaceSupervisorAction::PurgeArchivedEvents,
         ];
     }
     vec![
@@ -87,6 +89,8 @@ pub(super) fn managed_actions(circuit_open: bool) -> Vec<SurfaceSupervisorAction
         SurfaceSupervisorAction::Restart,
         SurfaceSupervisorAction::Repair,
         SurfaceSupervisorAction::HealthCheck,
+        SurfaceSupervisorAction::ArchiveDeadLetters,
+        SurfaceSupervisorAction::PurgeArchivedEvents,
     ]
 }
 

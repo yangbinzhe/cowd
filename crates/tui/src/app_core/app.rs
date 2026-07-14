@@ -2,9 +2,10 @@
 use crate::layout::{build_default_layout, LayoutState, LayoutTree};
 use crate::runtime_control_store::{
     ApprovalSummary, ConnectorAccountSummary, ConnectorCapabilitySummary, ConnectorResourceSummary,
-    CowdKernelSummary, FactFlowSummary, MissionControlSummary, RealityCoreSummary,
-    RuntimeActionReceiptSummary, StructuredDataSummary, SurfaceEventSummary, SurfaceHealthSummary,
-    SurfaceSummary, TaskSummary,
+    CowdKernelSummary, FactFlowSummary, GatewayCapabilityContractSummary, MessageBindingSummary,
+    MessageConnectorSummary, MessageEndpointSummary, MessageRouteSummary, MissionControlSummary,
+    RealityCoreSummary, RuntimeActionReceiptSummary, StructuredDataSummary, SurfaceEventSummary,
+    SurfaceHealthSummary, SurfaceSummary, TaskSummary,
 };
 use crate::CowdEvent;
 use ratatui::widgets::{Block, Borders};
@@ -220,6 +221,10 @@ pub struct App {
     pub memory_total_entries: Option<usize>,
     pub memory_vector_count: Option<usize>,
     pub memory_layer_counts: [usize; 5],
+    pub memory_context_envelope_status: Option<String>,
+    pub memory_context_envelope_compression: Option<String>,
+    pub memory_context_envelope_used_ratio: Option<u64>,
+    pub memory_context_envelope_checkpoint: Option<String>,
 
     /// Reputation score of the currently selected agent (if any).
     pub selected_agent_reputation: Option<f64>,
@@ -270,8 +275,18 @@ pub struct App {
     pub gateway_surface_health: Option<SurfaceHealthSummary>,
     /// Recent surface events observed through Gateway SurfaceHost.
     pub gateway_surface_events: Vec<SurfaceEventSummary>,
+    /// Message connector readiness and runtime summaries observed through Gateway.
+    pub gateway_message_connectors: Vec<MessageConnectorSummary>,
+    /// Message endpoint directory observed through Gateway.
+    pub gateway_message_endpoints: Vec<MessageEndpointSummary>,
+    /// Message delivery routes observed through Gateway.
+    pub gateway_message_routes: Vec<MessageRouteSummary>,
+    /// Message conversation bindings observed through Gateway.
+    pub gateway_message_bindings: Vec<MessageBindingSummary>,
     /// Cowd kernel capability and release-gate summary observed through projection API.
     pub gateway_cowd_kernel: Option<CowdKernelSummary>,
+    /// Gateway-owned API capability contract summary observed through Gateway contract API.
+    pub gateway_capability_contract: Option<GatewayCapabilityContractSummary>,
     /// Structured data-plane summary observed through projection API.
     pub gateway_structured_data: Option<StructuredDataSummary>,
     /// Reality Core engine health observed through Gateway projection API.
@@ -289,7 +304,7 @@ pub struct App {
     /// Current runtime session lease mode for the attached TUI session.
     pub gateway_lease_mode: Option<String>,
 
-    pub scroll_offset: u16,
+    pub scroll_offset: usize,
     pub auto_scroll: bool,
 
     pub turn_active: bool,
@@ -300,7 +315,10 @@ pub struct App {
     pub context_window: u64,
     pub latest_context_envelope: Option<Value>,
     pub latest_runtime_policy: Option<crate::RuntimePolicyDecisionSummary>,
-    pub latest_workgraph_summary: Option<crate::RuntimeWorkGraphSummary>,
+    pub latest_execution_graph_summary: Option<crate::RuntimeExecutionGraphSummary>,
+    /// Canonical execution snapshot received from Gateway. This is the only
+    /// TUI source for graph lifecycle state; stream prose remains display-only.
+    pub latest_execution_projection: Option<crate::protocol::ExecutionProjection>,
     pub latest_run_projection: Option<Value>,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -312,7 +330,7 @@ pub struct App {
 
     pub cached_chat_lines: Vec<ratatui::text::Line<'static>>,
 
-    pub entry_line_counts: Vec<u16>,
+    pub entry_line_counts: Vec<usize>,
     pub lines_dirty: bool,
     last_built_line_count: usize,
 
@@ -324,7 +342,7 @@ pub struct App {
     pub search_current: usize,
     pub search_active: bool,
 
-    pub viewport_height: u16,
+    pub viewport_height: usize,
 
     pub help_visible: bool,
 
@@ -533,6 +551,10 @@ impl App {
             memory_total_entries: None,
             memory_vector_count: None,
             memory_layer_counts: [0; 5],
+            memory_context_envelope_status: None,
+            memory_context_envelope_compression: None,
+            memory_context_envelope_used_ratio: None,
+            memory_context_envelope_checkpoint: None,
 
             selected_agent_reputation: None,
             mcp_count: 0,
@@ -558,7 +580,12 @@ impl App {
             gateway_surfaces: Vec::new(),
             gateway_surface_health: None,
             gateway_surface_events: Vec::new(),
+            gateway_message_connectors: Vec::new(),
+            gateway_message_endpoints: Vec::new(),
+            gateway_message_routes: Vec::new(),
+            gateway_message_bindings: Vec::new(),
             gateway_cowd_kernel: None,
+            gateway_capability_contract: None,
             gateway_structured_data: None,
             gateway_reality_core: None,
             gateway_fact_flow: None,
@@ -579,7 +606,8 @@ impl App {
             context_window: 0,
             latest_context_envelope: None,
             latest_runtime_policy: None,
-            latest_workgraph_summary: None,
+            latest_execution_graph_summary: None,
+            latest_execution_projection: None,
             latest_run_projection: None,
             input_tokens: 0,
             output_tokens: 0,
@@ -638,6 +666,54 @@ impl App {
             }
         }
         self.latest_run_projection = Some(projection);
+        self.msg_version = self.msg_version.wrapping_add(1);
+    }
+
+    pub fn apply_execution_projection(&mut self, projection: crate::protocol::ExecutionProjection) {
+        let total_nodes = projection.graph.nodes.len();
+        let terminal_nodes = projection
+            .graph
+            .nodes
+            .iter()
+            .filter(|node| node.status.is_terminal())
+            .count();
+        let status = if projection.graph.nodes.iter().any(|node| {
+            matches!(
+                node.status,
+                harness_contract::execution_graph::ExecutionNodeStatus::Failed
+            )
+        }) {
+            "failed"
+        } else if total_nodes > 0 && terminal_nodes == total_nodes {
+            "terminal"
+        } else if projection.graph.nodes.iter().any(|node| {
+            matches!(
+                node.status,
+                harness_contract::execution_graph::ExecutionNodeStatus::WaitingExternal
+            )
+        }) {
+            "waiting_external"
+        } else {
+            "running"
+        };
+        self.latest_execution_graph_summary = Some(crate::RuntimeExecutionGraphSummary {
+            graph_id: Some(projection.execution_id.clone()),
+            board_id: None,
+            status: status.to_string(),
+            agent_tasks: projection.agents.len(),
+            child_executions: projection.child_executions.len(),
+            memory_candidates: projection.context.len(),
+            conflicts: projection
+                .interventions
+                .iter()
+                .filter(|item| item.status.as_deref() == Some("blocked"))
+                .count(),
+            completion_rate: (total_nodes > 0)
+                .then_some(terminal_nodes as f32 / total_nodes as f32),
+            synthesis_lift: None,
+            complementarity_score: None,
+        });
+        self.latest_execution_projection = Some(projection);
         self.msg_version = self.msg_version.wrapping_add(1);
     }
 
@@ -704,7 +780,10 @@ impl App {
                 start_index: start,
             });
         }
-        self.timeline_pages.back_mut().unwrap().entries.push(entry);
+        let Some(page) = self.timeline_pages.back_mut() else {
+            return;
+        };
+        page.entries.push(entry);
         self.total_entries += 1;
         self.soft_evict();
         self.hard_evict();
@@ -741,7 +820,7 @@ impl App {
             };
             let evict_count = front.entries.len();
 
-            let evicted_lines: u16 = if !self.entry_line_counts.is_empty() {
+            let evicted_lines: usize = if !self.entry_line_counts.is_empty() {
                 let count = evict_count.min(self.entry_line_counts.len());
                 self.entry_line_counts
                     .iter()
@@ -779,7 +858,7 @@ impl App {
             };
             let evict_count = front.entries.len();
 
-            let evicted_lines: u16 = if !self.entry_line_counts.is_empty() {
+            let evicted_lines: usize = if !self.entry_line_counts.is_empty() {
                 let count = evict_count.min(self.entry_line_counts.len());
                 self.entry_line_counts
                     .iter()
@@ -1082,18 +1161,18 @@ impl App {
     }
 
     pub fn scroll_to_entry(&mut self, entry_idx: usize) {
-        let vh = self.viewport_height.max(1) as usize;
+        let vh = self.viewport_height.max(1);
         let mut offset: usize = 0;
         for i in 0..entry_idx.min(self.entry_line_counts.len()) {
-            offset += self.entry_line_counts[i] as usize + 1;
+            offset += self.entry_line_counts[i] + 1;
         }
-        let entry_h = self.entry_line_counts.get(entry_idx).copied().unwrap_or(1) as usize;
+        let entry_h = self.entry_line_counts.get(entry_idx).copied().unwrap_or(1);
 
-        let scroll = self.scroll_offset as usize;
+        let scroll = self.scroll_offset;
         if offset < scroll {
-            self.scroll_offset = offset as u16;
+            self.scroll_offset = offset;
         } else if offset + entry_h > scroll + vh {
-            self.scroll_offset = offset.saturating_sub(vh.saturating_sub(entry_h)) as u16;
+            self.scroll_offset = offset.saturating_sub(vh.saturating_sub(entry_h));
         }
     }
 
@@ -1301,8 +1380,8 @@ impl App {
                 self.latest_runtime_policy = Some(summary);
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
-            CowdEvent::WorkGraphSummary { summary } => {
-                self.latest_workgraph_summary = Some(summary);
+            CowdEvent::ExecutionGraphSummary { summary } => {
+                self.latest_execution_graph_summary = Some(summary);
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
 
@@ -1312,7 +1391,8 @@ impl App {
                 self.streaming_received = false;
                 self.latest_context_envelope = None;
                 self.latest_runtime_policy = None;
-                self.latest_workgraph_summary = None;
+                self.latest_execution_graph_summary = None;
+                self.latest_execution_projection = None;
                 self.latest_run_projection = None;
                 self.thinking_id_counter = 0;
                 self.pre_turn_input = self.input_tokens;
@@ -1529,11 +1609,12 @@ mod tests {
             requires_review: true,
             signal_count: 3,
         });
-        app.latest_workgraph_summary = Some(crate::RuntimeWorkGraphSummary {
+        app.latest_execution_graph_summary = Some(crate::RuntimeExecutionGraphSummary {
             graph_id: Some("g".into()),
             board_id: Some("b".into()),
             status: "done".into(),
             agent_tasks: 1,
+            child_executions: 0,
             memory_candidates: 2,
             conflicts: 0,
             completion_rate: Some(1.0),
@@ -1546,7 +1627,7 @@ mod tests {
 
         assert!(app.latest_context_envelope.is_none());
         assert!(app.latest_runtime_policy.is_none());
-        assert!(app.latest_workgraph_summary.is_none());
+        assert!(app.latest_execution_graph_summary.is_none());
         assert!(app.latest_run_projection.is_none());
     }
 

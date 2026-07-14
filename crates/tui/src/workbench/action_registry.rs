@@ -72,14 +72,15 @@ pub fn registered_actions() -> Vec<WorkbenchAction> {
             action: Action::Execute("/config".into()),
         },
         WorkbenchAction {
-            id: "workbench.reload_providers",
+            id: "workbench.refresh_config_status",
             domain: "config",
-            label: "Reload Providers",
-            description: "Reload provider and model registry through Gateway",
-            risk: ActionRisk::Medium,
+            label: "Refresh Config Status",
+            description:
+                "Refresh effective config, providers, models, and Gateway hot-reload status",
+            risk: ActionRisk::Low,
             requires_confirmation: false,
             receipt_target: "config_panel",
-            action: Action::ReloadProviders,
+            action: Action::RefreshConfigStatus,
         },
         WorkbenchAction {
             id: "workbench.review_approvals",

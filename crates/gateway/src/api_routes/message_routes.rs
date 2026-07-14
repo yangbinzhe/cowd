@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeSet, VecDeque},
     convert::Infallible,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -6,40 +7,54 @@ use std::{
 
 use axum::{
     extract::{Path, Query, State as AxumState},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse,
     },
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use futures::{stream::Stream, StreamExt};
+use harness_contract::turn::{
+    InputRoutingDecision, InputSourceKind, SessionInputEnvelope, SessionInputId, TurnId,
+};
 use runtime::{ContextProfile, ResumeContextPacket, ResumeContextSource};
 use serde::Deserialize;
 use tokio::sync::mpsc;
-use tokio::sync::oneshot;
-use tokio::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::event_bus::SessionEventBus;
-use crate::runtime_service::{
-    RuntimeService, RuntimeTurnExecution, RuntimeTurnExecutionError, RuntimeTurnOptions,
-};
-use crate::services::SessionService;
 use crate::task_kernel::TaskRecord;
 
-use super::{
-    clear_active_turn_control, discard_active_turn_partial, record_active_turn_text_delta,
-    register_active_turn_control, register_active_turn_partial, take_active_turn_partial, AppState,
-    ErrorResponse,
-};
+use super::{AppState, ErrorResponse};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route(
             "/api/sessions/:id/messages",
             get(get_session_messages).post(send_message),
+        )
+        .route(
+            "/api/sessions/:id/input-projection",
+            get(get_session_input_projection),
+        )
+        .route(
+            "/api/sessions/:id/inputs",
+            get(get_session_input_projection),
+        )
+        .route("/api/sessions/:id/turn-inbox", get(get_turn_inbox))
+        .route(
+            "/api/sessions/:id/turns/:turn_id/inbox",
+            get(get_turn_inbox_by_path),
+        )
+        .route(
+            "/api/sessions/:id/inputs/:input_id/cancel",
+            post(cancel_session_input),
+        )
+        .route(
+            "/api/sessions/:id/inputs/:input_id/reclassify",
+            post(reclassify_session_input),
         )
         .route("/api/sessions/:id/stream", get(sse_stream_handler))
 }
@@ -49,6 +64,8 @@ struct SendMessageRequest {
     content: String,
     #[serde(default)]
     resource_ids: Vec<String>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -61,107 +78,38 @@ struct GetMessagesParams {
     limit: Option<usize>,
 }
 
+#[derive(Deserialize)]
+struct TurnInboxParams {
+    #[serde(default)]
+    turn_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SessionInputCancelRequest {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SessionInputReclassifyRequest {
+    decision: InputRoutingDecision,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SessionStreamQuery {
+    /// Exclusive Runtime commit cursor. `Last-Event-ID` takes precedence so
+    /// native EventSource reconnects need no client-specific query mutation.
+    #[serde(default)]
+    from_cursor: Option<u64>,
+}
+
 fn current_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TurnTimeoutClass {
-    Direct,
-    Standard,
-    Deep,
-}
-
-fn classify_turn_timeout_prompt(prompt: &str, profile: ContextProfile) -> TurnTimeoutClass {
-    if matches!(profile, ContextProfile::YoloGoal) {
-        return TurnTimeoutClass::Deep;
-    }
-
-    let lower = prompt.to_lowercase();
-    let deep_markers = [
-        "deep",
-        "architecture",
-        "refactor",
-        "multi-agent",
-        "what if",
-        "scenario",
-        "simulation",
-        "matrix",
-        "memory",
-        "harness",
-        "沉浸式",
-        "深度",
-        "架构",
-        "重构",
-        "全量",
-        "全盘",
-        "复杂",
-        "多agent",
-        "多 agent",
-        "跨session",
-        "跨 session",
-        "记忆",
-        "矩阵",
-        "推演",
-        "测试",
-        "验证",
-    ];
-    if prompt.chars().count() > 500
-        || prompt.lines().count() > 6
-        || deep_markers.iter().any(|marker| lower.contains(marker))
-    {
-        return TurnTimeoutClass::Deep;
-    }
-
-    let direct_markers = [
-        "what is",
-        "怎么写",
-        "解释",
-        "列出",
-        "总结",
-        "简单",
-        "快速",
-        "status",
-        "help",
-    ];
-    if prompt.chars().count() <= 160 && direct_markers.iter().any(|marker| lower.contains(marker)) {
-        return TurnTimeoutClass::Direct;
-    }
-
-    TurnTimeoutClass::Standard
-}
-
-fn turn_timeout_for_prompt(prompt: &str, profile: ContextProfile) -> Duration {
-    match classify_turn_timeout_prompt(prompt, profile) {
-        TurnTimeoutClass::Direct => Duration::from_secs(240),
-        TurnTimeoutClass::Standard => Duration::from_secs(480),
-        TurnTimeoutClass::Deep => Duration::from_secs(900),
-    }
-}
-
-fn turn_max_iterations_for_prompt(prompt: &str, profile: ContextProfile) -> usize {
-    match classify_turn_timeout_prompt(prompt, profile) {
-        TurnTimeoutClass::Direct => 12,
-        TurnTimeoutClass::Standard => 32,
-        TurnTimeoutClass::Deep => 64,
-    }
-}
-
-async fn append_session_timeline_event(
-    session_service: &SessionService,
-    session_id: &str,
-    event_type: &str,
-    payload: serde_json::Value,
-) {
-    if let Err(error) = session_service
-        .append_timeline_event(session_id, event_type, payload)
-        .await
-    {
-        tracing::warn!(%session_id, %event_type, error = %error, "failed to append session event");
-    }
 }
 
 pub(super) fn task_resume_context_packet(
@@ -218,7 +166,7 @@ pub(super) fn task_resume_context_packet(
         active_task,
         recent_decisions,
         blockers,
-        source: ResumeContextSource::TaskRegistry,
+        source: ResumeContextSource::ExecutionGraph,
     }
 }
 
@@ -288,222 +236,6 @@ pub(super) fn runtime_run_completed_payload(
     })
 }
 
-struct RuntimeTurnSink<'a> {
-    state: &'a AppState,
-    runtime_service: &'a RuntimeService,
-    event_bus: &'a SessionEventBus,
-}
-
-impl<'a> RuntimeTurnSink<'a> {
-    async fn complete(
-        &self,
-        session_id: &str,
-        run_id: &str,
-        profile: ContextProfile,
-        execution: RuntimeTurnExecution,
-        started_at_ms: u64,
-    ) -> serde_json::Value {
-        let summary = execution.summary;
-        let turn_id = execution.receipt.turn_id.to_string();
-        let context_turn_report = summary.context_turn_report.clone();
-        let final_text = summary
-            .assistant_messages
-            .last()
-            .map(|msg| {
-                msg.blocks
-                    .iter()
-                    .filter_map(|block| match block {
-                        runtime::ContentBlock::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("")
-            })
-            .unwrap_or_default();
-
-        let session_snapshot = self.runtime_service.session_snapshot(session_id).await;
-        let context_envelope_id = self
-            .runtime_service
-            .last_context_envelope(session_id)
-            .await
-            .map(|envelope| envelope.id);
-        let collaboration_result = self
-            .runtime_service
-            .take_collaboration_result(session_id)
-            .await;
-        if let Some(session_snapshot) = session_snapshot {
-            if let Err(e) = self
-                .runtime_service
-                .sync_session_snapshot(session_id, &session_snapshot)
-                .await
-            {
-                tracing::warn!(%session_id, error = %e, "failed to sync API session to SQLite");
-            }
-        }
-        if let Some(collaboration_result) = collaboration_result {
-            let memory_manager = self.state.services.memory.manager();
-            if let Err(e) = self
-                .state
-                .services
-                .session
-                .persist_workgraph_review(
-                    &collaboration_result.work_graph,
-                    &collaboration_result.review_packet,
-                    memory_manager.as_ref(),
-                )
-                .await
-            {
-                tracing::warn!(
-                    %session_id,
-                    error = %e,
-                    "failed to persist collaboration closed-loop runtime event"
-                );
-            }
-        }
-
-        let sse_data = serde_json::json!({
-            "type": "TurnComplete",
-            "session_id": session_id,
-            "turn_id": &turn_id,
-            "response": final_text,
-            "iterations": summary.iterations,
-            "model_telemetry": summary.model_telemetry.clone(),
-            "context_turn_report": context_turn_report.clone(),
-        });
-        self.event_bus
-            .broadcast(session_id, &sse_data.to_string())
-            .await;
-        append_session_timeline_event(
-            &self.state.services.session,
-            session_id,
-            "ContextTurnReport",
-            serde_json::json!({
-                "type": "ContextTurnReport",
-                "session_id": session_id,
-                "run_id": run_id,
-                "turn_id": &turn_id,
-                "model_telemetry": summary.model_telemetry.clone(),
-                "context_turn_report": context_turn_report.clone(),
-            }),
-        )
-        .await;
-        append_session_timeline_event(
-            &self.state.services.session,
-            session_id,
-            "RuntimeRun",
-            runtime_run_completed_payload(
-                session_id,
-                run_id,
-                Some(&turn_id),
-                profile,
-                "completed",
-                Some(summary.iterations),
-                context_envelope_id,
-                None,
-                started_at_ms,
-                current_time_ms(),
-            ),
-        )
-        .await;
-        discard_active_turn_partial(session_id, run_id);
-
-        serde_json::json!({
-            "session_id": session_id,
-            "turn_id": &turn_id,
-            "turn": execution.receipt,
-            "status": "complete",
-            "response": final_text,
-            "iterations": summary.iterations,
-            "model_telemetry": summary.model_telemetry,
-            "context_turn_report": context_turn_report,
-        })
-    }
-
-    async fn fail(
-        &self,
-        session_id: &str,
-        run_id: &str,
-        profile: ContextProfile,
-        status: StatusCode,
-        error: &RuntimeTurnExecutionError,
-        started_at_ms: u64,
-    ) -> String {
-        let error_msg = error.message();
-        if let Some(session_snapshot) = self.runtime_service.session_snapshot(session_id).await {
-            if let Err(e) = self
-                .runtime_service
-                .sync_session_snapshot(session_id, &session_snapshot)
-                .await
-            {
-                tracing::warn!(%session_id, error = %e, "failed to sync failed API session to SQLite");
-            }
-        }
-        let context_envelope_id = self
-            .runtime_service
-            .last_context_envelope(session_id)
-            .await
-            .map(|envelope| envelope.id);
-        let partial = take_active_turn_partial(session_id, run_id)
-            .filter(|partial| !partial.text.trim().is_empty());
-
-        let sse_data = serde_json::json!({
-            "type": "TurnError",
-            "session_id": session_id,
-            "run_id": run_id,
-            "error": error_msg,
-        });
-        self.event_bus
-            .broadcast(session_id, &sse_data.to_string())
-            .await;
-        if let Some(partial) = partial {
-            let partial_text = partial.text;
-            let partial_char_count = partial_text.chars().count();
-            let partial_json = serde_json::json!({
-                "type": "PartialAnswer",
-                "session_id": session_id,
-                "run_id": run_id,
-                "reason": error_msg,
-                "content": partial_text,
-                "char_count": partial_char_count,
-                "updated_at_ms": partial.updated_at_ms,
-            });
-            self.event_bus
-                .broadcast(session_id, &partial_json.to_string())
-                .await;
-            append_session_timeline_event(
-                &self.state.services.session,
-                session_id,
-                "PartialAnswer",
-                partial_json,
-            )
-            .await;
-        }
-        append_session_timeline_event(
-            &self.state.services.session,
-            session_id,
-            "RuntimeRun",
-            runtime_run_completed_payload(
-                session_id,
-                run_id,
-                None,
-                profile,
-                if status == StatusCode::REQUEST_TIMEOUT {
-                    "timeout"
-                } else {
-                    "failed"
-                },
-                None,
-                context_envelope_id,
-                Some(error_msg.clone()),
-                started_at_ms,
-                current_time_ms(),
-            ),
-        )
-        .await;
-        error_msg
-    }
-}
-
 async fn send_message(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
@@ -534,350 +266,273 @@ async fn send_message(
         resource_count = body.resource_ids.len(),
         "API message received"
     );
-    let runtime_content =
-        render_message_resource_context(&state.config_home, &body.content, &body.resource_ids);
+    let runtime_content = render_message_resource_context(
+        &state.config_home,
+        &state.services.resource_capability_index(),
+        &body.content,
+        &body.resource_ids,
+    );
 
     let session_id = id.clone();
     let event_bus = state.event_bus();
     let run_id = uuid::Uuid::new_v4().to_string();
-    let run_started_at_ms = current_time_ms();
-    let active_task = state.services.task.current().unwrap_or_default();
-    let active_task_id = active_task.as_ref().map(|task| task.id.clone());
-    let run_profile = if active_task.as_ref().is_some_and(|task| task.yolo_mode) {
-        ContextProfile::YoloGoal
-    } else {
-        ContextProfile::MainTurn
-    };
-    append_session_timeline_event(
-        &state.services.session,
-        &session_id,
-        "RuntimeRun",
-        runtime_run_started_payload(
-            &session_id,
-            &run_id,
-            run_profile,
-            &runtime_content,
-            run_started_at_ms,
-        ),
-    )
-    .await;
-
-    if let Some(mut rx) = runtime_service.cowd_event_receiver(&session_id).await {
-        let eb = event_bus.clone();
-        let sid = session_id.clone();
-        let session_service = state.services.session.clone();
-        let active_run_id = run_id.clone();
-        tokio::spawn(async move {
-            while let Ok(event) = rx.recv().await {
-                match event {
-                    runtime::CowdEvent::TextDelta { text } => {
-                        record_active_turn_text_delta(&sid, &active_run_id, &text);
-                        eb.text_delta(&sid, &text).await;
-                        append_session_timeline_event(
-                            &session_service,
-                            &sid,
-                            "TextDelta",
-                            serde_json::json!({"type":"TextDelta","run_id":active_run_id.clone(),"content":text}),
-                        )
-                        .await;
-                    }
-                    runtime::CowdEvent::ThinkingDelta { thinking } => {
-                        eb.thinking_delta(&sid, &thinking).await;
-                        append_session_timeline_event(
-                            &session_service,
-                            &sid,
-                            "ThinkingDelta",
-                            serde_json::json!({"type":"ThinkingDelta","run_id":active_run_id.clone(),"content":thinking}),
-                        )
-                        .await;
-                    }
-                    runtime::CowdEvent::ToolStart { id, name, preview } => {
-                        eb.tool_start(&sid, &id, &name).await;
-                        append_session_timeline_event(
-                            &session_service,
-                            &sid,
-                            "ToolStart",
-                            serde_json::json!({"type":"ToolStart","run_id":active_run_id.clone(),"id":id,"name":name,"preview":preview}),
-                        )
-                        .await;
-                    }
-                    runtime::CowdEvent::ToolProgress { id, name, progress } => {
-                        eb.tool_progress(&sid, &id, &name, &progress).await;
-                        append_session_timeline_event(
-                            &session_service,
-                            &sid,
-                            "ToolProgress",
-                            serde_json::json!({"type":"ToolProgress","run_id":active_run_id.clone(),"id":id,"name":name,"progress":progress}),
-                        )
-                        .await;
-                    }
-                    runtime::CowdEvent::ToolComplete {
-                        id,
-                        name,
-                        summary,
-                        exit_code,
-                    } => {
-                        eb.tool_complete(&sid, &id, &name, &summary, exit_code)
-                            .await;
-                        append_session_timeline_event(
-                            &session_service,
-                            &sid,
-                            "ToolComplete",
-                            serde_json::json!({"type":"ToolComplete","run_id":active_run_id.clone(),"id":id,"name":name,"summary":summary,"exit_code":exit_code}),
-                        )
-                        .await;
-                    }
-                    runtime::CowdEvent::TurnComplete {
-                        assistant_text,
-                        iterations,
-                    } => {
-                        let json = serde_json::json!({"type":"TurnComplete","run_id":active_run_id.clone(),"text":assistant_text,"iterations":iterations});
-                        eb.broadcast(&sid, &json.to_string()).await;
-                        append_session_timeline_event(&session_service, &sid, "TurnComplete", json)
-                            .await;
-                    }
-                    runtime::CowdEvent::TurnStarted => {
-                        let json = serde_json::json!({"type":"TurnStarted","run_id":active_run_id.clone()});
-                        eb.broadcast(&sid, &json.to_string()).await;
-                        append_session_timeline_event(&session_service, &sid, "TurnStarted", json)
-                            .await;
-                    }
-                    runtime::CowdEvent::TurnError { error } => {
-                        let json = serde_json::json!({"type":"TurnError","run_id":active_run_id.clone(),"error":error});
-                        eb.broadcast(&sid, &json.to_string()).await;
-                        append_session_timeline_event(&session_service, &sid, "TurnError", json)
-                            .await;
-                    }
-                    runtime::CowdEvent::ContextEnvelope { envelope } => {
-                        let json = serde_json::json!({
-                            "type": "ContextEnvelope",
-                            "envelope_id": envelope.id.clone(),
-                            "run_id": active_run_id.clone(),
-                            "session_id": envelope.identity.session_id.clone(),
-                            "agent_id": envelope.identity.agent_id.clone(),
-                            "profile": envelope.profile,
-                            "diagnostics": envelope.diagnostics.clone(),
-                            "budget": envelope.budget.clone(),
-                            "hashes": {
-                                "stable_head": envelope.diagnostics.stable_head_hash,
-                                "runtime_header": envelope.diagnostics.runtime_header_hash,
-                                "dynamic_tail": envelope.diagnostics.dynamic_tail_hash,
-                            },
-                            "envelope": envelope,
-                        });
-                        eb.broadcast(&sid, &json.to_string()).await;
-                        append_session_timeline_event(
-                            &session_service,
-                            &sid,
-                            "ContextEnvelope",
-                            json,
-                        )
-                        .await;
-                    }
-                    runtime::CowdEvent::TokenUsage {
-                        input,
-                        output,
-                        cache_create,
-                        cache_read,
-                    } => {
-                        let json = serde_json::json!({
-                            "type": "TokenUsage",
-                            "run_id": active_run_id.clone(),
-                            "input": input,
-                            "output": output,
-                            "cache_create": cache_create,
-                            "cache_read": cache_read,
-                            "total": input + output + cache_create + cache_read,
-                        });
-                        eb.broadcast(&sid, &json.to_string()).await;
-                        append_session_timeline_event(&session_service, &sid, "TokenUsage", json)
-                            .await;
-                    }
-                    runtime::CowdEvent::RunModelTelemetry { telemetry } => {
-                        let json = serde_json::json!({
-                            "type": "RunModelTelemetry",
-                            "run_id": active_run_id.clone(),
-                            "telemetry": telemetry,
-                        });
-                        eb.broadcast(&sid, &json.to_string()).await;
-                        append_session_timeline_event(
-                            &session_service,
-                            &sid,
-                            "RunModelTelemetry",
-                            json,
-                        )
-                        .await;
-                    }
-                    runtime::CowdEvent::Warning { .. }
-                    | runtime::CowdEvent::CompactionNotice { .. } => {}
-                    _ => {}
-                }
-            }
-        });
-    }
-
-    let resume_context = active_task
+    let active_projection = runtime_service
+        .session_input_projection(&session_id)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: error.message(),
+                }),
+            )
+        })?;
+    let mut envelope =
+        SessionInputEnvelope::text(session_id.clone(), InputSourceKind::Webui, runtime_content)
+            .with_source_ref(format!("api:/api/sessions/{session_id}/messages"));
+    if let Some(idempotency_key) = body
+        .idempotency_key
         .as_ref()
-        .map(|task| task_resume_context_packet(&session_id, task));
-    let reality_context_items = state
-        .services
-        .reality
-        .recall_augmentation(
-            &state.config_home,
-            &state.services.matrix,
-            &state.services.growth,
-            &runtime_content,
-            8,
-        )
-        .context_items;
-    runtime_service
-        .configure_turn_context(
-            &session_id,
-            run_profile,
-            resume_context,
-            reality_context_items,
-        )
-        .await
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: error.message(),
-                }),
-            )
-        })?;
-
-    let content = runtime_content;
-    let turn_timeout = turn_timeout_for_prompt(&content, run_profile);
-    let turn_max_iterations = turn_max_iterations_for_prompt(&content, run_profile);
-    let cancellation_token = runtime::CancellationToken::new();
-    let hook_abort_signal = runtime::HookAbortSignal::new();
-    runtime_service
-        .install_turn_control(
-            &session_id,
-            cancellation_token.clone(),
-            hook_abort_signal.clone(),
-        )
-        .await
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: error.message(),
-                }),
-            )
-        })?;
-    register_active_turn_control(
-        session_id.clone(),
-        run_id.clone(),
-        cancellation_token,
-        hook_abort_signal,
-    );
-    register_active_turn_partial(session_id.clone(), run_id.clone());
-    let (completion_tx, completion_rx) = oneshot::channel();
-    let worker_state = state.clone();
-    let worker_runtime_service = runtime_service.clone();
-    let worker_event_bus = event_bus.clone();
-    let worker_session_id = session_id.clone();
-    let worker_run_id = run_id.clone();
-    tokio::spawn(async move {
-        let turn_result = worker_runtime_service
-            .run_turn_with_options(
-                &worker_session_id,
-                active_task_id,
-                content,
-                turn_timeout,
-                RuntimeTurnOptions {
-                    profile: run_profile,
-                    max_iterations: Some(turn_max_iterations),
-                    ..RuntimeTurnOptions::default()
-                },
-            )
-            .await;
-        clear_active_turn_control(&worker_session_id, &worker_run_id);
-        let turn_sink = RuntimeTurnSink {
-            state: &worker_state,
-            runtime_service: &worker_runtime_service,
-            event_bus: &worker_event_bus,
-        };
-
-        let completion = match turn_result {
-            Ok(execution) => {
-                let response = turn_sink
-                    .complete(
-                        &worker_session_id,
-                        &worker_run_id,
-                        run_profile,
-                        execution,
-                        run_started_at_ms,
-                    )
-                    .await;
-                Ok(response)
-            }
-            Err(error) => {
-                let status = match error {
-                    crate::runtime_service::RuntimeTurnExecutionError::Timeout { .. } => {
-                        StatusCode::REQUEST_TIMEOUT
-                    }
-                    crate::runtime_service::RuntimeTurnExecutionError::NotFound(_) => {
-                        StatusCode::NOT_FOUND
-                    }
-                    crate::runtime_service::RuntimeTurnExecutionError::Runtime(_)
-                    | crate::runtime_service::RuntimeTurnExecutionError::Join(_) => {
-                        StatusCode::INTERNAL_SERVER_ERROR
-                    }
-                };
-                let error_msg = turn_sink
-                    .fail(
-                        &worker_session_id,
-                        &worker_run_id,
-                        run_profile,
-                        status,
-                        &error,
-                        run_started_at_ms,
-                    )
-                    .await;
-                Err((status, error_msg))
-            }
-        };
-        let _ = completion_tx.send(completion);
-    });
-
-    match completion_rx.await {
-        Ok(Ok(response)) => Ok(Json(response)),
-        Ok(Err((status, error_msg))) => Err((status, Json(ErrorResponse { error: error_msg }))),
-        Err(_) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "runtime turn worker stopped before completion".to_string(),
-            }),
-        )),
+        .filter(|value| !value.trim().is_empty())
+    {
+        envelope = envelope.with_idempotency_key(idempotency_key.trim().to_string());
     }
+    let admission = runtime_service
+        .admit_session_input_with_materialized(envelope)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: error.message(),
+                }),
+            )
+        })?;
+    let execution_graph_id = admission.execution_graph_id;
+    let materialized = admission.materialized;
+    let receipt = admission.receipt;
+    let projection = runtime_service
+        .session_input_projection(&session_id)
+        .await
+        .ok();
+    let inbox = runtime_service
+        .active_turn_inbox(&session_id, receipt.active_turn_id.clone())
+        .await
+        .ok();
+    let response = serde_json::json!({
+        "session_id": session_id,
+        "run_id": run_id,
+        "status": "accepted",
+        "execution": {
+            "graph_id": execution_graph_id,
+            "status": "accepted",
+        },
+        "mode": if active_projection.active_turn_id.is_some() {
+            "attached_to_active_turn"
+        } else {
+            "queued_new_turn"
+        },
+        "input": receipt,
+        "materialized": materialized,
+        "input_projection": projection,
+        "turn_inbox": inbox,
+    });
+    event_bus
+        .broadcast(&session_id, &response.to_string())
+        .await;
+    Ok(Json(response))
+}
+
+async fn get_session_input_projection(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "runtime service unavailable".to_string(),
+            }),
+        )
+    })?;
+    let projection = runtime_service
+        .session_input_projection(&id)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: error.message(),
+                }),
+            )
+        })?;
+    Ok(Json(projection))
+}
+
+async fn get_turn_inbox(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<TurnInboxParams>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "runtime service unavailable".to_string(),
+            }),
+        )
+    })?;
+    let turn_id = params.turn_id.map(TurnId::from_string);
+    let inbox = runtime_service
+        .active_turn_inbox(&id, turn_id)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: error.message(),
+                }),
+            )
+        })?;
+    Ok(Json(inbox))
+}
+
+async fn get_turn_inbox_by_path(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path((id, turn_id)): Path<(String, String)>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "runtime service unavailable".to_string(),
+            }),
+        )
+    })?;
+    let inbox = runtime_service
+        .active_turn_inbox(&id, Some(TurnId::from_string(turn_id)))
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: error.message(),
+                }),
+            )
+        })?;
+    Ok(Json(inbox))
+}
+
+async fn cancel_session_input(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path((id, input_id)): Path<(String, String)>,
+    Json(body): Json<SessionInputCancelRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "runtime service unavailable".to_string(),
+            }),
+        )
+    })?;
+    let reason = body
+        .reason
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("cancelled by user");
+    let input = runtime_service
+        .cancel_session_input(&id, SessionInputId::from_string(input_id), reason)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: error.message(),
+                }),
+            )
+        })?;
+    let projection = runtime_service.session_input_projection(&id).await.ok();
+    let inbox = runtime_service.active_turn_inbox(&id, None).await.ok();
+    Ok(Json(serde_json::json!({
+        "kind": "session_input.cancel",
+        "session_id": id,
+        "input": input,
+        "input_projection": projection,
+        "turn_inbox": inbox,
+    })))
+}
+
+async fn reclassify_session_input(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path((id, input_id)): Path<(String, String)>,
+    Json(body): Json<SessionInputReclassifyRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "runtime service unavailable".to_string(),
+            }),
+        )
+    })?;
+    let reason = body
+        .reason
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("manual route override");
+    let input = runtime_service
+        .reclassify_session_input(
+            &id,
+            SessionInputId::from_string(input_id),
+            body.decision,
+            reason,
+        )
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: error.message(),
+                }),
+            )
+        })?;
+    let projection = runtime_service.session_input_projection(&id).await.ok();
+    let inbox = runtime_service.active_turn_inbox(&id, None).await.ok();
+    Ok(Json(serde_json::json!({
+        "kind": "session_input.reclassify",
+        "session_id": id,
+        "input": input,
+        "input_projection": projection,
+        "turn_inbox": inbox,
+    })))
 }
 
 fn render_message_resource_context(
     config_home: &std::path::Path,
+    capabilities: &runtime::ResourceCapabilityIndex,
     content: &str,
     ids: &[String],
 ) -> String {
     if ids.is_empty() {
         return content.to_string();
     }
-    let store = runtime::ResourceStore::default_for_config_home(config_home);
+    let store = runtime::ResourceStore::for_config_home_with_capabilities(
+        config_home,
+        capabilities.clone(),
+    );
     let mut pairs = Vec::new();
     let mut failures = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
     for raw_id in ids {
         let id = raw_id.trim().trim_start_matches("resource://");
-        if id.is_empty() {
+        if id.is_empty() || !seen.insert(id.to_string()) {
             continue;
         }
         match store.get(id) {
             Ok(envelope) => {
-                let hint = runtime::resource_hint(
-                    &envelope,
-                    &runtime::ResourceCapabilitySnapshot::default(),
-                );
-                pairs.push((envelope, hint));
+                let hint = runtime::resource_hint(&envelope, &capabilities.snapshot());
+                pairs.push(hint.prompt_hint(&envelope));
             }
             Err(error) => failures.push((raw_id.clone(), error)),
         }
@@ -934,6 +589,7 @@ async fn get_session_messages(
                 let blocks: Vec<serde_json::Value> =
                     serde_json::from_str(&m.content_json).unwrap_or_default();
                 let mut val = serde_json::json!({
+                    "id": m.stable_message_id,
                     "session_id": m.session_id,
                     "sequence": m.sequence,
                     "role": m.role,
@@ -998,6 +654,8 @@ struct SseStream {
     session_id: String,
     event_bus: Arc<SessionEventBus>,
     tx: mpsc::Sender<String>,
+    seen_durable_cursors: BTreeSet<u64>,
+    durable_cursor_order: VecDeque<u64>,
 }
 
 impl Stream for SseStream {
@@ -1007,12 +665,30 @@ impl Stream for SseStream {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        match self.rx.poll_next_unpin(cx) {
-            std::task::Poll::Ready(Some(data)) => {
-                std::task::Poll::Ready(Some(Ok(Event::default().data(data))))
+        loop {
+            match self.rx.poll_next_unpin(cx) {
+                std::task::Poll::Ready(Some(data)) => {
+                    let durable_cursor = stream_durable_cursor(&data);
+                    if let Some(cursor) = durable_cursor {
+                        if !self.seen_durable_cursors.insert(cursor) {
+                            continue;
+                        }
+                        self.durable_cursor_order.push_back(cursor);
+                        if self.durable_cursor_order.len() > 1_024 {
+                            if let Some(expired) = self.durable_cursor_order.pop_front() {
+                                self.seen_durable_cursors.remove(&expired);
+                            }
+                        }
+                    }
+                    let mut event = Event::default().data(data);
+                    if let Some(cursor) = durable_cursor {
+                        event = event.id(cursor.to_string());
+                    }
+                    return std::task::Poll::Ready(Some(Ok(event)));
+                }
+                std::task::Poll::Ready(None) => return std::task::Poll::Ready(None),
+                std::task::Poll::Pending => return std::task::Poll::Pending,
             }
-            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
-            std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 }
@@ -1031,11 +707,22 @@ impl Drop for SseStream {
 async fn sse_stream_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(session_id): Path<String>,
+    Query(query): Query<SessionStreamQuery>,
+    headers: HeaderMap,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let (tx, rx) = mpsc::channel(256);
     let bus_tx = tx.clone();
     let event_bus = state.event_bus();
     event_bus.subscribe(&session_id, bus_tx).await;
+    let resume_cursor = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .or(query.from_cursor)
+        .unwrap_or_default();
+    for event in replay_materialized_terminal_events(&state, &session_id, resume_cursor).await {
+        let _ = tx.send(event).await;
+    }
     let _ = tx
         .send(
             serde_json::json!({
@@ -1051,6 +738,8 @@ async fn sse_stream_handler(
         session_id,
         event_bus,
         tx,
+        seen_durable_cursors: BTreeSet::new(),
+        durable_cursor_order: VecDeque::new(),
     };
 
     Sse::new(stream).keep_alive(
@@ -1060,43 +749,58 @@ async fn sse_stream_handler(
     )
 }
 
+fn stream_durable_cursor(data: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(data)
+        .ok()?
+        .get("runtime_commit_cursor")?
+        .as_u64()
+}
+
+async fn replay_materialized_terminal_events(
+    state: &AppState,
+    session_id: &str,
+    after_cursor: u64,
+) -> Vec<String> {
+    let Some(runtime) = state.services.runtime.as_ref() else {
+        return Vec::new();
+    };
+    let delivery = runtime.runtime_services().session_terminal_delivery();
+    let session_id = session_id.to_string();
+    let records = tokio::task::spawn_blocking(move || {
+        delivery.materialized_after(&session_id, after_cursor, 500)
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or_default();
+    records
+        .into_iter()
+        .filter_map(|record| terminal_committed_stream_payload(&record))
+        .collect()
+}
+
+fn terminal_committed_stream_payload(
+    record: &runtime::RuntimeSessionOutboxRecord,
+) -> Option<String> {
+    let response =
+        crate::session_runtime_bridge::decode_terminal_payload(&record.payload_ref).ok()?;
+    Some(
+        serde_json::json!({
+            "type": "TerminalCommitted",
+            "session_id": record.session_id,
+            "terminal_id": record.terminal_id,
+            "message_id": record.message_id,
+            "response": response,
+            "runtime_commit_cursor": record.commit_cursor,
+            "replayed": true,
+        })
+        .to_string(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn turn_timeout_policy_expands_for_deep_tasks() {
-        let direct = turn_timeout_for_prompt("解释一下这个函数", ContextProfile::MainTurn);
-        let standard =
-            turn_timeout_for_prompt("帮我分析当前实现并给出建议", ContextProfile::MainTurn);
-        let deep = turn_timeout_for_prompt(
-            "请进行深度架构分析，模拟 what if 场景，验证 memory matrix harness 多Agent协同并输出完整报告",
-            ContextProfile::MainTurn,
-        );
-
-        assert!(direct < standard);
-        assert!(standard < deep);
-        assert_eq!(deep, Duration::from_secs(900));
-        assert_eq!(
-            turn_max_iterations_for_prompt("解释一下这个函数", ContextProfile::MainTurn),
-            12
-        );
-        assert_eq!(
-            turn_max_iterations_for_prompt(
-                "请进行深度架构分析，模拟 what if 场景，验证 memory matrix harness 多Agent协同并输出完整报告",
-                ContextProfile::MainTurn,
-            ),
-            64
-        );
-    }
-
-    #[test]
-    fn yolo_profile_uses_deep_turn_timeout() {
-        assert_eq!(
-            turn_timeout_for_prompt("继续执行", ContextProfile::YoloGoal),
-            Duration::from_secs(900)
-        );
-    }
 
     #[test]
     fn message_resource_ids_render_runtime_resource_context() {
@@ -1116,13 +820,41 @@ mod tests {
 
         let rendered = render_message_resource_context(
             &temp.path().join("home"),
+            &runtime::ResourceCapabilityIndex::default(),
             "请分析附件",
-            std::slice::from_ref(&resource.id),
+            &[resource.id.clone(), resource.id.clone()],
         );
 
         assert!(rendered.contains("请分析附件"));
         assert!(rendered.contains("## Attached Resources"));
         assert!(rendered.contains("kind: audio"));
         assert!(rendered.contains("Do not claim audio content"));
+        assert_eq!(rendered.matches("### resource://").count(), 1);
+    }
+
+    #[test]
+    fn terminal_commit_stream_payload_uses_durable_cursor_and_terminal_identity() {
+        let record = runtime::RuntimeSessionOutboxRecord {
+            terminal_id: "terminal-1".to_string(),
+            message_id: "message-1".to_string(),
+            session_id: "session-1".to_string(),
+            commit_cursor: 42,
+            payload_ref: "assistant_json:\"completed\"".to_string(),
+            status: "materialized".to_string(),
+            attempts: 1,
+            next_attempt_at_ms: None,
+            claim_owner: None,
+            claim_expires_at_ms: None,
+            failure_class: None,
+            last_error: None,
+            materialized_at_ms: Some(1),
+            revision: 2,
+        };
+        let encoded = terminal_committed_stream_payload(&record).expect("valid terminal payload");
+        let event: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(event["type"], "TerminalCommitted");
+        assert_eq!(event["terminal_id"], "terminal-1");
+        assert_eq!(event["runtime_commit_cursor"], 42);
+        assert_eq!(stream_durable_cursor(&encoded), Some(42));
     }
 }

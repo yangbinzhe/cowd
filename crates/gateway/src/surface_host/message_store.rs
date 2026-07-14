@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use chrono::{Duration as ChronoDuration, Utc};
+use harness_contract::managed_agent::ManagedAgentTriggerEvent;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use surface::{normalize_surface_id, SurfaceOperationResult, SurfaceSendRequest};
@@ -12,6 +13,7 @@ use surface::{normalize_surface_id, SurfaceOperationResult, SurfaceSendRequest};
 const INBOX_FILE: &str = "surface_inbox.jsonl";
 const OUTBOX_FILE: &str = "surface_outbox.jsonl";
 const EVENT_FILE: &str = "surface_delivery_event.jsonl";
+const TRIGGER_EVENT_FILE: &str = "surface_trigger_event.jsonl";
 const DEFAULT_MAX_ATTEMPTS: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -55,6 +57,27 @@ pub(crate) struct SurfaceOutboxRecord {
     pub reply_to_message_id: Option<String>,
 }
 
+/// Durable handoff from a Surface transport into Runtime's Managed Agent
+/// trigger boundary.  The Surface layer owns only delivery/recovery of this
+/// transport fact; Runtime remains the owner of matching, authorization,
+/// idempotency and invocation scheduling.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SurfaceTriggerEventRecord {
+    pub idempotency_key: String,
+    pub surface: String,
+    pub event_type: String,
+    pub trigger: ManagedAgentTriggerEvent,
+    pub payload_json: serde_json::Value,
+    pub status: String,
+    pub attempts: u32,
+    pub max_attempts: u32,
+    pub next_retry_at_ms: Option<i64>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub accepted_at_ms: Option<i64>,
+    pub last_error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SurfaceDeliveryEvent {
     pub event_id: String,
@@ -71,13 +94,20 @@ pub(crate) struct SurfaceDeliveryEvent {
 pub(crate) struct SurfaceMessageSnapshot {
     pub kind: &'static str,
     pub surface: String,
+    pub message_root: PathBuf,
     pub inbox: Vec<SurfaceInboxRecord>,
     pub active_inbox: Vec<SurfaceInboxRecord>,
     pub terminal_inbox: Vec<SurfaceInboxRecord>,
+    pub trigger_events: Vec<SurfaceTriggerEventRecord>,
+    pub active_trigger_events: Vec<SurfaceTriggerEventRecord>,
+    pub failed_trigger_events: Vec<SurfaceTriggerEventRecord>,
     pub outbox: Vec<SurfaceOutboxRecord>,
     pub active_outbox: Vec<SurfaceOutboxRecord>,
+    pub terminal_outbox: Vec<SurfaceOutboxRecord>,
     pub deliveries: Vec<SurfaceDeliveryEvent>,
     pub dead_letters: Vec<SurfaceOutboxRecord>,
+    pub archived_outbox: Vec<SurfaceOutboxRecord>,
+    pub archived_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -86,10 +116,17 @@ pub(crate) struct SurfaceInboxReceipt {
     pub duplicate: bool,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct SurfaceTriggerEventReceipt {
+    pub record: SurfaceTriggerEventRecord,
+    pub duplicate: bool,
+}
+
 #[derive(Debug, Default)]
 struct SurfaceMessageState {
     inbox: BTreeMap<String, SurfaceInboxRecord>,
     outbox: BTreeMap<String, SurfaceOutboxRecord>,
+    trigger_events: BTreeMap<String, SurfaceTriggerEventRecord>,
     events: BTreeMap<String, SurfaceDeliveryEvent>,
 }
 
@@ -209,6 +246,148 @@ impl SurfaceMessageStore {
         self.update_inbox_status(idempotency_key, "failed", None, Some(error.into()))
     }
 
+    pub(crate) fn record_trigger_event_received(
+        &self,
+        surface: &str,
+        event_type: &str,
+        trigger: &ManagedAgentTriggerEvent,
+        payload: &serde_json::Value,
+    ) -> Result<SurfaceTriggerEventReceipt, String> {
+        let surface = normalize_surface_id(surface);
+        let idempotency_key = trigger.idempotency_key.clone();
+        let mut state = self.lock_state()?;
+        if let Some(existing) = state.trigger_events.get(&idempotency_key) {
+            return Ok(SurfaceTriggerEventReceipt {
+                record: existing.clone(),
+                duplicate: true,
+            });
+        }
+        let now = now_ms();
+        let record = SurfaceTriggerEventRecord {
+            idempotency_key: idempotency_key.clone(),
+            surface: surface.clone(),
+            event_type: event_type.to_string(),
+            trigger: trigger.clone(),
+            payload_json: payload.clone(),
+            status: "received".to_string(),
+            attempts: 0,
+            max_attempts: DEFAULT_MAX_ATTEMPTS,
+            next_retry_at_ms: Some(now),
+            created_at_ms: now,
+            updated_at_ms: now,
+            accepted_at_ms: None,
+            last_error: None,
+        };
+        state.trigger_events.insert(idempotency_key, record.clone());
+        self.append_record(TRIGGER_EVENT_FILE, &record)?;
+        drop(state);
+        self.push_event(SurfaceDeliveryEvent {
+            event_id: new_event_id(),
+            surface,
+            delivery_id: None,
+            message_id: None,
+            kind: "trigger_event.received".to_string(),
+            status: "received".to_string(),
+            detail_json: serde_json::json!({
+                "event_id": trigger.event_id,
+                "event_type": event_type,
+                "idempotency_key": record.idempotency_key,
+            }),
+            created_at_ms: now,
+        })?;
+        Ok(SurfaceTriggerEventReceipt {
+            record,
+            duplicate: false,
+        })
+    }
+
+    pub(crate) fn mark_trigger_event_dispatching(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<SurfaceTriggerEventRecord>, String> {
+        let current = self
+            .state
+            .lock()
+            .map_err(|_| "surface message store lock poisoned".to_string())?
+            .trigger_events
+            .get(idempotency_key)
+            .cloned()
+            .ok_or_else(|| format!("surface trigger event `{idempotency_key}` not found"))?;
+        if !matches!(current.status.as_str(), "received" | "retry_scheduled") {
+            return Ok(None);
+        }
+        self.update_trigger_event(idempotency_key, |record| {
+            record.status = "dispatching".to_string();
+            record.attempts = record.attempts.saturating_add(1);
+            record.next_retry_at_ms = None;
+            record.last_error = None;
+        })
+        .map(Some)
+    }
+
+    pub(crate) fn mark_trigger_event_accepted(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<SurfaceTriggerEventRecord, String> {
+        self.update_trigger_event(idempotency_key, |record| {
+            record.status = "accepted".to_string();
+            record.next_retry_at_ms = None;
+            record.accepted_at_ms = Some(now_ms());
+            record.last_error = None;
+        })
+    }
+
+    pub(crate) fn mark_trigger_event_failed(
+        &self,
+        idempotency_key: &str,
+        error: impl Into<String>,
+    ) -> Result<SurfaceTriggerEventRecord, String> {
+        let error = error.into();
+        self.update_trigger_event(idempotency_key, |record| {
+            record.last_error = Some(error.clone());
+            if record.attempts < record.max_attempts {
+                record.status = "retry_scheduled".to_string();
+                record.next_retry_at_ms = Some(next_retry_at_ms(record.attempts));
+            } else {
+                record.status = "dead_letter".to_string();
+                record.next_retry_at_ms = None;
+            }
+        })
+    }
+
+    pub(crate) fn retry_trigger_event(
+        &self,
+        surface: &str,
+        idempotency_key: &str,
+    ) -> Result<SurfaceTriggerEventRecord, String> {
+        let surface = normalize_surface_id(surface);
+        let current = self
+            .state
+            .lock()
+            .map_err(|_| "surface message store lock poisoned".to_string())?
+            .trigger_events
+            .get(idempotency_key)
+            .cloned()
+            .ok_or_else(|| format!("surface trigger event `{idempotency_key}` not found"))?;
+        if current.surface != surface {
+            return Err(format!(
+                "surface trigger event `{idempotency_key}` does not belong to surface `{surface}`"
+            ));
+        }
+        if current.status != "dead_letter" {
+            return Err(format!(
+                "operator retry is only allowed for dead_letter trigger events; current status is {}",
+                current.status
+            ));
+        }
+        self.update_trigger_event(idempotency_key, |record| {
+            record.status = "received".to_string();
+            record.attempts = 0;
+            record.next_retry_at_ms = Some(now_ms());
+            record.last_error = None;
+        })
+    }
+
     pub(crate) fn queue_outbox(
         &self,
         request: &SurfaceSendRequest,
@@ -216,12 +395,14 @@ impl SurfaceMessageStore {
         reply_to_message_id: Option<String>,
     ) -> Result<SurfaceOutboxRecord, String> {
         let surface = normalize_surface_id(&request.surface);
-        let idempotency_key = outbound_idempotency_key(
-            &surface,
-            reply_to_message_id.as_deref(),
-            &request.recipient,
-            &request.text,
-        );
+        let idempotency_key = request.idempotency_key.clone().unwrap_or_else(|| {
+            outbound_idempotency_key(
+                &surface,
+                reply_to_message_id.as_deref(),
+                &request.recipient,
+                &request.text,
+            )
+        });
         let mut state = self.lock_state()?;
         if let Some(existing) = state.outbox.get(&idempotency_key) {
             return Ok(existing.clone());
@@ -274,6 +455,9 @@ impl SurfaceMessageStore {
         delivery_id: &str,
     ) -> Result<SurfaceOutboxRecord, String> {
         let updated = self.update_outbox_by_delivery(delivery_id, |record| {
+            if is_terminal_outbox_status(&record.status) {
+                return;
+            }
             record.status = "sending".to_string();
             record.attempts = record.attempts.saturating_add(1);
             record.updated_at_ms = now_ms();
@@ -423,8 +607,18 @@ impl SurfaceMessageStore {
         &self,
         delivery_id: &str,
     ) -> Result<SurfaceOutboxRecord, String> {
+        let current = self
+            .get_outbox_by_delivery(delivery_id)
+            .ok_or_else(|| format!("surface delivery `{delivery_id}` not found"))?;
+        if current.status != "dead_letter" {
+            return Err(format!(
+                "operator retry is only allowed for dead_letter deliveries; current status is {}",
+                current.status
+            ));
+        }
         let updated = self.update_outbox_by_delivery(delivery_id, |record| {
             record.status = "queued".to_string();
+            record.attempts = 0;
             record.updated_at_ms = now_ms();
             record.next_retry_at_ms = None;
             record.last_error = None;
@@ -434,12 +628,113 @@ impl SurfaceMessageStore {
             surface: updated.surface.clone(),
             delivery_id: Some(updated.delivery_id.clone()),
             message_id: updated.reply_to_message_id.clone(),
-            kind: "outbox.replayed".to_string(),
+            kind: "outbox.operator_retry_requested".to_string(),
             status: "queued".to_string(),
-            detail_json: serde_json::json!({"attempts": updated.attempts}),
+            detail_json: serde_json::json!({"attempts": updated.attempts, "operator_action": "retry"}),
             created_at_ms: now_ms(),
         })?;
         Ok(updated)
+    }
+
+    pub(crate) fn archive_dead_letters(
+        &self,
+        surface: &str,
+        older_than_ms: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<SurfaceOutboxRecord>, String> {
+        let surface = normalize_surface_id(surface);
+        let now = now_ms();
+        let mut state = self.lock_state()?;
+        let mut archived = Vec::new();
+        let keys = state
+            .outbox
+            .iter()
+            .filter(|(_, record)| {
+                record.surface == surface
+                    && record.status == "dead_letter"
+                    && older_than_ms.is_none_or(|threshold| record.updated_at_ms <= threshold)
+            })
+            .take(limit.max(1))
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in keys {
+            if let Some(record) = state.outbox.get_mut(&key) {
+                record.status = "archived".to_string();
+                record.updated_at_ms = now;
+                record.next_retry_at_ms = None;
+                archived.push(record.clone());
+            }
+        }
+        for record in &archived {
+            self.append_record(OUTBOX_FILE, record)?;
+        }
+        drop(state);
+        for record in &archived {
+            self.push_event(SurfaceDeliveryEvent {
+                event_id: new_event_id(),
+                surface: record.surface.clone(),
+                delivery_id: Some(record.delivery_id.clone()),
+                message_id: record.reply_to_message_id.clone(),
+                kind: "outbox.dead_letter_archived".to_string(),
+                status: "archived".to_string(),
+                detail_json: serde_json::json!({
+                    "attempts": record.attempts,
+                    "max_attempts": record.max_attempts,
+                    "last_error": record.last_error,
+                }),
+                created_at_ms: now_ms(),
+            })?;
+        }
+        Ok(archived)
+    }
+
+    pub(crate) fn purge_archived_events(
+        &self,
+        surface: &str,
+        older_than_ms: Option<i64>,
+        limit: usize,
+    ) -> Result<usize, String> {
+        let surface = normalize_surface_id(surface);
+        let limit = limit.max(1);
+        let mut state = self.lock_state()?;
+        let archived_delivery_ids = state
+            .outbox
+            .values()
+            .filter(|record| {
+                record.surface == surface
+                    && record.status == "archived"
+                    && older_than_ms.is_none_or(|threshold| record.updated_at_ms <= threshold)
+            })
+            .map(|record| record.delivery_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        if archived_delivery_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let purged_event_ids = state
+            .events
+            .iter()
+            .filter(|(_, event)| {
+                event.surface == surface
+                    && event
+                        .delivery_id
+                        .as_ref()
+                        .is_some_and(|delivery_id| archived_delivery_ids.contains(delivery_id))
+                    && older_than_ms.is_none_or(|threshold| event.created_at_ms <= threshold)
+            })
+            .take(limit)
+            .map(|(event_id, _)| event_id.clone())
+            .collect::<Vec<_>>();
+
+        for event_id in &purged_event_ids {
+            state.events.remove(event_id);
+        }
+        let remaining = state.events.values().cloned().collect::<Vec<_>>();
+        drop(state);
+        if !purged_event_ids.is_empty() {
+            self.rewrite_records(EVENT_FILE, &remaining)?;
+        }
+        Ok(purged_event_ids.len())
     }
 
     pub(crate) fn get_outbox_by_delivery(&self, delivery_id: &str) -> Option<SurfaceOutboxRecord> {
@@ -462,6 +757,25 @@ impl SurfaceMessageStore {
                     .values()
                     .filter(|record| {
                         record.status == "retry_scheduled"
+                            && record.attempts < record.max_attempts
+                            && record.next_retry_at_ms.is_some_and(|due| due <= now)
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn due_trigger_event_retries(&self) -> Vec<SurfaceTriggerEventRecord> {
+        let now = now_ms();
+        self.state
+            .lock()
+            .map(|state| {
+                state
+                    .trigger_events
+                    .values()
+                    .filter(|record| {
+                        matches!(record.status.as_str(), "received" | "retry_scheduled")
                             && record.attempts < record.max_attempts
                             && record.next_retry_at_ms.is_some_and(|due| due <= now)
                     })
@@ -519,6 +833,35 @@ impl SurfaceMessageStore {
             .unwrap_or_default()
     }
 
+    pub(crate) fn list_all_inbox(&self) -> Vec<SurfaceInboxRecord> {
+        self.state
+            .lock()
+            .map(|state| state.inbox.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn list_all_outbox(&self) -> Vec<SurfaceOutboxRecord> {
+        self.state
+            .lock()
+            .map(|state| state.outbox.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn list_trigger_events(&self, surface: &str) -> Vec<SurfaceTriggerEventRecord> {
+        let surface = normalize_surface_id(surface);
+        self.state
+            .lock()
+            .map(|state| {
+                state
+                    .trigger_events
+                    .values()
+                    .filter(|record| record.surface == surface)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub(crate) fn list_delivery_events(&self, surface: &str) -> Vec<SurfaceDeliveryEvent> {
         let surface = normalize_surface_id(surface);
         self.state
@@ -538,6 +881,7 @@ impl SurfaceMessageStore {
         let surface = normalize_surface_id(surface);
         let inbox = self.list_inbox(&surface);
         let outbox = self.list_outbox(&surface);
+        let trigger_events = self.list_trigger_events(&surface);
         let active_inbox = inbox
             .iter()
             .filter(|record| is_active_inbox_status(&record.status))
@@ -548,9 +892,24 @@ impl SurfaceMessageStore {
             .filter(|record| !is_active_inbox_status(&record.status))
             .cloned()
             .collect();
+        let active_trigger_events = trigger_events
+            .iter()
+            .filter(|record| is_active_trigger_event_status(&record.status))
+            .cloned()
+            .collect();
+        let failed_trigger_events = trigger_events
+            .iter()
+            .filter(|record| record.status == "dead_letter")
+            .cloned()
+            .collect();
         let active_outbox = outbox
             .iter()
             .filter(|record| is_active_outbox_status(&record.status))
+            .cloned()
+            .collect();
+        let terminal_outbox = outbox
+            .iter()
+            .filter(|record| is_terminal_outbox_status(&record.status))
             .cloned()
             .collect();
         let dead_letters = outbox
@@ -558,16 +917,29 @@ impl SurfaceMessageStore {
             .filter(|record| record.status == "dead_letter")
             .cloned()
             .collect();
+        let archived_outbox = outbox
+            .iter()
+            .filter(|record| record.status == "archived")
+            .cloned()
+            .collect::<Vec<_>>();
+        let archived_count = archived_outbox.len();
         SurfaceMessageSnapshot {
             kind: "surface.message_snapshot",
             surface: surface.clone(),
+            message_root: self.root.clone(),
             inbox,
             active_inbox,
             terminal_inbox,
+            trigger_events,
+            active_trigger_events,
+            failed_trigger_events,
             outbox,
             active_outbox,
+            terminal_outbox,
             deliveries: self.list_delivery_events(&surface),
             dead_letters,
+            archived_outbox,
+            archived_count,
         }
     }
 
@@ -605,6 +977,42 @@ impl SurfaceMessageStore {
             }),
             created_at_ms: now_ms(),
         })
+    }
+
+    fn update_trigger_event(
+        &self,
+        idempotency_key: &str,
+        update: impl FnOnce(&mut SurfaceTriggerEventRecord),
+    ) -> Result<SurfaceTriggerEventRecord, String> {
+        let mut state = self.lock_state()?;
+        let record = state
+            .trigger_events
+            .get_mut(idempotency_key)
+            .ok_or_else(|| format!("surface trigger event `{idempotency_key}` not found"))?;
+        update(record);
+        record.updated_at_ms = now_ms();
+        let record = record.clone();
+        self.append_record(TRIGGER_EVENT_FILE, &record)?;
+        drop(state);
+        self.push_event(SurfaceDeliveryEvent {
+            event_id: new_event_id(),
+            surface: record.surface.clone(),
+            delivery_id: None,
+            message_id: None,
+            kind: format!("trigger_event.{}", record.status),
+            status: record.status.clone(),
+            detail_json: serde_json::json!({
+                "event_id": record.trigger.event_id,
+                "event_type": record.event_type,
+                "idempotency_key": record.idempotency_key,
+                "attempts": record.attempts,
+                "max_attempts": record.max_attempts,
+                "next_retry_at_ms": record.next_retry_at_ms,
+                "last_error": record.last_error,
+            }),
+            created_at_ms: now_ms(),
+        })?;
+        Ok(record)
     }
 
     fn mark_inbox_status_by_message_id(
@@ -689,6 +1097,22 @@ impl SurfaceMessageStore {
         writer.write_all(b"\n").map_err(|error| error.to_string())
     }
 
+    fn rewrite_records<T: Serialize>(&self, file: &str, records: &[T]) -> Result<(), String> {
+        fs::create_dir_all(&self.root).map_err(|error| error.to_string())?;
+        let path = self.root.join(file);
+        let mut writer = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .map_err(|error| error.to_string())?;
+        for record in records {
+            serde_json::to_writer(&mut writer, record).map_err(|error| error.to_string())?;
+            writer.write_all(b"\n").map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, SurfaceMessageState>, String> {
         self.state
             .lock()
@@ -723,12 +1147,48 @@ fn load_state(root: &Path) -> Result<SurfaceMessageState, String> {
         outbox: read_latest(root.join(OUTBOX_FILE), |record: &SurfaceOutboxRecord| {
             record.idempotency_key.clone()
         })?,
+        trigger_events: read_latest(
+            root.join(TRIGGER_EVENT_FILE),
+            |record: &SurfaceTriggerEventRecord| record.idempotency_key.clone(),
+        )?,
         events: read_latest(root.join(EVENT_FILE), |record: &SurfaceDeliveryEvent| {
             record.event_id.clone()
         })?,
     };
+    normalize_terminal_outbox_state(&mut state);
+    normalize_trigger_event_state(&mut state);
     reconcile_inbox_with_outbox(&mut state);
     Ok(state)
+}
+
+fn normalize_trigger_event_state(state: &mut SurfaceMessageState) {
+    let now = now_ms();
+    for record in state.trigger_events.values_mut() {
+        if matches!(record.status.as_str(), "received" | "dispatching") {
+            record.status = "retry_scheduled".to_string();
+            record.next_retry_at_ms = Some(now);
+            record.updated_at_ms = record.updated_at_ms.max(now);
+            record.last_error =
+                Some("gateway restarted before Runtime acknowledged the trigger event".to_string());
+        }
+        if is_terminal_trigger_event_status(&record.status) {
+            record.next_retry_at_ms = None;
+        }
+        if record.attempts > record.max_attempts {
+            record.attempts = record.max_attempts;
+        }
+    }
+}
+
+fn normalize_terminal_outbox_state(state: &mut SurfaceMessageState) {
+    for record in state.outbox.values_mut() {
+        if is_terminal_outbox_status(&record.status) {
+            record.next_retry_at_ms = None;
+        }
+        if record.status == "dead_letter" && record.attempts > record.max_attempts {
+            record.attempts = record.max_attempts;
+        }
+    }
 }
 
 fn reconcile_inbox_with_outbox(state: &mut SurfaceMessageState) {
@@ -798,6 +1258,18 @@ fn is_active_inbox_status(status: &str) -> bool {
 
 fn is_active_outbox_status(status: &str) -> bool {
     matches!(status, "queued" | "sending" | "retry_scheduled")
+}
+
+fn is_terminal_outbox_status(status: &str) -> bool {
+    matches!(status, "sent" | "dead_letter" | "cancelled" | "archived")
+}
+
+fn is_active_trigger_event_status(status: &str) -> bool {
+    matches!(status, "received" | "dispatching" | "retry_scheduled")
+}
+
+fn is_terminal_trigger_event_status(status: &str) -> bool {
+    matches!(status, "accepted" | "dead_letter")
 }
 
 fn read_latest<T>(
@@ -889,6 +1361,135 @@ fn outbox_failure_reason(record: &SurfaceOutboxRecord) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn trigger_event(id: &str) -> ManagedAgentTriggerEvent {
+        ManagedAgentTriggerEvent {
+            event_id: format!("surface-event:feishu:message.received:{id}"),
+            source_id: "feishu".to_string(),
+            source_kind: "surface".to_string(),
+            event_type: "message.received".to_string(),
+            subject: "surface:feishu:chat-1".to_string(),
+            payload_ref: format!("surface-event:{id}"),
+            payload_digest: "sha256:test".to_string(),
+            occurred_at_ms: 1,
+            source_sequence: None,
+            idempotency_key: format!("surface-event:feishu:message.received:{id}"),
+            source_capabilities: vec!["surface.event.receive".to_string()],
+            attributes: BTreeMap::new(),
+            trace_refs: vec![format!("surface:feishu:event:{id}")],
+        }
+    }
+
+    #[test]
+    fn trigger_event_handoff_recovers_an_unacknowledged_runtime_delivery() {
+        let root = std::env::temp_dir().join(format!(
+            "cowd-edge-trigger-event-store-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = SurfaceMessageStore::new(&root);
+        let event = trigger_event("event-1");
+        let received = store
+            .record_trigger_event_received(
+                "feishu",
+                "message.received",
+                &event,
+                &serde_json::json!({"message_id": "event-1", "text": "hello"}),
+            )
+            .unwrap();
+        assert!(!received.duplicate);
+        let claimed = store
+            .mark_trigger_event_dispatching(&received.record.idempotency_key)
+            .unwrap()
+            .expect("fresh event must be claimable");
+        assert_eq!(claimed.status, "dispatching");
+        assert_eq!(claimed.attempts, 1);
+
+        let reloaded = SurfaceMessageStore::new(&root);
+        let recovered = reloaded.due_trigger_event_retries();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].status, "retry_scheduled");
+        let retried = reloaded
+            .mark_trigger_event_dispatching(&received.record.idempotency_key)
+            .unwrap()
+            .expect("recovered event must be re-claimable");
+        assert_eq!(retried.attempts, 2);
+        reloaded
+            .mark_trigger_event_accepted(&received.record.idempotency_key)
+            .unwrap();
+
+        let duplicate = reloaded
+            .record_trigger_event_received(
+                "feishu",
+                "message.received",
+                &event,
+                &serde_json::json!({"message_id": "event-1", "text": "hello"}),
+            )
+            .unwrap();
+        assert!(duplicate.duplicate);
+        assert_eq!(duplicate.record.status, "accepted");
+        let snapshot = reloaded.snapshot("feishu");
+        assert!(snapshot.active_trigger_events.is_empty());
+        assert!(snapshot.failed_trigger_events.is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn trigger_event_delivery_has_a_bounded_dead_letter_terminal_state() {
+        let root = std::env::temp_dir().join(format!(
+            "cowd-edge-trigger-event-dead-letter-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = SurfaceMessageStore::new(&root);
+        let event = trigger_event("event-2");
+        let received = store
+            .record_trigger_event_received(
+                "feishu",
+                "message.received",
+                &event,
+                &serde_json::json!({"message_id": "event-2"}),
+            )
+            .unwrap();
+        let key = received.record.idempotency_key;
+        let mut terminal = None;
+        for _ in 0..DEFAULT_MAX_ATTEMPTS {
+            store
+                .mark_trigger_event_dispatching(&key)
+                .unwrap()
+                .expect("retryable event must be claimable");
+            terminal = Some(
+                store
+                    .mark_trigger_event_failed(&key, "runtime unavailable")
+                    .unwrap(),
+            );
+            if terminal
+                .as_ref()
+                .is_some_and(|record| record.status == "dead_letter")
+            {
+                break;
+            }
+            let mut state = store.lock_state().unwrap();
+            state
+                .trigger_events
+                .get_mut(&key)
+                .expect("record")
+                .next_retry_at_ms = Some(now_ms());
+        }
+        let terminal = terminal.expect("terminal record");
+        assert_eq!(terminal.status, "dead_letter");
+        assert_eq!(terminal.attempts, DEFAULT_MAX_ATTEMPTS);
+        assert!(store.due_trigger_event_retries().is_empty());
+        assert_eq!(store.snapshot("feishu").failed_trigger_events.len(), 1);
+        let retried = store.retry_trigger_event("feishu", &key).unwrap();
+        assert_eq!(retried.status, "received");
+        assert_eq!(retried.attempts, 0);
+        assert!(store
+            .mark_trigger_event_dispatching(&key)
+            .unwrap()
+            .is_some());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn surface_inbox_dedupes_across_store_reload() {
         let root =
@@ -933,6 +1534,7 @@ mod tests {
             recipient: "user-1".to_string(),
             thread: Some("thread-1".to_string()),
             text: "hello".to_string(),
+            idempotency_key: None,
             metadata: serde_json::json!({"reply_to": "msg-1"}),
         };
         let queued = store
@@ -953,7 +1555,92 @@ mod tests {
             .mark_delivery_dead_letter(&queued.delivery_id, "operator closed")
             .unwrap();
         assert_eq!(dead.status, "dead_letter");
+        let sending_after_terminal = store.mark_delivery_sending(&queued.delivery_id).unwrap();
+        assert_eq!(sending_after_terminal.status, "dead_letter");
+        assert_eq!(sending_after_terminal.attempts, dead.attempts);
         assert_eq!(store.snapshot("feishu").dead_letters.len(), 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn caller_owned_idempotency_key_survives_payload_replay() {
+        let root = std::env::temp_dir().join(format!(
+            "cowd-edge-idempotent-store-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = SurfaceMessageStore::new(&root);
+        let mut request = SurfaceSendRequest {
+            surface: "feishu".to_string(),
+            recipient: "user-1".to_string(),
+            thread: None,
+            text: "first attempt".to_string(),
+            idempotency_key: Some("cross-plane:stable-send".to_string()),
+            metadata: serde_json::json!({}),
+        };
+        let first = store.queue_outbox(&request, None, None).unwrap();
+        request.text = "retry after crash".to_string();
+        let replay = store.queue_outbox(&request, None, None).unwrap();
+        assert_eq!(first.delivery_id, replay.delivery_id);
+        assert_eq!(first.idempotency_key, "cross-plane:stable-send");
+    }
+
+    #[test]
+    fn surface_retry_dead_letter_requires_operator_action() {
+        let root =
+            std::env::temp_dir().join(format!("cowd-edge-retry-store-{}", uuid::Uuid::new_v4()));
+        let store = SurfaceMessageStore::new(&root);
+        let request = SurfaceSendRequest {
+            surface: "feishu".to_string(),
+            recipient: "user-1".to_string(),
+            thread: None,
+            text: "hello".to_string(),
+            idempotency_key: None,
+            metadata: serde_json::json!({}),
+        };
+        let queued = store.queue_outbox(&request, None, None).unwrap();
+        let active_retry = store.mark_delivery_replayed(&queued.delivery_id);
+        assert!(active_retry.is_err());
+
+        let _ = store.mark_delivery_sending(&queued.delivery_id).unwrap();
+        let _ = store
+            .mark_delivery_failed(&queued.delivery_id, "transport timeout", false)
+            .unwrap();
+        let replayed = store.mark_delivery_replayed(&queued.delivery_id).unwrap();
+        assert_eq!(replayed.status, "queued");
+        assert_eq!(replayed.attempts, 0);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn surface_archive_dead_letters_preserves_audit_state() {
+        let root =
+            std::env::temp_dir().join(format!("cowd-edge-archive-store-{}", uuid::Uuid::new_v4()));
+        let store = SurfaceMessageStore::new(&root);
+        let request = SurfaceSendRequest {
+            surface: "feishu".to_string(),
+            recipient: "user-1".to_string(),
+            thread: None,
+            text: "hello".to_string(),
+            idempotency_key: None,
+            metadata: serde_json::json!({}),
+        };
+        let queued = store.queue_outbox(&request, None, None).unwrap();
+        let _ = store.mark_delivery_sending(&queued.delivery_id).unwrap();
+        let _ = store
+            .mark_delivery_failed(&queued.delivery_id, "permanent failure", false)
+            .unwrap();
+        let archived = store.archive_dead_letters("feishu", None, 10).unwrap();
+        assert_eq!(archived.len(), 1);
+        let snapshot = store.snapshot("feishu");
+        assert!(snapshot.dead_letters.is_empty());
+        assert_eq!(snapshot.archived_count, 1);
+        assert_eq!(snapshot.archived_outbox[0].status, "archived");
+        assert!(snapshot
+            .deliveries
+            .iter()
+            .any(|event| event.kind == "outbox.dead_letter_archived"));
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -984,6 +1671,7 @@ mod tests {
             recipient: "chat".to_string(),
             thread: Some("chat".to_string()),
             text: "reply".to_string(),
+            idempotency_key: None,
             metadata: serde_json::json!({"reply_to": "msg-1"}),
         };
         let delivery = store
@@ -1043,6 +1731,7 @@ mod tests {
             recipient: "chat".to_string(),
             thread: Some("chat".to_string()),
             text: "failed".to_string(),
+            idempotency_key: None,
             metadata: serde_json::json!({
                 "reply_to": "msg-1",
                 "failure_notice": true,
@@ -1118,6 +1807,48 @@ mod tests {
             snapshot.inbox[0].last_error.as_deref(),
             Some("surface processing was interrupted by gateway restart before a reply was queued")
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn surface_purge_archived_events_keeps_outbox_terminal_state() {
+        let root =
+            std::env::temp_dir().join(format!("cowd-edge-purge-store-{}", uuid::Uuid::new_v4()));
+        let store = SurfaceMessageStore::new(&root);
+        let request = SurfaceSendRequest {
+            surface: "feishu".to_string(),
+            recipient: "user-1".to_string(),
+            thread: None,
+            text: "hello".to_string(),
+            idempotency_key: None,
+            metadata: serde_json::json!({}),
+        };
+        let queued = store.queue_outbox(&request, None, None).unwrap();
+        let _ = store.mark_delivery_sending(&queued.delivery_id).unwrap();
+        let _ = store
+            .mark_delivery_failed(&queued.delivery_id, "transport timeout", false)
+            .unwrap();
+        let archived = store.archive_dead_letters("feishu", None, 10).unwrap();
+        assert_eq!(archived.len(), 1);
+        assert!(!store.list_delivery_events("feishu").is_empty());
+
+        let purged = store.purge_archived_events("feishu", None, 100).unwrap();
+        assert!(purged > 0);
+        let snapshot = store.snapshot("feishu");
+        assert_eq!(snapshot.archived_count, 1);
+        assert_eq!(snapshot.archived_outbox[0].delivery_id, queued.delivery_id);
+        assert!(store
+            .list_delivery_events("feishu")
+            .iter()
+            .all(|event| event.delivery_id.as_deref() != Some(&queued.delivery_id)));
+
+        let reloaded = SurfaceMessageStore::new(&root);
+        assert_eq!(reloaded.snapshot("feishu").archived_count, 1);
+        assert!(reloaded
+            .list_delivery_events("feishu")
+            .iter()
+            .all(|event| event.delivery_id.as_deref() != Some(&queued.delivery_id)));
 
         let _ = std::fs::remove_dir_all(root);
     }

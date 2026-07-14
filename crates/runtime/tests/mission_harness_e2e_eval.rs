@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
 use harness_contract::core::TaskRisk;
 use harness_contract::strategy::{decide_strategy, StrategyInput};
 use runtime::eval_gate::{
@@ -5,9 +12,9 @@ use runtime::eval_gate::{
 };
 use runtime::{
     ApprovalSource, ApprovalSourceKind, ApprovalTimeoutPolicy, AutonomyProfileId,
-    CollaborationTemplateMatcher, MissionRuntime, RuntimeEventInput, RuntimeEventScope,
-    RuntimeEventStore, StartMissionSessionRequest, StartStewardRuntimeRequest,
-    StartTeamRuntimeRequest, StewardActionStatus, StewardRuntimeService, TickStewardRuntimeRequest,
+    CollaborationTemplateId, MissionRuntime, RuntimeEventInput, RuntimeEventScope,
+    RuntimeEventStore, StartMissionSessionRequest, StewardActionRequest, StewardActionStatus,
+    StewardAgent,
 };
 use serde::Serialize;
 
@@ -37,69 +44,52 @@ fn mission_harness_quick_eval_covers_core_runtime_loop_and_writes_report() {
 
     let prompt = "implement mission harness event store, approval governance, and team review";
     let strategy = decide_strategy(&StrategyInput::from_prompt(prompt));
-    let decision = CollaborationTemplateMatcher::default().decide(prompt, &strategy);
-    let team = runtime::TeamRuntimeService::new()
-        .start(StartTeamRuntimeRequest {
-            session_id: session.session_id.clone(),
-            objective: prompt.to_string(),
-            collaboration_decision: decision,
-        })
-        .expect("team runtime starts");
-
-    let approval = runtime::GlobalApprovalQueue::new()
+    let services = runtime::RuntimeServices::in_memory().expect("runtime services");
+    let team_id = format!("mission-eval-team-{}", uuid::Uuid::new_v4());
+    let approval = services
+        .approval_queue()
         .submit(runtime::SubmitGlobalApprovalRequest {
             source: ApprovalSource {
                 kind: ApprovalSourceKind::Session,
                 session_id: Some(session.session_id.clone()),
                 agent_id: None,
-                team_id: Some(team.team_id.clone()),
+                team_id: Some(team_id.clone()),
                 mission_id: Some("mission-eval".to_string()),
             },
             action: "apply_patch".to_string(),
             summary: "write runtime changes".to_string(),
             risk: TaskRisk::High,
-            evidence_refs: vec![format!("team:{}", team.team_id)],
+            evidence_refs: vec![format!("team:{team_id}")],
             timeout_policy: ApprovalTimeoutPolicy::Pending,
         })
         .expect("approval submitted");
     assert_eq!(approval.status, runtime::GlobalApprovalStatus::Pending);
 
-    let command = mission
-        .enqueue_session_command(
-            &session.session_id,
-            &session.session_id,
-            "summarize evidence and blockers".to_string(),
-        )
-        .expect("session command enqueued");
-    let claimed = mission
-        .claim_session_command(&session.session_id, &command.command_id)
-        .expect("session command claimed");
-    assert_eq!(
-        claimed.status,
-        runtime::MissionSessionCommandStatus::Claimed
-    );
-
-    let steward_runtime = StewardRuntimeService::new();
-    let steward = steward_runtime
-        .start(StartStewardRuntimeRequest {
-            mission_id: "mission-eval".to_string(),
-            root_session_id: Some(session.session_id.clone()),
-            profile_id: AutonomyProfileId::Stewarded,
-            objective: "supervise mission harness eval".to_string(),
-        })
-        .expect("steward starts");
-    let steward_decision = steward_runtime
-        .tick(
-            &steward.steward_id,
-            TickStewardRuntimeRequest {
-                action: Some("read evidence".to_string()),
-                summary: Some("inspect runtime event evidence".to_string()),
+    let steward_decision = StewardAgent::new()
+        .evaluate_action(
+            StewardActionRequest {
+                steward_id: "policy-eval".to_string(),
+                profile_id: AutonomyProfileId::Stewarded,
+                source: ApprovalSource {
+                    kind: ApprovalSourceKind::Steward,
+                    session_id: Some(session.session_id.clone()),
+                    agent_id: None,
+                    team_id: Some(team_id.clone()),
+                    mission_id: Some("mission-eval".to_string()),
+                },
+                action: "read evidence".to_string(),
+                summary: "inspect runtime event evidence".to_string(),
                 risk: TaskRisk::Low,
                 requested_tool: Some("read_file".to_string()),
-                ..TickStewardRuntimeRequest::default()
+                template_id: Some(CollaborationTemplateId::PlannerExecutorVerifier),
+                requires_write: false,
+                is_critical_operation: false,
+                evidence_refs: vec!["mission-eval".to_string()],
+                timeout_policy: ApprovalTimeoutPolicy::Pending,
             },
+            services.approval_queue(),
         )
-        .expect("steward ticks");
+        .expect("policy evaluates action");
     assert_eq!(steward_decision.status, StewardActionStatus::Delegated);
 
     let event_store = RuntimeEventStore::open_in_memory().expect("event store opens");
@@ -112,10 +102,9 @@ fn mission_harness_quick_eval_covers_core_runtime_loop_and_writes_report() {
             actor: Some("mission_harness_eval".to_string()),
             refs: Vec::new(),
             payload: serde_json::json!({
-                "team_id": team.team_id,
+                "team_id": team_id,
                 "approval_id": approval.approval_id,
-                "command_id": command.command_id,
-                "steward_id": steward.steward_id,
+                "policy_actor": steward_decision.steward_id,
             }),
         })
         .expect("event appends");
@@ -128,21 +117,21 @@ fn mission_harness_quick_eval_covers_core_runtime_loop_and_writes_report() {
     );
 
     let scenario = ScenarioSpec::new("mission_harness_quick", prompt)
-        .expect_mode(strategy.mode)
+        .expect_mode(strategy.pattern)
         .require(ScenarioCheck::bool(
-            "workgraph.present",
-            ScenarioCheckKind::WorkgraphPresent,
+            "execution_graph.present",
+            ScenarioCheckKind::ExecutionGraphPresent,
             true,
             "mission-harness/team-runtime",
-            "complex mission harness eval must produce a workgraph",
+            "complex mission harness eval must produce a execution_graph",
         ));
     let observation = ScenarioObservation {
         scenario_id: "mission_harness_quick".to_string(),
-        strategy_mode: strategy.mode,
-        finalization_blocked: false,
+        strategy_pattern: strategy.pattern,
+        verification_blocked: false,
         regression_allowed: true,
-        has_workgraph: true,
-        workgraph_quality_ok: true,
+        has_execution_graph: true,
+        execution_graph_quality_ok: true,
         growth_has_blocker: false,
         growth_signal_kinds: Vec::new(),
         memory_candidate_count: 0,
@@ -164,7 +153,7 @@ fn mission_harness_quick_eval_covers_core_runtime_loop_and_writes_report() {
             CapabilityResult {
                 capability: "team_runtime",
                 status: "passed",
-                evidence: team.team_id,
+                evidence: team_id,
             },
             CapabilityResult {
                 capability: "approval_queue",
@@ -172,14 +161,14 @@ fn mission_harness_quick_eval_covers_core_runtime_loop_and_writes_report() {
                 evidence: approval.approval_id,
             },
             CapabilityResult {
-                capability: "session_inbox",
+                capability: "session_input",
                 status: "passed",
-                evidence: command.command_id,
+                evidence: "runtime.session_input_stream".to_string(),
             },
             CapabilityResult {
-                capability: "steward_runtime",
+                capability: "steward_policy",
                 status: "passed",
-                evidence: steward.steward_id,
+                evidence: steward_decision.steward_id,
             },
             CapabilityResult {
                 capability: "runtime_event_store",

@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use axum::{
-    extract::{Query, State as AxumState},
+    extract::{Extension, Query, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -10,7 +10,7 @@ use axum::{
 use runtime::ApprovalConfig;
 use serde::Deserialize;
 
-use super::{api_error, AppState, ErrorResponse};
+use super::{api_error, AppState, AuthenticatedPrincipal, ErrorResponse};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -26,6 +26,7 @@ pub(super) fn router() -> Router<Arc<AppState>> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ApprovalRespondRequest {
     id: String,
     approved: bool,
@@ -84,16 +85,24 @@ async fn approval_history_handler(
 
 async fn approval_respond_handler(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(body): Json<ApprovalRespondRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let _persistence = body.persistence.as_deref().unwrap_or("once");
     state
         .services
         .approval
-        .respond(&body.id, body.approved, body.reason)
+        .respond(&body.id, body.approved, body.reason, &principal.0)
         .await
         .map(Json)
-        .map_err(|error| api_error(StatusCode::NOT_FOUND, error))
+        .map_err(|error| {
+            let status = if error == "approval_human_interactive_capability_required" {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::NOT_FOUND
+            };
+            api_error(status, error)
+        })
 }
 
 async fn risk_receipt_handler(

@@ -1,65 +1,223 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use memory::SessionRecord;
+use harness_contract::turn::{InputSourceKind, SessionInputEnvelope};
+use memory::{SessionMissionOutboxOperation, SessionMissionOutboxRequest, SessionRecord};
 use sha2::{Digest, Sha256};
-use surface::{SurfaceActionRequest, SurfaceFrame, SurfaceSendRequest};
+use surface::{message::MessageActionKind, SurfaceActionRequest, SurfaceFrame, SurfaceSendRequest};
 use tokio::sync::Mutex;
 
 use crate::api_routes::AppState;
 use crate::runtime_service::RuntimeTurnOptions;
 
-const SURFACE_QUICK_WALL_CLOCK: Duration = Duration::from_secs(240);
-const SURFACE_MEDIA_WALL_CLOCK: Duration = Duration::from_secs(900);
-const SURFACE_DEEP_WALL_CLOCK: Duration = Duration::from_secs(900);
-const SURFACE_QUICK_MAX_ITERATIONS: usize = 12;
-const SURFACE_MEDIA_MAX_ITERATIONS: usize = 24;
-const SURFACE_DEEP_MAX_ITERATIONS: usize = 64;
-
 #[derive(Debug, Clone, Copy)]
 struct SurfaceTurnPolicy {
     profile: runtime::ContextProfile,
-    timeout: Duration,
-    max_iterations: usize,
 }
 
 pub(crate) fn spawn_surface_ingress_dispatcher(state: Arc<AppState>) {
     let mut rx = state.services.surface.subscribe_events();
     let session_locks = Arc::new(Mutex::new(HashMap::<String, Arc<Mutex<()>>>::new()));
     tokio::spawn(async move {
+        let mut retry_tick = tokio::time::interval(Duration::from_secs(5));
+        retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            let frame = match rx.recv().await {
-                Ok(frame) => frame,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    tracing::warn!(skipped, "surface ingress dispatcher lagged");
-                    continue;
+            tokio::select! {
+                _ = retry_tick.tick() => {
+                    retry_surface_trigger_events(&state).await;
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            };
-            let SurfaceFrame::Event {
-                surface,
-                event,
-                payload,
-            } = frame
-            else {
-                continue;
-            };
-            if event != "message.received" {
-                continue;
+                received = rx.recv() => {
+                    let frame = match received {
+                        Ok(frame) => frame,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(skipped, "surface ingress dispatcher lagged");
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    };
+                    let SurfaceFrame::Event {
+                        surface,
+                        event,
+                        payload,
+                    } = frame
+                    else {
+                        continue;
+                    };
+                    let state = state.clone();
+                    enqueue_surface_trigger_event(state.clone(), &surface, &event, &payload);
+                    if event != "message.received" {
+                        continue;
+                    }
+                    let session_locks = session_locks.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) =
+                            handle_surface_message(state, session_locks, surface, payload).await
+                        {
+                            tracing::warn!(error = %error, "surface ingress message handling failed");
+                        }
+                    });
+                }
             }
-            let state = state.clone();
-            let session_locks = session_locks.clone();
-            tokio::spawn(async move {
-                if let Err(error) =
-                    handle_surface_message(state, session_locks, surface, payload).await
-                {
-                    tracing::warn!(error = %error, "surface ingress message handling failed");
-                }
-            });
         }
     });
+}
+
+/// Persist a Surface transport event before attempting Runtime delivery.  The
+/// persisted record is the recoverable transport handoff; it is intentionally
+/// not a second scheduler or source-matching implementation.
+fn enqueue_surface_trigger_event(
+    state: Arc<AppState>,
+    surface: &str,
+    event_type: &str,
+    payload: &serde_json::Value,
+) {
+    let event = normalize_surface_event(surface, event_type, payload);
+    match state
+        .services
+        .surface
+        .record_trigger_event_received(surface, event_type, &event, payload)
+    {
+        Ok(receipt) if !receipt.duplicate => {
+            let idempotency_key = receipt.record.idempotency_key;
+            tokio::spawn(async move {
+                dispatch_surface_trigger_event(state, idempotency_key).await;
+            });
+        }
+        Ok(receipt) => {
+            tracing::debug!(
+                surface,
+                event = event_type,
+                status = %receipt.record.status,
+                "surface trigger event ignored as durable duplicate"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                surface,
+                event = event_type,
+                error = %error,
+                "surface trigger event could not be persisted"
+            );
+        }
+    }
+}
+
+async fn retry_surface_trigger_events(state: &Arc<AppState>) {
+    for record in state.services.surface.due_trigger_event_retries() {
+        dispatch_surface_trigger_event(state.clone(), record.idempotency_key).await;
+    }
+}
+
+async fn dispatch_surface_trigger_event(state: Arc<AppState>, idempotency_key: String) {
+    let record = match state
+        .services
+        .surface
+        .mark_trigger_event_dispatching(&idempotency_key)
+    {
+        Ok(Some(record)) => record,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%idempotency_key, error = %error, "surface trigger event claim failed");
+            return;
+        }
+    };
+    let result = state
+        .services
+        .runtime
+        .as_ref()
+        .ok_or_else(|| "runtime service unavailable".to_string())
+        .and_then(|runtime| {
+            runtime
+                .runtime_services()
+                .accept_managed_agent_event(record.trigger.clone())
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        });
+    match result {
+        Ok(()) => {
+            if let Err(error) = state
+                .services
+                .surface
+                .mark_trigger_event_accepted(&idempotency_key)
+            {
+                tracing::error!(%idempotency_key, error = %error, "Runtime accepted surface trigger but receipt persistence failed");
+            }
+        }
+        Err(error) => {
+            match state
+                .services
+                .surface
+                .mark_trigger_event_failed(&idempotency_key, &error)
+            {
+                Ok(updated) => tracing::warn!(
+                    surface = %updated.surface,
+                    event = %updated.event_type,
+                    attempts = updated.attempts,
+                    max_attempts = updated.max_attempts,
+                    status = %updated.status,
+                    error = %error,
+                    "surface trigger event Runtime handoff failed"
+                ),
+                Err(persistence_error) => tracing::error!(
+                    %idempotency_key,
+                    error = %persistence_error,
+                    runtime_error = %error,
+                    "surface trigger event failure could not be persisted"
+                ),
+            }
+        }
+    }
+}
+
+/// Normalize one Surface transport event into the Runtime-owned trigger
+/// contract. This deliberately performs no matching, authorization or
+/// scheduling: those decisions are durable Dispatcher responsibilities.
+fn normalize_surface_event(
+    surface: &str,
+    event_type: &str,
+    payload: &serde_json::Value,
+) -> harness_contract::managed_agent::ManagedAgentTriggerEvent {
+    let event_local_id = payload_string(payload, "event_id")
+        .or_else(|| payload_string(payload, "message_id"))
+        .or_else(|| payload_string(payload, "id"))
+        .unwrap_or_else(|| payload_fingerprint_id(surface, payload));
+    let session_id = surface_session_id(surface, payload);
+    let thread_id = payload_string(payload, "thread_id");
+    let user_id = payload_string(payload, "user_id");
+    let mut attributes = BTreeMap::new();
+    attributes.insert("surface".to_string(), surface.to_string());
+    attributes.insert("session_id".to_string(), session_id.clone());
+    if let Some(thread_id) = thread_id {
+        attributes.insert("thread_id".to_string(), thread_id);
+    }
+    if let Some(user_id) = user_id {
+        attributes.insert("user_id".to_string(), user_id);
+    }
+    let stable_key = format!("surface-event:{surface}:{event_type}:{event_local_id}");
+    harness_contract::managed_agent::ManagedAgentTriggerEvent {
+        event_id: stable_key.clone(),
+        source_id: surface.to_string(),
+        source_kind: "surface".to_string(),
+        event_type: event_type.to_string(),
+        subject: session_id,
+        payload_ref: format!("surface-event:{stable_key}"),
+        payload_digest: format!(
+            "sha256:{:x}",
+            Sha256::digest(payload.to_string().as_bytes())
+        ),
+        occurred_at_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64,
+        source_sequence: None,
+        idempotency_key: stable_key.clone(),
+        source_capabilities: vec!["surface.event.receive".to_string()],
+        attributes,
+        trace_refs: vec![format!("surface:{surface}:event:{event_local_id}")],
+    }
 }
 
 async fn handle_surface_message(
@@ -82,7 +240,7 @@ async fn handle_surface_message(
         .ok_or_else(|| "surface message has no text content".to_string())?;
     let session_id = surface_session_id(&surface, &payload);
     let session_lock = surface_session_lock(&session_locks, &session_id).await;
-    let _session_guard = session_lock.lock().await;
+    let session_guard = session_lock.lock().await;
     let user_id = payload_string(&payload, "user_id");
     let thread_id = payload_string(&payload, "thread_id");
     let metadata = payload
@@ -146,18 +304,82 @@ async fn handle_surface_message(
     let current_resources =
         register_surface_resources(&state, &surface, &session_id, &current_media);
     let recent_resources = register_surface_resources(&state, &surface, &session_id, &recent_media);
+    append_surface_resource_evidence(
+        &state,
+        &surface,
+        &session_id,
+        &message_id,
+        &current_resources,
+        &recent_resources,
+    )
+    .await?;
     let pre_messages = surface_runtime_pre_messages(&content, &current_media, &recent_media);
     let runtime_content = surface_runtime_content(&content, &current_resources, &recent_resources);
     let turn_policy = surface_turn_policy(&runtime_content);
-    let execution = match runtime_service
-        .run_turn_with_options(
+    if runtime_service
+        .session_input_projection(&session_id)
+        .await
+        .map_err(|error| error.message())?
+        .active_turn_id
+        .is_some()
+    {
+        let receipt = runtime_service
+            .admit_session_input(
+                SessionInputEnvelope::text(
+                    session_id.clone(),
+                    InputSourceKind::Surface,
+                    runtime_content,
+                )
+                .with_source_ref(format!("surface:{surface}"))
+                .with_source_message_id(message_id.clone())
+                .with_idempotency_key(inbox.record.idempotency_key.clone())
+                .with_metadata(serde_json::json!({
+                    "surface": surface.clone(),
+                    "thread_id": thread_id.clone(),
+                    "user_id": user_id.clone(),
+                    "payload_metadata": metadata,
+                })),
+            )
+            .await
+            .map_err(|error| error.message())?;
+        state.services.surface.mark_inbox_processed(
+            &inbox.record.idempotency_key,
+            receipt.active_turn_id.as_ref().map(ToString::to_string),
+        )?;
+        append_surface_timeline_event(
+            &state,
             &session_id,
+            "SurfaceMessageAttachedToActiveTurn",
+            serde_json::json!({
+                "type": "SurfaceMessageAttachedToActiveTurn",
+                "surface": surface.clone(),
+                "message_id": message_id.clone(),
+                "input_receipt": receipt,
+            }),
+        )
+        .await?;
+        notify_surface_processing_lifecycle(
+            &state,
+            &surface,
+            MessageActionKind::ProcessingComplete.as_str(),
+            &message_id,
             None,
+        )
+        .await;
+        return Ok(());
+    }
+    drop(session_guard);
+    let accepted_turn = runtime_service
+        .accept_turn_with_options(&session_id, None, runtime_content.clone())
+        .await
+        .map_err(|error| error.message())?;
+    let execution = match runtime_service
+        .run_accepted_turn_with_options(
+            &session_id,
+            accepted_turn.turn_id.clone(),
             runtime_content,
-            turn_policy.timeout,
             RuntimeTurnOptions {
                 profile: turn_policy.profile,
-                max_iterations: Some(turn_policy.max_iterations),
                 pre_messages,
             },
         )
@@ -194,7 +416,7 @@ async fn handle_surface_message(
             notify_surface_processing_lifecycle(
                 &state,
                 &surface,
-                "message.processing_failed",
+                MessageActionKind::ProcessingFailed.as_str(),
                 &message_id,
                 Some(message.clone()),
             )
@@ -235,7 +457,7 @@ async fn handle_surface_message(
         notify_surface_processing_lifecycle(
             &state,
             &surface,
-            "message.processing_complete",
+            MessageActionKind::ProcessingComplete.as_str(),
             &message_id,
             None,
         )
@@ -252,6 +474,7 @@ async fn handle_surface_message(
         recipient,
         thread: thread_id,
         text: response_text,
+        idempotency_key: Some(format!("surface-reply:{surface}:{message_id}")),
         metadata: serde_json::json!({
             "reply_to": platform_reply_to,
             "local_reply_to": message_id,
@@ -281,7 +504,7 @@ async fn handle_surface_message(
             notify_surface_processing_lifecycle(
                 &state,
                 &surface,
-                "message.processing_failed",
+                MessageActionKind::ProcessingFailed.as_str(),
                 &message_id,
                 Some(error.clone()),
             )
@@ -311,7 +534,7 @@ async fn handle_surface_message(
         notify_surface_processing_lifecycle(
             &state,
             &surface,
-            "message.processing_failed",
+            MessageActionKind::ProcessingFailed.as_str(),
             &message_id,
             Some(error.message.clone()),
         )
@@ -325,7 +548,7 @@ async fn handle_surface_message(
     notify_surface_processing_lifecycle(
         &state,
         &surface,
-        "message.processing_complete",
+        MessageActionKind::ProcessingComplete.as_str(),
         &message_id,
         None,
     )
@@ -426,23 +649,11 @@ fn surface_turn_policy(content: &str) -> SurfaceTurnPolicy {
     if profile != runtime::ContextProfile::DeepInvestigation
         && surface_content_has_media_attachment(content)
     {
-        return SurfaceTurnPolicy {
-            profile,
-            timeout: SURFACE_MEDIA_WALL_CLOCK,
-            max_iterations: SURFACE_MEDIA_MAX_ITERATIONS,
-        };
+        return SurfaceTurnPolicy { profile };
     }
     match profile {
-        runtime::ContextProfile::DeepInvestigation => SurfaceTurnPolicy {
-            profile,
-            timeout: SURFACE_DEEP_WALL_CLOCK,
-            max_iterations: SURFACE_DEEP_MAX_ITERATIONS,
-        },
-        _ => SurfaceTurnPolicy {
-            profile,
-            timeout: SURFACE_QUICK_WALL_CLOCK,
-            max_iterations: SURFACE_QUICK_MAX_ITERATIONS,
-        },
+        runtime::ContextProfile::DeepInvestigation => SurfaceTurnPolicy { profile },
+        _ => SurfaceTurnPolicy { profile },
     }
 }
 
@@ -481,6 +692,7 @@ async fn send_surface_failure_notice(
             recipient,
             thread,
             text: surface_failure_notice_text(error),
+            idempotency_key: Some(format!("surface-failure:{surface}:{message_id}")),
             metadata: serde_json::json!({
                 "reply_to": platform_reply_to,
                 "local_reply_to": message_id,
@@ -544,6 +756,60 @@ async fn append_surface_timeline_event(
         .map_err(|error| error.to_string())
 }
 
+async fn append_surface_resource_evidence(
+    state: &AppState,
+    surface: &str,
+    session_id: &str,
+    message_id: &str,
+    current_resources: &[SurfaceResourceRegistration],
+    recent_resources: &[SurfaceResourceRegistration],
+) -> Result<(), String> {
+    if current_resources.is_empty() && recent_resources.is_empty() {
+        return Ok(());
+    }
+    append_surface_timeline_event(
+        state,
+        session_id,
+        "SurfaceMessageResourcesRegistered",
+        serde_json::json!({
+            "type": "SurfaceMessageResourcesRegistered",
+            "surface": surface,
+            "message_id": message_id,
+            "current": surface_resource_evidence_rows(current_resources),
+            "recent": surface_resource_evidence_rows(recent_resources),
+        }),
+    )
+    .await
+}
+
+fn surface_resource_evidence_rows(
+    resources: &[SurfaceResourceRegistration],
+) -> Vec<serde_json::Value> {
+    resources
+        .iter()
+        .map(|registration| {
+            let resource = registration.resource.as_ref().map(|(resource, hint)| {
+                serde_json::json!({
+                    "resource_id": resource.id,
+                    "uri": resource.uri,
+                    "kind": resource.kind,
+                    "declared_mime": resource.declared_mime,
+                    "detected_mime": resource.detected_mime,
+                    "storage_path": resource.storage_path,
+                    "hint": hint,
+                })
+            });
+            serde_json::json!({
+                "source_message_id": registration.attachment.source_message_id,
+                "local_path": registration.attachment.local_path,
+                "media_type": registration.attachment.media_type,
+                "resource": resource,
+                "status": if registration.resource.is_some() { "registered" } else { "failed" },
+            })
+        })
+        .collect()
+}
+
 async fn ensure_surface_runtime_session(
     state: &AppState,
     surface: &str,
@@ -557,6 +823,7 @@ async fn ensure_surface_runtime_session(
         .as_ref()
         .ok_or_else(|| "runtime service unavailable".to_string())?;
     if runtime_service.has_active_session(session_id) {
+        ensure_surface_mission_registration(state, surface, session_id, user_id, metadata).await?;
         return Ok(());
     }
     let model = default_surface_session_model(state);
@@ -566,6 +833,9 @@ async fn ensure_surface_runtime_session(
     let runtime = if let Some(store) = state.services.session.unified_store() {
         crate::runtime_factory::create_runtime_entry_with_session_store(
             store,
+            runtime_service.runtime_services(),
+            runtime_service.provider_registry(),
+            runtime_service.tool_host(),
             session,
             session_id,
             model.clone(),
@@ -579,6 +849,9 @@ async fn ensure_surface_runtime_session(
         )
     } else {
         crate::runtime_factory::create_runtime_entry(
+            runtime_service.runtime_services(),
+            runtime_service.provider_registry(),
+            runtime_service.tool_host(),
             session,
             session_id,
             model.clone(),
@@ -595,23 +868,7 @@ async fn ensure_surface_runtime_session(
     runtime_service
         .register_runtime(session_id.to_string(), runtime)
         .map_err(|error| error.to_string())?;
-    if state.services.session.has_unified_store()
-        && state
-            .services
-            .session
-            .stored_session(session_id)
-            .await
-            .map_err(|error| error.to_string())?
-            .is_none()
-    {
-        let record = surface_session_record(surface, session_id, user_id, Some(model), metadata);
-        state
-            .services
-            .session
-            .upsert_stored_session(&record)
-            .await
-            .map_err(|error| error.to_string())?;
-    }
+    ensure_surface_mission_registration(state, surface, session_id, user_id, metadata).await?;
     state
         .services
         .session
@@ -629,6 +886,79 @@ async fn ensure_surface_runtime_session(
     Ok(())
 }
 
+async fn ensure_surface_mission_registration(
+    state: &AppState,
+    surface: &str,
+    session_id: &str,
+    user_id: Option<&str>,
+    metadata: &serde_json::Value,
+) -> Result<(), String> {
+    if !state.services.session.has_unified_store() {
+        return Ok(());
+    }
+    let mut record = state
+        .services
+        .session
+        .stored_session(session_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .unwrap_or_else(|| {
+            surface_session_record(
+                surface,
+                session_id,
+                user_id,
+                Some(default_surface_session_model(state)),
+                metadata,
+            )
+        });
+    let mut record_metadata = record
+        .metadata_json
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    record_metadata["workspace_root"] =
+        serde_json::Value::String(state.workspace_root.display().to_string());
+    record.metadata_json = Some(record_metadata.to_string());
+    let runtime = state
+        .services
+        .runtime
+        .as_ref()
+        .ok_or_else(|| "runtime service unavailable".to_string())?;
+    let workspace_key = runtime.runtime_services().workspace_key().to_string();
+    let title = record_metadata
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("{} {}", surface, &session_id[..session_id.len().min(8)]));
+    let request = SessionMissionOutboxRequest {
+        request_id: format!(
+            "mission:{workspace_key}:register:{}:{}",
+            record.session_id, record.created_at
+        ),
+        session_id: record.session_id.clone(),
+        title,
+        workspace_key,
+        operation: SessionMissionOutboxOperation::Register,
+        created_at_ms: current_time_ms(),
+    };
+    state
+        .services
+        .session
+        .upsert_stored_session_with_mission_outbox(&record, &request)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 fn surface_system_prompt(surface: &str) -> Vec<String> {
     vec![format!(
         "你正在通过 `{surface}` 外部 surface 回复用户。必须优先给出可见、简洁、可执行的阶段性结果。\
@@ -640,6 +970,7 @@ fn surface_system_prompt(surface: &str) -> Vec<String> {
 
 fn surface_session_id(surface: &str, payload: &serde_json::Value) -> String {
     payload_string(payload, "session")
+        .or_else(|| payload_string(payload, "session_id"))
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| {
             let metadata = payload.get("metadata").unwrap_or(&serde_json::Value::Null);
@@ -683,10 +1014,13 @@ fn surface_runtime_content(
     }
     let mut rendered = content.to_string();
 
+    let mut resource_ids = std::collections::BTreeSet::new();
     let resource_pairs = current_resources
         .iter()
         .chain(recent_resources.iter())
-        .filter_map(|registration| registration.resource.clone())
+        .filter_map(|registration| registration.resource.as_ref())
+        .filter(|(resource, _)| resource_ids.insert(resource.id.clone()))
+        .map(|(resource, hint)| hint.prompt_hint(resource))
         .collect::<Vec<_>>();
     rendered.push_str(&runtime::render_resource_context_markdown(&resource_pairs));
 
@@ -718,8 +1052,11 @@ fn register_surface_resources(
     media
         .iter()
         .map(|attachment| {
-            match runtime::register_resource_from_path(
+            let store = runtime::ResourceStore::for_config_home_with_capabilities(
                 &state.config_home,
+                state.services.resource_capability_index(),
+            );
+            match store.register_resource_from_path(
                 &attachment.local_path,
                 format!("surface:{surface}"),
                 Some(attachment.source_message_id.clone()),
@@ -1002,6 +1339,17 @@ mod tests {
     }
 
     #[test]
+    fn surface_session_id_accepts_canonical_session_id() {
+        let payload = serde_json::json!({
+            "session_id": "session-canonical",
+            "user_id": "user-a",
+            "thread_id": "chat-a"
+        });
+
+        assert_eq!(surface_session_id("feishu", &payload), "session-canonical");
+    }
+
+    #[test]
     fn surface_session_id_uses_surface_user_and_chat() {
         let payload = serde_json::json!({
             "user_id": "user-a",
@@ -1047,21 +1395,17 @@ mod tests {
     }
 
     #[test]
-    fn readme_followup_uses_deep_surface_budget() {
+    fn readme_followup_uses_deep_surface_profile_without_business_budget() {
         let policy = surface_turn_policy("我已经更新，看是否最新的readme还有问题");
 
         assert_eq!(policy.profile, runtime::ContextProfile::DeepInvestigation);
-        assert_eq!(policy.max_iterations, SURFACE_DEEP_MAX_ITERATIONS);
-        assert_eq!(policy.timeout, SURFACE_DEEP_WALL_CLOCK);
     }
 
     #[test]
-    fn short_surface_message_uses_quick_budget() {
+    fn short_surface_message_uses_quick_profile_without_business_budget() {
         let policy = surface_turn_policy("你好");
 
         assert_eq!(policy.profile, runtime::ContextProfile::SurfaceQuickReply);
-        assert_eq!(policy.max_iterations, SURFACE_QUICK_MAX_ITERATIONS);
-        assert_eq!(policy.timeout, SURFACE_QUICK_WALL_CLOCK);
     }
 
     #[test]
@@ -1071,8 +1415,6 @@ mod tests {
         );
 
         assert_eq!(policy.profile, runtime::ContextProfile::SurfaceQuickReply);
-        assert_eq!(policy.max_iterations, SURFACE_MEDIA_MAX_ITERATIONS);
-        assert_eq!(policy.timeout, SURFACE_MEDIA_WALL_CLOCK);
     }
 
     #[test]
@@ -1082,8 +1424,6 @@ mod tests {
         );
 
         assert_eq!(policy.profile, runtime::ContextProfile::DeepInvestigation);
-        assert_eq!(policy.max_iterations, SURFACE_DEEP_MAX_ITERATIONS);
-        assert_eq!(policy.timeout, SURFACE_DEEP_WALL_CLOCK);
     }
 
     #[test]
@@ -1260,5 +1600,38 @@ mod tests {
         assert!(text.contains("已经进入 Cowd"));
         assert!(text.contains("turn timed out after 240s"));
         assert!(text.contains("重放"));
+    }
+
+    #[test]
+    fn surface_events_normalize_to_stable_runtime_trigger_contracts() {
+        let payload = serde_json::json!({
+            "message_id": "om_123",
+            "thread_id": "chat_456",
+            "user_id": "user_789",
+            "session_id": "session_ops",
+            "text": "inspect the incident"
+        });
+
+        let event = normalize_surface_event("feishu", "message.received", &payload);
+
+        assert_eq!(
+            event.event_id,
+            "surface-event:feishu:message.received:om_123"
+        );
+        assert_eq!(event.idempotency_key, event.event_id);
+        assert_eq!(event.source_id, "feishu");
+        assert_eq!(event.source_kind, "surface");
+        assert_eq!(event.subject, "session_ops");
+        assert_eq!(event.source_capabilities, vec!["surface.event.receive"]);
+        assert_eq!(
+            event.attributes.get("thread_id"),
+            Some(&"chat_456".to_string())
+        );
+        assert_eq!(
+            event.attributes.get("user_id"),
+            Some(&"user_789".to_string())
+        );
+        assert!(event.payload_digest.starts_with("sha256:"));
+        assert_eq!(event.trace_refs, vec!["surface:feishu:event:om_123"]);
     }
 }

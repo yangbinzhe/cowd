@@ -252,11 +252,13 @@ impl ProfileManager {
                 poisoned.into_inner()
             })
             .clone();
-        self.get_profile(&active).unwrap_or_else(|| {
-            // Fallback to default if active is somehow invalid
-            self.get_profile("default")
-                .expect("default profile must exist")
-        })
+        self.get_profile(&active)
+            .or_else(|| self.get_profile("default"))
+            .unwrap_or_else(|| Profile {
+                id: "default".to_string(),
+                name: "default".to_string(),
+                base_dir: self.profiles_dir.join("default"),
+            })
     }
 
     /// Switch the active profile.

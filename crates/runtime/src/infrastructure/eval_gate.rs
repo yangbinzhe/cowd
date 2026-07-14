@@ -1,17 +1,17 @@
 //! CowdBench evaluation contracts and lightweight scoring.
 
-use harness_contract::core::ExecutionMode;
+use harness_contract::core::{ExecutionModifier, ExecutionPattern};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BenchCaseKind {
     SimpleAnswer,
-    FastEdit,
+    BoundedChange,
     ArchitecturePlan,
     ContextAssembly,
     VerificationGuard,
-    WorkGraphFanout,
+    ExecutionGraphFanout,
     ToolTransaction,
     BehaviorMinimalScope,
     MemoryGrowthLoop,
@@ -24,7 +24,9 @@ pub struct CowdBenchCase {
     pub id: String,
     pub kind: BenchCaseKind,
     pub prompt: String,
-    pub expected_mode: ExecutionMode,
+    pub expected_mode: ExecutionPattern,
+    #[serde(default)]
+    pub expected_modifiers: Vec<ExecutionModifier>,
     pub required_checks: Vec<String>,
 }
 
@@ -33,15 +35,24 @@ impl CowdBenchCase {
     pub fn new(
         kind: BenchCaseKind,
         prompt: impl Into<String>,
-        expected_mode: ExecutionMode,
+        expected_mode: ExecutionPattern,
     ) -> Self {
         Self {
             id: format!("cowdbench-{}", uuid::Uuid::new_v4()),
             kind,
             prompt: prompt.into(),
             expected_mode,
+            expected_modifiers: Vec::new(),
             required_checks: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_expected_modifier(mut self, modifier: ExecutionModifier) -> Self {
+        if !self.expected_modifiers.contains(&modifier) {
+            self.expected_modifiers.push(modifier);
+        }
+        self
     }
 }
 
@@ -54,7 +65,9 @@ pub struct TrajectoryEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Trajectory {
     pub case_id: String,
-    pub selected_mode: ExecutionMode,
+    pub selected_pattern: ExecutionPattern,
+    #[serde(default)]
+    pub selected_modifiers: Vec<ExecutionModifier>,
     pub checks_passed: Vec<String>,
     pub checks_failed: Vec<String>,
     pub events: Vec<TrajectoryEvent>,
@@ -62,14 +75,23 @@ pub struct Trajectory {
 
 impl Trajectory {
     #[must_use]
-    pub fn new(case_id: impl Into<String>, selected_mode: ExecutionMode) -> Self {
+    pub fn new(case_id: impl Into<String>, selected_pattern: ExecutionPattern) -> Self {
         Self {
             case_id: case_id.into(),
-            selected_mode,
+            selected_pattern,
+            selected_modifiers: Vec::new(),
             checks_passed: Vec::new(),
             checks_failed: Vec::new(),
             events: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_modifier(mut self, modifier: ExecutionModifier) -> Self {
+        if !self.selected_modifiers.contains(&modifier) {
+            self.selected_modifiers.push(modifier);
+        }
+        self
     }
 
     #[must_use]
@@ -182,7 +204,7 @@ pub struct CowdBenchSmokeSuite {
 pub struct ScenarioSpec {
     pub id: String,
     pub prompt: String,
-    pub expected_mode: Option<ExecutionMode>,
+    pub expected_mode: Option<ExecutionPattern>,
     pub required_checks: Vec<ScenarioCheck>,
 }
 
@@ -198,7 +220,7 @@ impl ScenarioSpec {
     }
 
     #[must_use]
-    pub const fn expect_mode(mut self, mode: ExecutionMode) -> Self {
+    pub const fn expect_mode(mut self, mode: ExecutionPattern) -> Self {
         self.expected_mode = Some(mode);
         self
     }
@@ -215,8 +237,8 @@ impl ScenarioSpec {
 pub enum ScenarioCheckKind {
     FinalizationBlocked,
     RegressionAllowed,
-    WorkgraphPresent,
-    WorkgraphQualityOk,
+    ExecutionGraphPresent,
+    ExecutionGraphQualityOk,
     GrowthBlocker,
     GrowthSignal,
     MemoryCandidateCount,
@@ -314,11 +336,11 @@ impl ScenarioCheck {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScenarioObservation {
     pub scenario_id: String,
-    pub strategy_mode: ExecutionMode,
-    pub finalization_blocked: bool,
+    pub strategy_pattern: ExecutionPattern,
+    pub verification_blocked: bool,
     pub regression_allowed: bool,
-    pub has_workgraph: bool,
-    pub workgraph_quality_ok: bool,
+    pub has_execution_graph: bool,
+    pub execution_graph_quality_ok: bool,
     pub growth_has_blocker: bool,
     pub growth_signal_kinds: Vec<String>,
     pub memory_candidate_count: usize,
@@ -412,12 +434,12 @@ pub fn evaluate_scenario(
 ) -> ScenarioVerdict {
     let mut failed_checks = Vec::new();
     if let Some(expected_mode) = spec.expected_mode {
-        if observation.strategy_mode != expected_mode {
+        if observation.strategy_pattern != expected_mode {
             failed_checks.push(FailedScenarioCheck {
-                check_id: "strategy.mode".to_string(),
+                check_id: "strategy.pattern".to_string(),
                 owner: "ai-strategy".to_string(),
                 expected: expected_mode.as_str().to_string(),
-                actual: observation.strategy_mode.as_str().to_string(),
+                actual: observation.strategy_pattern.as_str().to_string(),
                 repair_hint: "inspect strategy classifier and experience adapter".to_string(),
             });
         }
@@ -448,12 +470,14 @@ fn evaluate_check(
 ) -> Option<FailedScenarioCheck> {
     match check.kind {
         ScenarioCheckKind::FinalizationBlocked => {
-            compare_bool(check, observation.finalization_blocked)
+            compare_bool(check, observation.verification_blocked)
         }
         ScenarioCheckKind::RegressionAllowed => compare_bool(check, observation.regression_allowed),
-        ScenarioCheckKind::WorkgraphPresent => compare_bool(check, observation.has_workgraph),
-        ScenarioCheckKind::WorkgraphQualityOk => {
-            compare_bool(check, observation.workgraph_quality_ok)
+        ScenarioCheckKind::ExecutionGraphPresent => {
+            compare_bool(check, observation.has_execution_graph)
+        }
+        ScenarioCheckKind::ExecutionGraphQualityOk => {
+            compare_bool(check, observation.execution_graph_quality_ok)
         }
         ScenarioCheckKind::GrowthBlocker => compare_bool(check, observation.growth_has_blocker),
         ScenarioCheckKind::GrowthSignal => match check.expected_text.as_ref() {
@@ -590,7 +614,7 @@ impl CowdBenchSmokeSuite {
             "strategy".to_string(),
             "context".to_string(),
             "verification".to_string(),
-            "workgraph".to_string(),
+            "execution_graph".to_string(),
             "tool_transaction".to_string(),
             "policy".to_string(),
             "behavior".to_string(),
@@ -626,67 +650,67 @@ pub fn cowdbench_smoke_cases() -> Vec<CowdBenchCase> {
         (
             BenchCaseKind::SimpleAnswer,
             "explain this function",
-            ExecutionMode::DirectAnswer,
+            ExecutionPattern::Direct,
             "answered",
         ),
         (
-            BenchCaseKind::FastEdit,
+            BenchCaseKind::BoundedChange,
             "fix one small file",
-            ExecutionMode::FastEdit,
+            ExecutionPattern::Execute,
             "guardrails",
         ),
         (
             BenchCaseKind::ArchitecturePlan,
             "plan a multi-crate architecture change",
-            ExecutionMode::PlanExecute,
-            "workgraph",
+            ExecutionPattern::Execute,
+            "execution_graph",
         ),
         (
             BenchCaseKind::ContextAssembly,
             "assemble relevant memory and workspace context",
-            ExecutionMode::ReActLoop,
+            ExecutionPattern::Execute,
             "context_epoch",
         ),
         (
             BenchCaseKind::VerificationGuard,
             "verify claims before final answer",
-            ExecutionMode::PlanExecute,
+            ExecutionPattern::Execute,
             "verification_report",
         ),
         (
-            BenchCaseKind::WorkGraphFanout,
+            BenchCaseKind::ExecutionGraphFanout,
             "parallel multi-agent implementation",
-            ExecutionMode::SupervisorSubagents,
+            ExecutionPattern::Collaborate,
             "value_verdict",
         ),
         (
             BenchCaseKind::ToolTransaction,
             "write files safely with rollback discipline",
-            ExecutionMode::RiskGate,
+            ExecutionPattern::Execute,
             "tool_transaction",
         ),
         (
             BenchCaseKind::BehaviorMinimalScope,
             "avoid unnecessary abstractions while preserving safety",
-            ExecutionMode::FastEdit,
+            ExecutionPattern::Execute,
             "minimal_scope",
         ),
         (
             BenchCaseKind::MemoryGrowthLoop,
             "turn runtime learning into reviewable memory candidates",
-            ExecutionMode::PlanExecute,
+            ExecutionPattern::Execute,
             "memory_candidate",
         ),
         (
             BenchCaseKind::MatrixEvidenceSignal,
             "emit matrix-compatible evidence and quality signals",
-            ExecutionMode::PlanExecute,
+            ExecutionPattern::Execute,
             "matrix_signal",
         ),
         (
             BenchCaseKind::HarnessReceipt,
             "produce a harness receipt for the completed AI turn",
-            ExecutionMode::PlanExecute,
+            ExecutionPattern::Execute,
             "harness_receipt",
         ),
     ];
@@ -704,7 +728,7 @@ fn capability_for_check(check: &str) -> Option<&'static str> {
     match check {
         "answered" => Some("strategy"),
         "guardrails" => Some("policy"),
-        "workgraph" | "value_verdict" => Some("workgraph"),
+        "execution_graph" | "value_verdict" => Some("execution_graph"),
         "context_epoch" => Some("context"),
         "verification_report" => Some("verification"),
         "tool_transaction" => Some("tool_transaction"),
@@ -720,13 +744,26 @@ fn capability_for_check(check: &str) -> Option<&'static str> {
 pub fn score_case(case: &CowdBenchCase, trajectory: &Trajectory) -> BenchCaseResult {
     let mut score = 0.0f32;
     let mut reasons = Vec::new();
-    if case.expected_mode == trajectory.selected_mode {
-        score += 0.5;
+    if case.expected_mode == trajectory.selected_pattern {
+        score += 0.4;
     } else {
         reasons.push(format!(
             "mode mismatch: expected {}, got {}",
             case.expected_mode.as_str(),
-            trajectory.selected_mode.as_str()
+            trajectory.selected_pattern.as_str()
+        ));
+    }
+    let missing_modifiers = case
+        .expected_modifiers
+        .iter()
+        .filter(|modifier| !trajectory.selected_modifiers.contains(modifier))
+        .collect::<Vec<_>>();
+    let modifiers_satisfied = missing_modifiers.is_empty();
+    if modifiers_satisfied {
+        score += 0.1;
+    } else {
+        reasons.push(format!(
+            "missing execution modifiers: {missing_modifiers:?}"
         ));
     }
     let required_count = case.required_checks.len();
@@ -751,7 +788,7 @@ pub fn score_case(case: &CowdBenchCase, trajectory: &Trajectory) -> BenchCaseRes
     }
     BenchCaseResult {
         case_id: case.id.clone(),
-        passed: score >= 0.8 && trajectory.checks_failed.is_empty(),
+        passed: score >= 0.8 && trajectory.checks_failed.is_empty() && modifiers_satisfied,
         score,
         reasons,
     }
@@ -798,11 +835,11 @@ mod tests {
         let mut case = CowdBenchCase::new(
             BenchCaseKind::SimpleAnswer,
             "explain this",
-            ExecutionMode::DirectAnswer,
+            ExecutionPattern::Direct,
         );
         case.required_checks.push("answered".to_string());
         let trajectory =
-            Trajectory::new(case.id.clone(), ExecutionMode::DirectAnswer).pass("answered");
+            Trajectory::new(case.id.clone(), ExecutionPattern::Direct).pass("answered");
 
         let result = score_case(&case, &trajectory);
 
@@ -811,18 +848,19 @@ mod tests {
     }
 
     #[test]
-    fn mode_mismatch_is_penalized() {
+    fn missing_modifier_is_penalized() {
         let case = CowdBenchCase::new(
-            BenchCaseKind::FastEdit,
+            BenchCaseKind::BoundedChange,
             "small edit",
-            ExecutionMode::FastEdit,
-        );
-        let trajectory = Trajectory::new(case.id.clone(), ExecutionMode::PlanExecute);
+            ExecutionPattern::Execute,
+        )
+        .with_expected_modifier(ExecutionModifier::BoundedChange);
+        let trajectory = Trajectory::new(case.id.clone(), ExecutionPattern::Execute);
 
         let result = score_case(&case, &trajectory);
 
         assert!(!result.passed);
-        assert!(result.reasons[0].contains("mode mismatch"));
+        assert!(result.reasons[0].contains("missing execution modifiers"));
     }
 
     #[test]
@@ -830,7 +868,7 @@ mod tests {
         let case = CowdBenchCase::new(
             BenchCaseKind::ToolTransaction,
             "write safely",
-            ExecutionMode::RiskGate,
+            ExecutionPattern::Execute,
         );
         let report = score_report(&[case], &[]);
 
@@ -869,9 +907,9 @@ mod tests {
     #[test]
     fn scenario_suite_reports_owner_and_repair_hint() {
         let spec = ScenarioSpec::new("empty_answer", "answer this")
-            .expect_mode(ExecutionMode::DirectAnswer)
+            .expect_mode(ExecutionPattern::Direct)
             .require(ScenarioCheck::bool(
-                "verification.finalization_blocked",
+                "verification.verification_blocked",
                 ScenarioCheckKind::FinalizationBlocked,
                 true,
                 "ai-verification/runtime-conversation",
@@ -879,11 +917,11 @@ mod tests {
             ));
         let observation = ScenarioObservation {
             scenario_id: "empty_answer".to_string(),
-            strategy_mode: ExecutionMode::DirectAnswer,
-            finalization_blocked: false,
+            strategy_pattern: ExecutionPattern::Direct,
+            verification_blocked: false,
             regression_allowed: true,
-            has_workgraph: false,
-            workgraph_quality_ok: false,
+            has_execution_graph: false,
+            execution_graph_quality_ok: false,
             growth_has_blocker: false,
             growth_signal_kinds: Vec::new(),
             memory_candidate_count: 0,
@@ -907,7 +945,7 @@ mod tests {
     #[test]
     fn scenario_suite_accepts_growth_signal_checks() {
         let spec = ScenarioSpec::new("matrix_quality", "quality gate")
-            .expect_mode(ExecutionMode::PlanExecute)
+            .expect_mode(ExecutionPattern::Execute)
             .require(ScenarioCheck::growth_signal(
                 "growth.matrix_quality_gate",
                 "MatrixQualityGate",
@@ -916,11 +954,11 @@ mod tests {
             ));
         let observation = ScenarioObservation {
             scenario_id: "matrix_quality".to_string(),
-            strategy_mode: ExecutionMode::PlanExecute,
-            finalization_blocked: false,
+            strategy_pattern: ExecutionPattern::Execute,
+            verification_blocked: false,
             regression_allowed: false,
-            has_workgraph: false,
-            workgraph_quality_ok: false,
+            has_execution_graph: false,
+            execution_graph_quality_ok: false,
             growth_has_blocker: true,
             growth_signal_kinds: vec!["MatrixQualityGate".to_string()],
             memory_candidate_count: 1,

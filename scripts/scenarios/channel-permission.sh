@@ -13,9 +13,17 @@ CONFIG_HOME="$TMP_DIR/config"
 HOME_DIR="$TMP_DIR/home"
 LOG="$TMP_DIR/gateway.log"
 SUFFIX="channel-permission-$$"
-PRINCIPAL="user:$SUFFIX"
+# Gateway derives this stable value from the authenticated local authority;
+# scenarios must never inject an actor through an action payload.
+PRINCIPAL="principal:local-human"
 GRANT_ID="grant-$SUFFIX"
 CAPABILITY="service.local.docs.read"
+API_TOKEN="channel-permission-$$_credential"
+AUTH_BROKER_BIN="${COWD_AUTH_BROKER_BIN:-$TARGET_ROOT/debug/cowd-auth-broker}"
+
+curl() {
+  command curl -H "Authorization: Bearer $API_TOKEN" "$@"
+}
 
 cleanup() {
   if command -v tmux >/dev/null 2>&1; then
@@ -27,6 +35,11 @@ trap cleanup EXIT
 
 if ! command -v tmux >/dev/null 2>&1; then
   echo "tmux is required for channel permission scenario" >&2
+  exit 1
+fi
+
+if [[ ! -x "$AUTH_BROKER_BIN" ]]; then
+  echo "cowd-auth-broker is required at $AUTH_BROKER_BIN" >&2
   exit 1
 fi
 
@@ -51,7 +64,8 @@ gateway:
       host: "127.0.0.1"
       port: $PORT
       auth:
-        enabled: false
+        enabled: true
+        token: "$API_TOKEN"
 EOF
 cp "$CONFIG_HOME/config.yaml" "$HOME_DIR/.cowd/config.yaml"
 cp "$CONFIG_HOME/config.yaml" "$WORKDIR/.cowd/config.yaml"
@@ -59,6 +73,7 @@ cp "$CONFIG_HOME/config.yaml" "$WORKDIR/.cowd/config.yaml"
 tmux new-session -d -s "$SESSION" \
   "bash -lc \"cd '$WORKDIR' && \
     export COWD_CONFIG_HOME='$CONFIG_HOME' && \
+    export COWD_AUTH_BROKER_BIN='$AUTH_BROKER_BIN' && \
     export HOME='$HOME_DIR' && \
     '$BIN' gateway run >'$LOG' 2>&1\""
 
@@ -74,7 +89,7 @@ curl -fsS "$BASE_URL/api/cross-plane/grants" \
   -d "{\"id\":\"$GRANT_ID\",\"principal_id\":\"$PRINCIPAL\",\"capability\":\"$CAPABILITY\",\"account_id\":null,\"target_ref\":null,\"resource_ref\":null,\"source_channel\":null,\"grant_type\":\"single_use\",\"expires_at\":null,\"remaining_uses\":null,\"created_by\":\"channel-permission\",\"approval_id\":null}" \
   | rg -q "\"$GRANT_ID\""
 
-ACTION="{\"actor_principal\":\"$PRINCIPAL\",\"source_channel\":\"channel://wechat/chat/$SUFFIX\",\"session_id\":\"session-$SUFFIX\",\"requested_capability\":\"$CAPABILITY\",\"provider_account\":\"local.docs\",\"target_ref\":null,\"resource_ref\":null,\"risk\":\"medium\",\"data_classification\":\"internal\",\"identity_trust\":\"verified\"}"
+ACTION="{\"source_channel\":\"channel://wechat/chat/$SUFFIX\",\"session_id\":\"session-$SUFFIX\",\"requested_capability\":\"$CAPABILITY\",\"provider_account\":\"local.docs\",\"target_ref\":null,\"resource_ref\":null,\"risk\":\"medium\",\"data_classification\":\"internal\",\"identity_trust\":\"verified\"}"
 
 curl -fsS "$BASE_URL/api/cross-plane/action/preflight" \
   -H 'content-type: application/json' \
@@ -82,7 +97,7 @@ curl -fsS "$BASE_URL/api/cross-plane/action/preflight" \
 
 curl -fsS "$BASE_URL/api/connectors/services/local.docs/execute" \
   -H 'content-type: application/json' \
-  -d "{\"actor_principal\":\"$PRINCIPAL\",\"source_channel\":\"channel://wechat/chat/$SUFFIX\",\"session_id\":\"session-$SUFFIX\",\"tool_id\":\"$CAPABILITY\",\"resource_id\":\"doc-dry-$SUFFIX\",\"title\":\"Channel Permission Dry Run\",\"mode\":\"dry_run\",\"idempotency_key\":\"dry-$SUFFIX\"}" \
+  -d "{\"source_channel\":\"channel://wechat/chat/$SUFFIX\",\"session_id\":\"session-$SUFFIX\",\"tool_id\":\"$CAPABILITY\",\"resource_id\":\"doc-dry-$SUFFIX\",\"title\":\"Channel Permission Dry Run\",\"mode\":\"dry_run\",\"idempotency_key\":\"dry-$SUFFIX\"}" \
   | rg -q '"status"\s*:\s*"dry_run"'
 
 curl -fsS "$BASE_URL/api/cross-plane/policy/simulate" \
@@ -91,8 +106,8 @@ curl -fsS "$BASE_URL/api/cross-plane/policy/simulate" \
 
 curl -fsS "$BASE_URL/api/connectors/services/local.docs/execute" \
   -H 'content-type: application/json' \
-  -d "{\"actor_principal\":\"$PRINCIPAL\",\"source_channel\":\"channel://wechat/chat/$SUFFIX\",\"session_id\":\"session-$SUFFIX\",\"tool_id\":\"$CAPABILITY\",\"resource_id\":\"doc-$SUFFIX\",\"title\":\"Channel Permission\",\"mode\":\"commit\",\"idempotency_key\":\"commit-$SUFFIX\"}" \
-  | rg -q '"status"\s*:\s*"ok"'
+  -d "{\"source_channel\":\"channel://wechat/chat/$SUFFIX\",\"session_id\":\"session-$SUFFIX\",\"tool_id\":\"$CAPABILITY\",\"resource_id\":\"doc-$SUFFIX\",\"title\":\"Channel Permission\",\"mode\":\"commit\",\"idempotency_key\":\"commit-$SUFFIX\"}" \
+  | rg -q '"status"\s*:\s*"executed"'
 
 grants_json="$(curl -fsS "$BASE_URL/api/cross-plane/grants")"
 printf '%s' "$grants_json" | rg -q "\"id\"\\s*:\\s*\"$GRANT_ID\""

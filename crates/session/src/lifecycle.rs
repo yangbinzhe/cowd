@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use memory::{SessionEvent, UnifiedSessionStore};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -83,7 +85,13 @@ pub struct SessionLifecycleSnapshot {
     pub updated_at_ms: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct DurableLifecycleEvent {
+    event: SessionLifecycleEvent,
+    snapshot: SessionLifecycleSnapshot,
+}
+
+#[derive(Debug, Clone, Default)]
 struct SessionLifecycleEntry {
     state: SessionLifecycleState,
     attachments: HashMap<String, SessionAttachment>,
@@ -100,12 +108,26 @@ impl Default for SessionLifecycleState {
 #[derive(Debug, Default)]
 pub struct SessionLifecycleKernel {
     sessions: RwLock<HashMap<String, SessionLifecycleEntry>>,
+    store: Option<Arc<UnifiedSessionStore>>,
+    mutation_gate: tokio::sync::Mutex<()>,
 }
 
 impl SessionLifecycleKernel {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Runtime production construction. The kernel remains a hot cache, while
+    /// lifecycle truth is appended to UnifiedSessionStore and reconstructed on
+    /// demand after a Gateway restart.
+    #[must_use]
+    pub fn with_store(store: Arc<UnifiedSessionStore>) -> Self {
+        Self {
+            sessions: RwLock::new(HashMap::new()),
+            store: Some(store),
+            mutation_gate: tokio::sync::Mutex::new(()),
+        }
     }
 
     pub async fn attach(
@@ -115,8 +137,11 @@ impl SessionLifecycleKernel {
     ) -> Result<SessionLifecycleEvent, String> {
         let session_id = validate_session_id(session_id)?;
         validate_actor(&actor)?;
+        let _mutation = self.mutation_gate.lock().await;
+        self.ensure_loaded(&session_id).await?;
 
         let mut sessions = self.sessions.write().await;
+        let previous = sessions.get(&session_id).cloned();
         let entry = sessions.entry(session_id.clone()).or_insert_with(|| {
             let now = current_epoch_ms();
             SessionLifecycleEntry {
@@ -139,14 +164,22 @@ impl SessionLifecycleKernel {
         );
         entry.state = SessionLifecycleState::Attached;
         entry.updated_at_ms = now;
-        Ok(Self::push_event(
+        let event = Self::push_event(
             &session_id,
             entry,
             "session.attach",
             Some(actor),
             SessionLifecycleState::Attached,
             now,
-        ))
+        );
+        let snapshot = snapshot_from_entry(&session_id, entry);
+        drop(sessions);
+        if let Err(error) = self.persist(&event, &snapshot).await {
+            self.restore_after_failed_persist(&session_id, previous)
+                .await;
+            return Err(error);
+        }
+        Ok(event)
     }
 
     pub async fn detach(
@@ -158,8 +191,11 @@ impl SessionLifecycleKernel {
         if actor_id.trim().is_empty() {
             return Err("actor_id is required".to_string());
         }
+        let _mutation = self.mutation_gate.lock().await;
+        self.ensure_loaded(&session_id).await?;
 
         let mut sessions = self.sessions.write().await;
+        let previous = sessions.get(&session_id).cloned();
         let entry = sessions
             .entry(session_id.clone())
             .or_insert_with(SessionLifecycleEntry::default);
@@ -175,75 +211,67 @@ impl SessionLifecycleKernel {
         let now = current_epoch_ms();
         entry.state = state;
         entry.updated_at_ms = now;
-        Ok(Self::push_event(
-            &session_id,
-            entry,
-            "session.detach",
-            actor,
-            state,
-            now,
-        ))
+        let event = Self::push_event(&session_id, entry, "session.detach", actor, state, now);
+        let snapshot = snapshot_from_entry(&session_id, entry);
+        drop(sessions);
+        if let Err(error) = self.persist(&event, &snapshot).await {
+            self.restore_after_failed_persist(&session_id, previous)
+                .await;
+            return Err(error);
+        }
+        Ok(event)
     }
 
     pub async fn mark_active(&self, session_id: &str) -> Result<SessionLifecycleEvent, String> {
         let session_id = validate_session_id(session_id)?;
+        let _mutation = self.mutation_gate.lock().await;
+        self.ensure_loaded(&session_id).await?;
         let mut sessions = self.sessions.write().await;
+        let previous = sessions.get(&session_id).cloned();
         let entry = sessions
             .entry(session_id.clone())
             .or_insert_with(SessionLifecycleEntry::default);
         let now = current_epoch_ms();
         entry.state = SessionLifecycleState::Active;
         entry.updated_at_ms = now;
-        Ok(Self::push_event(
+        let event = Self::push_event(
             &session_id,
             entry,
             "session.active",
             None,
             SessionLifecycleState::Active,
             now,
-        ))
+        );
+        let snapshot = snapshot_from_entry(&session_id, entry);
+        drop(sessions);
+        if let Err(error) = self.persist(&event, &snapshot).await {
+            self.restore_after_failed_persist(&session_id, previous)
+                .await;
+            return Err(error);
+        }
+        Ok(event)
     }
 
     pub async fn snapshot(&self, session_id: &str) -> Option<SessionLifecycleSnapshot> {
+        self.ensure_loaded(session_id).await.ok()?;
         let sessions = self.sessions.read().await;
-        sessions.get(session_id).map(|entry| {
-            let mut attachments: Vec<_> = entry.attachments.values().cloned().collect();
-            attachments.sort_by(|left, right| {
-                left.actor
-                    .surface
-                    .cmp(&right.actor.surface)
-                    .then_with(|| left.actor.id.cmp(&right.actor.id))
-            });
-            SessionLifecycleSnapshot {
-                session_id: session_id.to_string(),
-                state: entry.state,
-                attachments,
-                next_sequence: entry.next_sequence,
-                updated_at_ms: entry.updated_at_ms,
-            }
-        })
+        sessions
+            .get(session_id)
+            .map(|entry| snapshot_from_entry(session_id, entry))
     }
 
     pub async fn snapshots(&self) -> Vec<SessionLifecycleSnapshot> {
+        if let Some(store) = &self.store {
+            if let Ok(records) = store.list_sessions().await {
+                for record in records {
+                    let _ = self.ensure_loaded(&record.session_id).await;
+                }
+            }
+        }
         let sessions = self.sessions.read().await;
         let mut snapshots: Vec<_> = sessions
             .iter()
-            .map(|(session_id, entry)| {
-                let mut attachments: Vec<_> = entry.attachments.values().cloned().collect();
-                attachments.sort_by(|left, right| {
-                    left.actor
-                        .surface
-                        .cmp(&right.actor.surface)
-                        .then_with(|| left.actor.id.cmp(&right.actor.id))
-                });
-                SessionLifecycleSnapshot {
-                    session_id: session_id.clone(),
-                    state: entry.state,
-                    attachments,
-                    next_sequence: entry.next_sequence,
-                    updated_at_ms: entry.updated_at_ms,
-                }
-            })
+            .map(|(session_id, entry)| snapshot_from_entry(session_id, entry))
             .collect();
         snapshots.sort_by(|left, right| left.session_id.cmp(&right.session_id));
         snapshots
@@ -267,6 +295,108 @@ impl SessionLifecycleKernel {
             state,
             created_at_ms,
         }
+    }
+
+    async fn ensure_loaded(&self, session_id: &str) -> Result<(), String> {
+        if self.sessions.read().await.contains_key(session_id) {
+            return Ok(());
+        }
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        let events = store
+            .get_events(session_id, 0)
+            .await
+            .map_err(|error| error.to_string())?;
+        let Some(snapshot) = events
+            .iter()
+            .filter(|event| event.event_type == "session.lifecycle.v1")
+            .filter_map(|event| {
+                serde_json::from_str::<DurableLifecycleEvent>(&event.event_json).ok()
+            })
+            .last()
+            .map(|event| event.snapshot)
+        else {
+            return Ok(());
+        };
+        let entry = SessionLifecycleEntry {
+            state: snapshot.state,
+            attachments: snapshot
+                .attachments
+                .into_iter()
+                .map(|attachment| (attachment.actor.id.clone(), attachment))
+                .collect(),
+            next_sequence: snapshot.next_sequence,
+            updated_at_ms: snapshot.updated_at_ms,
+        };
+        self.sessions
+            .write()
+            .await
+            .entry(session_id.to_string())
+            .or_insert(entry);
+        Ok(())
+    }
+
+    async fn persist(
+        &self,
+        event: &SessionLifecycleEvent,
+        snapshot: &SessionLifecycleSnapshot,
+    ) -> Result<(), String> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        let event_json = serde_json::to_string(&DurableLifecycleEvent {
+            event: event.clone(),
+            snapshot: snapshot.clone(),
+        })
+        .map_err(|error| error.to_string())?;
+        store
+            .append_event_allocating_sequence(&SessionEvent {
+                session_id: event.session_id.clone(),
+                event_type: "session.lifecycle.v1".to_string(),
+                event_json,
+                sequence: 0,
+                created_at_ms: event.created_at_ms,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    async fn restore_after_failed_persist(
+        &self,
+        session_id: &str,
+        previous: Option<SessionLifecycleEntry>,
+    ) {
+        let mut sessions = self.sessions.write().await;
+        match previous {
+            Some(entry) => {
+                sessions.insert(session_id.to_string(), entry);
+            }
+            None => {
+                sessions.remove(session_id);
+            }
+        }
+    }
+}
+
+fn snapshot_from_entry(
+    session_id: &str,
+    entry: &SessionLifecycleEntry,
+) -> SessionLifecycleSnapshot {
+    let mut attachments: Vec<_> = entry.attachments.values().cloned().collect();
+    attachments.sort_by(|left, right| {
+        left.actor
+            .surface
+            .cmp(&right.actor.surface)
+            .then_with(|| left.actor.id.cmp(&right.actor.id))
+    });
+    SessionLifecycleSnapshot {
+        session_id: session_id.to_string(),
+        state: entry.state,
+        attachments,
+        next_sequence: entry.next_sequence,
+        updated_at_ms: entry.updated_at_ms,
     }
 }
 
@@ -373,5 +503,55 @@ mod tests {
 
         let snapshot = kernel.snapshot("session-a").await.unwrap();
         assert_eq!(snapshot.next_sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn durable_kernel_rebuilds_attachment_state_after_restart() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().expect("store"));
+        let now = "2026-01-01T00:00:00Z".to_string();
+        store
+            .create_session(&memory::SessionRecord {
+                session_id: "session-a".to_string(),
+                platform: "test".to_string(),
+                chat_id: "session-a".to_string(),
+                user_id: None,
+                model: None,
+                created_at: now.clone(),
+                last_activity: now,
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .expect("session record");
+        let first = SessionLifecycleKernel::with_store(Arc::clone(&store));
+        first
+            .attach("session-a", SessionActor::new("web-1", "webui"))
+            .await
+            .expect("attach");
+        first.mark_active("session-a").await.expect("active");
+
+        let rebuilt = SessionLifecycleKernel::with_store(store);
+        let snapshot = rebuilt.snapshot("session-a").await.expect("rehydrated");
+        assert_eq!(snapshot.state, SessionLifecycleState::Active);
+        assert_eq!(snapshot.attachments.len(), 1);
+        assert_eq!(snapshot.attachments[0].actor.id, "web-1");
+        assert_eq!(snapshot.next_sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn failed_durable_append_restores_the_hot_cache() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().expect("store"));
+        let kernel = SessionLifecycleKernel::with_store(store);
+        let error = kernel
+            .attach("missing-session", SessionActor::new("web-1", "webui"))
+            .await
+            .expect_err("foreign session must not gain an in-memory lifecycle fact");
+        assert!(!error.is_empty());
+        assert!(kernel.snapshot("missing-session").await.is_none());
     }
 }

@@ -4,13 +4,10 @@ use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::time::UNIX_EPOCH;
 
 use runtime::{ConversationMessage, JsonValue, Session};
 use serde_json::json;
-
-static UNIFIED_STORE: OnceLock<memory::UnifiedSessionStore> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub(crate) struct SessionHandle {
@@ -35,15 +32,12 @@ pub(crate) struct LocalSessionImportCandidate {
     pub(crate) session_id: String,
 }
 
-pub(crate) fn get_unified_store(
-) -> Result<&'static memory::UnifiedSessionStore, Box<dyn std::error::Error>> {
-    if let Some(store) = UNIFIED_STORE.get() {
-        return Ok(store);
-    }
-
-    let store = GatewayStorage::open_unified_session_store(runtime::cowd_dirs::config_home_dir())?;
-    UNIFIED_STORE.set(store).unwrap_or_else(|_| {});
-    Ok(UNIFIED_STORE.get().unwrap())
+/// Opens a scoped CLI repository. The daemon owns and injects its own store
+/// through RuntimeServices; a process-global CLI cache would create a second
+/// lifecycle authority and leak state across homes/workspaces.
+pub(crate) fn get_unified_store() -> Result<memory::UnifiedSessionStore, Box<dyn std::error::Error>>
+{
+    GatewayStorage::open_unified_session_store(runtime::cowd_dirs::config_home_dir())
 }
 
 pub(crate) fn jsonl_sessions_dir() -> PathBuf {
@@ -189,7 +183,7 @@ pub(crate) fn run_import_session(
     output_format: CliOutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let store = get_unified_store()?;
-    let (session_id, imported_messages) = import_local_session_file(store, path)?;
+    let (session_id, imported_messages) = import_local_session_file(&store, path)?;
     match output_format {
         CliOutputFormat::Text => {
             println!(
@@ -477,7 +471,7 @@ pub(crate) fn resolve_session_reference(
         || reference.eq_ignore_ascii_case("recent")
     {
         let store = get_unified_store()?;
-        let workspace_records = list_workspace_session_records(store)?;
+        let workspace_records = list_workspace_session_records(&store)?;
         let record = workspace_records
             .iter()
             .find(|record| record.message_count > 0)
@@ -551,7 +545,7 @@ fn resolve_managed_session_path(session_id: &str) -> Result<PathBuf, Box<dyn std
 pub(crate) fn list_managed_sessions(
 ) -> Result<Vec<ManagedSessionSummary>, Box<dyn std::error::Error>> {
     let store = get_unified_store()?;
-    let records = list_workspace_session_records(store)?;
+    let records = list_workspace_session_records(&store)?;
     Ok(records.into_iter().map(record_to_summary).collect())
 }
 
@@ -620,7 +614,7 @@ pub(crate) fn load_session_reference(
 ) -> Result<(SessionHandle, Session), Box<dyn std::error::Error>> {
     let handle = resolve_session_reference(reference)?;
     let session = if let Ok(store) = get_unified_store() {
-        if let Some(hydrated) = hydrate_session_from_unified_store(store, &handle)? {
+        if let Some(hydrated) = hydrate_session_from_unified_store(&store, &handle)? {
             hydrated
         } else if handle.path.exists() {
             return Err(format!(

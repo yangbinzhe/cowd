@@ -96,8 +96,8 @@ pub enum Action {
     SubmitInput,
     /// Cycle to the next available model.
     NextModel,
-    /// Reload provider/model registry from the active runtime configuration.
-    ReloadProviders,
+    /// Refresh config projection and hot-reload status from Gateway.
+    RefreshConfigStatus,
     /// Browse input history (true = older, false = newer).
     HistoryBrowse(bool),
     /// Toggle the command palette overlay.

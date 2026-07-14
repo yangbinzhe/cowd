@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
 //! Cross-agent conflict detection and arbitration tests
 //! Verifies Phase 2 features of the 3D memory framework
 

@@ -31,7 +31,7 @@ use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
 
 use crate::components::base::{Component, EventResult, RenderContext};
-use crate::components::panel_scroll::{clamp_u16_offset, offset_to_u16, PanelScrollState};
+use crate::components::panel_scroll::PanelScrollState;
 
 /// Local static references to syntect data, duplicating those in
 /// `md_renderer` so the module can compile independently.
@@ -130,7 +130,7 @@ pub struct DiffViewer {
     /// Display mode.
     mode: DiffMode,
     /// Vertical scroll offset in the diff view (in lines).
-    scroll_offset: u16,
+    scroll_offset: usize,
     last_viewport_len: usize,
     /// View title shown in the border.
     title: String,
@@ -257,7 +257,7 @@ impl DiffViewer {
 
     /// Returns the scroll offset.
     #[must_use]
-    pub fn scroll_offset(&self) -> u16 {
+    pub fn scroll_offset(&self) -> usize {
         self.scroll_offset
     }
 
@@ -344,20 +344,20 @@ impl DiffViewer {
 
     // ── Scroll helpers ────────────────────────────────────────────
 
-    fn scroll_up(&mut self, lines: u16) {
+    fn scroll_up(&mut self, lines: usize) {
         self.scroll_offset = self.scroll_offset.saturating_sub(lines);
     }
 
-    fn scroll_down(&mut self, lines: u16) {
+    fn scroll_down(&mut self, lines: usize) {
         self.scroll_offset = self.scroll_offset.saturating_add(lines);
     }
 
     /// Total number of visible lines in the current file's selected hunk.
-    fn total_diff_lines(&self) -> u16 {
+    fn total_diff_lines(&self) -> usize {
         if let Some(file) = self.files.get(self.selected_file) {
             if let Some(hunk) = file.hunks.get(self.selected_hunk) {
                 // 1 header + N lines
-                return 1 + hunk.lines.len() as u16;
+                return 1 + hunk.lines.len();
             }
         }
         0
@@ -378,7 +378,7 @@ impl DiffViewer {
             .unwrap_or(0);
         // Cap at 40% of available width, with min 15 and max 50
         let cap = ((available_width as f32) * 0.4) as u16;
-        let width = max_path as u16 + 4; // +4 for borders/padding
+        let width = crate::components::base::terminal_len(max_path).saturating_add(4); // +4 for borders/padding
         width.clamp(15, cap.max(15).min(50))
     }
 
@@ -402,7 +402,7 @@ impl DiffViewer {
             .files
             .iter()
             .enumerate()
-            .skip(self.scroll_offset as usize)
+            .skip(self.scroll_offset)
             .take(max_visible)
             .map(|(i, f)| {
                 let reviewed_mark = if self.reviewed_files.contains(&f.path) {
@@ -499,8 +499,8 @@ impl DiffViewer {
 
     fn render_unified(&self, ctx: &mut RenderContext, area: Rect, file: &FileChange) {
         let lines = self.build_unified_lines(file);
-        let visible_lines = area.height as usize;
-        let scroll = self.scroll_offset as usize;
+        let visible_lines = usize::from(area.height);
+        let scroll = self.scroll_offset;
 
         let display: Vec<Line> = lines
             .iter()
@@ -509,8 +509,8 @@ impl DiffViewer {
             .cloned()
             .collect();
 
-        let content_height = lines.len() as u16;
-        let max_scroll = content_height.saturating_sub(area.height);
+        let content_height = lines.len();
+        let max_scroll = content_height.saturating_sub(usize::from(area.height));
         self.render_scroll_indicator(ctx, area, content_height);
         let _ = max_scroll;
 
@@ -619,8 +619,8 @@ impl DiffViewer {
         // Build left (old) and right (new) line lists
         let (old_lines, new_lines) = self.build_split_lines(file, lang.as_deref());
 
-        let scroll = self.scroll_offset as usize;
-        let visible = area.height as usize;
+        let scroll = self.scroll_offset;
+        let visible = usize::from(area.height);
 
         let old_display: Vec<Line> = old_lines
             .iter()
@@ -744,11 +744,12 @@ impl DiffViewer {
         (old_lines, new_lines)
     }
 
-    fn render_scroll_indicator(&self, ctx: &mut RenderContext, area: Rect, content_height: u16) {
-        if content_height <= area.height {
+    fn render_scroll_indicator(&self, ctx: &mut RenderContext, area: Rect, content_height: usize) {
+        if content_height <= usize::from(area.height) {
             return;
         }
-        let scroll_pct = self.scroll_offset as f64 / (content_height - area.height) as f64;
+        let scroll_pct = self.scroll_offset as f64
+            / content_height.saturating_sub(usize::from(area.height)) as f64;
         let scroll_pct = scroll_pct.clamp(0.0, 1.0);
 
         let bar_bg = Style::default().fg(Color::DarkGray);
@@ -814,12 +815,13 @@ impl Component for DiffViewer {
         let diff_area = Rect::new(area.x + tree_w, area.y, diff_w, main_h);
         let footer_area = Rect::new(area.x, area.y + main_h, area.width, footer_h);
         self.last_viewport_len = diff_area.height.max(1) as usize;
-        let total_diff_lines = self.total_diff_lines() as usize;
-        clamp_u16_offset(
-            &mut self.scroll_offset,
-            total_diff_lines,
-            self.last_viewport_len,
-        );
+        let mut scroll = PanelScrollState {
+            offset: self.scroll_offset,
+            content_len: self.total_diff_lines(),
+            viewport_len: self.last_viewport_len,
+        };
+        scroll.clamp();
+        self.scroll_offset = scroll.offset;
 
         self.render_file_tree(ctx, tree_area);
         self.render_diff_view(ctx, diff_area);
@@ -880,62 +882,62 @@ impl DiffViewer {
             // Scroll
             KeyCode::Up => {
                 let mut scroll = PanelScrollState {
-                    offset: self.scroll_offset as usize,
-                    content_len: self.total_diff_lines() as usize,
+                    offset: self.scroll_offset,
+                    content_len: self.total_diff_lines(),
                     viewport_len: self.last_viewport_len,
                 };
                 scroll.line_up();
-                self.scroll_offset = offset_to_u16(scroll.offset);
+                self.scroll_offset = scroll.offset;
                 EventResult::Consumed
             }
             KeyCode::Down => {
                 let mut scroll = PanelScrollState {
-                    offset: self.scroll_offset as usize,
-                    content_len: self.total_diff_lines() as usize,
+                    offset: self.scroll_offset,
+                    content_len: self.total_diff_lines(),
                     viewport_len: self.last_viewport_len,
                 };
                 scroll.line_down();
-                self.scroll_offset = offset_to_u16(scroll.offset);
+                self.scroll_offset = scroll.offset;
                 EventResult::Consumed
             }
             KeyCode::PageUp => {
                 let mut scroll = PanelScrollState {
-                    offset: self.scroll_offset as usize,
-                    content_len: self.total_diff_lines() as usize,
+                    offset: self.scroll_offset,
+                    content_len: self.total_diff_lines(),
                     viewport_len: self.last_viewport_len,
                 };
                 scroll.page_up();
-                self.scroll_offset = offset_to_u16(scroll.offset);
+                self.scroll_offset = scroll.offset;
                 EventResult::Consumed
             }
             KeyCode::PageDown => {
                 let mut scroll = PanelScrollState {
-                    offset: self.scroll_offset as usize,
-                    content_len: self.total_diff_lines() as usize,
+                    offset: self.scroll_offset,
+                    content_len: self.total_diff_lines(),
                     viewport_len: self.last_viewport_len,
                 };
                 scroll.page_down();
-                self.scroll_offset = offset_to_u16(scroll.offset);
+                self.scroll_offset = scroll.offset;
                 EventResult::Consumed
             }
             KeyCode::Home => {
                 let mut scroll = PanelScrollState {
-                    offset: self.scroll_offset as usize,
-                    content_len: self.total_diff_lines() as usize,
+                    offset: self.scroll_offset,
+                    content_len: self.total_diff_lines(),
                     viewport_len: self.last_viewport_len,
                 };
                 scroll.top();
-                self.scroll_offset = offset_to_u16(scroll.offset);
+                self.scroll_offset = scroll.offset;
                 EventResult::Consumed
             }
             KeyCode::End => {
                 let mut scroll = PanelScrollState {
-                    offset: self.scroll_offset as usize,
-                    content_len: self.total_diff_lines() as usize,
+                    offset: self.scroll_offset,
+                    content_len: self.total_diff_lines(),
                     viewport_len: self.last_viewport_len,
                 };
                 scroll.bottom();
-                self.scroll_offset = offset_to_u16(scroll.offset);
+                self.scroll_offset = scroll.offset;
                 EventResult::Consumed
             }
 

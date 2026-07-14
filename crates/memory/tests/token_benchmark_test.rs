@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
 //! Token benchmark tests — compare context size with/without code injection.
 //!
 //! Goal: verify code_injection adds <500 tokens and is only triggered

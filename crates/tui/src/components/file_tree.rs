@@ -25,7 +25,7 @@ use ratatui::{
 
 use crate::app::FileEntry;
 use crate::components::base::{Component, EventResult, RenderContext};
-use crate::components::panel_scroll::{offset_to_u16, PanelScrollState};
+use crate::components::panel_scroll::PanelScrollState;
 
 // ── Git Status ──────────────────────────────────────────────────────
 
@@ -193,8 +193,10 @@ fn insert_path(parent: &mut FileNode, parts: &[&str], entry: &FileEntry) {
                 children: Vec::new(),
             };
             parent.children.push(node);
-            // SAFETY: we just pushed; `last_mut` is always Some.
-            parent.children.last_mut().unwrap()
+            let Some(last_child) = parent.children.last_mut() else {
+                return;
+            };
+            last_child
         }
     };
 
@@ -266,7 +268,7 @@ pub struct FileTree {
     /// Cursor position (index into the flat list).
     cursor: usize,
     /// First visible tree row.
-    scroll_offset: u16,
+    scroll_offset: usize,
     /// Preview content of the currently selected file.
     preview: Option<String>,
     /// Path of the file whose preview is currently loaded.
@@ -556,7 +558,7 @@ impl Component for FileTree {
                 }
                 KeyCode::End => {
                     self.cursor = self.visible_nodes().len().saturating_sub(1);
-                    self.scroll_offset = u16::MAX;
+                    self.scroll_offset = usize::MAX;
                     self.load_preview();
                     EventResult::Consumed
                 }
@@ -621,17 +623,17 @@ impl FileTree {
         } else {
             let viewport_len = area.height.saturating_sub(3).max(1) as usize;
             let mut scroll = PanelScrollState {
-                offset: self.scroll_offset as usize,
+                offset: self.scroll_offset,
                 content_len: vis.len(),
                 viewport_len,
             };
             scroll.ensure_visible(self.cursor.min(vis.len().saturating_sub(1)));
-            self.scroll_offset = offset_to_u16(scroll.offset);
+            self.scroll_offset = scroll.offset;
 
             for (i, node) in vis
                 .iter()
                 .enumerate()
-                .skip(self.scroll_offset as usize)
+                .skip(self.scroll_offset)
                 .take(viewport_len)
             {
                 let is_selected = i == self.cursor;

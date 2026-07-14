@@ -93,7 +93,9 @@ pub fn run_bootstrap() -> Result<(), Box<dyn std::error::Error>> {
 /// 提示用户输入
 fn prompt_user(prompt: &str) -> String {
     print!("{}", prompt);
-    io::stdout().flush().unwrap();
+    if let Err(error) = io::stdout().flush() {
+        eprintln!("failed to flush bootstrap prompt: {error}");
+    }
     let mut input = String::new();
     let stdin = io::stdin();
     stdin.lock().read_line(&mut input).ok();
@@ -118,8 +120,7 @@ fn generate_token() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
+        .map_or(0, |duration| duration.as_nanos());
     format!("{:x}", timestamp)
 }
 

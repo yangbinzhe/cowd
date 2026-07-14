@@ -43,6 +43,10 @@ impl GatewayRuntimeEntry {
         }
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "the private runtime slot is empty only in test fixtures or while an exclusive mutable turn owns it"
+    )]
     pub(crate) fn with_hook_abort_signal(
         mut self,
         hook_abort_signal: runtime::HookAbortSignal,
@@ -62,6 +66,13 @@ impl GatewayRuntimeEntry {
     ) {
         self.runtime_mut()
             .install_turn_control(cancellation_token, hook_abort_signal);
+    }
+
+    pub(crate) fn install_approval_gate(
+        &mut self,
+        approval_gate: Arc<runtime::approval_gate::SmartApprovalGate>,
+    ) {
+        self.runtime_mut().install_approval_gate(approval_gate);
     }
 
     pub(crate) fn shutdown_plugins(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -97,16 +108,12 @@ impl GatewayRuntimeEntry {
         self.runtime_ref().cowd_bus()
     }
 
+    pub(crate) fn session_input_stream(&self) -> runtime::SessionInputStream {
+        self.runtime_ref().session_input_stream()
+    }
+
     pub(crate) fn set_context_profile(&self, profile: runtime::ContextProfile) {
         self.runtime_ref().set_context_profile(profile);
-    }
-
-    pub(crate) fn max_iterations(&self) -> usize {
-        self.runtime_ref().max_iterations()
-    }
-
-    pub(crate) fn set_max_iterations(&mut self, max_iterations: usize) {
-        self.runtime_mut().set_max_iterations(max_iterations);
     }
 
     pub(crate) fn inject_resume_context(&self, packet: runtime::ResumeContextPacket) {
@@ -128,12 +135,23 @@ impl GatewayRuntimeEntry {
         self.runtime_ref().last_context_turn_report()
     }
 
-    pub(crate) async fn run_turn_async(
+    pub(crate) async fn submit_turn(
         &mut self,
         content: &str,
         prompter: &runtime::permissions::SharedPrompter,
     ) -> Result<runtime::TurnSummary, runtime::RuntimeError> {
-        self.runtime_mut().run_turn_async(content, prompter).await
+        self.runtime_mut().submit_turn(content, prompter).await
+    }
+
+    pub(crate) async fn submit_ingress_turn(
+        &mut self,
+        content: &str,
+        prompter: &runtime::permissions::SharedPrompter,
+        ingress: runtime::TurnIngressRef,
+    ) -> Result<runtime::TurnSummary, runtime::RuntimeError> {
+        self.runtime_mut()
+            .submit_ingress_turn(content, prompter, ingress)
+            .await
     }
 
     pub(crate) async fn append_external_message(
@@ -147,11 +165,15 @@ impl GatewayRuntimeEntry {
         self.runtime_ref().session()
     }
 
-    pub(crate) fn compact_active_session(
+    pub(crate) async fn session_async(&self) -> runtime::Session {
+        self.runtime_ref().session_async().await
+    }
+
+    pub(crate) async fn compact_active_session(
         &mut self,
-        config: runtime::CompactionConfig,
-    ) -> (runtime::CompactionResult, runtime::Session) {
-        self.runtime_mut().compact_active_session(config)
+    ) -> Result<(Option<runtime::AutoCompactionEvent>, runtime::Session), runtime::RuntimeError>
+    {
+        self.runtime_mut().compact_active_session().await
     }
 
     pub(crate) fn active_session_stats_session(&self) -> runtime::Session {
@@ -166,16 +188,20 @@ impl GatewayRuntimeEntry {
         self.runtime_ref().last_context_envelope()
     }
 
-    pub(crate) fn take_collaboration_result(&self) -> Option<runtime::CollaborationContextResult> {
-        self.runtime_ref().take_collaboration_result()
-    }
-
+    #[allow(
+        clippy::expect_used,
+        reason = "production entries are constructed with a runtime; None is reserved for test fixtures"
+    )]
     fn runtime_ref(&self) -> &runtime::StandardRuntimeHost<GatewayToolExecutor> {
         self.runtime
             .as_ref()
             .expect("runtime should exist while gateway runtime entry is alive")
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "production entries are constructed with a runtime; None is reserved for test fixtures"
+    )]
     fn runtime_mut(&mut self) -> &mut runtime::StandardRuntimeHost<GatewayToolExecutor> {
         self.runtime
             .as_mut()

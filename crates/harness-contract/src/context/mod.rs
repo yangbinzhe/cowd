@@ -2,16 +2,144 @@
 
 pub use crate::core::EvidenceRef;
 use crate::core::{AiKernelError, AiKernelResult, KernelRef};
+use crate::tool::ToolExposureProjection;
 use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceDurability {
+    Pending,
+    Durable,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceAccessRef {
+    pub evidence_ref: EvidenceRef,
+    pub sha256: String,
+    pub bytes: u64,
+    pub media_type: String,
+    pub durability: EvidenceDurability,
+    pub retrieval_selector: String,
+    pub visibility_scope: String,
+}
+
+impl EvidenceAccessRef {
+    #[must_use]
+    pub fn durable(
+        evidence_ref: EvidenceRef,
+        sha256: impl Into<String>,
+        bytes: u64,
+        media_type: impl Into<String>,
+        retrieval_selector: impl Into<String>,
+        visibility_scope: impl Into<String>,
+    ) -> Self {
+        Self {
+            evidence_ref,
+            sha256: sha256.into(),
+            bytes,
+            media_type: media_type.into(),
+            durability: EvidenceDurability::Durable,
+            retrieval_selector: retrieval_selector.into(),
+            visibility_scope: visibility_scope.into(),
+        }
+    }
+
+    #[must_use]
+    pub const fn is_durable(&self) -> bool {
+        matches!(self.durability, EvidenceDurability::Durable)
+    }
+
+    /// A typed, non-retrievable reference for a relationship or execution
+    /// marker. It deliberately carries no selector, bytes, or hash and can
+    /// never be mistaken for durable raw evidence across a Session boundary.
+    #[must_use]
+    pub fn unavailable(
+        evidence_ref: EvidenceRef,
+        media_type: impl Into<String>,
+        visibility_scope: impl Into<String>,
+    ) -> Self {
+        Self {
+            evidence_ref,
+            sha256: String::new(),
+            bytes: 0,
+            media_type: media_type.into(),
+            durability: EvidenceDurability::Unavailable,
+            retrieval_selector: String::new(),
+            visibility_scope: visibility_scope.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextBudgetLeaseRef {
+    pub lease_id: String,
+    pub owner_id: String,
+    pub scope: String,
+    pub max_tokens: u64,
+    pub consumed_tokens: u64,
+    pub revision: u64,
+}
+
+impl ContextBudgetLeaseRef {
+    #[must_use]
+    pub fn new(
+        lease_id: impl Into<String>,
+        owner_id: impl Into<String>,
+        scope: impl Into<String>,
+        max_tokens: u64,
+        revision: u64,
+    ) -> Self {
+        Self {
+            lease_id: lease_id.into(),
+            owner_id: owner_id.into(),
+            scope: scope.into(),
+            max_tokens,
+            consumed_tokens: 0,
+            revision,
+        }
+    }
+
+    #[must_use]
+    pub fn with_consumed_tokens(mut self, consumed_tokens: u64) -> Self {
+        self.consumed_tokens = consumed_tokens.min(self.max_tokens);
+        self
+    }
+
+    #[must_use]
+    pub const fn remaining_tokens(&self) -> u64 {
+        self.max_tokens.saturating_sub(self.consumed_tokens)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceContentKind {
+    Text,
+    Json,
+    Diff,
+    Error,
+    Media,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceAuditProjection {
+    pub evidence_ref: EvidenceRef,
+    pub content_kind: EvidenceContentKind,
+    pub raw_tokens: u64,
+    pub receipt_tokens: u64,
+    pub omitted_tokens: u64,
+    pub raw_available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<EvidenceAccessRef>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextMode {
     MainTurn,
-    DirectAnswer,
-    FastEdit,
-    PlanExecute,
-    SubAgent,
+    Goal,
+    Agent,
     Review,
     Resume,
 }
@@ -45,6 +173,8 @@ pub enum ContextSourceKind {
     Conversation,
     Memory,
     Knowledge,
+    Fact,
+    Matrix,
     Task,
     ToolTrace,
     Workspace,
@@ -77,6 +207,32 @@ pub enum ContextRole {
     ToolSummary,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextSourceLifecycle {
+    Static,
+    #[default]
+    Runtime,
+    Ephemeral,
+    Session,
+    Durable,
+    External,
+    SuppressedForCurrentTurn,
+    Conflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextSourceRef {
+    pub source_id: String,
+    pub source: ContextSourceKind,
+    pub authority: ContextAuthority,
+    pub lifecycle: ContextSourceLifecycle,
+    pub version: Option<String>,
+    pub reason: Option<String>,
+    pub refs: Vec<KernelRef>,
+    pub conflict_with: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextItem {
     pub id: String,
@@ -87,6 +243,16 @@ pub struct ContextItem {
     pub token_estimate: u64,
     pub score: f32,
     pub refs: Vec<KernelRef>,
+    #[serde(default)]
+    pub source_id: Option<String>,
+    #[serde(default)]
+    pub source_version: Option<String>,
+    #[serde(default)]
+    pub source_lifecycle: ContextSourceLifecycle,
+    #[serde(default)]
+    pub source_reason: Option<String>,
+    #[serde(default)]
+    pub conflict_with: Vec<String>,
 }
 
 impl ContextItem {
@@ -107,6 +273,11 @@ impl ContextItem {
             content,
             score: 1.0,
             refs: Vec::new(),
+            source_id: None,
+            source_version: None,
+            source_lifecycle: ContextSourceLifecycle::Runtime,
+            source_reason: None,
+            conflict_with: Vec::new(),
         }
     }
 
@@ -150,6 +321,8 @@ pub struct ContextEpoch {
     pub budget: ContextBudget,
     pub selected: Vec<ContextItem>,
     pub omitted: Vec<ContextOmission>,
+    #[serde(default)]
+    pub source_registry: Vec<ContextSourceRef>,
     pub token_total: u64,
 }
 
@@ -291,7 +464,7 @@ impl ToolObservation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentReturnPacketV2 {
+pub struct AgentReturnContextEnvelope {
     pub parent_session_id: String,
     pub child_agent_id: String,
     pub result_summary: String,
@@ -306,7 +479,7 @@ pub struct AgentReturnPacketV2 {
     pub token_estimate: u64,
 }
 
-impl AgentReturnPacketV2 {
+impl AgentReturnContextEnvelope {
     #[must_use]
     pub fn new(
         parent_session_id: impl Into<String>,
@@ -485,6 +658,12 @@ pub struct ContextTurnReport {
     pub governance_decision: Option<ContextGovernanceDecision>,
     pub compaction_receipt: Option<CompactionReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger: Option<ContextLedgerProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_exposure: Option<ToolExposureProjection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audit_projections: Vec<EvidenceAuditProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub knowledge: Option<crate::knowledge::KnowledgeTurnReport>,
 }
 
@@ -501,8 +680,36 @@ impl ContextTurnReport {
             observations: Vec::new(),
             governance_decision: None,
             compaction_receipt: None,
+            ledger: None,
+            tool_exposure: None,
+            audit_projections: Vec::new(),
             knowledge: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_ledger(mut self, ledger: ContextLedgerProjection) -> Self {
+        self.ledger = Some(ledger);
+        self
+    }
+
+    #[must_use]
+    pub fn with_tool_exposure(mut self, exposure: ToolExposureProjection) -> Self {
+        self.tool_exposure = Some(exposure);
+        self
+    }
+
+    #[must_use]
+    pub fn with_audit_projection(mut self, projection: EvidenceAuditProjection) -> Self {
+        if !self
+            .evidence_refs
+            .iter()
+            .any(|reference| reference == &projection.evidence_ref)
+        {
+            self.evidence_refs.push(projection.evidence_ref.clone());
+        }
+        self.audit_projections.push(projection);
+        self
     }
 
     #[must_use]
@@ -541,6 +748,26 @@ impl ContextTurnReport {
         self.knowledge = Some(report);
         self
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextComponentUsage {
+    pub kind: String,
+    pub tokens: u64,
+    pub occurrences: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextLedgerProjection {
+    pub max_tokens: u64,
+    pub consumed_tokens: u64,
+    pub remaining_tokens: u64,
+    pub tool_result_limit: u64,
+    pub tool_result_consumed: u64,
+    pub components: Vec<ContextComponentUsage>,
+    pub request_sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibrated_input_tokens: Option<u64>,
 }
 
 impl EvidenceRef {
@@ -593,11 +820,24 @@ impl ContextEpochBuilder {
         let mut selected = Vec::new();
         let mut omitted = Vec::new();
         let mut token_total = 0u64;
+        let mut source_registry = Vec::new();
         for item in self.items {
+            let item = normalize_context_item_source(item);
             if token_total.saturating_add(item.token_estimate) <= self.budget.max_tokens {
                 token_total = token_total.saturating_add(item.token_estimate);
+                source_registry.push(context_source_ref_from_item(&item));
                 selected.push(item);
             } else {
+                source_registry.push(ContextSourceRef {
+                    source_id: item.source_id.clone().unwrap_or_else(|| item.id.clone()),
+                    source: item.source,
+                    authority: item.authority,
+                    lifecycle: ContextSourceLifecycle::SuppressedForCurrentTurn,
+                    version: item.source_version.clone(),
+                    reason: Some("context budget exceeded".to_string()),
+                    refs: item.refs.clone(),
+                    conflict_with: item.conflict_with.clone(),
+                });
                 omitted.push(ContextOmission {
                     item_id: item.id,
                     source: item.source,
@@ -612,6 +852,7 @@ impl ContextEpochBuilder {
             budget: self.budget,
             selected,
             omitted,
+            source_registry,
             token_total,
         })
     }
@@ -661,6 +902,60 @@ impl ContextEpoch {
     }
 }
 
+fn normalize_context_item_source(mut item: ContextItem) -> ContextItem {
+    if item.source_id.as_deref().unwrap_or_default().is_empty() {
+        item.source_id = Some(item.id.clone());
+    }
+    if item.source_lifecycle == ContextSourceLifecycle::Runtime {
+        item.source_lifecycle = default_source_lifecycle(item.source);
+    }
+    if item
+        .source_reason
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        item.source_reason = Some(format!(
+            "selected_for_{:?}_role_from_{:?}",
+            item.role, item.source
+        ));
+    }
+    item
+}
+
+fn context_source_ref_from_item(item: &ContextItem) -> ContextSourceRef {
+    ContextSourceRef {
+        source_id: item.source_id.clone().unwrap_or_else(|| item.id.clone()),
+        source: item.source,
+        authority: item.authority,
+        lifecycle: item.source_lifecycle,
+        version: item.source_version.clone(),
+        reason: item.source_reason.clone(),
+        refs: item.refs.clone(),
+        conflict_with: item.conflict_with.clone(),
+    }
+}
+
+fn default_source_lifecycle(source: ContextSourceKind) -> ContextSourceLifecycle {
+    match source {
+        ContextSourceKind::StableHead | ContextSourceKind::RuntimeHeader => {
+            ContextSourceLifecycle::Static
+        }
+        ContextSourceKind::Memory
+        | ContextSourceKind::Knowledge
+        | ContextSourceKind::Fact
+        | ContextSourceKind::Matrix => ContextSourceLifecycle::Durable,
+        ContextSourceKind::Workspace => ContextSourceLifecycle::External,
+        ContextSourceKind::UserRequest
+        | ContextSourceKind::Conversation
+        | ContextSourceKind::Task
+        | ContextSourceKind::ToolTrace
+        | ContextSourceKind::AgentPeer
+        | ContextSourceKind::Handoff => ContextSourceLifecycle::Runtime,
+    }
+}
+
 fn compare_context_items(left: &ContextItem, right: &ContextItem) -> std::cmp::Ordering {
     source_priority(left.source)
         .cmp(&source_priority(right.source))
@@ -682,10 +977,12 @@ fn source_priority(source: ContextSourceKind) -> u8 {
         ContextSourceKind::Workspace => 4,
         ContextSourceKind::Knowledge => 5,
         ContextSourceKind::Memory => 6,
-        ContextSourceKind::ToolTrace => 7,
-        ContextSourceKind::Conversation => 8,
-        ContextSourceKind::AgentPeer => 9,
-        ContextSourceKind::Handoff => 10,
+        ContextSourceKind::Fact => 7,
+        ContextSourceKind::Matrix => 8,
+        ContextSourceKind::ToolTrace => 9,
+        ContextSourceKind::Conversation => 10,
+        ContextSourceKind::AgentPeer => 11,
+        ContextSourceKind::Handoff => 12,
     }
 }
 
@@ -758,6 +1055,29 @@ mod tests {
         assert_eq!(plan.epoch_id, epoch.epoch_id);
         assert_eq!(plan.sections.len(), epoch.selected.len());
         assert_eq!(plan.omissions.len(), epoch.omitted.len());
+    }
+
+    #[test]
+    fn epoch_builds_source_registry_for_selected_and_omitted_items() {
+        let epoch = ContextEpochBuilder::new(ContextIdentity::main("s1"), ContextBudget::new(5))
+            .add_item(item(ContextSourceKind::Memory, "short", 1.0))
+            .add_item(item(
+                ContextSourceKind::Knowledge,
+                "this knowledge item is too long for the budget",
+                1.0,
+            ))
+            .build()
+            .unwrap();
+
+        assert_eq!(epoch.source_registry.len(), 2);
+        assert!(epoch
+            .source_registry
+            .iter()
+            .any(|source| source.lifecycle == ContextSourceLifecycle::Durable));
+        assert!(epoch
+            .source_registry
+            .iter()
+            .any(|source| source.lifecycle == ContextSourceLifecycle::SuppressedForCurrentTurn));
     }
 
     #[test]

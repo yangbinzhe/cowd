@@ -1,7 +1,14 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
 //! Swarm E2E test: full Planner → Executor → Reviewer lifecycle.
 //!
-//! Simulates a three-agent collaboration through the L4 shared layer:
-//! 1. Agent Planner writes a task to L4 (Shared visibility)
+//! Simulates a three-agent collaboration through scoped L3 evidence:
+//! 1. Agent Planner writes a task to L3 (Shared visibility)
 //! 2. Agent Executor reads the task, executes it, writes the result
 //! 3. Agent Reviewer reads both, writes a review
 //! 4. Agent Planner sees the complete lifecycle
@@ -9,7 +16,7 @@
 //! Verifies:
 //! - source_agent tracking across the full pipeline
 //! - scope isolation
-//! - peer perception (each agent can see prior agents' L4 entries)
+//! - peer perception (each agent can see prior agents' scoped entries)
 
 use memory::config::{BudgetConfig, StoreConfig};
 use memory::{
@@ -92,7 +99,6 @@ async fn test_swarm_e2e_planner_executor_reviewer_lifecycle() {
     // =====================================================================
     // Phase 1: Agent Planner writes task
     // =====================================================================
-    mgr.set_active_agent("agent-planner".into());
 
     let planner_task_id = uuid::Uuid::new_v4();
     let planner_task = make_agent_entry(
@@ -105,7 +111,7 @@ async fn test_swarm_e2e_planner_executor_reviewer_lifecycle() {
         MemoryCategory::Decision,
         vec!["e2e".into(), lifecycle_tag.clone(), "task".into()],
         project_scope.clone(),
-        MemoryLayer::L4,
+        MemoryLayer::L3,
     );
     // Override the random ID with a known one
     let planner_task = MemoryEntry {
@@ -128,7 +134,6 @@ async fn test_swarm_e2e_planner_executor_reviewer_lifecycle() {
     // =====================================================================
     // Phase 2: Agent Executor reads task, executes, writes result
     // =====================================================================
-    mgr.set_active_agent("agent-executor".into());
 
     // Executor searches for pending tasks
     let tasks = mgr.recall("auth middleware", 10).await.unwrap();
@@ -137,7 +142,7 @@ async fn test_swarm_e2e_planner_executor_reviewer_lifecycle() {
         tasks.len()
     );
 
-    // Executor should find the Planner's task (via L4 recall since visibility is Shared)
+    // Executor should find the Planner's task through scoped recall.
     let found_task = tasks.iter().find(|e| e.id == planner_task_id);
     assert!(
         found_task.is_some(),
@@ -171,7 +176,7 @@ async fn test_swarm_e2e_planner_executor_reviewer_lifecycle() {
             "task-complete".into(),
         ],
         project_scope.clone(),
-        MemoryLayer::L4,
+        MemoryLayer::L3,
     );
     let executor_result = MemoryEntry {
         id: executor_result_id,
@@ -183,7 +188,6 @@ async fn test_swarm_e2e_planner_executor_reviewer_lifecycle() {
     // =====================================================================
     // Phase 3: Agent Reviewer reads both, writes review
     // =====================================================================
-    mgr.set_active_agent("agent-reviewer".into());
 
     // Reviewer searches for all entries in this lifecycle
     let all_entries = mgr.recall(&lifecycle_tag, 10).await.unwrap();
@@ -222,7 +226,7 @@ async fn test_swarm_e2e_planner_executor_reviewer_lifecycle() {
         MemoryCategory::Decision,
         vec!["e2e".into(), lifecycle_tag.clone(), "review".into()],
         project_scope.clone(),
-        MemoryLayer::L4,
+        MemoryLayer::L3,
     );
     let review = MemoryEntry {
         id: review_id,
@@ -234,7 +238,6 @@ async fn test_swarm_e2e_planner_executor_reviewer_lifecycle() {
     // =====================================================================
     // Phase 4: Agent Planner sees complete lifecycle
     // =====================================================================
-    mgr.set_active_agent("agent-planner".into());
 
     // Planner searches for the complete lifecycle
     let complete = mgr.recall(&lifecycle_tag, 10).await.unwrap();
@@ -294,14 +297,14 @@ async fn test_swarm_e2e_planner_executor_reviewer_lifecycle() {
     assert!(agents.contains("agent-reviewer"));
 
     // =====================================================================
-    // Phase 7: Verify entries are in L4
+    // Phase 7: Verify entries are in L3
     // =====================================================================
-    let l4_meta = mgr.list_layer_entries(MemoryLayer::L4).await.unwrap();
-    eprintln!("[Verification] Total L4 entries: {}", l4_meta.len());
+    let l3_meta = mgr.list_layer_entries(MemoryLayer::L3).await.unwrap();
+    eprintln!("[Verification] Total L3 entries: {}", l3_meta.len());
     assert!(
-        l4_meta.len() >= 3,
-        "Expected at least 3 entries in L4, got {}",
-        l4_meta.len()
+        l3_meta.len() >= 3,
+        "Expected at least 3 entries in L3, got {}",
+        l3_meta.len()
     );
 }
 
@@ -321,7 +324,6 @@ async fn test_swarm_e2e_peer_perception() {
     let session_tag = format!("peer-test-{}", uuid::Uuid::new_v4().as_simple());
 
     // Agent 1 (Planner): writes task
-    mgr.set_active_agent("agent-alpha".into());
 
     let task_id = uuid::Uuid::new_v4();
     let task = MemoryEntry {
@@ -334,13 +336,12 @@ async fn test_swarm_e2e_peer_perception() {
             MemoryCategory::Decision,
             vec!["peer-test".into(), session_tag.clone(), "task".into()],
             scope.clone(),
-            MemoryLayer::L4,
+            MemoryLayer::L3,
         )
     };
     mgr.remember(task).await.unwrap();
 
     // Agent 2 (Executor): searches for tasks by other agents
-    mgr.set_active_agent("agent-bravo".into());
 
     // Executor recalls entries from "other" agents (i.e., not themselves)
     let peer_tasks = mgr.recall("optimize DB", 10).await.unwrap();
@@ -379,13 +380,12 @@ async fn test_swarm_e2e_peer_perception() {
             MemoryCategory::Decision,
             vec!["peer-test".into(), session_tag.clone(), "result".into()],
             scope.clone(),
-            MemoryLayer::L4,
+            MemoryLayer::L3,
         )
     };
     mgr.remember(result).await.unwrap();
 
     // Agent 3 (Reviewer): sees both agents
-    mgr.set_active_agent("agent-charlie".into());
 
     let all_peer = mgr.recall(&session_tag, 10).await.unwrap();
     let seen_agents: std::collections::HashSet<String> = all_peer
@@ -418,13 +418,12 @@ async fn test_swarm_e2e_peer_perception() {
             MemoryCategory::Decision,
             vec!["peer-test".into(), session_tag.clone(), "review".into()],
             scope.clone(),
-            MemoryLayer::L4,
+            MemoryLayer::L3,
         )
     };
     mgr.remember(review).await.unwrap();
 
     // Agent Alpha (Planner): now sees complete peer picture
-    mgr.set_active_agent("agent-alpha".into());
 
     let final_view = mgr.recall(&session_tag, 10).await.unwrap();
     eprintln!("[Agent Alpha] Final view: {} entries", final_view.len());
@@ -461,11 +460,11 @@ async fn test_swarm_e2e_peer_perception() {
         }
     }
 
-    // Verify L4 layer consistency
-    let l4_entries = mgr.list_layer_entries(MemoryLayer::L4).await.unwrap();
-    assert!(l4_entries.len() >= 3);
-    for meta in &l4_entries {
-        assert_eq!(meta.layer, MemoryLayer::L4);
+    // Verify L3 layer consistency
+    let l3_entries = mgr.list_layer_entries(MemoryLayer::L3).await.unwrap();
+    assert!(l3_entries.len() >= 3);
+    for meta in &l3_entries {
+        assert_eq!(meta.layer, MemoryLayer::L3);
     }
 
     eprintln!("=== Peer perception test PASSED ===");
@@ -484,7 +483,6 @@ async fn test_swarm_e2e_cross_scope_isolation() {
     let mgr = CognitiveContextManager::new(config).await.unwrap();
 
     // Agent in Project A writes
-    mgr.set_active_agent("agent-proj-a".into());
     let scope_a = MemoryScope::Project("project-a".into());
 
     for i in 0..3 {
@@ -495,13 +493,12 @@ async fn test_swarm_e2e_cross_scope_isolation() {
             MemoryCategory::ProjectConvention,
             vec!["scope-isolation".into(), "proj-a".into()],
             scope_a.clone(),
-            MemoryLayer::L4,
+            MemoryLayer::L3,
         );
         mgr.remember(entry).await.unwrap();
     }
 
     // Agent in Project B writes
-    mgr.set_active_agent("agent-proj-b".into());
     let scope_b = MemoryScope::Project("project-b".into());
 
     for i in 0..2 {
@@ -512,14 +509,14 @@ async fn test_swarm_e2e_cross_scope_isolation() {
             MemoryCategory::ProjectConvention,
             vec!["scope-isolation".into(), "proj-b".into()],
             scope_b.clone(),
-            MemoryLayer::L4,
+            MemoryLayer::L3,
         );
         mgr.remember(entry).await.unwrap();
     }
 
     // Verify total: 5 entries across both scopes
-    let all_l4 = mgr.list_layer_entries(MemoryLayer::L4).await.unwrap();
-    assert_eq!(all_l4.len(), 5, "Expected 5 total entries in L4");
+    let all_l3 = mgr.list_layer_entries(MemoryLayer::L3).await.unwrap();
+    assert_eq!(all_l3.len(), 5, "Expected 5 total entries in L3");
 
     // Query by project scope identifier in content
     let proj_a_results = mgr.recall("proj-a-entry", 10).await.unwrap();

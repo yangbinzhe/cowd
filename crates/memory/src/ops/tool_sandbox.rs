@@ -1,18 +1,25 @@
-//! Tool output sandbox — in-memory FTS5 index + summary replacement.
+//! Tool output sandbox — derived in-memory FTS5 index over tool evidence.
 //!
-//! When a tool output exceeds a configurable token threshold, the output is
-//! split into chunks and indexed in an in-memory SQLite FTS5 table. A compact
-//! summary replaces the raw output in the conversation context, and the model
-//! can later retrieve specific chunks via `/sandbox-search`.
+//! This index is never the lifecycle truth. Durable chunks carry a canonical
+//! evidence reference from the session ledger; a failed durable write may
+//! instead create an explicitly ephemeral active-runtime entry. Neither form
+//! is replaced by the index, and ephemeral entries are never advertised as
+//! restart-safe evidence.
 //!
 //! Inspired by context-mode's "batch→index→search→inject" pipeline.
 
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
 
+use crate::types::CanonicalRawEvidence;
+
 /// A snippet of indexed tool output returned by a search query.
 #[derive(Debug, Clone)]
 pub struct SearchSnippet {
+    /// Canonical durable evidence identifier.
+    pub evidence_ref: String,
+    /// Hash of the complete canonical raw payload.
+    pub content_hash: String,
     /// Starting line number (1-based).
     pub line_start: usize,
     /// Ending line number (1-based, inclusive).
@@ -57,7 +64,8 @@ impl ToolOutputSandbox {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(
             "CREATE VIRTUAL TABLE IF NOT EXISTS tool_output_fts \
-             USING fts5(call_id, line_range, content, tokenize='porter unicode61');",
+             USING fts5(call_id, evidence_ref UNINDEXED, content_hash UNINDEXED, \
+                        line_range, content, tokenize='porter unicode61');",
         )?;
         Ok(Self { conn })
     }
@@ -69,17 +77,76 @@ impl ToolOutputSandbox {
     /// Otherwise the output is chunked (50 lines per chunk) and inserted into
     /// the FTS5 index, and a [`ToolOutputSummary`] is returned.
     ///
-    /// The caller should replace the raw output with the summary text.
+    /// This compatibility entry point deliberately refuses to build an orphan
+    /// index. Call [`Self::index_tool_output_with_evidence`] after canonical raw
+    /// persistence has returned a durable receipt.
     #[must_use]
     pub fn index_tool_output(
+        &mut self,
+        _tool_call_id: &str,
+        _tool_name: &str,
+        _output: &str,
+        _threshold_min_lines: usize,
+    ) -> Option<ToolOutputSummary> {
+        None
+    }
+
+    /// Index a canonical raw tool output after its durable write has completed.
+    #[must_use]
+    pub fn index_tool_output_with_evidence(
         &mut self,
         tool_call_id: &str,
         _tool_name: &str,
         output: &str,
         threshold_min_lines: usize,
+        evidence: &CanonicalRawEvidence,
+    ) -> Option<ToolOutputSummary> {
+        if !evidence.is_durable() || evidence.access.bytes != output.len() as u64 {
+            return None;
+        }
+        self.index_tool_output_with_metadata(
+            tool_call_id,
+            output,
+            threshold_min_lines,
+            &evidence.access.evidence_ref.0.id,
+            &evidence.access.sha256,
+            &evidence.access.retrieval_selector,
+        )
+    }
+
+    /// Index an output retained only by the active Runtime instance. This is
+    /// deliberately separate from canonical evidence: callers must never
+    /// publish its reference as durable or claim it survives a restart.
+    #[must_use]
+    pub fn index_tool_output_ephemeral(
+        &mut self,
+        tool_call_id: &str,
+        output: &str,
+        threshold_min_lines: usize,
+        evidence_ref: &str,
+        content_hash: &str,
+    ) -> Option<ToolOutputSummary> {
+        self.index_tool_output_with_metadata(
+            tool_call_id,
+            output,
+            threshold_min_lines,
+            evidence_ref,
+            content_hash,
+            &format!("runtime-memory://tool-output/{tool_call_id}"),
+        )
+    }
+
+    fn index_tool_output_with_metadata(
+        &mut self,
+        tool_call_id: &str,
+        output: &str,
+        threshold_min_lines: usize,
+        evidence_ref: &str,
+        content_hash: &str,
+        retrieval_selector: &str,
     ) -> Option<ToolOutputSummary> {
         let lines: Vec<&str> = output.lines().collect();
-        if lines.len() < threshold_min_lines {
+        if lines.len() < threshold_min_lines && output.chars().count() < 16_000 {
             return None;
         }
 
@@ -89,14 +156,32 @@ impl ToolOutputSandbox {
         // Chunk by 50 lines and insert into FTS5.
         let chunk_size = 50;
         if let Ok(tx) = self.conn.transaction() {
-            for chunk_start in (0..total_lines).step_by(chunk_size) {
-                let chunk_end = (chunk_start + chunk_size).min(total_lines);
-                let chunk_content: String = lines[chunk_start..chunk_end].join("\n");
-                let line_range = format!("L{}-L{}", chunk_start + 1, chunk_end);
-                let _ = tx.execute(
-                    "INSERT INTO tool_output_fts(call_id, line_range, content) VALUES (?1, ?2, ?3)",
-                    params![tool_call_id, line_range, chunk_content],
-                );
+            if total_lines < threshold_min_lines {
+                let chars = output.chars().collect::<Vec<_>>();
+                for (chunk_index, chunk) in chars.chunks(8_000).enumerate() {
+                    let chunk_content = chunk.iter().collect::<String>();
+                    let line_range = format!(
+                        "C{}-C{}",
+                        chunk_index * 8_000,
+                        (chunk_index * 8_000) + chunk.len()
+                    );
+                    let _ = tx.execute(
+                        "INSERT INTO tool_output_fts(call_id, evidence_ref, content_hash, line_range, content) \
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![tool_call_id, evidence_ref, content_hash, line_range, chunk_content],
+                    );
+                }
+            } else {
+                for chunk_start in (0..total_lines).step_by(chunk_size) {
+                    let chunk_end = (chunk_start + chunk_size).min(total_lines);
+                    let chunk_content: String = lines[chunk_start..chunk_end].join("\n");
+                    let line_range = format!("L{}-L{}", chunk_start + 1, chunk_end);
+                    let _ = tx.execute(
+                        "INSERT INTO tool_output_fts(call_id, evidence_ref, content_hash, line_range, content) \
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![tool_call_id, evidence_ref, content_hash, line_range, chunk_content],
+                    );
+                }
             }
             let _ = tx.commit();
         }
@@ -116,8 +201,8 @@ impl ToolOutputSandbox {
             keyword_highlights: keywords,
             search_hint: format!(
                 "Output indexed ({} lines, {} bytes). \
-                 Use /sandbox-search {} <query> to locate specific content.",
-                total_lines, full_size_bytes, tool_call_id
+                 Use evidence_retrieve with evidence_ref {} and selector {}.",
+                total_lines, full_size_bytes, evidence_ref, retrieval_selector
             ),
         })
     }
@@ -128,7 +213,7 @@ impl ToolOutputSandbox {
     /// Returns up to `limit` [`SearchSnippet`]s ordered by FTS5 relevance.
     #[must_use]
     pub fn search(&self, tool_call_id: &str, query: &str, limit: usize) -> Vec<SearchSnippet> {
-        let sql = "SELECT line_range, content FROM tool_output_fts \
+        let sql = "SELECT evidence_ref, content_hash, line_range, content FROM tool_output_fts \
                    WHERE call_id = ?1 AND content MATCH ?2 \
                    LIMIT ?3";
         let mut stmt = match self.conn.prepare(sql) {
@@ -137,13 +222,14 @@ impl ToolOutputSandbox {
         };
 
         let rows = stmt.query_map(params![tool_call_id, query, limit as i64], |row| {
-            let line_range: String = row.get(0)?;
-            let content: String = row.get(1)?;
-            // Parse "L{start}-L{end}" format.
-            let parts: Vec<&str> = line_range.trim_start_matches('L').split("-L").collect();
-            let start: usize = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
-            let end: usize = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(start);
+            let evidence_ref: String = row.get(0)?;
+            let content_hash: String = row.get(1)?;
+            let line_range: String = row.get(2)?;
+            let content: String = row.get(3)?;
+            let (start, end) = parse_range(&line_range);
             Ok(SearchSnippet {
+                evidence_ref,
+                content_hash,
                 line_start: start,
                 line_end: end,
                 content,
@@ -156,11 +242,39 @@ impl ToolOutputSandbox {
         }
     }
 
+    /// Read the first indexed chunks for an evidence reference without an FTS query.
+    #[must_use]
+    pub fn read(&self, tool_call_id: &str, limit: usize) -> Vec<SearchSnippet> {
+        let mut stmt = match self.conn.prepare(
+            "SELECT evidence_ref, content_hash, line_range, content FROM tool_output_fts \
+             WHERE call_id = ?1 ORDER BY rowid LIMIT ?2",
+        ) {
+            Ok(statement) => statement,
+            Err(_) => return vec![],
+        };
+        let rows = stmt.query_map(params![tool_call_id, limit as i64], |row| {
+            let evidence_ref: String = row.get(0)?;
+            let content_hash: String = row.get(1)?;
+            let range: String = row.get(2)?;
+            let content: String = row.get(3)?;
+            let (line_start, line_end) = parse_range(&range);
+            Ok(SearchSnippet {
+                evidence_ref,
+                content_hash,
+                line_start,
+                line_end,
+                content,
+            })
+        });
+        rows.map(|mapped| mapped.filter_map(Result::ok).collect())
+            .unwrap_or_default()
+    }
+
     /// Search across ALL indexed tool outputs (not restricted to a specific call_id).
     /// Returns matching snippets ordered by FTS5 relevance.
     #[must_use]
     pub fn search_all(&self, query: &str, limit: usize) -> Vec<SearchSnippet> {
-        let sql = "SELECT line_range, content FROM tool_output_fts \
+        let sql = "SELECT evidence_ref, content_hash, line_range, content FROM tool_output_fts \
                    WHERE content MATCH ?1 \
                    LIMIT ?2";
         let mut stmt = match self.conn.prepare(sql) {
@@ -168,12 +282,14 @@ impl ToolOutputSandbox {
             Err(_) => return vec![],
         };
         let rows = stmt.query_map(params![query, limit as i64], |row| {
-            let line_range: String = row.get(0)?;
-            let content: String = row.get(1)?;
-            let parts: Vec<&str> = line_range.trim_start_matches('L').split("-L").collect();
-            let start: usize = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
-            let end: usize = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(start);
+            let evidence_ref: String = row.get(0)?;
+            let content_hash: String = row.get(1)?;
+            let line_range: String = row.get(2)?;
+            let content: String = row.get(3)?;
+            let (start, end) = parse_range(&line_range);
             Ok(SearchSnippet {
+                evidence_ref,
+                content_hash,
                 line_start: start,
                 line_end: end,
                 content,
@@ -229,6 +345,24 @@ impl ToolOutputSandbox {
     }
 }
 
+fn parse_range(range: &str) -> (usize, usize) {
+    let normalized = range
+        .trim_start_matches('L')
+        .trim_start_matches('C')
+        .replace("-L", "-")
+        .replace("-C", "-");
+    let mut parts = normalized.split('-');
+    let start = parts
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let end = parts
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(start);
+    (start, end)
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Extract up to `top_n` most frequent keywords from `text`, filtering out
@@ -265,6 +399,21 @@ fn extract_keywords(text: &str, top_n: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_contract::{context::EvidenceAccessRef, core::EvidenceRef};
+
+    fn receipt(id: &str, output: &str) -> CanonicalRawEvidence {
+        CanonicalRawEvidence::new(
+            EvidenceAccessRef::durable(
+                EvidenceRef::durable(id),
+                format!("sha256:{id}"),
+                output.len() as u64,
+                "text/plain",
+                format!("retrieve {id}"),
+                "session:test",
+            ),
+            "preview",
+        )
+    }
 
     #[test]
     fn below_threshold_returns_none() {
@@ -274,11 +423,46 @@ mod tests {
     }
 
     #[test]
+    fn large_output_without_durable_receipt_is_not_orphan_indexed() {
+        let mut sandbox = ToolOutputSandbox::new().unwrap();
+        let output = "uncommitted raw output\n".repeat(1_000);
+        assert!(sandbox
+            .index_tool_output("pending-call", "bash", &output, 10)
+            .is_none());
+        assert_eq!(sandbox.entry_count(), 0);
+    }
+
+    #[test]
+    fn active_runtime_can_index_ephemeral_output_without_claiming_durability() {
+        let mut sandbox = ToolOutputSandbox::new().unwrap();
+        let output = "transient_evidence_marker\n".repeat(120);
+        let summary = sandbox.index_tool_output_ephemeral(
+            "ephemeral-1",
+            &output,
+            10,
+            "tool-raw-ephemeral-1",
+            "ephemeral:hash",
+        );
+
+        assert!(summary.is_some());
+        assert!(sandbox.entry_count() > 0);
+        let found = sandbox.search("ephemeral-1", "transient_evidence_marker", 1);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].evidence_ref, "tool-raw-ephemeral-1");
+    }
+
+    #[test]
     fn above_threshold_returns_summary() {
         let mut sandbox = ToolOutputSandbox::new().unwrap();
         // ~5000 tokens worth of content.
         let large_output = "line of data\n".repeat(5000);
-        let result = sandbox.index_tool_output("call_1", "bash", &large_output, 1000);
+        let result = sandbox.index_tool_output_with_evidence(
+            "call_1",
+            "bash",
+            &large_output,
+            1000,
+            &receipt("raw-1", &large_output),
+        );
         assert!(result.is_some());
         let summary = result.unwrap();
         assert!(summary.total_lines > 0);
@@ -295,13 +479,21 @@ mod tests {
                       info: config loaded successfully\n\
                       warning: deprecated_option at line 200\n\
                       error: timeout at line 300";
-        let _ = sandbox.index_tool_output("call_x", "bash", output, 1);
+        let _ = sandbox.index_tool_output_with_evidence(
+            "call_x",
+            "bash",
+            output,
+            1,
+            &receipt("raw-x", output),
+        );
 
         let results = sandbox.search("call_x", "error", 5);
         assert!(
             !results.is_empty(),
             "should find 'error' in indexed content"
         );
+        assert_eq!(results[0].evidence_ref, "raw-x");
+        assert_eq!(results[0].content_hash, "sha256:raw-x");
     }
 
     #[test]
@@ -312,10 +504,32 @@ mod tests {
     }
 
     #[test]
+    fn large_single_line_json_is_indexed_and_readable() {
+        let mut sandbox = ToolOutputSandbox::new().unwrap();
+        let output = format!(r#"{{"records":["{}"]}}"#, "important-value,".repeat(2_000));
+        let summary = sandbox.index_tool_output_with_evidence(
+            "evidence-json",
+            "query",
+            &output,
+            100,
+            &receipt("raw-json", &output),
+        );
+        assert!(summary.is_some());
+        assert!(!sandbox.read("evidence-json", 1).is_empty());
+        assert!(!sandbox.search("evidence-json", "important", 1).is_empty());
+    }
+
+    #[test]
     fn clear_removes_entries() {
         let mut sandbox = ToolOutputSandbox::new().unwrap();
         let output = "error: something went wrong\n".repeat(200);
-        let _ = sandbox.index_tool_output("call_z", "bash", &output, 10);
+        let _ = sandbox.index_tool_output_with_evidence(
+            "call_z",
+            "bash",
+            &output,
+            10,
+            &receipt("raw-z", &output),
+        );
 
         // Should find before clear.
         assert!(!sandbox.search("call_z", "error", 5).is_empty());

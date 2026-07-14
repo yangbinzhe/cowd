@@ -21,6 +21,7 @@ use matrix_core::{
     MatrixMetricAttentionPlan, MatrixMetricAttentionScore, MatrixMetricDefinition,
     MatrixMetricDependency, MatrixMetricLineage, MatrixMetricSnapshot, MatrixMetricSnapshotItem,
     MatrixMetricState, MatrixOntologyPack, MatrixQualityGateDecision, MatrixRelation,
+    MatrixScenarioResult, MatrixScenarioRun, MatrixScenarioRunStatus, MatrixScenarioSpec,
     MatrixSeverity, MatrixSourceDeltaPlan, MatrixSourceKey, MatrixSourcePack,
     MatrixSourcePackValidation, MatrixSourceSnapshot, MatrixSourceSnapshotApplyReport,
     MatrixSourceSnapshotInput, MatrixSourceSnapshotPlan,
@@ -36,6 +37,10 @@ pub enum MatrixSqliteRepositoryError {
     Json(#[from] serde_json::Error),
     #[error("matrix record not found: {0}")]
     NotFound(String),
+    #[error("invalid matrix scenario: {0}")]
+    InvalidScenario(String),
+    #[error("matrix scenario state conflict: {0}")]
+    ScenarioState(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +65,9 @@ pub struct MatrixHealth {
     pub entity_match_candidate_count: u64,
     pub entity_conflict_decision_count: u64,
     pub metric_snapshot_count: u64,
+    pub scenario_spec_count: u64,
+    pub scenario_run_count: u64,
+    pub scenario_result_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -136,6 +144,9 @@ impl MatrixSqliteRepository {
                 "matrix_entity_conflict_decision",
             )?,
             metric_snapshot_count: count_table(&connection, "matrix_metric_snapshot")?,
+            scenario_spec_count: count_table(&connection, "matrix_scenario_spec")?,
+            scenario_run_count: count_table(&connection, "matrix_scenario_run")?,
+            scenario_result_count: count_table(&connection, "matrix_scenario_result")?,
         })
     }
 
@@ -697,6 +708,136 @@ impl MatrixSqliteRepository {
         list_source_snapshots(&connection, source_pack_id, limit)
     }
 
+    /// Persist an immutable scenario specification. The referenced source
+    /// snapshot must already exist, so a scenario can never be detached from
+    /// the exact data it was designed to explore.
+    pub fn create_scenario_spec(
+        &self,
+        spec: MatrixScenarioSpec,
+    ) -> Result<MatrixScenarioSpec, MatrixSqliteRepositoryError> {
+        spec.validate()
+            .map_err(MatrixSqliteRepositoryError::InvalidScenario)?;
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let snapshot_id = &spec.base_snapshot.snapshot_id;
+        if find_source_snapshot(&connection, snapshot_id)?.is_none() {
+            return Err(MatrixSqliteRepositoryError::NotFound(format!(
+                "source snapshot for scenario: {snapshot_id}"
+            )));
+        }
+        insert_scenario_spec(&connection, &spec)?;
+        Ok(spec)
+    }
+
+    pub fn get_scenario_spec(
+        &self,
+        scenario_id: &str,
+    ) -> Result<Option<MatrixScenarioSpec>, MatrixSqliteRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        find_scenario_spec(&connection, scenario_id)
+    }
+
+    pub fn list_scenario_specs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<MatrixScenarioSpec>, MatrixSqliteRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        list_scenario_specs(&connection, limit)
+    }
+
+    /// Start a scenario against the exact immutable Specification and source
+    /// snapshot. A caller supplies only parameters; it cannot swap a snapshot
+    /// or alter scenario assumptions after the specification was recorded.
+    pub fn start_scenario_run(
+        &self,
+        scenario_id: &str,
+        parameters: Value,
+    ) -> Result<MatrixScenarioRun, MatrixSqliteRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let spec = find_scenario_spec(&connection, scenario_id)?
+            .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(scenario_id.to_string()))?;
+        let run = MatrixScenarioRun::start(&spec, parameters);
+        run.validate()
+            .map_err(MatrixSqliteRepositoryError::InvalidScenario)?;
+        insert_scenario_run(&connection, &run)?;
+        Ok(run)
+    }
+
+    pub fn get_scenario_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<MatrixScenarioRun>, MatrixSqliteRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        find_scenario_run(&connection, run_id)
+    }
+
+    pub fn list_scenario_runs(
+        &self,
+        scenario_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MatrixScenarioRun>, MatrixSqliteRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        list_scenario_runs(&connection, scenario_id, limit)
+    }
+
+    /// Complete exactly one running scenario. Results are rejected unless they
+    /// preserve the run's scenario identity and immutable simulated boundary.
+    pub fn complete_scenario_run(
+        &self,
+        result: MatrixScenarioResult,
+    ) -> Result<MatrixScenarioResult, MatrixSqliteRepositoryError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let transaction = connection.transaction()?;
+        let mut run = find_scenario_run(&transaction, &result.run_id)?
+            .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(result.run_id.clone()))?;
+        if run.status != MatrixScenarioRunStatus::Running {
+            return Err(MatrixSqliteRepositoryError::ScenarioState(format!(
+                "scenario run is not running: {}",
+                run.run_id
+            )));
+        }
+        result
+            .validate_for_run(&run)
+            .map_err(MatrixSqliteRepositoryError::InvalidScenario)?;
+        run.status = MatrixScenarioRunStatus::Succeeded;
+        run.completed_at = Some(result.completed_at);
+        update_scenario_run(&transaction, &run)?;
+        insert_scenario_result(&transaction, &result)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn get_scenario_result(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<MatrixScenarioResult>, MatrixSqliteRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        find_scenario_result(&connection, run_id)
+    }
+
     pub fn apply_source_snapshot_rows(
         &self,
         source_pack_id: &str,
@@ -1221,7 +1362,7 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             updated_at TEXT NOT NULL
         );
         INSERT INTO matrix_schema (id, schema_version, updated_at)
-        VALUES (1, 18, datetime('now'))
+        VALUES (1, 19, datetime('now'))
         ON CONFLICT(id) DO UPDATE SET
             schema_version = CASE
                 WHEN matrix_schema.schema_version < excluded.schema_version
@@ -1486,6 +1627,46 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_matrix_metric_snapshot_scope
             ON matrix_metric_snapshot(scope_ref, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS matrix_scenario_spec (
+            scenario_id TEXT PRIMARY KEY,
+            source_snapshot_id TEXT NOT NULL,
+            transform_ref TEXT NOT NULL,
+            spec_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(source_snapshot_id) REFERENCES matrix_source_snapshot(snapshot_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_matrix_scenario_spec_snapshot
+            ON matrix_scenario_spec(source_snapshot_id, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS matrix_scenario_run (
+            run_id TEXT PRIMARY KEY,
+            scenario_id TEXT NOT NULL,
+            source_snapshot_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            run_json TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            completed_at TEXT,
+            FOREIGN KEY(scenario_id) REFERENCES matrix_scenario_spec(scenario_id),
+            FOREIGN KEY(source_snapshot_id) REFERENCES matrix_source_snapshot(snapshot_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_matrix_scenario_run_scenario
+            ON matrix_scenario_run(scenario_id, started_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_matrix_scenario_run_status
+            ON matrix_scenario_run(status, started_at DESC);
+
+        CREATE TABLE IF NOT EXISTS matrix_scenario_result (
+            result_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL UNIQUE,
+            scenario_id TEXT NOT NULL,
+            boundary TEXT NOT NULL CHECK (boundary = 'simulated'),
+            result_json TEXT NOT NULL,
+            completed_at TEXT NOT NULL,
+            FOREIGN KEY(run_id) REFERENCES matrix_scenario_run(run_id),
+            FOREIGN KEY(scenario_id) REFERENCES matrix_scenario_spec(scenario_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_matrix_scenario_result_scenario
+            ON matrix_scenario_result(scenario_id, completed_at DESC);
 
         ",
     )
@@ -2569,6 +2750,171 @@ fn insert_metric_snapshot(
     Ok(())
 }
 
+fn insert_scenario_spec(
+    connection: &Connection,
+    spec: &MatrixScenarioSpec,
+) -> Result<(), MatrixSqliteRepositoryError> {
+    connection.execute(
+        r"INSERT INTO matrix_scenario_spec (
+            scenario_id, source_snapshot_id, transform_ref, spec_json, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            spec.scenario_id,
+            spec.base_snapshot.snapshot_id,
+            spec.transform_ref,
+            serde_json::to_string(spec)?,
+            spec.created_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn find_scenario_spec(
+    connection: &Connection,
+    scenario_id: &str,
+) -> Result<Option<MatrixScenarioSpec>, MatrixSqliteRepositoryError> {
+    connection
+        .query_row(
+            "SELECT spec_json FROM matrix_scenario_spec WHERE scenario_id = ?1",
+            params![scenario_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(MatrixSqliteRepositoryError::from))
+        .transpose()
+}
+
+fn list_scenario_specs(
+    connection: &Connection,
+    limit: usize,
+) -> Result<Vec<MatrixScenarioSpec>, MatrixSqliteRepositoryError> {
+    let mut statement = connection.prepare(
+        "SELECT spec_json FROM matrix_scenario_spec ORDER BY created_at DESC, scenario_id ASC LIMIT ?1",
+    )?;
+    let rows = statement.query_map(params![limit.max(1) as i64], |row| row.get::<_, String>(0))?;
+    rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+}
+
+fn insert_scenario_run(
+    connection: &Connection,
+    run: &MatrixScenarioRun,
+) -> Result<(), MatrixSqliteRepositoryError> {
+    connection.execute(
+        r"INSERT INTO matrix_scenario_run (
+            run_id, scenario_id, source_snapshot_id, status, run_json, started_at, completed_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            run.run_id,
+            run.scenario_id,
+            run.base_snapshot.snapshot_id,
+            scenario_run_status_name(run.status),
+            serde_json::to_string(run)?,
+            run.started_at.to_rfc3339(),
+            run.completed_at.map(|value| value.to_rfc3339()),
+        ],
+    )?;
+    Ok(())
+}
+
+fn update_scenario_run(
+    connection: &Connection,
+    run: &MatrixScenarioRun,
+) -> Result<(), MatrixSqliteRepositoryError> {
+    connection.execute(
+        r"UPDATE matrix_scenario_run
+          SET status = ?2, run_json = ?3, completed_at = ?4
+          WHERE run_id = ?1",
+        params![
+            run.run_id,
+            scenario_run_status_name(run.status),
+            serde_json::to_string(run)?,
+            run.completed_at.map(|value| value.to_rfc3339()),
+        ],
+    )?;
+    Ok(())
+}
+
+fn find_scenario_run(
+    connection: &Connection,
+    run_id: &str,
+) -> Result<Option<MatrixScenarioRun>, MatrixSqliteRepositoryError> {
+    connection
+        .query_row(
+            "SELECT run_json FROM matrix_scenario_run WHERE run_id = ?1",
+            params![run_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(MatrixSqliteRepositoryError::from))
+        .transpose()
+}
+
+fn list_scenario_runs(
+    connection: &Connection,
+    scenario_id: Option<&str>,
+    limit: usize,
+) -> Result<Vec<MatrixScenarioRun>, MatrixSqliteRepositoryError> {
+    let (sql, parameter) = match scenario_id {
+        Some(scenario_id) => (
+            "SELECT run_json FROM matrix_scenario_run WHERE scenario_id = ?1 ORDER BY started_at DESC, run_id ASC LIMIT ?2",
+            vec![rusqlite::types::Value::Text(scenario_id.to_string()), rusqlite::types::Value::Integer(limit.max(1) as i64)],
+        ),
+        None => (
+            "SELECT run_json FROM matrix_scenario_run ORDER BY started_at DESC, run_id ASC LIMIT ?1",
+            vec![rusqlite::types::Value::Integer(limit.max(1) as i64)],
+        ),
+    };
+    let mut statement = connection.prepare(sql)?;
+    let rows = statement.query_map(rusqlite::params_from_iter(parameter), |row| {
+        row.get::<_, String>(0)
+    })?;
+    rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+}
+
+fn insert_scenario_result(
+    connection: &Connection,
+    result: &MatrixScenarioResult,
+) -> Result<(), MatrixSqliteRepositoryError> {
+    connection.execute(
+        r"INSERT INTO matrix_scenario_result (
+            result_id, run_id, scenario_id, boundary, result_json, completed_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            result.result_id,
+            result.run_id,
+            result.scenario_id,
+            result.boundary,
+            serde_json::to_string(result)?,
+            result.completed_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn find_scenario_result(
+    connection: &Connection,
+    run_id: &str,
+) -> Result<Option<MatrixScenarioResult>, MatrixSqliteRepositoryError> {
+    connection
+        .query_row(
+            "SELECT result_json FROM matrix_scenario_result WHERE run_id = ?1",
+            params![run_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(MatrixSqliteRepositoryError::from))
+        .transpose()
+}
+
+const fn scenario_run_status_name(status: MatrixScenarioRunStatus) -> &'static str {
+    match status {
+        MatrixScenarioRunStatus::Running => "running",
+        MatrixScenarioRunStatus::Succeeded => "succeeded",
+        MatrixScenarioRunStatus::Failed => "failed",
+        MatrixScenarioRunStatus::Cancelled => "cancelled",
+    }
+}
+
 fn priority_for_compute_job(job: &MatrixComputeJob) -> f32 {
     let metric_score = (job.metric_ids.len() as f32 / 8.0).min(1.0);
     let trigger_score = if job.trigger_fact_type.contains("shortage")
@@ -3194,8 +3540,8 @@ fn attention_from_change(
 mod tests {
     use super::*;
     use matrix_core::{
-        MatrixSourceEntityMapping, MatrixSourceFactMapping, MatrixSourceKind,
-        MatrixSourceRelationMapping,
+        MatrixScenarioOutputContract, MatrixSnapshotRef, MatrixSourceEntityMapping,
+        MatrixSourceFactMapping, MatrixSourceKind, MatrixSourceRelationMapping,
     };
 
     #[test]
@@ -3317,5 +3663,65 @@ mod tests {
         assert_eq!(health.fact_count, 2);
         assert_eq!(health.relation_count, 2);
         assert_eq!(health.attention_count, 2);
+    }
+
+    #[test]
+    fn scenario_runs_are_bound_to_an_immutable_snapshot_and_stay_simulated() {
+        let repository = MatrixSqliteRepository::in_memory().unwrap();
+        let snapshot = repository
+            .create_source_snapshot(MatrixSourceSnapshotInput {
+                snapshot_id: Some("scenario-snapshot".to_string()),
+                source_pack_id: None,
+                source_system: "scenario-fixture".to_string(),
+                source_kind: MatrixSourceKind::Manual,
+                resource_ref: Some("fixture://scenario-input".to_string()),
+                business_period: None,
+                captured_at: None,
+                schema_version: Some("scenario/v1".to_string()),
+                row_count: Some(1),
+                checksum: Some("fixture-checksum".to_string()),
+                confidence: Some(1.0),
+                metadata: serde_json::json!({"fixture": true}),
+            })
+            .unwrap();
+        let spec = repository
+            .create_scenario_spec(MatrixScenarioSpec::new(
+                MatrixSnapshotRef::from_source_snapshot(&snapshot),
+                serde_json::json!({"demand_change": 0.25}),
+                "runtime/scenario/supply-risk@1",
+                MatrixScenarioOutputContract {
+                    required_outputs: vec!["shortage_risk".to_string()],
+                    evidence_required: true,
+                },
+            ))
+            .unwrap();
+        let run = repository
+            .start_scenario_run(&spec.scenario_id, serde_json::json!({"region": "east"}))
+            .unwrap();
+        let completed = repository
+            .complete_scenario_run(MatrixScenarioResult::simulated(
+                &run,
+                serde_json::json!({"shortage_risk": "high"}),
+                vec![snapshot.reference()],
+            ))
+            .unwrap();
+
+        assert_eq!(completed.boundary, "simulated");
+        assert_eq!(
+            repository.get_scenario_result(&run.run_id).unwrap(),
+            Some(completed)
+        );
+        assert_eq!(
+            repository
+                .get_scenario_run(&run.run_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            MatrixScenarioRunStatus::Succeeded
+        );
+        let health = repository.health().unwrap();
+        assert_eq!(health.scenario_spec_count, 1);
+        assert_eq!(health.scenario_run_count, 1);
+        assert_eq!(health.scenario_result_count, 1);
     }
 }

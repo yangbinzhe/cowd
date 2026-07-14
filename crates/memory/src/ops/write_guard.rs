@@ -152,18 +152,12 @@ fn default_allowed_layers(source: WriteSource) -> HashSet<MemoryLayer> {
             MemoryLayer::L1,
             MemoryLayer::L2,
             MemoryLayer::L3,
-            MemoryLayer::L4,
         ]
         .into_iter()
         .collect(),
-        WriteSource::Assistant => [
-            MemoryLayer::L1,
-            MemoryLayer::L2,
-            MemoryLayer::L3,
-            MemoryLayer::L4,
-        ]
-        .into_iter()
-        .collect(),
+        WriteSource::Assistant => [MemoryLayer::L1, MemoryLayer::L2, MemoryLayer::L3]
+            .into_iter()
+            .collect(),
         WriteSource::Tool => [MemoryLayer::L2, MemoryLayer::L3].into_iter().collect(),
         WriteSource::SubAgent => [MemoryLayer::L2, MemoryLayer::L3].into_iter().collect(),
         WriteSource::Cron => [MemoryLayer::L3].into_iter().collect(),
@@ -401,14 +395,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn user_can_write_all_layers() {
+    fn user_cannot_bypass_governed_l4_promotion_boundary() {
         let guard = MemoryWriteGuard::new(WriteSource::User);
         for layer in [
             MemoryLayer::L0,
             MemoryLayer::L1,
             MemoryLayer::L2,
             MemoryLayer::L3,
-            MemoryLayer::L4,
         ] {
             assert!(
                 guard.is_write_allowed(layer),
@@ -416,6 +409,10 @@ mod tests {
                 layer
             );
         }
+        assert!(
+            !guard.is_write_allowed(MemoryLayer::L4),
+            "L4 must only be written through the governed promotion service"
+        );
     }
 
     #[test]

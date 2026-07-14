@@ -1,4 +1,13 @@
 #![warn(deprecated)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
 //! `memory` – unified memory framework for the cowd AI assistant.
 //!
 //! # Architecture
@@ -21,14 +30,10 @@
 //! }
 //! ```
 
-#![warn(deprecated)]
-
 // --- Public modules ---
 
 #[path = "ingestion/aaak_compression.rs"]
 pub mod aaak_compression;
-#[path = "ingestion/aaak_index.rs"]
-pub mod aaak_index;
 #[path = "lifecycle/agent_directory.rs"]
 pub mod agent_directory;
 #[path = "lifecycle/agent_reputation.rs"]
@@ -39,6 +44,7 @@ pub mod background_watcher;
 pub mod closet;
 #[path = "ingestion/code_indexer.rs"]
 pub mod code_indexer;
+#[allow(private_interfaces)]
 #[path = "kernel/cognitive.rs"]
 pub mod cognitive;
 #[path = "kernel/coherence.rs"]
@@ -88,10 +94,9 @@ pub mod maintenance;
 pub mod memory_authority;
 #[path = "kernel/memory_cluster.rs"]
 pub mod memory_cluster;
+#[allow(private_interfaces)]
 #[path = "kernel/memory_pulse.rs"]
 pub mod memory_pulse;
-#[path = "lifecycle/memory_sync.rs"]
-pub mod memory_sync;
 #[path = "kernel/memory_usage.rs"]
 pub mod memory_usage;
 #[path = "ingestion/miner.rs"]
@@ -105,7 +110,7 @@ pub mod project_scope;
 #[path = "graph/resolution.rs"]
 pub mod resolution;
 #[path = "session/runtime_event.rs"]
-pub mod runtime_event;
+pub(crate) mod runtime_event;
 pub mod search;
 #[path = "ingestion/seeds.rs"]
 pub mod seeds;
@@ -139,7 +144,6 @@ pub use aaak_compression::{
     AaakCompressed, AaakCompressor, AaakDictionary, Abbreviation, EntityType, GsdContext, GsdState,
     PriorityItem,
 };
-pub use aaak_index::{estimate_full_injection_tokens, AaakIndex, AaakSlot};
 pub use closet::{
     Closet, ClosetEntry, ClosetManager, ClosetPointer, CodeSymbolId, PointerKind, CHAR_LIMIT,
     RANK_BOOSTS,
@@ -150,10 +154,7 @@ pub use compression::token_estimation::{
     TokenEstimator,
 };
 pub use config::{MemoryConfig, TuningConfig, VectorConfig};
-pub use context_fence::{
-    build_memory_context_block, fence_from_session, filter_through_fence, ContextFence, EntryBlock,
-    FenceConfig, FenceRegistry, LayerBlock, MemoryContextBlock,
-};
+pub use context_fence::{fence_from_session, filter_through_fence, ContextFence, FenceRegistry};
 pub use context_rot::{ContextRotMonitor, RotAlert, RotMetrics};
 pub use embedding::{EmbeddingCapability, EmbeddingClient};
 pub use error::MemoryError;
@@ -168,9 +169,9 @@ pub use hot_reload::{
     SharedConfigReloader,
 };
 pub use kernel::reality_recall::{
-    rank_and_deduplicate_candidates, rank_candidates, CompactNavigationPointer, RecallCandidate,
-    RecallCandidateEvidence, RecallCandidateScores, RecallFence, RecallOmission, RecallReport,
-    RecallRequest, RecallSource, RecallSourceResult, RecallSourceStatus,
+    rank_and_deduplicate_candidates, rank_candidates, RecallCandidate, RecallCandidateEvidence,
+    RecallCandidateScores, RecallFence, RecallOmission, RecallReport, RecallRequest, RecallSource,
+    RecallSourceResult, RecallSourceStatus,
 };
 pub use kernel::{
     MemoryAtomView, MemoryContextPacket, MemoryContextPacketMode, MemoryDegradation, MemoryHealth,
@@ -189,10 +190,10 @@ pub use knowledge::{
     KnowledgeSnapshot, KnowledgeStore, KnowledgeStoreError, SqliteKnowledgeStore,
     UsageFeedbackLoop,
 };
-pub use layers::shared::{L4Event, L4EventBus, L4Operation};
 pub use maintenance::{
-    scan_maintenance_candidates, MaintenanceCandidate, MaintenanceCandidateFilter,
-    MaintenanceCandidateKind, MaintenanceCandidateStatus, MaintenanceQueue, MaintenanceScanConfig,
+    scan_maintenance_candidates, MaintenanceCandidate, MaintenanceCandidateAction,
+    MaintenanceCandidateFilter, MaintenanceCandidateKind, MaintenanceCandidateStatus,
+    MaintenanceQueue, MaintenanceScanConfig,
 };
 pub use memory_authority::{
     authority_decision, authority_level, MemoryAuthorityAction, MemoryAuthorityDecision,
@@ -204,9 +205,10 @@ pub use memory_pulse::{
     MemoryPulseTransition,
 };
 pub use memory_usage::{summarize_usage, MemoryUsageSignal, MemoryUsageSummary};
-pub use orchestrator::MemoryOrchestrator;
+pub use orchestrator::{L4PromotionCommand, MemoryOrchestrator};
 pub use runtime_event::{
-    RuntimeEvent, RuntimeEventPage, RuntimeEventScope, RuntimeRef, RUNTIME_EVENT_TYPE,
+    SessionDomainEvent, SessionDomainEventPage, SessionDomainRef, SessionDomainScope,
+    SESSION_DOMAIN_EVENT_TYPE,
 };
 pub use search::{BM25Scorer, HybridSearcher, SearchResult as HybridSearchResult};
 pub use session_resume::SessionResume;
@@ -216,7 +218,10 @@ pub use state_rebuilder::{
     StateItem, StateRebuilder, StateSource,
 };
 pub use store::session::{
-    SessionEvent, SessionMessage, SessionRecord, SessionSearchResult, SessionSnapshot,
+    OutboxFailureClass, OutboxStatus, SessionEvent, SessionMessage, SessionMissionOutboxOperation,
+    SessionMissionOutboxRecord, SessionMissionOutboxRequest, SessionRecord,
+    SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest,
+    SessionSearchResult, SessionSnapshot,
 };
 pub use store::verbatim::{VerbatimEntry, VerbatimSink};
 pub use temporal_graph::{temporal_relation, TimeRange};
@@ -258,7 +263,6 @@ pub use performance_monitor::{AutoTuner, PerformanceMonitor, PerformanceReport};
 pub use agent_directory::{AgentDirectory, AgentInfo, AgentStatus, ReputationScore};
 
 // --- Memory sync re-exports (P8.4) ---
-pub use memory_sync::MemorySyncProtocol;
 
 // --- Entity registry re-exports (P9.3) ---
 pub use entity_registry::{DisambiguationKey, EntityRecord, EntityRegistry, EvolutionRecord};

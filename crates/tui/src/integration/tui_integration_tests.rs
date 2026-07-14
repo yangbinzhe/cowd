@@ -143,11 +143,12 @@ fn integration_clean_mode_renders_current_turn_evidence_summary() {
         "selected": [{"id": "ctx-1"}, {"id": "ctx-2"}],
         "omitted": [{"id": "ctx-old"}]
     }));
-    state.app.latest_workgraph_summary = Some(crate::RuntimeWorkGraphSummary {
+    state.app.latest_execution_graph_summary = Some(crate::RuntimeExecutionGraphSummary {
         graph_id: None,
         board_id: None,
         status: "ready".into(),
         agent_tasks: 0,
+        child_executions: 0,
         memory_candidates: 4,
         conflicts: 0,
         completion_rate: None,

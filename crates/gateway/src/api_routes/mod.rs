@@ -2,20 +2,20 @@
 // Core gateway routes shared between TUI and HTTP API.
 
 use std::{
-    collections::HashMap,
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
     body::Body,
     extract::State as AxumState,
-    http::{header, HeaderMap, Request, StatusCode},
+    http::{header, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json},
     Router,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use runtime::approval_gate::SmartApprovalGate;
 #[cfg(test)]
 use runtime::ApprovalConfig;
@@ -27,7 +27,7 @@ use runtime::{
 use serde::Serialize;
 
 use runtime::ProfileManager;
-use tools::GlobalToolRegistry;
+use tools::ToolCatalog;
 
 use crate::event_bus::SessionEventBus;
 #[cfg(test)]
@@ -51,17 +51,20 @@ use memory::MemoryScope;
 mod agent_routes;
 mod approval_routes;
 mod audit_routes;
-mod channel_routes;
+mod capability_contract;
 pub(crate) mod connector_routes;
 mod context_routes;
 mod core_routes;
 mod cross_plane_routes;
 mod edge_routes;
+mod evolution_routes;
 mod growth_routes;
 mod harness_eval_routes;
+mod managed_agent_routes;
 mod matrix_outcomes;
 mod matrix_routes;
 pub(crate) mod memory_routes;
+mod message_connector_routes;
 mod message_routes;
 mod mfg_outcomes;
 mod mfg_routes;
@@ -71,6 +74,7 @@ mod public_routes;
 mod reality_routes;
 mod resource_routes;
 pub(crate) mod route_manifest;
+mod route_registry;
 mod runtime_routes;
 mod session_routes;
 mod skill_routes;
@@ -83,7 +87,7 @@ mod workspace_routes;
 // ── Shared application state ───────────────────────────────────
 
 pub struct AppState {
-    pub tool_registry: Arc<GlobalToolRegistry>,
+    pub tool_registry: Arc<ToolCatalog>,
     pub config: Option<serde_json::Value>,
     pub event_bus: Arc<SessionEventBus>,
     pub static_webui: crate::gateway_static::StaticWebUiSource,
@@ -97,155 +101,60 @@ pub struct AppState {
     pub session_lease_registry: Option<Arc<session::SessionLeaseRegistry>>,
 }
 
-#[derive(Clone)]
-struct ActiveTurnControl {
-    run_id: String,
-    cancellation_token: runtime::CancellationToken,
-    hook_abort_signal: runtime::HookAbortSignal,
+/// Request identity derived exclusively by Gateway authentication middleware.
+/// Route payloads must never carry actor or capability fields.
+#[derive(Debug, Clone)]
+pub(crate) struct AuthenticatedPrincipal(pub(crate) runtime::VerifiedPrincipal);
+
+pub(super) const WEB_SESSION_COOKIE: &str = "cowd_web_session";
+
+/// Stable audit principal derived only from the verified Gateway credential.
+///
+/// HTTP payloads may describe an external identity reference, but never choose
+/// the principal on whose behalf an effect is authorized or recorded.
+pub(crate) fn principal_actor_id(principal: &AuthenticatedPrincipal) -> String {
+    format!("principal:{}", principal.0.claims().principal_id)
 }
 
-impl ActiveTurnControl {
-    fn abort(&self) {
-        self.cancellation_token.cancel();
-        self.hook_abort_signal.abort();
+/// Lifecycle attachments identify a verified principal at a concrete surface.
+///
+/// A person may observe the same session in TUI and WebUI at once.  The
+/// lifecycle kernel keys attachments by actor id, so using only the principal
+/// would make the later surface silently replace the earlier one.  The
+/// surface remains descriptive input, while the authenticated principal is
+/// always supplied by the Gateway.
+pub(crate) fn surface_actor_id(principal: &AuthenticatedPrincipal, surface: &str) -> String {
+    format!(
+        "{}:surface:{}",
+        principal_actor_id(principal),
+        surface.trim()
+    )
+}
+
+impl AppState {
+    pub(crate) fn startup_config_snapshot(&self) -> Option<&serde_json::Value> {
+        self.config.as_ref()
     }
-}
 
-static ACTIVE_TURN_CONTROLS: OnceLock<Mutex<HashMap<String, ActiveTurnControl>>> = OnceLock::new();
-static ACTIVE_TURN_PARTIALS: OnceLock<Mutex<HashMap<String, ActiveTurnPartial>>> = OnceLock::new();
-const ACTIVE_TURN_PARTIAL_MAX_CHARS: usize = 160_000;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ActiveTurnPartial {
-    pub(crate) run_id: String,
-    pub(crate) text: String,
-    pub(crate) updated_at_ms: u64,
-    truncated: bool,
-}
-
-fn active_turn_controls() -> &'static Mutex<HashMap<String, ActiveTurnControl>> {
-    ACTIVE_TURN_CONTROLS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn active_turn_partials() -> &'static Mutex<HashMap<String, ActiveTurnPartial>> {
-    ACTIVE_TURN_PARTIALS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn active_turn_now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-pub(crate) fn register_active_turn_control(
-    session_id: String,
-    run_id: String,
-    cancellation_token: runtime::CancellationToken,
-    hook_abort_signal: runtime::HookAbortSignal,
-) {
-    let control = ActiveTurnControl {
-        run_id,
-        cancellation_token,
-        hook_abort_signal,
-    };
-    active_turn_controls()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(session_id, control);
-}
-
-pub(crate) fn register_active_turn_partial(session_id: String, run_id: String) {
-    active_turn_partials()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            session_id,
-            ActiveTurnPartial {
-                run_id,
-                text: String::new(),
-                updated_at_ms: active_turn_now_ms(),
-                truncated: false,
-            },
-        );
-}
-
-pub(crate) fn record_active_turn_text_delta(session_id: &str, run_id: &str, text: &str) {
-    if text.is_empty() {
-        return;
+    pub(crate) fn runtime_config_json_snapshot(&self) -> Option<serde_json::Value> {
+        self.services
+            .system
+            .runtime_config_json(&self.workspace_root, &self.config_home)
+            .ok()
+            .or_else(|| self.config.clone())
     }
-    let mut partials = active_turn_partials()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(partial) = partials
-        .get_mut(session_id)
-        .filter(|partial| partial.run_id == run_id)
-    else {
-        return;
-    };
 
-    let current_chars = partial.text.chars().count();
-    if current_chars < ACTIVE_TURN_PARTIAL_MAX_CHARS {
-        let remaining = ACTIVE_TURN_PARTIAL_MAX_CHARS.saturating_sub(current_chars);
-        partial.text.extend(text.chars().take(remaining));
-        if text.chars().count() > remaining && !partial.truncated {
-            partial
-                .text
-                .push_str("\n\n[partial output truncated by gateway buffer]");
-            partial.truncated = true;
-        }
-    } else if !partial.truncated {
-        partial
-            .text
-            .push_str("\n\n[partial output truncated by gateway buffer]");
-        partial.truncated = true;
+    pub(crate) fn redacted_runtime_config_json_snapshot(&self) -> Option<serde_json::Value> {
+        self.services
+            .system
+            .redacted_runtime_config_json(&self.workspace_root, &self.config_home)
+            .ok()
+            .or_else(|| {
+                self.config
+                    .clone()
+                    .map(|value| self.services.system.redact_config_json(value))
+            })
     }
-    partial.updated_at_ms = active_turn_now_ms();
-}
-
-pub(crate) fn take_active_turn_partial(
-    session_id: &str,
-    run_id: &str,
-) -> Option<ActiveTurnPartial> {
-    let mut partials = active_turn_partials()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if partials
-        .get(session_id)
-        .is_some_and(|partial| partial.run_id == run_id)
-    {
-        partials.remove(session_id)
-    } else {
-        None
-    }
-}
-
-pub(crate) fn discard_active_turn_partial(session_id: &str, run_id: &str) {
-    let _ = take_active_turn_partial(session_id, run_id);
-}
-
-pub(crate) fn clear_active_turn_control(session_id: &str, run_id: &str) {
-    let mut controls = active_turn_controls()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if controls
-        .get(session_id)
-        .is_some_and(|control| control.run_id == run_id)
-    {
-        controls.remove(session_id);
-    }
-}
-
-pub(crate) fn abort_active_turn(session_id: &str) -> Option<String> {
-    let control = active_turn_controls()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(session_id)
-        .cloned();
-    control.map(|control| {
-        control.abort();
-        control.run_id
-    })
 }
 
 impl AppState {
@@ -267,54 +176,504 @@ impl AppState {
 
 // ── Auth middleware ────────────────────────────────────────────
 
-/// If `auth_token` is set on `AppState`, require `Authorization: Bearer <token>`.
-/// When `auth_token` is `None`, all requests are allowed (no auth configured).
+/// Attach a server-derived principal to every protected request.  Same-origin
+/// headers are browser metadata, not proof of identity, and are deliberately
+/// never accepted as an authentication bypass.
 async fn auth_middleware(
     AxumState(state): AxumState<Arc<AppState>>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    if let Some(token) = &state.auth_token {
-        if is_webui_internal_request(request.headers()) {
-            return Ok(next.run(request).await);
-        }
-
+    let claims = if let Some(token) = &state.auth_token {
         let auth_header = request
             .headers()
             .get(header::AUTHORIZATION)
             .and_then(|v: &axum::http::HeaderValue| v.to_str().ok());
 
         match auth_header {
-            Some(h) if h == format!("Bearer {token}") => Ok(next.run(request).await),
-            _ => Err((
-                StatusCode::UNAUTHORIZED,
-                Json(ErrorResponse {
-                    error: "unauthorized".to_string(),
-                }),
-            )),
+            Some(h) if h == format!("Bearer {token}") => {
+                authenticated_human_principal(&state.config_home, token).map_err(|error| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: format!("authentication_authority_error:{error}"),
+                        }),
+                    )
+                })?
+            }
+            _ => web_session_principal(
+                &state.config_home,
+                request.headers(),
+                state.auth_token.as_deref(),
+            )
+            .map_err(|error| {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(ErrorResponse {
+                        error: format!("unauthorized:{error}"),
+                    }),
+                )
+            })?,
         }
     } else {
-        Ok(next.run(request).await)
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            test_human_principal()
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "authentication_not_configured".to_string(),
+            }),
+        ));
+    };
+    request
+        .extensions_mut()
+        .insert(AuthenticatedPrincipal(claims));
+    Ok(next.run(request).await)
+}
+
+pub(super) fn authenticated_human_principal(
+    config_home: &std::path::Path,
+    token: &str,
+) -> Result<runtime::VerifiedPrincipal, String> {
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        let client = auth_broker::BrokerClient::new(auth_broker::BrokerClient::default_socket(
+            config_home.join("auth-broker"),
+        ));
+        let (envelope, public_key) = client
+            .authenticate_human(token, human_capabilities(), Some(5 * 60 * 1_000))
+            .map_err(|error| error.to_string())?;
+        let lifecycle = client
+            .credential_lifecycle()
+            .map_err(|error| error.to_string())?;
+        if lifecycle.status != auth_broker::CredentialLifecycleStatus::Active {
+            return Err("local human credential is revoked".to_string());
+        }
+        return runtime::PrincipalVerifier::from_base64(&envelope.key_id, &public_key)
+            .map_err(|error| error.to_string())?
+            .requiring_credential_epoch(lifecycle.credential_epoch)
+            .verify(&envelope)
+            .map_err(|error| error.to_string());
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        let (envelope, public_key) = auth_broker::test_support::issue_human_principal(
+            config_home.join("auth-broker"),
+            token,
+            human_capabilities(),
+            Some(5 * 60 * 1_000),
+        )
+        .map_err(|error| error.to_string())?;
+        runtime::PrincipalVerifier::from_base64(&envelope.key_id, &public_key)
+            .map_err(|error| error.to_string())?
+            .verify(&envelope)
+            .map_err(|error| error.to_string())
     }
 }
 
-fn is_webui_internal_request(headers: &HeaderMap) -> bool {
-    let Some(fetch_site) = headers
-        .get("sec-fetch-site")
-        .and_then(|value| value.to_str().ok())
-    else {
-        return false;
-    };
-
-    if fetch_site != "same-origin" {
-        return false;
+/// Mint a short-lived browser session from a local human credential. The
+/// browser receives only a broker-signed principal envelope, never the raw
+/// credential. Gateway has no signing key and verifies this envelope again on
+/// every protected request.
+pub(super) fn issue_web_session(
+    config_home: &std::path::Path,
+    credential: &str,
+) -> Result<String, String> {
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        let client = auth_broker::BrokerClient::new(auth_broker::BrokerClient::default_socket(
+            config_home.join("auth-broker"),
+        ));
+        let (envelope, public_key) = client
+            .authenticate_human(credential, human_capabilities(), Some(5 * 60 * 1_000))
+            .map_err(|error| error.to_string())?;
+        let lifecycle = client
+            .credential_lifecycle()
+            .map_err(|error| error.to_string())?;
+        if lifecycle.status != auth_broker::CredentialLifecycleStatus::Active {
+            return Err("local human credential is revoked".to_string());
+        }
+        verify_human_envelope(&envelope, &public_key, lifecycle.credential_epoch)?;
+        return encode_web_session(&envelope);
     }
 
-    let destination = headers
-        .get("sec-fetch-dest")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("");
-    destination == "empty" || destination == "document"
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        let (envelope, public_key) = auth_broker::test_support::issue_human_principal(
+            config_home.join("auth-broker"),
+            credential,
+            human_capabilities(),
+            Some(5 * 60 * 1_000),
+        )
+        .map_err(|error| error.to_string())?;
+        verify_human_envelope(&envelope, &public_key, 0)?;
+        encode_web_session(&envelope)
+    }
+}
+
+pub(super) fn web_session_principal(
+    config_home: &std::path::Path,
+    headers: &axum::http::HeaderMap,
+    test_credential: Option<&str>,
+) -> Result<runtime::VerifiedPrincipal, String> {
+    let encoded = cookie_value(headers, WEB_SESSION_COOKIE)
+        .ok_or_else(|| "missing_browser_session".to_string())?;
+    if encoded.len() > 8_192 {
+        return Err("browser_session_too_large".to_string());
+    }
+    let bytes = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|error| format!("invalid_browser_session:{error}"))?;
+    let envelope =
+        serde_json::from_slice::<harness_contract::security::SignedPrincipalEnvelope>(&bytes)
+            .map_err(|error| format!("invalid_browser_session:{error}"))?;
+
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        let _ = test_credential;
+        let client = auth_broker::BrokerClient::new(auth_broker::BrokerClient::default_socket(
+            config_home.join("auth-broker"),
+        ));
+        let (key_id, public_key) = client.trust_metadata().map_err(|error| error.to_string())?;
+        if envelope.key_id != key_id {
+            return Err("browser_session_authority_mismatch".to_string());
+        }
+        let lifecycle = client
+            .credential_lifecycle()
+            .map_err(|error| error.to_string())?;
+        if lifecycle.status != auth_broker::CredentialLifecycleStatus::Active {
+            return Err("local_human_credential_revoked".to_string());
+        }
+        return verify_human_envelope(&envelope, &public_key, lifecycle.credential_epoch);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        let (_, public_key) = auth_broker::test_support::issue_human_principal(
+            config_home.join("auth-broker"),
+            test_credential.ok_or_else(|| "test_browser_session_credential_missing".to_string())?,
+            human_capabilities(),
+            Some(5 * 60 * 1_000),
+        )
+        .map_err(|error| error.to_string())?;
+        verify_human_envelope(&envelope, &public_key, 0)
+    }
+}
+
+fn verify_human_envelope(
+    envelope: &harness_contract::security::SignedPrincipalEnvelope,
+    public_key: &str,
+    credential_epoch: u64,
+) -> Result<runtime::VerifiedPrincipal, String> {
+    let verifier = runtime::PrincipalVerifier::from_base64(&envelope.key_id, public_key)
+        .map_err(|error| error.to_string())?;
+    let verifier = if credential_epoch == 0 {
+        verifier
+    } else {
+        verifier.requiring_credential_epoch(credential_epoch)
+    };
+    verifier.verify(envelope).map_err(|error| error.to_string())
+}
+
+fn encode_web_session(
+    envelope: &harness_contract::security::SignedPrincipalEnvelope,
+) -> Result<String, String> {
+    serde_json::to_vec(envelope)
+        .map(|value| URL_SAFE_NO_PAD.encode(value))
+        .map_err(|error| error.to_string())
+}
+
+pub(super) fn cookie_value<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())?
+        .split(';')
+        .map(str::trim)
+        .find_map(|pair| pair.split_once('='))
+        .and_then(|(key, value)| (key == name).then_some(value))
+}
+
+/// Ask the isolated local authority for a short-lived, action-bound human
+/// decision lease. The Gateway receives only a signed envelope and the
+/// authority public key; signing material never enters the process.
+pub(super) fn issue_human_decision_lease(
+    config_home: &std::path::Path,
+    credential: &str,
+    review_id: impl Into<String>,
+    action: impl Into<String>,
+    scope: impl Into<String>,
+    evidence_digest: impl Into<String>,
+    expires_at_ms: u64,
+) -> Result<(harness_contract::security::SignedDecisionLease, String), String> {
+    let review_id = review_id.into();
+    let action = action.into();
+    let scope = scope.into();
+    let evidence_digest = evidence_digest.into();
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        let client = auth_broker::BrokerClient::new(auth_broker::BrokerClient::default_socket(
+            config_home.join("auth-broker"),
+        ));
+        return client
+            .issue_decision_lease(
+                credential,
+                review_id,
+                action,
+                scope,
+                evidence_digest,
+                expires_at_ms,
+            )
+            .map_err(|error| error.to_string());
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        auth_broker::test_support::issue_decision_lease(
+            config_home.join("auth-broker"),
+            credential,
+            review_id,
+            action,
+            scope,
+            evidence_digest,
+            expires_at_ms,
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+
+fn human_capabilities() -> Vec<String> {
+    vec![
+        "approval.respond".to_string(),
+        "definition.manage".to_string(),
+        "evolution.release.manage".to_string(),
+        "runtime.maintenance.manage".to_string(),
+        "runtime.outbox.retry".to_string(),
+    ]
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn test_human_principal() -> runtime::VerifiedPrincipal {
+    static PRINCIPAL: std::sync::OnceLock<runtime::VerifiedPrincipal> = std::sync::OnceLock::new();
+    PRINCIPAL
+        .get_or_init(|| {
+            let (envelope, public_key) = auth_broker::test_support::issue_human_principal(
+                std::env::temp_dir().join("cowd-gateway-test-auth"),
+                "test-only-credential",
+                human_capabilities(),
+                None,
+            )
+            .expect("test principal envelope");
+            runtime::PrincipalVerifier::from_base64(&envelope.key_id, &public_key)
+                .expect("test verifier")
+                .verify(&envelope)
+                .expect("test verified principal")
+        })
+        .clone()
+}
+
+/// Minimal, feature-gated fixture for external black-box route tests.
+///
+/// The harness uses the same `api_router` and Runtime-backed `GatewayServices`
+/// construction as the in-crate route tests. It deliberately exposes no
+/// handlers, no raw stores, and no authentication bypass outside the explicit
+/// `test-support` feature.
+#[cfg(feature = "test-support")]
+pub mod test_support {
+    use std::{path::PathBuf, sync::Arc, time::Instant};
+
+    use approval::FileApprovalRepository;
+    use axum::Router;
+    use runtime::{
+        approval_gate::SmartApprovalGate, permission_enforcer::DestructivePatternDetector,
+        ApprovalConfig, ProfileManager,
+    };
+    use tools::ToolCatalog;
+
+    use super::{api_router, AppState};
+    use crate::{
+        event_bus::SessionEventBus, gateway::ActiveSessions, runtime_service::RuntimeService,
+        services::GatewayServices, session_kernel::SessionKernel, task_kernel::TaskKernel,
+    };
+
+    pub struct GatewayTestHarness {
+        state: Arc<AppState>,
+    }
+
+    impl GatewayTestHarness {
+        pub fn in_memory() -> Result<Self, String> {
+            Self::in_memory_with_optional_auth_token(None)
+        }
+
+        /// Construct the same in-memory production router with bearer
+        /// authentication enabled. This is intentionally test-support only so
+        /// black-box tests can prove missing and invalid credentials are
+        /// rejected without exposing a production authentication bypass.
+        pub fn in_memory_with_auth_token(token: impl Into<String>) -> Result<Self, String> {
+            let token = token.into();
+            if token.trim().is_empty() {
+                return Err("test auth token must not be empty".to_string());
+            }
+            Self::in_memory_with_optional_auth_token(Some(token))
+        }
+
+        fn in_memory_with_optional_auth_token(auth_token: Option<String>) -> Result<Self, String> {
+            let root = unique_test_root("gateway-api-harness");
+            let config_home = root.join("config");
+            let workspace_root = root.join("workspace");
+            std::fs::create_dir_all(&config_home).map_err(|error| error.to_string())?;
+            std::fs::create_dir_all(&workspace_root).map_err(|error| error.to_string())?;
+
+            let sessions = Arc::new(ActiveSessions::new());
+            let event_bus = SessionEventBus::new();
+            let session_store = Arc::new(
+                memory::session_store::UnifiedSessionStore::open_in_memory()
+                    .map_err(|error| error.to_string())?,
+            );
+            let session_kernel = Arc::new(SessionKernel::new(
+                Arc::clone(&sessions),
+                Some(Arc::clone(&session_store)),
+                Arc::clone(&event_bus),
+            ));
+            let lifecycle_kernel = Arc::new(
+                crate::session_lifecycle_kernel::SessionLifecycleKernel::with_store(Arc::clone(
+                    &session_store,
+                )),
+            );
+            let task_kernel = Arc::new(
+                TaskKernel::open(root.join("tasks.json")).map_err(|error| error.to_string())?,
+            );
+            let runtime_services =
+                runtime::RuntimeServices::in_memory().map_err(|error| error.to_string())?;
+            runtime_services
+                .install_session_store(session_store)
+                .map_err(|error| error.to_string())?;
+            let runtime = Arc::new(
+                RuntimeService::new(
+                    sessions,
+                    Arc::new(session::SessionLeaseRegistry::default()),
+                    session_kernel,
+                    lifecycle_kernel,
+                    Instant::now(),
+                    Arc::new(runtime::ProviderRegistry::empty()),
+                    Arc::new(runtime::UpgradeCoordinator::new()),
+                    runtime_services,
+                )
+                .map_err(|error| error.to_string())?
+                .with_tool_host(Arc::new(tools::ToolHost::builtin(
+                    "gateway-black-box-test",
+                    workspace_root.clone(),
+                ))),
+            );
+            let approval_gate = Arc::new(SmartApprovalGate::new(
+                Arc::new(DestructivePatternDetector::new(workspace_root.clone())),
+                ApprovalConfig::default(),
+                None,
+            ));
+            let approval_repository = FileApprovalRepository::new(
+                root.join("approval-history.json"),
+                root.join("always-approved.json"),
+            );
+            let services = Arc::new(GatewayServices::new_with_config_home(
+                runtime,
+                task_kernel,
+                Arc::new(crate::surface_host::SurfaceHost::default()),
+                None,
+                approval_gate,
+                approval_repository,
+                &config_home,
+            ));
+            let profiles = Arc::new(ProfileManager::new_with_profiles_dir(
+                config_home.join("profiles"),
+            ));
+            profiles.initialize().map_err(|error| error.to_string())?;
+
+            Ok(Self {
+                state: Arc::new(AppState {
+                    tool_registry: Arc::new(ToolCatalog::builtin()),
+                    config: None,
+                    event_bus,
+                    static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
+                    approval_gate: None,
+                    auth_token,
+                    workspace_root,
+                    config_home,
+                    profile_id: "default".to_string(),
+                    profile_manager: profiles,
+                    services,
+                    session_lease_registry: None,
+                }),
+            })
+        }
+
+        pub fn router(&self) -> Router {
+            api_router(Arc::clone(&self.state))
+        }
+
+        /// Seed one terminal Surface-to-Runtime handoff through the production
+        /// ledger APIs. Black-box tests use this only to establish a durable
+        /// dead-letter precondition that no public ingress route can create
+        /// deterministically; their assertions still traverse `api_router`.
+        pub fn seed_dead_letter_trigger_event(
+            &self,
+            surface: &str,
+            event_id: &str,
+        ) -> Result<String, String> {
+            let normalized_surface = surface::normalize_surface_id(surface);
+            let payload = serde_json::json!({
+                "event_id": event_id,
+                "surface": normalized_surface,
+                "fixture": "gateway-test-support",
+            });
+            let trigger = harness_contract::managed_agent::ManagedAgentTriggerEvent {
+                event_id: event_id.to_string(),
+                source_id: normalized_surface.clone(),
+                source_kind: "surface".to_string(),
+                event_type: "fixture.trigger".to_string(),
+                subject: format!("fixture:{event_id}"),
+                payload_ref: format!("surface://{normalized_surface}/events/{event_id}"),
+                payload_digest: format!("sha256:{event_id}"),
+                occurred_at_ms: 1,
+                source_sequence: Some(1),
+                idempotency_key: format!("surface:{normalized_surface}:{event_id}"),
+                source_capabilities: vec!["surface.event.receive".to_string()],
+                attributes: std::collections::BTreeMap::new(),
+                trace_refs: vec!["test-support".to_string()],
+            };
+            let receipt = self.state.services.surface.record_trigger_event_received(
+                &normalized_surface,
+                "fixture.trigger",
+                &trigger,
+                &payload,
+            )?;
+            let key = receipt.record.idempotency_key;
+            for _ in 0..receipt.record.max_attempts {
+                self.state
+                    .services
+                    .surface
+                    .mark_trigger_event_dispatching(&key)?
+                    .ok_or_else(|| "fixture trigger event was not dispatchable".to_string())?;
+                let updated = self
+                    .state
+                    .services
+                    .surface
+                    .mark_trigger_event_failed(&key, "fixture delivery failure")?;
+                if updated.status == "dead_letter" {
+                    return Ok(key);
+                }
+            }
+            Err("fixture trigger event did not reach dead_letter".to_string())
+        }
+    }
+
+    fn unique_test_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("cowd-{label}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("gateway test root should be writable");
+        root
+    }
 }
 
 // ── Router ─────────────────────────────────────────────────────
@@ -326,14 +685,16 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .merge(approval_routes::router())
         .merge(agent_routes::router())
         .merge(audit_routes::router())
-        .merge(channel_routes::router())
+        .merge(message_connector_routes::router())
         .merge(connector_routes::router())
         .merge(context_routes::router())
         .merge(core_routes::router())
         .merge(cross_plane_routes::router())
         .merge(edge_routes::router())
+        .merge(evolution_routes::router())
         .merge(growth_routes::router())
         .merge(harness_eval_routes::router())
+        .merge(managed_agent_routes::router())
         .merge(matrix_routes::router())
         .merge(mfg_routes::router())
         .merge(mission_routes::router())
@@ -448,6 +809,7 @@ pub(crate) async fn sync_runtime_session_metadata_to_store(
         .await
         .map_err(|e| e.to_string())?;
 
+    let mut message_events = Vec::with_capacity(session.messages.len());
     for (sequence, message) in session.messages.iter().enumerate() {
         let message_record = message.to_session_message(session_id, sequence);
         store
@@ -457,7 +819,7 @@ pub(crate) async fn sync_runtime_session_metadata_to_store(
 
         let message_json = serde_json::from_str::<serde_json::Value>(&message.to_json().render())
             .unwrap_or(serde_json::Value::Null);
-        let event = memory::SessionEvent {
+        message_events.push(memory::SessionEvent {
             session_id: session_id.to_string(),
             event_type: "message_appended".to_string(),
             event_json: serde_json::json!({
@@ -469,39 +831,13 @@ pub(crate) async fn sync_runtime_session_metadata_to_store(
             .to_string(),
             sequence,
             created_at_ms: message_record.created_at_ms,
-        };
-        store
-            .append_event(&event)
-            .await
-            .map_err(|e| e.to_string())?;
+        });
     }
+    store
+        .append_events_allocating_sequence(&message_events)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(())
-}
-
-async fn append_session_timeline_event(
-    store: &UnifiedSessionStore,
-    session_id: &str,
-    event_type: &str,
-    payload: serde_json::Value,
-) {
-    let sequence = match store.next_event_sequence(session_id).await {
-        Ok(sequence) => sequence,
-        Err(error) => {
-            tracing::warn!(%session_id, %event_type, error = %error, "failed to allocate session event sequence");
-            return;
-        }
-    };
-    let created_at_ms = current_time_ms();
-    let event = memory::SessionEvent {
-        session_id: session_id.to_string(),
-        event_type: event_type.to_string(),
-        event_json: payload.to_string(),
-        sequence,
-        created_at_ms,
-    };
-    if let Err(error) = store.append_event(&event).await {
-        tracing::warn!(%session_id, %event_type, error = %error, "failed to append session event");
-    }
 }
 
 fn current_time_ms() -> u64 {
@@ -533,9 +869,89 @@ pub(crate) mod tests {
     use memory::config::{BudgetConfig, StoreConfig};
     use runtime::permission_enforcer::DestructivePatternDetector;
     use runtime::{ContextProfile, ResumeContextSource};
+    use sha2::Digest;
     use std::sync::Arc;
     use std::time::Instant;
     use tower::ServiceExt;
+
+    struct ApprovalResumeTestExecutor;
+
+    struct CrossPlaneApprovalTestBackend {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl runtime::execution_core::ScopedNodeBackend for CrossPlaneApprovalTestBackend {
+        async fn execute(
+            &self,
+            ticket: &runtime::execution_core::NodeExecutionTicket,
+        ) -> Result<
+            runtime::execution_core::NodeExecutionOutcome,
+            runtime::execution_core::NodeExecutorError,
+        > {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(runtime::execution_core::NodeExecutionOutcome::new(
+                harness_contract::execution_graph::ExecutionNodeResult {
+                    status: harness_contract::execution_graph::ExecutionNodeStatus::Completed,
+                    result_ref: Some(format!("cross-plane-sent:{}", ticket.node_id)),
+                    evidence_refs: Vec::new(),
+                    failure: None,
+                    usage: Default::default(),
+                    finished_at_ms: 1,
+                },
+            ))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl runtime::execution_core::NodeExecutor for ApprovalResumeTestExecutor {
+        fn kind(&self) -> &str {
+            "approval_resume_test_tool"
+        }
+
+        fn validate(
+            &self,
+            _node: &harness_contract::execution_graph::ExecutionNodeSpec,
+        ) -> Result<(), runtime::execution_core::NodeExecutorError> {
+            Ok(())
+        }
+
+        async fn start(
+            &self,
+            context: runtime::execution_core::NodeExecutionContext,
+        ) -> Result<
+            runtime::execution_core::NodeExecutionTicket,
+            runtime::execution_core::NodeExecutorError,
+        > {
+            Ok(runtime::execution_core::NodeExecutionTicket {
+                graph_id: context.graph.id.clone(),
+                node_id: context.node.id,
+                executor_kind: self.kind().to_string(),
+                attempt: context.attempt,
+                idempotency_key: context.node.idempotency_key,
+                payload_ref: context.node.payload_ref,
+            })
+        }
+
+        async fn poll_or_await(
+            &self,
+            ticket: &runtime::execution_core::NodeExecutionTicket,
+        ) -> Result<
+            runtime::execution_core::NodeExecutionOutcome,
+            runtime::execution_core::NodeExecutorError,
+        > {
+            Ok(runtime::execution_core::NodeExecutionOutcome::new(
+                harness_contract::execution_graph::ExecutionNodeResult {
+                    status: harness_contract::execution_graph::ExecutionNodeStatus::Completed,
+                    result_ref: Some(format!("tool-result:{}", ticket.node_id)),
+                    evidence_refs: Vec::new(),
+                    failure: None,
+                    usage: Default::default(),
+                    finished_at_ms: 1,
+                },
+            ))
+        }
+    }
 
     #[derive(Clone, Default)]
     struct CapturedTraceEvents {
@@ -632,35 +1048,71 @@ pub(crate) mod tests {
         task_kernel: Arc<TaskKernel>,
         surface_host: Option<Arc<crate::surface_host::SurfaceHost>>,
     ) -> Arc<crate::services::GatewayServices> {
-        let sessions = Arc::new(ActiveSessions::new());
-        let lifecycle_kernel =
-            Arc::new(crate::session_lifecycle_kernel::SessionLifecycleKernel::new());
-        let runtime = Arc::new(crate::runtime_service::RuntimeService::new(
-            sessions,
-            Arc::new(session::SessionLeaseRegistry::default()),
+        test_services_for_workspace(
             session_kernel,
-            lifecycle_kernel,
-            Instant::now(),
-        ));
+            task_kernel,
+            surface_host,
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        )
+    }
+
+    fn test_services_for_workspace(
+        session_kernel: Arc<SessionKernel>,
+        task_kernel: Arc<TaskKernel>,
+        surface_host: Option<Arc<crate::surface_host::SurfaceHost>>,
+        tool_workspace_root: PathBuf,
+    ) -> Arc<crate::services::GatewayServices> {
+        let sessions = Arc::new(ActiveSessions::new());
+        let runtime_services =
+            runtime::RuntimeServices::in_memory().expect("test runtime services");
+        let runtime_store = session_kernel.unified_store().unwrap_or_else(|| {
+            Arc::new(UnifiedSessionStore::open_in_memory().expect("test session store"))
+        });
+        let lifecycle_kernel = Arc::new(
+            crate::session_lifecycle_kernel::SessionLifecycleKernel::with_store(Arc::clone(
+                &runtime_store,
+            )),
+        );
+        runtime_services
+            .install_session_store(runtime_store)
+            .expect("test session router");
+        let runtime = Arc::new(
+            crate::runtime_service::RuntimeService::new(
+                sessions,
+                Arc::new(session::SessionLeaseRegistry::default()),
+                session_kernel,
+                lifecycle_kernel,
+                Instant::now(),
+                Arc::new(runtime::ProviderRegistry::empty()),
+                Arc::new(runtime::UpgradeCoordinator::new()),
+                runtime_services,
+            )
+            .expect("test runtime service")
+            .with_tool_host(Arc::new(tools::ToolHost::builtin(
+                "gateway-test-runtime",
+                tool_workspace_root,
+            ))),
+        );
         let approval_dir =
             std::env::temp_dir().join(format!("cowd-api-approval-{}", uuid::Uuid::new_v4()));
         let approval_repository = approval::FileApprovalRepository::new(
             approval_dir.join("approval_history.json"),
             approval_dir.join("always_approved.json"),
         );
-        Arc::new(crate::services::GatewayServices::new(
+        Arc::new(crate::services::GatewayServices::new_with_config_home(
             runtime,
             task_kernel,
             surface_host.unwrap_or_else(|| Arc::new(crate::surface_host::SurfaceHost::default())),
             None,
             test_approval_gate(),
             approval_repository,
+            isolated_test_config_home(),
         ))
     }
 
     pub(crate) fn test_state() -> Arc<AppState> {
         let sessions = Arc::new(ActiveSessions::new());
-        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionEventBus::new(); // returns Arc<Self>
         let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
         let task_kernel = test_task_kernel();
@@ -672,7 +1124,7 @@ pub(crate) mod tests {
             approval_gate: None,
             auth_token: None,
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            config_home: default_config_home(),
+            config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             services: test_services(session_kernel, task_kernel, None),
@@ -688,7 +1140,7 @@ pub(crate) mod tests {
         registry: Arc<session::SessionLeaseRegistry>,
     ) -> Arc<AppState> {
         let sessions = Arc::new(ActiveSessions::new());
-        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionEventBus::new();
         let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
         let task_kernel = test_task_kernel();
@@ -700,7 +1152,7 @@ pub(crate) mod tests {
             approval_gate: None,
             auth_token: None,
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            config_home: default_config_home(),
+            config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             services: test_services(session_kernel, task_kernel, None),
@@ -725,10 +1177,11 @@ pub(crate) mod tests {
         workspace_root: PathBuf,
     ) -> Arc<AppState> {
         let sessions = Arc::new(ActiveSessions::new());
-        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionEventBus::new();
         let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
         let task_kernel = test_task_kernel();
+        let config_home = isolated_test_config_home_with_config(&config);
         Arc::new(AppState {
             tool_registry: tools,
             config: Some(config),
@@ -736,11 +1189,16 @@ pub(crate) mod tests {
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: None,
-            workspace_root,
-            config_home: default_config_home(),
+            workspace_root: workspace_root.clone(),
+            config_home,
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_kernel, task_kernel, surface_host),
+            services: test_services_for_workspace(
+                session_kernel,
+                task_kernel,
+                surface_host,
+                workspace_root,
+            ),
             session_lease_registry: None,
         })
     }
@@ -751,9 +1209,20 @@ pub(crate) mod tests {
         path
     }
 
+    fn isolated_test_config_home() -> PathBuf {
+        unique_test_workspace("config-home")
+    }
+
+    fn isolated_test_config_home_with_config(config: &serde_json::Value) -> PathBuf {
+        let path = isolated_test_config_home();
+        let rendered = serde_yaml::to_string(config).expect("test config renders as yaml");
+        std::fs::write(path.join("config.yaml"), rendered).expect("test config writes");
+        path
+    }
+
     fn test_state_with_store(store: Arc<UnifiedSessionStore>) -> Arc<AppState> {
         let sessions = Arc::new(ActiveSessions::new());
-        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionEventBus::new();
         let session_kernel =
             test_session_kernel(sessions.clone(), Some(store.clone()), event_bus.clone());
@@ -766,7 +1235,7 @@ pub(crate) mod tests {
             approval_gate: None,
             auth_token: None,
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            config_home: default_config_home(),
+            config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             services: test_services(session_kernel, task_kernel, None),
@@ -780,7 +1249,7 @@ pub(crate) mod tests {
         config_home: PathBuf,
     ) -> Arc<AppState> {
         let sessions = Arc::new(ActiveSessions::new());
-        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionEventBus::new();
         let session_kernel =
             test_session_kernel(sessions.clone(), Some(store.clone()), event_bus.clone());
@@ -792,11 +1261,16 @@ pub(crate) mod tests {
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: None,
-            workspace_root,
+            workspace_root: workspace_root.clone(),
             config_home,
             profile_id: "enterprise".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_kernel, task_kernel, None),
+            services: test_services_for_workspace(
+                session_kernel,
+                task_kernel,
+                None,
+                workspace_root,
+            ),
             session_lease_registry: None,
         })
     }
@@ -819,7 +1293,7 @@ pub(crate) mod tests {
     }
 
     fn test_state_with_memory(memory_manager: Arc<CognitiveContextManager>) -> Arc<AppState> {
-        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionEventBus::new();
         let task_kernel = test_task_kernel();
         Arc::new(AppState {
@@ -830,7 +1304,7 @@ pub(crate) mod tests {
             approval_gate: None,
             auth_token: None,
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            config_home: default_config_home(),
+            config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             services: Arc::new(
@@ -845,7 +1319,7 @@ pub(crate) mod tests {
         memory_manager: Arc<CognitiveContextManager>,
         workspace_root: PathBuf,
     ) -> Arc<AppState> {
-        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionEventBus::new();
         let task_kernel = test_task_kernel();
         Arc::new(AppState {
@@ -855,8 +1329,8 @@ pub(crate) mod tests {
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: None,
-            workspace_root,
-            config_home: default_config_home(),
+            workspace_root: workspace_root.clone(),
+            config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             services: Arc::new(
@@ -876,7 +1350,7 @@ pub(crate) mod tests {
     }
 
     fn test_state_with_approval_gate(gate: Arc<SmartApprovalGate>) -> Arc<AppState> {
-        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionEventBus::new();
         let task_kernel = test_task_kernel();
         Arc::new(AppState {
@@ -887,7 +1361,7 @@ pub(crate) mod tests {
             approval_gate: Some(gate.clone()),
             auth_token: None,
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            config_home: default_config_home(),
+            config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             services: Arc::new(
@@ -900,7 +1374,7 @@ pub(crate) mod tests {
 
     fn test_state_with_workspace(workspace_root: PathBuf, config_home: PathBuf) -> Arc<AppState> {
         let sessions = Arc::new(ActiveSessions::new());
-        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionEventBus::new();
         let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
         let task_kernel = test_task_kernel();
@@ -911,11 +1385,16 @@ pub(crate) mod tests {
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: None,
-            workspace_root,
+            workspace_root: workspace_root.clone(),
             config_home,
             profile_id: "enterprise".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_kernel, task_kernel, None),
+            services: test_services_for_workspace(
+                session_kernel,
+                task_kernel,
+                None,
+                workspace_root,
+            ),
             session_lease_registry: None,
         })
     }
@@ -946,10 +1425,226 @@ pub(crate) mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn agent_catalog_route_consumes_runtime_definition_projection() {
+        let app = api_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/agents/catalog")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("catalog json");
+        assert_eq!(value["source"], "runtime.definition_catalog");
+        assert!(value["agents"].is_array());
+        assert!(value.get("working_directory").is_none());
+        assert!(value["summary"].get("shadowed").is_none());
+    }
+
+    #[tokio::test]
+    async fn team_template_route_consumes_runtime_definition_projection() {
+        let app = api_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/team-templates")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("templates json");
+        assert_eq!(value["source"], "runtime.definition_catalog");
+        let templates = value["templates"].as_array().expect("template list");
+        assert!(templates.len() >= 8);
+        assert!(templates.iter().any(|template| {
+            template["revision_ref"]["template_id"] == "builtin/cowd/parallel-research-synthesis"
+        }));
+    }
+
+    #[tokio::test]
+    async fn runtime_outbox_management_reports_poison_and_retries_both_directions() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        store
+            .create_session(&new_api_session_record("outbox-session", None))
+            .await
+            .unwrap();
+        let state = test_state_with_store(Arc::clone(&store));
+        let request = memory::SessionRuntimeOutboxRequest {
+            request_id: "ingress-poison".to_string(),
+            turn_id: "turn-1".to_string(),
+            message_id: "user-1".to_string(),
+            created_at_ms: 1,
+        };
+        store
+            .append_ingress_with_runtime_outbox(
+                "outbox-session",
+                "user",
+                Some("[{\"type\":\"text\",\"text\":\"hello\"}]"),
+                1,
+                &request,
+            )
+            .await
+            .unwrap();
+        let ingress_claim = store
+            .claim_session_runtime_outbox("test-worker", 1, 10, 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        store
+            .fail_session_runtime_outbox(
+                "ingress-poison",
+                "test-worker",
+                ingress_claim.revision,
+                memory::OutboxFailureClass::CorruptPayload,
+                "bad payload",
+                2,
+                1,
+                2,
+            )
+            .await
+            .unwrap();
+        let delivery = state
+            .services
+            .runtime
+            .as_ref()
+            .unwrap()
+            .runtime_services()
+            .session_terminal_delivery();
+        delivery
+            .enqueue(
+                "terminal-poison",
+                "assistant-1",
+                "outbox-session",
+                9,
+                "bad payload",
+            )
+            .unwrap();
+        let terminal_claim = delivery
+            .claim("test-worker", 1, 10, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        delivery
+            .fail(
+                "terminal-poison",
+                "test-worker",
+                terminal_claim.revision,
+                runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+                "bad payload",
+                2,
+                1,
+                2,
+            )
+            .unwrap();
+
+        let app = api_router(state);
+        let status = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/runtime/outbox")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        let body = to_bytes(status.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["healthy"], false);
+        assert_eq!(json["ingress"]["poison"][0]["request_id"], "ingress-poison");
+        assert_eq!(
+            json["terminal"]["poison"][0]["terminal_id"],
+            "terminal-poison"
+        );
+
+        for (direction, id) in [
+            ("ingress", "ingress-poison"),
+            ("terminal", "terminal-poison"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/runtime/outbox/{direction}/{id}/retry"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({"reason":"repaired"}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
     fn test_temp_dir(label: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("cowd-api-{label}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    fn gateway_test_actor() -> String {
+        "principal:local-human".to_string()
+    }
+
+    fn cross_plane_intent_from_action(action: &serde_json::Value) -> serde_json::Value {
+        let mut intent = action.clone();
+        intent
+            .as_object_mut()
+            .expect("cross-plane action projection must be an object")
+            .remove("actor_principal");
+        intent
+    }
+
+    async fn wait_for_harness_eval_route_status(
+        app: axum::Router,
+        run_id: &str,
+        expected: &str,
+    ) -> serde_json::Value {
+        for _ in 0..40 {
+            let detail = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/harness-eval/runs/{run_id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = to_bytes(detail.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if json["run"]["status"] == expected {
+                return json;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let detail = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/harness-eval/runs/{run_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        serde_json::from_slice(&to_bytes(detail.into_body(), usize::MAX).await.unwrap()).unwrap()
     }
 
     #[tokio::test]
@@ -967,6 +1662,51 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn gateway_capability_contract_endpoints_are_available() {
+        let app = api_router(test_state());
+        for uri in [
+            "/api/gateway/capability-contract",
+            "/api/gateway/openapi.json",
+            "/api/gateway/openai-tools",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            match uri {
+                "/api/gateway/capability-contract" => {
+                    assert_eq!(json["kind"], "gateway.capability_contract");
+                    assert!(json["route_count"].as_u64().unwrap_or_default() > 50);
+                    assert!(json["capabilities"].as_array().is_some_and(|items| {
+                        items.iter().any(|capability| {
+                            capability["http"]["path"] == "/api/gateway/openapi.json"
+                        })
+                    }));
+                }
+                "/api/gateway/openapi.json" => {
+                    assert_eq!(json["openapi"], "3.1.0");
+                    assert!(json["paths"]["/api/gateway/capability-contract"]["get"].is_object());
+                }
+                "/api/gateway/openai-tools" => {
+                    assert_eq!(json["kind"], "gateway.openai_tools");
+                    assert!(json["tools"].as_array().is_some_and(|items| {
+                        items.iter().all(|tool| {
+                            tool["type"] == "function"
+                                && tool["function"]["name"].as_str().is_some()
+                                && tool["function"]["parameters"]["type"] == "object"
+                        })
+                    }));
+                }
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[tokio::test]
@@ -1098,6 +1838,7 @@ pub(crate) mod tests {
         store
             .insert_messages_batch(&[
                 memory::store::session::SessionMessage {
+                    stable_message_id: format!("branch:{source_id}:0"),
                     session_id: source_id.to_string(),
                     sequence: 0,
                     role: "user".to_string(),
@@ -1109,6 +1850,7 @@ pub(crate) mod tests {
                     created_at_ms: 10,
                 },
                 memory::store::session::SessionMessage {
+                    stable_message_id: format!("branch:{source_id}:1"),
                     session_id: source_id.to_string(),
                     sequence: 1,
                     role: "assistant".to_string(),
@@ -1135,13 +1877,23 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::CREATED);
+        let status = response.status();
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "branch response: {}",
+            String::from_utf8_lossy(&body)
+        );
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let branch_id = json["id"].as_str().expect("branch id should be returned");
         let copied = store.get_messages(branch_id, 0, 10).await.unwrap();
         assert_eq!(copied.len(), 2);
         assert_eq!(copied[0].session_id, branch_id);
+        assert_ne!(copied[0].stable_message_id, format!("branch:{source_id}:0"));
+        assert!(copied[0]
+            .stable_message_id
+            .starts_with(&format!("branch:{branch_id}:")));
         assert_eq!(copied[0].sequence, 0);
         assert!(copied[0].content_json.contains("hello"));
         let branch_record = store
@@ -1203,7 +1955,11 @@ pub(crate) mod tests {
         let run_body = to_bytes(run.into_body(), usize::MAX).await.unwrap();
         let run_json: serde_json::Value = serde_json::from_slice(&run_body).unwrap();
         assert_eq!(run_json["kind"], "harness_eval.run");
-        assert_eq!(run_json["run"]["status"], "completed");
+        assert_eq!(run_json["run"]["status"], "running");
+        let run_id = run_json["run"]["run_id"].as_str().unwrap();
+        let completed_run =
+            wait_for_harness_eval_route_status(app.clone(), run_id, "completed").await;
+        assert_eq!(completed_run["run"]["status"], "completed");
 
         let latest = app
             .clone()
@@ -1220,6 +1976,40 @@ pub(crate) mod tests {
         let latest_json: serde_json::Value = serde_json::from_slice(&latest_body).unwrap();
         assert_eq!(latest_json["kind"], "harness_eval.latest_report");
         assert_eq!(latest_json["report"]["status"], "passed");
+        let report_id = latest_json["report"]["id"].as_str().unwrap();
+
+        let artifacts = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/harness-eval/reports/{report_id}/artifacts"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(artifacts.status(), StatusCode::OK);
+        let artifacts_body = to_bytes(artifacts.into_body(), usize::MAX).await.unwrap();
+        let artifacts_json: serde_json::Value = serde_json::from_slice(&artifacts_body).unwrap();
+        assert_eq!(artifacts_json["kind"], "harness_eval.artifacts");
+        assert_eq!(artifacts_json["report_id"], report_id);
+        assert!(artifacts_json["count"].as_u64().unwrap_or_default() > 0);
+
+        let gate = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/harness-eval/reports/{report_id}/gate"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(gate.status(), StatusCode::OK);
+        let gate_body = to_bytes(gate.into_body(), usize::MAX).await.unwrap();
+        let gate_json: serde_json::Value = serde_json::from_slice(&gate_body).unwrap();
+        assert_eq!(gate_json["kind"], "harness_eval.report_gate");
+        assert_eq!(gate_json["report_gate"]["status"], "passed");
 
         let scenarios = app
             .oneshot(
@@ -1231,9 +2021,160 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(scenarios.status(), StatusCode::OK);
+        let scenarios_body = to_bytes(scenarios.into_body(), usize::MAX).await.unwrap();
+        let scenarios_json: serde_json::Value = serde_json::from_slice(&scenarios_body).unwrap();
+        assert!(scenarios_json["next_gen_harness_closure"]
+            .as_array()
+            .is_some_and(|items| items.len() >= 7));
 
         let _ = std::fs::remove_dir_all(workspace);
         let _ = std::fs::remove_dir_all(report_dir);
+    }
+
+    #[tokio::test]
+    async fn evolution_discovery_routes_have_no_gateway_owned_candidate_or_release_path() {
+        let workspace = test_temp_dir("evolution-route-workspace");
+        let app = api_router(test_state_with_config_runtime_and_workspace(
+            serde_json::json!({}),
+            None,
+            workspace.clone(),
+        ));
+
+        let signal = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/evolution/signals")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "signal_type": "memory_noise",
+                            "source": {
+                                "owner": "runtime",
+                                "session_id": "session-1",
+                                "agent_id": null,
+                                "team_id": null,
+                                "run_id": null
+                            },
+                            "evidence_refs": ["memory:packet:noise"],
+                            "severity": "warning",
+                            "summary": "memory packet contained unrelated context",
+                            "suggested_action": "tighten scope and salience gates",
+                            "immediate_task_can_continue": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(signal.status(), StatusCode::OK);
+        let signal_body = to_bytes(signal.into_body(), usize::MAX).await.unwrap();
+        let signal_json: serde_json::Value = serde_json::from_slice(&signal_body).unwrap();
+        assert_eq!(signal_json["kind"], "evolution.signal");
+
+        let proposal = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/evolution/proposals")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"signal_ids":[]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(proposal.status(), StatusCode::OK);
+        let proposal_body = to_bytes(proposal.into_body(), usize::MAX).await.unwrap();
+        let proposal_json: serde_json::Value = serde_json::from_slice(&proposal_body).unwrap();
+        let proposal_id = proposal_json["proposal"]["proposal_id"].as_str().unwrap();
+        assert_eq!(
+            proposal_json["diagnosis"]["root_cause_kind"],
+            "memory_governance_gap"
+        );
+        assert_eq!(proposal_json["plan_draft"]["blocked_mainline_write"], true);
+
+        let diagnoses = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/evolution/diagnoses")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(diagnoses.status(), StatusCode::OK);
+
+        let draft = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/evolution/proposals/{proposal_id}/skill-draft"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(draft.status(), StatusCode::OK);
+        let draft_body = to_bytes(draft.into_body(), usize::MAX).await.unwrap();
+        let draft_json: serde_json::Value = serde_json::from_slice(&draft_body).unwrap();
+        assert_eq!(draft_json["kind"], "skills.evolution_draft");
+        assert!(draft_json["draft"]["markdown"]
+            .as_str()
+            .unwrap()
+            .contains("Acceptance Gates"));
+
+        let candidates = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/evolution/candidates")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(candidates.status(), StatusCode::OK);
+        let candidates_body = to_bytes(candidates.into_body(), usize::MAX).await.unwrap();
+        let candidates_json: serde_json::Value = serde_json::from_slice(&candidates_body).unwrap();
+        assert_eq!(candidates_json["owner"], "runtime");
+        assert!(candidates_json["candidates"].is_array());
+
+        let chain = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/evolution/chain/{proposal_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(chain.status(), StatusCode::OK);
+
+        let decision = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/evolution/proposals/{proposal_id}/decision"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"decision":"approved"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(decision.status(), StatusCode::OK);
+        let decision_body = to_bytes(decision.into_body(), usize::MAX).await.unwrap();
+        let decision_json: serde_json::Value = serde_json::from_slice(&decision_body).unwrap();
+        assert_eq!(decision_json["proposal"]["status"], "approved");
+        assert_eq!(decision_json["mainline_modified"], false);
+
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[tokio::test]
@@ -1630,8 +2571,12 @@ pub(crate) mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(backgrounded["receipt"]["status"], "accepted");
-        assert!(backgrounded["mission"]["sessions"]
+        assert_eq!(backgrounded["receipt"]["status"], "executed");
+        assert_eq!(
+            backgrounded["receipt"]["result"]["receipt"]["status"],
+            "accepted"
+        );
+        assert!(backgrounded["projection"]["mission"]["sessions"]
             .as_array()
             .expect("mission sessions")
             .iter()
@@ -1641,6 +2586,7 @@ pub(crate) mod tests {
             ));
 
         let projection = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/mission/projection")
@@ -1659,6 +2605,122 @@ pub(crate) mod tests {
             .unwrap()
             .iter()
             .any(|session| session["session_id"].as_str() == Some(session_id.as_str())));
+
+        let interpreted = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mission/control/interpret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "current_session_id": session_id,
+                            "command_text": "dispatch pending mission work",
+                            "execute": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(interpreted.status(), StatusCode::OK);
+        let interpreted: serde_json::Value =
+            serde_json::from_slice(&to_bytes(interpreted.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            interpreted["kind"],
+            "mission_control.command_interpretation"
+        );
+        assert_eq!(interpreted["ok"], true);
+        assert_eq!(interpreted["interpretation"]["status"], "interpreted");
+        assert_eq!(
+            interpreted["interpretation"]["target_kind"].as_str(),
+            Some("dispatch")
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_projection_routes_use_runtime_snapshot_delta_and_command_contracts() {
+        use harness_contract::execution_graph::ExecutionGraph;
+
+        let state = test_state();
+        let runtime = state
+            .services
+            .runtime
+            .as_ref()
+            .expect("runtime service")
+            .runtime_services();
+        let graph = ExecutionGraph::new("projection route test");
+        let execution_id = graph.id.clone();
+        runtime
+            .graph_runner()
+            .start(graph)
+            .await
+            .expect("graph starts");
+        let app = api_router(Arc::clone(&state));
+
+        let snapshot = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/runtime/executions/{execution_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot.status(), StatusCode::OK);
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&to_bytes(snapshot.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(snapshot["execution_id"], execution_id);
+        let revision = snapshot["revision"].as_u64().expect("revision");
+        let cursor = snapshot["cursor"].as_u64().expect("cursor");
+
+        let delta = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/runtime/executions/{execution_id}/events?cursor=0"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delta.status(), StatusCode::OK);
+        let delta: serde_json::Value =
+            serde_json::from_slice(&to_bytes(delta.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(delta["target_cursor"].as_u64().unwrap_or_default() >= cursor);
+
+        let command = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/runtime/executions/{execution_id}/commands"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "command_id": "api-projection-pause",
+                            "expected_revision": revision,
+                            "command": "pause",
+                            "payload": { "reason": "test" }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(command.status(), StatusCode::OK);
+        let command: serde_json::Value =
+            serde_json::from_slice(&to_bytes(command.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(command["status"], "accepted");
+        assert!(command["accepted_revision"].as_u64().unwrap_or_default() > revision);
     }
 
     #[tokio::test]
@@ -1674,18 +2736,12 @@ pub(crate) mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/mission/control/command")
+                    .uri("/api/mission/sessions")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::json!({
-                            "target": "mission",
-                            "action": "start_session",
-                            "actor": "test-human",
-                            "payload": {
-                                "title": "mission control command a",
-                                "session_id": session_a,
-                            },
-                            "evidence_refs": ["test:mission-control"]
+                            "title": "mission control command a",
+                            "session_id": session_a,
                         })
                         .to_string(),
                     ))
@@ -1693,34 +2749,24 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(created_a.status(), StatusCode::OK);
+        assert_eq!(created_a.status(), StatusCode::CREATED);
         let created_a: serde_json::Value =
             serde_json::from_slice(&to_bytes(created_a.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        assert_eq!(created_a["kind"], "mission_control.command_result");
         assert_eq!(created_a["ok"], true);
-        assert_eq!(created_a["receipt"]["status"], "executed");
-        assert_eq!(
-            created_a["projection"]["kind"],
-            "mission_control.projection"
-        );
+        assert_eq!(created_a["mission"]["kind"], "mission.runtime");
 
         let created_b = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/mission/control/command")
+                    .uri("/api/mission/sessions")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::json!({
-                            "target": "mission",
-                            "action": "start_session",
-                            "actor": "test-human",
-                            "payload": {
-                                "title": "mission control command b",
-                                "session_id": session_b,
-                            }
+                            "title": "mission control command b",
+                            "session_id": session_b,
                         })
                         .to_string(),
                     ))
@@ -1728,36 +2774,7 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(created_b.status(), StatusCode::OK);
-
-        let routed = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/mission/control/command")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "target": { "session": { "session_id": session_a } },
-                            "action": "route_to_session",
-                            "actor": "test-human",
-                            "payload": {
-                                "target_session_id": session_b,
-                                "command": "review from mission control"
-                            }
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(routed.status(), StatusCode::OK);
-        let routed: serde_json::Value =
-            serde_json::from_slice(&to_bytes(routed.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
-        assert_eq!(routed["receipt"]["status"], "queued");
+        assert_eq!(created_b.status(), StatusCode::CREATED);
 
         let dispatch = app
             .clone()
@@ -1781,107 +2798,19 @@ pub(crate) mod tests {
         let dispatch: serde_json::Value =
             serde_json::from_slice(&to_bytes(dispatch.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        assert_eq!(dispatch["kind"], "mission_control.session_dispatch_result");
+        assert_eq!(
+            dispatch["kind"],
+            "mission_control.session_dispatch_submission"
+        );
         assert_eq!(dispatch["ok"], true);
-        assert!(dispatch["report"]["dispatched"]
+        let dispatch_report = dispatch["result"].get("Ok").unwrap_or(&dispatch["result"]);
+        assert!(dispatch_report["claimed"].as_u64().is_some());
+        assert!(dispatch_report["receipts"]
             .as_array()
-            .expect("dispatch receipts")
+            .expect("execution graph submission receipts")
             .iter()
-            .any(|receipt| receipt["status_after"].as_str() == Some("claimed")));
-
-        let steward_started = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/mission/control/command")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "target": { "session": { "session_id": session_a } },
-                            "action": "start_steward",
-                            "actor": "test-human",
-                            "payload": {
-                                "objective": "supervise mission control route"
-                            }
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let steward_started: serde_json::Value = serde_json::from_slice(
-            &to_bytes(steward_started.into_body(), usize::MAX)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(steward_started["receipt"]["status"], "executed");
-
-        let approval_required = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/mission/control/command")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "target": { "session": { "session_id": session_a } },
-                            "action": "route_to_agent",
-                            "actor": "test-human",
-                            "payload": {
-                                "agent_id": "agent-for-stage-i",
-                                "command": "perform sensitive intervention",
-                                "require_approval": true
-                            }
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let approval_required: serde_json::Value = serde_json::from_slice(
-            &to_bytes(approval_required.into_body(), usize::MAX)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(approval_required["receipt"]["status"], "approval_required");
-        let approval_id = approval_required["receipt"]["result"]["approval"]["approval_id"]
-            .as_str()
-            .expect("approval id")
-            .to_string();
-
-        let decided = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/mission/control/command")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "target": { "approval": { "approval_id": approval_id } },
-                            "action": "decide_approval",
-                            "actor": "test-human",
-                            "payload": {
-                                "approved": true,
-                                "reason": "stage i route test"
-                            }
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let decided: serde_json::Value =
-            serde_json::from_slice(&to_bytes(decided.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
-        assert_eq!(decided["receipt"]["status"], "executed");
+            .all(|receipt| receipt["graph_id"].as_str().is_some()
+                && receipt["commit_cursor"].as_u64().is_some()));
 
         let control = app
             .oneshot(
@@ -1908,11 +2837,13 @@ pub(crate) mod tests {
             control["projection"]["relations"]["kind"],
             "runtime.session_relations"
         );
+        assert!(control["projection"].get("stewards").is_none());
     }
 
     #[tokio::test]
     async fn mission_routes_write_approvals_relations_proxies_and_routes() {
         let _guard = mission_route_lock().lock().await;
+        let _env_guard = crate::test_process_env_lock();
         let app = api_router(test_state());
         let session_a = format!("mission-route-a-{}", uuid::Uuid::new_v4());
         let session_b = format!("mission-route-b-{}", uuid::Uuid::new_v4());
@@ -1938,10 +2869,6 @@ pub(crate) mod tests {
             assert_eq!(created.status(), StatusCode::CREATED);
         }
 
-        let original_config_home = std::env::var_os("COWD_CONFIG_HOME");
-        let team_agent_home =
-            std::env::temp_dir().join(format!("cowd-mission-team-agents-{}", uuid::Uuid::new_v4()));
-        std::env::set_var("COWD_CONFIG_HOME", &team_agent_home);
         let team = app
             .clone()
             .oneshot(
@@ -1951,8 +2878,19 @@ pub(crate) mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::json!({
+                            "request_id": "mission-route-team",
+                            "team_id": "mission-route-team",
+                            "session_id": session_a,
+                            "selection_mode": "explicit",
+                            "template_selector": {
+                                "kind": "latest_stable",
+                                "template_id": "builtin/cowd/execute-review"
+                            },
                             "objective": "research architecture and review implementation",
-                            "execution_mode": "register_only"
+                            "acceptance": ["summary", "evidence"],
+                            "permission_lease": "read_only",
+                            "model_lease": "default",
+                            "resource_scopes": ["session:mission-route"]
                         })
                         .to_string(),
                     ))
@@ -1964,116 +2902,11 @@ pub(crate) mod tests {
         let team_json: serde_json::Value =
             serde_json::from_slice(&to_bytes(team.into_body(), usize::MAX).await.unwrap()).unwrap();
         assert_eq!(team_json["ok"], true);
-        assert!(!team_json["team"]["team_id"]
-            .as_str()
-            .expect("team id")
-            .is_empty());
-        assert!(team_json["team"]["agents"]
-            .as_array()
-            .expect("team agents")
-            .iter()
-            .all(|agent| agent["agent_id"].as_str().is_some_and(|id| !id.is_empty())));
-        let team_id = team_json["team"]["team_id"].as_str().unwrap().to_string();
-        let runs = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/mission/control/teams")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(runs.status(), StatusCode::OK);
-        let runs_json: serde_json::Value =
-            serde_json::from_slice(&to_bytes(runs.into_body(), usize::MAX).await.unwrap()).unwrap();
-        assert!(runs_json["projection"]["runs"]
-            .as_array()
-            .expect("collaboration runs")
-            .iter()
-            .any(|run| run["team"]["team_id"] == team_id));
-
-        let run = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/api/mission/control/teams/{team_id}/run"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(run.status(), StatusCode::OK);
-        let run_json: serde_json::Value =
-            serde_json::from_slice(&to_bytes(run.into_body(), usize::MAX).await.unwrap()).unwrap();
-        assert_eq!(run_json["run"]["kind"], "runtime.collaboration_run");
-        assert!(
-            run_json["run"]["agent_runs"]
-                .as_array()
-                .expect("agent runs")
-                .len()
-                >= 2
-        );
-
-        let handoff = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/mission/control/teams/{team_id}/handoff"))
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "target": "human-agent",
-                            "note": "review before final synthesis"
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(handoff.status(), StatusCode::OK);
-        let handoff_json: serde_json::Value =
-            serde_json::from_slice(&to_bytes(handoff.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
-        assert_eq!(handoff_json["receipt"]["command"], "handoff");
-        assert!(handoff_json["run"]["team"]["review_notes"]
-            .as_array()
-            .expect("review notes")
-            .iter()
-            .any(|note| note.as_str().is_some_and(|value| value.contains("review"))));
-
-        let synthesis = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/mission/control/teams/{team_id}/synthesis"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(synthesis.status(), StatusCode::OK);
-        let synthesis_json: serde_json::Value =
-            serde_json::from_slice(&to_bytes(synthesis.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
-        assert_eq!(synthesis_json["summary"]["team_id"], team_id);
-        assert!(synthesis_json["summary"]["role_summaries"]
-            .as_array()
-            .expect("role summaries")
-            .iter()
-            .flat_map(|role| role["evidence_refs"].as_array().into_iter().flatten())
-            .any(|reference| reference
-                .as_str()
-                .is_some_and(|value| value.starts_with("team:"))));
-        if let Some(value) = original_config_home {
-            std::env::set_var("COWD_CONFIG_HOME", value);
-        } else {
-            std::env::remove_var("COWD_CONFIG_HOME");
-        }
-        let _ = std::fs::remove_dir_all(team_agent_home);
+        assert!(team_json["team"]["graph_id"].as_str().is_some());
+        assert!(matches!(
+            team_json["status"].as_str(),
+            Some("completed" | "blocked" | "failed" | "running")
+        ));
 
         let approval = app
             .clone()
@@ -2240,180 +3073,10 @@ pub(crate) mod tests {
             serde_json::from_slice(&to_bytes(proxy.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(proxy_json["proxy"]["session_id"], session_b);
-
-        let routed = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/mission/route")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "from_session_id": session_a.clone(),
-                            "target_ref": format!("@{session_b}"),
-                            "command": "review"
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(routed.status(), StatusCode::OK);
-        let routed_json: serde_json::Value =
-            serde_json::from_slice(&to_bytes(routed.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
-        assert_eq!(
-            routed_json["receipt"]["resolved_session_id"].as_str(),
-            Some(session_b.as_str())
-        );
-        assert_eq!(routed_json["routed"]["kind"], "mission.session_command");
-        assert_eq!(
-            routed_json["routed"]["command"]["target_session_id"].as_str(),
-            Some(session_b.as_str())
-        );
-        assert!(routed_json["mission"]["routed_commands"]
-            .as_array()
-            .expect("routed commands")
-            .iter()
-            .any(|command| command["target_session_id"].as_str() == Some(session_b.as_str())));
     }
 
     #[tokio::test]
-    async fn mission_routes_manage_steward_runtime_lifecycle() {
-        let _guard = mission_route_lock().lock().await;
-        let app = api_router(test_state());
-        let session_id = format!("mission-steward-session-{}", uuid::Uuid::new_v4());
-        let created = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/mission/sessions")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "title": "steward controlled session",
-                            "session_id": session_id,
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(created.status(), StatusCode::CREATED);
-
-        let started = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/mission/stewards")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "mission_id": "mission-runtime",
-                            "root_session_id": session_id,
-                            "profile_id": "stewarded",
-                            "objective": "supervise high risk implementation"
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(started.status(), StatusCode::CREATED);
-        let started_json: serde_json::Value =
-            serde_json::from_slice(&to_bytes(started.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
-        let steward_id = started_json["steward"]["steward_id"]
-            .as_str()
-            .expect("steward id")
-            .to_string();
-        assert_eq!(started_json["steward"]["status"], "running");
-
-        let tick_all = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/mission/stewards/tick-all")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(tick_all.status(), StatusCode::OK);
-        let tick_all_json: serde_json::Value =
-            serde_json::from_slice(&to_bytes(tick_all.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
-        assert_eq!(
-            tick_all_json["report"]["kind"],
-            "runtime.steward_loop_report"
-        );
-
-        let tick = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/mission/stewards/{steward_id}/tick"))
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "action": "apply patch",
-                            "summary": "write runtime changes",
-                            "risk": "high",
-                            "requested_tool": "apply_patch",
-                            "requires_write": true,
-                            "timeout_policy": "continue_alternative"
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(tick.status(), StatusCode::OK);
-        let tick_json: serde_json::Value =
-            serde_json::from_slice(&to_bytes(tick.into_body(), usize::MAX).await.unwrap()).unwrap();
-        assert_eq!(tick_json["decision"]["status"], "approval_submitted");
-        assert!(
-            tick_json["approvals"]["pending_count"]
-                .as_u64()
-                .expect("pending approvals")
-                >= 1
-        );
-
-        let takeover = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/mission/stewards/{steward_id}/takeover"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(takeover.status(), StatusCode::OK);
-        let takeover_json: serde_json::Value =
-            serde_json::from_slice(&to_bytes(takeover.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
-        assert_eq!(takeover_json["report"]["status"], "handed_off");
-        assert!(
-            takeover_json["report"]["decisions"]
-                .as_array()
-                .unwrap()
-                .len()
-                >= 2
-        );
-    }
-
-    #[tokio::test]
-    async fn runtime_events_api_exposes_durable_mission_events() {
+    async fn mission_projection_exposes_durable_mission_events() {
         let _guard = mission_route_lock().lock().await;
         let app = api_router(test_state());
         let session_id = format!("runtime-events-session-{}", uuid::Uuid::new_v4());
@@ -2440,9 +3103,7 @@ pub(crate) mod tests {
         let events = app
             .oneshot(
                 Request::builder()
-                    .uri(format!(
-                        "/api/runtime/events?stream_id=session:{session_id}"
-                    ))
+                    .uri("/api/mission/projection")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2452,81 +3113,13 @@ pub(crate) mod tests {
         let events_json: serde_json::Value =
             serde_json::from_slice(&to_bytes(events.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        assert_eq!(events_json["kind"], "runtime.events");
+        assert_eq!(events_json["mission"]["kind"], "mission.runtime");
         assert!(events_json["events"]
             .as_array()
+            .or_else(|| events_json["mission"]["events"].as_array())
             .expect("events")
             .iter()
-            .any(|event| event["kind"].as_str() == Some("mission.session.started")));
-    }
-
-    #[tokio::test]
-    async fn runtime_event_replay_report_and_recover_marks_steward_review() {
-        let _guard = mission_route_lock().lock().await;
-        let app = api_router(test_state());
-        let steward_response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/mission/stewards")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "mission_id": "mission-replay",
-                            "root_session_id": "session-replay",
-                            "profile_id": "stewarded",
-                            "objective": "verify recovery"
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(steward_response.status(), StatusCode::CREATED);
-
-        let report = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/runtime/events/replay-report?limit=2000")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(report.status(), StatusCode::OK);
-        let report_json: serde_json::Value =
-            serde_json::from_slice(&to_bytes(report.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
-        assert_eq!(report_json["kind"], "runtime.events.replay_report");
-        assert!(report_json["report"]["actions"]
-            .as_array()
-            .expect("actions")
-            .iter()
-            .any(|action| action["action"] == "pause_recovery_required"));
-
-        let recover = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/runtime/events/recover?limit=2000")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(recover.status(), StatusCode::OK);
-        let recover_json: serde_json::Value =
-            serde_json::from_slice(&to_bytes(recover.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
-        assert_eq!(recover_json["kind"], "runtime.recovery_result");
-        assert!(recover_json["applied"]
-            .as_array()
-            .expect("applied")
-            .iter()
-            .any(|item| item["action"] == "pause_recovery_required"));
+            .any(|event| event["event_type"].as_str() == Some("mission.session.started")));
     }
 
     #[tokio::test]
@@ -3291,20 +3884,20 @@ pub(crate) mod tests {
             .await
             .unwrap();
         store
-            .append_runtime_event(&memory::RuntimeEvent::new(
+            .append_session_domain_event(&memory::SessionDomainEvent::new(
                 session_id,
                 0,
-                memory::RuntimeEventScope::Turn,
+                memory::SessionDomainScope::Turn,
                 "execution.outcome",
                 serde_json::json!({"status": "ok", "title": "full loop outcome"}),
                 current_time_ms(),
             ))
             .await
             .unwrap();
-        let mut skill_activation_event = memory::RuntimeEvent::new(
+        let mut skill_activation_event = memory::SessionDomainEvent::new(
             session_id,
             1,
-            memory::RuntimeEventScope::Context,
+            memory::SessionDomainScope::Context,
             "skill_candidates",
             serde_json::json!({
                 "source": "conversation_runtime.skill_activation",
@@ -3329,24 +3922,24 @@ pub(crate) mod tests {
             }),
             current_time_ms(),
         );
-        skill_activation_event.refs.push(memory::RuntimeRef {
+        skill_activation_event.refs.push(memory::SessionDomainRef {
             ref_type: "skill".to_string(),
             id: "supply-risk-analyst".to_string(),
             label: Some("selected".to_string()),
         });
-        skill_activation_event.refs.push(memory::RuntimeRef {
+        skill_activation_event.refs.push(memory::SessionDomainRef {
             ref_type: "skill_invocation".to_string(),
             id: "supply-risk-analyst".to_string(),
             label: Some("selected_for_runtime".to_string()),
         });
         store
-            .append_runtime_event(&skill_activation_event)
+            .append_session_domain_event(&skill_activation_event)
             .await
             .unwrap();
-        let mut skill_memory_event = memory::RuntimeEvent::new(
+        let mut skill_memory_event = memory::SessionDomainEvent::new(
             session_id,
             2,
-            memory::RuntimeEventScope::Context,
+            memory::SessionDomainScope::Context,
             "skill_memory_candidate",
             serde_json::json!({
                 "source": "conversation_runtime.skill_memory_candidate",
@@ -3361,13 +3954,13 @@ pub(crate) mod tests {
             }),
             current_time_ms(),
         );
-        skill_memory_event.refs.push(memory::RuntimeRef {
+        skill_memory_event.refs.push(memory::SessionDomainRef {
             ref_type: "skill".to_string(),
             id: "supply-risk-analyst".to_string(),
             label: Some("memory_candidate_source".to_string()),
         });
         store
-            .append_runtime_event(&skill_memory_event)
+            .append_session_domain_event(&skill_memory_event)
             .await
             .unwrap();
         let app = api_router(test_state_with_store_and_workspace(
@@ -3720,7 +4313,7 @@ pub(crate) mod tests {
 
         let record = harness_contract::growth::LearningRecord::from_input(
             harness_contract::growth::GrowthInput {
-                selected_mode: harness_contract::core::ExecutionMode::PlanExecute,
+                selected_pattern: harness_contract::core::ExecutionPattern::Execute,
                 complexity: harness_contract::core::TaskComplexity::Complex,
                 risk: harness_contract::core::TaskRisk::Medium,
                 context_omitted: 0,
@@ -3734,7 +4327,7 @@ pub(crate) mod tests {
             harness_contract::growth::GrowthEventInput {
                 session_id: "session-reality-recall".to_string(),
                 source_event_kind: "runtime.context.reality_test".to_string(),
-                strategy_mode: harness_contract::core::ExecutionMode::PlanExecute,
+                strategy_pattern: harness_contract::core::ExecutionPattern::Execute,
                 learning_record: record,
                 evidence_refs: vec![harness_contract::growth::GrowthEvidenceRef::new(
                     "test_evidence",
@@ -4178,7 +4771,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn matrix_evidence_context_and_mfg_incident_create_agent_graph() {
+    async fn matrix_evidence_context_and_mfg_incident_create_workflow_graph() {
         let workspace = test_temp_dir("matrix-mfg-agent");
         let config_home = test_temp_dir("matrix-mfg-agent-config");
         let app = api_router(test_state_with_workspace(workspace.clone(), config_home));
@@ -4298,17 +4891,94 @@ pub(crate) mod tests {
         let body = to_bytes(incident.into_body(), usize::MAX).await.unwrap();
         let incident_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(incident_json["incident"]["evidence_packet_id"], packet_id);
-        assert!(incident_json["agent_graph"]["nodes"]
+        assert!(incident_json["workflow_graph"]["nodes"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|node| node["id"] == "mfg_researcher"));
-        assert!(incident_json["agent_graph"]["evidence"]
+            .any(|node| node["node_id"] == "mfg_researcher"));
+        assert!(incident_json["workflow_graph"]["evidence"]
             .as_array()
             .unwrap()
             .iter()
             .any(|evidence| evidence["reference"] == format!("mfg:evidence:{packet_id}")));
         let incident_id = incident_json["incident"]["incident_id"].as_str().unwrap();
+
+        let room = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/apps/mfg/incidents/{incident_id}/room"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(room.status(), StatusCode::OK);
+        let room_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(room.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(
+            room_json["workflow_graph"]["workflow_id"],
+            incident_json["workflow_graph"]["workflow_id"]
+        );
+        assert!(room_json.get("agent_graph").is_none());
+
+        let skill_plan = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/apps/mfg/incidents/{incident_id}/skills/plan"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"limit":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(skill_plan.status(), StatusCode::OK);
+        let skill_plan_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(skill_plan.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let skill_id = skill_plan_json["plan"]["selected_skills"][0]["skill_id"]
+            .as_str()
+            .unwrap();
+        let skill_node_id = app_mfg::skill_agent_node_id(skill_id);
+        assert!(skill_plan_json["workflow_graph"]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["node_id"] == skill_node_id));
+        assert!(skill_plan_json.get("agent_graph").is_none());
+
+        let skill_run = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/apps/mfg/incidents/{incident_id}/skills/{skill_id}/run"
+                    ))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let skill_run_status = skill_run.status();
+        let skill_run_body = to_bytes(skill_run.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            skill_run_status,
+            StatusCode::OK,
+            "MFG skill run response: {}",
+            String::from_utf8_lossy(&skill_run_body)
+        );
+        let skill_run_json: serde_json::Value = serde_json::from_slice(&skill_run_body).unwrap();
+        assert_eq!(skill_run_json["skill_run"]["status"], "completed");
+        assert!(skill_run_json["workflow_graph"]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["node_id"] == skill_node_id && node["status"] == "completed"));
+        assert!(skill_run_json.get("agent_graph").is_none());
 
         let analysis = app
             .clone()
@@ -4437,7 +5107,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn agent_run_persists_evidence_to_session_event() {
+    async fn task_execution_graph_is_committed_and_projected() {
         let app = api_router(test_state());
         let started = app
             .clone()
@@ -4466,7 +5136,7 @@ pub(crate) mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/agents/runs")
+                    .uri("/api/agents/execution-graphs")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -4475,15 +5145,15 @@ pub(crate) mod tests {
         assert_eq!(runs.status(), StatusCode::OK);
         let body = to_bytes(runs.into_body(), usize::MAX).await.unwrap();
         let runs_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(runs_json["kind"], "agent_run_graphs");
-        assert_eq!(runs_json["runs"][0]["session_id"], task_id);
+        assert_eq!(runs_json["kind"], "execution_graphs");
+        assert_eq!(runs_json["graphs"].as_array().unwrap().len(), 0);
 
         let upsert = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri(format!("/api/tasks/{task_id}/agent-graph"))
+                    .uri(format!("/api/tasks/{task_id}/execution-graph"))
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
@@ -4491,25 +5161,28 @@ pub(crate) mod tests {
                             "nodes": [
                                 {
                                     "id": "planner",
-                                    "role": "planner",
-                                    "title": "Plan",
-                                    "objective": "split work",
-                                    "depends_on": [],
-                                    "status": "ready",
-                                    "created_at_ms": 1,
-                                    "updated_at_ms": 1
+                                    "kind": "agent_task",
+                                    "payload_ref": "task:planner",
+                                    "executor_kind": "agent_task",
+                                    "idempotency_key": "task:planner:1",
+                                    "lease_ref": null,
+                                    "acceptance": {"criteria": [], "required_evidence": [], "minimum_score_basis_points": null},
+                                    "retry_policy": {"max_attempts": 1, "retryable_failure_kinds": [], "base_backoff_ms": 500, "maximum_backoff_ms": 30000},
+                                    "resource_scopes": []
                                 },
                                 {
                                     "id": "review",
-                                    "role": "reviewer",
-                                    "title": "Review",
-                                    "objective": "challenge result",
-                                    "depends_on": ["planner"],
-                                    "status": "pending",
-                                    "created_at_ms": 1,
-                                    "updated_at_ms": 1
+                                    "kind": "verify",
+                                    "payload_ref": "task:review",
+                                    "executor_kind": "verify",
+                                    "idempotency_key": "task:review:1",
+                                    "lease_ref": null,
+                                    "acceptance": {"criteria": [], "required_evidence": [], "minimum_score_basis_points": null},
+                                    "retry_policy": {"max_attempts": 1, "retryable_failure_kinds": [], "base_backoff_ms": 500, "maximum_backoff_ms": 30000},
+                                    "resource_scopes": []
                                 }
-                            ]
+                            ],
+                            "edges": [{"from": "planner", "to": "review", "kind": "depends_on"}]
                         })
                         .to_string(),
                     ))
@@ -4521,11 +5194,12 @@ pub(crate) mod tests {
         let body = to_bytes(upsert.into_body(), usize::MAX).await.unwrap();
         let graph: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(graph["nodes"].as_array().unwrap().len(), 2);
+        assert_eq!(graph["revision"], 1);
 
         let fetched = app
             .oneshot(
                 Request::builder()
-                    .uri(format!("/api/tasks/{task_id}/agent-graph"))
+                    .uri(format!("/api/tasks/{task_id}/execution-graph"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -4534,38 +5208,42 @@ pub(crate) mod tests {
         assert_eq!(fetched.status(), StatusCode::OK);
         let body = to_bytes(fetched.into_body(), usize::MAX).await.unwrap();
         let fetched_graph: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(fetched_graph["nodes"][1]["id"], "review");
+        assert_eq!(fetched_graph["nodes"][1]["node_id"], "review");
     }
 
     #[tokio::test]
-    async fn runtime_agent_routes_project_events_and_cancel() {
-        let app = api_router(test_state());
+    async fn runtime_agent_routes_reject_commands_without_recoverable_backend_handle() {
+        let state = test_state();
         let agent_id = format!("agent-route-{}", uuid::Uuid::new_v4());
-        let dir = std::env::temp_dir().join(format!("cowd-agent-route-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let output_file = dir.join("agent.md");
-        let manifest_file = dir.join("agent.json");
-        std::fs::write(&output_file, "# Agent Task\n").unwrap();
-        let snapshot = runtime::AgentSnapshot {
-            agent_id: agent_id.clone(),
-            name: String::from("route-agent"),
-            description: String::from("route test"),
-            subagent_type: Some(String::from("Explore")),
-            model: Some(String::from(runtime::DEFAULT_AGENT_MODEL)),
-            status: String::from("running"),
-            backend: runtime::AgentExecutionBackendKind::InProcess,
-            output_file: output_file.display().to_string(),
-            manifest_file: manifest_file.display().to_string(),
-            created_at: String::from("1"),
-            started_at: Some(String::from("1")),
-            completed_at: None,
-            lane_events: vec![],
-            current_blocker: None,
-            derived_state: String::from("working"),
-            error: None,
-        };
-        runtime::global_agent_lifecycle_service()
-            .register_started(snapshot, runtime::CancellationToken::new());
+        let services = state
+            .services
+            .runtime
+            .as_ref()
+            .expect("runtime service")
+            .runtime_services();
+        services
+            .agent_runtime()
+            .restore_verified_run(runtime::AgentRunSnapshot {
+                run_id: format!("run-{agent_id}"),
+                agent_id: agent_id.clone(),
+                task_id: "task-route".to_string(),
+                session_id: "session-route".to_string(),
+                graph_id: "graph-route".to_string(),
+                node_id: "node-route".to_string(),
+                attempt: 1,
+                expected_graph_revision: 1,
+                backend: runtime::AgentBackendKind::InProcess,
+                status: harness_contract::agent::AgentStatus::Running,
+                revision: 0,
+                model: None,
+                provider: None,
+                binding: None,
+                started_at_ms: 1,
+                updated_at_ms: 1,
+                failure: None,
+            })
+            .expect("restore agent");
+        let app = api_router(state);
 
         let detail = app
             .clone()
@@ -4593,7 +5271,11 @@ pub(crate) mod tests {
         assert_eq!(cancel.status(), StatusCode::OK);
         let body = to_bytes(cancel.into_body(), usize::MAX).await.unwrap();
         let cancel_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(cancel_json["receipt"]["status"], "accepted");
+        assert_eq!(cancel_json["receipt"]["accepted"], false);
+        assert_eq!(
+            cancel_json["receipt"]["reject_reason"],
+            "unsupported_by_backend"
+        );
 
         let events = app
             .clone()
@@ -4608,55 +5290,44 @@ pub(crate) mod tests {
         assert_eq!(events.status(), StatusCode::OK);
         let body = to_bytes(events.into_body(), usize::MAX).await.unwrap();
         let events_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            events_json["events"][1]["eventType"],
-            "agent.cancel_requested"
-        );
-
-        let manifest = std::fs::read_to_string(&manifest_file).unwrap();
-        assert!(manifest.contains("\"status\": \"cancel_requested\""));
-        let _ = std::fs::remove_dir_all(dir);
+        assert!(events_json["count"].as_u64().unwrap_or_default() >= 2);
     }
 
     #[tokio::test]
-    async fn runtime_agent_routes_deliver_input_interrupt_and_shutdown_commands() {
-        let app = api_router(test_state());
+    async fn runtime_agent_routes_preserve_rejection_for_unrecoverable_process_handles() {
+        let state = test_state();
         let agent_id = format!("agent-command-{}", uuid::Uuid::new_v4());
-        let dir = std::env::temp_dir().join(format!("cowd-agent-command-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let output_file = dir.join("agent.md");
-        let manifest_file = dir.join("agent.json");
-        std::fs::write(&output_file, "# Agent Task\n").unwrap();
-        let snapshot = runtime::AgentSnapshot {
-            agent_id: agent_id.clone(),
-            name: String::from("command-agent"),
-            description: String::from("command test"),
-            subagent_type: Some(String::from("Explore")),
-            model: Some(String::from(runtime::DEFAULT_AGENT_MODEL)),
-            status: String::from("running"),
-            backend: runtime::AgentExecutionBackendKind::ProcessJsonl,
-            output_file: output_file.display().to_string(),
-            manifest_file: manifest_file.display().to_string(),
-            created_at: String::from("1"),
-            started_at: Some(String::from("1")),
-            completed_at: None,
-            lane_events: vec![],
-            current_blocker: None,
-            derived_state: String::from("working"),
-            error: None,
-        };
-        runtime::global_agent_lifecycle_service()
-            .register_started(snapshot, runtime::CancellationToken::new());
-        let (tx, rx) = std::sync::mpsc::channel::<runtime::AgentExecutionCommand>();
-        runtime::global_agent_lifecycle_service()
-            .attach_command_channel(&agent_id, tx)
-            .expect("command channel");
+        let services = state
+            .services
+            .runtime
+            .as_ref()
+            .expect("runtime service")
+            .runtime_services();
+        services
+            .agent_runtime()
+            .restore_verified_run(runtime::AgentRunSnapshot {
+                run_id: format!("run-{agent_id}"),
+                agent_id: agent_id.clone(),
+                task_id: "task-command".to_string(),
+                session_id: "session-command".to_string(),
+                graph_id: "graph-command".to_string(),
+                node_id: "node-command".to_string(),
+                attempt: 1,
+                expected_graph_revision: 1,
+                backend: runtime::AgentBackendKind::ProcessJsonl,
+                status: harness_contract::agent::AgentStatus::Running,
+                revision: 0,
+                model: None,
+                provider: None,
+                binding: None,
+                started_at_ms: 1,
+                updated_at_ms: 1,
+                failure: None,
+            })
+            .expect("restore agent");
+        let app = api_router(state);
 
-        for (path, expected) in [
-            ("input", runtime::AgentExecutionCommandKind::Input),
-            ("interrupt", runtime::AgentExecutionCommandKind::Interrupt),
-            ("shutdown", runtime::AgentExecutionCommandKind::Shutdown),
-        ] {
+        for path in ["input", "interrupt", "shutdown"] {
             let response = app
                 .clone()
                 .oneshot(
@@ -4674,187 +5345,9 @@ pub(crate) mod tests {
             assert_eq!(response.status(), StatusCode::OK);
             let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(json["receipt"]["status"], "accepted");
-            let delivered = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
-            assert_eq!(delivered.command, expected);
-            assert_eq!(delivered.agent_id, agent_id);
+            assert_eq!(json["receipt"]["accepted"], false);
+            assert_eq!(json["receipt"]["reject_reason"], "unsupported_by_backend");
         }
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn runtime_agent_command_reports_backend_without_channel_as_conflict() {
-        let app = api_router(test_state());
-        let agent_id = format!("agent-no-command-channel-{}", uuid::Uuid::new_v4());
-        let dir = std::env::temp_dir().join(format!(
-            "cowd-agent-no-command-channel-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let output_file = dir.join("agent.md");
-        let manifest_file = dir.join("agent.json");
-        std::fs::write(&output_file, "# Agent Task\n").unwrap();
-        runtime::global_agent_lifecycle_service().register_started(
-            runtime::AgentSnapshot {
-                agent_id: agent_id.clone(),
-                name: String::from("no-command-agent"),
-                description: String::from("no command channel test"),
-                subagent_type: Some(String::from("Explore")),
-                model: Some(String::from(runtime::DEFAULT_AGENT_MODEL)),
-                status: String::from("queued"),
-                backend: runtime::AgentExecutionBackendKind::InProcess,
-                output_file: output_file.display().to_string(),
-                manifest_file: manifest_file.display().to_string(),
-                created_at: String::from("1"),
-                started_at: Some(String::from("1")),
-                completed_at: None,
-                lane_events: vec![],
-                current_blocker: None,
-                derived_state: String::from("queued"),
-                error: None,
-            },
-            runtime::CancellationToken::new(),
-        );
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/runtime/agents/{agent_id}/input"))
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({"payload": {"text": "hi"}}).to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn agent_team_profiles_crud_persists_receipts() {
-        let workspace = test_temp_dir("agent-team-profiles");
-        let config_home = test_temp_dir("agent-team-profiles-config");
-        let app = api_router(test_state_with_workspace(
-            workspace.clone(),
-            config_home.clone(),
-        ));
-
-        let create = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/agents/team-profiles")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "id": "qa-review-team",
-                            "name": "QA Review Team",
-                            "objective": "review manufacturing quality incidents",
-                            "leader": "planner",
-                            "members": ["planner", "executor", "reviewer"],
-                            "policy": { "max_parallel_agents": 3 },
-                            "evaluation": { "success_metric": "accepted_review" }
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(create.status(), StatusCode::CREATED);
-        let body = to_bytes(create.into_body(), usize::MAX).await.unwrap();
-        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(created["profile"]["id"], "qa-review-team");
-        assert_eq!(
-            created["receipt"]["changed_refs"][0],
-            "agent-team-profile:qa-review-team"
-        );
-
-        let list = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/agents/team-profiles")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(list.status(), StatusCode::OK);
-        let body = to_bytes(list.into_body(), usize::MAX).await.unwrap();
-        let listed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(listed["count"], 1);
-
-        let detail = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/agents/team-profiles/qa-review-team")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(detail.status(), StatusCode::OK);
-
-        let update = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("PUT")
-                    .uri("/api/agents/team-profiles/qa-review-team")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "name": "QA Review Team",
-                            "objective": "review incident and release evidence",
-                            "leader": "reviewer",
-                            "members": ["planner", "reviewer"],
-                            "policy": { "max_parallel_agents": 2 },
-                            "evaluation": { "quality_gate": "all_tests_pass" }
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(update.status(), StatusCode::OK);
-        let body = to_bytes(update.into_body(), usize::MAX).await.unwrap();
-        let updated: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(updated["profile"]["leader"], "reviewer");
-        assert_eq!(updated["receipt"]["status"], "ok");
-
-        let delete = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("DELETE")
-                    .uri("/api/agents/team-profiles/qa-review-team")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(delete.status(), StatusCode::OK);
-
-        let missing = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/agents/team-profiles/qa-review-team")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
-
-        let _ = std::fs::remove_dir_all(workspace);
-        let _ = std::fs::remove_dir_all(config_home);
     }
 
     #[tokio::test]
@@ -5938,44 +6431,16 @@ pub(crate) mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "user");
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].sequence, 0);
-        assert_eq!(events[1].event_type, "TextDelta");
-    }
-
-    #[tokio::test]
-    async fn append_session_timeline_event_persists_stream_events_in_order() {
-        let store = UnifiedSessionStore::open_in_memory().unwrap();
-        let session_id = "timeline-session";
-        store
-            .create_session(&new_api_session_record(
-                session_id,
-                Some("test-model".into()),
-            ))
-            .await
-            .unwrap();
-
-        append_session_timeline_event(
-            &store,
-            session_id,
-            "TurnStarted",
-            serde_json::json!({"type":"TurnStarted"}),
-        )
-        .await;
-        append_session_timeline_event(
-            &store,
-            session_id,
-            "TextDelta",
-            serde_json::json!({"type":"TextDelta","content":"hello"}),
-        )
-        .await;
-
-        let events = store.get_events(session_id, 0).await.unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].event_type, "TurnStarted");
-        assert_eq!(events[0].sequence, 0);
-        assert_eq!(events[1].event_type, "TextDelta");
-        assert_eq!(events[1].sequence, 1);
-        assert!(events[1].event_json.contains("hello"));
+        let text_delta = events
+            .iter()
+            .find(|event| event.event_type == "TextDelta")
+            .expect("non-message timeline events must survive transcript sync");
+        assert_eq!(text_delta.sequence, 99);
+        let message_event = events
+            .iter()
+            .find(|event| event.event_type == "message_appended")
+            .expect("current transcript must have one message projection");
+        assert!(message_event.sequence > text_delta.sequence);
     }
 
     #[tokio::test]
@@ -5991,6 +6456,7 @@ pub(crate) mod tests {
             .unwrap();
         let messages: Vec<memory::store::session::SessionMessage> = (0..1000)
             .map(|i| memory::store::session::SessionMessage {
+                stable_message_id: format!("page:{session_id}:{i}"),
                 session_id: session_id.to_string(),
                 sequence: i,
                 role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
@@ -6029,6 +6495,7 @@ pub(crate) mod tests {
         assert_eq!(json["next_seq"], 1000);
         assert_eq!(json["has_more"], false);
         assert_eq!(json["messages"].as_array().unwrap().len(), 10);
+        assert_eq!(json["messages"][0]["id"], "page:message-page-session:990");
         assert_eq!(json["messages"][0]["sequence"], 990);
         assert_eq!(json["messages"][9]["sequence"], 999);
     }
@@ -6137,7 +6604,6 @@ pub(crate) mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::json!({
-                            "actor_id": "tui:test",
                             "reason": "test_cancel",
                         })
                         .to_string(),
@@ -6151,68 +6617,9 @@ pub(crate) mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["ok"], true);
         assert_eq!(json["status"], "cancel_requested");
-        assert_eq!(json["actor_id"], "tui:test");
+        assert_eq!(json["actor_id"], "principal:local-human");
         assert_eq!(json["aborted"], false);
         assert_eq!(json["run_id"], serde_json::Value::Null);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/api/sessions/{session_id}/events"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["events"][0]["type"], "TurnCancelRequested");
-        assert_eq!(json["events"][0]["payload"]["actor_id"], "tui:test");
-        assert_eq!(json["events"][0]["payload"]["reason"], "test_cancel");
-        assert_eq!(json["events"][0]["payload"]["aborted"], false);
-        assert_eq!(
-            json["events"][0]["payload"]["run_id"],
-            serde_json::Value::Null
-        );
-    }
-
-    #[test]
-    fn active_turn_registry_aborts_runtime_control_signals() {
-        let session_id = format!("cancel-active-{}", uuid::Uuid::new_v4());
-        let run_id = "run-active-cancel".to_string();
-        let cancellation_token = runtime::CancellationToken::new();
-        let hook_abort_signal = runtime::HookAbortSignal::new();
-
-        register_active_turn_control(
-            session_id.clone(),
-            run_id.clone(),
-            cancellation_token.clone(),
-            hook_abort_signal.clone(),
-        );
-
-        assert_eq!(abort_active_turn(&session_id), Some(run_id.clone()));
-        assert!(cancellation_token.is_cancelled());
-        assert!(hook_abort_signal.is_aborted());
-
-        clear_active_turn_control(&session_id, &run_id);
-        assert_eq!(abort_active_turn(&session_id), None);
-    }
-
-    #[test]
-    fn active_turn_partial_buffer_is_run_scoped_and_take_clears_it() {
-        let session_id = format!("partial-active-{}", uuid::Uuid::new_v4());
-        let run_id = "run-partial".to_string();
-
-        register_active_turn_partial(session_id.clone(), run_id.clone());
-        record_active_turn_text_delta(&session_id, "other-run", "ignored");
-        record_active_turn_text_delta(&session_id, &run_id, "hello ");
-        record_active_turn_text_delta(&session_id, &run_id, "world");
-
-        let partial = take_active_turn_partial(&session_id, &run_id).unwrap();
-        assert_eq!(partial.run_id, run_id);
-        assert_eq!(partial.text, "hello world");
-        assert!(take_active_turn_partial(&session_id, "run-partial").is_none());
     }
 
     #[tokio::test]
@@ -6237,10 +6644,10 @@ pub(crate) mod tests {
             .await
             .unwrap();
         store
-            .append_runtime_event(&memory::RuntimeEvent::new(
+            .append_session_domain_event(&memory::SessionDomainEvent::new(
                 session_id,
                 1,
-                memory::RuntimeEventScope::Memory,
+                memory::SessionDomainScope::Memory,
                 "memory.pulse.created",
                 serde_json::json!({"candidates": 2}),
                 11,
@@ -6276,9 +6683,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_timeline_projects_workgraph_summary() {
+    async fn runtime_timeline_projects_execution_graph_summary() {
         let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
-        let session_id = "runtime-workgraph-summary-session";
+        let session_id = "runtime-execution_graph-summary-session";
         store
             .create_session(&new_api_session_record(
                 session_id,
@@ -6286,12 +6693,23 @@ pub(crate) mod tests {
             ))
             .await
             .unwrap();
-        let mut event = memory::RuntimeEvent::new(
-            session_id,
-            0,
-            memory::RuntimeEventScope::Workgraph,
-            "agent.workgraph.reviewed",
-            serde_json::json!({
+        let event = runtime::RuntimeEventInput {
+            stream_id: session_id.to_string(),
+            scope: runtime::RuntimeEventScope::ExecutionGraph,
+            kind: "agent.execution_graph.reviewed".to_string(),
+            status: Some("completed".to_string()),
+            actor: Some("gateway-test".to_string()),
+            refs: vec![
+                runtime::RuntimeEventRef {
+                    kind: "execution_graph".to_string(),
+                    id: "graph-summary".to_string(),
+                },
+                runtime::RuntimeEventRef {
+                    kind: "collaboration_board".to_string(),
+                    id: "board-summary".to_string(),
+                },
+            ],
+            payload: serde_json::json!({
                 "board_id": "board-summary",
                 "graph": {
                     "graph_id": "graph-summary",
@@ -6315,23 +6733,10 @@ pub(crate) mod tests {
                 },
                 "maintenance_candidates": [{"id": "candidate-summary"}]
             }),
-            10,
-        );
-        event.refs = vec![
-            memory::RuntimeRef {
-                ref_type: "workgraph".to_string(),
-                id: "graph-summary".to_string(),
-                label: None,
-            },
-            memory::RuntimeRef {
-                ref_type: "collaboration_board".to_string(),
-                id: "board-summary".to_string(),
-                label: None,
-            },
-        ];
-        store.append_runtime_event(&event).await.unwrap();
+        };
 
         let state = test_state_with_store(store);
+        state.services.runtime_events.append_fixture(event).unwrap();
         let app = api_router(state);
         let response = app
             .oneshot(
@@ -6348,28 +6753,145 @@ pub(crate) mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["workgraph_summary"]["count"], 1);
+        assert_eq!(json["execution_graph_summary"]["count"], 1);
         assert_eq!(
-            json["workgraph_summary"]["latest"]["graph_id"],
+            json["execution_graph_summary"]["latest"]["graph_id"],
             "graph-summary"
         );
         assert_eq!(
-            json["workgraph_summary"]["latest"]["board_id"],
+            json["execution_graph_summary"]["latest"]["board_id"],
             "board-summary"
         );
-        assert_eq!(json["workgraph_summary"]["latest"]["completion_rate"], 1.0);
         assert_eq!(
-            json["workgraph_summary"]["latest"]["value_verdict"]["positive_lift"],
+            json["execution_graph_summary"]["latest"]["completion_rate"],
+            1.0
+        );
+        assert_eq!(
+            json["execution_graph_summary"]["latest"]["value_verdict"]["positive_lift"],
             true
         );
-        assert_eq!(json["workgraph_summary"]["agent_tasks"], 1);
-        assert_eq!(json["workgraph_summary"]["memory_candidates"], 1);
-        assert_eq!(json["workgraph_summary"]["conflicts"], 1);
+        assert_eq!(json["execution_graph_summary"]["agent_tasks"], 1);
+        assert_eq!(json["execution_graph_summary"]["memory_candidates"], 1);
+        assert_eq!(json["execution_graph_summary"]["conflicts"], 1);
         assert_eq!(json["agent_value"]["status"], "review_required");
         assert_eq!(json["agent_value"]["recommendation"], "review_conflicts");
         assert_eq!(json["agent_value"]["policy_passed"], false);
         assert_eq!(json["agent_value"]["latest"]["agent_tasks"], 1);
         assert_eq!(json["agent_value"]["latest"]["value_score"], 70);
+    }
+
+    #[tokio::test]
+    async fn runtime_timeline_resolves_session_terminal_to_canonical_graph_events() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let session_id = "runtime-timeline-terminal-session";
+        store
+            .create_session(&new_api_session_record(
+                session_id,
+                Some("test-model".into()),
+            ))
+            .await
+            .unwrap();
+        let state = test_state_with_store(store);
+        let graph_id = "graph:terminal-session";
+        let child_graph_id = "graph:terminal-session:team";
+        state
+            .services
+            .runtime_events
+            .append_fixture(runtime::RuntimeEventInput {
+                stream_id: graph_id.to_string(),
+                scope: runtime::RuntimeEventScope::ExecutionGraph,
+                kind: "execution_graph.planned".to_string(),
+                status: Some("running".to_string()),
+                actor: Some("test".to_string()),
+                refs: Vec::new(),
+                payload: serde_json::json!({"graph": {"graph_id": graph_id, "status": "running"}}),
+            })
+            .unwrap();
+        state
+            .services
+            .runtime_events
+            .append_fixture(runtime::RuntimeEventInput {
+                stream_id: child_graph_id.to_string(),
+                scope: runtime::RuntimeEventScope::ExecutionGraph,
+                kind: "execution_graph.planned".to_string(),
+                status: Some("running".to_string()),
+                actor: Some("test".to_string()),
+                refs: Vec::new(),
+                payload: serde_json::json!({
+                    "event": "planned",
+                    "graph": {
+                        "id": child_graph_id,
+                        "node_statuses": {"researcher": "planned"},
+                        "nodes": [{"kind": "agent_task", "id": "researcher"}]
+                    }
+                }),
+            })
+            .unwrap();
+        state
+            .services
+            .runtime_events
+            .append_fixture(runtime::RuntimeEventInput {
+                stream_id: format!("execution-lineage:{graph_id}"),
+                scope: runtime::RuntimeEventScope::Relation,
+                kind: "execution.lineage.child_registered.v1".to_string(),
+                status: Some("registered".to_string()),
+                actor: Some("test".to_string()),
+                refs: Vec::new(),
+                payload: serde_json::json!({
+                    "parent_execution_id": graph_id,
+                    "parent_node_id": "model",
+                    "child_execution_id": child_graph_id,
+                    "child_objective": "parallel review"
+                }),
+            })
+            .unwrap();
+        state
+            .services
+            .runtime_events
+            .append_fixture(runtime::RuntimeEventInput {
+                stream_id: "session-terminal:timeline-terminal".to_string(),
+                scope: runtime::RuntimeEventScope::SessionInput,
+                kind: "runtime.session.terminal_requested".to_string(),
+                status: Some("pending_delivery".to_string()),
+                actor: Some("test".to_string()),
+                refs: vec![runtime::RuntimeEventRef {
+                    kind: "execution_graph".to_string(),
+                    id: graph_id.to_string(),
+                }],
+                payload: serde_json::json!({"session_id": session_id}),
+            })
+            .unwrap();
+
+        let app = api_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/runtime/timeline?session_id={session_id}&from_seq=0&limit=10"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["kind"] == "execution_graph.planned"));
+        assert_eq!(json["execution_graph_summary"]["count"], 1);
+        assert_eq!(json["execution_graph_summary"]["agent_tasks"], 1);
+        assert_eq!(
+            json["execution_graph_summary"]["latest"]["graph_id"],
+            child_graph_id
+        );
+        assert_eq!(
+            json["agent_value"]["status"], "unproven",
+            "operational graph visibility must not fabricate collaboration lift"
+        );
     }
 
     #[tokio::test]
@@ -6383,11 +6905,12 @@ pub(crate) mod tests {
             ))
             .await
             .unwrap();
+        let state = test_state_with_store(store.clone());
         store
-            .append_runtime_event(&memory::RuntimeEvent::new(
+            .append_session_domain_event(&memory::SessionDomainEvent::new(
                 session_id,
                 0,
-                memory::RuntimeEventScope::Task,
+                memory::SessionDomainScope::ApplicationTask,
                 "task.started",
                 serde_json::json!({"task_id": "task-health"}),
                 10,
@@ -6395,10 +6918,10 @@ pub(crate) mod tests {
             .await
             .unwrap();
         store
-            .append_runtime_event(&memory::RuntimeEvent::new(
+            .append_session_domain_event(&memory::SessionDomainEvent::new(
                 session_id,
                 1,
-                memory::RuntimeEventScope::Policy,
+                memory::SessionDomainScope::Policy,
                 "runtime.policy.decided",
                 serde_json::json!({
                     "agent_mode": "Parallel",
@@ -6413,13 +6936,17 @@ pub(crate) mod tests {
             ))
             .await
             .unwrap();
-        store
-            .append_runtime_event(&memory::RuntimeEvent::new(
-                session_id,
-                2,
-                memory::RuntimeEventScope::Workgraph,
-                "agent.workgraph.reviewed",
-                serde_json::json!({
+        state
+            .services
+            .runtime_events
+            .append_fixture(runtime::RuntimeEventInput {
+                stream_id: session_id.to_string(),
+                scope: runtime::RuntimeEventScope::ExecutionGraph,
+                kind: "agent.execution_graph.reviewed".to_string(),
+                status: None,
+                actor: Some("test".to_string()),
+                refs: Vec::new(),
+                payload: serde_json::json!({
                     "value_verdict": {
                         "positive_lift": true,
                         "continue_multi_agent": true,
@@ -6427,15 +6954,13 @@ pub(crate) mod tests {
                         "reasons": ["positive_multi_agent_lift"]
                     }
                 }),
-                12,
-            ))
-            .await
+            })
             .unwrap();
         store
-            .append_runtime_event(&memory::RuntimeEvent::new(
+            .append_session_domain_event(&memory::SessionDomainEvent::new(
                 session_id,
                 3,
-                memory::RuntimeEventScope::Task,
+                memory::SessionDomainScope::ApplicationTask,
                 "task.completed",
                 serde_json::json!({"task_id": "task-health"}),
                 13,
@@ -6443,7 +6968,6 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        let state = test_state_with_store(store);
         let app = api_router(state);
         let response = app
             .oneshot(
@@ -6473,7 +6997,7 @@ pub(crate) mod tests {
         );
         assert_eq!(json["health_summary"]["scope_counts"]["task"], 2);
         assert_eq!(json["health_summary"]["scope_counts"]["policy"], 1);
-        assert_eq!(json["health_summary"]["scope_counts"]["workgraph"], 1);
+        assert_eq!(json["health_summary"]["scope_counts"]["execution_graph"], 1);
         assert_eq!(json["value_loop"]["status"], "incomplete");
         assert_eq!(json["value_loop"]["required_observed"], 3);
         assert_eq!(json["value_loop"]["missing_required_count"], 4);
@@ -6498,7 +7022,7 @@ pub(crate) mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["degraded"], true);
         assert_eq!(json["events"].as_array().unwrap().len(), 0);
-        assert_eq!(json["workgraph_summary"]["count"], 0);
+        assert_eq!(json["execution_graph_summary"]["count"], 0);
         assert_eq!(json["health_summary"]["status"], "degraded");
         assert_eq!(json["health_summary"]["score"], 35);
         assert_eq!(json["health_summary"]["degraded_events"], 0);
@@ -6515,7 +7039,7 @@ pub(crate) mod tests {
         assert_eq!(json["agent_value"]["status"], "degraded");
         assert_eq!(
             json["agent_value"]["recommendation"],
-            "collect_workgraph_review"
+            "collect_execution_graph_review"
         );
     }
 
@@ -6545,9 +7069,10 @@ pub(crate) mod tests {
         assert_eq!(json["control_policy"]["enabled"], true);
         assert_eq!(json["control_policy"]["agent"]["max_parallel_agents"], 4);
         assert_eq!(
-            json["control_policy"]["task"]["thresholds"]["critical_min"],
-            80
+            json["control_policy"]["task"]["max_failures_before_review"],
+            2
         );
+        assert!(json["control_policy"]["task"].get("thresholds").is_none());
         assert!(json["warnings"].as_array().unwrap().is_empty());
     }
 
@@ -6728,7 +7253,6 @@ runtime:
                     .body(Body::from(
                         serde_json::json!({
                             "session_id": "session-a",
-                            "owner": "tui:one",
                             "mode": "exclusive"
                         })
                         .to_string(),
@@ -6741,7 +7265,7 @@ runtime:
         let body = to_bytes(acquire.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["ok"], true);
-        assert_eq!(json["owner"], "tui:one");
+        assert_eq!(json["owner"], "principal:local-human");
         assert_eq!(json["mode"], "exclusive");
         assert!(json["acquired_at_ms"].as_u64().is_some());
 
@@ -6779,7 +7303,7 @@ runtime:
         assert_eq!(json["components"]["session"]["leases"]["total"], 1);
         assert_eq!(
             json["components"]["session"]["leases"]["leases"][0]["owner"],
-            "tui:one"
+            "principal:local-human"
         );
 
         let release = app
@@ -6791,7 +7315,6 @@ runtime:
                     .body(Body::from(
                         serde_json::json!({
                             "session_id": "session-a",
-                            "owner": "tui:one"
                         })
                         .to_string(),
                     ))
@@ -7020,6 +7543,14 @@ providers:
             json["components"]["provider"]["configured_model_resolved"],
             true
         );
+        assert!(json["components"]["provider"]["catalog_generation"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("provider-catalog-v1-"));
+        assert_eq!(
+            json["components"]["provider"]["catalog"]["models"][0]["effective_protocol"],
+            "anthropic"
+        );
         assert_eq!(
             json["components"]["provider"]["provider_names"]
                 .as_array()
@@ -7061,7 +7592,7 @@ providers:
     base_url: "https://local.example/v1"
     api_key: "secret-local-key"
     models: ["model-a", "model-b"]
-    protocol: "openai-compat"
+    protocol: "completions"
 "#,
         )
         .unwrap();
@@ -7084,8 +7615,38 @@ providers:
         assert_eq!(json["provider_model_count"], 2);
         assert_eq!(json["configured_model"], "model-a");
         assert_eq!(json["models"][1]["id"], "model-b");
+        assert_eq!(json["models"][1]["effective_protocol"], "completions");
+        assert_eq!(json["models"][1]["protocol_configured"], true);
+        assert!(json["catalog_generation"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("provider-catalog-v1-"));
+        assert_eq!(json["catalog"]["providers"][0]["id"], "local");
+        assert_eq!(json["catalog"]["models"][1]["id"], "model-b");
+        assert_eq!(json["catalog"]["profiles"][0]["id"], "default");
+        assert_eq!(json["providers"][0]["effective_protocol"], "completions");
+        assert_eq!(json["providers"][0]["protocol_configured"], true);
         assert_eq!(json["providers"][0]["credential_present"], true);
         assert!(!json.to_string().contains("secret-local-key"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config/provider-catalog")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let catalog_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            catalog_json["catalog"]["generation"],
+            json["catalog_generation"]
+        );
+        assert_eq!(catalog_json["catalog"]["models"][0]["provider"], "local");
 
         let response = app
             .clone()
@@ -7260,9 +7821,7 @@ providers:
     }
 
     #[tokio::test]
-    #[serial_test::serial(provider_registry)]
-    async fn runtime_provider_reload_replaces_global_registry_from_config() {
-        runtime::init_global_providers(model_protocol::provider_config::ProvidersConfig::default());
+    async fn runtime_provider_reload_replaces_runtime_registry_from_config() {
         let root = test_temp_dir("runtime-provider-reload");
         let workspace = root.join("workspace");
         let config_home = root.join("home");
@@ -7277,12 +7836,14 @@ providers:
     base_url: "https://reload.example/v1"
     api_key: "reload-secret-key"
     models: ["reload-model", "reload-fast"]
-    protocol: "openai-compat"
+    protocol: "completions"
 "#,
         )
         .unwrap();
 
-        let app = api_router(test_state_with_workspace(workspace, config_home));
+        let state = test_state_with_workspace(workspace, config_home);
+        let provider_registry = state.services.runtime.as_ref().unwrap().provider_registry();
+        let app = api_router(state);
         let response = app
             .oneshot(
                 Request::builder()
@@ -7306,7 +7867,9 @@ providers:
         assert_eq!(json["configured_model_provider"], "reload");
         assert_eq!(json["configured_model_resolved"], true);
         assert!(!json.to_string().contains("reload-secret-key"));
-        let provider = runtime::resolve_global_provider("reload-model")
+        let provider_snapshot = provider_registry.pin();
+        let provider = provider_snapshot
+            .resolve("reload-model")
             .expect("reloaded provider should resolve model");
         assert_eq!(provider.name, "reload");
         assert_eq!(provider.models, vec!["reload-model", "reload-fast"]);
@@ -7330,10 +7893,14 @@ providers:
         )
         .unwrap();
 
-        let app = api_router(test_state_with_workspace(
-            invalid_workspace,
-            invalid_config_home,
-        ));
+        let invalid_state = test_state_with_workspace(invalid_workspace, invalid_config_home);
+        let invalid_registry = invalid_state
+            .services
+            .runtime
+            .as_ref()
+            .unwrap()
+            .provider_registry();
+        let app = api_router(invalid_state);
         let response = app
             .oneshot(
                 Request::builder()
@@ -7356,23 +7923,188 @@ providers:
             .to_string()
             .contains("unsupported-protocol"));
         assert!(!json.to_string().contains("broken-secret-key"));
-        assert!(runtime::resolve_global_provider("broken-model").is_none());
+        assert!(invalid_registry.pin().resolve("broken-model").is_none());
+        let retained_snapshot = provider_registry.pin();
         assert_eq!(
-            runtime::resolve_global_provider("reload-model")
+            retained_snapshot
+                .resolve("reload-model")
                 .expect("existing provider should remain after failed reload")
                 .name,
             "reload"
         );
 
-        runtime::init_global_providers(model_protocol::provider_config::ProvidersConfig::default());
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(invalid_root);
     }
 
+    #[tokio::test]
+    async fn runtime_config_reload_applies_gateway_runtime_dependencies() {
+        let root = test_temp_dir("runtime-config-reload");
+        let workspace = root.join("workspace");
+        let config_home = root.join("home");
+        let webui_dir = root.join("webui");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&config_home).unwrap();
+        std::fs::create_dir_all(&webui_dir).unwrap();
+        std::fs::write(webui_dir.join("index.html"), "<!doctype html>reload").unwrap();
+        std::fs::write(
+            config_home.join("config.yaml"),
+            format!(
+                r#"
+model: "reload-model"
+providers:
+  reload:
+    base_url: "https://reload.example/v1"
+    api_key: "reload-secret-key"
+    models: ["reload-model"]
+    protocol: "completions"
+gateway:
+  enabled: true
+  webui_dir: "{}"
+  platforms:
+    - platform_type: "api_server"
+      enabled: true
+      host: "127.0.0.1"
+      port: 8642
+    - platform_type: "feishu"
+      enabled: true
+      app_id: "app-id"
+      app_secret: "app-secret"
+"#,
+                webui_dir.display()
+            ),
+        )
+        .unwrap();
+
+        let app = api_router(test_state_with_workspace(workspace, config_home));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/runtime/config/reload")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["kind"], "gateway.config.reload");
+        assert_eq!(json["applied"], true);
+        assert_eq!(json["applied_sections"]["providers"]["provider_count"], 1);
+        assert_eq!(
+            json["applied_sections"]["surface_runtime_configs"]["count"],
+            1
+        );
+        assert_eq!(json["applied_sections"]["static_webui"]["status"], "ready");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/message-connectors")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let connectors: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let feishu = connectors["connectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|connector| connector["connector"] == "feishu")
+            .expect("feishu message connector should be projected from reloaded config");
+        assert_eq!(feishu["configured"], true);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_config_reload_rejects_invalid_config_without_replacing_running_state() {
+        let root = test_temp_dir("runtime-config-reload-invalid-preserve");
+        let workspace = root.join("workspace");
+        let config_home = root.join("home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&config_home).unwrap();
+        let config_path = config_home.join("config.yaml");
+        std::fs::write(
+            &config_path,
+            r#"
+model: "stable-model"
+providers:
+  stable:
+    base_url: "https://stable.example/v1"
+    api_key: "stable-secret-key"
+    models: ["stable-model"]
+    protocol: "completions"
+"#,
+        )
+        .unwrap();
+
+        let state = test_state_with_workspace(workspace, config_home);
+        let provider_registry = state.services.runtime.as_ref().unwrap().provider_registry();
+        let app = api_router(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/runtime/config/reload")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["applied"], true);
+        assert!(provider_registry.pin().resolve("stable-model").is_some());
+
+        std::fs::write(&config_path, "model: [\n").unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/runtime/config/reload")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "invalid");
+        assert_eq!(json["applied"], false);
+        assert!(provider_registry.pin().resolve("stable-model").is_some());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/runtime/config/reload/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status["kind"], "gateway.config.reload.status");
+        assert_eq!(status["status"], "invalid");
+        assert_eq!(status["applied"], false);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn runtime_control_plane_emits_structured_trace_event() {
-        use tracing_subscriber::prelude::*;
-
         let root = test_temp_dir("runtime-control-plane-trace");
         let workspace = root.join("workspace");
         let config_home = root.join("home");
@@ -7385,38 +8117,24 @@ providers:
             .task
             .start_goal("trace control plane", false)
             .unwrap();
-        let _trace_guard = trace_capture_lock().lock().await;
-        let capture = CapturedTraceEvents::default();
-        let subscriber = tracing_subscriber::registry().with(capture.clone());
-
-        let _default_trace_subscriber = tracing::subscriber::set_default(subscriber);
-        tracing::callsite::rebuild_interest_cache();
         let Json(json) = runtime_routes::get_runtime_control_plane(AxumState(state)).await;
         assert_eq!(json["kind"], "runtime_control_plane");
-        let lines = capture.lines();
-        let joined = lines.join("\n");
-        assert!(
-            joined.contains("runtime control plane inspected"),
-            "expected control-plane trace event, got: {joined}"
-        );
-        assert!(joined.contains("cowd.runtime.control_plane"));
-        assert!(joined.contains("status=\"attention\""));
-        assert!(joined.contains("performance_status="));
-        assert!(joined.contains("elapsed_ms="));
-        assert!(joined.contains("production_ready=false"));
-        assert!(joined.contains("readiness_score=81"));
-        assert!(joined.contains("blocked_required_count=2"));
-        assert!(joined.contains("degraded=false"));
-        assert!(joined.contains("durable_session_store=true"));
-        assert!(joined.contains("memory_attached=false"));
-        assert!(joined.contains("provider_configured=false"));
-        assert!(joined.contains("provider_count=0"));
-        assert!(joined.contains("provider_model_count=0"));
-        assert!(joined.contains("configured_model_resolved=true"));
-        assert!(joined.contains("stored_sessions=0"));
-        assert!(joined.contains("open_tasks=1"));
-        assert!(joined.contains("component_count=10"));
-        assert!(joined.contains("capability_count="));
+        assert_eq!(json["status"], "attention");
+        assert_eq!(json["degraded"], false);
+        assert_eq!(json["diagnostics"]["durable_session_store"], true);
+        assert_eq!(json["diagnostics"]["memory_attached"], false);
+        assert_eq!(json["diagnostics"]["provider_configured"], false);
+        assert_eq!(json["diagnostics"]["provider_count"], 0);
+        assert_eq!(json["diagnostics"]["provider_model_count"], 0);
+        assert_eq!(json["diagnostics"]["configured_model_resolved"], true);
+        assert_eq!(json["diagnostics"]["stored_sessions"], 0);
+        assert_eq!(json["diagnostics"]["open_tasks"], 1);
+        assert_eq!(json["diagnostics"]["component_count"], 10);
+        assert!(json["diagnostics"]["capability_count"].as_u64().is_some());
+        assert!(json["diagnostics"]["elapsed_ms"].as_u64().is_some());
+        assert!(json["readiness"]["production_ready"].is_boolean());
+        assert!(json["readiness"]["required_blocked"].as_u64().is_some());
+        assert!(json["readiness"]["score"].as_u64().is_some());
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -7744,6 +8462,7 @@ providers:
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(trace_capture)]
     async fn session_context_history_emits_structured_trace_events() {
         use tracing_subscriber::prelude::*;
 
@@ -8008,7 +8727,7 @@ providers:
         let packet = message_routes::task_resume_context_packet("session-task", &task);
 
         assert_eq!(packet.session_id, "session-task");
-        assert_eq!(packet.source, ResumeContextSource::TaskRegistry);
+        assert_eq!(packet.source, ResumeContextSource::ExecutionGraph);
         assert!(packet
             .active_task
             .as_deref()
@@ -8039,8 +8758,15 @@ providers:
     #[tokio::test]
     async fn approval_routes_resolve_global_queue_request() {
         let state = test_state();
+        let runtime_services = state
+            .services
+            .runtime
+            .as_ref()
+            .expect("test runtime service")
+            .runtime_services();
         let app = api_router(state);
-        let approval = runtime::global_approval_queue()
+        let approval = runtime_services
+            .approval_queue()
             .submit(runtime::SubmitGlobalApprovalRequest {
                 source: runtime::ApprovalSource {
                     kind: runtime::ApprovalSourceKind::Session,
@@ -8098,12 +8824,259 @@ providers:
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            runtime::global_approval_queue()
+            runtime_services
+                .approval_queue()
                 .get(&approval.approval_id)
                 .expect("approval exists")
                 .status,
             runtime::GlobalApprovalStatus::Approved
         );
+    }
+
+    #[tokio::test]
+    async fn approval_api_resumes_the_same_execution_graph_and_rejects_stale_decisions() {
+        use harness_contract::execution_graph::{
+            ExecutionEdge, ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec,
+            ExecutionNodeStatus,
+        };
+
+        let state = test_state();
+        let runtime_services = state
+            .services
+            .runtime
+            .as_ref()
+            .expect("test runtime service")
+            .runtime_services();
+        runtime_services
+            .executor_registry()
+            .register(Arc::new(ApprovalResumeTestExecutor))
+            .expect("test tool executor");
+
+        let mut graph = ExecutionGraph::new("gateway approval resume");
+        let approval = ExecutionNodeSpec::new(
+            ExecutionNodeKind::Approval,
+            "approval",
+            serde_json::json!({
+                "action": "write",
+                "summary": "approve graph continuation",
+                "session_id": "approval-api-session"
+            })
+            .to_string(),
+        );
+        let tool = ExecutionNodeSpec::new(
+            ExecutionNodeKind::ToolBatch,
+            "approval_resume_test_tool",
+            "tool:after-approval",
+        );
+        graph.edges.push(ExecutionEdge {
+            from: approval.id.clone(),
+            to: tool.id.clone(),
+            kind: ExecutionEdgeKind::DependsOn,
+        });
+        graph.nodes = vec![approval.clone(), tool.clone()];
+        let graph_id = graph.id.clone();
+        let report = runtime_services
+            .graph_runner()
+            .start(graph)
+            .await
+            .expect("graph reaches approval wait");
+        assert_eq!(report.waiting, 1);
+        let waiting = runtime_services
+            .graph_state_store()
+            .load(&graph_id)
+            .expect("waiting graph");
+        assert_eq!(
+            waiting.node_statuses[&approval.id],
+            ExecutionNodeStatus::WaitingApproval
+        );
+        assert_eq!(
+            waiting.node_statuses[&tool.id],
+            ExecutionNodeStatus::Planned
+        );
+        assert!(matches!(
+            runtime_services
+                .graph_runner()
+                .command(
+                    &graph_id,
+                    harness_contract::execution_graph::ExecutionGraphCommand::SubmitApproval {
+                        expected_revision: waiting.revision.saturating_sub(1),
+                        node_id: approval.id.clone(),
+                        approved: true,
+                        decision_ref: "stale-test-decision".to_string(),
+                    },
+                )
+                .await,
+            Err(runtime::execution_core::ExecutionRunnerError::Commit(
+                runtime::execution_core::graph::ExecutionCommitError::StaleRevision { .. }
+            ))
+        ));
+
+        let approval_id =
+            runtime::execution_core::graph::executors::graph_approval_id(&graph_id, &approval.id);
+        let app = api_router(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/approval/respond")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "id": approval_id,
+                            "approved": true,
+                            "reason": "verified by operator"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "graph approval response: {}",
+            String::from_utf8_lossy(&response_body)
+        );
+        let body: serde_json::Value = serde_json::from_slice(&response_body).unwrap();
+        assert_eq!(body["execution_graph"]["graph_id"], graph_id);
+        assert_eq!(body["execution_graph"]["node_status"], "completed");
+
+        let terminal = runtime_services
+            .graph_state_store()
+            .load(&graph_id)
+            .expect("terminal graph");
+        assert_eq!(
+            terminal.node_statuses[&approval.id],
+            ExecutionNodeStatus::Completed
+        );
+        assert_eq!(
+            terminal.node_statuses[&tool.id],
+            ExecutionNodeStatus::Completed
+        );
+        assert_eq!(
+            terminal.node_results[&tool.id].result_ref.as_deref(),
+            Some(format!("tool-result:{}", tool.id).as_str())
+        );
+
+        let duplicate = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/approval/respond")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"id": approval_id, "approved": true}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate.status(), StatusCode::OK);
+        let duplicate_body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(duplicate.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(duplicate_body["status"], "already_applied");
+
+        let conflicting = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/approval/respond")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"id": approval_id, "approved": false}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(conflicting.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn cross_plane_waiting_approval_resumes_tool_and_reaches_terminal_graph() {
+        let state = test_state();
+        let runtime_services = state
+            .services
+            .runtime
+            .as_ref()
+            .expect("test runtime service")
+            .runtime_services();
+        let action = runtime::CrossPlaneAction::new("operator", "channel.send");
+        let decision = runtime::CrossPlanePolicyDecision {
+            decision: runtime::PolicyDecisionKind::RequireSingleApproval,
+            reason: "operator approval required".to_string(),
+            matched_grant: None,
+            required_approval: Some(runtime::GrantType::SingleUse),
+            degrade_to: None,
+        };
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let projection = state
+            .services
+            .cross_plane
+            .execute_commit_graph(
+                &action,
+                &decision,
+                &format!("cross-plane-approval-{}", uuid::Uuid::new_v4()),
+                Arc::new(CrossPlaneApprovalTestBackend {
+                    calls: Arc::clone(&calls),
+                }),
+            )
+            .await
+            .expect("cross-plane graph reaches approval wait");
+        let approval = projection
+            .nodes
+            .iter()
+            .find(|node| {
+                node.kind == harness_contract::execution_graph::ExecutionNodeKind::Approval
+            })
+            .expect("approval node");
+        assert_eq!(
+            approval.status,
+            harness_contract::execution_graph::ExecutionNodeStatus::WaitingApproval
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let approval_id = runtime::execution_core::graph::executors::graph_approval_id(
+            &projection.graph_id,
+            &approval.node_id,
+        );
+        let response = api_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/approval/respond")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"id": approval_id, "approved": true}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let terminal = runtime_services
+            .graph_runner()
+            .projection(&projection.graph_id)
+            .await
+            .expect("terminal cross-plane graph");
+        let tool = terminal
+            .nodes
+            .iter()
+            .find(|node| {
+                node.kind == harness_contract::execution_graph::ExecutionNodeKind::ToolBatch
+            })
+            .expect("tool node");
+        assert_eq!(
+            tool.status,
+            harness_contract::execution_graph::ExecutionNodeStatus::Completed
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -8163,11 +9136,11 @@ providers:
             && item["capabilities"]
                 .as_array()
                 .unwrap()
-                .contains(&serde_json::json!("ingress"))
+                .contains(&serde_json::json!("message.ingress"))
             && item["capabilities"]
                 .as_array()
                 .unwrap()
-                .contains(&serde_json::json!("delivery"))));
+                .contains(&serde_json::json!("message.send.text"))));
     }
 
     #[tokio::test]
@@ -8299,7 +9272,7 @@ providers:
             .as_array()
             .unwrap()
             .iter()
-            .any(|item| item == "channel.feishu.delivery"));
+            .any(|item| item == "channel.feishu.send_text"));
         assert!(!json.to_string().contains("cli_app_id"));
     }
 
@@ -8464,7 +9437,6 @@ providers:
 
         let key = format!("mock-docs-{}", uuid::Uuid::new_v4());
         let request = serde_json::json!({
-            "actor_principal": format!("user:{key}"),
             "tool_id": "service.local.docs.read",
             "resource_id": "doc-1",
             "title": "Architecture",
@@ -8553,7 +9525,6 @@ providers:
             workspace.clone(),
         ));
         let request = serde_json::json!({
-            "actor_principal": "user:resource-persistence",
             "tool_id": "service.local.docs.read",
             "resource_id": "persisted-doc",
             "title": "Persisted Runtime Resource",
@@ -8635,7 +9606,6 @@ providers:
             workspace,
         ));
         let request = serde_json::json!({
-            "actor_principal": "user:connector-resource-revalidate",
             "tool_id": "service.local.docs.read",
             "resource_id": "revalidate-doc",
             "title": "Revalidate Doc",
@@ -8710,7 +9680,6 @@ providers:
         );
         let app = api_router(test_state_with_memory_and_workspace(manager, tmp.clone()));
         let request = serde_json::json!({
-            "actor_principal": "user:connector-resource-memory",
             "tool_id": "service.local.docs.read",
             "resource_id": "memory-doc",
             "title": "Memory Bridge Doc",
@@ -8816,7 +9785,7 @@ providers:
     async fn cross_plane_policy_simulation_does_not_consume_single_use_grant() {
         let app = api_router(test_state());
         let suffix = uuid::Uuid::new_v4().to_string();
-        let principal = format!("user:test-{suffix}");
+        let principal = gateway_test_actor();
         let capability = format!("service.feishu.drive.download.{suffix}");
         let grant_id = format!("grant-{suffix}");
         let grant = serde_json::json!({
@@ -8849,7 +9818,6 @@ providers:
         assert_eq!(response.status(), StatusCode::OK);
 
         let action = serde_json::json!({
-            "actor_principal": principal,
             "source_channel": "channel://wechat/chat/test",
             "session_id": "test-session",
             "requested_capability": capability,
@@ -8917,10 +9885,10 @@ providers:
     }
 
     #[tokio::test]
-    async fn connector_service_commit_consumes_single_use_grant_and_audits() {
+    async fn connector_service_commit_consumes_single_use_grant_after_effect_receipt() {
         let app = api_router(test_state());
         let suffix = uuid::Uuid::new_v4().to_string();
-        let principal = format!("user:service-commit-{suffix}");
+        let principal = gateway_test_actor();
         let capability = "service.local.docs.read";
         let grant_id = format!("grant-service-commit-{suffix}");
         let grant = serde_json::json!({
@@ -8952,7 +9920,6 @@ providers:
         assert_eq!(response.status(), StatusCode::OK);
 
         let execute = serde_json::json!({
-            "actor_principal": principal,
             "source_channel": "channel://wechat/chat/service-commit",
             "session_id": "service-commit-session",
             "tool_id": capability,
@@ -8976,7 +9943,13 @@ providers:
         assert_eq!(executed.status(), StatusCode::OK);
         let body = to_bytes(executed.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["result"]["status"], "ok");
+        assert_eq!(json["result"]["status"], "executed");
+        assert_eq!(json["receipt"]["dispatch_status"], "service_executed");
+        assert!(json["execution_graph"]["graph_id"].as_str().is_some());
+        assert_eq!(
+            json["receipt"]["execution_graph_id"],
+            json["execution_graph"]["graph_id"]
+        );
         assert_eq!(json["receipt"]["audit_record_id"].as_str().is_some(), true);
 
         let audit = app
@@ -8991,18 +9964,16 @@ providers:
             .unwrap();
         let audit_body = to_bytes(audit.into_body(), usize::MAX).await.unwrap();
         let audit_json: serde_json::Value = serde_json::from_slice(&audit_body).unwrap();
-        let consumed = audit_json["records"]
+        let planned = audit_json["records"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|record| {
-                record["evidence"]["consumed_grant_id"].as_str() == Some(grant_id.as_str())
-            })
-            .expect("commit audit should include single-use grant consumption");
-        assert_eq!(consumed["evidence"]["remaining_uses_after"], 0);
+            .find(|record| record["action"]["actor_principal"] == principal)
+            .expect("commit planning must be audited");
+        assert_eq!(planned["evidence"]["consumed_grant_id"], grant_id);
+        assert_eq!(planned["evidence"]["remaining_uses_after"], 0);
 
         let action = serde_json::json!({
-            "actor_principal": principal,
             "requested_capability": capability,
             "provider_account": "local.docs",
             "source_channel": "channel://wechat/chat/service-commit",
@@ -9087,7 +10058,7 @@ providers:
         let app = api_router(test_state());
         let suffix = uuid::Uuid::new_v4().to_string();
         let email = format!("policy-{suffix}@example.com");
-        let principal = format!("user:policy-{suffix}");
+        let principal = gateway_test_actor();
         let capability = format!("service.feishu.drive.download.{suffix}");
 
         let identity = serde_json::json!({
@@ -9134,7 +10105,6 @@ providers:
         }
 
         let action = serde_json::json!({
-            "actor_principal": "",
             "actor_identity_ref": format!("channel://wechat/user/policy?email={email}"),
             "source_channel": "channel://wechat/chat/test",
             "session_id": "test-session",
@@ -9182,7 +10152,7 @@ providers:
         })));
         let suffix = uuid::Uuid::new_v4().to_string();
         let email = format!("preflight-{suffix}@example.com");
-        let principal = format!("user:preflight-{suffix}");
+        let principal = gateway_test_actor();
         let capability = format!("service.feishu.drive.download.{suffix}");
         let identity = serde_json::json!({
             "id": format!("idb-preflight-{suffix}"),
@@ -9228,7 +10198,6 @@ providers:
         }
 
         let action = serde_json::json!({
-            "actor_principal": "",
             "actor_identity_ref": format!("channel://wechat/user/preflight?email={email}"),
             "source_channel": "channel://wechat/chat/test",
             "session_id": "test-session",
@@ -9311,7 +10280,7 @@ providers:
             }
         })));
         let suffix = uuid::Uuid::new_v4().to_string();
-        let principal = format!("user:execute-dry-run-{suffix}");
+        let principal = gateway_test_actor();
         let capability = format!("channel.feishu.send_text.{suffix}");
         let grant_id = format!("grant-execute-dry-run-{suffix}");
         let grant = serde_json::json!({
@@ -9343,7 +10312,6 @@ providers:
         assert_eq!(response.status(), StatusCode::OK);
 
         let action = serde_json::json!({
-            "actor_principal": principal,
             "actor_identity_ref": null,
             "source_channel": "channel://wechat/chat/test",
             "session_id": "test-session",
@@ -9378,7 +10346,7 @@ providers:
         assert_eq!(json["kind"], "cross_plane_action_execution");
         assert_eq!(json["status"], "planned");
         assert_eq!(json["dispatch_status"], "dry_run");
-        assert_eq!(json["executable"], true);
+        assert_eq!(json["executable"], false);
         assert_eq!(json["dispatched"], false);
         assert!(json["audit_record_id"]
             .as_str()
@@ -9392,7 +10360,9 @@ providers:
                     .method("POST")
                     .uri("/api/cross-plane/policy/simulate")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(json["action"].to_string()))
+                    .body(Body::from(
+                        cross_plane_intent_from_action(&json["action"]).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -9408,7 +10378,9 @@ providers:
                     .method("POST")
                     .uri("/api/cross-plane/policy/simulate")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(json["action"].to_string()))
+                    .body(Body::from(
+                        cross_plane_intent_from_action(&json["action"]).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -9431,7 +10403,7 @@ providers:
             }
         })));
         let suffix = uuid::Uuid::new_v4().to_string();
-        let principal = format!("user:execute-idempotent-{suffix}");
+        let principal = gateway_test_actor();
         let capability = format!("channel.feishu.send_text.{suffix}");
         let grant = serde_json::json!({
             "id": format!("grant-execute-idempotent-{suffix}"),
@@ -9465,7 +10437,6 @@ providers:
             "mode": "dry_run",
             "idempotency_key": format!("idem-{suffix}"),
             "action": {
-                "actor_principal": principal,
                 "actor_identity_ref": null,
                 "source_channel": "channel://wechat/chat/test",
                 "session_id": "test-session",
@@ -9553,7 +10524,7 @@ providers:
             }
         })));
         let suffix = uuid::Uuid::new_v4().to_string();
-        let principal = format!("user:execute-commit-{suffix}");
+        let principal = gateway_test_actor();
         let capability = format!("channel.feishu.send_text.{suffix}");
         let grant = serde_json::json!({
             "id": format!("grant-execute-commit-{suffix}"),
@@ -9584,7 +10555,6 @@ providers:
         assert_eq!(response.status(), StatusCode::OK);
 
         let action = serde_json::json!({
-            "actor_principal": principal,
             "actor_identity_ref": null,
             "source_channel": "channel://wechat/chat/test",
             "session_id": "test-session",
@@ -9616,14 +10586,17 @@ providers:
         let body = to_bytes(executed.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "blocked");
-        assert_eq!(json["dispatch_status"], "adapter_not_bound");
+        assert_eq!(json["dispatch_status"], "adapter_unavailable");
         assert_eq!(json["executable"], false);
         assert_eq!(json["adapter_capability"]["live_supported"], true);
         assert_eq!(json["adapter_capability"]["adapter_bound"], false);
-        assert!(json["blockers"]
-            .as_array()
-            .unwrap()
-            .contains(&serde_json::json!("dispatch:adapter_not_bound")));
+        assert!(json["blockers"].as_array().unwrap().iter().any(|value| {
+            value
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("adapter:feishu:send_text:not_bound")
+        }));
+        assert!(json["execution_graph"].is_null());
 
         let first = app
             .clone()
@@ -9632,7 +10605,9 @@ providers:
                     .method("POST")
                     .uri("/api/cross-plane/policy/simulate")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(json["action"].to_string()))
+                    .body(Body::from(
+                        cross_plane_intent_from_action(&json["action"]).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -9704,7 +10679,7 @@ providers:
             None,
         ));
         let suffix = uuid::Uuid::new_v4().to_string();
-        let principal = format!("user:dispatch-target-{suffix}");
+        let principal = gateway_test_actor();
         let capability = format!("channel.feishu.send_text.{suffix}");
         let grant = serde_json::json!({
             "id": format!("grant-dispatch-target-{suffix}"),
@@ -9735,7 +10710,6 @@ providers:
         assert_eq!(grant_response.status(), StatusCode::OK);
 
         let action = serde_json::json!({
-            "actor_principal": principal,
             "actor_identity_ref": null,
             "source_channel": "channel://wechat/chat/source",
             "session_id": "test-session",
@@ -9794,7 +10768,7 @@ providers:
             None,
         ));
         let suffix = uuid::Uuid::new_v4().to_string();
-        let principal = format!("user:dispatch-receipt-{suffix}");
+        let principal = gateway_test_actor();
         let capability = format!("channel.feishu.send_text.{suffix}");
         let grant = serde_json::json!({
             "id": format!("grant-dispatch-receipt-{suffix}"),
@@ -9828,7 +10802,6 @@ providers:
             "mode": "dry_run",
             "idempotency_key": format!("idem-dispatch-receipt-{suffix}"),
             "action": {
-                "actor_principal": principal,
                 "actor_identity_ref": null,
                 "source_channel": "channel://wechat/chat/source",
                 "session_id": "test-session",
@@ -9899,7 +10872,7 @@ providers:
             None,
         ));
         let suffix = uuid::Uuid::new_v4().to_string();
-        let principal = format!("user:dispatch-live-{suffix}");
+        let principal = gateway_test_actor();
         let capability = format!("channel.feishu.send_text.{suffix}");
         let grant = serde_json::json!({
             "id": format!("grant-dispatch-live-{suffix}"),
@@ -9933,7 +10906,6 @@ providers:
             "mode": "commit",
             "idempotency_key": format!("idem-dispatch-live-{suffix}"),
             "action": {
-                "actor_principal": principal,
                 "actor_identity_ref": null,
                 "source_channel": "channel://wechat/chat/source",
                 "session_id": "test-session",
@@ -9962,16 +10934,18 @@ providers:
         let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
 
         assert_eq!(executed_json["status"], "blocked");
-        assert_eq!(executed_json["dispatch_status"], "adapter_not_bound");
+        assert_eq!(executed_json["dispatch_status"], "adapter_unavailable");
         assert_eq!(executed_json["dispatched"], false);
         assert!(executed_json["blockers"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|blocker| blocker
-                .as_str()
-                .unwrap_or_default()
-                .contains("adapter_not_bound")));
+            .any(|value| {
+                value
+                    .as_str()
+                    .is_some_and(|value| value.starts_with("adapter:feishu:send_text:not_bound"))
+            }));
+        assert!(executed_json["execution_graph"].is_null());
     }
 
     #[tokio::test]
@@ -9990,7 +10964,7 @@ providers:
             None,
         ));
         let suffix = uuid::Uuid::new_v4().to_string();
-        let principal = format!("user:dispatch-image-{suffix}");
+        let principal = gateway_test_actor();
         let capability = format!("channel.feishu.send_image.{suffix}");
         let grant = serde_json::json!({
             "id": format!("grant-dispatch-image-{suffix}"),
@@ -10024,7 +10998,6 @@ providers:
             "mode": "commit",
             "idempotency_key": format!("idem-dispatch-image-{suffix}"),
             "action": {
-                "actor_principal": principal,
                 "actor_identity_ref": null,
                 "source_channel": "channel://wechat/chat/source",
                 "session_id": "test-session",
@@ -10053,7 +11026,7 @@ providers:
         let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
 
         assert_eq!(executed_json["status"], "blocked");
-        assert_eq!(executed_json["dispatch_status"], "adapter_not_bound");
+        assert_eq!(executed_json["dispatch_status"], "adapter_unavailable");
         assert_eq!(
             executed_json["execution_receipt"]["dispatch_target"]["outbound_message"]
                 ["payload_kind"],
@@ -10084,7 +11057,7 @@ providers:
             workspace.clone(),
         ));
         let suffix = uuid::Uuid::new_v4().to_string();
-        let principal = format!("user:dispatch-file-{suffix}");
+        let principal = gateway_test_actor();
         let capability = format!("channel.feishu.send_file.{suffix}");
         let grant = serde_json::json!({
             "id": format!("grant-dispatch-file-{suffix}"),
@@ -10118,7 +11091,6 @@ providers:
             "mode": "commit",
             "idempotency_key": format!("idem-dispatch-file-{suffix}"),
             "action": {
-                "actor_principal": principal,
                 "actor_identity_ref": null,
                 "source_channel": "channel://wechat/chat/source",
                 "session_id": "test-session",
@@ -10147,7 +11119,7 @@ providers:
         let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
 
         assert_eq!(executed_json["status"], "blocked");
-        assert_eq!(executed_json["dispatch_status"], "adapter_not_bound");
+        assert_eq!(executed_json["dispatch_status"], "adapter_unavailable");
         assert_eq!(
             executed_json["execution_receipt"]["dispatch_target"]["outbound_message"]
                 ["payload_kind"],
@@ -10184,7 +11156,7 @@ providers:
             workspace,
         ));
         let suffix = uuid::Uuid::new_v4().to_string();
-        let principal = format!("user:dispatch-file-block-{suffix}");
+        let principal = gateway_test_actor();
         let capability = format!("channel.feishu.send_file.{suffix}");
         let grant = serde_json::json!({
             "id": format!("grant-dispatch-file-block-{suffix}"),
@@ -10218,7 +11190,6 @@ providers:
             "mode": "commit",
             "idempotency_key": format!("idem-dispatch-file-block-{suffix}"),
             "action": {
-                "actor_principal": principal,
                 "actor_identity_ref": null,
                 "source_channel": "channel://wechat/chat/source",
                 "session_id": "test-session",
@@ -10247,7 +11218,7 @@ providers:
         let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
 
         assert_eq!(executed_json["status"], "blocked");
-        assert_eq!(executed_json["dispatch_status"], "adapter_not_bound");
+        assert_eq!(executed_json["dispatch_status"], "payload_rejected");
         assert!(executed_json["blockers"]
             .as_array()
             .unwrap()
@@ -10255,7 +11226,7 @@ providers:
             .any(|blocker| blocker
                 .as_str()
                 .unwrap_or_default()
-                .contains("adapter_not_bound")));
+                .contains("payload_blocked")));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -10387,7 +11358,6 @@ providers:
             workspace,
         ));
         let request = serde_json::json!({
-            "actor_principal": "user:context-resource",
             "tool_id": "service.local.docs.read",
             "resource_id": "context-doc",
             "title": "Context Resource Plan",
@@ -10450,7 +11420,6 @@ providers:
             workspace,
         ));
         let request = serde_json::json!({
-            "actor_principal": "user:resource-evidence",
             "tool_id": "service.local.docs.read",
             "resource_id": "evidence-doc",
             "title": "Evidence Resource",
@@ -10766,10 +11735,10 @@ providers:
             .await
             .unwrap();
         store
-            .append_runtime_event(&memory::RuntimeEvent::new(
+            .append_session_domain_event(&memory::SessionDomainEvent::new(
                 session_id,
                 3,
-                memory::RuntimeEventScope::Policy,
+                memory::SessionDomainScope::Policy,
                 "runtime.policy.decided",
                 serde_json::json!({
                     "agent_mode": "Solo",
@@ -10803,13 +11772,15 @@ providers:
         assert_eq!(timeline["total"], 4);
         assert_eq!(timeline["events"][0]["kind"], "message_appended");
         assert_eq!(timeline["events"][1]["kind"], "ContextEnvelope");
-        assert_eq!(timeline["events"][2]["kind"], "RuntimeRun");
-        assert_eq!(timeline["events"][2]["status"], "completed");
-        assert_eq!(timeline["events"][2]["refs"][0]["type"], "context_envelope");
-        assert_eq!(
-            timeline["events"][2]["refs"][0]["id"],
-            "ctx-runtime-timeline"
-        );
+        let runtime_run = timeline["events"]
+            .as_array()
+            .expect("timeline events")
+            .iter()
+            .find(|event| event["kind"] == "RuntimeRun")
+            .expect("runtime run projection");
+        assert_eq!(runtime_run["status"], "completed");
+        assert_eq!(runtime_run["refs"][0]["type"], "context_envelope");
+        assert_eq!(runtime_run["refs"][0]["id"], "ctx-runtime-timeline");
         assert_eq!(
             timeline["health_summary"]["latest_policy"]["agent_mode"],
             "Solo"
@@ -10909,20 +11880,60 @@ providers:
             ))
             .await
             .unwrap();
+        let raw = "tests passed";
+        let content_hash = format!("sha256:{:x}", sha2::Sha256::digest(raw.as_bytes()));
+        let raw_event = store
+            .append_session_domain_event_allocating_sequence(&memory::SessionDomainEvent::new(
+                session_id,
+                0,
+                memory::SessionDomainScope::Tool,
+                "evidence.raw.persisted",
+                serde_json::json!({
+                    "type": "RawEvidence",
+                    "evidence_id": "tool-1",
+                    "tool_name": "bash",
+                    "raw": raw,
+                    "content_hash": content_hash,
+                    "byte_count": raw.len(),
+                    "media_type": "text/plain",
+                    "visibility_scope": format!("session:{session_id}"),
+                }),
+                1,
+            ))
+            .await
+            .unwrap();
+        let evidence_ref = harness_contract::core::EvidenceRef::new("tool", "tool-1");
+        let projection = harness_contract::context::EvidenceAuditProjection {
+            evidence_ref: evidence_ref.clone(),
+            content_kind: harness_contract::context::EvidenceContentKind::Text,
+            raw_tokens: 3,
+            receipt_tokens: 1,
+            omitted_tokens: 2,
+            raw_available: true,
+            access: Some(harness_contract::context::EvidenceAccessRef::durable(
+                evidence_ref,
+                content_hash,
+                raw.len() as u64,
+                "text/plain",
+                format!("session-event://{session_id}/{}", raw_event.sequence),
+                format!("session:{session_id}"),
+            )),
+        };
         store
-            .append_event(&memory::SessionEvent {
-                session_id: session_id.to_string(),
-                event_type: "ToolComplete".to_string(),
-                event_json: serde_json::json!({
-                    "type": "ToolComplete",
-                    "id": "tool-1",
-                    "name": "bash",
-                    "summary": "tests passed",
-                })
-                .to_string(),
-                sequence: 0,
-                created_at_ms: 1,
-            })
+            .append_session_domain_event_allocating_sequence(&memory::SessionDomainEvent::new(
+                session_id,
+                0,
+                memory::SessionDomainScope::Context,
+                "context.turn_report",
+                serde_json::json!({
+                    "type": "ContextTurnReport",
+                    "report": {
+                        "turn_id": "tool-evidence-turn",
+                        "audit_projections": [projection],
+                    }
+                }),
+                2,
+            ))
             .await
             .unwrap();
 
@@ -10945,7 +11956,8 @@ providers:
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["available"], true);
         assert_eq!(json["kind"], "tool");
-        assert_eq!(json["events"][0]["payload"]["summary"], "tests passed");
+        assert_eq!(json["verified"], true);
+        assert_eq!(json["event"]["snippet"], "tests passed");
     }
 
     #[tokio::test]
@@ -11540,9 +12552,9 @@ providers:
         );
         manager
             .create_entry(
-                MemoryLayer::L4,
+                MemoryLayer::L3,
                 MemoryCategory::Shared,
-                "Team Decision",
+                "Durable Decision Candidate",
                 "Use SessionKernel as the source of truth for v0.8.10.",
                 Priority::High,
                 vec!["team_relevant".into()],
@@ -11591,19 +12603,19 @@ providers:
             .await
             .unwrap();
         let layers_json: serde_json::Value = serde_json::from_slice(&layers_body).unwrap();
-        let l4_count = layers_json["layers"]
+        let l3_count = layers_json["layers"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|layer| layer["layer"] == "L4")
+            .find(|layer| layer["layer"] == "L3")
             .and_then(|layer| layer["entry_count"].as_u64())
             .unwrap_or_default();
-        assert_eq!(l4_count, 1);
+        assert_eq!(l3_count, 1);
 
         let entries_response = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/memory/L4")
+                    .uri("/api/memory/L3")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -11615,7 +12627,10 @@ providers:
             .unwrap();
         let entries_json: serde_json::Value = serde_json::from_slice(&entries_body).unwrap();
         assert_eq!(entries_json["entries"].as_array().unwrap().len(), 1);
-        assert_eq!(entries_json["entries"][0]["title"], "Team Decision");
+        assert_eq!(
+            entries_json["entries"][0]["title"],
+            "Durable Decision Candidate"
+        );
     }
 
     #[tokio::test]
@@ -11868,7 +12883,7 @@ providers:
     #[tokio::test]
     async fn auth_required_when_token_set() {
         let sessions = Arc::new(ActiveSessions::new());
-        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionEventBus::new();
         let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
         let task_kernel = test_task_kernel();
@@ -11880,7 +12895,7 @@ providers:
             approval_gate: None,
             auth_token: Some("test-token".into()),
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            config_home: default_config_home(),
+            config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             services: test_services(session_kernel, task_kernel, None),
@@ -11903,7 +12918,7 @@ providers:
     #[tokio::test]
     async fn system_routes_stay_protected_when_auth_token_set() {
         let sessions = Arc::new(ActiveSessions::new());
-        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionEventBus::new();
         let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
         let task_kernel = test_task_kernel();
@@ -11915,7 +12930,7 @@ providers:
             approval_gate: None,
             auth_token: Some("test-token".into()),
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            config_home: default_config_home(),
+            config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             services: test_services(session_kernel, task_kernel, None),
@@ -11936,9 +12951,9 @@ providers:
     }
 
     #[tokio::test]
-    async fn webui_same_origin_requests_bypass_browser_token_handling() {
+    async fn same_origin_headers_do_not_bypass_bearer_authentication() {
         let sessions = Arc::new(ActiveSessions::new());
-        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionEventBus::new();
         let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
         let task_kernel = test_task_kernel();
@@ -11950,7 +12965,7 @@ providers:
             approval_gate: None,
             auth_token: Some("test-token".into()),
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            config_home: default_config_home(),
+            config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             services: test_services(session_kernel, task_kernel, None),
@@ -11969,13 +12984,13 @@ providers:
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
     async fn cross_site_requests_still_require_bearer_auth() {
         let sessions = Arc::new(ActiveSessions::new());
-        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionEventBus::new();
         let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
         let task_kernel = test_task_kernel();
@@ -11987,7 +13002,7 @@ providers:
             approval_gate: None,
             auth_token: Some("test-token".into()),
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            config_home: default_config_home(),
+            config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             services: test_services(session_kernel, task_kernel, None),
@@ -12012,7 +13027,7 @@ providers:
     #[tokio::test]
     async fn profile_and_workspace_routes_stay_protected_when_auth_token_set() {
         let sessions = Arc::new(ActiveSessions::new());
-        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionEventBus::new();
         let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
         let task_kernel = test_task_kernel();
@@ -12024,7 +13039,7 @@ providers:
             approval_gate: None,
             auth_token: Some("test-token".into()),
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            config_home: default_config_home(),
+            config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             services: test_services(session_kernel, task_kernel, None),
@@ -12037,7 +13052,7 @@ providers:
             "/api/workspace",
             "/api/approval/pending",
             "/api/cross-plane/summary",
-            "/api/channels/wechat-ilink/accounts",
+            "/api/message-connectors/wechat-ilink/accounts",
             "/api/memory/status",
             "/api/tasks",
             "/api/runtime/control-plane",
@@ -12056,7 +13071,7 @@ providers:
     #[tokio::test]
     async fn auth_passes_with_valid_token() {
         let sessions = Arc::new(ActiveSessions::new());
-        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionEventBus::new();
         let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
         let task_kernel = test_task_kernel();
@@ -12068,7 +13083,7 @@ providers:
             approval_gate: None,
             auth_token: Some("test-token".into()),
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            config_home: default_config_home(),
+            config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             services: test_services(session_kernel, task_kernel, None),

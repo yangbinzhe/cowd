@@ -99,96 +99,96 @@ pub struct MfgSkillRun {
 #[must_use]
 pub fn server_manufacturing_skill_pack() -> Vec<MfgSkillManifest> {
     vec![
-        skill(
-            "supply-risk-analyst",
-            "Supply Risk Analyst",
-            &["supply.material_shortage", "supplier.commit_change"],
-            &["material_shortage_risk", "supplier_commit_variance"],
-            &["metric_lineage", "supplier_commit", "inventory_position"],
-            &["supplier_recovery", "material_allocation_review"],
-            "Trace shortage facts through supplier, inventory, and order delivery impact.",
-            "shortage impact is bounded and recovery owner is identified",
-        ),
-        skill(
-            "material-clear-to-build-analyst",
-            "Material Clear-to-Build Analyst",
-            &[
+        skill(SkillSeed {
+            skill_id: "supply-risk-analyst",
+            role: "Supply Risk Analyst",
+            input_fact_types: &["supply.material_shortage", "supplier.commit_change"],
+            input_metric_keys: &["material_shortage_risk", "supplier_commit_variance"],
+            required_evidence: &["metric_lineage", "supplier_commit", "inventory_position"],
+            output_actions: &["supplier_recovery", "material_allocation_review"],
+            analysis_method: "Trace shortage facts through supplier, inventory, and order delivery impact.",
+            success_criteria: "shortage impact is bounded and recovery owner is identified",
+        }),
+        skill(SkillSeed {
+            skill_id: "material-clear-to-build-analyst",
+            role: "Material Clear-to-Build Analyst",
+            input_fact_types: &[
                 "bom.change",
                 "supply.material_shortage",
                 "inventory.position",
             ],
-            &["material_shortage_risk", "inventory_coverage_weeks"],
-            &["bom_snapshot", "substitution_rule", "inventory_lot"],
-            &["clear_to_build_check", "substitution_review"],
-            "Compare BOM demand, available supply, substitutions, and weekly build plan.",
-            "CTB blocker list is deterministic and tied to component refs",
-        ),
-        skill(
-            "capacity-risk-analyst",
-            "Capacity Risk Analyst",
-            &["manufacturing.capacity_load", "plan.weekly_commit"],
-            &["work_center_load", "order_delivery_risk"],
-            &["work_center_calendar", "routing", "weekly_plan"],
-            &["capacity_rebalance", "schedule_review"],
-            "Project work-center load and identify bottleneck propagation to shipment risk.",
-            "capacity bottleneck has owner, period, and mitigation path",
-        ),
-        skill(
-            "quality-trace-analyst",
-            "Quality Trace Analyst",
-            &["quality.issue", "quality.escape"],
-            &["first_pass_yield", "quality_escape_risk"],
-            &["quality_lot", "test_station", "affected_orders"],
-            &["containment_review", "root_cause_trace"],
-            "Trace quality issue from lot/test evidence to affected product and customer scope.",
-            "affected scope and containment action are explicit",
-        ),
-        skill(
-            "delivery-risk-analyst",
-            "Delivery Risk Analyst",
-            &[
+            input_metric_keys: &["material_shortage_risk", "inventory_coverage_weeks"],
+            required_evidence: &["bom_snapshot", "substitution_rule", "inventory_lot"],
+            output_actions: &["clear_to_build_check", "substitution_review"],
+            analysis_method: "Compare BOM demand, available supply, substitutions, and weekly build plan.",
+            success_criteria: "CTB blocker list is deterministic and tied to component refs",
+        }),
+        skill(SkillSeed {
+            skill_id: "capacity-risk-analyst",
+            role: "Capacity Risk Analyst",
+            input_fact_types: &["manufacturing.capacity_load", "plan.weekly_commit"],
+            input_metric_keys: &["work_center_load", "order_delivery_risk"],
+            required_evidence: &["work_center_calendar", "routing", "weekly_plan"],
+            output_actions: &["capacity_rebalance", "schedule_review"],
+            analysis_method: "Project work-center load and identify bottleneck propagation to shipment risk.",
+            success_criteria: "capacity bottleneck has owner, period, and mitigation path",
+        }),
+        skill(SkillSeed {
+            skill_id: "quality-trace-analyst",
+            role: "Quality Trace Analyst",
+            input_fact_types: &["quality.issue", "quality.escape"],
+            input_metric_keys: &["first_pass_yield", "quality_escape_risk"],
+            required_evidence: &["quality_lot", "test_station", "affected_orders"],
+            output_actions: &["containment_review", "root_cause_trace"],
+            analysis_method: "Trace quality issue from lot/test evidence to affected product and customer scope.",
+            success_criteria: "affected scope and containment action are explicit",
+        }),
+        skill(SkillSeed {
+            skill_id: "delivery-risk-analyst",
+            role: "Delivery Risk Analyst",
+            input_fact_types: &[
                 "customer.order_change",
                 "shipment.delay",
                 "supply.material_shortage",
             ],
-            &["order_delivery_risk", "revenue_at_risk"],
-            &[
+            input_metric_keys: &["order_delivery_risk", "revenue_at_risk"],
+            required_evidence: &[
                 "customer_order",
                 "shipment_plan",
                 "material_and_capacity_risk",
             ],
-            &["delivery_commit_review", "customer_escalation_plan"],
-            "Combine material, capacity, quality, and shipment signals into delivery risk.",
-            "delivery commitment risk is quantified with next action",
-        ),
-        skill(
-            "procurement-coordinator",
-            "Procurement Coordinator",
-            &[
+            output_actions: &["delivery_commit_review", "customer_escalation_plan"],
+            analysis_method: "Combine material, capacity, quality, and shipment signals into delivery risk.",
+            success_criteria: "delivery commitment risk is quantified with next action",
+        }),
+        skill(SkillSeed {
+            skill_id: "procurement-coordinator",
+            role: "Procurement Coordinator",
+            input_fact_types: &[
                 "purchase_order.delay",
                 "supplier.commit_change",
                 "supply.material_shortage",
             ],
-            &["supplier_commit_variance", "material_shortage_risk"],
-            &["purchase_order", "supplier_contact", "allocation_decision"],
-            &["supplier_followup", "expedite_request"],
-            "Prepare governed supplier follow-up tasks with evidence and expected recovery date.",
-            "supplier task is ready for cross-plane dispatch",
-        ),
-        skill(
-            "plan-change-impact-analyst",
-            "Plan Change Impact Analyst",
-            &["plan.weekly_commit", "bom.change", "customer.order_change"],
-            &[
+            input_metric_keys: &["supplier_commit_variance", "material_shortage_risk"],
+            required_evidence: &["purchase_order", "supplier_contact", "allocation_decision"],
+            output_actions: &["supplier_followup", "expedite_request"],
+            analysis_method: "Prepare governed supplier follow-up tasks with evidence and expected recovery date.",
+            success_criteria: "supplier task is ready for cross-plane dispatch",
+        }),
+        skill(SkillSeed {
+            skill_id: "plan-change-impact-analyst",
+            role: "Plan Change Impact Analyst",
+            input_fact_types: &["plan.weekly_commit", "bom.change", "customer.order_change"],
+            input_metric_keys: &[
                 "order_delivery_risk",
                 "work_center_load",
                 "inventory_coverage_weeks",
             ],
-            &["weekly_plan", "bom_diff", "demand_change"],
-            &["plan_impact_review", "scenario_compare"],
-            "Propagate plan and BOM changes across material, capacity, and delivery metrics.",
-            "impact path is explainable and scoped by week/entity",
-        ),
+            required_evidence: &["weekly_plan", "bom_diff", "demand_change"],
+            output_actions: &["plan_impact_review", "scenario_compare"],
+            analysis_method: "Propagate plan and BOM changes across material, capacity, and delivery metrics.",
+            success_criteria: "impact path is explainable and scoped by week/entity",
+        }),
     ]
 }
 
@@ -333,29 +333,34 @@ pub fn skill_agent_node_id(skill_id: &str) -> String {
     format!("mfg_skill_{}", skill_id.replace('-', "_"))
 }
 
-fn skill(
-    skill_id: &str,
-    role: &str,
-    input_fact_types: &[&str],
-    input_metric_keys: &[&str],
-    required_evidence: &[&str],
-    output_actions: &[&str],
-    analysis_method: &str,
-    success_criteria: &str,
-) -> MfgSkillManifest {
+struct SkillSeed<'a> {
+    skill_id: &'a str,
+    role: &'a str,
+    input_fact_types: &'a [&'a str],
+    input_metric_keys: &'a [&'a str],
+    required_evidence: &'a [&'a str],
+    output_actions: &'a [&'a str],
+    analysis_method: &'a str,
+    success_criteria: &'a str,
+}
+
+fn skill(seed: SkillSeed<'_>) -> MfgSkillManifest {
     MfgSkillManifest {
-        skill_id: skill_id.to_string(),
-        role: role.to_string(),
+        skill_id: seed.skill_id.to_string(),
+        role: seed.role.to_string(),
         domain: "server_manufacturing".to_string(),
-        input_fact_types: input_fact_types
+        input_fact_types: seed
+            .input_fact_types
             .iter()
             .map(|value| value.to_string())
             .collect(),
-        input_metric_keys: input_metric_keys
+        input_metric_keys: seed
+            .input_metric_keys
             .iter()
             .map(|value| value.to_string())
             .collect(),
-        required_evidence: required_evidence
+        required_evidence: seed
+            .required_evidence
             .iter()
             .map(|value| value.to_string())
             .collect(),
@@ -365,13 +370,14 @@ fn skill(
             "mfg.evidence_packet".to_string(),
             "mfg.cross_plane_preflight".to_string(),
         ],
-        analysis_method: analysis_method.to_string(),
-        output_actions: output_actions
+        analysis_method: seed.analysis_method.to_string(),
+        output_actions: seed
+            .output_actions
             .iter()
             .map(|value| value.to_string())
             .collect(),
         quality_gate: "evidence_quality_gate_required".to_string(),
-        success_criteria: success_criteria.to_string(),
+        success_criteria: seed.success_criteria.to_string(),
     }
 }
 
@@ -421,4 +427,25 @@ fn score_skill(skill: &MfgSkillManifest, text: &str, metric_keys: &[String]) -> 
         })
         .count();
     metric_score + text_score
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skill_pack_preserves_builtin_identity_and_contracts() {
+        let skills = server_manufacturing_skill_pack();
+
+        assert_eq!(skills.len(), 7);
+        assert_eq!(skills[0].skill_id, "supply-risk-analyst");
+        assert_eq!(skills[0].domain, "server_manufacturing");
+        assert_eq!(
+            skills[0].input_metric_keys,
+            vec!["material_shortage_risk", "supplier_commit_variance"]
+        );
+        assert!(skills.iter().all(|skill| {
+            skill.quality_gate == "evidence_quality_gate_required" && !skill.tools.is_empty()
+        }));
+    }
 }

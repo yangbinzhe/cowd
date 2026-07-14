@@ -102,15 +102,19 @@ async fn upload_resource_handler(
 
     let temp_path = write_resource_upload_temp(&state.config_home, &file_name, &bytes)
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let (resource, hint) = runtime::register_resource_from_path(
+    let store = runtime::ResourceStore::for_config_home_with_capabilities(
         &state.config_home,
-        &temp_path,
-        source,
-        source_message_id,
-        session_id,
-        declared_mime,
-    )
-    .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
+        state.services.resource_capability_index(),
+    );
+    let (resource, hint) = store
+        .register_resource_from_path(
+            &temp_path,
+            source,
+            source_message_id,
+            session_id,
+            declared_mime,
+        )
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
     let _ = fs::remove_file(&temp_path);
 
     Ok((
@@ -126,11 +130,17 @@ async fn get_resource_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = runtime::ResourceStore::default_for_config_home(&state.config_home);
+    let store = runtime::ResourceStore::for_config_home_with_capabilities(
+        &state.config_home,
+        state.services.resource_capability_index(),
+    );
     let resource = store
         .get(&id)
         .map_err(|e| api_error(StatusCode::NOT_FOUND, e))?;
-    let hint = runtime::resource_hint(&resource, &runtime::ResourceCapabilitySnapshot::default());
+    let hint = runtime::resource_hint(
+        &resource,
+        &state.services.resource_capability_index().snapshot(),
+    );
     Ok(Json(serde_json::json!({
         "resource": resource,
         "hint": hint,
@@ -141,7 +151,10 @@ async fn get_resource_evidence_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let store = runtime::ResourceStore::default_for_config_home(&state.config_home);
+    let store = runtime::ResourceStore::for_config_home_with_capabilities(
+        &state.config_home,
+        state.services.resource_capability_index(),
+    );
     Json(serde_json::json!({
         "resource_id": id,
         "evidence": store.evidence(&id),

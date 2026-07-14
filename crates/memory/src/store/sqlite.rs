@@ -18,6 +18,7 @@ use chrono::{DateTime, Utc};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -213,10 +214,12 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
     let updated_at_str: String = row.get(14)?;
     let last_accessed_str: Option<String> = row.get(15)?;
     let scope: Option<String> = row.get(16)?;
-    let scope = scope
-        .as_deref()
-        .map(|s| s.parse::<MemoryScope>().unwrap_or_default())
-        .unwrap_or_default();
+    // A malformed or pre-V2 scope must never silently become the default
+    // session scope.  That would make an unclassified historical record
+    // eligible for unrelated Runtime recall. Schema migration persists the
+    // held form, and this conversion keeps the same safety property for a
+    // database that is opened read-only or interrupted mid-migration.
+    let scope = parse_persisted_scope(scope.as_deref(), &id_str);
     let session_id: Option<String> = row.get(17)?;
     let source_agent: Option<String> = row.get(18).unwrap_or(None);
     let visibility_str: Option<String> = row.get(19).unwrap_or(None);
@@ -293,6 +296,23 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
         source_agent,
         visibility,
     })
+}
+
+fn parse_persisted_scope(raw_scope: Option<&str>, memory_id: &str) -> MemoryScope {
+    raw_scope
+        .and_then(|scope| scope.parse::<MemoryScope>().ok())
+        .unwrap_or_else(|| MemoryScope::LegacyUnresolvedAgent(format!("unclassified:{memory_id}")))
+}
+
+/// A durable record of an old scope that Runtime intentionally keeps outside
+/// every cognitive lease until an operator explicitly classifies it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyScopeMigrationReport {
+    pub memory_id: String,
+    pub raw_scope: Option<String>,
+    pub held_scope: String,
+    pub reason: String,
+    pub migrated_at: String,
 }
 
 fn row_to_meta(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryMeta> {
@@ -389,6 +409,13 @@ fn init_schema(conn: &Connection) -> Result<()> {
             session_id       TEXT,
             source_agent     TEXT,
             visibility       TEXT
+)",
+        r"CREATE TABLE IF NOT EXISTS memory_scope_migration_reports (
+    memory_id    TEXT PRIMARY KEY,
+    raw_scope    TEXT,
+    held_scope   TEXT NOT NULL,
+    reason       TEXT NOT NULL,
+    migrated_at  TEXT NOT NULL
 )",
         r"CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     id      UNINDEXED,
@@ -558,6 +585,8 @@ END",
         .map_err(|e| MemoryError::Store(format!("migrate legacy memory enums: {e}")))?;
     migrate_legacy_memory_ids(conn)
         .map_err(|e| MemoryError::Store(format!("migrate legacy memory ids: {e}")))?;
+    migrate_legacy_memory_scopes(conn)
+        .map_err(|e| MemoryError::Store(format!("migrate legacy memory scopes: {e}")))?;
 
     conn.execute_batch("COMMIT;")
         .map_err(|e| sql_ctx("commit schema migration", e))?;
@@ -843,6 +872,80 @@ fn migrate_legacy_memory_enums(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Preserve historical scope records without guessing a new identity.  In
+/// particular, the old `agent_*` namespace encoded neither a Definition
+/// lineage nor an execution Instance, so assigning either would leak recall
+/// across agents.  The migration is idempotent: reopening the database never
+/// changes an already held record or duplicates its report.
+fn migrate_legacy_memory_scopes(conn: &Connection) -> Result<()> {
+    let rows = {
+        let mut stmt = conn
+            .prepare("SELECT id, scope FROM memories ORDER BY id")
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .map_err(sql_err)?;
+        let mut values = Vec::new();
+        for row in rows {
+            values.push(row.map_err(sql_err)?);
+        }
+        values
+    };
+
+    let migrated_at = Utc::now().to_rfc3339();
+    for (memory_id, raw_scope) in rows {
+        let Some((held_scope, reason)) = classify_legacy_scope(&memory_id, raw_scope.as_deref())
+        else {
+            continue;
+        };
+
+        conn.execute(
+            "UPDATE memories SET scope = ?1 WHERE id = ?2",
+            params![held_scope, memory_id],
+        )
+        .map_err(sql_err)?;
+        conn.execute(
+            r"INSERT OR IGNORE INTO memory_scope_migration_reports
+                 (memory_id, raw_scope, held_scope, reason, migrated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![memory_id, raw_scope, held_scope, reason, migrated_at],
+        )
+        .map_err(sql_err)?;
+    }
+    Ok(())
+}
+
+fn classify_legacy_scope(
+    memory_id: &str,
+    raw_scope: Option<&str>,
+) -> Option<(String, &'static str)> {
+    let Some(raw_scope) = raw_scope else {
+        return Some((
+            format!("legacy_agent_missing-scope-{memory_id}"),
+            "legacy record did not declare a memory scope",
+        ));
+    };
+
+    if raw_scope.starts_with("agent_")
+        && !raw_scope.starts_with("agent_definition_")
+        && !raw_scope.starts_with("agent_instance_")
+    {
+        return Some((
+            format!("legacy_agent_{}", &raw_scope[6..]),
+            "pre-V2 agent scope cannot be classified as a Definition lineage or Instance",
+        ));
+    }
+
+    raw_scope.parse::<MemoryScope>().is_err().then(|| {
+        (
+            format!("legacy_agent_invalid-scope-{memory_id}"),
+            "stored memory scope is not recognized by the current contract",
+        )
+    })
+}
+
 // ---------------------------------------------------------------------------
 // SqliteStore definition
 // ---------------------------------------------------------------------------
@@ -920,6 +1023,35 @@ impl SqliteStore {
     /// Returns the internal connection pool (for sharing with ReputationManager etc.)
     pub fn pool(&self) -> Pool<SqliteConnectionManager> {
         self.pool.clone()
+    }
+
+    /// Return every scope record that was deliberately held during the V2
+    /// migration.  Callers may present these records for explicit operator
+    /// classification; Runtime must not treat this report as a read lease.
+    pub fn legacy_scope_migration_reports(&self) -> Result<Vec<LegacyScopeMigrationReport>> {
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT memory_id, raw_scope, held_scope, reason, migrated_at
+                 FROM memory_scope_migration_reports ORDER BY migrated_at, memory_id",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(LegacyScopeMigrationReport {
+                    memory_id: row.get(0)?,
+                    raw_scope: row.get(1)?,
+                    held_scope: row.get(2)?,
+                    reason: row.get(3)?,
+                    migrated_at: row.get(4)?,
+                })
+            })
+            .map_err(sql_err)?;
+        let mut reports = Vec::new();
+        for row in rows {
+            reports.push(row.map_err(sql_err)?);
+        }
+        Ok(reports)
     }
 
     /// Get a connection from the pool.
@@ -2243,6 +2375,13 @@ impl MemoryStore for SqliteStore {
         .map_err(|e| MemoryError::Store(e.to_string()))?
     }
 
+    async fn legacy_scope_migration_reports(&self) -> Result<Vec<LegacyScopeMigrationReport>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.legacy_scope_migration_reports())
+            .await
+            .map_err(|error| MemoryError::Store(error.to_string()))?
+    }
+
     async fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
         let store = self.clone();
         let sanitized = Self::sanitize_fts_query(query);
@@ -2799,6 +2938,48 @@ mod tests {
         let entries = store.search_by_layer(MemoryLayer::L2).await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].title, "legacy title");
+    }
+
+    #[tokio::test]
+    async fn init_schema_holds_ambiguous_agent_scopes_with_a_durable_report() {
+        let store = open_store();
+        let conn = store.conn().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let id = Uuid::new_v4().to_string();
+        conn.execute(
+            r"INSERT INTO memories
+               (id, layer, category, priority, source, title, content,
+                embedding_json, tags_json, relations_json, confidence,
+                access_count, staleness, created_at, updated_at,
+                last_accessed_at, scope, session_id, source_agent, visibility)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,NULL,?8,?9,1.0,0,0.0,?10,?10,NULL,?11,NULL,NULL,NULL)",
+            rusqlite::params![
+                id,
+                layer_to_int(MemoryLayer::L1),
+                category_to_str(MemoryCategory::Shared),
+                priority_to_int(Priority::Normal),
+                source_to_str(MemorySource::AutoExtracted),
+                "ambiguous agent memory",
+                "must not leak into another agent",
+                "[]",
+                "[]",
+                now,
+                "agent_researcher",
+            ],
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+        let reports = store.legacy_scope_migration_reports().unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].raw_scope.as_deref(), Some("agent_researcher"));
+        assert_eq!(reports[0].held_scope, "legacy_agent_researcher");
+
+        let entries = store.search_by_layer(MemoryLayer::L1).await.unwrap();
+        assert!(matches!(
+            entries[0].scope,
+            MemoryScope::LegacyUnresolvedAgent(ref id) if id == "researcher"
+        ));
     }
 
     #[tokio::test]

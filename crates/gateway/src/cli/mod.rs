@@ -21,7 +21,12 @@ pub fn permission_mode_from_label(mode: &str) -> runtime::PermissionMode {
         "read-only" => runtime::PermissionMode::ReadOnly,
         "workspace-write" => runtime::PermissionMode::WorkspaceWrite,
         "danger-full-access" => runtime::PermissionMode::DangerFullAccess,
-        other => panic!("unsupported permission mode label: {other}"),
+        other => {
+            tracing::warn!(
+                "unsupported permission mode label `{other}`; falling back to read-only"
+            );
+            runtime::PermissionMode::ReadOnly
+        }
     }
 }
 

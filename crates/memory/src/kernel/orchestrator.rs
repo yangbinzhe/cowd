@@ -12,7 +12,6 @@ use std::{
 };
 
 use chrono::Utc;
-use parking_lot::Mutex;
 use std::sync::OnceLock;
 
 /// Global FactChecker singleton — replacing the dual-instance pattern.
@@ -27,16 +26,12 @@ use crate::{
     closet::{Closet, ClosetManager},
     config::{BudgetCalculator, MemoryConfig},
     context_fence::FenceRegistry,
-    context_sync::ContextSync,
     error::MemoryError,
     fact_checker::{FactCheckResult, FactChecker},
+    kernel::{scoped_entry_scope, MemoryTurnContext},
     layers::{
-        deep::DeepLayer,
-        essential::EssentialLayer,
-        identity::IdentityLayer,
-        project::ProjectLayer,
-        shared::{L4EventBus, SharedLayer},
-        LayerManager,
+        deep::DeepLayer, essential::EssentialLayer, identity::IdentityLayer, project::ProjectLayer,
+        shared::SharedLayer, LayerManager,
     },
     performance_monitor::PerformanceReport,
     project_scope::MemoryScope,
@@ -76,20 +71,58 @@ pub struct MemoryOrchestrator {
     closet: parking_lot::Mutex<ClosetManager>,
     /// Fence registry for context isolation.
     fence_registry: FenceRegistry,
-    /// Active memory scope for auto-filling new entries.
-    active_scope: Mutex<MemoryScope>,
-    /// Active agent ID for auto-filling new entries' source_agent.
-    active_agent: Mutex<Option<String>>,
-    /// Active session ID for auto-filling new entries' session_id.
-    active_session: Mutex<Option<String>>,
     /// Closet rebuild counter for automatic periodic rebuild.
     closet_rebuild_counter: AtomicU32,
-    /// Cross-session context synchronisation store.
-    context_sync: Mutex<ContextSync>,
     /// Write guard for anti-corruption control (optional).
     write_guard: Option<Arc<MemoryWriteGuard>>,
-    /// Optional event bus for L4 push notifications across agents.
-    l4_event_bus: Option<Arc<L4EventBus>>,
+}
+
+/// Typed command accepted by the only L4 persistence boundary.
+///
+/// L4 stores durable, reviewed collaboration knowledge. Runtime must turn
+/// transient team output into this command only after its candidate lifecycle
+/// has reached `Promoted`; ordinary memory extraction and caller supplied
+/// writes cannot construct an L4 entry through `remember` or `write`.
+#[derive(Debug, Clone)]
+pub struct L4PromotionCommand {
+    pub candidate_id: String,
+    pub promotion_receipt: String,
+    pub lineage_ref: String,
+    pub source_evidence_refs: Vec<String>,
+    pub scope: MemoryScope,
+    pub title: String,
+    pub content: String,
+    pub priority: Priority,
+    pub tags: Vec<String>,
+}
+
+impl L4PromotionCommand {
+    fn validate(&self) -> Result<()> {
+        for (field, value) in [
+            ("candidate_id", &self.candidate_id),
+            ("promotion_receipt", &self.promotion_receipt),
+            ("lineage_ref", &self.lineage_ref),
+            ("title", &self.title),
+            ("content", &self.content),
+        ] {
+            if value.trim().is_empty() {
+                return Err(MemoryError::InvalidArgument(format!(
+                    "L4 promotion {field} must not be empty"
+                )));
+            }
+        }
+        if self.source_evidence_refs.is_empty()
+            || self
+                .source_evidence_refs
+                .iter()
+                .any(|reference| reference.trim().is_empty())
+        {
+            return Err(MemoryError::InvalidArgument(
+                "L4 promotion requires durable source evidence references".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl MemoryOrchestrator {
@@ -136,14 +169,12 @@ impl MemoryOrchestrator {
             ProjectLayer::new(Arc::clone(&store))
         };
         let l3 = DeepLayer::with_config(Arc::clone(&store), 5, config.drift.clone());
-        let event_bus = Arc::new(L4EventBus::new(256));
-        let mut l4 = if config.store.enable_vector_index {
+        let l4 = if config.store.enable_vector_index {
             // When the vector index is enabled we also allow the shared layer.
             SharedLayer::new(Arc::clone(&store))
         } else {
             SharedLayer::new(Arc::clone(&store))
         };
-        l4.event_bus = Some(Arc::clone(&event_bus));
 
         // Build Closet index from L2 (project) + L3 (deep) memory metadata.
         let closet = parking_lot::Mutex::new(ClosetManager::from_closet(Closet::default()));
@@ -158,13 +189,8 @@ impl MemoryOrchestrator {
             l4,
             closet,
             fence_registry: FenceRegistry::new(),
-            active_scope: Mutex::new(MemoryScope::default()),
-            active_agent: Mutex::new(None),
-            active_session: Mutex::new(None),
             closet_rebuild_counter: AtomicU32::new(0),
-            context_sync: Mutex::new(ContextSync::new()),
             write_guard: None,
-            l4_event_bus: Some(event_bus),
         })
     }
 
@@ -453,36 +479,6 @@ impl MemoryOrchestrator {
         &self.store
     }
 
-    /// Get a reference to the L4 event bus for subscribing to push notifications.
-    pub fn l4_event_bus(&self) -> Option<&Arc<L4EventBus>> {
-        self.l4_event_bus.as_ref()
-    }
-
-    /// Set the active memory scope for new entries.
-    pub fn set_active_scope(&self, scope: MemoryScope) {
-        *self.active_scope.lock() = scope;
-    }
-
-    /// Get the currently active memory scope.
-    pub fn get_active_scope(&self) -> MemoryScope {
-        self.active_scope.lock().clone()
-    }
-
-    /// Set the active agent ID for auto-filling new entries' source_agent.
-    pub fn set_active_agent(&self, agent_id: String) {
-        *self.active_agent.lock() = Some(agent_id);
-    }
-
-    /// Set the active session ID for auto-filling new entries.
-    pub fn set_active_session(&self, session_id: String) {
-        *self.active_session.lock() = Some(session_id);
-    }
-
-    /// Get the current active session ID (if set).
-    pub fn active_session_id(&self) -> Option<String> {
-        self.active_session.lock().clone()
-    }
-
     /// Return a snapshot of current performance metrics from the shared
     /// cognitive context manager, if available.
     #[must_use]
@@ -497,13 +493,34 @@ impl MemoryOrchestrator {
     // Write API
     // -----------------------------------------------------------------------
 
-    /// Store a new memory entry, routing it to the correct layer.
+    /// Store an entry supplied outside Runtime execution. Even this lower
+    /// level API never persists the historical empty-session scope sentinel:
+    /// omitted ownership is deterministically attributed to `memory-api`.
+    pub async fn remember(&self, entry: MemoryEntry) -> Result<MemoryId> {
+        let fallback_turn = MemoryTurnContext::new(
+            entry.session_id.as_deref().unwrap_or("memory-api"),
+            entry.source_agent.as_deref().unwrap_or("memory-api"),
+        )
+        .with_project_id(match &entry.scope {
+            MemoryScope::Project(project) if !project.trim().is_empty() => Some(project.clone()),
+            _ => None,
+        });
+        self.remember_for_turn(&fallback_turn, entry).await
+    }
+
+    /// Store one already-resolved entry, routing it to the correct layer.
     ///
     /// If a fact checker is configured, the entry content is scanned for
     /// known entity facts. Extracted facts are registered for future checks,
     /// and contradictory statements cause the entry's confidence to be
     /// downgraded.
-    pub async fn remember(&self, mut entry: MemoryEntry) -> Result<MemoryId> {
+    async fn remember_resolved(&self, mut entry: MemoryEntry) -> Result<MemoryId> {
+        if entry.layer == MemoryLayer::L4 {
+            return Err(MemoryError::WriteDenied {
+                layer: "L4".to_string(),
+                write_source: "ordinary_memory_write_requires_l4_promotion_service".to_string(),
+            });
+        }
         // Enforce WriteGuard before allowing any write
         if let Some(ref guard) = self.write_guard {
             if !guard.is_write_allowed(entry.layer) {
@@ -511,27 +528,6 @@ impl MemoryOrchestrator {
                     layer: format!("{:?}", entry.layer),
                     write_source: format!("{:?}", guard.source()),
                 });
-            }
-        }
-
-        // Auto-fill scope from the active scope only when callers did not
-        // provide an explicit scope. L4/team writes rely on preserving Global
-        // or Project scopes for cross-agent recall.
-        if entry.scope == MemoryScope::default() {
-            entry.scope = self.active_scope.lock().clone();
-        }
-
-        // Auto-fill source_agent from the active agent
-        if entry.source_agent.is_none() {
-            if let Some(ref agent) = *self.active_agent.lock() {
-                entry.source_agent = Some(agent.clone());
-            }
-        }
-
-        // Auto-fill session_id from the active session
-        if entry.session_id.is_none() {
-            if let Some(ref session) = *self.active_session.lock() {
-                entry.session_id = Some(session.clone());
             }
         }
 
@@ -602,12 +598,20 @@ impl MemoryOrchestrator {
             MemoryLayer::L1 => self.l1.insert(entry).await?,
             MemoryLayer::L2 => self.l2.insert(entry).await?,
             MemoryLayer::L3 => self.l3.insert(entry).await?,
-            MemoryLayer::L4 => self.l4.insert(entry).await?,
+            // L4 is deliberately absent from ordinary memory writes.  A
+            // caller must use the typed promotion command below after Runtime
+            // has produced a governed candidate and receipt.
+            MemoryLayer::L4 => {
+                return Err(MemoryError::WriteDenied {
+                    layer: "L4".to_string(),
+                    write_source: "ordinary_memory_write_requires_l4_promotion_service".to_string(),
+                });
+            }
         };
 
         // Wire into verbatim sink for persistent layers (L2/L3/L4).
         // L0/L1 are volatile layers and should NOT be stored verbatim.
-        if matches!(layer, MemoryLayer::L2 | MemoryLayer::L3 | MemoryLayer::L4) {
+        if matches!(layer, MemoryLayer::L2 | MemoryLayer::L3) {
             let timestamp = Utc::now().to_rfc3339();
             self.store
                 .save_verbatim(
@@ -623,11 +627,43 @@ impl MemoryOrchestrator {
         Ok(id)
     }
 
+    /// Persist an entry with the immutable Runtime turn that produced it.
+    /// The orchestrator deliberately has no process-wide active Agent, session
+    /// or scope: concurrent Agent instances must not overwrite one another.
+    pub async fn remember_for_turn(
+        &self,
+        turn: &MemoryTurnContext,
+        mut entry: MemoryEntry,
+    ) -> Result<MemoryId> {
+        entry
+            .session_id
+            .get_or_insert_with(|| turn.session_id.clone());
+        entry
+            .source_agent
+            .get_or_insert_with(|| turn.agent_id.clone());
+        entry.scope = scoped_entry_scope(turn, &entry);
+        self.remember_resolved(entry).await
+    }
+
     /// Write multiple memory entries in a batch, returning their IDs.
     pub async fn remember_batch(&self, entries: Vec<MemoryEntry>) -> Result<Vec<MemoryId>> {
         let mut ids = Vec::with_capacity(entries.len());
         for entry in entries {
             ids.push(self.remember(entry).await?);
+        }
+        Ok(ids)
+    }
+
+    /// Persist a batch emitted by one exact Runtime turn. This is used by
+    /// delayed extraction so completion order cannot alter memory ownership.
+    pub async fn remember_batch_for_turn(
+        &self,
+        turn: &MemoryTurnContext,
+        entries: Vec<MemoryEntry>,
+    ) -> Result<Vec<MemoryId>> {
+        let mut ids = Vec::with_capacity(entries.len());
+        for entry in entries {
+            ids.push(self.remember_for_turn(turn, entry).await?);
         }
         Ok(ids)
     }
@@ -685,6 +721,12 @@ impl MemoryOrchestrator {
 
     /// Update an existing memory entry in-place.
     pub async fn update(&self, entry: &crate::types::MemoryEntry) -> Result<()> {
+        if entry.layer == MemoryLayer::L4 {
+            return Err(MemoryError::WriteDenied {
+                layer: "L4".to_string(),
+                write_source: "ordinary_memory_update_requires_l4_promotion_service".to_string(),
+            });
+        }
         self.store.update(entry).await
     }
 
@@ -694,34 +736,64 @@ impl MemoryOrchestrator {
     }
 
     // -----------------------------------------------------------------------
-    // L4 Shared Layer – Team Knowledge Operations
+    // L4 Shared Layer – governed promotion only
     // -----------------------------------------------------------------------
 
-    /// Write a shared entry visible to all agents in the same team scope.
-    ///
-    /// This is the recommended API for agent-to-agent knowledge sharing:
-    /// task handoff, team decisions, coding conventions, operational runbooks.
-    /// Entries are automatically scoped by `shared_scope` and pruned based
-    /// on staleness thresholds during maintenance ticks.
-    pub async fn team_remember(
-        &self,
-        title: &str,
-        content: &str,
-        priority: Priority,
-        tags: Vec<String>,
-        scope: MemoryScope,
-    ) -> Result<MemoryId> {
-        self.write(
-            MemoryLayer::L4,
-            MemoryCategory::Shared,
-            title,
-            content,
-            priority,
-            MemorySource::Import,
+    /// Persist a verified long-term collaboration candidate. This is the sole
+    /// L4 write path; callers must supply Runtime's promotion receipt,
+    /// lineage, and evidence references instead of a raw peer message.
+    pub async fn promote_l4(&self, command: L4PromotionCommand) -> Result<MemoryId> {
+        command.validate()?;
+        let now = Utc::now();
+        let mut tags = command.tags;
+        tags.extend([
+            format!("l4_candidate:{}", command.candidate_id),
+            format!("l4_promotion_receipt:{}", command.promotion_receipt),
+            format!("l4_lineage:{}", command.lineage_ref),
+        ]);
+        tags.extend(
+            command
+                .source_evidence_refs
+                .iter()
+                .map(|reference| format!("l4_evidence:{reference}")),
+        );
+        tags.sort();
+        tags.dedup();
+        let entry = MemoryEntry {
+            id: uuid::Uuid::new_v4(),
+            layer: MemoryLayer::L4,
+            category: MemoryCategory::Shared,
+            priority: command.priority,
+            source: MemorySource::Import,
+            title: command.title,
+            content: command.content,
+            embedding: None,
             tags,
-            scope,
-        )
-        .await
+            relations: Vec::new(),
+            confidence: 1.0,
+            access_count: 0,
+            staleness: 0.0,
+            created_at: now,
+            updated_at: now,
+            last_accessed_at: None,
+            scope: command.scope,
+            session_id: None,
+            source_agent: Some("runtime-l4-promotion-service".to_string()),
+            visibility: crate::types::AgentVisibility::Shared,
+        };
+        let entry_id = entry.id;
+        let content = entry.content.clone();
+        let id = self.l4.insert_promoted(entry).await?;
+        self.store
+            .save_verbatim(
+                &entry_id.to_string(),
+                &content,
+                crate::store::sqlite::source_to_str(MemorySource::Import),
+                crate::store::sqlite::layer_to_int(MemoryLayer::L4),
+                &now.to_rfc3339(),
+            )
+            .await?;
+        Ok(id)
     }
 
     /// Query team-shared knowledge relevant to a search term.
@@ -751,72 +823,6 @@ impl MemoryOrchestrator {
     /// Recall L4 shared entries scoped globally.
     pub async fn recall_l4_global(&self, query: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
         self.l4.recall_global(query, limit).await
-    }
-
-    /// Recall peer agent context from L4 for cross-agent perception.
-    ///
-    /// Returns entries where visibility is Shared and source_agent differs
-    /// from `current_agent`, capped per peer and total.
-    pub async fn recall_peer_context(
-        &self,
-        query: &str,
-        current_agent: &str,
-        max_per_peer: usize,
-        max_peers: usize,
-    ) -> Result<Vec<MemoryEntry>> {
-        let mut entries = self
-            .l4
-            .recall_peers(query, current_agent, max_per_peer, max_peers)
-            .await?;
-
-        // Inject cross-session context from ContextSync
-        let session_id = self.active_session.lock().clone().unwrap_or_default();
-        if !session_id.is_empty() && !entries.is_empty() {
-            let sync = self.context_sync.lock();
-            let sync_count = sync.session_count();
-            if sync_count > 0 {
-                if let Some(first) = entries.first_mut() {
-                    let mut ctx = std::mem::take(&mut first.content);
-                    let injected = sync.inject_from_others(&session_id, &mut ctx);
-                    if injected > 0 {
-                        first.content = ctx;
-                        tracing::debug!(
-                            injected,
-                            sync_count,
-                            "context_sync: injected cross-session context into peer recall"
-                        );
-                    } else {
-                        first.content = ctx;
-                    }
-                }
-            }
-        }
-
-        Ok(entries)
-    }
-
-    /// Intra-turn real-time peer perception (T3).
-    ///
-    /// Delegates to [`SharedLayer::recall_peers_realtime`].  No 5-minute time
-    /// cutoff — filters by session_id instead so Agent B sees Agent A's writes
-    /// from the same turn.
-    pub async fn recall_peer_context_realtime(
-        &self,
-        query: &str,
-        current_agent: &str,
-        current_session_id: &str,
-        max_per_peer: usize,
-        max_peers: usize,
-    ) -> Result<Vec<MemoryEntry>> {
-        self.l4
-            .recall_peers_realtime(
-                query,
-                current_agent,
-                current_session_id,
-                max_per_peer,
-                max_peers,
-            )
-            .await
     }
 
     // -----------------------------------------------------------------------
@@ -919,11 +925,13 @@ fn estimate_tokens(content: &str) -> u64 {
 /// - `"Alice is child_of Charlie"` → same
 /// - `"Alice's full_name is Alice Smith"` → triple(subject="Alice", predicate="full_name", object="Alice Smith")
 fn extract_triple_from_content(content: &str, source_agent: Option<&str>) -> Option<Triple> {
-    static PARENT_RE: OnceLock<regex::Regex> = OnceLock::new();
-    static CHILD_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static PARENT_RE: OnceLock<std::result::Result<regex::Regex, regex::Error>> = OnceLock::new();
+    static CHILD_RE: OnceLock<std::result::Result<regex::Regex, regex::Error>> = OnceLock::new();
 
-    let parent_re =
-        PARENT_RE.get_or_init(|| regex::Regex::new(r#"(\w+)'s\s+parent\s+is\s+(\w+)"#).unwrap());
+    let parent_re = PARENT_RE
+        .get_or_init(|| regex::Regex::new(r#"(\w+)'s\s+parent\s+is\s+(\w+)"#))
+        .as_ref()
+        .ok()?;
     if let Some(caps) = parent_re.captures(content) {
         let subject = caps.get(1)?.as_str().to_string();
         let object = caps.get(2)?.as_str().to_string();
@@ -942,8 +950,10 @@ fn extract_triple_from_content(content: &str, source_agent: Option<&str>) -> Opt
     }
 
     // Pattern: "X is child_of Y"
-    let child_re =
-        CHILD_RE.get_or_init(|| regex::Regex::new(r#"(\w+)\s+is\s+child_of\s+(\w+)"#).unwrap());
+    let child_re = CHILD_RE
+        .get_or_init(|| regex::Regex::new(r#"(\w+)\s+is\s+child_of\s+(\w+)"#))
+        .as_ref()
+        .ok()?;
     if let Some(caps) = child_re.captures(content) {
         let subject = caps.get(1)?.as_str().to_string();
         let object = caps.get(2)?.as_str().to_string();
@@ -974,37 +984,38 @@ fn register_facts_from_content(
     content: &str,
     source_agent: Option<&str>,
 ) {
-    static REGISTER_PARENT_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static REGISTER_PARENT_RE: OnceLock<std::result::Result<regex::Regex, regex::Error>> =
+        OnceLock::new();
 
-    let parent_re = Some(
-        REGISTER_PARENT_RE
-            .get_or_init(|| regex::Regex::new(r#"(\w+)'s\s+parent\s+is\s+(\w+)"#).unwrap()),
-    );
-    if let Some(re) = parent_re {
-        for caps in re.captures_iter(content) {
-            if let (Some(subj), Some(obj)) = (caps.get(1), caps.get(2)) {
-                let subject = subj.as_str();
-                let parent_name = obj.as_str();
-                let mut facts = EntityFacts::default();
-                facts.entity_type = Some("person".to_string());
-                facts.parent = Some(parent_name.to_string());
-                checker.register_facts(subject, facts);
+    let Ok(parent_re) = REGISTER_PARENT_RE
+        .get_or_init(|| regex::Regex::new(r#"(\w+)'s\s+parent\s+is\s+(\w+)"#))
+        .as_ref()
+    else {
+        return;
+    };
+    for caps in parent_re.captures_iter(content) {
+        if let (Some(subj), Some(obj)) = (caps.get(1), caps.get(2)) {
+            let subject = subj.as_str();
+            let parent_name = obj.as_str();
+            let mut facts = EntityFacts::default();
+            facts.entity_type = Some("person".to_string());
+            facts.parent = Some(parent_name.to_string());
+            checker.register_facts(subject, facts);
 
-                // Register triple for cross-agent conflict detection
-                let triple = Triple {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    subject: subject.to_string(),
-                    predicate: "child_of".to_string(),
-                    object: parent_name.to_string(),
-                    valid_from: Some(chrono::Utc::now()),
-                    valid_until: None,
-                    confidence: 1.0,
-                    source_memory_id: None,
-                    source_file: None,
-                    source_agent: source_agent.map(String::from),
-                };
-                checker.register_triple(triple);
-            }
+            // Register triple for cross-agent conflict detection
+            let triple = Triple {
+                id: uuid::Uuid::new_v4().to_string(),
+                subject: subject.to_string(),
+                predicate: "child_of".to_string(),
+                object: parent_name.to_string(),
+                valid_from: Some(chrono::Utc::now()),
+                valid_until: None,
+                confidence: 1.0,
+                source_memory_id: None,
+                source_file: None,
+                source_agent: source_agent.map(String::from),
+            };
+            checker.register_triple(triple);
         }
     }
 }
@@ -1130,13 +1141,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remember_fills_default_scope_from_active_scope() {
+    async fn remember_for_turn_fills_default_scope_from_explicit_turn() {
         let store = in_memory_store();
         let orch = MemoryOrchestrator::from_store(test_config(), store, None).unwrap();
-        orch.set_active_scope(MemoryScope::Project("active-project".into()));
+        let turn = MemoryTurnContext::new("session-a", "agent-a")
+            .with_project_id(Some("active-project".into()));
 
         let id = orch
-            .remember(test_entry(MemoryLayer::L2, "scoped", "content"))
+            .remember_for_turn(&turn, test_entry(MemoryLayer::L2, "scoped", "content"))
             .await
             .unwrap();
 
@@ -1148,7 +1160,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remember_all_five_layers() {
+    async fn ordinary_writes_reject_l4_and_promotions_are_receipted() {
         let store = in_memory_store();
         let orch = MemoryOrchestrator::from_store(test_config(), store, None).unwrap();
 
@@ -1157,13 +1169,36 @@ mod tests {
             MemoryLayer::L1,
             MemoryLayer::L2,
             MemoryLayer::L3,
-            MemoryLayer::L4,
         ] {
             let e = test_entry(*layer, "T", "C");
             let id = orch.remember(e).await.unwrap();
             let got = orch.recall(&id).await.unwrap().unwrap();
             assert_eq!(got.layer, *layer);
         }
+        assert!(matches!(
+            orch.remember(test_entry(MemoryLayer::L4, "T", "C")).await,
+            Err(MemoryError::WriteDenied { .. })
+        ));
+        let id = orch
+            .promote_l4(L4PromotionCommand {
+                candidate_id: "candidate-1".to_string(),
+                promotion_receipt: "receipt-1".to_string(),
+                lineage_ref: "team-run:1".to_string(),
+                source_evidence_refs: vec!["evidence:1".to_string()],
+                scope: MemoryScope::TeamRun("team-run-1".to_string()),
+                title: "Verified team decision".to_string(),
+                content: "Use the evidence-backed decision.".to_string(),
+                priority: Priority::High,
+                tags: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let promoted = orch.recall(&id).await.unwrap().unwrap();
+        assert_eq!(promoted.layer, MemoryLayer::L4);
+        assert!(promoted
+            .tags
+            .iter()
+            .any(|tag| tag == "l4_promotion_receipt:receipt-1"));
     }
 
     // ── Read ────────────────────────────────────────────────────────────────

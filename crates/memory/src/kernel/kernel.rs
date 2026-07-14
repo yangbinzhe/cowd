@@ -16,6 +16,7 @@ use chrono::Utc;
 use fact_kernel::{FactKernelService, FactReviewReceipt, InMemoryFactStore};
 use harness_contract::reality::RecallSourceKind;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::{
     cognitive::CognitiveContextManager,
@@ -270,8 +271,16 @@ pub struct MemoryTurnContext {
     pub session_id: String,
     pub project_id: Option<String>,
     pub agent_id: String,
+    /// Definition lineage is distinct from `agent_id`, which is always an
+    /// isolated runtime instance identity.
+    pub definition_lineage_id: Option<String>,
     pub team_id: Option<String>,
     pub task_id: Option<String>,
+    /// Explicit cognitive read lease supplied by the Runtime Binding. This is
+    /// checked again after every retrieval source returns candidates, so a
+    /// broad backend query cannot leak a memory into an Agent context.
+    #[serde(default = "default_cognitive_read_scopes")]
+    pub cognitive_read_scopes: Vec<harness_contract::agent::CognitiveReadScope>,
 }
 
 impl MemoryTurnContext {
@@ -281,14 +290,22 @@ impl MemoryTurnContext {
             session_id: session_id.into(),
             project_id: None,
             agent_id: agent_id.into(),
+            definition_lineage_id: None,
             team_id: None,
             task_id: None,
+            cognitive_read_scopes: default_cognitive_read_scopes(),
         }
     }
 
     #[must_use]
     pub fn with_project_id(mut self, project_id: Option<String>) -> Self {
         self.project_id = project_id;
+        self
+    }
+
+    #[must_use]
+    pub fn with_definition_lineage_id(mut self, definition_lineage_id: Option<String>) -> Self {
+        self.definition_lineage_id = definition_lineage_id;
         self
     }
 
@@ -303,6 +320,27 @@ impl MemoryTurnContext {
         self.team_id = team_id;
         self
     }
+
+    #[must_use]
+    pub fn with_cognitive_read_scopes(
+        mut self,
+        scopes: Vec<harness_contract::agent::CognitiveReadScope>,
+    ) -> Self {
+        self.cognitive_read_scopes = scopes;
+        self
+    }
+}
+
+fn default_cognitive_read_scopes() -> Vec<harness_contract::agent::CognitiveReadScope> {
+    use harness_contract::agent::CognitiveReadScope;
+
+    vec![
+        CognitiveReadScope::Session,
+        CognitiveReadScope::Team,
+        CognitiveReadScope::WorkspaceKnowledge,
+        CognitiveReadScope::Project,
+        CognitiveReadScope::DefinitionLineage,
+    ]
 }
 
 /// A degraded memory subsystem or fallback path.
@@ -377,16 +415,18 @@ impl MemoryKernel {
         query: &str,
         messages: &[Message],
     ) -> MemoryKernelResult<PreparedContext> {
-        self.manager.set_active_session(ctx.session_id.clone());
-        self.manager.set_active_agent(ctx.agent_id.clone());
-
         match self
             .manager
-            .prepare_context(query, messages, Some(&ctx.session_id))
+            .prepare_context_for_turn(ctx, query, messages)
             .await
         {
             Ok(mut prepared) => {
-                prepared.entries = self.filter_active_entries(prepared.entries).await;
+                prepared.entries = self
+                    .filter_active_entries(prepared.entries)
+                    .await
+                    .into_iter()
+                    .filter(|entry| memory_scope_visible_to_ctx(&entry.scope, ctx))
+                    .collect();
                 prepared.total_tokens = prepared
                     .entries
                     .iter()
@@ -412,10 +452,7 @@ impl MemoryKernel {
         ctx: &MemoryTurnContext,
         messages: &mut Vec<Message>,
     ) -> MemoryKernelResult<()> {
-        self.manager.set_active_session(ctx.session_id.clone());
-        self.manager.set_active_agent(ctx.agent_id.clone());
-
-        if let Err(error) = self.manager.on_turn_end(messages).await {
+        if let Err(error) = self.manager.on_turn_end_for_turn(ctx, messages).await {
             tracing::warn!(
                 session_id = %ctx.session_id,
                 agent_id = %ctx.agent_id,
@@ -435,9 +472,6 @@ impl MemoryKernel {
         ctx: &MemoryTurnContext,
         mut entry: MemoryEntry,
     ) -> MemoryKernelResult<()> {
-        self.manager.set_active_session(ctx.session_id.clone());
-        self.manager.set_active_agent(ctx.agent_id.clone());
-
         entry
             .session_id
             .get_or_insert_with(|| ctx.session_id.clone());
@@ -483,7 +517,7 @@ impl MemoryKernel {
             );
             return Ok(());
         }
-        if let Err(error) = self.manager.remember(entry).await {
+        if let Err(error) = self.manager.remember_for_turn(ctx, entry).await {
             tracing::warn!(
                 session_id = %ctx.session_id,
                 agent_id = %ctx.agent_id,
@@ -546,7 +580,12 @@ impl MemoryKernel {
             .facts
             .iter()
             .enumerate()
-            .map(|(index, fact)| (checkpoint.fact_candidate_id_key(index), fact.clone()))
+            .map(|(index, fact)| {
+                (
+                    checkpoint.fact_candidate_id_key(index),
+                    (index, fact.clone()),
+                )
+            })
             .collect::<HashMap<_, _>>();
         let mut fact_service = FactKernelService::with_store(InMemoryFactStore::new());
         for entry in self.manager.list_all_entries().await? {
@@ -556,10 +595,14 @@ impl MemoryKernel {
 
         let mut ids = Vec::with_capacity(fact_review.promoted.len());
         for decision in &fact_review.promoted {
-            let Some(fact) = candidate_to_fact.get(decision.candidate.candidate_id.as_str()) else {
+            let Some((fact_index, fact)) =
+                candidate_to_fact.get(decision.candidate.candidate_id.as_str())
+            else {
                 continue;
             };
-            let id = self.remember_checkpoint_fact(ctx, fact.clone()).await?;
+            let id = self
+                .remember_checkpoint_fact(ctx, &checkpoint.checkpoint_id, *fact_index, fact.clone())
+                .await?;
             ids.push(id);
         }
 
@@ -572,6 +615,8 @@ impl MemoryKernel {
     async fn remember_checkpoint_fact(
         &self,
         ctx: &MemoryTurnContext,
+        checkpoint_id: &str,
+        fact_index: usize,
         fact: SessionCheckpointFact,
     ) -> MemoryKernelResult<MemoryId> {
         let now = Utc::now();
@@ -603,7 +648,11 @@ impl MemoryKernel {
             tags.push(format!("task:{task_id}"));
         }
         let entry = MemoryEntry {
-            id: uuid::Uuid::new_v4(),
+            // A checkpoint event is durable before this projection. Use a
+            // deterministic ID so replay after a crash either creates the
+            // missing memory once or reuses the existing fact without
+            // duplicating the knowledge base.
+            id: checkpoint_memory_id(checkpoint_id, fact_index),
             layer: fact.layer,
             category: fact.category,
             priority: Priority::Normal,
@@ -794,27 +843,11 @@ impl MemoryKernel {
         }
         let (deduplicated_entries, mut duplicate_omissions) =
             deduplicate_memory_entries_for_recall(prepared.entries);
-        prepared.entries = deduplicated_entries;
+        prepared.entries = deduplicated_entries
+            .into_iter()
+            .filter(|entry| memory_scope_visible_to_ctx(&entry.scope, ctx))
+            .collect();
         checkpoint_omissions.append(&mut duplicate_omissions);
-        let aaak_index = crate::aaak_index::AaakIndex::from_entries(
-            &prepared.entries,
-            (max_tokens / 8).clamp(128, 2_048),
-        );
-        source_results.push(RecallSourceResult {
-            source: RecallSourceKind::CompactNavigation,
-            status: if aaak_index.slots.is_empty() {
-                "degraded"
-            } else {
-                "enabled_and_wired"
-            }
-            .to_string(),
-            selected_count: aaak_index.slots.len(),
-            omitted_count: 0,
-            degraded_reason: aaak_index
-                .slots
-                .is_empty()
-                .then(|| "AAAK compact index has no slots for this packet".to_string()),
-        });
         let usage_summary = self.usage_summary().await.unwrap_or_default();
         let mut packet = self
             .context_packet_from_entries_with_budget(
@@ -1332,6 +1365,13 @@ impl MemoryKernel {
     }
 }
 
+fn checkpoint_memory_id(checkpoint_id: &str, fact_index: usize) -> MemoryId {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("cowd:semantic-checkpoint:{checkpoint_id}:fact:{fact_index}").as_bytes(),
+    )
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MemoryRuntimeSnapshot {
     pub total_entries: usize,
@@ -1448,14 +1488,20 @@ fn packet_role_and_reason(atom: &MemoryAtomView) -> (MemoryPacketRole, String) {
     }
 }
 
-fn scoped_entry_scope(ctx: &MemoryTurnContext, entry: &MemoryEntry) -> MemoryScope {
+pub(crate) fn scoped_entry_scope(ctx: &MemoryTurnContext, entry: &MemoryEntry) -> MemoryScope {
     match &entry.scope {
+        // `MemoryScope::default()` is the historical Session("") sentinel.
+        // Never persist it: it is neither visible to its source session nor a
+        // meaningful authorization boundary.
+        MemoryScope::Session(session_id) if session_id.trim().is_empty() => {
+            default_scope_for_ctx(ctx)
+        }
         MemoryScope::Global => {
             if matches!(entry.visibility, AgentVisibility::Private) {
-                return MemoryScope::Agent(ctx.agent_id.clone());
+                return MemoryScope::AgentInstance(ctx.agent_id.clone());
             }
             if let Some(team_id) = &ctx.team_id {
-                return MemoryScope::Project(team_id.clone());
+                return MemoryScope::TeamRun(team_id.clone());
             }
             if let Some(project_id) = &ctx.project_id {
                 return MemoryScope::Project(project_id.clone());
@@ -1476,15 +1522,55 @@ fn scoped_entry_scope(ctx: &MemoryTurnContext, entry: &MemoryEntry) -> MemorySco
     }
 }
 
-fn memory_scope_visible_to_ctx(scope: &MemoryScope, ctx: &MemoryTurnContext) -> bool {
+pub(crate) fn default_scope_for_ctx(ctx: &MemoryTurnContext) -> MemoryScope {
+    if let Some(task_id) = ctx.task_id.as_deref().filter(|id| !id.trim().is_empty()) {
+        return MemoryScope::Task(task_id.to_string());
+    }
+    if let Some(project_id) = ctx.project_id.as_deref().filter(|id| !id.trim().is_empty()) {
+        return MemoryScope::Project(project_id.to_string());
+    }
+    MemoryScope::Session(ctx.session_id.clone())
+}
+
+pub(crate) fn memory_scope_visible_to_ctx(scope: &MemoryScope, ctx: &MemoryTurnContext) -> bool {
+    use harness_contract::agent::CognitiveReadScope;
+
     match scope {
-        MemoryScope::Global => true,
-        MemoryScope::Session(session_id) => session_id == &ctx.session_id,
-        MemoryScope::Project(project_id) => {
-            ctx.project_id.as_ref() == Some(project_id) || ctx.team_id.as_ref() == Some(project_id)
+        MemoryScope::Global => ctx
+            .cognitive_read_scopes
+            .contains(&CognitiveReadScope::WorkspaceKnowledge),
+        MemoryScope::Session(session_id) => {
+            session_id == &ctx.session_id
+                && ctx
+                    .cognitive_read_scopes
+                    .contains(&CognitiveReadScope::Session)
         }
-        MemoryScope::Task(task_id) => ctx.task_id.as_ref() == Some(task_id),
-        MemoryScope::Agent(agent_id) => agent_id == &ctx.agent_id,
+        MemoryScope::Project(project_id) => {
+            ctx.project_id.as_ref() == Some(project_id)
+                && ctx
+                    .cognitive_read_scopes
+                    .contains(&CognitiveReadScope::Project)
+        }
+        MemoryScope::Task(task_id) => {
+            ctx.task_id.as_ref() == Some(task_id)
+                && ctx
+                    .cognitive_read_scopes
+                    .contains(&CognitiveReadScope::Session)
+        }
+        MemoryScope::AgentDefinitionLineage(definition_id) => {
+            ctx.definition_lineage_id.as_ref() == Some(definition_id)
+                && ctx
+                    .cognitive_read_scopes
+                    .contains(&CognitiveReadScope::DefinitionLineage)
+        }
+        MemoryScope::AgentInstance(instance_id) => instance_id == &ctx.agent_id,
+        MemoryScope::TeamRun(team_id) => {
+            ctx.team_id.as_ref() == Some(team_id)
+                && ctx
+                    .cognitive_read_scopes
+                    .contains(&CognitiveReadScope::Team)
+        }
+        MemoryScope::LegacyUnresolvedAgent(_) => false,
     }
 }
 
@@ -1492,13 +1578,14 @@ fn checkpoint_recall_score(entry: &MemoryEntry, ctx: &MemoryTurnContext, query: 
     let scope_score = match &entry.scope {
         MemoryScope::Task(task_id) if ctx.task_id.as_ref() == Some(task_id) => 0.34,
         MemoryScope::Session(session_id) if session_id == &ctx.session_id => 0.30,
-        MemoryScope::Project(project_id)
-            if ctx.project_id.as_ref() == Some(project_id)
-                || ctx.team_id.as_ref() == Some(project_id) =>
+        MemoryScope::Project(project_id) if ctx.project_id.as_ref() == Some(project_id) => 0.20,
+        MemoryScope::TeamRun(team_id) if ctx.team_id.as_ref() == Some(team_id) => 0.22,
+        MemoryScope::AgentDefinitionLineage(definition_id)
+            if ctx.definition_lineage_id.as_ref() == Some(definition_id) =>
         {
-            0.20
+            0.18
         }
-        MemoryScope::Agent(agent_id) if agent_id == &ctx.agent_id => 0.18,
+        MemoryScope::AgentInstance(instance_id) if instance_id == &ctx.agent_id => 0.16,
         MemoryScope::Global => 0.08,
         _ => 0.0,
     };
@@ -1850,7 +1937,12 @@ mod tests {
     use chrono::{Duration, Utc};
 
     use super::*;
+    use crate::compression::session::{
+        CheckpointFactKind, CheckpointTokenStats, CompactionSourceRange, SessionCheckpointFact,
+        SessionResumeCursor, SessionSemanticCheckpoint,
+    };
     use crate::types::{AgentVisibility, MemoryCategory};
+    use harness_contract::core::EvidenceRef;
 
     fn memory_entry(
         title: &str,
@@ -1924,5 +2016,182 @@ mod tests {
         assert_eq!(deduplicated[0].id, fresh_id);
         assert_eq!(omitted.len(), 1);
         assert!(omitted[0].reason.contains("duplicate recall candidate"));
+    }
+
+    #[test]
+    fn default_scope_never_persists_the_empty_session_sentinel() {
+        let context = MemoryTurnContext::new("session-a", "primary");
+        let empty_scope_entry = MemoryEntry {
+            scope: MemoryScope::default(),
+            ..memory_entry("Scoped", "must stay with its session", 0.0, 1.0, 0)
+        };
+        assert_eq!(
+            scoped_entry_scope(&context, &empty_scope_entry),
+            MemoryScope::Session("session-a".to_string())
+        );
+    }
+
+    #[test]
+    fn cognitive_read_lease_filters_team_project_and_global_memory() {
+        use harness_contract::agent::CognitiveReadScope;
+
+        let context = MemoryTurnContext::new("session-a", "agent-a")
+            .with_project_id(Some("project-a".to_string()))
+            .with_team_id(Some("team-a".to_string()))
+            .with_cognitive_read_scopes(vec![CognitiveReadScope::Session]);
+        assert!(memory_scope_visible_to_ctx(
+            &MemoryScope::Session("session-a".to_string()),
+            &context
+        ));
+        assert!(!memory_scope_visible_to_ctx(
+            &MemoryScope::Project("project-a".to_string()),
+            &context
+        ));
+        assert!(!memory_scope_visible_to_ctx(&MemoryScope::Global, &context));
+
+        let expanded = context.with_cognitive_read_scopes(vec![
+            CognitiveReadScope::Session,
+            CognitiveReadScope::Project,
+            CognitiveReadScope::Team,
+            CognitiveReadScope::WorkspaceKnowledge,
+        ]);
+        assert!(memory_scope_visible_to_ctx(
+            &MemoryScope::Project("project-a".to_string()),
+            &expanded
+        ));
+        assert!(memory_scope_visible_to_ctx(
+            &MemoryScope::TeamRun("team-a".to_string()),
+            &expanded
+        ));
+        assert!(memory_scope_visible_to_ctx(&MemoryScope::Global, &expanded));
+    }
+
+    #[test]
+    fn definition_instance_and_team_scopes_never_cross_a_binding_lease() {
+        use harness_contract::agent::CognitiveReadScope;
+
+        let context = MemoryTurnContext::new("session-a", "instance-a")
+            .with_definition_lineage_id(Some("builtin/cowd/researcher".to_string()))
+            .with_team_id(Some("team-a".to_string()))
+            .with_cognitive_read_scopes(vec![
+                CognitiveReadScope::Session,
+                CognitiveReadScope::DefinitionLineage,
+                CognitiveReadScope::Team,
+            ]);
+        assert!(memory_scope_visible_to_ctx(
+            &MemoryScope::AgentDefinitionLineage("builtin/cowd/researcher".to_string()),
+            &context
+        ));
+        assert!(!memory_scope_visible_to_ctx(
+            &MemoryScope::AgentDefinitionLineage("builtin/cowd/reviewer".to_string()),
+            &context
+        ));
+        assert!(memory_scope_visible_to_ctx(
+            &MemoryScope::AgentInstance("instance-a".to_string()),
+            &context
+        ));
+        assert!(!memory_scope_visible_to_ctx(
+            &MemoryScope::AgentInstance("instance-b".to_string()),
+            &context
+        ));
+        assert!(memory_scope_visible_to_ctx(
+            &MemoryScope::TeamRun("team-a".to_string()),
+            &context
+        ));
+        assert!(!memory_scope_visible_to_ctx(
+            &MemoryScope::TeamRun("team-b".to_string()),
+            &context
+        ));
+        assert!(!memory_scope_visible_to_ctx(
+            &MemoryScope::LegacyUnresolvedAgent("researcher".to_string()),
+            &context
+        ));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_fact_projection_is_idempotent_across_replay() {
+        let temp = tempfile::tempdir().expect("temporary memory root");
+        let manager = Arc::new(
+            CognitiveContextManager::new(crate::config::MemoryConfig {
+                store: crate::config::StoreConfig {
+                    sqlite_path: temp.path().join("memory.sqlite"),
+                    blob_dir: temp.path().join("blobs"),
+                    enable_vector_index: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .expect("memory manager"),
+        );
+        let kernel = MemoryKernel::new(Arc::clone(&manager));
+        let context = MemoryTurnContext::new("session-idempotent", "primary");
+        let checkpoint = SessionSemanticCheckpoint {
+            schema_version: 2,
+            checkpoint_id: "checkpoint-idempotent".to_string(),
+            session_id: "session-idempotent".to_string(),
+            agent_id: "primary".to_string(),
+            project_id: None,
+            task_id: None,
+            team_id: None,
+            summary: "Keep the durable decision.".to_string(),
+            user_rules: Vec::new(),
+            goal: Some("validate replay".to_string()),
+            constraints: Vec::new(),
+            decisions: vec!["use one checkpoint".to_string()],
+            evidence_refs: Vec::new(),
+            unresolved: Vec::new(),
+            file_changes: Vec::new(),
+            resume_cursor: SessionResumeCursor {
+                message_index: 1,
+                event_sequence: Some(1),
+                checkpoint_id: "checkpoint-idempotent".to_string(),
+            },
+            token_stats: CheckpointTokenStats {
+                before: 200,
+                after: 40,
+                message_count: 2,
+            },
+            source_range: CompactionSourceRange {
+                session_id: "session-idempotent".to_string(),
+                message_start: 0,
+                message_end_exclusive: 2,
+                event_start: Some(0),
+                event_end_exclusive: Some(2),
+                raw_refs: vec![EvidenceRef::durable("checkpoint-replay-source")],
+            },
+            facts: vec![SessionCheckpointFact {
+                kind: CheckpointFactKind::Decision,
+                title: "Checkpoint decision".to_string(),
+                content: "Use a deterministic checkpoint fact identifier.".to_string(),
+                category: MemoryCategory::Decision,
+                layer: MemoryLayer::L2,
+                tags: vec!["semantic-checkpoint".to_string()],
+                confidence: 0.9,
+                evidence_refs: vec![EvidenceRef::durable("checkpoint-replay-source")],
+            }],
+        };
+
+        let first = kernel
+            .checkpoint_compaction(&context, checkpoint.clone())
+            .await
+            .expect("first projection");
+        let entries_after_first = manager.list_all_entries().await.expect("entries");
+        assert!(entries_after_first
+            .iter()
+            .any(|entry| entry.id == checkpoint_memory_id(&checkpoint.checkpoint_id, 0)));
+
+        let second = kernel
+            .checkpoint_compaction(&context, checkpoint.clone())
+            .await
+            .expect("replayed projection");
+        let entries_after_replay = manager.list_all_entries().await.expect("entries");
+
+        assert_eq!(entries_after_replay.len(), entries_after_first.len());
+        assert!(first
+            .memory_ids
+            .iter()
+            .all(|id| entries_after_replay.iter().any(|entry| entry.id == *id)));
+        assert!(second.memory_ids.is_empty() || second.memory_ids == first.memory_ids);
     }
 }

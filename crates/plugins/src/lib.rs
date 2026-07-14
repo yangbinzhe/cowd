@@ -1,3 +1,14 @@
+// Test assertions intentionally use unwrap/expect; normal library builds remain strict.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
+
 mod hooks;
 #[cfg(test)]
 pub mod test_isolation;
@@ -8,7 +19,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -980,6 +991,7 @@ impl Display for PluginManifestValidationError {
 pub enum PluginError {
     Io(std::io::Error),
     Json(serde_json::Error),
+    ClockBeforeUnixEpoch,
     ManifestValidation(Vec<PluginManifestValidationError>),
     LoadFailures(Vec<PluginLoadFailure>),
     InvalidManifest(String),
@@ -992,6 +1004,9 @@ impl Display for PluginError {
         match self {
             Self::Io(error) => write!(f, "{error}"),
             Self::Json(error) => write!(f, "{error}"),
+            Self::ClockBeforeUnixEpoch => {
+                f.write_str("system clock is earlier than the Unix epoch")
+            }
             Self::ManifestValidation(errors) => {
                 for (index, error) in errors.iter().enumerate() {
                     if index > 0 {
@@ -1134,7 +1149,7 @@ impl PluginManager {
             let _ = fs::remove_dir_all(&staged_source);
         }
 
-        let now = unix_time_ms();
+        let now = unix_time_ms()?;
         let record = InstalledPluginRecord {
             kind: PluginKind::External,
             id: plugin_id.clone(),
@@ -1220,7 +1235,7 @@ impl PluginManager {
         let updated_record = InstalledPluginRecord {
             version: manifest.version.clone(),
             description: manifest.description,
-            updated_at_unix_ms: unix_time_ms(),
+            updated_at_unix_ms: unix_time_ms()?,
             ..record.clone()
         };
         registry
@@ -1375,7 +1390,7 @@ impl PluginManager {
             let plugin_id = plugin_id(&manifest.name, BUNDLED_MARKETPLACE);
             active_bundled_ids.insert(plugin_id.clone());
             let install_path = install_root.join(sanitize_plugin_id(&plugin_id));
-            let now = unix_time_ms();
+            let now = unix_time_ms()?;
             let existing_record = registry.plugins.get(&plugin_id);
             let installed_copy_is_valid =
                 install_path.exists() && load_plugin_from_directory(&install_path).is_ok();
@@ -1490,7 +1505,7 @@ impl PluginManager {
         enabled: Option<bool>,
     ) -> Result<(), PluginError> {
         update_settings_json(&self.plugin_state_path(), |root| {
-            let enabled_plugins = ensure_object(root, "enabledPlugins");
+            let enabled_plugins = ensure_object(root, "enabledPlugins")?;
             match enabled {
                 Some(value) => {
                     enabled_plugins.insert(plugin_id.to_string(), Value::Bool(value));
@@ -1499,6 +1514,7 @@ impl PluginManager {
                     enabled_plugins.remove(plugin_id);
                 }
             }
+            Ok(())
         })
     }
 
@@ -2177,10 +2193,7 @@ fn materialize_source(
         PluginInstallSource::GitUrl { url } => {
             static MATERIALIZE_COUNTER: AtomicU64 = AtomicU64::new(0);
             let unique = MATERIALIZE_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
+            let nanos = unix_duration(SystemTime::now())?.as_nanos();
             let destination = temp_root.join(format!("plugin-{nanos}-{unique}"));
             let output = Command::new("git")
                 .arg("clone")
@@ -2239,11 +2252,13 @@ fn describe_install_source(source: &PluginInstallSource) -> String {
     }
 }
 
-fn unix_time_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time should be after epoch")
-        .as_millis()
+fn unix_duration(now: SystemTime) -> Result<Duration, PluginError> {
+    now.duration_since(UNIX_EPOCH)
+        .map_err(|_| PluginError::ClockBeforeUnixEpoch)
+}
+
+fn unix_time_ms() -> Result<u128, PluginError> {
+    Ok(unix_duration(SystemTime::now())?.as_millis())
 }
 
 fn copy_dir_all(source: &Path, destination: &Path) -> Result<(), PluginError> {
@@ -2262,7 +2277,7 @@ fn copy_dir_all(source: &Path, destination: &Path) -> Result<(), PluginError> {
 
 fn update_settings_json(
     path: &Path,
-    mut update: impl FnMut(&mut Map<String, Value>),
+    mut update: impl FnMut(&mut Map<String, Value>) -> Result<(), PluginError>,
 ) -> Result<(), PluginError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -2280,18 +2295,24 @@ fn update_settings_json(
             path.display()
         ))
     })?;
-    update(object);
+    update(object)?;
     fs::write(path, serde_json::to_string_pretty(&root)?)?;
     Ok(())
 }
 
-fn ensure_object<'a>(root: &'a mut Map<String, Value>, key: &str) -> &'a mut Map<String, Value> {
-    if !root.get(key).is_some_and(Value::is_object) {
-        root.insert(key.to_string(), Value::Object(Map::new()));
+fn ensure_object<'a>(
+    root: &'a mut Map<String, Value>,
+    key: &str,
+) -> Result<&'a mut Map<String, Value>, PluginError> {
+    let value = root
+        .entry(key.to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !value.is_object() {
+        *value = Value::Object(Map::new());
     }
-    root.get_mut(key)
-        .and_then(Value::as_object_mut)
-        .expect("object should exist")
+    value
+        .as_object_mut()
+        .ok_or_else(|| PluginError::InvalidManifest(format!("`{key}` must be a JSON object")))
 }
 
 /// Environment variable lock for test isolation.
@@ -2312,6 +2333,30 @@ mod tests {
             .expect("time should be after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("plugins-{label}-{nanos}"))
+    }
+
+    #[test]
+    fn unix_duration_rejects_clock_before_epoch() {
+        let before_epoch = UNIX_EPOCH
+            .checked_sub(Duration::from_secs(1))
+            .expect("system time supports pre-epoch values");
+
+        assert!(matches!(
+            unix_duration(before_epoch),
+            Err(PluginError::ClockBeforeUnixEpoch)
+        ));
+    }
+
+    #[test]
+    fn ensure_object_replaces_scalar_value() {
+        let mut root = Map::new();
+        root.insert("enabledPlugins".to_string(), Value::Bool(true));
+
+        ensure_object(&mut root, "enabledPlugins")
+            .expect("scalar must be replaced with an object")
+            .insert("demo@external".to_string(), Value::Bool(true));
+
+        assert_eq!(root["enabledPlugins"]["demo@external"], Value::Bool(true));
     }
 
     fn write_file(path: &Path, contents: &str) {

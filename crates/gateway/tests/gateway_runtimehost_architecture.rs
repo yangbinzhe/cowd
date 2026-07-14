@@ -1,7 +1,83 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
 use std::path::PathBuf;
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+#[test]
+fn mission_entries_do_not_own_execution() {
+    let mission_service_source = read_repo("crates/gateway/src/services/mission_service.rs");
+    let mission_service = production_part(&mission_service_source);
+    for forbidden in [
+        "global_team_runtime_service().cancel(",
+        "global_team_runtime_service().handoff(",
+        ".finalize_execution_summary(",
+        ".tick_all_once(",
+    ] {
+        assert!(
+            !mission_service.contains(forbidden),
+            "MissionService must not execute through scoped globals: {forbidden}"
+        );
+    }
+    assert!(mission_service.contains(".cancel_team("));
+    assert!(!mission_service.contains("global_agent_lifecycle_service().command("));
+    assert!(mission_service.contains("MissionRuntimePort"));
+    for forbidden in [
+        "RuntimeServices",
+        ".graph_runner()",
+        ".team_runtime()",
+        ".mission_runtime()",
+        ".approval_queue()",
+        ".session_relations()",
+    ] {
+        assert!(
+            !mission_service.contains(forbidden),
+            "MissionService must consume Runtime Mission queries/commands through its port: {forbidden}"
+        );
+    }
+
+    let mission_control_source = read_repo("crates/runtime/src/mission/mission_control.rs");
+    let mission_control = production_part(&mission_control_source);
+    assert!(!mission_control.contains("global_agent_lifecycle_service().command("));
+    assert!(!mission_control.contains("steward_runtime"));
+    assert!(mission_control.contains("crate::execute_mission_command"));
+    assert!(!mission_control.contains("mission_runtime().pause_session("));
+    assert!(!mission_control.contains("approval_queue().decide("));
+    assert!(!mission_control.contains("available_in\": \"V4\""));
+
+    let mission_routes_source = read_repo("crates/gateway/src/api_routes/mission_routes.rs");
+    let mission_routes = production_part(&mission_routes_source);
+    for retired in [
+        "teams/:team_id/handoff",
+        "teams/:team_id/synthesis",
+        "tasks/:task_id/outcome",
+        "tick_team_execution_handler",
+    ] {
+        assert!(
+            !mission_routes.contains(retired),
+            "Gateway must not expose a Mission team control without a Runtime execution path: {retired}"
+        );
+    }
+
+    let team_runtime_source = read_repo("crates/runtime/src/team/team_runtime.rs");
+    let team_runtime = production_part(&team_runtime_source);
+    for forbidden in [
+        "pub fn cancel(&self, team_id:",
+        "pub fn handoff(",
+        "pub fn finalize_execution_summary(",
+    ] {
+        assert!(
+            !team_runtime.contains(forbidden),
+            "scoped team globals must not expose execution owner API: {forbidden}"
+        );
+    }
 }
 
 fn read_repo(path: &str) -> String {
@@ -25,6 +101,43 @@ fn manifest_dependencies(source: &str) -> &str {
     source.split("[dev-dependencies]").next().unwrap_or(source)
 }
 
+fn production_rust_sources(roots: &[&str]) -> Vec<(String, String)> {
+    fn visit(root: &std::path::Path, files: &mut Vec<PathBuf>) {
+        let mut entries = std::fs::read_dir(root)
+            .unwrap_or_else(|error| panic!("{} should be readable: {error}", root.display()))
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                visit(&path, files);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                files.push(path);
+            }
+        }
+    }
+
+    let root = repo_root();
+    let mut files = Vec::new();
+    for relative in roots {
+        visit(&root.join(relative), &mut files);
+    }
+    files
+        .into_iter()
+        .map(|path| {
+            let relative = path
+                .strip_prefix(&root)
+                .expect("source must be inside repository")
+                .to_string_lossy()
+                .to_string();
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("{relative} should read: {error}"));
+            (relative, production_part(&source).to_string())
+        })
+        .collect()
+}
+
 #[test]
 fn removed_builtin_channel_document_operations_do_not_reappear() {
     let forbidden_terms = [
@@ -34,7 +147,7 @@ fn removed_builtin_channel_document_operations_do_not_reappear() {
         "doc_ops",
     ];
     let checked_files = [
-        "crates/surface/src/channel.rs",
+        "crates/surface/src/message.rs",
         "crates/connector/src/lib.rs",
         "crates/gateway/src/api_routes/mod.rs",
         "crates/gateway/src/runtime_host/mod.rs",
@@ -59,7 +172,7 @@ fn removed_builtin_channel_document_operations_do_not_reappear() {
 fn macro_crates_keep_source_files_grouped_by_business_boundary() {
     assert_root_rs_files("crates/gateway/src", &["main.rs"]);
     assert_root_rs_files("crates/tui/src", &["lib.rs"]);
-    assert_root_rs_files("crates/tools/src", &["lib.rs"]);
+    assert_root_rs_files("crates/tools/src", &["host.rs", "lib.rs"]);
     assert_root_rs_files("crates/matrix/core/src", &["lib.rs"]);
 
     for (root, dirs) in [
@@ -195,6 +308,54 @@ fn production_code_does_not_depend_on_daemon_module() {
 }
 
 #[test]
+fn production_turns_enter_the_execution_graph_host_once() {
+    let gateway_entry_source = read_repo("crates/gateway/src/runtime/runtime_entry.rs");
+    let gateway_service_source = read_repo("crates/gateway/src/runtime/runtime_service.rs");
+    let in_process_agent_source = read_repo("crates/runtime/src/agent/in_process_worker.rs");
+    let agent_source = read_repo("crates/runtime/src/agent/agent.rs");
+    let host_source = read_repo("crates/runtime/src/conversation/host.rs");
+    let gateway_entry = gateway_entry_source.as_str();
+    let gateway_service = production_part(&gateway_service_source);
+    let in_process_agent = production_part(&in_process_agent_source);
+    let agent = production_part(&agent_source);
+    let host = production_part(&host_source);
+
+    assert!(gateway_entry.contains(".submit_turn(content, prompter)"));
+    assert!(gateway_service.contains(".submit_turn(&content"));
+    assert!(in_process_agent.contains("submit_turn(&packet.objective"));
+    assert!(agent.contains("production implementations submit canonical AgentTask nodes"));
+    // The host registers the graph before running it so a reconnecting
+    // surface can attach to its durable cursor before provider work starts.
+    // That is the canonical execution path; `start(graph)` is only a
+    // convenience wrapper and must not be required by this architecture test.
+    assert!(host.contains("let registered = services"));
+    assert!(host.contains(".graph_runner()\n                .register(graph)"));
+    assert!(host.contains(".run_until_quiescent(&registered.id)"));
+    assert!(host.contains("ExecutionGraphCompiler"));
+    assert!(!host.contains("execute_model_tool_cycle"));
+
+    for (path, source) in [
+        ("gateway runtime entry", gateway_entry),
+        ("gateway runtime service", gateway_service),
+        ("in-process agent", in_process_agent),
+        ("generic agent", agent),
+    ] {
+        assert!(
+            !source.contains("execute_model_tool_cycle"),
+            "{path} must not bypass StandardRuntimeHost/ExecutionGraphRunner"
+        );
+        assert!(
+            !source.contains("run_turn_async"),
+            "{path} must not restore the removed turn loop entry"
+        );
+        assert!(
+            !source.contains("assistant_messages.last()"),
+            "{path} must consume the synthesized terminal result"
+        );
+    }
+}
+
+#[test]
 fn socket_business_commands_are_removed_after_tui_gateway_migration() {
     let source = production_part(&read_repo("crates/gateway/src/runtime_host/mod.rs")).to_string();
     for forbidden in [
@@ -224,18 +385,18 @@ fn socket_business_commands_are_removed_after_tui_gateway_migration() {
 }
 
 #[test]
-fn approval_api_uses_global_queue_for_decisions() {
+fn approval_api_uses_workspace_runtime_queue_for_decisions() {
     let full_source = read_repo("crates/gateway/src/services/approval_service.rs");
     let source = production_part(&full_source);
-    assert!(
-        source.contains("runtime::global_approval_queue().pending()"),
-        "approval pending API must read the unified GlobalApprovalQueue"
-    );
-    assert!(
-        source.contains("runtime::global_approval_queue().decide("),
-        "approval respond API must decide through the unified GlobalApprovalQueue"
-    );
-    for forbidden in ["get_pending_requests", "resolve_approval"] {
+    assert!(source.contains("runtime_services"));
+    assert!(source.contains("approval_queue()"));
+    assert!(source.contains(".pending()"));
+    assert!(source.contains(".decide("));
+    for forbidden in [
+        "get_pending_requests",
+        "resolve_approval",
+        "runtime::global_",
+    ] {
         assert!(
             !source.contains(forbidden),
             "ApprovalService must not use SmartApprovalGate {forbidden} as a production decision path"
@@ -286,7 +447,6 @@ fn ai_kernel_is_pure_semantic_crate() {
         "ai-strategy",
         "ai-tool-transaction",
         "ai-verification",
-        "ai-workgraph",
     ];
     let workspace_manifest = read_repo("Cargo.toml");
     for absorbed in absorbed_crates {
@@ -331,7 +491,7 @@ fn ai_kernel_is_pure_semantic_crate() {
         "pub mod strategy",
         "pub mod context",
         "pub mod agent",
-        "pub mod workgraph",
+        "pub mod execution_graph",
         "pub mod tool",
         "pub mod verification",
         "pub mod policy",
@@ -488,28 +648,34 @@ fn connector_is_independent_external_resource_boundary() {
 }
 
 #[test]
-fn channel_contracts_drive_gateway_surface_readiness() {
+fn message_connector_contracts_drive_gateway_surface_readiness() {
     assert!(
         !repo_root().join("crates/channel-adapters").exists(),
         "core workspace must not retain channel-adapters; non-TUI surfaces live in cowd-edge"
     );
     assert!(
         !repo_root().join("crates/channel").exists(),
-        "channel contracts are absorbed into surface::channel"
+        "legacy channel contracts are absorbed into surface::message"
     );
 
-    let channel_source = production_part(&read_repo("crates/surface/src/channel.rs")).to_string();
+    let message_source = production_part(&read_repo("crates/surface/src/message.rs")).to_string();
     for required in [
-        "pub struct ChannelContract",
-        "pub fn channel_required_fields",
-        "pub fn channel_transport_capabilities",
-        "pub fn normalize_channel",
+        "pub struct MessageConnectorContract",
+        "pub fn message_connector_required_fields",
+        "pub fn message_connector_capabilities",
+        "pub fn normalize_message_connector",
     ] {
         assert!(
-            channel_source.contains(required),
-            "channel contract missing {required}"
+            message_source.contains(required),
+            "message connector contract missing {required}"
         );
     }
+    assert!(
+        !repo_root()
+            .join(["crates/surface/src/", "channel.rs"].concat())
+            .exists(),
+        "legacy channel contract file must be deleted from production source"
+    );
 
     let gateway_manifest = read_repo("crates/gateway/Cargo.toml");
     assert!(
@@ -518,28 +684,29 @@ fn channel_contracts_drive_gateway_surface_readiness() {
     );
     assert!(
         !manifest_dependencies(&gateway_manifest).contains("channel = { path = \"../channel\" }"),
-        "gateway must consume channel contracts through surface::channel"
+        "gateway must consume message connector contracts through surface::message"
     );
     assert!(
         !manifest_dependencies(&gateway_manifest).contains("channel-adapters"),
         "gateway must not depend on channel-adapters; platform SDKs live in Cowd Edge sidecars"
     );
-    let channel_routes = production_part(&read_repo(
-        "crates/gateway/src/api_routes/channel_routes.rs",
+    let message_connector_routes = production_part(&read_repo(
+        "crates/gateway/src/api_routes/message_connector_routes.rs",
     ))
     .to_string();
     assert!(
-        channel_routes
-            .contains("use surface::channel::{channel_required_fields, ChannelContract};"),
-        "gateway channel routes must consume channel contract"
+        message_connector_routes.contains(
+            "use surface::message::{message_connector_required_fields, MessageConnectorContract};"
+        ),
+        "gateway message readiness routes must consume message connector contract"
     );
     assert!(
-        !channel_routes.contains("fn platform_capabilities"),
+        !message_connector_routes.contains("fn platform_capabilities"),
         "gateway must not own a duplicate platform capability table"
     );
     assert!(
-        !channel_source.contains("feishu_document_operation"),
-        "channel contract must not expose Feishu document operations as built-in channel capability"
+        !message_source.contains("feishu_document_operation"),
+        "message connector contract must not expose Feishu document operations as built-in capability"
     );
 
     let gateway_services_source = read_repo("crates/gateway/src/services/mod.rs");
@@ -568,7 +735,7 @@ fn channel_contracts_drive_gateway_surface_readiness() {
         "crates/gateway/src/main.rs",
         "crates/gateway/src/api_routes/mod.rs",
         "crates/gateway/src/runtime_host/mod.rs",
-        "crates/gateway/src/api_routes/channel_routes.rs",
+        "crates/gateway/src/api_routes/message_connector_routes.rs",
         "crates/gateway/src/api_routes/cross_plane_routes.rs",
         "crates/gateway/src/entry/workspace_entry.rs",
     ] {
@@ -584,8 +751,7 @@ fn channel_contracts_drive_gateway_surface_readiness() {
     }
 
     for source_path in [
-        "crates/gateway/src/api_routes/channel_routes.rs",
-        "crates/gateway/src/api_routes/cross_plane_routes.rs",
+        "crates/gateway/src/api_routes/message_connector_routes.rs",
         "crates/gateway/src/api_routes/mfg_routes.rs",
         "crates/gateway/src/infrastructure/gateway_health.rs",
     ] {
@@ -813,15 +979,17 @@ fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
     let task_service =
         production_part(&read_repo("crates/gateway/src/services/task_service.rs")).to_string();
     assert!(
-        task_service.contains("pub(crate) async fn append_runtime_event")
-            && task_service.contains("ensure_task_session_record"),
-        "task service must own task lifecycle runtime-event projection"
+        task_service.contains("pub(crate) fn record_lifecycle_event")
+            && task_service.contains("runtime::TaskLifecycleEvent")
+            && task_service.contains(".record_task_lifecycle(")
+            && !task_service.contains("ensure_task_session_record"),
+        "task service must write lifecycle state through the Runtime-owned writer without fake sessions"
     );
     let task_routes =
         production_part(&read_repo("crates/gateway/src/api_routes/task_routes.rs")).to_string();
     assert!(
         !task_routes.contains("async fn append_task_runtime_event")
-            && task_routes.contains(".append_runtime_event(&state.services.session"),
+            && task_routes.contains(".record_lifecycle_event(&task,"),
         "task routes must delegate lifecycle projection to TaskService"
     );
     let context_routes = production_part(&read_repo(
@@ -1143,7 +1311,6 @@ fn runtime_uses_ai_kernel_as_harness_semantic_entrypoint() {
         "ai-strategy",
         "ai-tool-transaction",
         "ai-verification",
-        "ai-workgraph",
     ] {
         assert!(
             !dependencies.contains(forbidden),
@@ -1188,10 +1355,11 @@ fn entry_boundary_crates_exist_as_migration_targets() {
         "cli must keep TUI as a full-build-only optional surface dependency"
     );
     assert!(
-        cli_main.contains("open_tui_or_exit()")
+        cli_main.contains("open_tui()")
             && cli_main.contains("#[cfg(feature = \"tui-surface\")]")
-            && cli_main.contains("tui::terminal_entry()"),
-        "cli launcher must route TUI usage through the feature-gated TUI surface entry"
+            && cli_main.contains("match tui::terminal_entry()")
+            && cli_main.contains("std::process::ExitCode::FAILURE"),
+        "cli launcher must route TUI usage through the feature-gated TUI surface entry and preserve its failure status"
     );
     assert!(
         cli_main.contains("TUI surface is not built in this binary"),
@@ -1369,14 +1537,30 @@ fn tui_surface_projection_uses_gateway_surface_api_without_platform_channel_temp
         "pub async fn surface_health_check",
         "pub async fn surface_repair",
         "pub async fn surface_events",
+        "pub async fn surface_messages",
+        "pub async fn surface_archive_messages",
+        "pub async fn surface_purge_archived_events",
         "pub async fn surface_send",
         "pub async fn surface_action",
         "/api/surfaces",
         "/api/surfaces/{}/status",
         "/api/surfaces/{}/health-check",
         "/api/surfaces/{}/repair",
+        "/api/surfaces/{}/messages",
+        "/api/surfaces/{}/messages/archive",
+        "/api/surfaces/{}/messages/purge-archived-events",
         "/api/surfaces/{}/send",
         "/api/surfaces/{}/action",
+        "pub async fn message_connectors",
+        "pub async fn message_connector_status",
+        "pub async fn message_connector_repair",
+        "pub async fn message_endpoints",
+        "pub async fn message_routes",
+        "pub async fn message_bindings",
+        "/api/message-connectors",
+        "/api/message-endpoints",
+        "/api/message-routes",
+        "/api/message-bindings",
     ] {
         assert!(
             gateway_client.contains(required),
@@ -1405,6 +1589,45 @@ fn tui_surface_projection_uses_gateway_surface_api_without_platform_channel_temp
             );
         }
     }
+
+    let runtime_store = production_part(&read_repo(
+        "crates/tui/src/app_core/runtime_control_store.rs",
+    ))
+    .to_string();
+    for required in [
+        "pub struct MessageConnectorSummary",
+        "pub struct MessageEndpointSummary",
+        "pub struct MessageRouteSummary",
+        "pub struct MessageBindingSummary",
+        "ingest_message_connectors",
+        "ingest_message_endpoints",
+        "ingest_message_routes",
+        "ingest_message_bindings",
+        "projection.message_connectors()",
+        "projection.message_endpoints()",
+        "projection.message_routes()",
+        "projection.message_bindings()",
+    ] {
+        assert!(
+            runtime_store.contains(required),
+            "TUI runtime control store must consume Message Plane `{required}`"
+        );
+    }
+
+    let gateway_panel =
+        production_part(&read_repo("crates/tui/src/components/gateway_panel.rs")).to_string();
+    let surface_panel =
+        production_part(&read_repo("crates/tui/src/components/surface_panel.rs")).to_string();
+    assert!(
+        gateway_panel.contains("Message Plane")
+            && gateway_panel.contains("message_connectors")
+            && surface_panel.contains("Message Plane")
+            && surface_panel.contains("message_connectors")
+            && surface_panel.contains("g ledger")
+            && surface_panel.contains("A archive")
+            && surface_panel.contains("P purge"),
+        "TUI Gateway and Surface panels must display Message Plane and Surface ledger state"
+    );
 }
 
 #[test]
@@ -1423,7 +1646,7 @@ fn surface_is_gateway_owned_and_runtime_host_uses_runtime_service_turns() {
         !gateway_dependencies.contains("channel = { path = \"../channel\" }")
             && gateway_dependencies.contains("surface = { path = \"../surface\" }")
             && !gateway_dependencies.contains("channel-adapters = "),
-        "gateway must consume surface::channel contracts and Edge sidecar protocol without adapter SDK coupling"
+        "gateway must consume surface::message contracts and Edge sidecar protocol without adapter SDK coupling"
     );
 
     let runtime_host =
@@ -1439,8 +1662,9 @@ fn surface_is_gateway_owned_and_runtime_host_uses_runtime_service_turns() {
     assert!(
         (runtime_host.contains("GatewayServices::new(")
             || runtime_host.contains("GatewayServices::new_with_config_home("))
-            && runtime_host.contains("Arc::new(RuntimeService::new("),
-        "runtime host must register RuntimeService through GatewayServices"
+            && runtime_host.contains("RuntimeService::new(")
+            && runtime_host.contains(".with_approval_gate("),
+        "runtime host must register an approval-wired RuntimeService through GatewayServices"
     );
     assert!(
         !runtime_host.contains("PlatformRuntime"),
@@ -1457,6 +1681,32 @@ fn surface_is_gateway_owned_and_runtime_host_uses_runtime_service_turns() {
 }
 
 #[test]
+fn cross_plane_state_and_execution_are_runtime_scoped() {
+    let gateway_service_source = read_repo("crates/gateway/src/services/cross_plane_service.rs");
+    let gateway_service = production_part(&gateway_service_source);
+    let gateway_routes_source = read_repo("crates/gateway/src/api_routes/cross_plane_routes.rs");
+    let gateway_routes = production_part(&gateway_routes_source);
+    let runtime_service_source =
+        read_repo("crates/runtime/src/execution_core/cross_plane/service.rs");
+    let runtime_service = production_part(&runtime_service_source);
+    for forbidden in [
+        "CROSS_PLANE_CONTROL",
+        "CROSS_PLANE_LOADED",
+        "control-state.json",
+        "save_to_path",
+        "load_from_path",
+    ] {
+        assert!(!gateway_service.contains(forbidden));
+        assert!(!runtime_service.contains(forbidden));
+    }
+    assert!(gateway_service.contains("runtime_services.cross_plane()"));
+    assert!(runtime_service.contains("RuntimeEventScope::CrossPlane"));
+    assert!(runtime_service.contains("compile_commit_graph"));
+    assert!(!gateway_routes.contains("dispatch_ready_target"));
+    assert!(!gateway_routes.contains("services.surface.send"));
+}
+
+#[test]
 fn production_gateway_entry_does_not_run_ai_turns_directly() {
     let main_source = read_repo("crates/gateway/src/main.rs");
     let production_main = production_part(&main_source);
@@ -1468,9 +1718,9 @@ fn production_gateway_entry_does_not_run_ai_turns_directly() {
     let runtime_service_source = read_repo("crates/gateway/src/runtime/runtime_service.rs");
     let runtime_service = production_part(&runtime_service_source);
     assert!(
-        runtime_service.contains("run_turn_with_timeout")
-            && runtime_service.contains(".run_turn_async("),
-        "RuntimeService is the gateway-owned boundary allowed to call the runtime turn engine"
+        runtime_service.contains(".submit_turn(&content")
+            && !runtime_service.contains(".run_turn_async("),
+        "RuntimeService must submit through StandardRuntimeHost and the canonical graph runner"
     );
 }
 
@@ -1517,7 +1767,7 @@ fn gateway_runtime_factory_owns_runtime_assembly_without_legacy_direct_ai_shell(
         runtime_factory.contains("pub(crate) fn create_runtime_entry(")
             && runtime_factory.contains("pub(crate) fn create_runtime_entry_with_session_store(")
             && runtime_factory.contains("runtime::StandardRuntimeHost::new")
-            && runtime_factory.contains("GatewayToolExecutor::new")
+            && runtime_factory.contains("GatewayToolExecutor::from_tool_host")
             && !runtime_factory.contains("ProviderRuntimeClient")
             && !runtime_factory.contains("ConversationRuntime::new"),
         "runtime_factory must delegate provider/conversation assembly to runtime::StandardRuntimeHost"
@@ -1544,9 +1794,276 @@ fn gateway_runtime_factory_owns_runtime_assembly_without_legacy_direct_ai_shell(
 }
 
 #[test]
+fn v3_removed_execution_owners_cannot_reappear_in_production() {
+    let sources = production_rust_sources(&[
+        "crates/runtime/src",
+        "crates/gateway/src",
+        "crates/harness-contract/src",
+        "crates/app-mfg/src",
+    ]);
+    let forbidden = [
+        ("WorkGraph", "legacy work graph contract"),
+        ("AgentWorkGraph", "legacy agent work graph"),
+        ("AgentRunGraph", "legacy agent run graph"),
+        ("workgraph::", "legacy workgraph module"),
+        ("agent_workgraph", "legacy agent workgraph module"),
+        ("run_turn_async(", "graph-bypassing turn loop"),
+        (
+            "assistant_messages.last()",
+            "transcript-tail result inference",
+        ),
+        ("TeamExecutionLoop::tick_ready", "second team scheduler"),
+        ("blocked_missing_executor", "late missing-executor fallback"),
+        ("agent.waiting_executor", "fake waiting executor state"),
+        (
+            "SessionExecutionPlane",
+            "graph-external session execution owner",
+        ),
+        (
+            "materialize_session_input_decision",
+            "gateway session materializer",
+        ),
+        ("CROSS_PLANE_CONTROL", "gateway cross-plane state singleton"),
+        ("CROSS_PLANE_LOADED", "gateway cross-plane load singleton"),
+        ("control-state.json", "cross-plane JSON truth source"),
+        ("global_runtime_event_store", "global runtime event store"),
+        ("global_approval_queue", "global approval truth source"),
+        ("global_conflict_arbiter", "global conflict truth source"),
+        (
+            "global_runtime_control_plane",
+            "global runtime control plane",
+        ),
+        ("global_task_registry", "global task registry"),
+    ];
+
+    for (path, source) in &sources {
+        if path.ends_with("/recovery/source_self_audit.rs") {
+            continue;
+        }
+        for (needle, owner) in forbidden {
+            assert!(
+                !source.contains(needle),
+                "{path} must not restore {owner}: `{needle}`"
+            );
+        }
+    }
+
+    assert!(
+        !repo_root().join("crates/runtime/src/persistence").exists(),
+        "dead runtime persistence facade must be deleted"
+    );
+    assert!(
+        !repo_root()
+            .join("crates/runtime/src/orchestration/executor.rs")
+            .exists(),
+        "orchestration must compile commands for the canonical Runner, not own an executor"
+    );
+}
+
+#[test]
+fn v3_turn_call_trace_has_one_compiler_runner_and_commit_owner() {
+    let gateway_service = read_repo("crates/gateway/src/runtime/runtime_service.rs");
+    let gateway_entry = read_repo("crates/gateway/src/runtime/runtime_entry.rs");
+    let host = read_repo("crates/runtime/src/conversation/host.rs");
+    let runner = read_repo("crates/runtime/src/execution_core/graph/runner.rs");
+    let commit = read_repo("crates/runtime/src/execution_core/graph/commit_service.rs");
+
+    assert!(production_part(&gateway_service).contains(".submit_turn(&content"));
+    assert!(gateway_entry.contains("self.runtime_mut().submit_turn"));
+    assert!(production_part(&host).contains("ExecutionGraphCompiler"));
+    assert!(production_part(&host).contains(".graph_runner()\n                .register(graph)"));
+    assert!(production_part(&host).contains(".run_until_quiescent(&registered.id)"));
+    assert!(production_part(&runner).contains("self.commit_service.register_graph_async(graph)"));
+    assert!(production_part(&runner).contains("bind_and_start_node_async"));
+    assert!(production_part(&commit).contains("append_transaction"));
+}
+
+#[test]
+fn v3_runtime_services_are_scoped_and_executors_are_fixed_at_assembly() {
+    let services = read_repo("crates/runtime/src/execution_core/services.rs");
+    let host = read_repo("crates/runtime/src/conversation/host.rs");
+    let services = production_part(&services);
+    let host = production_part(&host);
+
+    for required in [
+        "pub struct RuntimeServices",
+        "pub fn builder(",
+        "pub fn in_memory()",
+        "workspace_key",
+        "event_store: Arc<RuntimeEventStore>",
+        "executor_registry: Arc<NodeExecutorRegistry>",
+        "graph_runner: Arc<ExecutionGraphRunner>",
+        "resource_manager: Arc<ExecutionResourceManager>",
+        "scope_locks: Arc<ScopeLockManager>",
+        "worktree_leases: Arc<WorktreeLeaseManager>",
+    ] {
+        assert!(
+            services.contains(required),
+            "RuntimeServices missing `{required}`"
+        );
+    }
+
+    assert!(
+        services.contains("register_builtin_executors")
+            || services.contains("install_builtin_executors"),
+        "RuntimeServices assembly must install the fixed canonical executor set"
+    );
+    assert!(
+        !host.contains("executor_registry().register(")
+            && !host.contains("executor_registry().unregister("),
+        "turn execution must not mutate the shared executor registry per request"
+    );
+
+    for (path, source) in production_rust_sources(&["crates/runtime/src", "crates/gateway/src"]) {
+        if path == "crates/runtime/src/execution_core/services.rs" {
+            continue;
+        }
+        assert!(
+            !source.contains("executor_registry().register(")
+                && !source.contains("executor_registry().unregister(")
+                && !source.contains(".unregister(&executor_kind)"),
+            "{path} must bind graph-scoped backends instead of mutating the executor registry"
+        );
+    }
+
+    let cross_plane = read_repo("crates/gateway/src/services/cross_plane_service.rs");
+    let cross_plane = production_part(&cross_plane);
+    assert!(cross_plane.contains("cross_plane_connector_executor()"));
+    assert!(cross_plane.contains(".install_resolver("));
+    assert!(!cross_plane.contains(".bind(") && !cross_plane.contains(".unbind("));
+    assert!(!cross_plane.contains("executor_registry()"));
+}
+
+#[test]
+fn v3_bidirectional_outboxes_have_started_production_pumps() {
+    let services = read_repo("crates/runtime/src/execution_core/services.rs");
+    let ingress_bridge = read_repo("crates/runtime/src/session/session_execution.rs");
+    let delivery_bridge = read_repo("crates/gateway/src/runtime/session_runtime_bridge.rs");
+    let gateway_host = read_repo("crates/gateway/src/runtime_host/mod.rs");
+    let services = production_part(&services);
+    let ingress_bridge = production_part(&ingress_bridge);
+    let delivery_bridge = production_part(&delivery_bridge);
+    let gateway_host = production_part(&gateway_host);
+
+    assert!(ingress_bridge.contains("claim_session_runtime_outbox"));
+    assert!(ingress_bridge.contains("ack_session_runtime_outbox"));
+    assert!(delivery_bridge.contains("SessionTerminalDeliveryPort"));
+    assert!(delivery_bridge.contains("claim_store.claim("));
+    assert!(delivery_bridge.contains("event_store.acknowledge("));
+    assert!(
+        services.contains("SessionRuntimeBridge") || services.contains("SessionInputRouter"),
+        "workspace RuntimeServices must own the durable session bridge"
+    );
+    assert!(
+        gateway_host.contains("SessionRuntimeBridge::start("),
+        "Gateway startup must start the bidirectional outbox pump; request-path polling is insufficient"
+    );
+}
+
+#[test]
+fn v3_gateway_startup_recovers_persistent_execution_graphs() {
+    let gateway_host = read_repo("crates/gateway/src/runtime_host/mod.rs");
+    let services = read_repo("crates/runtime/src/execution_core/services.rs");
+    let state_store = read_repo("crates/runtime/src/execution_core/graph/state_store.rs");
+    let gateway_host = production_part(&gateway_host);
+    let services = production_part(&services);
+    let state_store = production_part(&state_store);
+
+    assert!(
+        gateway_host.contains(".recover_execution_graphs_on_startup()"),
+        "Gateway startup must invoke runtime-owned startup recovery after executor resolvers are installed"
+    );
+    assert!(
+        gateway_host.contains("emit_execution_startup_recovery"),
+        "Gateway startup must emit structured recovery diagnostics"
+    );
+    assert!(
+        services.contains("pub async fn recover_execution_graphs_on_startup"),
+        "RuntimeServices must own the startup recovery coordinator"
+    );
+    assert!(
+        services.contains("ExecutionGraphRecovery::new"),
+        "RuntimeServices recovery must reuse the canonical graph recovery service"
+    );
+    assert!(
+        services.contains("self.graph_runner.run_until_quiescent"),
+        "RuntimeServices recovery must continue ready/planned graphs through the canonical runner"
+    );
+    assert!(
+        state_store.contains("pub fn nonterminal_graph_ids"),
+        "ExecutionGraphStateStore must enumerate persisted nonterminal graphs without Gateway SQL"
+    );
+}
+
+#[test]
+fn v3_approval_and_turn_boundaries_have_no_gateway_dual_write_state() {
+    let approval = read_repo("crates/gateway/src/services/approval_service.rs");
+    let commit = read_repo("crates/runtime/src/execution_core/graph/commit_service.rs");
+    let routes = production_rust_sources(&["crates/gateway/src/api_routes"]);
+
+    assert!(!approval.contains("reconcile_graph_decisions"));
+    assert!(commit.contains("ExecutionGraphCommand::SubmitApproval"));
+    assert!(commit.contains("\"approval.decided\""));
+    assert!(commit.contains("append_transaction(request)"));
+
+    for (path, source) in routes {
+        for forbidden in [
+            "ACTIVE_TURN_CONTROLS",
+            "ACTIVE_TURN_PARTIALS",
+            "register_active_turn_control",
+            "take_active_turn_partial",
+            "append_session_timeline_event",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{path} must not restore dead turn state or direct timeline writes: `{forbidden}`"
+            );
+        }
+    }
+}
+
+#[test]
+fn v3_executor_binding_is_committed_before_running_state() {
+    let runner = read_repo("crates/runtime/src/execution_core/graph/runner.rs");
+    let commit = read_repo("crates/runtime/src/execution_core/graph/commit_service.rs");
+    let runner = production_part(&runner);
+    let commit = production_part(&commit);
+    let ready_wave = source_between(
+        runner,
+        "async fn start_and_execute_node(",
+        "async fn acquire_node_resources(",
+    );
+
+    let start = ready_wave
+        .find("let ticket = executor")
+        .expect("executor must return a durable ticket before Running");
+    let bind = ready_wave
+        .find("bind_and_start_node_async")
+        .expect("Runner must atomically bind and start a node");
+    assert!(
+        start < bind,
+        "executor ticket/binding must exist before Running commit"
+    );
+    assert!(
+        !ready_wave[..bind].contains("ExecutionNodeStatus::Running"),
+        "Runner must not persist Running before executor binding"
+    );
+
+    let bind_commit = source_between(
+        commit,
+        "pub fn bind_and_start_node(",
+        "pub async fn bind_and_start_node_async",
+    );
+    assert!(bind_commit.contains("binding: Some(binding)"));
+    assert!(bind_commit.contains("ExecutionNodeStatus::Running"));
+    assert!(bind_commit.contains("append_graph_event("));
+}
+
+#[test]
 fn runtime_source_self_audit_is_exposed_through_gateway_api() {
     let runtime_lib = read_repo("crates/runtime/src/lib.rs");
     let runtime_audit = read_repo("crates/runtime/src/recovery/source_self_audit.rs");
+    let old_route_file = ["channel", "_routes.rs"].concat();
     let runtime_routes = production_part(&read_repo(
         "crates/gateway/src/api_routes/runtime_routes.rs",
     ))
@@ -1558,7 +2075,9 @@ fn runtime_source_self_audit_is_exposed_through_gateway_api() {
             && runtime_audit.contains("runtime.no_surface_sdk_dependency")
             && runtime_audit.contains("gateway.owns_surface_boundary")
             && runtime_audit.contains("gateway.runtime_host_uses_runtime_service")
-            && runtime_audit.contains("harness_eval.repair_hints"),
+            && runtime_audit.contains("harness_eval.repair_hints")
+            && runtime_audit.contains("message_connector_routes.rs")
+            && !runtime_audit.contains(&old_route_file),
         "runtime must expose source-aware self audit checks with repair hints"
     );
     assert!(
@@ -1566,6 +2085,226 @@ fn runtime_source_self_audit_is_exposed_through_gateway_api() {
             && runtime_routes.contains("/api/runtime/source-repair-plan")
             && runtime_routes.contains("RuntimeSourceSelfAudit::audit_repo"),
         "Gateway must expose runtime source audit and repair plan APIs"
+    );
+}
+
+#[test]
+fn context_envelope_projection_is_exposed_to_reality_and_surfaces() {
+    let memory_routes =
+        production_part(&read_repo("crates/gateway/src/api_routes/memory_routes.rs")).to_string();
+    let reality_service =
+        production_part(&read_repo("crates/gateway/src/services/reality_service.rs")).to_string();
+    let context_history = production_part(&read_repo(
+        "crates/gateway/src/services/context_service/history.rs",
+    ))
+    .to_string();
+    let tui_gateway_panel =
+        production_part(&read_repo("crates/tui/src/components/gateway_panel.rs")).to_string();
+    let tui_runtime_store = production_part(&read_repo(
+        "crates/tui/src/app_core/runtime_control_store.rs",
+    ))
+    .to_string();
+    let edge_root = repo_root().join("../cowd-edge");
+    let webui_client = std::fs::read_to_string(edge_root.join("surfaces/webui/src/api/client.ts"))
+        .expect("webui client should read");
+    let webui_memory =
+        std::fs::read_to_string(edge_root.join("surfaces/webui/src/pages/MemoryPage.vue"))
+            .expect("webui memory page should read");
+    let webui_reality =
+        std::fs::read_to_string(edge_root.join("surfaces/webui/src/pages/RealityCorePage.vue"))
+            .expect("webui reality page should read");
+
+    assert!(
+        memory_routes.contains("/api/memory/context-envelope")
+            && memory_routes.contains("/api/memory/context-envelope/:session_id")
+            && memory_routes.contains("memory_context_envelope_projection_value")
+            && memory_routes.contains("context_envelope_capability_from_projection"),
+        "memory routes must expose real ContextEnvelope projection APIs and capability status"
+    );
+    assert!(
+        context_history.contains("context_envelope_projection(")
+            && context_history.contains("stored_events_by_type_page")
+            && context_history.contains("\"ContextEnvelope\"")
+            && context_history.contains("memory.context_envelope_projection")
+            && context_history.contains("compression_status")
+            && context_history.contains("recall_quality_status"),
+        "ContextService must derive ContextEnvelope projection from persisted session events"
+    );
+    let stale_context_envelope_fallback = [
+        "ContextEnvelope status is not exposed by ",
+        "memory projection",
+    ]
+    .concat();
+    assert!(
+        reality_service.contains("\"context_runtime\"")
+            && reality_service.contains("context_runtime_projection")
+            && reality_service.contains("inject_context_envelope_projection")
+            && !reality_service.contains(&stale_context_envelope_fallback),
+        "Reality status must consume ContextEnvelope projection instead of a stale fallback"
+    );
+    assert!(
+        tui_gateway_panel.contains("ContextEnvelope:")
+            && tui_runtime_store.contains("context_envelope_projection")
+            && tui_runtime_store.contains("memory_context_envelope_used_ratio"),
+        "TUI Gateway status panel must render ContextEnvelope runtime projection from Gateway status"
+    );
+    assert!(
+        webui_client.contains("memoryContextEnvelope")
+            && webui_client.contains("/api/memory/context-envelope")
+            && webui_memory.contains("data-section=\"context-envelope\"")
+            && webui_reality.contains("data-section=\"context-runtime\""),
+        "WebUI must consume and render ContextEnvelope and Reality context-runtime sections"
+    );
+}
+
+#[test]
+fn knowledge_governance_projection_is_exposed_to_reality_and_webui() {
+    let memory_routes =
+        production_part(&read_repo("crates/gateway/src/api_routes/memory_routes.rs")).to_string();
+    let memory_service =
+        production_part(&read_repo("crates/gateway/src/services/memory_service.rs")).to_string();
+    let reality_service =
+        production_part(&read_repo("crates/gateway/src/services/reality_service.rs")).to_string();
+    let runtime_activation = read_repo("crates/runtime/src/context/knowledge_activation.rs");
+    let memory_knowledge =
+        production_part(&read_repo("crates/memory/src/knowledge/mod.rs")).to_string();
+    let edge_root = repo_root().join("../cowd-edge");
+    let webui_memory =
+        std::fs::read_to_string(edge_root.join("surfaces/webui/src/pages/MemoryPage.vue"))
+            .expect("webui memory page should read");
+    let webui_reality =
+        std::fs::read_to_string(edge_root.join("surfaces/webui/src/pages/RealityCorePage.vue"))
+            .expect("webui reality page should read");
+    let webui_client = std::fs::read_to_string(edge_root.join("surfaces/webui/src/api/client.ts"))
+        .expect("webui client should read");
+
+    for route in [
+        "/api/memory/knowledge",
+        "/api/memory/knowledge/namespaces",
+        "/api/memory/knowledge/conflicts",
+        "/api/memory/knowledge/maintenance",
+    ] {
+        assert!(
+            memory_routes.contains(route),
+            "memory knowledge governance route `{route}` must be exposed"
+        );
+    }
+    for field in [
+        "namespace_tree",
+        "activation_policy_distribution",
+        "governance_distribution",
+        "conflict_projection",
+        "maintenance_candidates",
+        "recall_quality",
+    ] {
+        assert!(
+            memory_knowledge.contains(field),
+            "KnowledgeFabric projection missing `{field}`"
+        );
+    }
+    assert!(
+        memory_service.contains("knowledge_projection"),
+        "MemoryService must expose knowledge_projection"
+    );
+    assert!(
+        reality_service.contains("recall_quality"),
+        "RealityService must surface knowledge recall quality"
+    );
+    assert!(
+        runtime_activation.contains("Knowledge pointer only")
+            && runtime_activation.contains("is_generic_knowledge_relevance_term"),
+        "Runtime knowledge activation must keep low relevance knowledge pointer-only"
+    );
+    assert!(
+        webui_client.contains("memoryKnowledgeNamespaces")
+            && webui_client.contains("memoryKnowledgeConflicts")
+            && webui_client.contains("memoryKnowledgeMaintenance")
+            && webui_memory.contains("data-section=\"knowledge-governance\"")
+            && webui_reality.contains("knowledgeRecallQuality"),
+        "WebUI must consume knowledge governance APIs and render Memory/Reality projections"
+    );
+}
+
+#[test]
+fn source_connector_realtime_watermark_is_wired_to_matrix_and_webui() {
+    let connector_routes = read_repo("crates/gateway/src/api_routes/connector_routes.rs");
+    let surface_service = read_repo("crates/gateway/src/services/surface_service.rs");
+    let matrix_service = read_repo("crates/gateway/src/services/matrix_service.rs");
+    let connector_source = read_repo("crates/connector/src/source.rs");
+    let edge_root = std::path::Path::new("/media/yi/Datas/workspace/cowd-edge");
+    let edge_sidecar =
+        std::fs::read_to_string(edge_root.join("crates/edge-adapters/src/source_sidecar.rs"))
+            .expect("edge source sidecar should read");
+    let edge_db = std::fs::read_to_string(edge_root.join("crates/edge-adapters/src/source_db.rs"))
+        .expect("edge source db should read");
+    let webui_client = std::fs::read_to_string(edge_root.join("surfaces/webui/src/api/client.ts"))
+        .expect("webui client should read");
+    let gateway_page =
+        std::fs::read_to_string(edge_root.join("surfaces/webui/src/pages/GatewayPage.vue"))
+            .expect("gateway page should read");
+
+    for route in [
+        "/api/connectors/sources/:adapter_id/state",
+        "/api/connectors/sources/:adapter_id/run-incremental",
+        "/api/connectors/sources/:adapter_id/poll-events",
+        "/api/connectors/sources/:adapter_id/commit-watermark",
+    ] {
+        assert!(
+            connector_routes.contains(route),
+            "connector source route `{route}` must be exposed"
+        );
+    }
+    for dto in [
+        "SourceWatermark",
+        "SourceIncrementalRunRequest",
+        "SourceIncrementalRunResult",
+        "SourceEventBatch",
+        "SourceIngestionReceipt",
+        "SourceConnectorState",
+    ] {
+        assert!(
+            connector_source.contains(dto),
+            "connector source contract missing `{dto}`"
+        );
+    }
+    assert!(
+        surface_service.contains("source_incremental_run")
+            && surface_service.contains("source_event_poll")
+            && surface_service.contains("commit_source_watermark")
+            && surface_service.contains("\"source.incremental.run\""),
+        "SurfaceService must expose typed source action helpers"
+    );
+    assert!(
+        matrix_service.contains("ingest_source_record_batch")
+            && matrix_service.contains("SourceIngestionReceipt")
+            && matrix_service.contains("plan_data_plane_ingest"),
+        "MatrixService must turn source batches into source pack, snapshot, watermark, and receipt"
+    );
+    for action in [
+        "\"source.state\"",
+        "\"source.watermark.get\"",
+        "\"source.watermark.commit\"",
+        "\"source.incremental.run\"",
+        "\"source.event.poll\"",
+    ] {
+        assert!(
+            edge_sidecar.contains(action),
+            "edge source sidecar missing action {action}"
+        );
+    }
+    assert!(
+        edge_db.contains("updated_at_field")
+            && edge_db.contains("cursor_field")
+            && edge_db.contains("degraded_incremental_offset_only"),
+        "edge DB source must implement updated_at/cursor/offset incremental semantics"
+    );
+    assert!(
+        webui_client.contains("connectorSourceRunIncremental")
+            && webui_client.contains("connectorSourcePollEvents")
+            && gateway_page.contains("sourceRuntimeRows")
+            && gateway_page.contains("runEdgeSourceIncremental")
+            && gateway_page.contains("pollEdgeSourceEvents"),
+        "WebUI must manage source runtime state, watermark, incremental run, and event poll"
     );
 }
 
@@ -1587,7 +2326,7 @@ fn api_route_direct_dependencies_are_closed() {
         "api_routes/agent_routes.rs",
         "api_routes/approval_routes.rs",
         "api_routes/audit_routes.rs",
-        "api_routes/channel_routes.rs",
+        "api_routes/message_connector_routes.rs",
         "api_routes/connector_routes.rs",
         "api_routes/context_routes.rs",
         "api_routes/core_routes.rs",

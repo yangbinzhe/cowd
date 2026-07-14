@@ -1,3 +1,14 @@
+// Test assertions intentionally use unwrap/expect; normal library builds remain strict.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
+
 mod cached_client;
 mod client;
 mod error;
@@ -20,11 +31,16 @@ pub use model_protocol::prompt_cache::{
     CacheBreakEvent, PromptCache, PromptCacheConfig, PromptCachePaths, PromptCacheRecord,
     PromptCacheStats,
 };
+pub use model_protocol::provider_catalog::{
+    ProviderCatalog, ProviderCatalogInput, ProviderCatalogModel, ProviderCatalogProfile,
+    ProviderCatalogProvider, ProviderCatalogSource, ProviderCatalogTransform,
+};
 pub use providers::anthropic::{AnthropicClient, AnthropicClient as ApiClient, AuthSource};
-pub use providers::openai_compat::{OpenAiCompatClient, OpenAiCompatConfig};
+pub use providers::openai_compat::{OpenAiCompatClient, OpenAiCompatConfig, OpenAiWireProtocol};
 pub use providers::{
     detect_provider_kind, max_tokens_for_model, max_tokens_for_model_with_override,
-    model_context_window, model_context_window_with_overrides, ProviderKind,
+    model_context_window, model_context_window_resolution, model_context_window_with_overrides,
+    ModelContextWindowResolution, ModelContextWindowSource, ProviderKind,
 };
 pub use sse::{parse_frame, SseParser};
 pub use types::{

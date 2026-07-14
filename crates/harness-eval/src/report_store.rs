@@ -8,12 +8,18 @@ use serde_json::Value;
 
 use crate::{
     evaluate_report_gate,
+    real_provider_runner::run_deep_real_provider_review,
     report::{
         HarnessEvalReportDetail, HarnessEvalReportSummary, HarnessEvalRunRecord,
         HarnessEvalUsageSummary,
     },
-    StableAiHealthReport,
+    HarnessEvalRunnerOptions, StableAiHealthReport,
 };
+
+const FULL_ANALYSIS_REPORT_TEMPLATE: &str =
+    include_str!("../templates/full-analysis-report-template.md");
+const FULL_ANALYSIS_REPORT_PROMPT: &str =
+    include_str!("../templates/full-analysis-report-prompt.md");
 
 #[derive(Debug, Clone)]
 pub struct HarnessEvalReportStore {
@@ -94,6 +100,9 @@ impl HarnessEvalReportStore {
         let responses_dir = run_dir.join("responses");
         let events_dir = run_dir.join("events");
         let run_evidence_dir = run_dir.join("run-evidence");
+        let live_scenarios_dir = run_dir.join("live-scenarios");
+        let provider_rounds_dir = run_dir.join("provider-rounds");
+        let tool_calls_dir = run_dir.join("tool-calls");
         let model_speed_dir = run_dir.join("model-speed");
         let quality_rubric_dir = run_dir.join("quality-rubric");
         fs::create_dir_all(&evidence_dir).map_err(|error| error.to_string())?;
@@ -102,20 +111,48 @@ impl HarnessEvalReportStore {
             &responses_dir,
             &events_dir,
             &run_evidence_dir,
+            &live_scenarios_dir,
+            &provider_rounds_dir,
+            &tool_calls_dir,
             &model_speed_dir,
             &quality_rubric_dir,
         ] {
             fs::create_dir_all(dir).map_err(|error| error.to_string())?;
         }
         report["result_package_dir"] = Value::String(run_dir.display().to_string());
+        if !report
+            .get("evidence_manifest")
+            .is_some_and(Value::is_object)
+        {
+            report["evidence_manifest"] = serde_json::json!({
+                "kind": "harness_eval.evidence_manifest"
+            });
+        }
+        report["evidence_manifest"]["report_id"] = Value::String(base.clone());
+        report["evidence_manifest"]["result_package_dir"] =
+            Value::String(run_dir.display().to_string());
         report["report_package"] = serde_json::json!({
             "status": "written",
             "root": run_dir.display().to_string(),
-            "required_dirs": ["requests", "responses", "events", "run-evidence", "model-speed", "quality-rubric"],
+            "required_dirs": ["requests", "responses", "events", "run-evidence", "live-scenarios", "provider-rounds", "tool-calls", "model-speed", "quality-rubric", "evidence"],
             "summary": "summary.md",
             "full_report": "full-report.md",
+            "full_analysis_report": "full-analysis-report.md",
+            "full_analysis_template": "full-analysis-report-template.md",
+            "full_analysis_prompt": "full-analysis-report-prompt.md",
+            "analysis_context": "analysis-context.json",
+            "evidence_manifest": "evidence/evidence-manifest.json",
             "quality_rubric": "quality-rubric/quality-rubric.json"
         });
+        // Write full live API traces before serializing the human-facing
+        // report, then retain only a package reference in report.json.
+        write_live_scenario_artifacts(report, &live_scenarios_dir)?;
+        if report.get("live_gateway_scenario_details").is_some() {
+            report["live_gateway_scenario_details"] = serde_json::json!({
+                "stored": true,
+                "directory": "live-scenarios",
+            });
+        }
         report["report_gate"] = serde_json::to_value(evaluate_report_gate(report))
             .map_err(|error| error.to_string())?;
         let json_path = run_dir.join("report.json");
@@ -131,11 +168,33 @@ impl HarnessEvalReportStore {
             .map_err(|error| error.to_string())?;
         fs::write(run_dir.join("full-report.md"), &markdown).map_err(|error| error.to_string())?;
         fs::write(
+            run_dir.join("full-analysis-report-template.md"),
+            FULL_ANALYSIS_REPORT_TEMPLATE,
+        )
+        .map_err(|error| error.to_string())?;
+        fs::write(
+            run_dir.join("full-analysis-report-prompt.md"),
+            FULL_ANALYSIS_REPORT_PROMPT,
+        )
+        .map_err(|error| error.to_string())?;
+        fs::write(
+            run_dir.join("full-analysis-report.md"),
+            render_full_analysis_report(report),
+        )
+        .map_err(|error| error.to_string())?;
+        fs::write(
+            run_dir.join("analysis-context.json"),
+            serde_json::to_string_pretty(&analysis_context(report))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        fs::write(
             run_dir.join("execution-trace.json"),
             serde_json::to_string_pretty(report.get("execution_trace").unwrap_or(&Value::Null))
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
+        write_provider_round_artifacts(report, &provider_rounds_dir)?;
         fs::write(
             events_dir.join("runtime-actions.json"),
             serde_json::to_string_pretty(
@@ -170,6 +229,7 @@ impl HarnessEvalReportStore {
             &responses_dir,
             &events_dir,
             &run_evidence_dir,
+            &tool_calls_dir,
         )?;
         fs::write(
             evidence_dir.join("stable-ai-health.json"),
@@ -182,6 +242,42 @@ impl HarnessEvalReportStore {
                 report.get("reality_context_eval").unwrap_or(&Value::Null),
             )
             .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        fs::write(
+            evidence_dir.join("next-gen-harness-closure.json"),
+            serde_json::to_string_pretty(
+                report
+                    .get("next_gen_harness_closure")
+                    .unwrap_or(&Value::Null),
+            )
+            .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        fs::write(
+            evidence_dir.join("complex-scenarios.json"),
+            serde_json::to_string_pretty(report.get("complex_scenarios").unwrap_or(&Value::Null))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        fs::write(
+            evidence_dir.join("real-tool-scenarios.json"),
+            serde_json::to_string_pretty(report.get("real_tool_scenarios").unwrap_or(&Value::Null))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        fs::write(
+            evidence_dir.join("live-gateway-scenarios.json"),
+            serde_json::to_string_pretty(
+                report.get("live_gateway_scenarios").unwrap_or(&Value::Null),
+            )
+            .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        fs::write(
+            evidence_dir.join("evidence-manifest.json"),
+            serde_json::to_string_pretty(report.get("evidence_manifest").unwrap_or(&Value::Null))
+                .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
         fs::copy(&json_path, self.root.join(format!("{base}.json")))
@@ -211,6 +307,28 @@ impl HarnessEvalReportStore {
             .map_err(|error| error.to_string())
     }
 
+    pub fn upsert_run(&self, record: &HarnessEvalRunRecord) -> Result<(), String> {
+        self.ensure_root()?;
+        let path = self.root.join("runs.jsonl");
+        let mut records = if path.exists() {
+            let text = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+            text.lines()
+                .filter(|line| !line.trim().is_empty())
+                .filter_map(|line| serde_json::from_str::<HarnessEvalRunRecord>(line).ok())
+                .filter(|item| item.run_id != record.run_id)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        records.push(record.clone());
+        let mut text = String::new();
+        for item in records {
+            text.push_str(&serde_json::to_string(&item).map_err(|error| error.to_string())?);
+            text.push('\n');
+        }
+        fs::write(path, text).map_err(|error| error.to_string())
+    }
+
     pub fn list_runs(&self) -> Result<Vec<HarnessEvalRunRecord>, String> {
         let path = self.root.join("runs.jsonl");
         if !path.exists() {
@@ -228,6 +346,82 @@ impl HarnessEvalReportStore {
 
     pub fn get_run(&self, id: &str) -> Result<Option<HarnessEvalRunRecord>, String> {
         Ok(self.list_runs()?.into_iter().find(|run| run.run_id == id))
+    }
+
+    pub fn review_report_dir(
+        run_dir: impl AsRef<Path>,
+        options: HarnessEvalRunnerOptions,
+    ) -> Result<PathBuf, String> {
+        let run_dir = run_dir.as_ref();
+        let report_path = run_dir.join("report.json");
+        let text = fs::read_to_string(&report_path).map_err(|error| error.to_string())?;
+        let mut report = serde_json::from_str::<Value>(&text).map_err(|error| error.to_string())?;
+        if options.allow_real_model {
+            let provider_review = run_deep_real_provider_review(&options, &report);
+            let provider_round_count = provider_review.provider_rounds.len();
+            let mut rounds = report
+                .pointer("/execution_trace/rounds")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let reviewer_rounds = serde_json::to_value(&provider_review.provider_rounds)
+                .map_err(|error| error.to_string())?;
+            if let Some(items) = reviewer_rounds.as_array() {
+                rounds.extend(items.iter().cloned());
+            }
+            let existing_rounds = report
+                .pointer("/execution_trace/provider_rounds")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let existing_usage = report
+                .pointer("/execution_trace/total_usage")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or_else(|| empty_usage("unavailable"));
+            let combined_usage = merge_usage(&existing_usage, &provider_review.usage);
+            report["execution_trace"]["rounds"] = Value::Array(rounds);
+            report["execution_trace"]["provider_rounds"] =
+                serde_json::json!(existing_rounds.saturating_add(provider_round_count as u64));
+            report["execution_trace"]["total_usage"] =
+                serde_json::to_value(&combined_usage).map_err(|error| error.to_string())?;
+            let mut details = report
+                .get("provider_round_details")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let reviewer_details = serde_json::to_value(&provider_review.provider_round_details)
+                .map_err(|error| error.to_string())?;
+            if let Some(items) = reviewer_details.as_array() {
+                details.extend(items.iter().cloned());
+            }
+            report["provider_round_details"] = Value::Array(details);
+            report["ai_reviewer"] = serde_json::json!({
+                "status": provider_review.status,
+                "report_source": "provider_round",
+                "provider_rounds": provider_round_count,
+                "error": provider_review.error,
+                "markdown_available": provider_review.reviewer_markdown.is_some()
+            });
+            if let Some(markdown) = provider_review.reviewer_markdown {
+                report["ai_reviewer_report_markdown"] = Value::String(markdown);
+            }
+            if let Some(parent) = report_path.parent() {
+                let provider_rounds_dir = parent.join("provider-rounds");
+                fs::create_dir_all(&provider_rounds_dir).map_err(|error| error.to_string())?;
+                write_provider_round_artifacts(&report, &provider_rounds_dir)?;
+            }
+        }
+        report["report_gate"] = serde_json::to_value(evaluate_report_gate(&report))
+            .map_err(|error| error.to_string())?;
+        fs::write(
+            &report_path,
+            serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let output = run_dir.join("full-analysis-report.md");
+        fs::write(&output, render_full_analysis_report(&report))
+            .map_err(|error| error.to_string())?;
+        Ok(output)
     }
 
     fn scan_report_files(&self) -> Result<Vec<HarnessEvalStoredReport>, String> {
@@ -261,6 +455,30 @@ pub fn empty_usage(source: &str) -> HarnessEvalUsageSummary {
     HarnessEvalUsageSummary {
         usage_source: source.to_string(),
         ..HarnessEvalUsageSummary::default()
+    }
+}
+
+fn merge_usage(
+    left: &HarnessEvalUsageSummary,
+    right: &HarnessEvalUsageSummary,
+) -> HarnessEvalUsageSummary {
+    if right.total_tokens == 0 {
+        return left.clone();
+    }
+    if left.total_tokens == 0 {
+        return right.clone();
+    }
+    HarnessEvalUsageSummary {
+        input_tokens: left.input_tokens.saturating_add(right.input_tokens),
+        output_tokens: left.output_tokens.saturating_add(right.output_tokens),
+        cache_creation_input_tokens: left
+            .cache_creation_input_tokens
+            .saturating_add(right.cache_creation_input_tokens),
+        cache_read_input_tokens: left
+            .cache_read_input_tokens
+            .saturating_add(right.cache_read_input_tokens),
+        total_tokens: left.total_tokens.saturating_add(right.total_tokens),
+        usage_source: format!("{}+{}", left.usage_source, right.usage_source),
     }
 }
 
@@ -444,6 +662,81 @@ fn render_markdown_report(report: &Value) -> String {
             ));
         }
     }
+    if let Some(next_gen) = report.get("next_gen_harness_closure") {
+        markdown.push_str("\n## Next Gen Harness Closure\n\n");
+        markdown.push_str(&format!(
+            "- status: {}\n- total: {}\n- passed: {}\n- failed: {}\n- detail: `evidence/next-gen-harness-closure.json`\n\n",
+            next_gen
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            next_gen
+                .get("total")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            next_gen
+                .get("passed")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            next_gen
+                .get("failed")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+        ));
+        markdown.push_str("| Scenario | Status | Runtime Actions | Tool Calls | Evidence |\n| --- | --- | ---: | ---: | ---: |\n");
+        for scenario in next_gen
+            .get("scenarios")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+        {
+            markdown.push_str(&format!(
+                "| {} | {} | {} | {} | {} |\n",
+                scenario
+                    .get("scenario_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-"),
+                scenario
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-"),
+                scenario
+                    .get("runtime_actions")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len),
+                scenario
+                    .get("tool_calls")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+                scenario
+                    .get("evidence_refs")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len),
+            ));
+        }
+    }
+    if let Some(manifest) = report.get("evidence_manifest") {
+        markdown.push_str("\n## Evidence Manifest\n\n");
+        markdown.push_str(&format!(
+            "- repo: `{}`\n- commit: `{}`\n- version: `{}`\n- command: `{}`\n- detail: `evidence/evidence-manifest.json`\n",
+            manifest
+                .get("repo")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            manifest
+                .get("commit")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            manifest
+                .get("version")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            manifest
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+        ));
+    }
     markdown
 }
 
@@ -464,12 +757,131 @@ fn render_summary_report(report: &Value) -> String {
     )
 }
 
+fn render_full_analysis_report(report: &Value) -> String {
+    if let Some(markdown) = report
+        .get("ai_reviewer_report_markdown")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        return markdown.to_string();
+    }
+    let level = report
+        .get("level")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let status = report
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let gate = report.get("report_gate").unwrap_or(&Value::Null);
+    let reviewer = report.get("ai_reviewer").unwrap_or(&Value::Null);
+    format!(
+        "# Mission Harness {level} Full Analysis Report\n\n\
+         ## Status\n\n\
+         - report_status: `{status}`\n\
+         - gate_status: `{}`\n\
+         - ai_reviewer_status: `{}`\n\
+         - provider_rounds: `{}`\n\n\
+         ## Analysis\n\n\
+         This is a structured evidence summary because an optional AI ReportReviewer was not requested or was unavailable. \
+         It is not an AI-authored quality judgment. Deep-real capability status remains bound to independent isolated Gateway scenario traces, canonical token/round metrics, and the report gate.\n\n\
+         ## Evidence Package\n\n\
+         - report: `report.json`\n\
+         - trace: `execution-trace.json`\n\
+         - analysis context: `analysis-context.json`\n\
+         - evidence: `evidence/`\n\
+         - provider rounds: `provider-rounds/`\n\n\
+         ## Reviewer Error\n\n\
+         `{}`\n",
+        gate.get("status").and_then(Value::as_str).unwrap_or("missing"),
+        reviewer
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("not_required"),
+        report
+            .pointer("/execution_trace/provider_rounds")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        reviewer
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("not_applicable")
+    )
+}
+
+fn analysis_context(report: &Value) -> Value {
+    serde_json::json!({
+        "kind": "harness_eval.analysis_context",
+        "level": report.get("level").cloned().unwrap_or(Value::Null),
+        "status": report.get("status").cloned().unwrap_or(Value::Null),
+        "report_gate": report.get("report_gate").cloned().unwrap_or(Value::Null),
+        "execution_trace": report.get("execution_trace").cloned().unwrap_or(Value::Null),
+        "evidence_manifest": report.get("evidence_manifest").cloned().unwrap_or(Value::Null),
+        "scenario_capabilities": report.get("scenarios").cloned().unwrap_or(Value::Null),
+        "next_gen_harness_closure": report.get("next_gen_harness_closure").cloned().unwrap_or(Value::Null),
+        "reality_context_eval": report.get("reality_context_eval").cloned().unwrap_or(Value::Null),
+        "mission_runtime_collaboration": report.get("mission_runtime_collaboration").cloned().unwrap_or(Value::Null),
+        "real_tool_scenarios": report.get("real_tool_scenarios").cloned().unwrap_or(Value::Null),
+        "live_gateway_scenarios": report.get("live_gateway_scenarios").cloned().unwrap_or(Value::Null),
+        "instructions": [
+            "Use summaries in the human report and cite JSON artifact paths for details.",
+            "Distinguish deterministic contract checks, real local tool execution, and real provider rounds.",
+            "Do not claim a capability proven unless report_gate and scenario evidence support it."
+        ]
+    })
+}
+
+fn write_provider_round_artifacts(
+    report: &Value,
+    provider_rounds_dir: &Path,
+) -> Result<(), String> {
+    if let Some(details) = report
+        .get("provider_round_details")
+        .and_then(Value::as_array)
+    {
+        for detail in details {
+            let index = detail
+                .get("summary")
+                .and_then(|summary| summary.get("round_index"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if index == 0 {
+                continue;
+            }
+            fs::write(
+                provider_rounds_dir.join(format!("{index:03}-round.json")),
+                serde_json::to_string_pretty(detail).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        if !details.is_empty() {
+            return Ok(());
+        }
+    }
+    let Some(rounds) = report
+        .get("execution_trace")
+        .and_then(|trace| trace.get("rounds"))
+        .and_then(Value::as_array)
+    else {
+        return Ok(());
+    };
+    for (index, round) in rounds.iter().enumerate() {
+        fs::write(
+            provider_rounds_dir.join(format!("{:03}-round.json", index + 1)),
+            serde_json::to_string_pretty(round).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 fn write_tool_call_artifacts(
     report: &Value,
     requests_dir: &Path,
     responses_dir: &Path,
     events_dir: &Path,
     run_evidence_dir: &Path,
+    tool_calls_dir: &Path,
 ) -> Result<(), String> {
     let Some(details) = report.get("tool_call_details").and_then(Value::as_array) else {
         return Ok(());
@@ -506,6 +918,49 @@ fn write_tool_call_artifacts(
             serde_json::to_string_pretty(detail).map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
+        fs::write(
+            tool_calls_dir.join(format!("tool-call-{index}.json")),
+            serde_json::to_string_pretty(detail).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn write_live_scenario_artifacts(report: &Value, root: &Path) -> Result<(), String> {
+    let live = report
+        .get("live_gateway_scenario_details")
+        .or_else(|| report.get("live_gateway_scenarios"))
+        .unwrap_or(&Value::Null);
+    fs::write(
+        root.join("suite.json"),
+        serde_json::to_string_pretty(live).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let Some(scenarios) = live.get("scenarios").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for (index, scenario) in scenarios.iter().enumerate() {
+        let id = scenario
+            .get("scenario_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unnamed");
+        let safe_id = id
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        fs::write(
+            root.join(format!("{:03}-{safe_id}.json", index + 1)),
+            serde_json::to_string_pretty(scenario).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
     }
     Ok(())
 }
@@ -523,6 +978,36 @@ fn write_stable_ai_health(root: &Path, report: &StableAiHealthReport) -> Result<
 mod tests {
     use super::*;
     use crate::runner::{run_eval, HarnessEvalRunnerOptions};
+
+    #[test]
+    fn reviewer_usage_is_appended_without_erasing_live_scenario_usage() {
+        let live = HarnessEvalUsageSummary {
+            input_tokens: 300,
+            output_tokens: 60,
+            cache_read_input_tokens: 10,
+            total_tokens: 370,
+            usage_source: "live_gateway_canonical_usage".to_string(),
+            ..HarnessEvalUsageSummary::default()
+        };
+        let reviewer = HarnessEvalUsageSummary {
+            input_tokens: 40,
+            output_tokens: 10,
+            total_tokens: 50,
+            usage_source: "provider".to_string(),
+            ..HarnessEvalUsageSummary::default()
+        };
+
+        let combined = merge_usage(&live, &reviewer);
+
+        assert_eq!(combined.input_tokens, 340);
+        assert_eq!(combined.output_tokens, 70);
+        assert_eq!(combined.cache_read_input_tokens, 10);
+        assert_eq!(combined.total_tokens, 420);
+        assert_eq!(
+            combined.usage_source,
+            "live_gateway_canonical_usage+provider"
+        );
+    }
 
     #[test]
     fn report_store_writes_lists_and_reads_smoke_report() {
@@ -560,11 +1045,31 @@ mod tests {
         assert!(detail
             .artifacts
             .iter()
+            .any(|path| path.ends_with("full-analysis-report-template.md")));
+        assert!(detail
+            .artifacts
+            .iter()
+            .any(|path| path.ends_with("full-analysis-report-prompt.md")));
+        assert!(detail
+            .artifacts
+            .iter()
+            .any(|path| path.ends_with("analysis-context.json")));
+        assert!(detail
+            .artifacts
+            .iter()
             .any(|path| path.ends_with("quality-rubric.json")));
         assert!(detail
             .artifacts
             .iter()
             .any(|path| path.ends_with("evidence/reality-context-eval.json")));
+        assert!(detail
+            .artifacts
+            .iter()
+            .any(|path| path.ends_with("evidence/next-gen-harness-closure.json")));
+        assert!(detail
+            .artifacts
+            .iter()
+            .any(|path| path.ends_with("evidence/evidence-manifest.json")));
         let _ = fs::remove_dir_all(root);
     }
 }

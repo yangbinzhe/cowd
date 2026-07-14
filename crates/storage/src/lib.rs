@@ -1,3 +1,14 @@
+// Test assertions intentionally use unwrap/expect; normal library builds remain strict.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
+
 mod sqlite;
 
 use std::collections::BTreeMap;
@@ -55,6 +66,7 @@ pub trait MatrixRepository {
 pub enum StorageBackendKind {
     Sqlite,
     FileJson,
+    Directory,
     BlobDirectory,
 }
 
@@ -89,6 +101,10 @@ pub struct StorageLayout {
     pub root: PathBuf,
     pub sqlite: BTreeMap<String, PathBuf>,
     pub files: BTreeMap<String, PathBuf>,
+    /// Named, non-blob directory roots. Domains that retain immutable
+    /// revision trees must be registered here instead of deriving an ad-hoc
+    /// path from a configuration directory.
+    pub directories: BTreeMap<String, PathBuf>,
     pub blobs: PathBuf,
 }
 
@@ -123,10 +139,15 @@ impl StorageLayout {
             ),
             ("audit_log".to_string(), files_root.join("audit.jsonl")),
         ]);
+        let directories = BTreeMap::from([(
+            "definitions".to_string(),
+            config_home.as_ref().join("definitions"),
+        )]);
         Self {
             root: root.clone(),
             sqlite,
             files,
+            directories,
             blobs: root.join("blobs"),
         }
     }
@@ -137,6 +158,10 @@ impl StorageLayout {
 
     pub fn file_path(&self, domain: &str) -> Option<&Path> {
         self.files.get(domain).map(PathBuf::as_path)
+    }
+
+    pub fn directory_path(&self, domain: &str) -> Option<&Path> {
+        self.directories.get(domain).map(PathBuf::as_path)
     }
 
     pub fn ensure_directories(&self) -> Result<(), StorageError> {
@@ -152,6 +177,9 @@ impl StorageLayout {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
+        }
+        for path in self.directories.values() {
+            fs::create_dir_all(path)?;
         }
         Ok(())
     }
@@ -206,6 +234,15 @@ impl StorageRegistry {
                 migration: "file_path_registered_since_0.9.295".to_string(),
             });
         }
+        for (domain, path) in &layout.directories {
+            handles.push(StorageHandle {
+                domain: domain.clone(),
+                backend: StorageBackendKind::Directory,
+                path: path.clone(),
+                owner: owner_for_domain(domain).to_string(),
+                migration: "directory_registered_since_0.9.484".to_string(),
+            });
+        }
         handles.push(StorageHandle {
             domain: "blobs".to_string(),
             backend: StorageBackendKind::BlobDirectory,
@@ -251,6 +288,7 @@ fn owner_for_domain(domain: &str) -> &'static str {
         "audit" | "audit_log" => "audit",
         "approval" | "approval_history" | "always_approved" => "approval",
         "growth" => "growth",
+        "definitions" => "runtime",
         _ => "storage",
     }
 }
@@ -302,7 +340,9 @@ pub struct StorageHandleHealth {
 impl StorageHandleHealth {
     fn from_handle(handle: &StorageHandle) -> Self {
         let parent = match handle.backend {
-            StorageBackendKind::BlobDirectory => handle.path.as_path(),
+            StorageBackendKind::Directory | StorageBackendKind::BlobDirectory => {
+                handle.path.as_path()
+            }
             _ => handle.path.parent().unwrap_or_else(|| Path::new(".")),
         };
         Self {
@@ -738,6 +778,10 @@ mod tests {
             layout.file_path("approval_history").unwrap(),
             Path::new("/tmp/cowd-config/storage/files/approval_history.json")
         );
+        assert_eq!(
+            layout.directory_path("definitions").unwrap(),
+            Path::new("/tmp/cowd-config/definitions")
+        );
         assert_eq!(layout.blobs, Path::new("/tmp/cowd-config/storage/blobs"));
     }
 
@@ -753,6 +797,7 @@ mod tests {
             "audit",
             "approval",
             "growth",
+            "definitions",
             "approval_history",
             "always_approved",
             "audit_log",

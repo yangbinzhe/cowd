@@ -36,8 +36,16 @@ pub enum MemoryScope {
     Session(String),
     /// Task-scoped memory, keyed by a runtime task identifier.
     Task(String),
-    /// Agent-scoped memory, keyed by an agent identifier.
-    Agent(String),
+    /// Durable reusable knowledge for all instances of one Agent Definition.
+    AgentDefinitionLineage(String),
+    /// Private working state for exactly one Agent instance.
+    AgentInstance(String),
+    /// Shared but ephemeral collaboration state for one Team run.
+    TeamRun(String),
+    /// A pre-V2 `agent_*` row whose identity cannot be safely classified as a
+    /// reusable Definition lineage or one isolated instance. It is retained
+    /// for review but is never eligible for Runtime recall.
+    LegacyUnresolvedAgent(String),
 }
 
 impl MemoryScope {
@@ -52,7 +60,7 @@ impl MemoryScope {
     /// assert_eq!(MemoryScope::Project("abc".into()).scope_key(), "project_abc");
     /// assert_eq!(MemoryScope::Session("s1".into()).scope_key(), "session_s1");
     /// assert_eq!(MemoryScope::Task("t1".into()).scope_key(), "task_t1");
-    /// assert_eq!(MemoryScope::Agent("a1".into()).scope_key(), "agent_a1");
+    /// assert_eq!(MemoryScope::AgentInstance("a1".into()).scope_key(), "agent_instance_a1");
     /// ```
     pub fn scope_key(&self) -> String {
         match self {
@@ -60,7 +68,10 @@ impl MemoryScope {
             MemoryScope::Project(id) => format!("project_{id}"),
             MemoryScope::Session(id) => format!("session_{id}"),
             MemoryScope::Task(id) => format!("task_{id}"),
-            MemoryScope::Agent(id) => format!("agent_{id}"),
+            MemoryScope::AgentDefinitionLineage(id) => format!("agent_definition_{id}"),
+            MemoryScope::AgentInstance(id) => format!("agent_instance_{id}"),
+            MemoryScope::TeamRun(id) => format!("team_run_{id}"),
+            MemoryScope::LegacyUnresolvedAgent(id) => format!("legacy_agent_{id}"),
         }
     }
 
@@ -85,7 +96,22 @@ impl std::str::FromStr for MemoryScope {
             _ if s.starts_with("project_") => Ok(MemoryScope::Project(s[8..].to_string())),
             _ if s.starts_with("session_") => Ok(MemoryScope::Session(s[8..].to_string())),
             _ if s.starts_with("task_") => Ok(MemoryScope::Task(s[5..].to_string())),
-            _ if s.starts_with("agent_") => Ok(MemoryScope::Agent(s[6..].to_string())),
+            _ if s.starts_with("agent_definition_") => {
+                Ok(MemoryScope::AgentDefinitionLineage(s[17..].to_string()))
+            }
+            _ if s.starts_with("agent_instance_") => {
+                Ok(MemoryScope::AgentInstance(s[15..].to_string()))
+            }
+            _ if s.starts_with("team_run_") => Ok(MemoryScope::TeamRun(s[9..].to_string())),
+            _ if s.starts_with("legacy_agent_") => {
+                Ok(MemoryScope::LegacyUnresolvedAgent(s[13..].to_string()))
+            }
+            // Do not guess whether a historic `agent_*` record belonged to a
+            // reusable Definition or a one-off Instance. Hold it outside all
+            // Runtime leases until a migration command classifies it.
+            _ if s.starts_with("agent_") => {
+                Ok(MemoryScope::LegacyUnresolvedAgent(s[6..].to_string()))
+            }
             other => Err(format!("unknown scope key: {other}")),
         }
     }
@@ -1499,8 +1525,8 @@ mod tests {
             "task_task_1"
         );
         assert_eq!(
-            MemoryScope::Agent("agent_x".into()).scope_key(),
-            "agent_agent_x"
+            MemoryScope::AgentInstance("agent_x".into()).scope_key(),
+            "agent_instance_agent_x"
         );
     }
 

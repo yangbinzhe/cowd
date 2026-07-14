@@ -1,70 +1,85 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use futures::StreamExt;
+use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use harness_contract::tool::ToolExposureProjection;
 use provider::{
-    max_tokens_for_model, ApiError, ContentBlockDelta, ImageSource, InputContentBlock,
-    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    ApiError, ContentBlockDelta, ImageSource, InputContentBlock, InputMessage, MessageRequest,
+    MessageResponse, OutputContentBlock, ProviderClient, StreamEvent as ApiStreamEvent, ToolChoice,
+    ToolDefinition, ToolResultContentBlock,
 };
 
 use crate::{
-    resolve_global_provider, ApiClient, ApiRequest, AssistantEvent, ConfigLoader, ContentBlock,
-    ConversationMessage, MessageRole, PromptCacheEvent, RuntimeError,
+    ApiClient, ApiRequest, AssistantEvent, ContentBlock, ConversationMessage, MessageRole,
+    PromptCacheEvent, ProviderContextInventory, RuntimeError,
 };
+
+use crate::provider_registry::{ProviderRegistry, ProviderRegistrySnapshot};
 
 pub use provider::OutputContentBlock as ProviderOutputContentBlock;
 pub use provider::ToolDefinition as ProviderToolDefinition;
 
+#[derive(Clone)]
 struct ProviderEntry {
     model: String,
     client: ProviderClient,
 }
 
+#[derive(Clone)]
 pub struct ProviderRuntimeClient {
-    chain: Vec<ProviderEntry>,
+    registry: Arc<ProviderRegistry>,
     tool_definitions: Vec<ToolDefinition>,
+    tool_exposure: Option<ToolExposureProjection>,
     reasoning_effort: Option<String>,
     emit_output: bool,
     stream_callback: Option<std::sync::mpsc::SyncSender<crate::CowdEvent>>,
 }
 
-impl ProviderRuntimeClient {
-    pub fn new(model: String, tool_definitions: Vec<ToolDefinition>) -> Result<Self, String> {
-        let fallback_config = load_provider_fallback_config();
-        Self::new_with_fallback_config(model, tool_definitions, &fallback_config)
-    }
+/// Bridges one provider request into the runtime's lazy `ApiClient` stream.
+///
+/// The provider SDK is asynchronous but does not itself implement
+/// `futures::Stream`. Keeping the producer in a cancellable task lets us
+/// expose each upstream event immediately while still aborting the request
+/// when the consumer applies a transport timeout or the turn is cancelled.
+struct ProviderEventStream {
+    receiver: UnboundedReceiver<Result<AssistantEvent, RuntimeError>>,
+    producer: Option<tokio::task::JoinHandle<()>>,
+}
 
-    pub fn new_with_fallback_config(
+impl futures::Stream for ProviderEventStream {
+    type Item = Result<AssistantEvent, RuntimeError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.receiver).poll_next(cx)
+    }
+}
+
+impl Drop for ProviderEventStream {
+    fn drop(&mut self) {
+        // The consumer owns the request lifetime. In particular, a runtime
+        // transport timeout must not leave a detached provider request running
+        // after its graph node has been failed or replanned.
+        if let Some(producer) = &self.producer {
+            producer.abort();
+        }
+    }
+}
+
+impl ProviderRuntimeClient {
+    pub fn new(
+        registry: Arc<ProviderRegistry>,
         model: String,
         tool_definitions: Vec<ToolDefinition>,
-        fallbacks: &[String],
     ) -> Result<Self, String> {
-        let primary = build_provider_entry(&model)?;
-        let mut chain = vec![primary];
-        if let Some(vision_model) = load_vision_model_config() {
-            match build_provider_entry(&vision_model) {
-                Ok(entry) => chain.push(entry),
-                Err(error) => {
-                    tracing::warn!("skipping unavailable vision provider {vision_model}: {error}");
-                }
-            }
-        }
-        for fallback_model in fallbacks {
-            match build_provider_entry(fallback_model) {
-                Ok(entry) => chain.push(entry),
-                Err(error) => {
-                    tracing::warn!(
-                        "skipping unavailable fallback provider {fallback_model}: {error}"
-                    );
-                }
-            }
-        }
-        chain.dedup_by(|a, b| a.model == b.model);
+        let snapshot = registry.pin();
+        build_provider_entry(&snapshot, &model)?;
         Ok(Self {
-            chain,
+            registry,
             tool_definitions,
+            tool_exposure: None,
             reasoning_effort: None,
             emit_output: false,
             stream_callback: None,
@@ -72,11 +87,8 @@ impl ProviderRuntimeClient {
     }
 
     #[must_use]
-    pub fn chain_models(&self) -> Vec<&str> {
-        self.chain
-            .iter()
-            .map(|entry| entry.model.as_str())
-            .collect()
+    pub fn provider_registry(&self) -> &Arc<ProviderRegistry> {
+        &self.registry
     }
 
     #[must_use]
@@ -98,39 +110,60 @@ impl ProviderRuntimeClient {
         self.reasoning_effort = effort;
     }
 
-    pub fn switch_model(&mut self, new_model: &str) -> Result<(), String> {
-        self.chain = vec![build_provider_entry(new_model)?];
-        self.model_fallbacks_extend();
-        Ok(())
+    /// Install the explicit tool schema set selected by Runtime.
+    ///
+    /// An unconfigured client exposes no tools. Older projections are ignored,
+    /// which prevents a delayed planner update from rolling schema visibility
+    /// back after a newer activation revision has reached the client.
+    pub fn configure_tool_exposure(&mut self, projection: ToolExposureProjection) {
+        let is_stale = self.tool_exposure.as_ref().is_some_and(|current| {
+            projection.catalog_revision < current.catalog_revision
+                || (projection.catalog_revision == current.catalog_revision
+                    && projection.exposure_revision < current.exposure_revision)
+        });
+        if is_stale {
+            tracing::warn!(
+                catalog_revision = projection.catalog_revision,
+                exposure_revision = projection.exposure_revision,
+                "ignoring stale provider tool exposure projection"
+            );
+            return;
+        }
+        self.tool_exposure = Some(projection);
     }
 
-    fn model_fallbacks_extend(&mut self) {
-        if let Some(vision_model) = load_vision_model_config() {
-            match build_provider_entry(&vision_model) {
-                Ok(entry) => self.chain.push(entry),
-                Err(error) => {
-                    tracing::warn!("skipping unavailable vision provider {vision_model}: {error}");
-                }
-            }
-        }
-        for fallback_model in load_provider_fallback_config() {
-            match build_provider_entry(&fallback_model) {
-                Ok(entry) => self.chain.push(entry),
-                Err(error) => {
-                    tracing::warn!(
-                        "skipping unavailable fallback provider {fallback_model}: {error}"
-                    );
-                }
-            }
-        }
-        self.chain.dedup_by(|a, b| a.model == b.model);
+    fn active_tool_definitions(&self) -> Vec<ToolDefinition> {
+        tool_definitions_for_exposure(&self.tool_definitions, self.tool_exposure.as_ref())
     }
 }
 
-fn build_provider_entry(model: &str) -> Result<ProviderEntry, String> {
+fn tool_definitions_for_exposure(
+    definitions: &[ToolDefinition],
+    exposure: Option<&ToolExposureProjection>,
+) -> Vec<ToolDefinition> {
+    let Some(exposure) = exposure else {
+        return Vec::new();
+    };
+    let active_ids = exposure
+        .bootstrap_ids
+        .iter()
+        .chain(exposure.active_ids.iter())
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    definitions
+        .iter()
+        .filter(|definition| active_ids.contains(definition.name.as_str()))
+        .cloned()
+        .collect()
+}
+
+fn build_provider_entry(
+    snapshot: &ProviderRegistrySnapshot,
+    model: &str,
+) -> Result<ProviderEntry, String> {
     let resolved = model.trim().to_string();
-    let client = match resolve_global_provider(&resolved) {
-        Some(provider) => ProviderClient::from_config(&provider).map_err(|e| e.to_string())?,
+    let client = match snapshot.resolve(&resolved) {
+        Some(provider) => ProviderClient::from_config(provider).map_err(|e| e.to_string())?,
         None => {
             tracing::warn!(
                 "model '{resolved}' not in providers config, falling back to environment variables"
@@ -144,21 +177,6 @@ fn build_provider_entry(model: &str) -> Result<ProviderEntry, String> {
     })
 }
 
-fn load_provider_fallback_config() -> Vec<String> {
-    std::env::current_dir()
-        .ok()
-        .and_then(|cwd| ConfigLoader::default_for(cwd).load().ok())
-        .map_or_else(Vec::new, |config| config.fallbacks().to_vec())
-}
-
-fn load_vision_model_config() -> Option<String> {
-    std::env::current_dir()
-        .ok()
-        .and_then(|cwd| ConfigLoader::default_for(cwd).load().ok())
-        .and_then(|config| config.aliases().get("vision").cloned())
-        .filter(|model| !model.trim().is_empty())
-}
-
 impl ApiClient for ProviderRuntimeClient {
     fn stream(
         &mut self,
@@ -166,147 +184,205 @@ impl ApiClient for ProviderRuntimeClient {
     ) -> Pin<
         Box<dyn futures::stream::Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>,
     > {
-        let events = async move {
-            match self.stream_collect_inner(request).await {
-                Ok(events) => events.into_iter().map(Ok).collect::<Vec<_>>(),
-                Err(error) => vec![Err(error)],
-            }
-        };
-        Box::pin(futures::stream::once(events).flat_map(futures::stream::iter))
+        let provider_snapshot = self.registry.pin();
+        self.stream_with_provider_snapshot(request, provider_snapshot)
+    }
+
+    fn configure_tool_exposure(&mut self, projection: ToolExposureProjection) {
+        ProviderRuntimeClient::configure_tool_exposure(self, projection);
+    }
+
+    fn context_inventory(&self) -> ProviderContextInventory {
+        let tools = self.active_tool_definitions();
+        let tool_schema_tokens = serde_json::to_string(&tools)
+            .map(|json| crate::context_ledger::estimate_text_tokens(&json))
+            .unwrap_or(0);
+        ProviderContextInventory {
+            tool_count: tools.len(),
+            tool_schema_tokens,
+        }
     }
 }
 
 impl ProviderRuntimeClient {
-    async fn stream_collect_inner(
+    pub(crate) fn stream_with_provider_snapshot(
         &mut self,
         request: ApiRequest,
-    ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        let messages = convert_messages(&request.messages);
-        let system =
-            (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n"));
-        let tool_choice = (!self.tool_definitions.is_empty()).then_some(ToolChoice::Auto);
-
-        let needs_vision = request_has_image_input(&messages);
-        let chain = self.candidate_chain(needs_vision);
-        let mut last_error: Option<ApiError> = None;
-        for (index, entry) in chain.iter().enumerate() {
-            let message_request = MessageRequest {
-                model: entry.model.clone(),
-                max_tokens: max_tokens_for_model(&entry.model),
-                messages: messages.clone(),
-                system: system.clone(),
-                tools: (!self.tool_definitions.is_empty()).then(|| self.tool_definitions.clone()),
-                tool_choice: tool_choice.clone(),
-                stream: true,
-                reasoning_effort: self.reasoning_effort.clone(),
-                ..Default::default()
-            };
-
-            let attempt = stream_with_provider(
-                &entry.client,
-                &message_request,
-                self.emit_output,
-                self.stream_callback.clone(),
-            )
-            .await;
-            match attempt {
-                Ok(events) => return Ok(events),
-                Err(error) if error.is_retryable() && index + 1 < chain.len() => {
-                    tracing::warn!(
-                        "provider {} failed with retryable error, falling back: {error}",
-                        entry.model
-                    );
-                    last_error = Some(error);
-                }
-                Err(error)
-                    if needs_vision
-                        && index + 1 < chain.len()
-                        && looks_like_vision_unsupported(&error) =>
-                {
-                    tracing::warn!(
-                        "provider {} rejected vision input, falling back: {error}",
-                        entry.model
-                    );
-                    last_error = Some(error);
-                }
-                Err(error) => return Err(RuntimeError::new(error.to_string())),
-            }
-        }
-
-        Err(RuntimeError::new(last_error.map_or_else(
-            || String::from("provider chain exhausted with no attempts"),
-            |error| error.to_string(),
-        )))
-    }
-
-    fn candidate_chain(&self, needs_vision: bool) -> Vec<&ProviderEntry> {
-        if !needs_vision {
-            return self.chain.iter().collect();
-        }
-        let filtered = self
-            .chain
-            .iter()
-            .filter(|entry| !model_is_known_without_vision(&entry.model))
+        provider_snapshot: ProviderRegistrySnapshot,
+    ) -> Pin<
+        Box<dyn futures::stream::Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>,
+    > {
+        let mut messages = request
+            .prompt
+            .contextual_messages()
+            .into_iter()
+            .map(InputMessage::user_text)
             .collect::<Vec<_>>();
-        if filtered.is_empty() {
-            self.chain.iter().collect()
-        } else {
-            filtered
-        }
+        messages.extend(convert_messages(&request.messages));
+        let system = request.prompt.trusted_system_text();
+        let active_tools = self.active_tool_definitions();
+        let tool_choice = (!active_tools.is_empty()).then_some(ToolChoice::Auto);
+
+        // Runtime selects one candidate and owns the route/retry lifecycle.
+        // This adapter owns exactly one pinned wire-protocol attempt.
+        let entry = match build_provider_entry(&provider_snapshot, &request.model) {
+            Ok(entry) => entry,
+            Err(error) => {
+                return Box::pin(futures::stream::once(async move {
+                    Err(RuntimeError::new(format!(
+                        "provider candidate `{}` is unavailable: {error}",
+                        request.model
+                    )))
+                }));
+            }
+        };
+        let (sender, receiver) = mpsc::unbounded();
+        let producer = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => Some(
+                handle.spawn(forward_provider_attempt(
+                    entry,
+                    messages,
+                    system,
+                    active_tools,
+                    tool_choice,
+                    request
+                        .budget
+                        .requested_output_tokens
+                        .min(u64::from(u32::MAX)) as u32,
+                    request
+                        .budget
+                        .context_window_tokens
+                        .min(u64::from(u32::MAX)) as u32,
+                    self.reasoning_effort.clone(),
+                    self.emit_output,
+                    self.stream_callback.clone(),
+                    sender,
+                )),
+            ),
+            Err(_) => {
+                // `ApiClient::stream` is consumed from async Runtime code, but
+                // callers may still construct it in synchronous diagnostics.
+                // Return a normal stream error instead of panicking while
+                // attempting to spawn a Tokio task without a reactor.
+                let _ = sender.unbounded_send(Err(RuntimeError::new(
+                    "provider stream requires an active Tokio runtime",
+                )));
+                None
+            }
+        };
+        Box::pin(ProviderEventStream { receiver, producer })
     }
 }
 
-fn request_has_image_input(messages: &[InputMessage]) -> bool {
-    messages.iter().any(|message| {
-        message
-            .content
-            .iter()
-            .any(|block| matches!(block, InputContentBlock::Image { .. }))
-    })
+#[allow(clippy::too_many_arguments)]
+async fn forward_provider_attempt(
+    entry: ProviderEntry,
+    messages: Vec<InputMessage>,
+    system: Option<String>,
+    active_tools: Vec<ToolDefinition>,
+    tool_choice: Option<ToolChoice>,
+    max_tokens: u32,
+    context_window_limit: u32,
+    reasoning_effort: Option<String>,
+    emit_output: bool,
+    stream_callback: Option<std::sync::mpsc::SyncSender<crate::CowdEvent>>,
+    sender: UnboundedSender<Result<AssistantEvent, RuntimeError>>,
+) {
+    let message_request = MessageRequest {
+        model: entry.model.clone(),
+        max_tokens,
+        context_window_limit: Some(context_window_limit),
+        messages,
+        system,
+        tools: (!active_tools.is_empty()).then_some(active_tools),
+        tool_choice,
+        stream: true,
+        reasoning_effort,
+        ..Default::default()
+    };
+    if let Err(error) = forward_provider_stream(
+        &entry.client,
+        &message_request,
+        &entry.model,
+        emit_output,
+        stream_callback,
+        &sender,
+    )
+    .await
+    {
+        let _ = sender.unbounded_send(Err(RuntimeError::with_provider_context_window_limit(
+            error.error.to_string(),
+            error.error.context_window_limit_hint(),
+        )));
+    }
 }
 
-fn model_is_known_without_vision(model: &str) -> bool {
-    let canonical = model.split_once('/').map_or(model, |(_, rest)| rest).trim();
-    model_protocol::model_registry::global_registry()
-        .get(canonical)
-        .is_some_and(|info| {
-            !info
-                .capabilities
-                .iter()
-                .any(|capability| capability.eq_ignore_ascii_case("vision"))
-        })
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardedProviderStream {
+    Completed,
+    ConsumerDropped,
 }
 
-fn looks_like_vision_unsupported(error: &ApiError) -> bool {
-    let text = error.to_string().to_ascii_lowercase();
-    (text.contains("image") || text.contains("vision") || text.contains("multimodal"))
-        && (text.contains("unsupported")
-            || text.contains("not support")
-            || text.contains("does not support")
-            || text.contains("invalid")
-            || text.contains("extra inputs"))
+#[derive(Debug)]
+struct ProviderStreamError {
+    error: ApiError,
+}
+
+impl std::fmt::Display for ProviderStreamError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
 }
 
 #[allow(clippy::too_many_lines)]
-async fn stream_with_provider(
+async fn forward_provider_stream(
     client: &ProviderClient,
     message_request: &MessageRequest,
+    effective_model: &str,
     emit_output: bool,
     stream_callback: Option<std::sync::mpsc::SyncSender<crate::CowdEvent>>,
-) -> Result<Vec<AssistantEvent>, ApiError> {
-    let mut stream = client.stream_message(message_request).await?;
-    let mut events = Vec::new();
+    sender: &UnboundedSender<Result<AssistantEvent, RuntimeError>>,
+) -> Result<ForwardedProviderStream, ProviderStreamError> {
+    let mut stream = client
+        .stream_message(message_request)
+        .await
+        .map_err(|error| ProviderStreamError { error })?;
     let mut pending_tools: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
     let mut saw_stop = false;
+    let mut emitted = false;
+    let mut provider_model_emitted = false;
 
-    while let Some(event) = stream.next_event().await? {
+    while let Some(event) = stream
+        .next_event()
+        .await
+        .map_err(|error| ProviderStreamError { error })?
+    {
+        if !provider_model_emitted {
+            if !forward_event(
+                sender,
+                AssistantEvent::ProviderModel {
+                    model: effective_model.to_string(),
+                },
+                emit_output,
+                &stream_callback,
+                &mut emitted,
+            ) {
+                return Ok(ForwardedProviderStream::ConsumerDropped);
+            }
+            provider_model_emitted = true;
+        }
         match event {
             ApiStreamEvent::MessageStart(start) => {
+                let mut events = Vec::new();
                 for block in start.message.content {
                     push_provider_output_block(block, 0, &mut events, &mut pending_tools, true);
                 }
+                if !forward_events(sender, events, emit_output, &stream_callback, &mut emitted) {
+                    return Ok(ForwardedProviderStream::ConsumerDropped);
+                }
             }
             ApiStreamEvent::ContentBlockStart(start) => {
+                let mut events = Vec::new();
                 push_provider_output_block(
                     start.content_block,
                     start.index,
@@ -314,19 +390,22 @@ async fn stream_with_provider(
                     &mut pending_tools,
                     true,
                 );
+                if !forward_events(sender, events, emit_output, &stream_callback, &mut emitted) {
+                    return Ok(ForwardedProviderStream::ConsumerDropped);
+                }
             }
             ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
                 ContentBlockDelta::TextDelta { text } => {
                     if !text.is_empty() {
-                        if emit_output {
-                            print!("{text}");
-                            let _ = std::io::stdout().flush();
+                        if !forward_event(
+                            sender,
+                            AssistantEvent::TextDelta(text),
+                            emit_output,
+                            &stream_callback,
+                            &mut emitted,
+                        ) {
+                            return Ok(ForwardedProviderStream::ConsumerDropped);
                         }
-                        if let Some(callback) = &stream_callback {
-                            let _ = callback
-                                .try_send(crate::CowdEvent::TextDelta { text: text.clone() });
-                        }
-                        events.push(AssistantEvent::TextDelta(text));
                     }
                 }
                 ContentBlockDelta::InputJsonDelta { partial_json } => {
@@ -339,35 +418,70 @@ async fn stream_with_provider(
             },
             ApiStreamEvent::ContentBlockStop(stop) => {
                 if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
-                    events.push(AssistantEvent::ToolUse { id, name, input });
+                    if !forward_event(
+                        sender,
+                        AssistantEvent::ToolUse { id, name, input },
+                        emit_output,
+                        &stream_callback,
+                        &mut emitted,
+                    ) {
+                        return Ok(ForwardedProviderStream::ConsumerDropped);
+                    }
                 }
             }
             ApiStreamEvent::MessageDelta(delta) => {
-                events.push(AssistantEvent::Usage(delta.usage.token_usage()));
+                if !forward_event(
+                    sender,
+                    AssistantEvent::Usage(delta.usage.token_usage()),
+                    emit_output,
+                    &stream_callback,
+                    &mut emitted,
+                ) {
+                    return Ok(ForwardedProviderStream::ConsumerDropped);
+                }
             }
             ApiStreamEvent::MessageStop(_) => {
                 saw_stop = true;
-                events.push(AssistantEvent::MessageStop);
+                if !forward_event(
+                    sender,
+                    AssistantEvent::MessageStop,
+                    emit_output,
+                    &stream_callback,
+                    &mut emitted,
+                ) {
+                    return Ok(ForwardedProviderStream::ConsumerDropped);
+                }
             }
         }
     }
 
-    push_prompt_cache_record(client, &mut events);
-
-    if !saw_stop
-        && events.iter().any(|event| {
-            matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
-                || matches!(event, AssistantEvent::ToolUse { .. })
-        })
-    {
-        events.push(AssistantEvent::MessageStop);
+    let mut prompt_cache_events = Vec::new();
+    push_prompt_cache_record(client, &mut prompt_cache_events);
+    if !forward_events(
+        sender,
+        prompt_cache_events,
+        emit_output,
+        &stream_callback,
+        &mut emitted,
+    ) {
+        return Ok(ForwardedProviderStream::ConsumerDropped);
     }
 
-    if events
-        .iter()
-        .any(|event| matches!(event, AssistantEvent::MessageStop))
-    {
-        return Ok(events);
+    if saw_stop {
+        return Ok(ForwardedProviderStream::Completed);
+    }
+    if emitted {
+        return if forward_event(
+            sender,
+            AssistantEvent::MessageStop,
+            emit_output,
+            &stream_callback,
+            &mut emitted,
+        ) {
+            Ok(ForwardedProviderStream::Completed)
+        } else {
+            Ok(ForwardedProviderStream::ConsumerDropped)
+        };
     }
 
     let response = client
@@ -375,10 +489,53 @@ async fn stream_with_provider(
             stream: false,
             ..message_request.clone()
         })
-        .await?;
+        .await
+        .map_err(|error| ProviderStreamError { error })?;
     let mut events = response_to_events(response);
+    events.insert(
+        0,
+        AssistantEvent::ProviderModel {
+            model: effective_model.to_string(),
+        },
+    );
     push_prompt_cache_record(client, &mut events);
-    Ok(events)
+    if forward_events(sender, events, emit_output, &stream_callback, &mut emitted) {
+        Ok(ForwardedProviderStream::Completed)
+    } else {
+        Ok(ForwardedProviderStream::ConsumerDropped)
+    }
+}
+
+fn forward_events(
+    sender: &UnboundedSender<Result<AssistantEvent, RuntimeError>>,
+    events: Vec<AssistantEvent>,
+    emit_output: bool,
+    stream_callback: &Option<std::sync::mpsc::SyncSender<crate::CowdEvent>>,
+    emitted: &mut bool,
+) -> bool {
+    events
+        .into_iter()
+        .all(|event| forward_event(sender, event, emit_output, stream_callback, emitted))
+}
+
+fn forward_event(
+    sender: &UnboundedSender<Result<AssistantEvent, RuntimeError>>,
+    event: AssistantEvent,
+    emit_output: bool,
+    stream_callback: &Option<std::sync::mpsc::SyncSender<crate::CowdEvent>>,
+    emitted: &mut bool,
+) -> bool {
+    if let AssistantEvent::TextDelta(text) = &event {
+        if emit_output {
+            print!("{text}");
+            let _ = std::io::stdout().flush();
+        }
+        if let Some(callback) = stream_callback {
+            let _ = callback.try_send(crate::CowdEvent::TextDelta { text: text.clone() });
+        }
+    }
+    *emitted = true;
+    sender.unbounded_send(Ok(event)).is_ok()
 }
 
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
@@ -467,7 +624,9 @@ fn response_to_events(response: MessageResponse) -> Vec<AssistantEvent> {
     let mut pending_tools = BTreeMap::new();
 
     for (index, block) in response.content.into_iter().enumerate() {
-        let index = u32::try_from(index).expect("response block index overflow");
+        let Ok(index) = u32::try_from(index) else {
+            break;
+        };
         push_provider_output_block(block, index, &mut events, &mut pending_tools, false);
         if let Some((id, name, input)) = pending_tools.remove(&index) {
             events.push(AssistantEvent::ToolUse { id, name, input });
@@ -502,38 +661,83 @@ fn prompt_cache_record_to_runtime_event(
 
 #[cfg(test)]
 mod tests {
-    use super::{looks_like_vision_unsupported, request_has_image_input};
-    use provider::{ApiError, ImageSource, InputContentBlock, InputMessage};
+    use super::tool_definitions_for_exposure;
+    use crate::config::{ProviderConfig, ProvidersConfig};
+    use crate::{ProviderRegistry, ProviderRuntimeClient};
+    use harness_contract::tool::ToolExposureProjection;
+    use provider::ToolDefinition;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
-    #[test]
-    fn request_has_image_input_detects_structured_image_blocks() {
-        let messages = vec![InputMessage {
-            role: "user".to_string(),
-            content: vec![
-                InputContentBlock::Text {
-                    text: "describe".to_string(),
-                },
-                InputContentBlock::Image {
-                    source: ImageSource::base64("image/png", "aW1hZ2U="),
-                },
-            ],
-        }];
+    fn tool(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: None,
+            input_schema: json!({"type": "object"}),
+        }
+    }
 
-        assert!(request_has_image_input(&messages));
+    fn exposure(bootstrap: &[&str], active: &[&str], revision: u64) -> ToolExposureProjection {
+        ToolExposureProjection {
+            catalog_revision: 7,
+            exposure_revision: revision,
+            bootstrap_ids: bootstrap.iter().map(|id| (*id).to_string()).collect(),
+            active_ids: active.iter().map(|id| (*id).to_string()).collect(),
+            deferred_ids: Vec::new(),
+            fallback_full: false,
+            reason: "test".to_string(),
+            schema_tokens: 0,
+        }
     }
 
     #[test]
-    fn vision_unsupported_errors_can_continue_fallback_chain() {
-        let error = ApiError::Api {
-            status: reqwest::StatusCode::BAD_REQUEST,
-            error_type: Some("invalid_request".to_string()),
-            message: Some("This model does not support image input".to_string()),
-            request_id: None,
-            body: "image input unsupported".to_string(),
-            retryable: false,
-            suggested_action: None,
-        };
+    fn unconfigured_client_exposes_no_tool_schema() {
+        let tools = vec![tool("tool_search"), tool("read_file")];
+        assert!(tool_definitions_for_exposure(&tools, None).is_empty());
+    }
 
-        assert!(looks_like_vision_unsupported(&error));
+    #[test]
+    fn explicit_projection_selects_bootstrap_and_active_ids_only() {
+        let tools = vec![tool("tool_search"), tool("read_file"), tool("write_file")];
+        let projection = exposure(&["tool_search"], &["read_file"], 3);
+        let visible = tool_definitions_for_exposure(&tools, Some(&projection))
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(visible, vec!["tool_search", "read_file"]);
+    }
+
+    #[test]
+    fn fallback_flag_does_not_bypass_explicit_ids() {
+        let tools = vec![tool("tool_search"), tool("dangerous_tool")];
+        let mut projection = exposure(&["tool_search"], &[], 1);
+        projection.fallback_full = true;
+        let visible = tool_definitions_for_exposure(&tools, Some(&projection));
+
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].name, "tool_search");
+    }
+
+    #[test]
+    fn provider_client_accepts_one_runtime_selected_model() {
+        let registry = Arc::new(
+            ProviderRegistry::new(ProvidersConfig {
+                providers: HashMap::from([(
+                    "test".to_string(),
+                    ProviderConfig {
+                        name: "test".to_string(),
+                        base_url: "https://example.test/v1".to_string(),
+                        api_key: "test".to_string(),
+                        models: vec!["primary".to_string(), "fallback".to_string()],
+                        protocol: Some("completions".to_string()),
+                    },
+                )]),
+            })
+            .expect("registry"),
+        );
+        ProviderRuntimeClient::new(registry, "primary".to_string(), Vec::new())
+            .expect("single selected model must be valid");
     }
 }

@@ -14,7 +14,6 @@ impl SlashCommand {
         match self {
             Self::Help => "/help",
             Self::Clear { .. } => "/clear",
-            Self::Compact { .. } => "/compact",
             Self::Cost => "/cost",
             Self::Doctor => "/doctor",
             Self::Config { .. } => "/config",
@@ -79,11 +78,11 @@ impl SlashCommand {
             Self::OutputStyle { .. } => "/output-style",
             Self::AddDir { .. } => "/add-dir",
             Self::Sandbox => "/sandbox",
+            Self::Compact => "/compact",
             Self::Mcp { .. } => "/mcp",
             Self::Export { .. } => "/export",
             Self::Handoff { .. } => "/handoff",
             Self::Closet { .. } => "/closet",
-            Self::SandboxSearch { .. } => "/sandbox-search",
             Self::Retry => "/retry",
             Self::Undo => "/undo",
             Self::NewSession => "/new",
@@ -94,7 +93,6 @@ impl SlashCommand {
             Self::Pipeline { .. } => "/pipeline",
             Self::Solve { .. } => "/solve",
             Self::Agents { .. } => "/agent",
-            Self::AgentProfile { .. } => "/agent",
             #[allow(unreachable_patterns)]
             _ => "/unknown",
         }
@@ -329,9 +327,6 @@ pub fn validate_slash_command_input(
         }
         "closet" | "rooms" | "memory-rooms" => SlashCommand::Closet {
             topic: args.first().map(|s| s.to_string()),
-        },
-        "sandbox-search" => SlashCommand::SandboxSearch {
-            query: args.first().map(|s| s.to_string()),
         },
         "retry" => SlashCommand::Retry,
         "undo" => SlashCommand::Undo,
@@ -623,14 +618,6 @@ fn parse_agent_command(args: Option<&str>) -> Result<SlashCommand, SlashCommandP
         None | Some("list" | "help" | "-h" | "--help") => Ok(SlashCommand::Agents {
             args: args.map(String::from),
         }),
-        Some(profile_args) if profile_args.starts_with("profile") => {
-            let agent_id = profile_args
-                .strip_prefix("profile")
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .map(String::from);
-            Ok(SlashCommand::AgentProfile { agent_id })
-        }
         Some(other) => {
             // Treat unknown subcommand as agents list/help.
             Ok(SlashCommand::Agents {

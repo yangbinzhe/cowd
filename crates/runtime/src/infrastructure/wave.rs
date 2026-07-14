@@ -521,10 +521,11 @@ impl WaveOrchestrator {
 
             // Sort by priority within wave
             let mut ready_sorted: Vec<&TaskId> = ready.iter().collect();
-            ready_sorted.sort_by(|a, b| {
-                let task_a = self.tasks.get(*a).unwrap();
-                let task_b = self.tasks.get(*b).unwrap();
-                task_b.priority.cmp(&task_a.priority)
+            ready_sorted.sort_by(|a, b| match (self.tasks.get(*a), self.tasks.get(*b)) {
+                (Some(task_a), Some(task_b)) => task_b.priority.cmp(&task_a.priority),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.0.cmp(&b.0),
             });
 
             let current_wave: Vec<TaskId> = ready_sorted.into_iter().cloned().collect();

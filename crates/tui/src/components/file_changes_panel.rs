@@ -14,7 +14,7 @@ use ratatui::{
 };
 
 use crate::components::base::{Component, EventResult, RenderContext};
-use crate::components::panel_scroll::{offset_to_u16, PanelScrollState};
+use crate::components::panel_scroll::PanelScrollState;
 
 /// A single changed file entry in the file changes panel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,7 +36,7 @@ pub struct FileChangeEntry {
 pub struct FileChangesPanel {
     files: Vec<FileChangeEntry>,
     selected_idx: usize,
-    scroll_offset: u16,
+    scroll_offset: usize,
     collapsed: bool,
     /// Max items to show before collapsing. Default: 8.
     collapse_limit: usize,
@@ -132,7 +132,7 @@ impl FileChangesPanel {
     }
 
     #[must_use]
-    pub fn scroll_offset(&self) -> u16 {
+    pub fn scroll_offset(&self) -> usize {
         self.scroll_offset
     }
 
@@ -232,19 +232,19 @@ impl Component for FileChangesPanel {
 
         let viewport_len = inner.height.saturating_sub(3).max(1) as usize;
         let mut scroll = PanelScrollState {
-            offset: self.scroll_offset as usize,
+            offset: self.scroll_offset,
             content_len: max_display,
             viewport_len,
         };
         scroll.ensure_visible(self.selected_idx.min(max_display.saturating_sub(1)));
-        self.scroll_offset = offset_to_u16(scroll.offset);
+        self.scroll_offset = scroll.offset;
 
         let display_files: Vec<(usize, &FileChangeEntry)> = self
             .files
             .iter()
             .take(max_display)
             .enumerate()
-            .skip(self.scroll_offset as usize)
+            .skip(self.scroll_offset)
             .take(viewport_len)
             .collect();
 
@@ -350,7 +350,7 @@ impl FileChangesPanel {
             }
             KeyCode::End => {
                 self.selected_idx = self.max_select_idx();
-                self.scroll_offset = u16::MAX;
+                self.scroll_offset = usize::MAX;
                 EventResult::Consumed
             }
             KeyCode::Char('c') => {

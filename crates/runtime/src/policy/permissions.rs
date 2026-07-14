@@ -157,6 +157,11 @@ impl PermissionPolicy {
     }
 
     #[must_use]
+    pub const fn active_mode(&self) -> PermissionMode {
+        self.active_mode
+    }
+
+    #[must_use]
     pub fn with_tool_requirement(
         mut self,
         tool_name: impl Into<String>,
@@ -185,11 +190,6 @@ impl PermissionPolicy {
             .map(|rule| PermissionRule::parse(rule))
             .collect();
         self
-    }
-
-    #[must_use]
-    pub fn active_mode(&self) -> PermissionMode {
-        self.active_mode
     }
 
     #[must_use]

@@ -3,10 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use memory::store::session::{
     SessionEvent, SessionListOptions, SessionListPage, SessionMessage, SessionRecord,
 };
-use memory::{
-    CognitiveContextManager, MemoryError, RuntimeEventPage, RuntimeEventScope, UnifiedSessionStore,
-};
-use runtime::{AgentWorkGraph, CollaborationReviewPacket};
+use memory::{MemoryError, SessionDomainEventPage, SessionDomainScope, UnifiedSessionStore};
 use serde::{Deserialize, Serialize};
 use session::SessionLifecycleKernel;
 
@@ -329,6 +326,21 @@ impl SessionService {
         }
     }
 
+    pub(crate) async fn upsert_stored_session_with_mission_outbox(
+        &self,
+        record: &SessionRecord,
+        request: &memory::store::session::SessionMissionOutboxRequest,
+    ) -> Result<bool, MemoryError> {
+        match self.kernel() {
+            Some(kernel) => {
+                kernel
+                    .upsert_stored_session_with_mission_outbox(record, request)
+                    .await
+            }
+            None => Ok(false),
+        }
+    }
+
     pub(crate) async fn update_stored_session(
         &self,
         record: &SessionRecord,
@@ -345,6 +357,20 @@ impl SessionService {
     ) -> Result<bool, MemoryError> {
         match self.kernel() {
             Some(kernel) => kernel.delete_stored_session(session_id).await,
+            None => Ok(false),
+        }
+    }
+
+    pub(crate) async fn delete_stored_session_with_mission_outbox(
+        &self,
+        request: &memory::store::session::SessionMissionOutboxRequest,
+    ) -> Result<bool, MemoryError> {
+        match self.kernel() {
+            Some(kernel) => {
+                kernel
+                    .delete_stored_session_with_mission_outbox(request)
+                    .await
+            }
             None => Ok(false),
         }
     }
@@ -462,42 +488,20 @@ impl SessionService {
         }
     }
 
-    pub(crate) async fn append_runtime_event(
+    pub(crate) async fn append_session_domain_event(
         &self,
         session_id: &str,
-        scope: RuntimeEventScope,
+        scope: SessionDomainScope,
         kind: impl Into<String>,
         payload: serde_json::Value,
     ) -> Result<Option<usize>, MemoryError> {
         match self.kernel() {
             Some(kernel) => {
                 kernel
-                    .append_runtime_event(session_id, scope, kind, payload)
+                    .append_session_domain_event(session_id, scope, kind, payload)
                     .await
             }
             None => Ok(None),
-        }
-    }
-
-    pub(crate) async fn persist_workgraph_review(
-        &self,
-        graph: &AgentWorkGraph,
-        packet: &CollaborationReviewPacket,
-        memory_manager: Option<&Arc<CognitiveContextManager>>,
-    ) -> Result<crate::session_kernel::RuntimeClosedLoopResult, MemoryError> {
-        match self.kernel() {
-            Some(kernel) => {
-                kernel
-                    .persist_workgraph_review(graph, packet, memory_manager)
-                    .await
-            }
-            None => Ok(crate::session_kernel::RuntimeClosedLoopResult {
-                session_id: graph.session_id.clone(),
-                persisted: false,
-                runtime_event_sequence: None,
-                memory_pulse: None,
-                degraded_reason: Some("session service not configured".to_string()),
-            }),
         }
     }
 
@@ -511,16 +515,16 @@ impl SessionService {
         }
     }
 
-    pub(crate) async fn stored_runtime_events_page(
+    pub(crate) async fn stored_session_domain_events_page(
         &self,
         session_id: &str,
         from_sequence: usize,
         limit: usize,
-    ) -> Result<Option<RuntimeEventPage>, MemoryError> {
+    ) -> Result<Option<SessionDomainEventPage>, MemoryError> {
         match self.kernel() {
             Some(kernel) => {
                 kernel
-                    .stored_runtime_events_page(session_id, from_sequence, limit)
+                    .stored_session_domain_events_page(session_id, from_sequence, limit)
                     .await
             }
             None => Ok(None),
@@ -532,7 +536,7 @@ impl SessionService {
         session_id: &str,
         from_sequence: usize,
         limit: usize,
-    ) -> Result<Option<RuntimeEventPage>, MemoryError> {
+    ) -> Result<Option<SessionDomainEventPage>, MemoryError> {
         match self.kernel() {
             Some(kernel) => {
                 kernel

@@ -20,7 +20,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace
-      - run: cargo clippy --workspace --all-targets
+      - run: scripts/ci/clippy-safety.sh
       - run: scripts/validate.sh unit-fast
 
   validate-core:

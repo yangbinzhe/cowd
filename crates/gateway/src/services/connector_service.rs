@@ -44,7 +44,16 @@ impl ConnectorService {
         blockers: Vec<String>,
         evidence: CrossPlaneDecisionEvidence,
         audit_summary: String,
-    ) -> CrossPlaneExecutionReceipt {
+        execution_graph_id: Option<String>,
+    ) -> Result<CrossPlaneExecutionReceipt, runtime::CrossPlaneRuntimeError> {
+        if execution_graph_id.is_some() {
+            if let Some(existing) = idempotency_key
+                .as_deref()
+                .and_then(|key| cross_plane.find_execution_by_idempotency_key(key))
+            {
+                return Ok(existing);
+            }
+        }
         let audit_result = if mode == "commit" && status == "executed" {
             "executed"
         } else if status == "dry_run" {
@@ -52,7 +61,7 @@ impl ConnectorService {
         } else {
             "blocked"
         };
-        let (_, receipt) = cross_plane.record_action_execution(CrossPlaneExecutionRecord {
+        let record = CrossPlaneExecutionRecord {
             idempotency_key,
             mode: mode.to_string(),
             status: match status {
@@ -62,7 +71,7 @@ impl ConnectorService {
             }
             .to_string(),
             dispatch_status: match dispatch_status {
-                "service_mock_executed" => "service_mock_executed",
+                "service_executed" | "service_mock_executed" => dispatch_status,
                 _ => "not_dispatched",
             }
             .to_string(),
@@ -74,8 +83,14 @@ impl ConnectorService {
             evidence,
             audit_result: audit_result.to_string(),
             audit_summary,
-        });
-        receipt
+            execution_graph_id,
+        };
+        let (_, receipt) = if mode == "commit" && status == "executed" {
+            cross_plane.record_completed_effect_execution(record)?
+        } else {
+            cross_plane.record_action_execution(record)?
+        };
+        Ok(receipt)
     }
 
     pub(crate) fn resource_list(&self) -> ServiceEnvelope {

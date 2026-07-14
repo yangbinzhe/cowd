@@ -20,10 +20,7 @@ pub(in crate::api_routes) fn health_summary(
     }
 
     for event in events {
-        let scope = serde_json::to_value(event.scope)
-            .ok()
-            .and_then(|value| value.as_str().map(ToString::to_string))
-            .unwrap_or_else(|| "unknown".to_string());
+        let scope = event.scope.clone();
         let next = scope_counts
             .get(&scope)
             .and_then(Value::as_u64)
@@ -57,7 +54,7 @@ pub(in crate::api_routes) fn health_summary(
                     "complexity": event.payload.get("complexity").cloned().unwrap_or(Value::Null),
                 });
             }
-            "agent.workgraph.reviewed" => {
+            "agent.execution_graph.reviewed" => {
                 if let Some(verdict) = event.payload.get("value_verdict") {
                     positive_agent_lift |= verdict
                         .get("positive_lift")

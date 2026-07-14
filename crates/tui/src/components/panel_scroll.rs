@@ -70,20 +70,6 @@ impl PanelScrollState {
     }
 }
 
-pub fn clamp_u16_offset(offset: &mut u16, content_len: usize, viewport_len: usize) {
-    let mut state = PanelScrollState {
-        offset: *offset as usize,
-        content_len,
-        viewport_len: viewport_len.max(1),
-    };
-    state.clamp();
-    *offset = offset_to_u16(state.offset);
-}
-
-pub fn offset_to_u16(offset: usize) -> u16 {
-    offset.min(u16::MAX as usize) as u16
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,7 +111,13 @@ mod tests {
     }
 
     #[test]
-    fn u16_offset_conversion_saturates() {
-        assert_eq!(offset_to_u16(usize::MAX), u16::MAX);
+    fn long_panel_content_never_wraps_at_terminal_coordinate_limit() {
+        let mut state = PanelScrollState::new();
+        state.sync(70_000, 10);
+        state.bottom();
+        assert_eq!(state.offset, 69_990);
+
+        state.ensure_visible(69_999);
+        assert_eq!(state.offset, 69_990);
     }
 }

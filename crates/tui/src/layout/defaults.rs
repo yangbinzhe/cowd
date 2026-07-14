@@ -238,28 +238,19 @@ impl LayoutState {
     ///   (chat view fills the entire width).
     /// * **Showing**: restores the previously saved ratio.
     ///
-    /// # Panics
-    ///
-    /// Panics if the root node of `tree` is not a `LayoutNode::Split`.
-    /// `build_default_layout()` always produces a `Split` root.
     pub fn toggle_sidebar(&mut self, tree: &mut LayoutTree) {
-        match &mut tree.root {
-            LayoutNode::Split(ref mut split) => {
-                if self.sidebar_visible {
-                    // Hide sidebar: save current ratio, set to 1.0
-                    self.saved_ratio = split.ratio.clamp(RATIO_MIN, RATIO_MAX);
-                    split.ratio = 1.0;
-                } else {
-                    // Show sidebar: restore saved ratio
-                    split.ratio = self.saved_ratio.clamp(RATIO_MIN, RATIO_MAX);
-                }
-                self.sidebar_visible = !self.sidebar_visible;
-            }
-            other => panic!(
-                "toggle_sidebar expects a Split root node, got {:?}",
-                std::mem::discriminant(other)
-            ),
+        let LayoutNode::Split(split) = &mut tree.root else {
+            return;
+        };
+        if self.sidebar_visible {
+            // Hide sidebar: save current ratio, set to 1.0
+            self.saved_ratio = split.ratio.clamp(RATIO_MIN, RATIO_MAX);
+            split.ratio = 1.0;
+        } else {
+            // Show sidebar: restore saved ratio
+            split.ratio = self.saved_ratio.clamp(RATIO_MIN, RATIO_MAX);
         }
+        self.sidebar_visible = !self.sidebar_visible;
     }
 
     // ── Ratio Resize ───────────────────────────────────────────────
@@ -274,22 +265,14 @@ impl LayoutState {
     /// makes it visible again (sets `sidebar_visible = true` and
     /// updates `saved_ratio`).
     ///
-    /// # Panics
-    ///
-    /// Panics if the root node of `tree` is not a `LayoutNode::Split`.
     pub fn resize_sidebar(&mut self, tree: &mut LayoutTree, delta: f32) {
-        match &mut tree.root {
-            LayoutNode::Split(ref mut split) => {
-                let new_ratio = (split.ratio + delta).clamp(RATIO_MIN, RATIO_MAX);
-                split.ratio = new_ratio;
-                self.saved_ratio = new_ratio;
-                self.sidebar_visible = true;
-            }
-            other => panic!(
-                "resize_sidebar expects a Split root node, got {:?}",
-                std::mem::discriminant(other)
-            ),
-        }
+        let LayoutNode::Split(split) = &mut tree.root else {
+            return;
+        };
+        let new_ratio = (split.ratio + delta).clamp(RATIO_MIN, RATIO_MAX);
+        split.ratio = new_ratio;
+        self.saved_ratio = new_ratio;
+        self.sidebar_visible = true;
     }
 
     // ── Accessors ──────────────────────────────────────────────────

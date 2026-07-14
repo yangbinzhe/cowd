@@ -216,7 +216,9 @@ run_serial_global() {
 
 run_scenario() {
   run_step cargo_build_cli cargo build -p cli --no-default-features
+  run_step cargo_build_auth_broker cargo build -p auth-broker
   export COWD_BIN="$CARGO_TARGET_DIR/debug/cowd"
+  export COWD_AUTH_BROKER_BIN="$CARGO_TARGET_DIR/debug/cowd-auth-broker"
   run_step ai_harness bash scripts/ci/ai-harness.sh
   run_step gateway_baseline bash scripts/scenarios/gateway-webui-contract.sh
   run_step session_runtime bash scripts/scenarios/runtime-surface.sh

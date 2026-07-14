@@ -1,12 +1,23 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
 use chrono::Utc;
 use memory::store::session::SessionRecord;
 use memory::{
     AgentVisibility, CognitiveContextManager, FactChecker, MemoryCategory, MemoryConfig,
-    MemoryEntry, MemoryLayer, MemoryScope, MemorySource, Priority, RuntimeEvent, RuntimeEventScope,
-    RuntimeRef, UnifiedSessionStore,
+    MemoryEntry, MemoryLayer, MemoryScope, MemorySource, MemoryTurnContext, Priority,
+    UnifiedSessionStore,
 };
 use memory::{DocumentCategory, DocumentContent, DocumentIngestor};
-use runtime::agent_protocol::{AgentEvidence, AgentReview, ReviewVerdict};
+use runtime::{
+    L4CandidateLifecycle, L4PromotionCandidate, L4PromotionService, RuntimeEventInput,
+    RuntimeEventRef, RuntimeEventScope, RuntimeEventStore,
+};
+use std::sync::Arc;
 
 fn memory_config(sqlite_path: &std::path::Path) -> MemoryConfig {
     MemoryConfig {
@@ -114,9 +125,11 @@ async fn cowd_full_capability_eval_covers_document_memory_fact_session_agents_an
 ) {
     let tmp = tempfile::TempDir::new().expect("temp dir creates");
     let session_id = "session-full-capability-eval";
-    let memory = CognitiveContextManager::new(memory_config(&tmp.path().join("memory.db")))
-        .await
-        .expect("memory manager opens");
+    let memory = Arc::new(
+        CognitiveContextManager::new(memory_config(&tmp.path().join("memory.db")))
+            .await
+            .expect("memory manager opens"),
+    );
     let sessions = UnifiedSessionStore::open_in_memory().expect("session store opens");
     sessions
         .create_session(&session_record(session_id))
@@ -185,103 +198,81 @@ async fn cowd_full_capability_eval_covers_document_memory_fact_session_agents_an
     assert!(fact_result.contradiction.is_some());
 
     let agent_evidence = [
-        AgentEvidence {
-            id: "evidence-planner-doc".to_string(),
-            node_id: "agent-planner".to_string(),
-            kind: "complex_document".to_string(),
-            reference: format!("memory:{document_memory_id}"),
-            summary: "Planner extracted manufacturing facts from complex document.".to_string(),
-            created_at_ms: 1_000,
-        },
-        AgentEvidence {
-            id: "evidence-executor-structured".to_string(),
-            node_id: "agent-executor".to_string(),
-            kind: "structured_evidence".to_string(),
-            reference: "structured-evidence:shortage-risk-packet".to_string(),
-            summary: "Executor linked structured shortage evidence and supplier recovery action."
-                .to_string(),
-            created_at_ms: 2_000,
-        },
-        AgentEvidence {
-            id: "evidence-reviewer-fact-check".to_string(),
-            node_id: "agent-reviewer".to_string(),
-            kind: "fact_check".to_string(),
-            reference: "fact-check:triple-full-capability-conflict".to_string(),
-            summary: "Reviewer detected contradictory supplier recovery status.".to_string(),
-            created_at_ms: 3_000,
-        },
+        serde_json::json!({
+            "id": "evidence-planner-doc",
+            "node_id": "agent-planner",
+            "kind": "complex_document",
+            "reference": format!("memory:{document_memory_id}"),
+            "summary": "Planner extracted manufacturing facts from complex document."
+        }),
+        serde_json::json!({
+            "id": "evidence-executor-structured",
+            "node_id": "agent-executor",
+            "kind": "structured_evidence",
+            "reference": "structured-evidence:shortage-risk-packet",
+            "summary": "Executor linked structured shortage evidence and supplier recovery action."
+        }),
+        serde_json::json!({
+            "id": "evidence-reviewer-fact-check",
+            "node_id": "agent-reviewer",
+            "kind": "fact_check",
+            "reference": "fact-check:triple-full-capability-conflict",
+            "summary": "Reviewer detected contradictory supplier recovery status."
+        }),
     ];
-    let review = AgentReview {
-        id: "review-full-capability".to_string(),
-        node_id: "agent-reviewer".to_string(),
-        reviewer: "agent-reviewer".to_string(),
-        verdict: ReviewVerdict::Accept,
-        comment: "All evidence, memory, session, and structured checks are connected.".to_string(),
-        created_at_ms: 4_000,
-    };
+    let review = serde_json::json!({
+        "id": "review-full-capability",
+        "node_id": "agent-reviewer",
+        "reviewer": "agent-reviewer",
+        "verdict": "accept",
+        "comment": "All evidence, memory, session, and structured checks are connected."
+    });
 
-    let mut events = Vec::new();
-    for (index, evidence) in agent_evidence.iter().enumerate() {
-        let mut event = RuntimeEvent::new(
-            session_id,
-            index + 1,
-            RuntimeEventScope::Agent,
-            "agent.evidence",
-            serde_json::to_value(evidence).expect("agent evidence serializes"),
-            evidence.created_at_ms,
-        );
-        event.status = Some("ok".to_string());
-        event.refs = vec![
-            RuntimeRef {
-                ref_type: "agent_node".to_string(),
-                id: evidence.node_id.clone(),
-                label: Some(evidence.kind.clone()),
-            },
-            RuntimeRef {
-                ref_type: "evidence".to_string(),
-                id: evidence.id.clone(),
-                label: Some(evidence.summary.clone()),
-            },
-        ];
-        sessions
-            .append_runtime_event(&event)
-            .await
+    let execution_events =
+        Arc::new(RuntimeEventStore::open_in_memory().expect("runtime event store opens"));
+    for evidence in &agent_evidence {
+        execution_events
+            .append(RuntimeEventInput {
+                stream_id: session_id.to_string(),
+                scope: RuntimeEventScope::Agent,
+                kind: "agent.evidence".to_string(),
+                status: Some("ok".to_string()),
+                actor: Some("capability-eval".to_string()),
+                refs: vec![
+                    RuntimeEventRef {
+                        kind: "agent_node".to_string(),
+                        id: evidence["node_id"].as_str().unwrap().to_string(),
+                    },
+                    RuntimeEventRef {
+                        kind: "evidence".to_string(),
+                        id: evidence["id"].as_str().unwrap().to_string(),
+                    },
+                ],
+                payload: evidence.clone(),
+            })
             .expect("agent evidence event appends");
-        events.push(event);
     }
-
-    let mut review_event = RuntimeEvent::new(
-        session_id,
-        10,
-        RuntimeEventScope::Agent,
-        "agent.review",
-        serde_json::to_value(&review).expect("review serializes"),
-        review.created_at_ms,
-    );
-    review_event.status = Some("accepted".to_string());
-    review_event.refs = vec![RuntimeRef {
-        ref_type: "agent_review".to_string(),
-        id: review.id.clone(),
-        label: Some("full capability accepted".to_string()),
-    }];
-    sessions
-        .append_runtime_event(&review_event)
-        .await
+    execution_events
+        .append(RuntimeEventInput {
+            stream_id: session_id.to_string(),
+            scope: RuntimeEventScope::Agent,
+            kind: "agent.review".to_string(),
+            status: Some("accepted".to_string()),
+            actor: Some("agent-reviewer".to_string()),
+            refs: vec![RuntimeEventRef {
+                kind: "agent_review".to_string(),
+                id: review["id"].as_str().unwrap().to_string(),
+            }],
+            payload: review.clone(),
+        })
         .expect("review event appends");
 
-    let timeline = sessions
-        .timeline_events_page(session_id, 0, 20)
-        .await
+    let timeline = execution_events
+        .list_stream(session_id)
         .expect("timeline loads");
-    assert_eq!(timeline.total, 4);
-    assert!(timeline
-        .events
-        .iter()
-        .any(|event| event.kind == "agent.evidence"));
-    assert!(timeline
-        .events
-        .iter()
-        .any(|event| event.kind == "agent.review"));
+    assert_eq!(timeline.len(), 4);
+    assert!(timeline.iter().any(|event| event.kind == "agent.evidence"));
+    assert!(timeline.iter().any(|event| event.kind == "agent.review"));
 
     let associated = sessions
         .get_session_memories(session_id)
@@ -289,32 +280,73 @@ async fn cowd_full_capability_eval_covers_document_memory_fact_session_agents_an
         .expect("session memories load");
     assert!(associated.contains(&document_memory_id.to_string()));
 
-    let reviewer_memory = memory_entry(
-        "Reviewer accepted full capability eval",
-        &format!(
+    let l4_promotion =
+        L4PromotionService::new(Arc::clone(&execution_events), Some(Arc::clone(&memory)));
+    let reviewer_candidate = L4PromotionCandidate {
+        candidate_id: "candidate-full-capability-review".to_string(),
+        team_id: "team-full-capability-eval".to_string(),
+        graph_id: "graph-full-capability-eval".to_string(),
+        lineage_ref: format!("session:{session_id}"),
+        title: "Reviewer accepted full capability eval".to_string(),
+        content: format!(
             "review={} fact_check_consistent={} structured_ref={}",
-            review.id, fact_result.is_consistent, "structured-evidence:shortage-risk-packet"
+            review["id"].as_str().unwrap(),
+            fact_result.is_consistent,
+            "structured-evidence:shortage-risk-packet"
         ),
-        MemoryLayer::L4,
-        MemoryCategory::Decision,
-        Some(session_id.to_string()),
-        Some("agent-reviewer".to_string()),
-        vec!["review".to_string(), "full-capability".to_string()],
-    );
-    let reviewer_memory_id = reviewer_memory.id;
-    memory
-        .remember(reviewer_memory)
+        scope: MemoryScope::Project("cowd-full-capability-eval".to_string()),
+        source_evidence_refs: agent_evidence
+            .iter()
+            .map(|evidence| format!("evidence:{}", evidence["id"].as_str().unwrap()))
+            .collect(),
+        priority: Priority::High,
+        tags: vec!["review".to_string(), "full-capability".to_string()],
+    };
+    let reviewer_memory = l4_promotion
+        .validate_and_promote(reviewer_candidate.clone())
         .await
-        .expect("reviewer memory stores");
+        .expect("reviewer memory promotes through the governed L4 path");
+    assert_eq!(reviewer_memory.lifecycle, L4CandidateLifecycle::Promoted);
+    assert_eq!(
+        l4_promotion
+            .lifecycle(&reviewer_candidate)
+            .expect("L4 promotion lifecycle loads"),
+        vec![
+            L4CandidateLifecycle::Proposed,
+            L4CandidateLifecycle::Validated,
+            L4CandidateLifecycle::Promoted,
+        ]
+    );
 
+    let shared_l4 = memory
+        .orchestrator()
+        .team_query(
+            "full capability eval",
+            Some(&MemoryScope::Project(
+                "cowd-full-capability-eval".to_string(),
+            )),
+            5,
+        )
+        .await
+        .expect("governed shared memory query succeeds");
+    assert!(
+        shared_l4
+            .iter()
+            .any(|entry| entry.id.to_string() == reviewer_memory.memory_id),
+        "promoted L4 memory must be retrievable through the scoped Runtime-facing recall path"
+    );
+
+    let turn = MemoryTurnContext::new(session_id, "agent-reviewer")
+        .with_project_id(Some("cowd-full-capability-eval".to_string()))
+        .with_team_id(Some("team-full-capability-eval".to_string()));
     let prepared = memory
-        .prepare_context("full capability eval supplier_recovery", &[], None)
+        .prepare_context_for_turn(
+            &turn,
+            "material_shortage_risk supplier_recovery quality gate",
+            &[],
+        )
         .await
         .expect("context prepares");
-    assert!(prepared
-        .entries
-        .iter()
-        .any(|entry| entry.id == reviewer_memory_id));
     assert!(prepared.entries.iter().any(|entry| {
         entry.title.contains("full capability")
             || entry.title.contains("Full capability")

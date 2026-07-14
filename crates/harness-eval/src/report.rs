@@ -27,7 +27,7 @@ impl HarnessEvalLevel {
         match value.trim().to_ascii_lowercase().as_str() {
             "quick" | "smoke" | "lightweight" => Some(Self::Quick),
             "full" => Some(Self::Full),
-            "deep" | "real" => Some(Self::Deep),
+            "deep" | "real" | "deep-real" | "deep_real" => Some(Self::Deep),
             _ => None,
         }
     }
@@ -42,6 +42,9 @@ impl Default for HarnessEvalLevel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HarnessEvalRunStatus {
+    Queued,
+    Running,
+    CancelRequested,
     Completed,
     Gated,
     Cancelled,
@@ -52,6 +55,9 @@ impl HarnessEvalRunStatus {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::CancelRequested => "cancel_requested",
             Self::Completed => "completed",
             Self::Gated => "gated",
             Self::Cancelled => "cancelled",
@@ -230,8 +236,37 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
         .get("event_observation_parity")
         .unwrap_or(&Value::Null);
     let reality_context = report.get("reality_context_eval").unwrap_or(&Value::Null);
+    let mission_runtime = report
+        .get("mission_runtime_collaboration")
+        .unwrap_or(&Value::Null);
+    let next_gen = report
+        .get("next_gen_harness_closure")
+        .unwrap_or(&Value::Null);
+    let next_gen_scenarios = next_gen
+        .get("scenarios")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let evidence_manifest = report.get("evidence_manifest").unwrap_or(&Value::Null);
     let package = report.get("report_package").unwrap_or(&Value::Null);
     let is_quick = level == "quick";
+    let claims_tool_validation = next_gen_claims(&next_gen_scenarios, "claims_tool_validation");
+    let claims_orchestration = next_gen_claims(&next_gen_scenarios, "claims_orchestration");
+    let claims_memory_context = next_gen_claims(&next_gen_scenarios, "claims_memory_context");
+    let claims_replay = next_gen_claims(&next_gen_scenarios, "claims_replay");
+    let claims_external_access = next_gen_claims(&next_gen_scenarios, "claims_external_access");
+    let real_model_claimed = report
+        .get("authorized_real_model")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || report
+            .get("stable_ai")
+            .and_then(|value| value.get("real_provider_enabled"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    let live = report.get("live_gateway_scenarios").unwrap_or(&Value::Null);
+    let live_provider_rounds = live_gateway_provider_rounds(live);
+    let live_total_tokens = live_gateway_total_tokens(live);
 
     let mut items = Vec::new();
     items.push(HarnessEvalReportGateItem::new(
@@ -293,6 +328,169 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
         ),
         "repair RecallReport/ContextEnvelope scenario evidence before accepting the report",
     ));
+    items.push(HarnessEvalReportGateItem::new(
+        "mission_runtime_collaboration_closure",
+        scenario_status(&scenarios, "mission_runtime_collaboration_closure") == Some("passed")
+            && mission_runtime.get("status").and_then(Value::as_str) == Some("passed")
+            && mission_runtime
+                .pointer("/mission_projection/schema_version")
+                .and_then(Value::as_u64)
+                .is_some_and(|version| version >= 2),
+        true,
+        format!(
+            "status={}, projection_v={}",
+            mission_runtime
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("missing"),
+            mission_runtime
+                .pointer("/mission_projection/schema_version")
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+        ),
+        "repair mission runtime collaboration closure before accepting the report",
+    ));
+    items.push(HarnessEvalReportGateItem::new(
+        "next_gen_harness_closure_complete",
+        scenario_status(&scenarios, "next_gen_harness_closure") == Some("passed")
+            && next_gen.get("status").and_then(Value::as_str) == Some("passed")
+            && next_gen
+                .get("failed")
+                .and_then(Value::as_u64)
+                .is_some_and(|failed| failed == 0)
+            && next_gen_scenarios.len() >= 7,
+        true,
+        format!(
+            "status={}, scenarios={}, failed={}",
+            next_gen
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("missing"),
+            next_gen_scenarios.len(),
+            next_gen
+                .get("failed")
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+        ),
+        "run the next_gen_harness_closure suite and keep all terminal scenarios evidenced",
+    ));
+    items.push(HarnessEvalReportGateItem::new(
+        "claimed_orchestration_has_runtime_actions",
+        !claims_orchestration || runtime_actions >= 3,
+        true,
+        format!("claims_orchestration={claims_orchestration}, runtime_actions={runtime_actions}"),
+        "reports that claim orchestration must include runtime action trace evidence",
+    ));
+    items.push(HarnessEvalReportGateItem::new(
+        "claimed_tool_validation_has_tool_evidence",
+        !claims_tool_validation || tool_calls > 0,
+        true,
+        format!("claims_tool_validation={claims_tool_validation}, tool_calls={tool_calls}"),
+        "reports that claim tool validation must include real local tool execution evidence",
+    ));
+    items.push(HarnessEvalReportGateItem::new(
+        "claimed_memory_context_has_context_report",
+        !claims_memory_context
+            || (reality_context
+                .get("evidence_ref_total")
+                .and_then(Value::as_u64)
+                .is_some_and(|count| count > 0)
+                && next_gen_evidence_refs_total(&next_gen_scenarios) > 0),
+        true,
+        format!(
+            "claims_memory_context={}, reality_evidence_refs={}, next_gen_refs={}",
+            claims_memory_context,
+            reality_context
+                .get("evidence_ref_total")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            next_gen_evidence_refs_total(&next_gen_scenarios)
+        ),
+        "memory/context claims must include RecallReport/ContextEnvelope evidence refs",
+    ));
+    items.push(HarnessEvalReportGateItem::new(
+        "claimed_replay_has_evidence_refs",
+        !claims_replay || next_gen_claimed_evidence_refs(&next_gen_scenarios, "claims_replay") > 0,
+        true,
+        format!(
+            "claims_replay={}, replay_refs={}",
+            claims_replay,
+            next_gen_claimed_evidence_refs(&next_gen_scenarios, "claims_replay")
+        ),
+        "replay/recovery claims must include replay, conflict, or recovery evidence refs",
+    ));
+    items.push(HarnessEvalReportGateItem::new(
+        "claimed_external_access_has_health_evidence",
+        !claims_external_access || manifest_has_external_health(evidence_manifest),
+        true,
+        format!(
+            "claims_external_access={}, source={}, sidecar={}, db={}",
+            claims_external_access,
+            evidence_manifest
+                .get("source_fixture_status")
+                .and_then(Value::as_str)
+                .unwrap_or("missing"),
+            evidence_manifest
+                .get("sidecar_fixture_status")
+                .and_then(Value::as_str)
+                .unwrap_or("missing"),
+            evidence_manifest
+                .get("db_fixture_status")
+                .and_then(Value::as_str)
+                .unwrap_or("missing")
+        ),
+        "external source/sidecar claims must include explicit connected or healthy fixture evidence",
+    ));
+    items.push(HarnessEvalReportGateItem::new(
+        "real_model_claim_has_provider_rounds",
+        !real_model_claimed || runtime_provider_rounds(trace) > 0 || live_provider_rounds > 0,
+        true,
+        format!(
+            "real_model_claimed={}, trace_provider_rounds={}, live_provider_rounds={}",
+            real_model_claimed,
+            runtime_provider_rounds(trace),
+            live_provider_rounds
+        ),
+        "deep/real reports may not claim real model evidence with zero provider rounds",
+    ));
+    items.push(HarnessEvalReportGateItem::new(
+        "evidence_manifest_complete",
+        evidence_manifest.get("kind").and_then(Value::as_str)
+            == Some("harness_eval.evidence_manifest")
+            && evidence_manifest
+                .get("repo")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+            && evidence_manifest
+                .get("commit")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+            && evidence_manifest
+                .get("version")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+            && evidence_manifest
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty()),
+        true,
+        format!(
+            "repo={}, commit={}, version={}",
+            evidence_manifest
+                .get("repo")
+                .and_then(Value::as_str)
+                .unwrap_or("missing"),
+            evidence_manifest
+                .get("commit")
+                .and_then(Value::as_str)
+                .unwrap_or("missing"),
+            evidence_manifest
+                .get("version")
+                .and_then(Value::as_str)
+                .unwrap_or("missing")
+        ),
+        "write a complete evidence manifest before accepting the report package",
+    ));
 
     if is_quick {
         items.push(HarnessEvalReportGateItem::new(
@@ -341,9 +539,11 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
         ));
         items.push(HarnessEvalReportGateItem::new(
             "token_usage_nonzero_or_estimated",
-            total_tokens > 0 && usage_source != "unavailable",
+            (total_tokens > 0 || live_total_tokens > 0) && usage_source != "unavailable",
             true,
-            format!("total_tokens={total_tokens}, usage_source={usage_source}"),
+            format!(
+                "trace_total_tokens={total_tokens}, live_total_tokens={live_total_tokens}, usage_source={usage_source}"
+            ),
             "record provider usage or explicit deterministic/estimated fallback",
         ));
         items.push(HarnessEvalReportGateItem::new(
@@ -364,6 +564,44 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
         ));
     }
 
+    if level == "deep" {
+        let live = report.get("live_gateway_scenarios").unwrap_or(&Value::Null);
+        let live_scenarios = live
+            .get("scenarios")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let all_traces_complete = live_scenarios.iter().all(|scenario| {
+            scenario.get("status").and_then(Value::as_str) == Some("passed")
+                && scenario
+                    .pointer("/production_trace/session_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.is_empty())
+                && scenario
+                    .pointer("/production_trace/terminal_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.is_empty())
+                && scenario
+                    .pointer("/production_trace/execution_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.is_empty())
+        });
+        items.push(HarnessEvalReportGateItem::new(
+            "deep_live_gateway_scenarios",
+            live.get("status").and_then(Value::as_str) == Some("passed")
+                && live_scenarios.len() >= 3
+                && all_traces_complete,
+            true,
+            format!(
+                "live_status={}, scenarios={}, complete_traces={}",
+                live.get("status").and_then(Value::as_str).unwrap_or("missing"),
+                live_scenarios.len(),
+                all_traces_complete
+            ),
+            "run deep evaluation against an explicit isolated COWD_EVAL_GATEWAY_URL and retain durable session, terminal, execution and cursor traces for every live scenario",
+        ));
+    }
+
     HarnessEvalReportGate::from_items(items)
 }
 
@@ -373,6 +611,139 @@ fn scenario_status<'a>(scenarios: &'a [Value], capability: &str) -> Option<&'a s
         .find(|item| item.get("capability").and_then(Value::as_str) == Some(capability))
         .and_then(|item| item.get("status"))
         .and_then(Value::as_str)
+}
+
+fn next_gen_claims(scenarios: &[Value], field: &str) -> bool {
+    scenarios.iter().any(|scenario| {
+        scenario
+            .get(field)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    })
+}
+
+fn next_gen_evidence_refs_total(scenarios: &[Value]) -> u64 {
+    scenarios
+        .iter()
+        .map(|scenario| {
+            scenario
+                .get("evidence_refs")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len) as u64
+        })
+        .sum()
+}
+
+fn next_gen_claimed_evidence_refs(scenarios: &[Value], claim_field: &str) -> u64 {
+    scenarios
+        .iter()
+        .filter(|scenario| {
+            scenario
+                .get(claim_field)
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .map(|scenario| {
+            scenario
+                .get("evidence_refs")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len) as u64
+        })
+        .sum()
+}
+
+fn manifest_has_external_health(manifest: &Value) -> bool {
+    [
+        "source_fixture_status",
+        "sidecar_fixture_status",
+        "db_fixture_status",
+    ]
+    .iter()
+    .any(|key| {
+        manifest
+            .get(*key)
+            .and_then(Value::as_str)
+            .is_some_and(|value| matches!(value, "connected" | "healthy" | "passed"))
+    })
+}
+
+fn runtime_provider_rounds(trace: &Value) -> u64 {
+    trace
+        .get("provider_rounds")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+}
+
+fn live_gateway_provider_rounds(live: &Value) -> u64 {
+    live.get("scenarios")
+        .and_then(Value::as_array)
+        .map(|scenarios| {
+            scenarios
+                .iter()
+                .map(|scenario| {
+                    scenario
+                        .pointer("/metrics/model_rounds")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default()
+                })
+                .sum()
+        })
+        .unwrap_or_default()
+}
+
+fn live_gateway_total_tokens(live: &Value) -> u64 {
+    live.get("scenarios")
+        .and_then(Value::as_array)
+        .map(|scenarios| {
+            scenarios
+                .iter()
+                .map(|scenario| {
+                    scenario
+                        .pointer("/metrics/total_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default()
+                })
+                .sum()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn gate_accepts_real_gateway_model_metrics_without_report_reviewer() {
+        let report = json!({
+            "level": "deep",
+            "authorized_real_model": true,
+            "execution_trace": {
+                "provider_rounds": 0,
+                "total_usage": {"total_tokens": 0, "usage_source": "deterministic_smoke"}
+            },
+            "live_gateway_scenarios": {
+                "status": "passed",
+                "scenarios": [{
+                    "status": "passed",
+                    "metrics": {"model_rounds": 2, "total_tokens": 321}
+                }]
+            }
+        });
+
+        let gate = evaluate_report_gate(&report);
+        let item = |name: &str| {
+            gate.items
+                .iter()
+                .find(|item| item.name == name)
+                .expect("gate item")
+        };
+        assert_eq!(
+            item("real_model_claim_has_provider_rounds").status,
+            "passed"
+        );
+        assert_eq!(item("token_usage_nonzero_or_estimated").status, "passed");
+    }
 }
 
 #[derive(Debug, Serialize)]

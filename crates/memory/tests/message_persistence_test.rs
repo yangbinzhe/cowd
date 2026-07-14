@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
 //! Tests for `SessionMessage` CRUD and FTS5 search.
 //!
 //! Covers:
@@ -51,6 +58,7 @@ fn make_message(
     content_text: &str,
 ) -> SessionMessage {
     SessionMessage {
+        stable_message_id: format!("test:{session_id}:{sequence}"),
         session_id: session_id.to_string(),
         sequence,
         role: role.to_string(),
@@ -65,6 +73,7 @@ fn make_message(
 
 fn make_multi_block_message(session_id: &str, sequence: usize) -> SessionMessage {
     SessionMessage {
+        stable_message_id: format!("test:{session_id}:{sequence}"),
         session_id: session_id.to_string(),
         sequence,
         role: "assistant".to_string(),

@@ -1,11 +1,11 @@
 // ── Task Decomposition View ────────────────────────────────────────
 // Displays a DAG-based tree of subtasks decomposed by the
-// CollaborationOrchestrator. Each subtask shows description,
+// canonical ExecutionGraph projection. Each task shows description,
 // required skills, dependency status, and tree indentation
 // derived from the dependency graph depth.
 //
 // Features:
-//   - sync_from_orchestrator: fetch subtasks from CollaborationOps
+//   - sync_from_projection: fetch task nodes from the Gateway projection
 //   - DAG-based tree indentation
 //   - Status: depends_on satisfied = ready, else pending
 //   - Expand/collapse individual subtasks
@@ -34,7 +34,7 @@ pub struct SubTask {
 
 /// Renders a dependency-aware tree view of decomposed subtasks.
 ///
-/// Built from a `SubTask` list obtained via [`CollaborationOps::decompose_task`].
+/// Built from a task-node projection supplied by the Gateway.
 /// The dependency graph (DAG) drives indentation depth and readiness status.
 pub struct TaskDecompositionView {
     /// Subtasks from the orchestrator.

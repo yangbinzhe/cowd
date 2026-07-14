@@ -62,12 +62,13 @@ impl Split {
                 }
 
                 let rem_w = area.width.saturating_sub(split_w);
-                let base = rem_w / remaining as u16;
-                let extra = rem_w % remaining as u16;
+                let divisor = crate::components::base::terminal_len(remaining).max(1);
+                let base = rem_w / divisor;
+                let extra = rem_w % divisor;
 
                 let mut cx = area.x + split_w;
                 for i in 0..remaining {
-                    let w = base + if (i as u16) < extra { 1 } else { 0 };
+                    let w = base + if i < usize::from(extra) { 1 } else { 0 };
                     areas.push(Rect {
                         x: cx,
                         y: area.y,
@@ -97,12 +98,13 @@ impl Split {
                 }
 
                 let rem_h = area.height.saturating_sub(split_h);
-                let base = rem_h / remaining as u16;
-                let extra = rem_h % remaining as u16;
+                let divisor = crate::components::base::terminal_len(remaining).max(1);
+                let base = rem_h / divisor;
+                let extra = rem_h % divisor;
 
                 let mut cy = area.y + split_h;
                 for i in 0..remaining {
-                    let h = base + if (i as u16) < extra { 1 } else { 0 };
+                    let h = base + if i < usize::from(extra) { 1 } else { 0 };
                     areas.push(Rect {
                         x: area.x,
                         y: cy,

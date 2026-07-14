@@ -1,13 +1,15 @@
 use std::cmp::Reverse;
 use std::fs;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use glob::Pattern;
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
+
+use crate::path_policy::WorkspacePathPolicy;
 
 /// Maximum file size that can be read (10 MB).
 const MAX_READ_SIZE: u64 = 10 * 1024 * 1024;
@@ -155,11 +157,12 @@ pub struct GrepSearchOutput {
 
 /// Reads a text file and returns a line-windowed payload.
 pub fn read_file(
+    policy: &WorkspacePathPolicy,
     path: &str,
     offset: Option<usize>,
     limit: Option<usize>,
 ) -> io::Result<ReadFileOutput> {
-    let absolute_path = normalize_path(path)?;
+    let absolute_path = policy.resolve(path)?;
 
     // Check file size before reading
     let metadata = fs::metadata(&absolute_path)?;
@@ -203,7 +206,11 @@ pub fn read_file(
 }
 
 /// Replaces a file's contents and returns patch metadata.
-pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
+pub fn write_file(
+    policy: &WorkspacePathPolicy,
+    path: &str,
+    content: &str,
+) -> io::Result<WriteFileOutput> {
     if content.len() > MAX_WRITE_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -215,7 +222,7 @@ pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
         ));
     }
 
-    let absolute_path = normalize_path_allow_missing(path)?;
+    let absolute_path = policy.resolve(path)?;
     let original_file = fs::read_to_string(&absolute_path).ok();
     if let Some(parent) = absolute_path.parent() {
         fs::create_dir_all(parent)?;
@@ -238,12 +245,13 @@ pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
 
 /// Performs an in-file string replacement and returns patch metadata.
 pub fn edit_file(
+    policy: &WorkspacePathPolicy,
     path: &str,
     old_string: &str,
     new_string: &str,
     replace_all: bool,
 ) -> io::Result<EditFileOutput> {
-    let absolute_path = normalize_path(path)?;
+    let absolute_path = policy.resolve(path)?;
     let original_file = fs::read_to_string(&absolute_path)?;
     if old_string == new_string {
         return Err(io::Error::new(
@@ -278,22 +286,26 @@ pub fn edit_file(
 }
 
 /// Expands a glob pattern and returns matching filenames.
-pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOutput> {
+pub fn glob_search(
+    policy: &WorkspacePathPolicy,
+    pattern: &str,
+    path: Option<&str>,
+) -> io::Result<GlobSearchOutput> {
     let started = Instant::now();
     let base_dir = path
-        .map(normalize_path)
+        .map(|path| policy.resolve(path))
         .transpose()?
-        .unwrap_or(std::env::current_dir()?);
+        .unwrap_or_else(|| policy.workspace_root().to_path_buf());
     let search_pattern = if Path::new(pattern).is_absolute() {
-        pattern.to_owned()
+        policy.resolve_glob_pattern(pattern)?
     } else {
-        base_dir.join(pattern).to_string_lossy().into_owned()
+        policy.resolve_glob_pattern(&base_dir.join(pattern).to_string_lossy())?
     };
 
     // The `glob` crate does not support brace expansion ({a,b,c}).
     // Expand braces into multiple patterns so patterns like
     // `Assets/**/*.{cs,uxml,uss}` work correctly.
-    let expanded = expand_braces(&search_pattern);
+    let expanded = expand_braces(&search_pattern.to_string_lossy());
 
     let mut seen = std::collections::HashSet::new();
     let mut matches = Vec::new();
@@ -301,8 +313,12 @@ pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOu
         let entries = glob::glob(pat)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
         for entry in entries.flatten() {
-            if entry.is_file() && seen.insert(entry.clone()) {
-                matches.push(entry);
+            if entry.is_file() {
+                if let Ok(resolved) = policy.ensure_resolved_path(&entry) {
+                    if seen.insert(resolved.clone()) {
+                        matches.push(resolved);
+                    }
+                }
             }
         }
     }
@@ -330,7 +346,10 @@ pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOu
 }
 
 /// Runs a regex search over workspace files with optional context lines.
-pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
+pub fn grep_search(
+    policy: &WorkspacePathPolicy,
+    input: &GrepSearchInput,
+) -> io::Result<GrepSearchOutput> {
     let pattern = match &input.pattern {
         Some(p) if !p.trim().is_empty() => p.as_str(),
         _ => {
@@ -344,9 +363,9 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     let base_path = input
         .path
         .as_deref()
-        .map(normalize_path)
+        .map(|path| policy.resolve(path))
         .transpose()?
-        .unwrap_or(std::env::current_dir()?);
+        .unwrap_or_else(|| policy.workspace_root().to_path_buf());
 
     let regex = RegexBuilder::new(pattern)
         .case_insensitive(input.case_insensitive.unwrap_or(false))
@@ -371,7 +390,7 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     let mut content_lines = Vec::new();
     let mut total_matches = 0usize;
 
-    for file_path in collect_search_files(&base_path)? {
+    for file_path in collect_search_files(policy, &base_path)? {
         if !matches_optional_filters(&file_path, glob_filter.as_ref(), file_type) {
             continue;
         }
@@ -453,12 +472,22 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     })
 }
 
-fn collect_search_files(base_path: &Path) -> io::Result<Vec<PathBuf>> {
+fn collect_search_files(
+    policy: &WorkspacePathPolicy,
+    base_path: &Path,
+) -> io::Result<Vec<PathBuf>> {
     if base_path.is_file() {
-        return Ok(vec![base_path.to_path_buf()]);
+        return Ok(vec![policy.ensure_resolved_path(base_path)?]);
     }
 
-    let skip_dirs = ["target", "node_modules", ".git", ".cargo", ".gitnexus"];
+    let skip_dirs = [
+        "target",
+        "node_modules",
+        ".git",
+        ".cowd",
+        ".cargo",
+        ".gitnexus",
+    ];
     let mut files = Vec::new();
     for entry in WalkDir::new(base_path)
         .max_depth(20)
@@ -467,7 +496,9 @@ fn collect_search_files(base_path: &Path) -> io::Result<Vec<PathBuf>> {
     {
         let entry = entry.map_err(|error| io::Error::other(error.to_string()))?;
         if entry.file_type().is_file() {
-            files.push(entry.path().to_path_buf());
+            if let Ok(resolved) = policy.ensure_resolved_path(entry.path()) {
+                files.push(resolved);
+            }
         }
     }
     Ok(files)
@@ -534,56 +565,6 @@ fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
     }]
 }
 
-fn normalize_path(path: &str) -> io::Result<PathBuf> {
-    let candidate = if Path::new(path).is_absolute() {
-        PathBuf::from(path)
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    candidate.canonicalize()
-}
-
-fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
-    let candidate = if Path::new(path).is_absolute() {
-        PathBuf::from(path)
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-
-    if let Ok(canonical) = candidate.canonicalize() {
-        return Ok(canonical);
-    }
-
-    if let Some(parent) = candidate.parent() {
-        let canonical_parent = parent
-            .canonicalize()
-            .unwrap_or_else(|_| lexically_resolve(parent));
-        if let Some(name) = candidate.file_name() {
-            return Ok(canonical_parent.join(name));
-        }
-    }
-
-    Ok(lexically_resolve(&candidate))
-}
-
-/// Walk path components and resolve `.` and `..` segments without touching the filesystem.
-/// This prevents path-traversal attacks from sneaking through when `canonicalize()` fails.
-fn lexically_resolve(path: &Path) -> PathBuf {
-    let mut resolved = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::ParentDir => {
-                resolved.pop();
-            }
-            Component::CurDir => {}
-            other => {
-                resolved.push(other.as_os_str());
-            }
-        }
-    }
-    resolved
-}
-
 /// Expand shell-style brace groups in a glob pattern.
 ///
 /// Handles one level of braces: `foo.{a,b,c}` → `["foo.a", "foo.b", "foo.c"]`.
@@ -610,6 +591,8 @@ fn expand_braces(pattern: &str) -> Vec<String> {
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use crate::path_policy::WorkspacePathPolicy;
+
     use super::{
         edit_file, expand_braces, glob_search, grep_search, read_file, write_file, GrepSearchInput,
         MAX_WRITE_SIZE,
@@ -623,14 +606,19 @@ mod tests {
         std::env::temp_dir().join(format!("cowd-native-{name}-{unique}"))
     }
 
+    fn policy_for(path: &std::path::Path) -> WorkspacePathPolicy {
+        WorkspacePathPolicy::new(path.parent().expect("temporary path parent"))
+    }
+
     #[test]
     fn reads_and_writes_files() {
         let path = temp_path("read-write.txt");
-        let write_output = write_file(path.to_string_lossy().as_ref(), "one\ntwo\nthree")
+        let policy = policy_for(&path);
+        let write_output = write_file(&policy, path.to_string_lossy().as_ref(), "one\ntwo\nthree")
             .expect("write should succeed");
         assert_eq!(write_output.kind, "create");
 
-        let read_output = read_file(path.to_string_lossy().as_ref(), Some(1), Some(1))
+        let read_output = read_file(&policy, path.to_string_lossy().as_ref(), Some(1), Some(1))
             .expect("read should succeed");
         assert_eq!(read_output.file.content, "two");
     }
@@ -638,18 +626,26 @@ mod tests {
     #[test]
     fn edits_file_contents() {
         let path = temp_path("edit.txt");
-        write_file(path.to_string_lossy().as_ref(), "alpha beta alpha")
+        let policy = policy_for(&path);
+        write_file(&policy, path.to_string_lossy().as_ref(), "alpha beta alpha")
             .expect("initial write should succeed");
-        let output = edit_file(path.to_string_lossy().as_ref(), "alpha", "omega", true)
-            .expect("edit should succeed");
+        let output = edit_file(
+            &policy,
+            path.to_string_lossy().as_ref(),
+            "alpha",
+            "omega",
+            true,
+        )
+        .expect("edit should succeed");
         assert!(output.replace_all);
     }
 
     #[test]
     fn rejects_binary_files() {
         let path = temp_path("binary-test.bin");
+        let policy = policy_for(&path);
         std::fs::write(&path, b"\x00\x01\x02\x03binary content").expect("write should succeed");
-        let result = read_file(path.to_string_lossy().as_ref(), None, None);
+        let result = read_file(&policy, path.to_string_lossy().as_ref(), None, None);
         assert!(result.is_err());
         let error = result.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
@@ -659,8 +655,9 @@ mod tests {
     #[test]
     fn rejects_oversized_writes() {
         let path = temp_path("oversize-write.txt");
+        let policy = policy_for(&path);
         let huge = "x".repeat(MAX_WRITE_SIZE + 1);
-        let result = write_file(path.to_string_lossy().as_ref(), &huge);
+        let result = write_file(&policy, path.to_string_lossy().as_ref(), &huge);
         assert!(result.is_err());
         let error = result.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
@@ -671,33 +668,38 @@ mod tests {
     fn globs_and_greps_directory() {
         let dir = temp_path("search-dir");
         std::fs::create_dir_all(&dir).expect("directory should be created");
+        let policy = WorkspacePathPolicy::new(&dir);
         let file = dir.join("demo.rs");
         write_file(
+            &policy,
             file.to_string_lossy().as_ref(),
             "fn main() {\n println!(\"hello\");\n}\n",
         )
         .expect("file write should succeed");
 
-        let globbed = glob_search("**/*.rs", Some(dir.to_string_lossy().as_ref()))
+        let globbed = glob_search(&policy, "**/*.rs", Some(dir.to_string_lossy().as_ref()))
             .expect("glob should succeed");
         assert_eq!(globbed.num_files, 1);
 
-        let grep_output = grep_search(&GrepSearchInput {
-            pattern: Some(String::from("hello")),
-            path: Some(dir.to_string_lossy().into_owned()),
-            glob: Some(String::from("**/*.rs")),
-            output_mode: Some(String::from("content")),
-            before: None,
-            after: None,
-            context_short: None,
-            context: None,
-            line_numbers: Some(true),
-            case_insensitive: Some(false),
-            file_type: None,
-            head_limit: Some(10),
-            offset: Some(0),
-            multiline: Some(false),
-        })
+        let grep_output = grep_search(
+            &policy,
+            &GrepSearchInput {
+                pattern: Some(String::from("hello")),
+                path: Some(dir.to_string_lossy().into_owned()),
+                glob: Some(String::from("**/*.rs")),
+                output_mode: Some(String::from("content")),
+                before: None,
+                after: None,
+                context_short: None,
+                context: None,
+                line_numbers: Some(true),
+                case_insensitive: Some(false),
+                file_type: None,
+                head_limit: Some(10),
+                offset: Some(0),
+                multiline: Some(false),
+            },
+        )
         .expect("grep should succeed");
         assert!(grep_output.content.unwrap_or_default().contains("hello"));
     }
@@ -736,12 +738,13 @@ mod tests {
     fn glob_search_with_braces_finds_files() {
         let dir = temp_path("glob-braces");
         std::fs::create_dir_all(&dir).unwrap();
+        let policy = WorkspacePathPolicy::new(&dir);
         std::fs::write(dir.join("a.rs"), "fn main() {}").unwrap();
         std::fs::write(dir.join("b.toml"), "[package]").unwrap();
         std::fs::write(dir.join("c.txt"), "hello").unwrap();
 
-        let result =
-            glob_search("*.{rs,toml}", Some(dir.to_str().unwrap())).expect("glob should succeed");
+        let result = glob_search(&policy, "*.{rs,toml}", Some(dir.to_str().unwrap()))
+            .expect("glob should succeed");
         assert_eq!(
             result.num_files, 2,
             "should match .rs and .toml but not .txt"

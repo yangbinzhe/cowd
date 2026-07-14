@@ -1,30 +1,30 @@
-use harness_contract::core::ExecutionMode;
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
+use harness_contract::core::ExecutionPattern;
+use harness_contract::execution_graph::{
+    apply_node_transition, validate_execution_graph, ExecutionEdge, ExecutionEdgeKind,
+    ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec, ExecutionNodeStatus,
+};
 use harness_contract::strategy::{
     decide_strategy, understand, StrategyExperienceRecord, StrategyExperienceStore, StrategyInput,
 };
 use runtime::eval_gate::{ScenarioCheck, ScenarioCheckKind, ScenarioSpec, ScenarioSuite};
-use runtime::{
-    AgentNodeStatus, AgentRole, AgentRunGraph, AgentTaskNode, ReviewVerdict, RuntimeAiKernel,
-};
+use runtime::RuntimeAiKernel;
 
-fn node(id: &str, role: AgentRole, deps: Vec<&str>) -> AgentTaskNode {
-    AgentTaskNode {
-        id: id.to_string(),
-        role,
-        title: id.to_string(),
-        objective: format!("complete {id}"),
-        depends_on: deps.into_iter().map(str::to_string).collect(),
-        status: AgentNodeStatus::Pending,
-        assigned_agent: None,
-        result: None,
-        error: None,
-        created_at_ms: 1,
-        updated_at_ms: 1,
-    }
+fn node(id: &str, kind: ExecutionNodeKind) -> ExecutionNodeSpec {
+    let mut node = ExecutionNodeSpec::new(kind, "scenario-executor", format!("payload:{id}"));
+    node.id = id.to_string();
+    node.idempotency_key = format!("scenario:{id}");
+    node
 }
 
 #[test]
-fn deep_task_closure_links_strategy_workgraph_memory_matrix_and_final_gate() {
+fn deep_task_closure_links_strategy_execution_graph_memory_matrix_and_final_gate() {
     let kernel = RuntimeAiKernel::begin_turn(
         "deep-task-closure",
         "完整迁移 gateway runtime service 并保证 matrix evidence、memory pulse、测试回归和最终审查",
@@ -41,26 +41,32 @@ fn deep_task_closure_links_strategy_workgraph_memory_matrix_and_final_gate() {
     );
 
     let quality = trace
-        .workgraph_quality
+        .execution_graph_quality
         .as_ref()
-        .expect("complex closure should produce workgraph quality");
-    assert_eq!(trace.strategy.mode, ExecutionMode::PlanExecute);
-    assert!(
-        trace.workgraph.is_some(),
-        "complex task should allocate workgraph"
+        .expect("complex closure should produce execution_graph quality");
+    assert_eq!(
+        trace.execution_decision.strategy.pattern,
+        ExecutionPattern::Execute
     );
-    assert!(quality.is_dag, "workgraph must be acyclic");
-    assert!(quality.has_review_node, "workgraph must include review");
     assert!(
-        quality.has_synthesis_node,
-        "workgraph must include synthesis"
+        trace.execution_graph.is_some(),
+        "complex task should allocate execution_graph"
+    );
+    assert!(quality.is_dag, "execution_graph must be acyclic");
+    assert!(
+        quality.has_verify_node,
+        "execution graph must include verification"
+    );
+    assert!(
+        quality.has_synthesize_node,
+        "execution_graph must include synthesis"
     );
     assert!(
         trace.regression_gate.allowed,
         "verified closure should pass regression gate"
     );
     assert!(
-        !trace.finalization_blocked,
+        !trace.verification_blocked,
         "evidence-backed closure should finalize"
     );
     assert!(
@@ -69,20 +75,20 @@ fn deep_task_closure_links_strategy_workgraph_memory_matrix_and_final_gate() {
     );
 
     let spec = ScenarioSpec::new("deep_task_closure", "complex closure")
-        .expect_mode(ExecutionMode::PlanExecute)
+        .expect_mode(ExecutionPattern::Execute)
         .require(ScenarioCheck::bool(
-            "workgraph.present",
-            ScenarioCheckKind::WorkgraphPresent,
+            "execution_graph.present",
+            ScenarioCheckKind::ExecutionGraphPresent,
             true,
             "runtime-harness-contract",
-            "complex closure must allocate a workgraph",
+            "complex closure must allocate a execution_graph",
         ))
         .require(ScenarioCheck::bool(
-            "workgraph.quality",
-            ScenarioCheckKind::WorkgraphQualityOk,
+            "execution_graph.quality",
+            ScenarioCheckKind::ExecutionGraphQualityOk,
             true,
-            "ai-workgraph",
-            "repair workgraph DAG/review/synthesis requirements",
+            "ai-execution_graph",
+            "repair execution_graph DAG/review/synthesis requirements",
         ))
         .require(ScenarioCheck::min_count(
             "matrix.signal_count",
@@ -93,13 +99,13 @@ fn deep_task_closure_links_strategy_workgraph_memory_matrix_and_final_gate() {
         ));
     let observation = runtime::eval_gate::ScenarioObservation {
         scenario_id: "deep_task_closure".to_string(),
-        strategy_mode: trace.strategy.mode,
-        finalization_blocked: trace.finalization_blocked,
+        strategy_pattern: trace.execution_decision.strategy.pattern,
+        verification_blocked: trace.verification_blocked,
         regression_allowed: trace.regression_gate.allowed,
-        has_workgraph: trace.workgraph.is_some(),
-        workgraph_quality_ok: quality.is_dag
-            && quality.has_review_node
-            && quality.has_synthesis_node,
+        has_execution_graph: trace.execution_graph.is_some(),
+        execution_graph_quality_ok: quality.is_dag
+            && quality.has_verify_node
+            && quality.has_synthesize_node,
         growth_has_blocker: trace.learning_record.has_blocker(),
         growth_signal_kinds: trace
             .learning_record
@@ -125,7 +131,7 @@ fn failure_repair_scenario_blocks_finalization_and_exposes_repair_owner() {
     );
     let trace = kernel.finalize("", 0, 0);
 
-    assert!(trace.finalization_blocked);
+    assert!(trace.verification_blocked);
     assert!(!trace.regression_gate.allowed);
     assert!(trace.learning_record.has_blocker());
     assert!(
@@ -144,124 +150,89 @@ fn failure_repair_scenario_blocks_finalization_and_exposes_repair_owner() {
 
 #[test]
 fn multi_agent_merge_scenario_records_conflict_and_blocks_false_consensus() {
-    let mut graph = AgentRunGraph::new(
-        "deep-agent-merge",
-        "并行分析 provider fallback 是否应该默认开启",
-    );
-    graph
-        .add_node(node("research-a", AgentRole::Researcher, vec![]))
-        .unwrap();
-    graph
-        .add_node(node("research-b", AgentRole::Researcher, vec![]))
-        .unwrap();
-    graph
-        .record_result("research-a", "fallback should retry 429")
-        .unwrap();
-    graph
-        .record_result("research-b", "fallback should not retry auth errors")
-        .unwrap();
-    graph
-        .add_evidence(
-            "research-a",
-            "provider_trace",
-            "trace:429",
-            "retryable throttling evidence",
-        )
-        .unwrap();
-    graph
-        .add_evidence(
-            "research-b",
-            "provider_trace",
-            "trace:401",
-            "non-retryable auth evidence",
-        )
-        .unwrap();
-    graph
-        .add_review(
-            "research-a",
-            "reviewer",
-            ReviewVerdict::Accept,
-            "429 evidence accepted",
-        )
-        .unwrap();
-    graph
-        .add_review(
-            "research-b",
-            "reviewer",
-            ReviewVerdict::Challenge,
-            "401 conflicts with blanket fallback",
-        )
-        .unwrap();
-    let merge = graph.record_merge_decision(
-        vec!["research-a".to_string(), "research-b".to_string()],
-        "block blanket fallback; classify by provider error",
-        vec!["retry policy differs between 429 and 401".to_string()],
-    );
+    let mut graph = ExecutionGraph::new("并行分析 provider fallback 是否应该默认开启");
+    graph.nodes = vec![
+        node("research-a", ExecutionNodeKind::AgentTask),
+        node("research-b", ExecutionNodeKind::AgentTask),
+        node("verify-conflict", ExecutionNodeKind::Verify),
+        node("synthesize", ExecutionNodeKind::Synthesize),
+    ];
+    graph.edges = vec![
+        ExecutionEdge {
+            from: "research-a".into(),
+            to: "verify-conflict".into(),
+            kind: ExecutionEdgeKind::DependsOn,
+        },
+        ExecutionEdge {
+            from: "research-b".into(),
+            to: "verify-conflict".into(),
+            kind: ExecutionEdgeKind::DependsOn,
+        },
+        ExecutionEdge {
+            from: "verify-conflict".into(),
+            to: "synthesize".into(),
+            kind: ExecutionEdgeKind::DependsOn,
+        },
+    ];
 
-    assert_eq!(graph.evidence.len(), 2);
-    assert_eq!(graph.reviews.len(), 2);
-    assert_eq!(merge.conflicts.len(), 1);
-    assert!(
-        !merge.conflicts.is_empty(),
-        "conflict must be surfaced instead of hidden by final answer"
-    );
-    assert_eq!(graph.status, AgentNodeStatus::Running);
-    assert!(graph
-        .merge_decisions
-        .last()
-        .unwrap()
-        .decision
-        .contains("classify by provider error"));
+    let waves = validate_execution_graph(&graph).unwrap();
+    assert_eq!(waves[0], vec!["research-a", "research-b"]);
+    assert_eq!(waves[1], vec!["verify-conflict"]);
+    assert_eq!(waves[2], vec!["synthesize"]);
 }
 
 #[test]
 fn agent_parallel_research_scenario_keeps_independent_nodes_ready_for_merge() {
-    let mut graph = AgentRunGraph::new(
-        "deep-agent-parallel",
-        "并行调研 provider、runtime、matrix 三条链路并合并审查",
-    );
-    graph
-        .add_node(node("provider-research", AgentRole::Researcher, vec![]))
-        .unwrap();
-    graph
-        .add_node(node("runtime-research", AgentRole::Researcher, vec![]))
-        .unwrap();
-    graph
-        .add_node(node("matrix-research", AgentRole::Researcher, vec![]))
-        .unwrap();
-    graph
-        .add_node(node(
-            "merge-review",
-            AgentRole::Merger,
-            vec!["provider-research", "runtime-research", "matrix-research"],
-        ))
-        .unwrap();
-
-    let ready = graph
-        .ready_nodes()
+    let mut graph = ExecutionGraph::new("并行调研 provider、runtime、matrix 三条链路并合并审查");
+    graph.revision = 1;
+    graph.nodes = vec![
+        node("provider-research", ExecutionNodeKind::AgentTask),
+        node("runtime-research", ExecutionNodeKind::AgentTask),
+        node("matrix-research", ExecutionNodeKind::AgentTask),
+        node("merge-review", ExecutionNodeKind::Synthesize),
+    ];
+    graph.edges = ["provider-research", "runtime-research", "matrix-research"]
+        .into_iter()
+        .map(|from| ExecutionEdge {
+            from: from.into(),
+            to: "merge-review".into(),
+            kind: ExecutionEdgeKind::DependsOn,
+        })
+        .collect();
+    graph.node_statuses = graph
+        .nodes
         .iter()
-        .map(|node| node.id.as_str())
-        .collect::<Vec<_>>();
-    assert!(ready.contains(&"provider-research"));
-    assert!(ready.contains(&"runtime-research"));
-    assert!(ready.contains(&"matrix-research"));
-    assert!(!ready.contains(&"merge-review"));
+        .map(|node| (node.id.clone(), ExecutionNodeStatus::Planned))
+        .collect();
 
     for id in ["provider-research", "runtime-research", "matrix-research"] {
-        graph
-            .record_result(id, format!("{id} evidence ready"))
+        graph = apply_node_transition(&graph, graph.revision, id, ExecutionNodeStatus::Ready, None)
             .unwrap();
-        graph
-            .add_review(id, "reviewer", ReviewVerdict::Accept, "accepted")
-            .unwrap();
+        graph = apply_node_transition(
+            &graph,
+            graph.revision,
+            id,
+            ExecutionNodeStatus::Running,
+            None,
+        )
+        .unwrap();
+        graph = apply_node_transition(
+            &graph,
+            graph.revision,
+            id,
+            ExecutionNodeStatus::Completed,
+            None,
+        )
+        .unwrap();
     }
-
-    let ready = graph
-        .ready_nodes()
+    assert_eq!(
+        graph.node_statuses["merge-review"],
+        ExecutionNodeStatus::Planned
+    );
+    assert!(graph
+        .edges
         .iter()
-        .map(|node| node.id.as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(ready, vec!["merge-review"]);
+        .all(|edge| graph.node_statuses[&edge.from] == ExecutionNodeStatus::Completed));
 }
 
 #[test]
@@ -274,7 +245,7 @@ fn agent_low_lift_downgrade_keeps_simple_work_out_of_multi_agent_path() {
             domain: understanding.domain,
             complexity: understanding.complexity,
             risk: understanding.risk,
-            selected_mode: harness_contract::core::ExecutionMode::SupervisorSubagents,
+            selected_pattern: harness_contract::core::ExecutionPattern::Collaborate,
             succeeded: idx == 0,
             verification_blocked: false,
             context_pressure: false,
@@ -285,8 +256,8 @@ fn agent_low_lift_downgrade_keeps_simple_work_out_of_multi_agent_path() {
 
     let adapted = decide_strategy(&store.enrich_input(StrategyInput::from_prompt(prompt)));
     assert_eq!(
-        adapted.mode,
-        harness_contract::core::ExecutionMode::PlanExecute
+        adapted.pattern,
+        harness_contract::core::ExecutionPattern::Execute
     );
     assert!(adapted
         .reasons

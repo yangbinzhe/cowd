@@ -47,7 +47,13 @@ const CONCEPT_CLUSTERS: &[(&[&str], &[&str])] = &[
     ),
     (
         &["agent", "collaboration", "delegate", "delegation"],
-        &["peer", "sub agent", "workgraph", "evidence", "conflict"],
+        &[
+            "peer",
+            "sub agent",
+            "execution_graph",
+            "evidence",
+            "conflict",
+        ],
     ),
 ];
 

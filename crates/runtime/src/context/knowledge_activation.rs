@@ -78,40 +78,70 @@ impl KnowledgeActivationRuntime {
         let mut items = Vec::new();
         let mut fragment = String::from("### Context: Knowledge\n");
         for canon in canon_packs {
-            let content = format!(
-                "{}\nrules:\n{}\nprocedures:\n{}\nevidence_refs: {}",
-                canon.summary,
-                canon
+            let required_or_blocking = canon.rules.iter().any(|rule| {
+                matches!(
+                    rule.governance_level,
+                    KnowledgeGovernanceLevel::Required | KnowledgeGovernanceLevel::Blocking
+                )
+            });
+            let relevant = canon_relevant_to_intent(&canon.summary, intent)
+                || canon
                     .rules
                     .iter()
-                    .map(|rule| format!("- [{:?}] {}", rule.governance_level, rule.summary))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                canon.procedures.join("\n"),
-                canon
-                    .evidence_refs
-                    .iter()
-                    .map(|reference| format!("{}/{}", reference.ref_type, reference.id))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
+                    .any(|rule| canon_relevant_to_intent(&rule.summary, intent));
+            let pointer_only = !required_or_blocking && !relevant;
+            let content = if pointer_only {
+                format!(
+                    "Knowledge pointer only; not injected as full body because relevance is low for this turn.\ncanon: {}\nsummary: withheld_until_explicit_recall\nevidence_refs: {}",
+                    canon.canon_id,
+                    canon
+                        .evidence_refs
+                        .iter()
+                        .map(|reference| format!("{}/{}", reference.ref_type, reference.id))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            } else {
+                format!(
+                    "{}\nrules:\n{}\nprocedures:\n{}\nevidence_refs: {}",
+                    canon.summary,
+                    canon
+                        .rules
+                        .iter()
+                        .map(|rule| format!("- [{:?}] {}", rule.governance_level, rule.summary))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    canon.procedures.join("\n"),
+                    canon
+                        .evidence_refs
+                        .iter()
+                        .map(|reference| format!("{}/{}", reference.ref_type, reference.id))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
             let mut item = ContextItem::new(
                 canon.canon_id.clone(),
                 ContextSourceKind::Knowledge,
-                ContextRole::Evidence,
+                if pointer_only {
+                    ContextRole::Orientation
+                } else {
+                    ContextRole::Evidence
+                },
                 content.clone(),
             );
             item.authority = ContextAuthority::Project;
             item.visibility = ContextVisibility::Shared;
-            item.score = 0.88;
+            item.score = if pointer_only { 0.42 } else { 0.88 };
             item.evidence = canon
                 .evidence_refs
                 .iter()
                 .map(|reference| format!("knowledge://{}/{}", reference.ref_type, reference.id))
                 .collect();
             fragment.push_str(&format!(
-                "- canon: {}\n  tokens: {}\n  summary: {}\n",
+                "- canon: {}\n  mode: {}\n  tokens: {}\n  summary: {}\n",
                 canon.canon_id,
+                if pointer_only { "pointer" } else { "body" },
                 canon.token_estimate,
                 content.replace('\n', "\n  ")
             ));
@@ -144,6 +174,30 @@ impl KnowledgeActivationRuntime {
             compliance_decision,
         })
     }
+}
+
+fn canon_relevant_to_intent(text: &str, intent: &str) -> bool {
+    let haystack = normalize_turn_text(text);
+    normalize_turn_text(intent)
+        .split_whitespace()
+        .filter(|term| term.len() >= 3 && !is_generic_knowledge_relevance_term(term))
+        .any(|term| haystack.contains(term))
+}
+
+fn is_generic_knowledge_relevance_term(term: &str) -> bool {
+    matches!(
+        term,
+        "runtime"
+            | "analysis"
+            | "analyze"
+            | "review"
+            | "background"
+            | "knowledge"
+            | "evidence"
+            | "context"
+            | "system"
+            | "task"
+    )
 }
 
 #[must_use]
@@ -679,7 +733,7 @@ mod tests {
         let activation = KnowledgeActivationRuntime::new()
             .activate_from_packet(
                 "s1",
-                "architecture evidence review",
+                "runtime architecture analysis",
                 "DeepInvestigation",
                 &packet,
             )
@@ -734,6 +788,43 @@ mod tests {
         assert!(KnowledgeActivationRuntime::new()
             .activate_from_packet("s1", "分析记忆架构", "DeepInvestigation", &packet)
             .is_none());
+    }
+
+    #[test]
+    fn runtime_knowledge_activation_keeps_low_relevance_global_knowledge_as_pointer() {
+        let mut item = packet_item(
+            "Global payroll procedure background",
+            MemoryLayer::L0,
+            MemoryPacketRole::Supporting,
+        );
+        item.reason = "background reference".to_string();
+        item.content_preview =
+            "payroll reimbursement calendar and office expense process".to_string();
+        let packet = MemoryContextPacket {
+            selected: vec![item],
+            omitted: Vec::new(),
+            token_estimate: 128,
+            truncated: false,
+            recall_report: RecallReport::default(),
+        };
+
+        let activation = KnowledgeActivationRuntime::new()
+            .activate_from_packet(
+                "s1",
+                "architecture evidence review",
+                "DeepInvestigation",
+                &packet,
+            )
+            .expect("default global knowledge should remain visible as pointer");
+
+        assert!(activation.debug_fragment.contains("mode: pointer"));
+        assert!(activation.items.iter().any(|item| {
+            item.role == ContextRole::Orientation
+                && item.content.contains("Knowledge pointer only")
+                && !item
+                    .content
+                    .contains("payroll reimbursement calendar and office expense process")
+        }));
     }
 
     #[test]

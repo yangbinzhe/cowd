@@ -171,7 +171,9 @@ pub fn ensure_user_dirs() -> std::io::Result<()> {
         user_skills_dir(),
         user_plugins_dir(),
         user_credentials_dir(),
-        cron_jobs_path().parent().unwrap().to_path_buf(),
+        cron_jobs_path()
+            .parent()
+            .map_or_else(config_home_dir, std::path::Path::to_path_buf),
         handoffs_dir(),
     ];
     for d in &dirs {

@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
 #![allow(clippy::doc_markdown, clippy::uninlined_format_args, unused_imports)]
 //! Integration tests for cross-module wiring.
 //!
@@ -286,41 +292,15 @@ fn fresh_approved_lane_gets_merge_action() {
     assert_eq!(actions, vec![PolicyAction::MergeToDev]);
 }
 
-/// worker_boot + recovery_recipes + policy_engine integration:
-/// When a session completes with a provider failure, does the worker
-/// status transition trigger the correct recovery recipe, and does
-/// the resulting recovery state feed into policy decisions?
+/// Recovery policy and green-state policy integrate through a normalized
+/// runtime startup failure, without a second process-local worker registry.
 #[test]
-fn worker_provider_failure_flows_through_recovery_to_policy() {
+fn provider_failure_flows_through_recovery_to_policy() {
     use runtime::recovery_recipes::{
         attempt_recovery, FailureScenario, RecoveryContext, RecoveryResult, RecoveryStep,
+        StartupFailureKind,
     };
-    use runtime::worker_boot::{WorkerFailureKind, WorkerRegistry, WorkerStatus};
-
-    // given — a worker that encounters a provider failure during session completion
-    let registry = WorkerRegistry::new();
-    let worker = registry.create("/tmp/repo-recovery-test", &[], true);
-
-    // Worker reaches ready state
-    registry
-        .observe(&worker.worker_id, "Ready for your input\n>")
-        .expect("ready observe should succeed");
-    registry
-        .send_prompt(&worker.worker_id, Some("Run analysis"), None)
-        .expect("prompt send should succeed");
-
-    // Session completes with provider failure (finish="unknown", tokens=0)
-    let failed_worker = registry
-        .observe_completion(&worker.worker_id, "unknown", 0)
-        .expect("completion observe should succeed");
-    assert_eq!(failed_worker.status, WorkerStatus::Failed);
-    let failure = failed_worker
-        .last_error
-        .expect("worker should have recorded error");
-    assert_eq!(failure.kind, WorkerFailureKind::Provider);
-
-    // Bridge: WorkerFailureKind -> FailureScenario
-    let scenario = FailureScenario::from_worker_failure_kind(failure.kind);
+    let scenario = FailureScenario::from_startup_failure_kind(StartupFailureKind::Provider);
     assert_eq!(scenario, FailureScenario::ProviderFailure);
 
     // Recovery recipe lookup and execution
@@ -389,13 +369,11 @@ fn worker_provider_failure_flows_through_recovery_to_policy() {
     );
 }
 
-/// TeamDiscovery + AgentDirectory integration:
-/// TeamDiscoveryProtocol correctly discovers and ranks agents from the
-/// global AgentDirectory by skill overlap.
+/// AgentDirectory remains a scoped catalog for collaboration planning; it is
+/// not a persisted Team registry.
 #[test]
-fn team_discovery_ranks_by_skill_overlap_from_directory() {
+fn agent_directory_filters_by_skill_overlap() {
     use memory::agent_directory::{AgentDirectory, AgentInfo, AgentStatus};
-    use runtime::team_discovery::TeamDiscoveryProtocol;
 
     let rust_skill = "rust-td-rank-unique";
     let testing_skill = "testing-td-rank-unique";
@@ -439,15 +417,30 @@ fn team_discovery_ranks_by_skill_overlap_from_directory() {
         },
     ];
 
+    let directory = std::sync::Arc::new(AgentDirectory::new());
     for a in &agents {
-        AgentDirectory::global().register(a.clone());
+        directory.register(a.clone());
     }
 
-    let discovery = TeamDiscoveryProtocol::new();
-    let ranked = discovery.discover_team(
-        "Build a Rust microservice with tests",
-        &[rust_skill.into(), testing_skill.into()],
-    );
+    let mut ranked = directory.discover(&[rust_skill.into(), testing_skill.into()]);
+    ranked.sort_by(|left, right| {
+        right
+            .capabilities
+            .iter()
+            .filter(|capability| {
+                capability.as_str() == rust_skill || capability.as_str() == testing_skill
+            })
+            .count()
+            .cmp(
+                &left
+                    .capabilities
+                    .iter()
+                    .filter(|capability| {
+                        capability.as_str() == rust_skill || capability.as_str() == testing_skill
+                    })
+                    .count(),
+            )
+    });
 
     assert_eq!(ranked.len(), 2);
     assert_eq!(ranked[0].agent_id, "rust-expert"); // 2 matches (rust+testing)
@@ -458,105 +451,8 @@ fn team_discovery_ranks_by_skill_overlap_from_directory() {
 
     // Cleanup
     for a in &agents {
-        AgentDirectory::global().unregister(&a.agent_id);
+        directory.unregister(&a.agent_id);
     }
-}
-
-/// TeamDiscovery + CollaborationOrchestrator integration:
-/// The orchestrator's assemble_team() uses reputation-aware discovery
-/// and produces a valid AgentTeam with leader and workers.
-#[test]
-fn orchestrator_assemble_team_uses_discovery_protocol() {
-    use memory::agent_directory::{AgentDirectory, AgentInfo, AgentStatus, ReputationScore};
-    use runtime::agent::{SubAgentConfig, SubAgentError, SubAgentExecutor, SubAgentResult};
-    use runtime::agent_collaboration::{CollaborationOrchestrator, CollaborationTask};
-
-    let rust_skill = "rust-orchestrator-unique";
-    struct NoopExecutor;
-    impl SubAgentExecutor for NoopExecutor {
-        fn execute(
-            &self,
-            _config: SubAgentConfig,
-            _task: &str,
-        ) -> impl std::future::Future<Output = Result<SubAgentResult, SubAgentError>> {
-            async { Ok(SubAgentResult::default()) }
-        }
-    }
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
-    // Register agents with reputation — leader should be the one with highest rep
-    let agents = [
-        AgentInfo {
-            agent_id: "high-rep".into(),
-            role: "Executor".into(),
-            capabilities: vec![rust_skill.into()],
-            status: AgentStatus::Active,
-            registered_at_ms: now,
-            last_heartbeat_ms: now,
-            reputation: Some(ReputationScore {
-                success_rate: 0.95,
-                task_count: 50,
-                peer_rating: 4.9,
-                last_success_at_ms: now,
-                recent_failures: 0,
-            }),
-        },
-        AgentInfo {
-            agent_id: "low-rep".into(),
-            role: "Executor".into(),
-            capabilities: vec![rust_skill.into(), "testing-orchestrator-unique".into()],
-            status: AgentStatus::Active,
-            registered_at_ms: now,
-            last_heartbeat_ms: now,
-            reputation: Some(ReputationScore {
-                success_rate: 0.2,
-                task_count: 3,
-                peer_rating: 1.0,
-                last_success_at_ms: 0,
-                recent_failures: 5,
-            }),
-        },
-    ];
-
-    for a in &agents {
-        AgentDirectory::global().register(a.clone());
-    }
-
-    let orch = CollaborationOrchestrator::<NoopExecutor>::new(std::sync::Arc::new(NoopExecutor));
-
-    let task = CollaborationTask {
-        description: "Rust refactoring".into(),
-        required_capabilities: vec![rust_skill.into()],
-        subtasks: vec![],
-        review_criteria: None,
-        collaboration_decision: None,
-    };
-
-    let team = orch.assemble_team(&task).expect("should assemble team");
-
-    // High-rep agent should be leader despite fewer skill matches
-    assert_eq!(team.leader.agent_id, "high-rep");
-    assert!(!team.workers.is_empty());
-    assert_eq!(team.workers[0].agent_id, "low-rep");
-
-    // Cleanup
-    for a in &agents {
-        AgentDirectory::global().unregister(&a.agent_id);
-    }
-}
-
-/// TeamDiscovery auto_assemble + empty directory returns None.
-#[test]
-fn auto_assemble_returns_none_when_directory_empty() {
-    use runtime::team_discovery::TeamDiscoveryProtocol;
-
-    let discovery = TeamDiscoveryProtocol::new();
-    let result = discovery.auto_assemble("any task", &["rust".into()]);
-    assert!(result.is_none());
 }
 
 /// AgentReputation + AgentDirectory integration:
@@ -590,7 +486,8 @@ async fn test_reputation_flows_to_agent_directory() {
         last_heartbeat_ms: now,
         reputation: None,
     };
-    AgentDirectory::global().register(info);
+    let directory = AgentDirectory::new();
+    directory.register(info);
 
     // 3. Record completion (sync, not async)
     let metrics = rep_mgr
@@ -598,7 +495,7 @@ async fn test_reputation_flows_to_agent_directory() {
         .expect("record_completion should succeed");
 
     // 4. Bridge: manually update AgentDirectory reputation from metrics
-    AgentDirectory::global().update_reputation(
+    directory.update_reputation(
         "test-rep-1",
         ReputationScore {
             success_rate: metrics.avg_quality_score,
@@ -610,7 +507,7 @@ async fn test_reputation_flows_to_agent_directory() {
     );
 
     // 5. Verify reputation is now non-None in the directory
-    let agents = AgentDirectory::global().list_active();
+    let agents = directory.list_active();
     let agent = agents
         .iter()
         .find(|a| a.agent_id == "test-rep-1")
@@ -625,171 +522,5 @@ async fn test_reputation_flows_to_agent_directory() {
     );
 
     // Cleanup
-    AgentDirectory::global().unregister("test-rep-1");
-}
-
-/// DiscussionEngine + L4 memory integration:
-/// Verifies that the engine can be created, connected to a CognitiveContextManager
-/// backed by temp storage, and that conflict detection runs without panic.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_discussion_engine_detects_conflicts() {
-    use memory::cognitive::CognitiveContextManager;
-    use memory::config::MemoryConfig;
-    use runtime::agent_discussion::DiscussionEngine;
-    use runtime::cowd_event::CowdEventBus;
-    use std::sync::Arc;
-
-    let tmp = tempfile::TempDir::new().expect("tempdir");
-    let mut config = MemoryConfig::default();
-    config.store.sqlite_path = tmp.path().join("mem.db");
-    config.store.blob_dir = tmp.path().join("blobs");
-    std::fs::create_dir_all(&config.store.blob_dir).expect("create blobs dir");
-
-    let memory = match CognitiveContextManager::new(config).await {
-        Ok(m) => m,
-        Err(e) => {
-            // CognitiveContextManager::new requires a fully configured store;
-            // skip the test gracefully if the temp store isn't valid.
-            eprintln!("Skipping test_discussion_engine_detects_conflicts: memory init failed: {e}");
-            return;
-        }
-    };
-    let memory = Arc::new(memory);
-
-    let bus = Arc::new(CowdEventBus::new());
-    let engine = DiscussionEngine::new(Arc::clone(&bus), Arc::clone(&memory));
-
-    let conflicts = engine
-        .check_for_conflicts_sync()
-        .expect("check_for_conflicts_sync should not error");
-    assert_eq!(
-        conflicts, 0,
-        "expected 0 conflicts on empty L4 memory, got {conflicts}"
-    );
-}
-
-/// CollaborationOrchestrator synthesis:
-/// Verifies that run_boxed() produces a non-empty synthesis string
-/// when driven by a no-op executor and agents are registered.
-#[tokio::test]
-async fn test_collaboration_orchestrator_synthesis() {
-    use memory::agent_directory::{AgentDirectory, AgentInfo, AgentStatus};
-    use runtime::agent::SubAgentConfig;
-    use runtime::agent::{SubAgentError, SubAgentExecutor, SubAgentResult};
-    use runtime::agent_collaboration::{CollaborationOps, CollaborationOrchestrator};
-    use std::sync::Arc;
-
-    struct DummyExec;
-    impl SubAgentExecutor for DummyExec {
-        fn execute(
-            &self,
-            _config: SubAgentConfig,
-            _task: &str,
-        ) -> impl std::future::Future<Output = Result<SubAgentResult, SubAgentError>> {
-            async { Ok(SubAgentResult::default()) }
-        }
-    }
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
-    // Register a dummy agent so assemble_team doesn't return None.
-    let dummy_skill = "rust-run-boxed-unique";
-    AgentDirectory::global().register(AgentInfo {
-        agent_id: "dummy-1".to_string(),
-        role: "Executor".to_string(),
-        capabilities: vec![dummy_skill.to_string()],
-        status: AgentStatus::Active,
-        registered_at_ms: now,
-        last_heartbeat_ms: now,
-        reputation: None,
-    });
-
-    let orch = CollaborationOrchestrator::<DummyExec>::new(Arc::new(DummyExec));
-    let result: Option<String> = orch
-        .run_boxed("test task", &[dummy_skill.to_string()])
-        .await;
-    assert!(
-        result.is_some(),
-        "run_boxed should return Some for valid task"
-    );
-    let synthesis = result.unwrap();
-    assert!(!synthesis.is_empty(), "synthesis should be non-empty");
-
-    AgentDirectory::global().unregister("dummy-1");
-}
-
-/// MemorySyncProtocol import:
-/// Verifies that importing from L4 via a file-backed orchestrator
-/// returns a valid result without panic.
-#[tokio::test]
-async fn test_memory_sync_import_from_l4() {
-    use memory::config::MemoryConfig;
-    use memory::memory_sync::MemorySyncProtocol;
-    use memory::orchestrator::MemoryOrchestrator;
-    use memory::store::sqlite::SqliteStore;
-    use std::sync::Arc;
-
-    let tmp = tempfile::TempDir::new().expect("tempdir");
-    let store = match SqliteStore::open_path(&tmp.path().join("sync.db")) {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            eprintln!("Skipping test_memory_sync_import_from_l4: sqlite open failed: {e}");
-            return;
-        }
-    };
-    let orch = match MemoryOrchestrator::from_store(MemoryConfig::default(), store, None) {
-        Ok(o) => Arc::new(o),
-        Err(e) => {
-            eprintln!("Skipping test_memory_sync_import_from_l4: orchestrator init failed: {e}");
-            return;
-        }
-    };
-    let bus = match orch.l4_event_bus().cloned() {
-        Some(b) => b,
-        None => {
-            eprintln!("Skipping test_memory_sync_import_from_l4: no L4 event bus");
-            return;
-        }
-    };
-    let protocol = MemorySyncProtocol::new(orch, bus);
-
-    let entries = protocol
-        .import_from_l4("test_topic", "test_agent")
-        .await
-        .expect("import_from_l4 should not error");
-    assert_eq!(
-        entries.len(),
-        0,
-        "import_from_l4 on empty store should return 0 entries"
-    );
-}
-
-/// JointProblemSolving pipeline:
-/// Verifies that the full 7-phase pipeline runs to completion
-/// with a no-op executor and produces a PipelineResult.
-#[tokio::test]
-async fn test_jps_pipeline_runs() {
-    use runtime::agent::{SubAgentConfig, SubAgentError, SubAgentExecutor, SubAgentResult};
-    use runtime::joint_problem_solving::{ProblemSolvingPipeline, ProblemStatement};
-    use std::sync::Arc;
-
-    struct DummyExec;
-    impl SubAgentExecutor for DummyExec {
-        fn execute(
-            &self,
-            _config: SubAgentConfig,
-            _task: &str,
-        ) -> impl std::future::Future<Output = Result<SubAgentResult, SubAgentError>> {
-            async { Ok(SubAgentResult::default()) }
-        }
-    }
-
-    let pipeline = ProblemSolvingPipeline::<DummyExec>::new(Arc::new(DummyExec));
-    let problem = ProblemStatement::new("Test problem");
-
-    let result = pipeline.run(problem).await;
-    assert!(result.is_some(), "pipeline should produce a PipelineResult");
+    directory.unregister("test-rep-1");
 }

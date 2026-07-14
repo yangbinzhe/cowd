@@ -118,7 +118,7 @@
 │  Conversation Loop    │  SystemPromptBuilder → ProviderClient → SSE Stream
 │  ←→ 模型              │  turn_supervisor 监控循环/停滞
 │  ←→ 工具执行          │  tool_dispatch → tool_ledger → tool_memory(pulse)
-│  ←→ 上下文压缩        │  compact (70% 窗口阈值触发)
+│  ←→ 上下文压缩        │  compact (必需上下文硬容量预检)
 │  ←→ 记忆脉冲          │  memory::emit_pulses_from_workgraph
 └──────────┬───────────┘
            ▼
@@ -155,8 +155,8 @@
 |--------|------|--------|----------|
 | **多模型路由** | OpenAI/Anthropic/DeepSeek/Qwen 自动适配 + Provider fallback 链 | ✅ 生产就绪 | `provider` · `model-protocol` · `ModelRouteDecision` |
 | **会话管理** | 多 session 并行、切换、后台运行、暂停/关闭、检查点/恢复 | ✅ 生产就绪 | `session_execution` · `SessionExecutionPlane` |
-| **上下文工程** | 动态预算分配、自动压缩(70%阈值)、记忆召回、知识激活、证据规划 | ✅ 生产就绪 | `context_runtime` · `budget_policy` · `compact` |
-| **5 层记忆系统** | L0身份→L1核心→L2项目→L3深度→L4共享 + AAAK压缩 + 向量检索 | ✅ 生产就绪 | `memory` · `fact-kernel` · `CognitiveContextManager` |
+| **上下文工程** | 动态预算分配、硬容量预检、语义检查点压缩、记忆召回、知识激活、证据规划 | ✅ 生产就绪 | `context_runtime` · `budget_policy` · `compact` |
+| **5 层记忆系统** | L0身份→L1核心→L2项目→L3深度→L4共享 + 有界压缩 + 向量/FTS 检索 | ✅ 生产就绪 | `memory` · `fact-kernel` · `CognitiveContextManager` |
 | **结构化事实引擎** | 实体/关系/证据/Metrics/Ontology + SQLite 持久化 + 质量门控 | ✅ 生产就绪 | `matrix-core` · `matrix-repository` · `MatrixDataPlane` |
 | **多 Agent 协作** | Team 模板 → role task 生成 → agent mailbox 投递 → event bus 同步 | 🔶 基础完成 | `team_runtime` · `agent_lifecycle` · `collaboration_template` |
 | **Agent 讨论** | 多 agent 讨论引擎、共识方法、联合问题求解管道 | 🔶 基础完成 | `agent_discussion` · `joint_problem_solving` |

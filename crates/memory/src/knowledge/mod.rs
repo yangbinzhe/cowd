@@ -669,6 +669,12 @@ impl KnowledgeFabric {
         serde_json::json!({
             "kind": "memory.knowledge_fabric",
             "health": health_from_state(&state),
+            "namespace_tree": knowledge_namespace_tree(&state),
+            "activation_policy_distribution": knowledge_activation_policy_distribution(&state),
+            "governance_distribution": knowledge_governance_distribution(&state),
+            "conflict_projection": knowledge_conflict_projection(&state),
+            "maintenance_candidates": knowledge_maintenance_candidates(&state),
+            "recall_quality": knowledge_recall_quality_projection(&state),
             "corpus": state.corpus.values().collect::<Vec<_>>(),
             "packs": state.packs.values().collect::<Vec<_>>(),
             "canon": state.canon.values().collect::<Vec<_>>(),
@@ -1492,6 +1498,251 @@ fn health_from_state(state: &KnowledgeFabricState) -> KnowledgeFabricHealth {
     }
 }
 
+fn knowledge_namespace_tree(state: &KnowledgeFabricState) -> Vec<serde_json::Value> {
+    let mut namespaces: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new();
+    for corpus in state.corpus.values() {
+        let entry = namespaces
+            .entry(normalize_namespace_key(&corpus.namespace))
+            .or_insert((0, 0, 0));
+        entry.0 += 1;
+    }
+    for pack in state.packs.values() {
+        let entry = namespaces
+            .entry(normalize_namespace_key(&pack.namespace))
+            .or_insert((0, 0, 0));
+        entry.1 += 1;
+        if matches!(
+            pack.state,
+            KnowledgeObjectState::Active | KnowledgeObjectState::Canonized
+        ) {
+            entry.2 += 1;
+        }
+    }
+    namespaces
+        .into_iter()
+        .map(
+            |(namespace, (corpus_count, pack_count, active_pack_count))| {
+                let (level, id) = namespace
+                    .split_once(':')
+                    .map_or((namespace.as_str(), ""), |(level, id)| (level, id));
+                serde_json::json!({
+                    "namespace": namespace,
+                    "level": level,
+                    "id": id,
+                    "corpus_count": corpus_count,
+                    "pack_count": pack_count,
+                    "active_pack_count": active_pack_count,
+                })
+            },
+        )
+        .collect()
+}
+
+fn knowledge_activation_policy_distribution(
+    state: &KnowledgeFabricState,
+) -> Vec<serde_json::Value> {
+    count_by_key(state.packs.values().map(|pack| {
+        format!("{:?}", pack.activation_policy)
+            .to_ascii_lowercase()
+            .replace("blockingpolicy", "blocking")
+    }))
+}
+
+fn knowledge_governance_distribution(state: &KnowledgeFabricState) -> Vec<serde_json::Value> {
+    count_by_key(
+        state
+            .packs
+            .values()
+            .map(|pack| format!("{:?}", pack.governance_level).to_ascii_lowercase()),
+    )
+}
+
+fn knowledge_conflict_projection(state: &KnowledgeFabricState) -> serde_json::Value {
+    let unresolved = state
+        .conflicts
+        .values()
+        .filter(|conflict| conflict.decision.is_none())
+        .count();
+    let conflicts = state
+        .conflicts
+        .values()
+        .map(|conflict| {
+            serde_json::json!({
+                "id": conflict.conflict_id,
+                "pack_id": conflict.pack_id,
+                "type": conflict.conflict_type,
+                "summary": conflict.summary,
+                "decision": conflict.decision,
+                "state": conflict.state,
+                "detected_at": conflict.detected_at,
+                "resolution_policy": "authority_then_freshness_then_confidence_else_hold",
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "total": conflicts.len(),
+        "unresolved": unresolved,
+        "resolution_policy": [
+            "system",
+            "user_explicit",
+            "project_policy",
+            "domain_policy",
+            "imported_reference",
+            "derived",
+            "freshness",
+            "confidence",
+            "hold_with_warning",
+        ],
+        "conflicts": conflicts,
+    })
+}
+
+fn knowledge_maintenance_candidates(state: &KnowledgeFabricState) -> Vec<serde_json::Value> {
+    let mut candidates = Vec::new();
+    for conflict in state
+        .conflicts
+        .values()
+        .filter(|item| item.decision.is_none())
+    {
+        candidates.push(serde_json::json!({
+            "id": format!("knowledge-maintenance:conflict:{}", conflict.conflict_id),
+            "kind": "unresolved_conflict",
+            "status": "pending",
+            "severity": "high",
+            "pack_id": conflict.pack_id,
+            "reason": conflict.summary,
+            "action": "review_conflict_resolution",
+        }));
+    }
+    let mut source_hashes: BTreeMap<String, Vec<&KnowledgeCorpus>> = BTreeMap::new();
+    for corpus in state.corpus.values() {
+        source_hashes
+            .entry(corpus.source_hash.clone())
+            .or_default()
+            .push(corpus);
+    }
+    for (source_hash, corpus) in source_hashes
+        .into_iter()
+        .filter(|(_, corpus)| corpus.len() > 1)
+    {
+        candidates.push(serde_json::json!({
+            "id": format!("knowledge-maintenance:duplicate:{source_hash}"),
+            "kind": "duplicate_merge_candidate",
+            "status": "pending",
+            "severity": "medium",
+            "reason": "multiple corpus records share the same source hash",
+            "corpus_ids": corpus.iter().map(|item| item.corpus_id.as_str()).collect::<Vec<_>>(),
+            "action": "review_duplicate_merge",
+        }));
+    }
+    for pack in state.packs.values() {
+        if pack.health_score_bp < 7_000 {
+            candidates.push(serde_json::json!({
+                "id": format!("knowledge-maintenance:health:{}", pack.pack_id),
+                "kind": "stale_rule_review_candidate",
+                "status": "pending",
+                "severity": "medium",
+                "pack_id": pack.pack_id,
+                "namespace": normalize_namespace_key(&pack.namespace),
+                "reason": format!("pack health score {} below 7000bp", pack.health_score_bp),
+                "action": "review_pack_health",
+            }));
+        }
+        if pack.state == KnowledgeObjectState::Quarantined {
+            candidates.push(serde_json::json!({
+                "id": format!("knowledge-maintenance:quarantine:{}", pack.pack_id),
+                "kind": "quarantined_item_review_candidate",
+                "status": "pending",
+                "severity": "high",
+                "pack_id": pack.pack_id,
+                "namespace": normalize_namespace_key(&pack.namespace),
+                "reason": "pack is quarantined and cannot enter runtime context",
+                "action": "review_quarantine",
+            }));
+        }
+    }
+    candidates
+}
+
+fn knowledge_recall_quality_projection(state: &KnowledgeFabricState) -> serde_json::Value {
+    let namespace_rows = knowledge_namespace_tree(state);
+    let suppressed_by_namespace = state
+        .packs
+        .values()
+        .filter(|pack| {
+            !matches!(
+                pack.state,
+                KnowledgeObjectState::Active | KnowledgeObjectState::Canonized
+            )
+        })
+        .map(|pack| {
+            serde_json::json!({
+                "namespace": normalize_namespace_key(&pack.namespace),
+                "pack_id": pack.pack_id,
+                "reason": format!("state={:?}", pack.state),
+            })
+        })
+        .collect::<Vec<_>>();
+    let unrelated_selected_count = 0usize;
+    let omitted_high_value_count = state
+        .packs
+        .values()
+        .filter(|pack| {
+            pack.governance_level != KnowledgeGovernanceLevel::Advisory
+                && !matches!(
+                    pack.state,
+                    KnowledgeObjectState::Active | KnowledgeObjectState::Canonized
+                )
+        })
+        .count();
+    let precision_estimate = if state.packs.is_empty() {
+        1.0
+    } else {
+        let active = state
+            .packs
+            .values()
+            .filter(|pack| {
+                matches!(
+                    pack.state,
+                    KnowledgeObjectState::Active | KnowledgeObjectState::Canonized
+                )
+            })
+            .count();
+        active as f64 / state.packs.len() as f64
+    };
+    serde_json::json!({
+        "selected_by_namespace": namespace_rows,
+        "suppressed_by_namespace": suppressed_by_namespace,
+        "cross_project_contamination_warnings": [],
+        "unrelated_selected_count": unrelated_selected_count,
+        "omitted_high_value_count": omitted_high_value_count,
+        "precision_estimate": precision_estimate,
+        "conflict_warnings": state.conflicts.values().filter(|item| item.decision.is_none()).map(|item| item.summary.as_str()).collect::<Vec<_>>(),
+        "policy": "project scoped knowledge stays out of unrelated projects; global/domain knowledge enters body only when required, blocking, or relevant, otherwise it is kept as pointer/governance evidence",
+    })
+}
+
+fn normalize_namespace_key(namespace: &KnowledgeNamespace) -> String {
+    match namespace {
+        KnowledgeNamespace::SharedLibrary(id) if id == "global" => "global".to_string(),
+        other => other.key(),
+    }
+}
+
+fn count_by_key<I>(keys: I) -> Vec<serde_json::Value>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for key in keys {
+        *counts.entry(key).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(key, count)| serde_json::json!({ "key": key, "count": count }))
+        .collect()
+}
+
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
@@ -1678,6 +1929,23 @@ mod tests {
                 .unwrap_or_default(),
             receipt.conflicts.len() as u64
         );
+        assert!(projection["namespace_tree"]
+            .as_array()
+            .is_some_and(|rows| rows
+                .iter()
+                .any(|row| row["namespace"] == "shared:operations")));
+        assert_eq!(
+            projection["conflict_projection"]["unresolved"]
+                .as_u64()
+                .unwrap_or_default(),
+            receipt.conflicts.len() as u64
+        );
+        assert!(projection["maintenance_candidates"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| row["kind"] == "unresolved_conflict")));
+        assert!(projection["recall_quality"]["conflict_warnings"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty()));
     }
 
     #[test]

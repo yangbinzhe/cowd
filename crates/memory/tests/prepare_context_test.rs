@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
 //! Tests for prepare_context and recall integration.
 //!
 //! These tests verify that CognitiveContextManager can recall durable memories
@@ -33,7 +40,6 @@ fn test_basic_config(sqlite_path: &std::path::Path) -> MemoryConfig {
 fn cached_test_config(sqlite_path: &std::path::Path) -> MemoryConfig {
     MemoryConfig {
         tuning: TuningConfig {
-            l4_push_enabled: false,
             prefetch_hot_topics: 0,
             prepare_context_cache_ttl_ms: 60_000,
             ..Default::default()

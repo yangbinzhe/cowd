@@ -10,7 +10,9 @@ pub mod memory;
 
 pub use activation::{RuntimeSkillCandidate, RuntimeSkillCandidateSource, SkillActivationRecord};
 pub use dependency::CowdSkillStructuredDependency;
-pub use memory::{memory_candidate_from_skill_activation, SkillMemoryPolicy};
+pub use memory::{
+    memory_candidate_from_skill_activation, skill_memory_candidate_session_event, SkillMemoryPolicy,
+};
 
 use std::collections::BTreeMap;
 
@@ -37,6 +39,48 @@ pub struct SkillActivationDecision {
     pub selected_invocation: Option<SkillInvocation>,
     pub invocation_evidence: Option<SkillInvocationEvidence>,
     pub structured_dependencies: Vec<CowdSkillStructuredDependency>,
+}
+
+/// A PromptOnly Skill payload inspected by the Skill layer and made available
+/// to Runtime. Runtime selects the asset but never scans package paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeSkillPromptAsset {
+    pub skill_id: String,
+    pub version: Option<String>,
+    pub content: String,
+    pub source_ref: String,
+}
+
+/// Runtime-owned snapshot of inspected Skill capabilities and bounded
+/// PromptOnly payloads. The composition root may replace the snapshot after
+/// package discovery; workers only consume it and never scan packages.
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeSkillCatalog {
+    profiles: Vec<SkillCapabilityProfile>,
+    prompt_assets: Vec<RuntimeSkillPromptAsset>,
+}
+
+impl RuntimeSkillCatalog {
+    #[must_use]
+    pub fn new(
+        profiles: Vec<SkillCapabilityProfile>,
+        prompt_assets: Vec<RuntimeSkillPromptAsset>,
+    ) -> Self {
+        Self {
+            profiles,
+            prompt_assets,
+        }
+    }
+
+    #[must_use]
+    pub fn profiles(&self) -> Vec<SkillCapabilityProfile> {
+        self.profiles.clone()
+    }
+
+    #[must_use]
+    pub fn prompt_assets(&self) -> Vec<RuntimeSkillPromptAsset> {
+        self.prompt_assets.clone()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -218,7 +262,14 @@ impl SkillSelector {
                 .cmp(&left.score)
                 .then_with(|| left.name.cmp(&right.name))
         });
-        let selected = candidates.first().cloned();
+        // A single generic summary-token match (for example `runtime` or
+        // `agent`) is discovery evidence, not authorization to inject an
+        // entire Skill prompt. Selection requires either an explicit visible
+        // grant or a direct name/id match.
+        let selected = candidates
+            .first()
+            .filter(|candidate| candidate.score >= MIN_SKILL_SELECTION_SCORE)
+            .cloned();
         SkillSelectionResult {
             selected,
             candidates,
@@ -275,6 +326,8 @@ fn query_terms(query: &str) -> Vec<String> {
         .map(str::to_ascii_lowercase)
         .collect()
 }
+
+const MIN_SKILL_SELECTION_SCORE: u32 = 6;
 
 fn visible_skill_refs(profile: &AgentSkillProfile) -> Vec<String> {
     profile
@@ -432,7 +485,7 @@ mod tests {
                 .map(|evidence| evidence.skill_id.as_str()),
             Some("release-plan")
         );
-        let event = decision.activation.to_runtime_event(9);
+        let event = decision.activation.to_session_domain_event(9);
         assert_eq!(
             event.payload["invocation_evidence"]["outcome"],
             "selected_for_runtime"
@@ -473,7 +526,7 @@ mod tests {
         });
 
         assert_eq!(decision.structured_dependencies.len(), 1);
-        let event = decision.activation.to_runtime_event(10);
+        let event = decision.activation.to_session_domain_event(10);
         assert_eq!(
             event.payload["structured_dependencies"][0]["domain"],
             "supply_chain"
@@ -505,7 +558,7 @@ mod tests {
             decision.activation.candidates[0].source,
             RuntimeSkillCandidateSource::CapabilityRefFallback
         );
-        let event = decision.activation.to_runtime_event(2);
+        let event = decision.activation.to_session_domain_event(2);
         assert!(event.payload.get("invocation_evidence").is_some());
         assert!(!event
             .refs
@@ -549,5 +602,24 @@ mod tests {
             decision.activation.candidates[0].reasons,
             vec!["capability_ref_fallback".to_string()]
         );
+    }
+
+    #[test]
+    fn generic_summary_term_does_not_activate_unrelated_skill() {
+        let mut candidate = profile(
+            "commit-version-gate",
+            "Commit Version Gate",
+            vec![SkillAdapterKind::PromptOnly],
+        );
+        candidate.inspection_summary = vec!["runtime governance".to_string()];
+
+        let result = SkillSelector::select(SkillSelectionInput {
+            query: "review runtime architecture".to_string(),
+            agent_profile: AgentSkillProfile::default(),
+            available_skills: vec![candidate],
+        });
+
+        assert!(result.selected.is_none());
+        assert_eq!(result.candidates[0].score, 2);
     }
 }

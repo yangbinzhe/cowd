@@ -10,10 +10,10 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::bash::{execute_bash, BashCommandInput, BashCommandOutput};
+use crate::bash::{BashCommandInput, BashCommandOutput};
 use crate::checkpoint::{
-    checkpoint_create, checkpoint_diff, checkpoint_list, checkpoint_restore, CheckpointCreateInput,
-    CheckpointDiffInput, CheckpointRestoreInput,
+    checkpoint_create_in, checkpoint_diff_in, checkpoint_list_in, checkpoint_restore_in,
+    CheckpointCreateInput, CheckpointDiffInput, CheckpointRestoreInput,
 };
 use crate::file_ops::{
     edit_file, glob_search, grep_search, read_file, write_file, GrepSearchInput,
@@ -24,18 +24,14 @@ use crate::lane_policy::{iso8601_now, LaneContext};
 use crate::mutation_plan::{
     apply_mutations, preview_mutations, MutationApplyInput, MutationPreviewInput,
 };
+use crate::path_policy::WorkspacePathPolicy;
 use crate::permissions::{EnforcementResult, PermissionEnforcer, PermissionMode};
 use crate::prepared::{
     prepare_readonly_invocations, PreparedReadonlyLeaf, PreparedToolCall, PreparedToolInvocation,
     ToolExecutionContext,
 };
 use crate::stale_branch::{check_freshness, BranchFreshness};
-use crate::tool_cache::{
-    get_cached_tool_result_scoped, invalidate_tool_cache, invalidate_tool_cache_scope,
-    put_cached_tool_result_scoped, tool_cache_stats,
-};
-use crate::tool_orchestrator::{tool_execution_profile, ToolSafetyCategory, ToolSafetyRegistry};
-use crate::{configured_mcp_service, global_lsp_registry, GlobalToolRegistry};
+use crate::ToolHostLease;
 
 /// Check permission before executing a tool. Returns Err with denial reason if blocked.
 pub fn enforce_permission_check(
@@ -52,8 +48,25 @@ pub fn enforce_permission_check(
     }
 }
 
-pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
-    execute_tool_with_enforcer(None, None, name, input)
+#[cfg(test)]
+pub fn execute_tool_for_test(name: &str, input: &Value) -> Result<String, String> {
+    TEST_TOOL_HOST.with(|host| execute_with_lease(&host.pin_snapshot(), name, input))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_TOOL_HOST: crate::ToolHost = crate::ToolHost::builtin(
+        "tools-test",
+        std::env::current_dir().unwrap_or_default(),
+    );
+}
+
+pub(crate) fn execute_with_lease(
+    lease: &ToolHostLease,
+    name: &str,
+    input: &Value,
+) -> Result<String, String> {
+    execute_tool_with_enforcer(lease, None, None, name, input)
 }
 
 /// Execute a tool with optional permission enforcer and gate evaluator checks.
@@ -61,6 +74,7 @@ pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
 /// The gate evaluator is checked FIRST — before the permission enforcer —
 /// so that gate failures short-circuit before any enforcement logic runs.
 pub(crate) fn execute_tool_with_enforcer(
+    lease: &ToolHostLease,
     enforcer: Option<&PermissionEnforcer>,
     gate_evaluator: Option<&GateEvaluator>,
     name: &str,
@@ -109,76 +123,86 @@ pub(crate) fn execute_tool_with_enforcer(
             let bash_input: BashCommandInput = from_value(input)?;
             let classified_mode = classify_bash_permission(&bash_input.command);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
-            run_bash(bash_input)
+            run_bash(lease, bash_input)
         }
         "read_file" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<ReadFileInput>(input).and_then(run_read_file)
+            from_value::<ReadFileInput>(input).and_then(|parsed| run_read_file(lease, parsed))
         }
         "read_many" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<ReadManyInput>(input).and_then(|parsed| run_read_many(enforcer, parsed))
+            from_value::<ReadManyInput>(input)
+                .and_then(|parsed| run_read_many(lease, enforcer, parsed))
         }
         "write_file" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<WriteFileInput>(input).and_then(run_write_file)
+            from_value::<WriteFileInput>(input).and_then(|parsed| run_write_file(lease, parsed))
         }
         "edit_file" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<EditFileInput>(input).and_then(run_edit_file)
+            from_value::<EditFileInput>(input).and_then(|parsed| run_edit_file(lease, parsed))
         }
         "mutation_preview" | "edit_many_preview" | "patch_plan" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<MutationPreviewInput>(input).and_then(run_mutation_preview)
+            from_value::<MutationPreviewInput>(input)
+                .and_then(|parsed| run_mutation_preview(lease, parsed))
         }
         "apply_patch_transaction" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<MutationApplyInput>(input).and_then(run_apply_patch_transaction)
+            from_value::<MutationApplyInput>(input)
+                .and_then(|parsed| run_apply_patch_transaction(lease, parsed))
         }
         "checkpoint_create" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<CheckpointCreateInput>(input).and_then(run_checkpoint_create)
+            from_value::<CheckpointCreateInput>(input)
+                .and_then(|parsed| run_checkpoint_create(lease, parsed))
         }
         "checkpoint_list" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            run_checkpoint_list()
+            run_checkpoint_list(lease)
         }
         "checkpoint_diff" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<CheckpointDiffInput>(input).and_then(run_checkpoint_diff)
+            from_value::<CheckpointDiffInput>(input)
+                .and_then(|parsed| run_checkpoint_diff(lease, parsed))
         }
         "checkpoint_restore" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<CheckpointRestoreInput>(input).and_then(run_checkpoint_restore)
+            from_value::<CheckpointRestoreInput>(input)
+                .and_then(|parsed| run_checkpoint_restore(lease, parsed))
         }
         "glob_search" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<GlobSearchInputValue>(input).and_then(run_glob_search)
+            from_value::<GlobSearchInputValue>(input)
+                .and_then(|parsed| run_glob_search(lease, parsed))
         }
         "glob_many" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<GlobManyInput>(input).and_then(|parsed| run_glob_many(enforcer, parsed))
+            from_value::<GlobManyInput>(input)
+                .and_then(|parsed| run_glob_many(lease, enforcer, parsed))
         }
         "grep_search" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<GrepSearchInput>(input).and_then(run_grep_search)
+            from_value::<GrepSearchInput>(input).and_then(|parsed| run_grep_search(lease, parsed))
         }
         "grep_many" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<GrepManyInput>(input).and_then(|parsed| run_grep_many(enforcer, parsed))
+            from_value::<GrepManyInput>(input)
+                .and_then(|parsed| run_grep_many(lease, enforcer, parsed))
         }
         "workspace_snapshot" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<WorkspaceSnapshotInput>(input).and_then(run_workspace_snapshot)
+            from_value::<WorkspaceSnapshotInput>(input)
+                .and_then(|parsed| run_workspace_snapshot(lease, parsed))
         }
         "tool_batch_readonly" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
             from_value::<ToolBatchReadonlyInput>(input)
-                .and_then(|parsed| run_tool_batch_readonly(enforcer, gate_evaluator, parsed))
+                .and_then(|parsed| run_tool_batch_readonly(lease, enforcer, gate_evaluator, parsed))
         }
         "tool_cache_stats" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            to_pretty_json(tool_cache_stats())
+            to_pretty_json(lease.cache().stats())
         }
         "WebFetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
         "WebSearch" => from_value::<WebSearchInput>(input).and_then(run_web_search),
@@ -206,10 +230,15 @@ pub(crate) fn execute_tool_with_enforcer(
                 "AST search: {pattern} in {lang}\nUse ast_grep_search tool for structured code patterns."
             ))
         }
-        "ToolSearch" => from_value::<ToolSearchInput>(input).and_then(run_tool_search),
-        "NotebookEdit" => from_value::<NotebookEditInput>(input).and_then(run_notebook_edit),
+        "ToolSearch" => {
+            from_value::<ToolSearchInput>(input).and_then(|parsed| run_tool_search(lease, parsed))
+        }
+        "NotebookEdit" => from_value::<NotebookEditInput>(input)
+            .and_then(|parsed| run_notebook_edit(lease, parsed)),
         "Sleep" => from_value::<SleepInput>(input).and_then(run_sleep),
-        "SendUserMessage" | "Brief" => from_value::<BriefInput>(input).and_then(run_brief),
+        "SendUserMessage" | "Brief" => {
+            from_value::<BriefInput>(input).and_then(|parsed| run_brief(lease, parsed))
+        }
         "Config" => from_value::<ConfigInput>(input).and_then(run_config),
         "EnterPlanMode" => from_value::<EnterPlanModeInput>(input).and_then(run_enter_plan_mode),
         "ExitPlanMode" => from_value::<ExitPlanModeInput>(input).and_then(run_exit_plan_mode),
@@ -227,20 +256,22 @@ pub(crate) fn execute_tool_with_enforcer(
         "AskUserQuestion" => {
             from_value::<AskUserQuestionInput>(input).and_then(run_ask_user_question)
         }
-        "LSP" => from_value::<LspInput>(input).and_then(run_lsp),
-        "ListMcpResources" => {
-            from_value::<McpResourceInput>(input).and_then(run_list_mcp_resources)
+        "LSP" => from_value::<LspInput>(input).and_then(|parsed| run_lsp(lease, parsed)),
+        "ListMcpResources" => from_value::<McpResourceInput>(input)
+            .and_then(|parsed| run_list_mcp_resources(lease, parsed)),
+        "ReadMcpResource" => from_value::<McpResourceInput>(input)
+            .and_then(|parsed| run_read_mcp_resource(lease, parsed)),
+        "McpAuth" => {
+            from_value::<McpAuthInput>(input).and_then(|parsed| run_mcp_auth(lease, parsed))
         }
-        "ReadMcpResource" => from_value::<McpResourceInput>(input).and_then(run_read_mcp_resource),
-        "McpAuth" => from_value::<McpAuthInput>(input).and_then(run_mcp_auth),
         "RemoteTrigger" => from_value::<RemoteTriggerInput>(input).and_then(run_remote_trigger),
-        "MCP" => from_value::<McpToolInput>(input).and_then(run_mcp_tool),
+        "MCP" => from_value::<McpToolInput>(input).and_then(|parsed| run_mcp_tool(lease, parsed)),
         "TestingPermission" => {
             from_value::<TestingPermissionInput>(input).and_then(run_testing_permission)
         }
         "vision_analyze" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            run_vision_analyze(input)
+            run_vision_analyze(lease, input)
         }
         "execute_code" => {
             use crate::sandbox_exec::execute_code;
@@ -369,8 +400,8 @@ fn resolve_ask_user_answer(response: &str, options: Option<&[String]>) -> String
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_lsp(input: LspInput) -> Result<String, String> {
-    let registry = global_lsp_registry();
+fn run_lsp(lease: &ToolHostLease, input: LspInput) -> Result<String, String> {
+    let registry = &lease.snapshot().lsp;
     let action = &input.action;
     let path = input.path.as_deref();
     let line = input.line;
@@ -388,9 +419,12 @@ fn run_lsp(input: LspInput) -> Result<String, String> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_list_mcp_resources(input: McpResourceInput) -> Result<String, String> {
+fn run_list_mcp_resources(
+    lease: &ToolHostLease,
+    input: McpResourceInput,
+) -> Result<String, String> {
     let server = input.server.as_deref().unwrap_or("default");
-    let Some(service) = configured_mcp_service() else {
+    let Some(service) = lease.snapshot().mcp.as_ref() else {
         return mcp_service_unavailable("list_resources", server);
     };
     match service.list_resources(Some(server)) {
@@ -420,10 +454,10 @@ fn run_list_mcp_resources(input: McpResourceInput) -> Result<String, String> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_read_mcp_resource(input: McpResourceInput) -> Result<String, String> {
+fn run_read_mcp_resource(lease: &ToolHostLease, input: McpResourceInput) -> Result<String, String> {
     let uri = input.uri.as_deref().unwrap_or("");
     let server = input.server.as_deref().unwrap_or("default");
-    let Some(service) = configured_mcp_service() else {
+    let Some(service) = lease.snapshot().mcp.as_ref() else {
         return mcp_service_unavailable("read_resource", server);
     };
     match service.read_resource(server, uri) {
@@ -443,7 +477,7 @@ fn run_read_mcp_resource(input: McpResourceInput) -> Result<String, String> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_mcp_auth(input: McpAuthInput) -> Result<String, String> {
+fn run_mcp_auth(lease: &ToolHostLease, input: McpAuthInput) -> Result<String, String> {
     let auth_url_env = format!(
         "COWD_MCP_AUTH_URL_{}",
         input
@@ -457,7 +491,7 @@ fn run_mcp_auth(input: McpAuthInput) -> Result<String, String> {
             .collect::<String>()
     );
     let auth_url = std::env::var(auth_url_env).ok();
-    let Some(service) = configured_mcp_service() else {
+    let Some(service) = lease.snapshot().mcp.as_ref() else {
         return to_pretty_json(json!({
             "server": input.server,
             "status": "disconnected",
@@ -568,9 +602,9 @@ fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_mcp_tool(input: McpToolInput) -> Result<String, String> {
+fn run_mcp_tool(lease: &ToolHostLease, input: McpToolInput) -> Result<String, String> {
     let args = input.arguments.unwrap_or(serde_json::json!({}));
-    let Some(service) = configured_mcp_service() else {
+    let Some(service) = lease.snapshot().mcp.as_ref() else {
         return mcp_service_unavailable("call_tool", &input.server);
     };
     match service.call_tool(mcp::McpToolCallRequest {
@@ -608,7 +642,7 @@ fn run_testing_permission(input: TestingPermissionInput) -> Result<String, Strin
 /// a base64-encoded representation along with metadata, suitable for passing
 /// to a multimodal LLM. The actual LLM vision call is handled by the
 /// ConversationRuntime, not this tool — this tool prepares the image data.
-fn run_vision_analyze(input: &Value) -> Result<String, String> {
+fn run_vision_analyze(lease: &ToolHostLease, input: &Value) -> Result<String, String> {
     let image_path = input
         .get("image_path")
         .and_then(|v| v.as_str())
@@ -625,7 +659,10 @@ fn run_vision_analyze(input: &Value) -> Result<String, String> {
         .unwrap_or("auto");
 
     // Validate the image file exists and is a supported format
-    let path = std::path::Path::new(image_path);
+    let path = lease
+        .path_policy()
+        .resolve(image_path)
+        .map_err(io_to_string)?;
     if !path.exists() {
         return Err(format!("Image file not found: {}", image_path));
     }
@@ -650,7 +687,7 @@ fn run_vision_analyze(input: &Value) -> Result<String, String> {
     };
 
     // Read and base64-encode the image
-    let image_data = std::fs::read(path)
+    let image_data = std::fs::read(&path)
         .map_err(|e| format!("Failed to read image file '{}': {}", image_path, e))?;
 
     let base64_data = base64::engine::general_purpose::STANDARD.encode(&image_data);
@@ -740,12 +777,15 @@ fn has_dangerous_paths(command: &str) -> bool {
     false
 }
 
-fn run_bash(input: BashCommandInput) -> Result<String, String> {
+fn run_bash(lease: &ToolHostLease, input: BashCommandInput) -> Result<String, String> {
     if let Some(output) = workspace_test_branch_preflight(&input.command, None) {
         return serde_json::to_string_pretty(&output).map_err(|error| error.to_string());
     }
-    serde_json::to_string_pretty(&execute_bash(input).map_err(|error| error.to_string())?)
-        .map_err(|error| error.to_string())
+    serde_json::to_string_pretty(
+        &crate::bash::execute_bash_in_workspace(input, lease.workspace_root())
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn workspace_test_branch_preflight(
@@ -870,6 +910,23 @@ fn branch_divergence_output(
         "branch divergence detected before workspace tests: `{branch}` {relation} `{main_ref}`. Missing commits: {missing_summary}. Merge or rebase `{main_ref}` before re-running `{command}`."
     );
 
+    let lane_event = LaneEvent::new(
+        LaneEventName::BranchStaleAgainstMain,
+        LaneEventStatus::Blocked,
+        iso8601_now(),
+    )
+    .with_failure_class(LaneFailureClass::BranchDivergence)
+    .with_detail(stderr.clone())
+    .with_data(json!({
+        "branch": branch,
+        "mainRef": main_ref,
+        "commitsBehind": commits_behind,
+        "commitsAhead": commits_ahead,
+        "missingCommits": missing_fixes,
+        "blockedCommand": command,
+        "recommendedAction": format!("merge or rebase {main_ref} before workspace tests")
+    }));
+
     BashCommandOutput {
         stdout: String::new(),
         stderr: stderr.clone(),
@@ -882,25 +939,9 @@ fn branch_divergence_output(
         dangerously_disable_sandbox: None,
         return_code_interpretation: Some("preflight_blocked:branch_divergence".to_string()),
         no_output_expected: Some(false),
-        structured_content: Some(vec![serde_json::to_value(
-            LaneEvent::new(
-                LaneEventName::BranchStaleAgainstMain,
-                LaneEventStatus::Blocked,
-                iso8601_now(),
-            )
-            .with_failure_class(LaneFailureClass::BranchDivergence)
-            .with_detail(stderr.clone())
-            .with_data(json!({
-                "branch": branch,
-                "mainRef": main_ref,
-                "commitsBehind": commits_behind,
-                "commitsAhead": commits_ahead,
-                "missingCommits": missing_fixes,
-                "blockedCommand": command,
-                "recommendedAction": format!("merge or rebase {main_ref} before workspace tests")
-            })),
-        )
-        .expect("lane event should serialize")]),
+        structured_content: serde_json::to_value(lane_event)
+            .ok()
+            .map(|event| vec![event]),
         persisted_output_path: None,
         persisted_output_size: None,
         sandbox_status: None,
@@ -908,45 +949,63 @@ fn branch_divergence_output(
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_read_file(input: ReadFileInput) -> Result<String, String> {
-    let fingerprint = file_fingerprint(&input.path);
-    let scope = file_cache_scope(&input.path);
-    cached_json_tool("read_file", &input, &fingerprint, &scope, || {
-        read_file(&input.path, input.offset, input.limit).map_err(io_to_string)
+fn run_read_file(lease: &ToolHostLease, input: ReadFileInput) -> Result<String, String> {
+    let resolved = lease
+        .path_policy()
+        .resolve(&input.path)
+        .map_err(io_to_string)?;
+    let fingerprint = file_fingerprint(&resolved);
+    let scope = file_cache_scope(&resolved);
+    cached_json_tool(lease, "read_file", &input, &fingerprint, &scope, || {
+        read_file(lease.path_policy(), &input.path, input.offset, input.limit).map_err(io_to_string)
     })
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_read_many(
+    lease: &ToolHostLease,
     enforcer: Option<&PermissionEnforcer>,
     input: ReadManyInput,
 ) -> Result<String, String> {
     let results = run_ordered_batch(input.files, input.max_concurrency, |item| {
         let value = serde_json::to_value(&item).map_err(|error| error.to_string())?;
         maybe_enforce_permission_check(enforcer, "read_file", &value)?;
-        serde_json::to_value(read_file(&item.path, item.offset, item.limit).map_err(io_to_string)?)
-            .map_err(|error| error.to_string())
+        let output = run_read_file(lease, item)?;
+        serde_json::from_str(&output).or(Ok(Value::String(output)))
     });
     to_pretty_json(batch_output("read_many", results))
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_write_file(input: WriteFileInput) -> Result<String, String> {
-    let scope = file_cache_scope(&input.path);
-    create_auto_checkpoint("write_file")?;
-    let output = to_pretty_json(write_file(&input.path, &input.content).map_err(io_to_string)?);
+fn run_write_file(lease: &ToolHostLease, input: WriteFileInput) -> Result<String, String> {
+    let scope = file_cache_scope(
+        &lease
+            .path_policy()
+            .resolve(&input.path)
+            .map_err(io_to_string)?,
+    );
+    create_auto_checkpoint(lease, "write_file")?;
+    let output = to_pretty_json(
+        write_file(lease.path_policy(), &input.path, &input.content).map_err(io_to_string)?,
+    );
     if output.is_ok() {
-        invalidate_tool_cache_scope(&scope);
+        lease.cache().invalidate_scope(&scope);
     }
     output
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_edit_file(input: EditFileInput) -> Result<String, String> {
-    let scope = file_cache_scope(&input.path);
-    create_auto_checkpoint("edit_file")?;
+fn run_edit_file(lease: &ToolHostLease, input: EditFileInput) -> Result<String, String> {
+    let scope = file_cache_scope(
+        &lease
+            .path_policy()
+            .resolve(&input.path)
+            .map_err(io_to_string)?,
+    );
+    create_auto_checkpoint(lease, "edit_file")?;
     let output = to_pretty_json(
         edit_file(
+            lease.path_policy(),
             &input.path,
             &input.old_string,
             &input.new_string,
@@ -955,126 +1014,158 @@ fn run_edit_file(input: EditFileInput) -> Result<String, String> {
         .map_err(io_to_string)?,
     );
     if output.is_ok() {
-        invalidate_tool_cache_scope(&scope);
+        lease.cache().invalidate_scope(&scope);
     }
     output
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_mutation_preview(input: MutationPreviewInput) -> Result<String, String> {
-    to_pretty_json(preview_mutations(input).map_err(io_to_string)?)
+fn run_mutation_preview(
+    lease: &ToolHostLease,
+    input: MutationPreviewInput,
+) -> Result<String, String> {
+    to_pretty_json(preview_mutations(lease.path_policy(), input).map_err(io_to_string)?)
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_apply_patch_transaction(input: MutationApplyInput) -> Result<String, String> {
-    create_auto_checkpoint("apply_patch_transaction")?;
-    let applied = apply_mutations(input).map_err(io_to_string)?;
+fn run_apply_patch_transaction(
+    lease: &ToolHostLease,
+    input: MutationApplyInput,
+) -> Result<String, String> {
+    create_auto_checkpoint(lease, "apply_patch_transaction")?;
+    let applied = apply_mutations(lease.path_policy(), input).map_err(io_to_string)?;
     for file in &applied.applied {
-        invalidate_tool_cache_scope(&file_cache_scope(&file.path));
+        lease.cache().invalidate_scope(&file_cache_scope(
+            &lease
+                .path_policy()
+                .resolve(&file.path)
+                .map_err(io_to_string)?,
+        ));
     }
     to_pretty_json(applied)
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_checkpoint_create(input: CheckpointCreateInput) -> Result<String, String> {
-    to_pretty_json(checkpoint_create(input).map_err(io_to_string)?)
+fn run_checkpoint_create(
+    lease: &ToolHostLease,
+    input: CheckpointCreateInput,
+) -> Result<String, String> {
+    to_pretty_json(checkpoint_create_in(lease.workspace_root(), input).map_err(io_to_string)?)
 }
 
-fn create_auto_checkpoint(tool_name: &str) -> Result<(), String> {
+fn create_auto_checkpoint(lease: &ToolHostLease, tool_name: &str) -> Result<(), String> {
     if std::env::var("COWD_AUTO_CHECKPOINT").ok().as_deref() != Some("1") {
         return Ok(());
     }
-    checkpoint_create(CheckpointCreateInput {
-        label: Some(format!("auto-before-{tool_name}")),
-    })
+    checkpoint_create_in(
+        lease.workspace_root(),
+        CheckpointCreateInput {
+            label: Some(format!("auto-before-{tool_name}")),
+        },
+    )
     .map(|_| ())
     .map_err(io_to_string)
 }
 
-fn run_checkpoint_list() -> Result<String, String> {
-    to_pretty_json(checkpoint_list().map_err(io_to_string)?)
+fn run_checkpoint_list(lease: &ToolHostLease) -> Result<String, String> {
+    to_pretty_json(checkpoint_list_in(lease.workspace_root()).map_err(io_to_string)?)
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_checkpoint_diff(input: CheckpointDiffInput) -> Result<String, String> {
-    to_pretty_json(checkpoint_diff(input).map_err(io_to_string)?)
+fn run_checkpoint_diff(
+    lease: &ToolHostLease,
+    input: CheckpointDiffInput,
+) -> Result<String, String> {
+    to_pretty_json(checkpoint_diff_in(lease.workspace_root(), input).map_err(io_to_string)?)
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_checkpoint_restore(input: CheckpointRestoreInput) -> Result<String, String> {
-    let output = to_pretty_json(checkpoint_restore(input).map_err(io_to_string)?);
+fn run_checkpoint_restore(
+    lease: &ToolHostLease,
+    input: CheckpointRestoreInput,
+) -> Result<String, String> {
+    let output =
+        to_pretty_json(checkpoint_restore_in(lease.workspace_root(), input).map_err(io_to_string)?);
     if output.is_ok() {
-        invalidate_tool_cache();
+        lease.cache().invalidate_all();
     }
     output
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_glob_search(input: GlobSearchInputValue) -> Result<String, String> {
-    let fingerprint = scope_fingerprint(input.path.as_deref());
-    let scope = directory_cache_scope(input.path.as_deref());
-    cached_json_tool("glob_search", &input, &fingerprint, &scope, || {
-        glob_search(&input.pattern, input.path.as_deref()).map_err(io_to_string)
+fn run_glob_search(lease: &ToolHostLease, input: GlobSearchInputValue) -> Result<String, String> {
+    let fingerprint = scope_fingerprint(lease.path_policy(), input.path.as_deref())?;
+    let scope = directory_cache_scope(lease.path_policy(), input.path.as_deref())?;
+    cached_json_tool(lease, "glob_search", &input, &fingerprint, &scope, || {
+        glob_search(lease.path_policy(), &input.pattern, input.path.as_deref())
+            .map_err(io_to_string)
     })
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_glob_many(
+    lease: &ToolHostLease,
     enforcer: Option<&PermissionEnforcer>,
     input: GlobManyInput,
 ) -> Result<String, String> {
     let results = run_ordered_batch(input.patterns, input.max_concurrency, |item| {
         let value = serde_json::to_value(&item).map_err(|error| error.to_string())?;
         maybe_enforce_permission_check(enforcer, "glob_search", &value)?;
-        serde_json::to_value(
-            glob_search(&item.pattern, item.path.as_deref()).map_err(io_to_string)?,
-        )
-        .map_err(|error| error.to_string())
+        let output = run_glob_search(lease, item)?;
+        serde_json::from_str(&output).or(Ok(Value::String(output)))
     });
     to_pretty_json(batch_output("glob_many", results))
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_grep_search(input: GrepSearchInput) -> Result<String, String> {
-    let fingerprint = scope_fingerprint(input.path.as_deref());
-    let scope = directory_cache_scope(input.path.as_deref());
-    cached_json_tool("grep_search", &input, &fingerprint, &scope, || {
-        grep_search(&input).map_err(io_to_string)
+fn run_grep_search(lease: &ToolHostLease, input: GrepSearchInput) -> Result<String, String> {
+    let fingerprint = scope_fingerprint(lease.path_policy(), input.path.as_deref())?;
+    let scope = directory_cache_scope(lease.path_policy(), input.path.as_deref())?;
+    cached_json_tool(lease, "grep_search", &input, &fingerprint, &scope, || {
+        grep_search(lease.path_policy(), &input).map_err(io_to_string)
     })
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_grep_many(
+    lease: &ToolHostLease,
     enforcer: Option<&PermissionEnforcer>,
     input: GrepManyInput,
 ) -> Result<String, String> {
     let results = run_ordered_batch(input.searches, input.max_concurrency, |item| {
         let value = serde_json::to_value(&item).map_err(|error| error.to_string())?;
         maybe_enforce_permission_check(enforcer, "grep_search", &value)?;
-        serde_json::to_value(grep_search(&item).map_err(io_to_string)?)
-            .map_err(|error| error.to_string())
+        let output = run_grep_search(lease, item)?;
+        serde_json::from_str(&output).or(Ok(Value::String(output)))
     });
     to_pretty_json(batch_output("grep_many", results))
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_workspace_snapshot(input: WorkspaceSnapshotInput) -> Result<String, String> {
+fn run_workspace_snapshot(
+    lease: &ToolHostLease,
+    input: WorkspaceSnapshotInput,
+) -> Result<String, String> {
     let snapshot_input = input.clone();
-    let fingerprint = workspace_snapshot_fingerprint(&input);
+    let fingerprint = workspace_snapshot_fingerprint(lease.path_policy(), &input)?;
     cached_json_tool(
+        lease,
         "workspace_snapshot",
         &input,
         &fingerprint,
         "workspace:.",
-        || workspace_snapshot_value(snapshot_input),
+        || workspace_snapshot_value(lease, snapshot_input),
     )
 }
 
-fn workspace_snapshot_value(input: WorkspaceSnapshotInput) -> Result<Value, String> {
+fn workspace_snapshot_value(
+    lease: &ToolHostLease,
+    input: WorkspaceSnapshotInput,
+) -> Result<Value, String> {
     let include_git = input.include_git.unwrap_or(true);
     let include_files = input.include_files.unwrap_or(true);
     let max_files = input.max_files.unwrap_or(500).clamp(1, 5000);
-    let cwd = std::env::current_dir().map_err(io_to_string)?;
+    let cwd = lease.path_policy().workspace_root().to_path_buf();
 
     let git = if include_git {
         Some(json!({
@@ -1093,12 +1184,8 @@ fn workspace_snapshot_value(input: WorkspaceSnapshotInput) -> Result<Value, Stri
             if files.len() >= max_files {
                 break;
             }
-            let root_path = if Path::new(&root).is_absolute() {
-                PathBuf::from(root)
-            } else {
-                cwd.join(root)
-            };
-            collect_snapshot_files(&root_path, max_files, &mut files);
+            let root_path = lease.path_policy().resolve(&root).map_err(io_to_string)?;
+            collect_snapshot_files(lease.path_policy(), &root_path, max_files, &mut files);
         }
         files.sort();
         files.dedup();
@@ -1118,6 +1205,7 @@ fn workspace_snapshot_value(input: WorkspaceSnapshotInput) -> Result<Value, Stri
 }
 
 fn cached_json_tool<T, F, O>(
+    lease: &ToolHostLease,
     tool_name: &str,
     input: &T,
     fingerprint: &str,
@@ -1135,28 +1223,49 @@ where
         return to_pretty_json(operation()?);
     }
     let cache_input = format!("{input_json}::fingerprint::{fingerprint}");
-    if let Some(cached) = get_cached_tool_result_scoped(tool_name, &cache_input, scope) {
+    if let Some(cached) = lease.cache().get(
+        lease.workspace_id(),
+        scope,
+        tool_name,
+        &cache_input,
+        lease.schema_revision(),
+    ) {
         return Ok(cached);
     }
     let output = to_pretty_json(operation()?)?;
-    put_cached_tool_result_scoped(tool_name, &cache_input, scope, &output);
+    lease.cache().put(
+        lease.workspace_id(),
+        scope,
+        tool_name,
+        &cache_input,
+        lease.schema_revision(),
+        &output,
+    );
     Ok(output)
 }
 
-fn file_cache_scope(path: &str) -> String {
-    format!("file:{}", absolutize_path(path).to_string_lossy())
+fn file_cache_scope(path: &Path) -> String {
+    format!("file:{}", path.to_string_lossy())
 }
 
-fn directory_cache_scope(path: Option<&str>) -> String {
+fn directory_cache_scope(
+    policy: &WorkspacePathPolicy,
+    path: Option<&str>,
+) -> Result<String, String> {
     match path {
-        Some(path) => format!("directory:{}", absolutize_path(path).to_string_lossy()),
-        None => "workspace:.".to_string(),
+        Some(path) => Ok(format!(
+            "directory:{}",
+            policy
+                .resolve(path)
+                .map_err(io_to_string)?
+                .to_string_lossy()
+        )),
+        None => Ok("workspace:.".to_string()),
     }
 }
 
-fn file_fingerprint(path: &str) -> String {
-    let resolved = absolutize_path(path);
-    let content_hash = match std::fs::File::open(&resolved) {
+fn file_fingerprint(resolved: &Path) -> String {
+    let content_hash = match std::fs::File::open(resolved) {
         Ok(mut file) => {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             let mut buffer = [0_u8; 8192];
@@ -1170,7 +1279,7 @@ fn file_fingerprint(path: &str) -> String {
         }
         Err(_) => String::from("missing"),
     };
-    let Ok(metadata) = std::fs::metadata(&resolved) else {
+    let Ok(metadata) = std::fs::metadata(resolved) else {
         return format!("missing:{}", resolved.to_string_lossy());
     };
     let modified = metadata
@@ -1187,20 +1296,24 @@ fn file_fingerprint(path: &str) -> String {
     ) + &format!(":{content_hash}")
 }
 
-fn scope_fingerprint(path: Option<&str>) -> String {
-    let root = path
-        .map(absolutize_path)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+fn scope_fingerprint(policy: &WorkspacePathPolicy, path: Option<&str>) -> Result<String, String> {
+    let root = match path {
+        Some(path) => policy.resolve(path).map_err(io_to_string)?,
+        None => policy.workspace_root().to_path_buf(),
+    };
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     root.to_string_lossy().hash(&mut hasher);
     let complete = hash_path_scope(&root, &mut hasher, &mut 0usize);
     if !complete {
-        return String::from("uncacheable");
+        return Ok(String::from("uncacheable"));
     }
-    format!("scope:{:016x}", hasher.finish())
+    Ok(format!("scope:{:016x}", hasher.finish()))
 }
 
-fn workspace_snapshot_fingerprint(input: &WorkspaceSnapshotInput) -> String {
+fn workspace_snapshot_fingerprint(
+    policy: &WorkspacePathPolicy,
+    input: &WorkspaceSnapshotInput,
+) -> Result<String, String> {
     let mut parts = Vec::new();
     if input.include_git.unwrap_or(true) {
         parts.push(git_stdout(&["rev-parse", "HEAD"]).unwrap_or_default());
@@ -1212,21 +1325,10 @@ fn workspace_snapshot_fingerprint(input: &WorkspaceSnapshotInput) -> String {
             .clone()
             .unwrap_or_else(|| vec![String::from(".")]);
         for root in roots {
-            parts.push(scope_fingerprint(Some(&root)));
+            parts.push(scope_fingerprint(policy, Some(&root))?);
         }
     }
-    parts.join("\n")
-}
-
-fn absolutize_path(path: &str) -> PathBuf {
-    let path = Path::new(path);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(path)
-    }
+    Ok(parts.join("\n"))
 }
 
 fn hash_path_scope(
@@ -1301,6 +1403,7 @@ fn should_skip_cache_fingerprint(path: &Path) -> bool {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_tool_batch_readonly(
+    lease: &ToolHostLease,
     enforcer: Option<&PermissionEnforcer>,
     gate_evaluator: Option<&GateEvaluator>,
     input: ToolBatchReadonlyInput,
@@ -1333,7 +1436,7 @@ fn run_tool_batch_readonly(
                     &prepared.normalized_name,
                     prepared_leaf_input(&prepared),
                 )?;
-                execute_prepared_readonly_leaf(prepared)
+                execute_prepared_readonly_leaf(lease, prepared)
             });
             return to_pretty_json(batch_output_with_mode(
                 "tool_batch_readonly",
@@ -1344,7 +1447,8 @@ fn run_tool_batch_readonly(
     }
 
     let results = run_ordered_batch(input.calls, input.max_concurrency, |call| {
-        let output = execute_tool_with_enforcer(enforcer, gate_evaluator, &call.name, &call.input)?;
+        let output =
+            execute_tool_with_enforcer(lease, enforcer, gate_evaluator, &call.name, &call.input)?;
         Ok(serde_json::from_str(&output).unwrap_or(Value::String(output)))
     });
     to_pretty_json(batch_output_with_mode(
@@ -1357,7 +1461,7 @@ fn run_tool_batch_readonly(
 fn calls_support_prepared_readonly(calls: &[ToolBatchReadonlyCallInput]) -> bool {
     calls
         .iter()
-        .all(|call| tool_execution_profile(&call.name).prepared_readonly_supported)
+        .all(|call| is_prepared_readonly_tool(&call.name))
 }
 
 fn prepared_leaf_input(prepared: &PreparedToolInvocation) -> &Value {
@@ -1370,23 +1474,32 @@ fn prepared_leaf_input(prepared: &PreparedToolInvocation) -> &Value {
     }
 }
 
-fn execute_prepared_readonly_leaf(prepared: PreparedToolInvocation) -> Result<Value, String> {
+fn execute_prepared_readonly_leaf(
+    lease: &ToolHostLease,
+    prepared: PreparedToolInvocation,
+) -> Result<Value, String> {
     let output = match prepared.leaf {
         PreparedReadonlyLeaf::ReadFile(input) => {
-            from_value::<ReadFileInput>(&input).and_then(run_read_file)?
+            from_value::<ReadFileInput>(&input).and_then(|parsed| run_read_file(lease, parsed))?
         }
-        PreparedReadonlyLeaf::GlobSearch(input) => {
-            from_value::<GlobSearchInputValue>(&input).and_then(run_glob_search)?
-        }
-        PreparedReadonlyLeaf::GrepSearch(input) => {
-            from_value::<GrepSearchInput>(&input).and_then(run_grep_search)?
-        }
+        PreparedReadonlyLeaf::GlobSearch(input) => from_value::<GlobSearchInputValue>(&input)
+            .and_then(|parsed| run_glob_search(lease, parsed))?,
+        PreparedReadonlyLeaf::GrepSearch(input) => from_value::<GrepSearchInput>(&input)
+            .and_then(|parsed| run_grep_search(lease, parsed))?,
         PreparedReadonlyLeaf::WorkspaceSnapshot(input) => {
-            from_value::<WorkspaceSnapshotInput>(&input).and_then(run_workspace_snapshot)?
+            from_value::<WorkspaceSnapshotInput>(&input)
+                .and_then(|parsed| run_workspace_snapshot(lease, parsed))?
         }
-        PreparedReadonlyLeaf::ToolCacheStats => to_pretty_json(tool_cache_stats())?,
+        PreparedReadonlyLeaf::ToolCacheStats => to_pretty_json(lease.cache().stats())?,
     };
     Ok(serde_json::from_str(&output).unwrap_or(Value::String(output)))
+}
+
+fn is_prepared_readonly_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file" | "glob_search" | "grep_search" | "workspace_snapshot" | "tool_cache_stats"
+    )
 }
 
 fn is_allowed_readonly_batch_tool(name: &str) -> bool {
@@ -1403,31 +1516,39 @@ fn is_allowed_readonly_batch_tool(name: &str) -> bool {
             | "mutation_preview"
             | "edit_many_preview"
             | "patch_plan"
-    ) && ToolSafetyRegistry::global().classify(name) == ToolSafetyCategory::ReadOnly
+    )
 }
 
-fn collect_snapshot_files(root: &Path, max_files: usize, files: &mut Vec<String>) {
+fn collect_snapshot_files(
+    policy: &WorkspacePathPolicy,
+    root: &Path,
+    max_files: usize,
+    files: &mut Vec<String>,
+) {
     if files.len() >= max_files {
         return;
     }
-    let Ok(metadata) = std::fs::metadata(root) else {
+    let Ok(resolved_root) = policy.ensure_resolved_path(root) else {
+        return;
+    };
+    let Ok(metadata) = std::fs::metadata(&resolved_root) else {
         return;
     };
     if metadata.is_file() {
-        files.push(root.to_string_lossy().into_owned());
+        files.push(resolved_root.to_string_lossy().into_owned());
         return;
     }
-    if !metadata.is_dir() || should_skip_snapshot_dir(root) {
+    if !metadata.is_dir() || should_skip_snapshot_dir(&resolved_root) {
         return;
     }
-    let Ok(entries) = std::fs::read_dir(root) else {
+    let Ok(entries) = std::fs::read_dir(&resolved_root) else {
         return;
     };
     for entry in entries.flatten() {
         if files.len() >= max_files {
             break;
         }
-        collect_snapshot_files(&entry.path(), max_files, files);
+        collect_snapshot_files(policy, &entry.path(), max_files, files);
     }
 }
 
@@ -1437,7 +1558,14 @@ fn should_skip_snapshot_dir(path: &Path) -> bool {
         .is_some_and(|name| {
             matches!(
                 name,
-                ".git" | "target" | "node_modules" | "dist" | "build" | ".cache" | "coverage"
+                ".git"
+                    | ".cowd"
+                    | "target"
+                    | "node_modules"
+                    | "dist"
+                    | "build"
+                    | ".cache"
+                    | "coverage"
             )
         })
 }
@@ -1595,20 +1723,20 @@ fn run_todo_write(input: TodoWriteInput) -> Result<String, String> {
     to_pretty_json(execute_todo_write(input)?)
 }
 
-fn run_tool_search(input: ToolSearchInput) -> Result<String, String> {
-    to_pretty_json(execute_tool_search(input))
+fn run_tool_search(lease: &ToolHostLease, input: ToolSearchInput) -> Result<String, String> {
+    to_pretty_json(execute_tool_search(lease, input))
 }
 
-fn run_notebook_edit(input: NotebookEditInput) -> Result<String, String> {
-    to_pretty_json(execute_notebook_edit(input)?)
+fn run_notebook_edit(lease: &ToolHostLease, input: NotebookEditInput) -> Result<String, String> {
+    to_pretty_json(execute_notebook_edit(lease.path_policy(), input)?)
 }
 
 fn run_sleep(input: SleepInput) -> Result<String, String> {
     to_pretty_json(execute_sleep(input)?)
 }
 
-fn run_brief(input: BriefInput) -> Result<String, String> {
-    to_pretty_json(execute_brief(input)?)
+fn run_brief(lease: &ToolHostLease, input: BriefInput) -> Result<String, String> {
+    to_pretty_json(execute_brief(lease.path_policy(), input)?)
 }
 
 fn run_config(input: ConfigInput) -> Result<String, String> {
@@ -2043,19 +2171,6 @@ struct TodoWriteOutput {
     new_todos: Vec<TodoItem>,
     #[serde(rename = "verificationNudgeNeeded")]
     verification_nudge_needed: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct ToolSearchOutput {
-    pub(crate) matches: Vec<String>,
-    pub(crate) query: String,
-    pub(crate) normalized_query: String,
-    #[serde(rename = "total_deferred_tools")]
-    pub(crate) total_deferred_tools: usize,
-    #[serde(rename = "pending_mcp_servers")]
-    pub(crate) pending_mcp_servers: Option<Vec<String>>,
-    #[serde(rename = "mcp_degraded", skip_serializing_if = "Option::is_none")]
-    pub(crate) mcp_degraded: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2624,8 +2739,11 @@ fn todo_store_path() -> Result<std::path::PathBuf, String> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn execute_tool_search(input: ToolSearchInput) -> ToolSearchOutput {
-    GlobalToolRegistry::builtin().search(&input.query, input.max_results.unwrap_or(5), None, None)
+fn execute_tool_search(
+    lease: &ToolHostLease,
+    input: ToolSearchInput,
+) -> harness_contract::tool::ToolDiscoveryReceipt {
+    lease.search(&input.query, input.max_results.unwrap_or(5))
 }
 
 pub(crate) fn search_tool_specs(
@@ -2740,8 +2858,11 @@ fn canonical_tool_token(value: &str) -> String {
 }
 
 #[allow(clippy::too_many_lines)]
-fn execute_notebook_edit(input: NotebookEditInput) -> Result<NotebookEditOutput, String> {
-    let path = std::path::PathBuf::from(&input.notebook_path);
+fn execute_notebook_edit(
+    policy: &WorkspacePathPolicy,
+    input: NotebookEditInput,
+) -> Result<NotebookEditOutput, String> {
+    let path = policy.resolve(&input.notebook_path).map_err(io_to_string)?;
     if path.extension().and_then(|ext| ext.to_str()) != Some("ipynb") {
         return Err(String::from(
             "File must be a Jupyter notebook (.ipynb file).",
@@ -2924,7 +3045,7 @@ fn execute_sleep(input: SleepInput) -> Result<SleepOutput, String> {
     })
 }
 
-fn execute_brief(input: BriefInput) -> Result<BriefOutput, String> {
+fn execute_brief(policy: &WorkspacePathPolicy, input: BriefInput) -> Result<BriefOutput, String> {
     if input.message.trim().is_empty() {
         return Err(String::from("message must not be empty"));
     }
@@ -2935,7 +3056,7 @@ fn execute_brief(input: BriefInput) -> Result<BriefOutput, String> {
         .map(|paths| {
             paths
                 .iter()
-                .map(|path| resolve_attachment(path))
+                .map(|path| resolve_attachment(policy, path))
                 .collect::<Result<Vec<_>, String>>()
         })
         .transpose()?;
@@ -2951,8 +3072,11 @@ fn execute_brief(input: BriefInput) -> Result<BriefOutput, String> {
     })
 }
 
-fn resolve_attachment(path: &str) -> Result<ResolvedAttachment, String> {
-    let resolved = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
+fn resolve_attachment(
+    policy: &WorkspacePathPolicy,
+    path: &str,
+) -> Result<ResolvedAttachment, String> {
+    let resolved = policy.resolve(path).map_err(io_to_string)?;
     let metadata = std::fs::metadata(&resolved).map_err(|error| error.to_string())?;
     Ok(ResolvedAttachment {
         path: resolved.display().to_string(),
@@ -3484,7 +3608,9 @@ fn get_nested_value<'a>(
 }
 
 fn set_nested_value(root: &mut serde_json::Map<String, Value>, path: &[&str], new_value: Value) {
-    let (first, rest) = path.split_first().expect("config path must not be empty");
+    let Some((first, rest)) = path.split_first() else {
+        return;
+    };
     if rest.is_empty() {
         root.insert((*first).to_string(), new_value);
         return;
@@ -3496,8 +3622,9 @@ fn set_nested_value(root: &mut serde_json::Map<String, Value>, path: &[&str], ne
     if !entry.is_object() {
         *entry = Value::Object(serde_json::Map::new());
     }
-    let map = entry.as_object_mut().expect("object inserted");
-    set_nested_value(map, rest, new_value);
+    if let Some(map) = entry.as_object_mut() {
+        set_nested_value(map, rest, new_value);
+    }
 }
 
 fn remove_nested_value(root: &mut serde_json::Map<String, Value>, path: &[&str]) -> bool {
@@ -3821,20 +3948,18 @@ mod tests {
     use std::net::{SocketAddr, TcpListener};
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
 
-    use super::execute_tool;
+    use super::execute_tool_for_test as execute_tool;
     use crate::lane_events::LaneEventName;
     use crate::permissions::{PermissionEnforcer, PermissionMode, PermissionPolicy};
-    use crate::tool_cache::reset_tool_cache_for_tests;
-    use crate::{mvp_tool_specs, permission_mode_from_plugin, GlobalToolRegistry};
+    use crate::{mvp_tool_specs, permission_mode_from_plugin, ToolCatalog};
     use serde_json::json;
 
     fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        crate::test_process_environment_lock()
     }
 
     fn temp_path(name: &str) -> PathBuf {
@@ -3843,6 +3968,15 @@ mod tests {
             .expect("time")
             .as_nanos();
         std::env::temp_dir().join(format!("cowd-tools-{unique}-{name}"))
+    }
+
+    fn execute_in_workspace(
+        root: &Path,
+        name: &str,
+        input: &serde_json::Value,
+    ) -> Result<String, String> {
+        let host = crate::ToolHost::builtin("tools-test-workspace", root);
+        super::execute_with_lease(&host.pin_snapshot(), name, input)
     }
 
     fn run_git(cwd: &Path, args: &[&str]) {
@@ -4004,10 +4138,10 @@ mod tests {
     }
 
     #[test]
-    fn global_tool_registry_denies_blocked_tool_before_dispatch() {
+    fn test_catalog_denies_blocked_tool_before_dispatch() {
         // given
         let policy = permission_policy_for_mode(PermissionMode::ReadOnly);
-        let registry = GlobalToolRegistry::builtin().with_enforcer(PermissionEnforcer::new(policy));
+        let registry = ToolCatalog::builtin().with_enforcer(PermissionEnforcer::new(policy));
 
         // when
         let error = registry
@@ -4037,18 +4171,20 @@ mod tests {
 
     #[test]
     fn runtime_tools_extend_registry_definitions_permissions_and_search() {
-        let registry = GlobalToolRegistry::builtin()
-            .with_runtime_tools(vec![crate::RuntimeToolDefinition {
-                name: "mcp__demo__echo".to_string(),
-                description: Some("Echo text from the demo MCP server".to_string()),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": { "text": { "type": "string" } },
-                    "additionalProperties": false
-                }),
-                required_permission: PermissionMode::ReadOnly,
-            }])
-            .expect("runtime tools should register");
+        let registry = Arc::new(
+            ToolCatalog::builtin()
+                .with_runtime_tools(vec![crate::RuntimeToolDefinition {
+                    name: "mcp__demo__echo".to_string(),
+                    description: Some("Echo text from the demo MCP server".to_string()),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": { "text": { "type": "string" } },
+                        "additionalProperties": false
+                    }),
+                    required_permission: PermissionMode::ReadOnly,
+                }])
+                .expect("runtime tools should register"),
+        );
 
         let allowed = registry
             .normalize_allowed_tools(&["mcp__demo__echo".to_string()])
@@ -4068,26 +4204,20 @@ mod tests {
             vec![("mcp__demo__echo".to_string(), PermissionMode::ReadOnly)]
         );
 
-        let search = registry.search(
-            "demo echo",
-            5,
-            Some(vec!["pending-server".to_string()]),
-            Some(json!({
-                "failed_servers": [{
-                    "server_name": "pending-server",
-                    "phase": "tool_discovery",
-                    "error": {"message": "tool discovery failed"}
-                }],
-                "available_tools": ["mcp__demo__echo"]
-            })),
+        let host = crate::ToolHost::new(
+            "test-workspace",
+            std::env::current_dir().unwrap(),
+            crate::ToolHostSnapshot::new(
+                Arc::clone(&registry),
+                Arc::new(crate::lsp_client::LspRegistry::new()),
+                None,
+            ),
         );
+        let search = host.pin_snapshot().search("demo echo", 5);
         let output = serde_json::to_value(search).expect("search output should serialize");
-        assert_eq!(output["matches"][0], "mcp__demo__echo");
-        assert_eq!(output["pending_mcp_servers"][0], "pending-server");
-        assert_eq!(
-            output["mcp_degraded"]["failed_servers"][0]["phase"],
-            "tool_discovery"
-        );
+        assert_eq!(output["activation_candidates"][0], "mcp__demo__echo");
+        assert_eq!(output["descriptors"][0]["source"], "runtime");
+        assert_eq!(output["catalog_revision"], 1);
     }
 
     #[test]
@@ -4375,7 +4505,9 @@ mod tests {
         )
         .expect("ToolSearch should succeed");
         let keyword_output: serde_json::Value = serde_json::from_str(&keyword).expect("valid json");
-        let matches = keyword_output["matches"].as_array().expect("matches");
+        let matches = keyword_output["activation_candidates"]
+            .as_array()
+            .expect("activation candidates");
         assert!(matches.iter().any(|value| value == "WebSearch"));
 
         let selected = execute_tool(
@@ -4385,7 +4517,9 @@ mod tests {
         .expect("ToolSearch should succeed");
         let selected_output: serde_json::Value =
             serde_json::from_str(&selected).expect("valid json");
-        let selected_matches = selected_output["matches"].as_array().expect("matches");
+        let selected_matches = selected_output["activation_candidates"]
+            .as_array()
+            .expect("activation candidates");
         assert_eq!(selected_matches.len(), 2);
         assert!(selected_matches.iter().any(|value| value == "WebSearch"));
         assert!(selected_matches.iter().any(|value| value == "ToolSearch"));
@@ -4394,9 +4528,9 @@ mod tests {
             .expect("ToolSearch should ignore removed control-plane tools");
         let removed_output: serde_json::Value = serde_json::from_str(&removed).expect("valid json");
         assert!(
-            removed_output["matches"]
+            removed_output["activation_candidates"]
                 .as_array()
-                .expect("matches")
+                .expect("activation candidates")
                 .is_empty(),
             "removed control-plane tools must not be searchable"
         );
@@ -4508,6 +4642,7 @@ mod tests {
     #[test]
     fn notebook_edit_replaces_inserts_and_deletes_cells() {
         let path = temp_path("notebook.ipynb");
+        let root = path.parent().expect("notebook parent");
         std::fs::write(
             &path,
             r#"{
@@ -4521,7 +4656,8 @@ mod tests {
         )
         .expect("write notebook");
 
-        let replaced = execute_tool(
+        let replaced = execute_in_workspace(
+            root,
             "NotebookEdit",
             &json!({
                 "notebook_path": path.display().to_string(),
@@ -4535,7 +4671,8 @@ mod tests {
         assert_eq!(replaced_output["cell_id"], "cell-a");
         assert_eq!(replaced_output["cell_type"], "code");
 
-        let inserted = execute_tool(
+        let inserted = execute_in_workspace(
+            root,
             "NotebookEdit",
             &json!({
                 "notebook_path": path.display().to_string(),
@@ -4548,7 +4685,8 @@ mod tests {
         .expect("NotebookEdit insert should succeed");
         let inserted_output: serde_json::Value = serde_json::from_str(&inserted).expect("json");
         assert_eq!(inserted_output["cell_type"], "markdown");
-        let appended = execute_tool(
+        let appended = execute_in_workspace(
+            root,
             "NotebookEdit",
             &json!({
                 "notebook_path": path.display().to_string(),
@@ -4560,7 +4698,8 @@ mod tests {
         let appended_output: serde_json::Value = serde_json::from_str(&appended).expect("json");
         assert_eq!(appended_output["cell_type"], "code");
 
-        let deleted = execute_tool(
+        let deleted = execute_in_workspace(
+            root,
             "NotebookEdit",
             &json!({
                 "notebook_path": path.display().to_string(),
@@ -4588,8 +4727,10 @@ mod tests {
     #[test]
     fn notebook_edit_rejects_invalid_inputs() {
         let text_path = temp_path("notebook.txt");
+        let root = text_path.parent().expect("notebook parent");
         fs::write(&text_path, "not a notebook").expect("write text file");
-        let wrong_extension = execute_tool(
+        let wrong_extension = execute_in_workspace(
+            root,
             "NotebookEdit",
             &json!({
                 "notebook_path": text_path.display().to_string(),
@@ -4607,7 +4748,8 @@ mod tests {
         )
         .expect("write empty notebook");
 
-        let missing_source = execute_tool(
+        let missing_source = execute_in_workspace(
+            root,
             "NotebookEdit",
             &json!({
                 "notebook_path": empty_notebook.display().to_string(),
@@ -4617,7 +4759,8 @@ mod tests {
         .expect_err("insert without source should fail");
         assert!(missing_source.contains("new_source is required"));
 
-        let missing_cell = execute_tool(
+        let missing_cell = execute_in_workspace(
+            root,
             "NotebookEdit",
             &json!({
                 "notebook_path": empty_notebook.display().to_string(),
@@ -4635,7 +4778,8 @@ mod tests {
         fs::create_dir_all(&root).expect("bash cwd should exist");
         let cwd = root.to_string_lossy().to_string();
 
-        let success = execute_tool(
+        let success = execute_in_workspace(
+            &root,
             "bash",
             &json!({ "command": "printf 'hello'", "cwd": cwd, "dangerouslyDisableSandbox": true }),
         )
@@ -4644,7 +4788,8 @@ mod tests {
         assert_eq!(success_output["stdout"], "hello");
         assert_eq!(success_output["interrupted"], false);
 
-        let failure = execute_tool(
+        let failure = execute_in_workspace(
+            &root,
             "bash",
             &json!({ "command": "printf 'oops' >&2; exit 7", "cwd": cwd, "dangerouslyDisableSandbox": true }),
         )
@@ -4656,7 +4801,8 @@ mod tests {
             .expect("stderr")
             .contains("oops"));
 
-        let timeout = execute_tool(
+        let timeout = execute_in_workspace(
+            &root,
             "bash",
             &json!({ "command": "sleep 1", "cwd": cwd, "timeout": 10, "dangerouslyDisableSandbox": true }),
         )
@@ -4669,7 +4815,8 @@ mod tests {
             .expect("stderr")
             .contains("Command exceeded timeout"));
 
-        let background = execute_tool(
+        let background = execute_in_workspace(
+            &root,
             "bash",
             &json!({ "command": "sleep 1", "cwd": cwd, "run_in_background": true, "dangerouslyDisableSandbox": true }),
         )
@@ -4996,37 +5143,40 @@ mod tests {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reset_tool_cache_for_tests();
         let root = temp_path("tool-cache-suite");
         fs::create_dir_all(root.join("src")).expect("create root");
         let file = root.join("src/lib.rs");
         fs::write(&file, "alpha\n").expect("write file");
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
+        let host = crate::ToolHost::builtin("tool-cache-suite", &root);
+        let lease = host.pin_snapshot();
 
-        execute_tool("read_file", &json!({ "path": "src/lib.rs" })).expect("first read");
-        execute_tool("read_file", &json!({ "path": "src/lib.rs" })).expect("second read");
-        let stats = execute_tool("tool_cache_stats", &json!({})).expect("stats");
+        super::execute_with_lease(&lease, "read_file", &json!({ "path": "src/lib.rs" }))
+            .expect("first read");
+        super::execute_with_lease(&lease, "read_file", &json!({ "path": "src/lib.rs" }))
+            .expect("second read");
+        let stats =
+            super::execute_with_lease(&lease, "tool_cache_stats", &json!({})).expect("stats");
         let stats_value: serde_json::Value = serde_json::from_str(&stats).expect("json");
         assert_eq!(stats_value["hits"], 1);
         assert_eq!(stats_value["entries"], 1);
 
-        execute_tool(
+        super::execute_with_lease(
+            &lease,
             "write_file",
             &json!({ "path": "src/lib.rs", "content": "omega\n" }),
         )
         .expect("write invalidates cache");
-        let stats = execute_tool("tool_cache_stats", &json!({})).expect("stats after write");
+        let stats = super::execute_with_lease(&lease, "tool_cache_stats", &json!({}))
+            .expect("stats after write");
         let stats_value: serde_json::Value = serde_json::from_str(&stats).expect("json");
         assert_eq!(stats_value["invalidations"], 1);
         assert_eq!(stats_value["scopeEpochs"], 1);
-        let reread = execute_tool("read_file", &json!({ "path": "src/lib.rs" }))
-            .expect("reread should not use stale cache");
+        let reread =
+            super::execute_with_lease(&lease, "read_file", &json!({ "path": "src/lib.rs" }))
+                .expect("reread should not use stale cache");
         assert!(reread.contains("omega"));
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
-        reset_tool_cache_for_tests();
     }
 
     #[test]
@@ -5034,27 +5184,29 @@ mod tests {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reset_tool_cache_for_tests();
         let root = temp_path("tool-cache-external-suite");
         fs::create_dir_all(root.join("src")).expect("create root");
         let file = root.join("src/lib.rs");
         fs::write(&file, "alpha\n").expect("write file");
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
+        let host = crate::ToolHost::builtin("tool-cache-external-suite", &root);
+        let lease = host.pin_snapshot();
 
-        let first = execute_tool("read_file", &json!({ "path": "src/lib.rs" })).expect("first");
+        let first =
+            super::execute_with_lease(&lease, "read_file", &json!({ "path": "src/lib.rs" }))
+                .expect("first");
         assert!(first.contains("alpha"));
         fs::write(&file, "omega\n").expect("external write");
-        let second = execute_tool("read_file", &json!({ "path": "src/lib.rs" })).expect("second");
+        let second =
+            super::execute_with_lease(&lease, "read_file", &json!({ "path": "src/lib.rs" }))
+                .expect("second");
         assert!(second.contains("omega"));
-        let stats = execute_tool("tool_cache_stats", &json!({})).expect("stats");
+        let stats =
+            super::execute_with_lease(&lease, "tool_cache_stats", &json!({})).expect("stats");
         let stats_value: serde_json::Value = serde_json::from_str(&stats).expect("json");
         assert_eq!(stats_value["hits"], 0);
         assert_eq!(stats_value["misses"], 2);
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
-        reset_tool_cache_for_tests();
     }
 
     #[test]
@@ -5197,24 +5349,35 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_path("checkpoint-suite");
+        let unrelated_cwd = temp_path("checkpoint-unrelated-cwd");
         fs::create_dir_all(root.join("src")).expect("create root");
+        fs::create_dir_all(&unrelated_cwd).expect("create unrelated cwd");
         let file = root.join("src/lib.rs");
         fs::write(&file, "alpha\n").expect("write file");
         let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
+        std::env::set_current_dir(&unrelated_cwd).expect("set unrelated cwd");
 
-        let created = execute_tool("checkpoint_create", &json!({ "label": "before edit" }))
-            .expect("checkpoint create should succeed");
+        let created = execute_in_workspace(
+            &root,
+            "checkpoint_create",
+            &json!({ "label": "before edit" }),
+        )
+        .expect("checkpoint create should succeed");
         let created_value: serde_json::Value = serde_json::from_str(&created).expect("json");
         let checkpoint_id = created_value["id"]
             .as_str()
             .expect("checkpoint id")
             .to_string();
+        assert!(root.join(".cowd/checkpoints").is_dir());
+        assert!(
+            !unrelated_cwd.join(".cowd/checkpoints").exists(),
+            "checkpoint state must remain in the leased workspace rather than process cwd"
+        );
 
         fs::write(&file, "omega\n").expect("mutate file");
         fs::write(root.join("src/new.rs"), "new\n").expect("add file");
         fs::remove_file(&file).expect("delete file");
-        let diff = execute_tool("checkpoint_diff", &json!({ "id": checkpoint_id }))
+        let diff = execute_in_workspace(&root, "checkpoint_diff", &json!({ "id": checkpoint_id }))
             .expect("checkpoint diff should succeed");
         let diff_value: serde_json::Value = serde_json::from_str(&diff).expect("json");
         assert_eq!(diff_value["type"], "checkpoint_diff");
@@ -5230,12 +5393,13 @@ mod tests {
             .any(|file| file.as_str() == Some("src/new.rs")));
 
         let checkpoint_id = created_value["id"].as_str().expect("checkpoint id");
-        execute_tool("checkpoint_restore", &json!({ "id": checkpoint_id }))
+        execute_in_workspace(&root, "checkpoint_restore", &json!({ "id": checkpoint_id }))
             .expect("checkpoint restore should succeed");
         assert_eq!(fs::read_to_string(&file).expect("read restored"), "alpha\n");
         assert!(!root.join("src/new.rs").exists());
 
-        let listed = execute_tool("checkpoint_list", &json!({})).expect("checkpoint list");
+        let listed =
+            execute_in_workspace(&root, "checkpoint_list", &json!({})).expect("checkpoint list");
         let listed_value: serde_json::Value = serde_json::from_str(&listed).expect("json");
         assert_eq!(listed_value["type"], "checkpoint_list");
         assert!(!listed_value["checkpoints"]
@@ -5245,6 +5409,7 @@ mod tests {
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(unrelated_cwd);
     }
 
     #[test]
@@ -5477,8 +5642,10 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::write(&attachment, b"png-data").expect("write attachment");
+        let root = attachment.parent().expect("attachment parent");
 
-        let result = execute_tool(
+        let result = execute_in_workspace(
+            root,
             "SendUserMessage",
             &json!({
                 "message": "hello user",
@@ -5837,12 +6004,12 @@ printf 'pwsh:%s' "$1"
         assert!(err.contains("PowerShell executable not found"));
     }
 
-    fn read_only_registry() -> super::GlobalToolRegistry {
+    fn read_only_registry() -> ToolCatalog {
         let policy = mvp_tool_specs().into_iter().fold(
             PermissionPolicy::new(PermissionMode::ReadOnly),
             |policy, spec| policy.with_tool_requirement(spec.name, spec.required_permission),
         );
-        let mut registry = super::GlobalToolRegistry::builtin();
+        let mut registry = ToolCatalog::builtin();
         registry.set_enforcer(PermissionEnforcer::new(policy));
         registry
     }
@@ -5897,13 +6064,15 @@ printf 'pwsh:%s' "$1"
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_path("perm-read");
         fs::create_dir_all(&root).expect("create root");
-        let file = root.join("readable.txt");
-        fs::write(&file, "content\n").expect("write test file");
+        fs::write(root.join("readable.txt"), "content\n").expect("write test file");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
 
         let registry = read_only_registry();
-        let result = registry.execute("read_file", &json!({ "path": file.display().to_string() }));
+        let result = registry.execute("read_file", &json!({ "path": "readable.txt" }));
         assert!(result.is_ok(), "read_file should be allowed: {result:?}");
 
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -5922,7 +6091,7 @@ printf 'pwsh:%s' "$1"
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let registry = super::GlobalToolRegistry::builtin();
+        let registry = ToolCatalog::builtin();
         let result = registry
             .execute("bash", &json!({ "command": "printf 'ok'" }))
             .expect("bash should succeed without enforcer");

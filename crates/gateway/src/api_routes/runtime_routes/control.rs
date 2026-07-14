@@ -1,14 +1,15 @@
 use super::*;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 mod agent_value;
+mod execution_graph;
 mod health;
 mod value_loop;
-mod workgraph;
 
 pub(in crate::api_routes) use agent_value::*;
+pub(in crate::api_routes) use execution_graph::*;
 pub(in crate::api_routes) use health::*;
 pub(in crate::api_routes) use value_loop::*;
-pub(in crate::api_routes) use workgraph::*;
 
 pub(in crate::api_routes) async fn get_runtime_control_plane(
     AxumState(state): AxumState<Arc<AppState>>,
@@ -35,6 +36,19 @@ pub(in crate::api_routes) async fn get_runtime_control_plane(
     };
     let control = runtime_config.runtime_control();
     let providers = runtime_config.providers();
+    let registry = model_protocol::model_registry::ModelRegistry::load()
+        .unwrap_or_else(|_| model_protocol::model_registry::ModelRegistry::empty());
+    let provider_catalog = provider::ProviderCatalog::from_input(provider::ProviderCatalogInput {
+        providers,
+        registry: &registry,
+        configured_model: runtime_config.model(),
+        aliases: runtime_config.aliases(),
+        config_source,
+        extra_sources: Vec::new(),
+        transforms: Vec::new(),
+        warnings: config_warnings.clone(),
+    });
+    let catalog_generation = provider_catalog.generation.clone();
     let provider_count = providers.providers.len();
     let provider_configured = provider_count > 0;
     let provider_model_count: usize = providers
@@ -426,6 +440,9 @@ pub(in crate::api_routes) async fn get_runtime_control_plane(
             "provider": {
                 "status": provider_status,
                 "source": config_source,
+                "catalog_generation": catalog_generation,
+                "catalog_updated": generated_at_ms,
+                "catalog": provider_catalog,
                 "configured": provider_configured,
                 "provider_count": provider_count,
                 "model_count": provider_model_count,

@@ -14,9 +14,21 @@ CONFIG_HOME="$TMP_DIR/config"
 HOME_DIR="$TMP_DIR/home"
 GATEWAY_LOG="$TMP_DIR/gateway.log"
 TUI_CAPTURE="$TMP_DIR/tui-pane.txt"
+TUI_RUNTIME_SESSION="tui-daemon-attach-$$_session"
 SCENARIO_API_KEY="${ANTHROPIC_API_KEY:-test-dummy-key-for-tui-gateway-scenario}"
+API_TOKEN="tui-daemon-attach-$$_credential"
+AUTH_BROKER_BIN="${COWD_AUTH_BROKER_BIN:-$TARGET_ROOT/debug/cowd-auth-broker}"
+FAILED=0
+
+curl() {
+  command curl -H "Authorization: Bearer $API_TOKEN" "$@"
+}
 
 cleanup() {
+  if [[ "$FAILED" == "1" && "${COWD_TUI_DAEMON_ATTACH_KEEP_TMP:-}" == "1" ]]; then
+    echo "preserving TUI Gateway attach temp dir: $TMP_DIR" >&2
+    return
+  fi
   if command -v tmux >/dev/null 2>&1; then
     tmux kill-session -t "$TUI_SESSION" >/dev/null 2>&1 || true
     tmux kill-session -t "$GATEWAY_SESSION" >/dev/null 2>&1 || true
@@ -38,6 +50,7 @@ print_logs() {
 
 on_error() {
   local status=$?
+  FAILED=1
   echo "TUI Gateway attach scenario failed with status $status" >&2
   print_logs
   exit "$status"
@@ -55,6 +68,10 @@ done
 
 if ss -ltnp | rg -q ":$PORT\\b"; then
   echo "port $PORT is already in use" >&2
+  exit 1
+fi
+if [[ ! -x "$AUTH_BROKER_BIN" ]]; then
+  echo "cowd-auth-broker is required at $AUTH_BROKER_BIN" >&2
   exit 1
 fi
 
@@ -90,7 +107,8 @@ gateway:
       host: "127.0.0.1"
       port: $PORT
       auth:
-        enabled: false
+        enabled: true
+        token: "$API_TOKEN"
 EOF
 cp "$CONFIG_HOME/config.yaml" "$HOME_DIR/.cowd/config.yaml"
 cp "$CONFIG_HOME/config.yaml" "$WORKDIR/.cowd/config.yaml"
@@ -98,6 +116,7 @@ cp "$CONFIG_HOME/config.yaml" "$WORKDIR/.cowd/config.yaml"
 tmux new-session -d -s "$GATEWAY_SESSION" \
   "bash -lc \"cd '$WORKDIR' && \
     export COWD_CONFIG_HOME='$CONFIG_HOME' && \
+    export COWD_AUTH_BROKER_BIN='$AUTH_BROKER_BIN' && \
     export HOME='$HOME_DIR' && \
     '$BIN' gateway run >'$GATEWAY_LOG' 2>&1\""
 
@@ -118,37 +137,37 @@ curl -fsS "$BASE_URL/api/cowd/release-gate" \
 
 curl -fsS -X POST "$BASE_URL/api/connectors/services/local.docs/execute" \
   -H 'Content-Type: application/json' \
-  --data "{\"actor_principal\":\"user:tui-daemon\",\"tool_id\":\"service.local.docs.read\",\"resource_id\":\"tui-daemon-tui-doc\",\"title\":\"tui-daemon TUI Attach Doc\",\"mode\":\"commit\",\"idempotency_key\":\"tui-daemon-$$\"}" \
+  --data "{\"tool_id\":\"service.local.docs.read\",\"resource_id\":\"tui-daemon-tui-doc\",\"title\":\"tui-daemon TUI Attach Doc\",\"mode\":\"commit\",\"idempotency_key\":\"tui-daemon-$$\"}" \
   >/dev/null
 
 tmux new-session -d -s "$TUI_SESSION" -x 140 -y 42 \
   "bash -lc \"cd '$WORKDIR' && \
     export COWD_CONFIG_HOME='$CONFIG_HOME' && \
     export HOME='$HOME_DIR' && \
+    export COWD_API_TOKEN='$API_TOKEN' && \
     export ANTHROPIC_API_KEY='$SCENARIO_API_KEY' && \
     export COWD_GATEWAY_URL='$BASE_URL' && \
     export COWD_DISABLE_DAEMON_AUTOSTART=1 && \
     export COWD_TUI_ACCESSIBILITY=1 && \
     export COWD_TUI_SKIP_RAW_MODE=1 && \
     export TERM=xterm-256color && \
-    timeout 14s '$BIN' --yolo --model claude-sonnet-4-6; \
+    timeout 14s '$BIN' --yolo --model claude-sonnet-4-6 --session '$TUI_RUNTIME_SESSION'; \
     status=\\\$?; printf '\\n__COWD_TUI_EXIT__%s\\n' \\\"\\\$status\\\"; sleep 8\""
 
-for _ in {1..60}; do
-  tmux capture-pane -pt "$TUI_SESSION" -S -260 >"$TUI_CAPTURE" 2>/dev/null || true
-  if rg -q "Gateway session (created|attached)|Gateway session lease acquired" "$TUI_CAPTURE"; then
+attached=0
+for _ in {1..32}; do
+  if curl -fsS "$BASE_URL/api/sessions/$TUI_RUNTIME_SESSION/projection" \
+    | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("session_id") == sys.argv[1], data' "$TUI_RUNTIME_SESSION"; then
+    attached=1
     break
   fi
+  tmux has-session -t "$TUI_SESSION" >/dev/null 2>&1 || break
   sleep 0.25
 done
 
-tmux capture-pane -pt "$TUI_SESSION" -S -260 >"$TUI_CAPTURE"
-
-rg -q "Gateway session (created|attached)" "$TUI_CAPTURE"
-rg -q "Gateway lifecycle attached" "$TUI_CAPTURE"
-rg -q "Gateway replay ready" "$TUI_CAPTURE"
-rg -q "Gateway session lease acquired" "$TUI_CAPTURE"
-rg -q "Gateway runtime projection connected|Gateway projection degraded" "$TUI_CAPTURE"
+[[ "$attached" == "1" ]]
+tmux has-session -t "$TUI_SESSION" >/dev/null
+tmux capture-pane -pt "$TUI_SESSION" -S -260 >"$TUI_CAPTURE" 2>/dev/null || true
 if rg -q "__COWD_TUI_EXIT__[1-9]|panic|backtrace|thread .* panicked|failed to initialize terminal|Run cowd --help" "$TUI_CAPTURE"; then
   exit 1
 fi

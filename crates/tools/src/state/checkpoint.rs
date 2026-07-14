@@ -50,11 +50,6 @@ pub struct CheckpointDiffOutput {
     pub deleted_files: Vec<String>,
 }
 
-pub fn checkpoint_create(input: CheckpointCreateInput) -> io::Result<CheckpointSummary> {
-    let root = std::env::current_dir()?;
-    checkpoint_create_in(&root, input)
-}
-
 pub fn checkpoint_create_in(
     root: impl AsRef<Path>,
     input: CheckpointCreateInput,
@@ -74,11 +69,6 @@ pub fn checkpoint_create_in(
         path: checkpoint_dir.to_string_lossy().into_owned(),
         label: input.label,
     })
-}
-
-pub fn checkpoint_list() -> io::Result<CheckpointListOutput> {
-    let root = std::env::current_dir()?;
-    checkpoint_list_in(&root)
 }
 
 pub fn checkpoint_list_in(root: impl AsRef<Path>) -> io::Result<CheckpointListOutput> {
@@ -105,11 +95,6 @@ pub fn checkpoint_list_in(root: impl AsRef<Path>) -> io::Result<CheckpointListOu
         kind: "checkpoint_list".to_string(),
         checkpoints,
     })
-}
-
-pub fn checkpoint_diff(input: CheckpointDiffInput) -> io::Result<CheckpointDiffOutput> {
-    let root = std::env::current_dir()?;
-    checkpoint_diff_in(&root, input)
 }
 
 pub fn checkpoint_diff_in(
@@ -155,11 +140,6 @@ pub fn checkpoint_diff_in(
         added_files: added,
         deleted_files: deleted,
     })
-}
-
-pub fn checkpoint_restore(input: CheckpointRestoreInput) -> io::Result<CheckpointSummary> {
-    let root = std::env::current_dir()?;
-    checkpoint_restore_in(&root, input)
 }
 
 pub fn checkpoint_restore_in(

@@ -102,6 +102,16 @@ pub trait MemoryStore: Send + Sync {
     /// List all entries across all layers (for temporal graph queries).
     async fn list_all(&self) -> Result<Vec<MemoryEntry>>;
 
+    /// Return historical scope records that were deliberately held during a
+    /// contract migration. Backends without durable scope migration support
+    /// expose an empty report rather than pretending those records are
+    /// recallable.
+    async fn legacy_scope_migration_reports(
+        &self,
+    ) -> Result<Vec<sqlite::LegacyScopeMigrationReport>> {
+        Ok(Vec::new())
+    }
+
     // -----------------------------------------------------------------------
     // Knowledge-graph persistence
     // -----------------------------------------------------------------------

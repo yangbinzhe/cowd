@@ -7,10 +7,9 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use harness_contract::execution_graph::{ExecutionEdge, ExecutionNodeSpec};
 use serde::Deserialize;
 use serde_json::Value;
-
-use crate::services::UpsertAgentTeamProfileRequest;
 
 use super::{api_error, AppState, ErrorResponse};
 
@@ -20,8 +19,20 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route("/api/agents/directory", get(agent_directory_handler))
         .route("/api/agents/discover", get(agent_discover_handler))
         .route("/api/agents/assemble", post(agent_assemble_handler))
-        .route("/api/agents/reputation", get(agent_reputation_handler))
-        .route("/api/agents/runs", get(agent_runs_handler))
+        .route("/api/agents/self-models", get(agent_self_models_handler))
+        .route("/api/team-templates", get(team_templates_handler))
+        .route(
+            "/api/team-templates/instantiate",
+            post(team_template_instantiate_handler),
+        )
+        .route(
+            "/api/runtime/teams/:id/working-state",
+            get(team_working_state_handler),
+        )
+        .route(
+            "/api/agents/execution-graphs",
+            get(execution_graphs_handler),
+        )
         .route("/api/runtime/agents", get(runtime_agents_list_handler))
         .route("/api/runtime/agents/:id", get(runtime_agent_detail_handler))
         .route(
@@ -45,27 +56,19 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             post(runtime_agent_shutdown_handler),
         )
         .route(
-            "/api/agents/team-profiles",
-            get(agent_team_profiles_list_handler).post(agent_team_profile_create_handler),
-        )
-        .route(
-            "/api/agents/team-profiles/:id",
-            get(agent_team_profile_detail_handler)
-                .put(agent_team_profile_update_handler)
-                .delete(agent_team_profile_delete_handler),
-        )
-        .route(
-            "/api/tasks/:id/agent-graph",
-            get(task_agent_graph_handler).post(upsert_task_agent_graph_handler),
+            "/api/tasks/:id/execution-graph",
+            get(task_execution_graph_handler).post(register_task_execution_graph_handler),
         )
 }
 
 #[derive(Deserialize)]
-struct UpsertAgentGraphRequest {
+struct RegisterExecutionGraphRequest {
     #[serde(default)]
     objective: Option<String>,
     #[serde(default)]
-    nodes: Vec<Value>,
+    nodes: Vec<ExecutionNodeSpec>,
+    #[serde(default)]
+    edges: Vec<ExecutionEdge>,
 }
 
 #[derive(Deserialize)]
@@ -82,6 +85,10 @@ struct AgentAssembleRequest {
 
 #[derive(Debug, Deserialize)]
 struct RuntimeAgentCommandRequest {
+    #[serde(rename = "commandId")]
+    command_id: Option<String>,
+    #[serde(rename = "expectedRevision")]
+    expected_revision: Option<u64>,
     #[serde(default)]
     payload: Option<Value>,
 }
@@ -89,23 +96,15 @@ struct RuntimeAgentCommandRequest {
 async fn agent_catalog_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    state
-        .services
-        .agent
-        .catalog(&state.workspace_root)
-        .map(Json)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+    let runtime = runtime_services(&state)?;
+    Ok(Json(state.services.agent.catalog(&runtime)))
 }
 
 async fn agent_directory_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    state
-        .services
-        .agent
-        .directory(&state.workspace_root)
-        .map(Json)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+    let runtime = runtime_services(&state)?;
+    Ok(Json(state.services.agent.directory(&runtime)))
 }
 
 async fn agent_discover_handler(
@@ -116,12 +115,8 @@ async fn agent_discover_handler(
     if task.is_empty() {
         return Err(api_error(StatusCode::BAD_REQUEST, "task query is required"));
     }
-    state
-        .services
-        .agent
-        .discover(&state.workspace_root, task)
-        .map(Json)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+    let runtime = runtime_services(&state)?;
+    Ok(Json(state.services.agent.discover(&runtime, task)))
 }
 
 async fn agent_assemble_handler(
@@ -132,37 +127,99 @@ async fn agent_assemble_handler(
     if task.is_empty() {
         return Err(api_error(StatusCode::BAD_REQUEST, "task is required"));
     }
-    state
-        .services
-        .agent
-        .assemble(&state.workspace_root, task)
-        .map(Json)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+    let runtime = runtime_services(&state)?;
+    Ok(Json(state.services.agent.assemble(&runtime, task)))
 }
 
-async fn agent_reputation_handler(
+async fn agent_self_models_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    state
+    let runtime = runtime_services(&state)?;
+    Ok(Json(state.services.agent.self_models(&runtime)))
+}
+
+/// Read-only Team Template projection. Template creation and release decisions
+/// remain Runtime commands; Gateway never rebuilds a team definition from
+/// workspace files or a browser payload.
+async fn team_templates_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime = runtime_services(&state)?;
+    let templates = runtime
+        .definition_registry()
+        .runnable_team_catalog()
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "team_templates",
+        "templates": templates,
+        "source": "runtime.definition_catalog",
+    })))
+}
+
+/// Gateway accepts declarative template intent only. Runtime resolves the
+/// immutable template/Agent revisions and owns graph construction.
+async fn team_template_instantiate_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(request): Json<harness_contract::team::TeamInstantiationRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime = runtime_services(&state)?;
+    let projection = runtime
+        .team_runtime()
+        .instantiate(request)
+        .await
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "kind": "runtime.team.instantiated",
+            "team": projection,
+        })),
+    ))
+}
+
+async fn team_working_state_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime = runtime_services(&state)?;
+    let state = runtime
+        .team_runtime()
+        .working_state(&id)
+        .map_err(|error| api_error(StatusCode::NOT_FOUND, error))?;
+    Ok(Json(serde_json::json!({
+        "kind": "runtime.team.working_state",
+        "working_state": state,
+    })))
+}
+
+async fn execution_graphs_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let value = state
         .services
         .agent
-        .reputation(&state.workspace_root)
-        .map(Json)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+        .list_execution_graphs(&state.services.task)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(value))
 }
 
-async fn agent_runs_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    Json(state.services.agent.list_agent_graphs(&state.services.task))
-}
-
-async fn runtime_agents_list_handler() -> impl IntoResponse {
-    Json(runtime::global_agent_lifecycle_service().projection())
+async fn runtime_agents_list_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime = runtime_services(&state)?;
+    Ok(Json(serde_json::json!({
+        "kind": "runtime.agent.list",
+        "agents": runtime.agent_runtime().list(),
+    })))
 }
 
 async fn runtime_agent_detail_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    runtime::global_agent_lifecycle_service()
+    runtime_services(&state)?
+        .agent_runtime()
         .get(&id)
         .map(|agent| {
             Json(serde_json::json!({
@@ -174,236 +231,160 @@ async fn runtime_agent_detail_handler(
 }
 
 async fn runtime_agent_events_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    runtime::global_agent_lifecycle_service()
-        .events(&id)
-        .map(|events| {
-            Json(serde_json::json!({
-                "kind": "runtime.agent.events",
-                "agentId": id,
-                "count": events.len(),
-                "events": events,
-            }))
-        })
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "agent not found"))
+    let runtime = runtime_services(&state)?;
+    if runtime.agent_runtime().get(&id).is_none() {
+        return Err(api_error(StatusCode::NOT_FOUND, "agent not found"));
+    }
+    let events = runtime.agent_runtime().events(&id);
+    Ok(Json(serde_json::json!({
+        "kind": "runtime.agent.events",
+        "agentId": id,
+        "count": events.len(),
+        "events": events,
+    })))
 }
 
 async fn runtime_agent_cancel_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    runtime::global_agent_lifecycle_service()
-        .cancel(&id)
-        .map(|receipt| {
-            Json(serde_json::json!({
-                "kind": "runtime.agent.cancel",
-                "receipt": receipt,
-            }))
-        })
-        .map_err(|error| api_error(StatusCode::NOT_FOUND, error))
+    runtime_agent_command_result(
+        &state,
+        &id,
+        harness_contract::agent::AgentCommand::Cancel,
+        RuntimeAgentCommandRequest {
+            command_id: None,
+            expected_revision: None,
+            payload: None,
+        },
+    )
+    .await
 }
 
 async fn runtime_agent_input_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
     Json(body): Json<RuntimeAgentCommandRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    runtime_agent_command_result(&id, runtime::AgentExecutionCommandKind::Input, body.payload)
+    runtime_agent_command_result(
+        &state,
+        &id,
+        harness_contract::agent::AgentCommand::SendInput,
+        body,
+    )
+    .await
 }
 
 async fn runtime_agent_interrupt_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
     Json(body): Json<RuntimeAgentCommandRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     runtime_agent_command_result(
+        &state,
         &id,
-        runtime::AgentExecutionCommandKind::Interrupt,
-        body.payload,
+        harness_contract::agent::AgentCommand::Interrupt,
+        body,
     )
+    .await
 }
 
 async fn runtime_agent_shutdown_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
     Json(body): Json<RuntimeAgentCommandRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     runtime_agent_command_result(
+        &state,
         &id,
-        runtime::AgentExecutionCommandKind::Shutdown,
-        body.payload,
+        harness_contract::agent::AgentCommand::Shutdown,
+        body,
     )
+    .await
 }
 
-fn runtime_agent_command_result(
+async fn runtime_agent_command_result(
+    state: &Arc<AppState>,
     id: &str,
-    command: runtime::AgentExecutionCommandKind,
-    payload: Option<Value>,
+    command: harness_contract::agent::AgentCommand,
+    body: RuntimeAgentCommandRequest,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    runtime::global_agent_lifecycle_service()
-        .command(id, command, payload)
-        .map(|receipt| {
-            Json(serde_json::json!({
-                "kind": "runtime.agent.command",
-                "receipt": receipt,
-            }))
+    let runtime = runtime_services(state)?;
+    let snapshot = runtime
+        .agent_runtime()
+        .get(id)
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "agent not found"))?;
+    let input = body.payload.map(|payload| match payload {
+        Value::String(text) => harness_contract::agent::AgentInput::UserSupplement(text),
+        value => harness_contract::agent::AgentInput::ControlContext(value),
+    });
+    let receipt = runtime
+        .agent_runtime()
+        .command(harness_contract::agent::AgentCommandRequest {
+            command_id: body
+                .command_id
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            agent_id: id.to_string(),
+            expected_revision: body.expected_revision.unwrap_or(snapshot.revision),
+            command,
+            input,
         })
-        .map_err(|error| api_error(runtime_agent_command_error_status(&error), error))
-}
-
-fn runtime_agent_command_error_status(error: &str) -> StatusCode {
-    if error.contains("agent not found") {
-        StatusCode::NOT_FOUND
-    } else if error.contains("does not expose a command channel") {
-        StatusCode::CONFLICT
-    } else if error.contains("failed to deliver agent command") {
-        StatusCode::SERVICE_UNAVAILABLE
-    } else {
-        StatusCode::BAD_REQUEST
-    }
-}
-
-async fn agent_team_profiles_list_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let profiles = state
-        .services
-        .agent
-        .list_team_profiles(&state.workspace_root)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+        .await;
     Ok(Json(serde_json::json!({
-        "kind": "agents.team_profiles",
-        "count": profiles.len(),
-        "profiles": profiles,
-        "storage": state.services.agent.team_profiles_path(&state.workspace_root),
+        "kind": "runtime.agent.command",
+        "receipt": receipt,
     })))
 }
 
-async fn agent_team_profile_detail_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let profile = state
+fn runtime_services(
+    state: &AppState,
+) -> Result<Arc<runtime::RuntimeServices>, (StatusCode, Json<ErrorResponse>)> {
+    state
         .services
-        .agent
-        .get_team_profile(&state.workspace_root, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "team profile not found"))?;
-    Ok(Json(serde_json::json!({
-        "kind": "agents.team_profile",
-        "profile": profile,
-    })))
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.runtime_services())
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "RuntimeServices is unavailable",
+            )
+        })
 }
 
-async fn agent_team_profile_create_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(body): Json<UpsertAgentTeamProfileRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let profile = state
-        .services
-        .agent
-        .create_team_profile(&state.workspace_root, body)
-        .map_err(|error| {
-            let status = if error == "team profile id already exists" {
-                StatusCode::CONFLICT
-            } else if error == "team profile name is required" {
-                StatusCode::BAD_REQUEST
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            api_error(status, error)
-        })?;
-    Ok((
-        StatusCode::CREATED,
-        Json(serde_json::json!({
-            "kind": "agents.team_profile.created",
-            "profile": profile,
-            "receipt": team_profile_receipt("create", &profile.id),
-        })),
-    ))
-}
-
-async fn agent_team_profile_update_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(body): Json<UpsertAgentTeamProfileRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let profile = state
-        .services
-        .agent
-        .update_team_profile(&state.workspace_root, &id, body)
-        .map_err(|error| {
-            let status = if error == "team profile name is required" {
-                StatusCode::BAD_REQUEST
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            api_error(status, error)
-        })?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "team profile not found"))?;
-    Ok(Json(serde_json::json!({
-        "kind": "agents.team_profile.updated",
-        "profile": profile,
-        "receipt": team_profile_receipt("update", &profile.id),
-    })))
-}
-
-async fn agent_team_profile_delete_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let deleted = state
-        .services
-        .agent
-        .delete_team_profile(&state.workspace_root, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-    if !deleted {
-        return Err(api_error(StatusCode::NOT_FOUND, "team profile not found"));
-    }
-    Ok(Json(serde_json::json!({
-        "kind": "agents.team_profile.deleted",
-        "profile_id": id,
-        "receipt": team_profile_receipt("delete", &id),
-    })))
-}
-
-async fn task_agent_graph_handler(
+async fn task_execution_graph_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let graph = state
         .services
         .agent
-        .agent_graph(&state.services.task, &id)
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "agent graph not found"))?;
+        .execution_graph(&state.services.task, &id)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "execution graph not found"))?;
     Ok(Json(graph))
 }
 
-async fn upsert_task_agent_graph_handler(
+async fn register_task_execution_graph_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(body): Json<UpsertAgentGraphRequest>,
+    Json(body): Json<RegisterExecutionGraphRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let graph = state
         .services
         .agent
-        .upsert_agent_graph(
+        .register_execution_graph(
             &state.services.task,
-            &state.services.session,
             &id,
             body.objective,
             body.nodes,
+            body.edges,
         )
         .await
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
     Ok(Json(graph))
-}
-
-fn team_profile_receipt(action: &str, id: &str) -> Value {
-    serde_json::json!({
-        "request_id": format!("agent-team-profile-{action}-{id}"),
-        "mode": "live",
-        "status": "ok",
-        "changed_refs": [format!("agent-team-profile:{id}")],
-        "audit_ref": format!("agent-team-profile:{action}:{id}"),
-        "warnings": [],
-        "next_actions": ["open profile", "reuse in agent graph", "evaluate team run"],
-    })
 }

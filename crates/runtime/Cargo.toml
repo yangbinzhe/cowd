@@ -5,9 +5,26 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# Raw runtime ledger construction is available only to explicitly opted-in
+# integration fixtures. Production consumers receive typed Runtime ports.
+test-fixtures = []
+
+[[test]]
+name = "cowd_full_capability_eval"
+path = "tests/cowd_full_capability_eval.rs"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "mission_harness_e2e_eval"
+path = "tests/mission_harness_e2e_eval.rs"
+required-features = ["test-fixtures"]
+
 [dependencies]
 harness-contract = { path = "../harness-contract" }
 fact-kernel = { path = "../fact-kernel" }
+matrix-core = { path = "../matrix/core" }
+matrix-repository = { path = "../matrix/repository" }
 model-protocol = { path = "../model-protocol" }
 memory = { path = "../memory" }
 storage = { path = "../storage" }
@@ -15,6 +32,8 @@ approval = { path = "../approval" }
 async-trait = "0.1"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz.workspace = true
+cron.workspace = true
 reqwest = { workspace = true, features = ["multipart"] }
 sha2 = "0.10"
 thiserror = "2"
@@ -27,16 +46,17 @@ regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 serde_yaml.workspace = true
+toml = "0.8"
 fs2 = "0.4"
 walkdir = "2"
 uuid = { version = "1", features = ["v4"] }
 rand = "0.8"
+ring = "0.17"
 futures = "0.3"
 rusqlite = { version = "0.31", features = ["bundled"] }
 libc = "0.2.186"
 
 [dev-dependencies]
-matrix-core = { path = "../matrix/core" }
 r2d2 = "0.8"
 r2d2_sqlite = "0.24"
 tempfile = "3"

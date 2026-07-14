@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
 //! RED Tests: Task 3 - Knowledge Graph persistence
 //!
 //! Tests:

@@ -3,6 +3,17 @@
 //! This crate is the application-facing MFG boundary over Matrix structured
 //! facts, Memory projections, skills and governed action dispatch.
 
+// Test assertions intentionally use unwrap/expect; normal library builds remain strict.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
+
 pub mod analysis;
 pub mod app;
 pub mod cockpit;
@@ -14,6 +25,7 @@ pub mod ontology;
 mod repository;
 pub mod skill;
 mod store;
+pub mod workflow;
 
 pub use analysis::{
     MfgAttributionCandidate, MfgImpactPath, MfgOperationalAnalysis, MfgRecommendedAction,
@@ -44,6 +56,11 @@ pub use skill::{
     MfgSkillRun,
 };
 pub use store::MfgStore;
+pub use workflow::{
+    MfgWorkflowEvidence, MfgWorkflowGraph, MfgWorkflowGraphError, MfgWorkflowNode,
+    MfgWorkflowNodeKind, MfgWorkflowNodeStatus, MfgWorkflowReview, MfgWorkflowReviewVerdict,
+    MfgWorkflowStatus,
+};
 
 pub use repository::{MfgHealth, MfgMetricRecomputeResult, MfgRepositoryError};
 

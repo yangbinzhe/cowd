@@ -49,6 +49,37 @@ pub struct ModelTokenLimit {
     pub context_window_tokens: u32,
 }
 
+/// Provenance for the model context capacity Runtime is allowed to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelContextWindowSource {
+    Configured,
+    Registry,
+    Assumed,
+    /// A provider explicitly rejected a larger capacity and returned a
+    /// numeric maximum. Runtime may use this smaller limit for the process
+    /// lifetime without overwriting user configuration.
+    Calibrated,
+}
+
+impl ModelContextWindowSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Configured => "configured",
+            Self::Registry => "registry",
+            Self::Assumed => "assumed",
+            Self::Calibrated => "calibrated",
+        }
+    }
+}
+
+/// Model window plus the evidence from which it was resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelContextWindowResolution {
+    pub tokens: u32,
+    pub source: ModelContextWindowSource,
+}
+
 /// Strip a known routing prefix (e.g. `"kimi:"`) from a model name so that
 /// `kimi:kimi-latest` resolves to the `kimi-latest` alias while still
 /// selecting the Moonshot provider via prefix routing.
@@ -199,28 +230,51 @@ pub fn model_context_window_with_overrides(
     model: &str,
     overrides: Option<&std::collections::BTreeMap<String, u32>>,
 ) -> u32 {
+    model_context_window_resolution(model, overrides).tokens
+}
+
+/// Resolve model context capacity with explicit config taking precedence over
+/// the local model registry and the 128K unknown-model assumption.
+#[must_use]
+pub fn model_context_window_resolution(
+    model: &str,
+    overrides: Option<&std::collections::BTreeMap<String, u32>>,
+) -> ModelContextWindowResolution {
     if let Some(overrides) = overrides {
         if let Some(&ctx) = overrides.get(model) {
-            return ctx;
+            return ModelContextWindowResolution {
+                tokens: ctx,
+                source: ModelContextWindowSource::Configured,
+            };
         }
     }
-    model_context_window(model)
+    if let Some(limit) = model_token_limit(model) {
+        ModelContextWindowResolution {
+            tokens: limit.context_window_tokens,
+            source: ModelContextWindowSource::Registry,
+        }
+    } else {
+        ModelContextWindowResolution {
+            tokens: 128_000,
+            source: ModelContextWindowSource::Assumed,
+        }
+    }
 }
 
 pub fn preflight_message_request(request: &MessageRequest) -> Result<(), ApiError> {
-    let Some(limit) = model_token_limit(&request.model) else {
-        return Ok(());
-    };
+    let context_window_tokens = request
+        .context_window_limit
+        .unwrap_or_else(|| model_context_window(&request.model));
 
     let estimated_input_tokens = estimate_message_request_input_tokens(request);
     let estimated_total_tokens = estimated_input_tokens.saturating_add(request.max_tokens);
-    if estimated_total_tokens > limit.context_window_tokens {
+    if estimated_total_tokens > context_window_tokens {
         return Err(ApiError::ContextWindowExceeded {
             model: request.model.clone(),
             estimated_input_tokens,
             requested_output_tokens: request.max_tokens,
             estimated_total_tokens,
-            context_window_tokens: limit.context_window_tokens,
+            context_window_tokens,
         });
     }
 
@@ -409,8 +463,8 @@ mod tests {
     use super::{
         anthropic_missing_credentials, anthropic_missing_credentials_hint, detect_provider_kind,
         load_dotenv_file, max_tokens_for_model, max_tokens_for_model_with_override,
-        model_context_window, model_token_limit, parse_dotenv, preflight_message_request,
-        ProviderKind,
+        model_context_window, model_context_window_resolution, model_token_limit, parse_dotenv,
+        preflight_message_request, ModelContextWindowSource, ProviderKind,
     };
 
     #[test]
@@ -574,7 +628,7 @@ mod tests {
     }
 
     #[test]
-    fn preflight_skips_unknown_models() {
+    fn preflight_assumes_128k_for_unknown_models() {
         let request = MessageRequest {
             model: "unknown-model".to_string(),
             max_tokens: 64_000,
@@ -591,8 +645,15 @@ mod tests {
             ..Default::default()
         };
 
-        preflight_message_request(&request)
-            .expect("models without context metadata should skip the guarded preflight");
+        let error = preflight_message_request(&request)
+            .expect_err("unknown models must use the conservative 128K assumption");
+        assert!(matches!(
+            error,
+            ApiError::ContextWindowExceeded {
+                context_window_tokens: 128_000,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -947,5 +1008,17 @@ NO_EQUALS_LINE
     #[test]
     fn model_context_window_fallback_is_128k_not_200k() {
         assert_eq!(model_context_window("unknown-model-xyz"), 128_000);
+    }
+
+    #[test]
+    fn explicit_context_window_override_has_precedence_and_unknown_is_128k() {
+        let overrides = std::collections::BTreeMap::from([("deepseek-v4-pro".to_string(), 64_000)]);
+        let configured = model_context_window_resolution("deepseek-v4-pro", Some(&overrides));
+        assert_eq!(configured.tokens, 64_000);
+        assert_eq!(configured.source, ModelContextWindowSource::Configured);
+
+        let unknown = model_context_window_resolution("private-unknown-model", None);
+        assert_eq!(unknown.tokens, 128_000);
+        assert_eq!(unknown.source, ModelContextWindowSource::Assumed);
     }
 }

@@ -439,7 +439,7 @@ impl Component for StatusBar {
             };
 
             // Truncate from right if too wide
-            if display.len() as u16 > available {
+            if display.chars().count() > usize::from(available) {
                 break;
             }
 

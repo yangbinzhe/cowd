@@ -10,8 +10,6 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::worker_boot::WorkerFailureKind;
-
 /// The six failure scenarios that have known recovery recipes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -24,6 +22,22 @@ pub enum FailureScenario {
     PartialPluginStartup,
     ProviderFailure,
     ContextWindowBlocked,
+}
+
+/// Normalized startup/provider failure observed by a runtime adapter.
+///
+/// This is deliberately independent from any process or agent implementation
+/// so recovery policy can consume durable execution evidence without owning a
+/// second worker lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupFailureKind {
+    TrustGate,
+    PromptDelivery,
+    Protocol,
+    Provider,
+    StartupNoEvidence,
+    Unknown,
 }
 
 impl FailureScenario {
@@ -42,17 +56,16 @@ impl FailureScenario {
         ]
     }
 
-    /// Map a `WorkerFailureKind` to the corresponding `FailureScenario`.
-    /// This is the bridge that lets recovery policy consume worker boot events.
+    /// Map a normalized startup failure to the corresponding recovery scenario.
     #[must_use]
-    pub fn from_worker_failure_kind(kind: WorkerFailureKind) -> Self {
+    pub fn from_startup_failure_kind(kind: StartupFailureKind) -> Self {
         match kind {
-            WorkerFailureKind::TrustGate => Self::TrustPromptUnresolved,
-            WorkerFailureKind::PromptDelivery => Self::PromptMisdelivery,
-            WorkerFailureKind::Protocol => Self::McpHandshakeFailure,
-            WorkerFailureKind::Provider => Self::ProviderFailure,
-            WorkerFailureKind::StartupNoEvidence => Self::PromptMisdelivery,
-            WorkerFailureKind::Unknown => Self::ProviderFailure,
+            StartupFailureKind::TrustGate => Self::TrustPromptUnresolved,
+            StartupFailureKind::PromptDelivery => Self::PromptMisdelivery,
+            StartupFailureKind::Protocol => Self::McpHandshakeFailure,
+            StartupFailureKind::Provider => Self::ProviderFailure,
+            StartupFailureKind::StartupNoEvidence => Self::PromptMisdelivery,
+            StartupFailureKind::Unknown => Self::ProviderFailure,
         }
     }
 }
@@ -594,22 +607,22 @@ mod tests {
     }
 
     #[test]
-    fn worker_failure_kind_maps_to_failure_scenario() {
+    fn startup_failure_kind_maps_to_failure_scenario() {
         // given / when / then — verify the bridge is correct
         assert_eq!(
-            FailureScenario::from_worker_failure_kind(WorkerFailureKind::TrustGate),
+            FailureScenario::from_startup_failure_kind(StartupFailureKind::TrustGate),
             FailureScenario::TrustPromptUnresolved,
         );
         assert_eq!(
-            FailureScenario::from_worker_failure_kind(WorkerFailureKind::PromptDelivery),
+            FailureScenario::from_startup_failure_kind(StartupFailureKind::PromptDelivery),
             FailureScenario::PromptMisdelivery,
         );
         assert_eq!(
-            FailureScenario::from_worker_failure_kind(WorkerFailureKind::Protocol),
+            FailureScenario::from_startup_failure_kind(StartupFailureKind::Protocol),
             FailureScenario::McpHandshakeFailure,
         );
         assert_eq!(
-            FailureScenario::from_worker_failure_kind(WorkerFailureKind::Provider),
+            FailureScenario::from_startup_failure_kind(StartupFailureKind::Provider),
             FailureScenario::ProviderFailure,
         );
     }

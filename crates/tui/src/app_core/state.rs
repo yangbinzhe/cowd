@@ -833,7 +833,8 @@ impl TuiState {
         }
 
         // BUG 2 FIX: Dynamic input height based on line count.
-        let input_lines = self.app.input.lines().len().max(1) as u16;
+        let input_lines =
+            crate::components::base::terminal_len(self.app.input.lines().len().max(1));
         let max_input = (area.height / 2).max(3);
         let input_h = (input_lines + 2).min(max_input).max(3);
         let frame_areas = TuiFrameAreas::build(area, input_h, self.app.search_active);
@@ -891,8 +892,11 @@ impl TuiState {
                 && frame_areas.body.width >= 100
             {
                 let max_topic_w = frame_areas.body.width.saturating_sub(40);
-                let topic_w =
-                    ((frame_areas.body.width as u32 * 55 / 100) as u16).clamp(48, max_topic_w);
+                let desired_topic_width = u32::from(frame_areas.body.width) * 55 / 100;
+                let topic_w = crate::components::base::terminal_len(
+                    usize::try_from(desired_topic_width).unwrap_or(usize::MAX),
+                )
+                .clamp(48, max_topic_w);
                 chat_area.width = frame_areas.body.width.saturating_sub(topic_w).max(40);
             }
             if topic_fullscreen {
@@ -2336,6 +2340,65 @@ impl TuiState {
         if key.kind != crossterm::event::KeyEventKind::Press {
             return false;
         }
+        if key.code == KeyCode::Char('n') {
+            self.agent_team_panel.select_next_team_template();
+            return true;
+        }
+        if key.code == KeyCode::Char('t') {
+            let Some(template) = self.agent_team_panel.selected_team_template().cloned() else {
+                self.agent_team_panel.record_action_result(
+                    "team.instantiate",
+                    Err("No runnable Team template is loaded".to_string()),
+                );
+                return true;
+            };
+            let objective = self.app.input.lines().join("\n").trim().to_string();
+            if objective.is_empty() {
+                self.agent_team_panel.record_action_result(
+                    "team.instantiate",
+                    Err("Enter the Team objective in the composer before pressing t".to_string()),
+                );
+                return true;
+            }
+            let session_id = self.app.session_id.clone();
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_millis())
+                .unwrap_or_default();
+            let team_id = format!("tui-team-{nonce}");
+            let body = serde_json::json!({
+                "request_id": format!("tui-team-request-{nonce}"),
+                "team_id": team_id,
+                "session_id": session_id,
+                "selection_mode": "explicit",
+                "template_selector": {
+                    "kind": "latest_stable",
+                    "template_id": template.template_id,
+                },
+                "objective": objective,
+                "acceptance": template.result_fields,
+                "role_binding_overrides": [],
+                "cardinality_overrides": [],
+                "focus_partition_plans": [],
+                "permission_lease": "read_only",
+                "model_lease": "default",
+                "resource_scopes": [format!("session:{}", self.app.session_id)],
+            });
+            let result = run_gateway_api_blocking(move |client| async move {
+                let mut receipt = client.instantiate_team_template(body).await?;
+                if let Some(team_id) = receipt
+                    .pointer("/team/team_id")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    let working_state = client.team_working_state(team_id).await?;
+                    receipt["working_state"] = working_state;
+                }
+                Ok(receipt)
+            });
+            self.agent_team_panel
+                .record_action_result("team.instantiate", result);
+            return true;
+        }
         let action = match key.code {
             KeyCode::Char('i') => "input",
             KeyCode::Char('!') => "interrupt",
@@ -2362,7 +2425,7 @@ impl TuiState {
             "shutdown" => run_gateway_api_blocking(move |client| async move {
                 client.runtime_agent_shutdown(&agent_id, payload).await
             }),
-            _ => unreachable!(),
+            _ => return false,
         };
         self.agent_team_panel
             .record_action_result(&format!("agent.{action}"), result);
@@ -2377,24 +2440,6 @@ impl TuiState {
             return false;
         }
         match key.code {
-            KeyCode::Char('c') => {
-                let result = self.run_mission_command_action("consume");
-                self.gateway_panel
-                    .record_action_result("mission.command.consume", result);
-                true
-            }
-            KeyCode::Char('C') => {
-                let result = self.run_mission_command_action("cancel");
-                self.gateway_panel
-                    .record_action_result("mission.command.cancel", result);
-                true
-            }
-            KeyCode::Char('y') => {
-                let result = self.run_mission_command_action("retry");
-                self.gateway_panel
-                    .record_action_result("mission.command.retry", result);
-                true
-            }
             KeyCode::Char('e') => {
                 let result = run_gateway_api_blocking(move |client| async move {
                     client.harness_eval_latest_report().await
@@ -2410,60 +2455,161 @@ impl TuiState {
                     .record_action_result("harness_eval.run_smoke", result);
                 true
             }
-            KeyCode::Char('t') => {
+            KeyCode::Char('v') => {
+                let result = run_gateway_api_blocking(move |client| async move {
+                    let signals = client.evolution_signals().await?;
+                    let diagnoses = client.evolution_diagnoses().await?;
+                    let missions = client.evolution_missions_summary().await?;
+                    let proposals = client.evolution_proposals().await?;
+                    let candidates = client.evolution_candidates().await?;
+                    let reviews = client.evolution_reviews().await?;
+                    Ok(serde_json::json!({
+                        "kind": "evolution.overview",
+                        "signals": signals,
+                        "diagnoses": diagnoses,
+                        "missions": missions,
+                        "proposals": proposals,
+                        "candidates": candidates,
+                        "reviews": reviews,
+                    }))
+                });
+                self.gateway_panel.record_evolution_overview(result);
+                true
+            }
+            KeyCode::Char('p') => {
+                let result = run_gateway_api_blocking(move |client| async move {
+                    let policy = client.evolution_evaluation_policy().await?;
+                    let reviews = client.evolution_evaluation_policy_reviews().await?;
+                    Ok(serde_json::json!({
+                        "kind": "evolution.evaluation_policy.overview",
+                        "policy": policy.get("policy").cloned().unwrap_or(policy),
+                        "reviews": reviews,
+                    }))
+                });
+                self.gateway_panel.record_evaluation_policy_overview(result);
+                true
+            }
+            KeyCode::Char('m') => {
+                let result =
+                    run_gateway_api_blocking(
+                        move |client| async move { client.managed_agents().await },
+                    );
+                self.gateway_panel.record_managed_agent_overview(result);
+                true
+            }
+            KeyCode::Char('D') => {
+                let result = run_gateway_api_blocking(move |client| async move {
+                    client.dispatch_managed_agents("tui-operator", 16).await
+                });
+                self.gateway_panel
+                    .record_action_result("runtime.managed_agents.dispatch_due_and_retry", result);
+                true
+            }
+            KeyCode::Char('R') => {
+                let Some(managed_agent_id) = self.gateway_panel.selected_managed_agent_health_id()
+                else {
+                    self.gateway_panel.record_action_result(
+                        "runtime.managed_agents.health.reset",
+                        Err("no degraded Managed Agent selected; press m to refresh".to_string()),
+                    );
+                    return true;
+                };
+                let result = run_gateway_api_blocking(move |client| async move {
+                    client.reset_managed_agent_health(&managed_agent_id).await
+                });
+                self.gateway_panel
+                    .record_action_result("runtime.managed_agents.health.reset", result);
+                true
+            }
+            KeyCode::Char('n') => {
+                self.gateway_panel.select_next_managed_agent_health();
+                true
+            }
+            KeyCode::Char('N') => {
+                self.gateway_panel.select_previous_managed_agent_health();
+                true
+            }
+            KeyCode::Char('[') => {
+                self.gateway_panel.select_previous_release_review();
+                true
+            }
+            KeyCode::Char(']') => {
+                self.gateway_panel.select_next_release_review();
+                true
+            }
+            KeyCode::Char('{') => {
+                self.gateway_panel.select_previous_policy_review();
+                true
+            }
+            KeyCode::Char('}') => {
+                self.gateway_panel.select_next_policy_review();
+                true
+            }
+            KeyCode::Char('a') | KeyCode::Char('x') => {
+                let decision = if matches!(key.code, KeyCode::Char('a')) {
+                    "approve"
+                } else {
+                    "reject"
+                };
+                let Some(review_id) = self.gateway_panel.selected_release_review_id() else {
+                    self.gateway_panel.record_action_result(
+                        &format!("evolution.release_review.{decision}"),
+                        Err("no pending release review selected; press v to refresh".to_string()),
+                    );
+                    return true;
+                };
+                let review_id_for_request = review_id.clone();
+                let decision_for_request = decision.to_string();
                 let result = run_gateway_api_blocking(move |client| async move {
                     client
-                        .tick_mission_steward_scheduler(serde_json::json!({
-                            "source": "tui.gateway_panel",
-                            "mode": "tick"
-                        }))
+                        .evolution_review_decision(
+                            &review_id_for_request,
+                            &decision_for_request,
+                            "TUI human operator decision",
+                        )
                         .await
                 });
                 self.gateway_panel
-                    .record_action_result("mission.team.tick", result);
+                    .record_release_review_decision(&review_id, decision, result);
+                true
+            }
+            KeyCode::Char('A') | KeyCode::Char('X') => {
+                let decision = if matches!(key.code, KeyCode::Char('A')) {
+                    "approve"
+                } else {
+                    "reject"
+                };
+                let Some(review_id) = self.gateway_panel.selected_policy_review_id() else {
+                    self.gateway_panel.record_action_result(
+                        &format!("evolution.evaluation_policy.{decision}"),
+                        Err("no pending policy review selected; press p to refresh".to_string()),
+                    );
+                    return true;
+                };
+                let review_id_for_request = review_id.clone();
+                let decision_for_request = decision.to_string();
+                let result = run_gateway_api_blocking(move |client| async move {
+                    client
+                        .evolution_evaluation_policy_review_decision(
+                            &review_id_for_request,
+                            &decision_for_request,
+                            "TUI human operator decision",
+                        )
+                        .await
+                });
+                self.gateway_panel
+                    .record_policy_review_decision(&review_id, decision, result);
+                true
+            }
+            KeyCode::Char('t') => {
+                let result = run_gateway_api_blocking(move |client| async move {
+                    client.tick_mission_schedules(serde_json::json!({})).await
+                });
+                self.gateway_panel
+                    .record_action_result("mission.schedule.tick", result);
                 true
             }
             _ => false,
-        }
-    }
-
-    fn run_mission_command_action(&mut self, action: &str) -> Result<serde_json::Value, String> {
-        let session_id = self
-            .app
-            .gateway_mission_control
-            .as_ref()
-            .and_then(|mission| {
-                mission.active_session_id.clone().or_else(|| {
-                    mission
-                        .sessions
-                        .first()
-                        .map(|session| session.session_id.clone())
-                })
-            })
-            .ok_or_else(|| "No active mission session".to_string())?;
-        let inbox_session = session_id.clone();
-        let inbox = run_gateway_api_blocking(move |client| async move {
-            client.mission_session_inbox(&inbox_session).await
-        })?;
-        let command_id = first_command_id(&inbox)
-            .ok_or_else(|| "No mission command id found in active inbox".to_string())?;
-        match action {
-            "consume" => run_gateway_api_blocking(move |client| async move {
-                client
-                    .consume_mission_session_command(&session_id, &command_id, "operator")
-                    .await
-            }),
-            "cancel" => run_gateway_api_blocking(move |client| async move {
-                client
-                    .cancel_mission_session_command(&session_id, &command_id)
-                    .await
-            }),
-            "retry" => run_gateway_api_blocking(move |client| async move {
-                client
-                    .retry_mission_session_command(&session_id, &command_id)
-                    .await
-            }),
-            _ => Err(format!("unsupported mission command action: {action}")),
         }
     }
 
@@ -2485,12 +2631,15 @@ impl TuiState {
                     | KeyCode::Char('R')
                     | KeyCode::Char('m')
                     | KeyCode::Char('a')
+                    | KeyCode::Char('g')
                     | KeyCode::Char('i')
                     | KeyCode::Char('o')
                     | KeyCode::Char('v')
                     | KeyCode::Char('p')
                     | KeyCode::Char('d')
                     | KeyCode::Char('D')
+                    | KeyCode::Char('A')
+                    | KeyCode::Char('P')
             );
         };
         match key.code {
@@ -2587,6 +2736,16 @@ impl TuiState {
                 );
                 true
             }
+            KeyCode::Char('g') => {
+                let label = format!("surface.messages:{surface_id}");
+                self.surface_panel.record_action_result(
+                    &label,
+                    run_gateway_api_blocking(move |client| async move {
+                        client.surface_messages(&surface_id).await
+                    }),
+                );
+                true
+            }
             KeyCode::Char('i') => {
                 let label = format!("surface.inbox:{surface_id}");
                 self.surface_panel.record_action_result(
@@ -2667,6 +2826,38 @@ impl TuiState {
                                 "operator moved delivery from TUI",
                             )
                             .await
+                    }),
+                );
+                true
+            }
+            KeyCode::Char('A') => {
+                if !self
+                    .surface_panel
+                    .require_confirmation("surface.messages.archive", "A")
+                {
+                    return true;
+                }
+                let label = format!("surface.messages.archive:{surface_id}");
+                self.surface_panel.record_action_result(
+                    &label,
+                    run_gateway_api_blocking(move |client| async move {
+                        client.surface_archive_messages(&surface_id, 100).await
+                    }),
+                );
+                true
+            }
+            KeyCode::Char('P') => {
+                if !self
+                    .surface_panel
+                    .require_confirmation("surface.messages.purge_archived_events", "P")
+                {
+                    return true;
+                }
+                let label = format!("surface.messages.purge_archived_events:{surface_id}");
+                self.surface_panel.record_action_result(
+                    &label,
+                    run_gateway_api_blocking(move |client| async move {
+                        client.surface_purge_archived_events(&surface_id, 100).await
                     }),
                 );
                 true
@@ -3371,11 +3562,12 @@ impl TuiState {
     fn dispatch_action(&mut self, action: Action) {
         match action {
             Action::Scroll(delta) => {
+                let magnitude = usize::try_from(delta.unsigned_abs()).unwrap_or(usize::MAX);
                 if delta > 0 {
-                    self.app.scroll_offset = self.app.scroll_offset.saturating_add(delta as u16);
+                    self.app.scroll_offset = self.app.scroll_offset.saturating_add(magnitude);
                     self.app.auto_scroll = false;
                 } else {
-                    self.app.scroll_offset = self.app.scroll_offset.saturating_sub((-delta) as u16);
+                    self.app.scroll_offset = self.app.scroll_offset.saturating_sub(magnitude);
                     self.app.auto_scroll = false;
                 }
                 self.set_focus_target(FocusTarget::Chat);
@@ -3448,6 +3640,17 @@ impl TuiState {
             }
             Action::ToggleAgentPanel => {
                 self.agent_team_panel.toggle();
+                if self.agent_team_panel.visible {
+                    let result = run_gateway_api_blocking(move |client| async move {
+                        client.team_templates().await
+                    });
+                    match result {
+                        Ok(payload) => self.agent_team_panel.set_team_templates(&payload),
+                        Err(error) => self
+                            .agent_team_panel
+                            .record_action_result("team.templates", Err(error)),
+                    }
+                }
             }
             Action::TogglePerformanceDashboard => {
                 self.performance_dashboard.toggle();
@@ -3509,8 +3712,9 @@ impl TuiState {
                         .show_notification(&format!("Switched to model: {model}"));
                 }
             }
-            Action::ReloadProviders => {
-                self.reload_runtime_provider_registry();
+            Action::RefreshConfigStatus => {
+                self.refresh_config_panel();
+                self.reload_runtime_provider_projection();
             }
             Action::HistoryBrowse(older) => {
                 let text = if older {
@@ -3605,7 +3809,6 @@ impl TuiState {
                 });
                 match result {
                     Ok(_) => {
-                        self.apply_local_gateway_approval_response(&approval_id);
                         let verdict = if approved { "approved" } else { "rejected" };
                         self.push_runtime_action_receipt(
                             "ok",
@@ -3652,7 +3855,6 @@ impl TuiState {
                     });
                 match result {
                     Ok(_) => {
-                        self.apply_local_gateway_task_status(&task_id, "cancelled");
                         self.push_runtime_action_receipt(
                             "ok",
                             "cancelled",
@@ -3697,7 +3899,6 @@ impl TuiState {
                 });
                 match result {
                     Ok(_) => {
-                        self.apply_local_gateway_task_status(&task_id, "completed");
                         self.push_runtime_action_receipt(
                             "ok",
                             "completed",
@@ -3926,14 +4127,6 @@ impl TuiState {
         }
     }
 
-    fn apply_local_gateway_approval_response(&mut self, approval_id: &str) {
-        self.mutate_runtime_control_store(|store| store.apply_approval_response(approval_id));
-    }
-
-    fn apply_local_gateway_task_status(&mut self, task_id: &str, status: &str) {
-        self.mutate_runtime_control_store(|store| store.apply_task_status(task_id, status));
-    }
-
     fn apply_local_connector_resource_state(&mut self, reference: &str, state: &str) {
         self.mutate_runtime_control_store(|store| {
             store.apply_connector_resource_state(reference, state);
@@ -3999,14 +4192,17 @@ impl TuiState {
             run_gateway_api_blocking(
                 |client| async move { client.runtime_effective_config().await },
             );
+        let reload_status =
+            run_gateway_api_blocking(|client| async move { client.config_reload_status().await });
 
-        match (config, providers, effective) {
-            (Ok(config), Ok(providers), Ok(effective)) => {
+        match (config, providers, effective, reload_status) {
+            (Ok(config), Ok(providers), Ok(effective), Ok(reload_status)) => {
                 self.config_panel.sync_config(config, providers, effective);
+                self.config_panel.sync_config_reload_status(reload_status);
                 self.config_panel.set_status("Config projection refreshed");
                 true
             }
-            (config, providers, effective) => {
+            (config, providers, effective, reload_status) => {
                 let mut errors = Vec::new();
                 if let Err(error) = config {
                     errors.push(format!("config: {error}"));
@@ -4017,23 +4213,14 @@ impl TuiState {
                 if let Err(error) = effective {
                     errors.push(format!("effective: {error}"));
                 }
+                if let Err(error) = reload_status {
+                    errors.push(format!("reload-status: {error}"));
+                }
                 self.config_panel
                     .set_status(format!("Config refresh failed: {}", errors.join("; ")));
                 false
             }
         }
-    }
-
-    fn reload_runtime_provider_registry(&mut self) -> bool {
-        let result =
-            run_gateway_api_blocking(
-                |client| async move { client.reload_runtime_providers().await },
-            );
-        self.config_panel
-            .record_action_result("runtime.providers.reload", result);
-        self.refresh_config_panel();
-        self.runtime_activity_panel.sync_from_app(&self.app);
-        true
     }
 
     fn handle_config_panel_action(&mut self, event: &crossterm::event::Event) -> bool {
@@ -4045,7 +4232,7 @@ impl TuiState {
         }
         match key.code {
             KeyCode::Char('e') => self.refresh_config_panel(),
-            KeyCode::Char('r') => self.reload_runtime_provider_registry(),
+            KeyCode::Char('r') => self.refresh_config_panel(),
             KeyCode::Enter => {
                 let Some(model) = self.config_panel.selected_model_id() else {
                     self.config_panel.set_status("No model selected");
@@ -4171,7 +4358,9 @@ impl TuiState {
         let n = menu_items.len();
 
         let w = 42u16;
-        let h = (n as u16 + 4).min(area.height.saturating_sub(2));
+        let h = crate::components::base::terminal_len(n)
+            .saturating_add(4)
+            .min(area.height.saturating_sub(2));
         let x = (area.width.saturating_sub(w)) / 2;
         let y = (area.height.saturating_sub(h)) / 2;
         let menu_rect = ratatui::layout::Rect::new(x, y, w, h);
@@ -4382,7 +4571,9 @@ impl L4MemoryView {
         }
 
         let width = area.width.min(40);
-        let height = (lines.len() as u16 + 2).min(area.height);
+        let height = crate::components::base::terminal_len(lines.len())
+            .saturating_add(2)
+            .min(area.height);
         let rect = ratatui::layout::Rect::new(
             area.x.saturating_add(area.width.saturating_sub(width)),
             area.y,
@@ -4430,28 +4621,6 @@ where
             .map_err(|_| "Gateway API worker panicked".to_string())?
     } else {
         run()
-    }
-}
-
-fn first_command_id(value: &serde_json::Value) -> Option<String> {
-    match value {
-        serde_json::Value::Object(map) => {
-            if let Some(command_id) = map
-                .get("command_id")
-                .and_then(serde_json::Value::as_str)
-                .filter(|item| !item.trim().is_empty())
-            {
-                return Some(command_id.to_string());
-            }
-            for key in ["commands", "items", "session_commands", "inbox"] {
-                if let Some(found) = map.get(key).and_then(first_command_id) {
-                    return Some(found);
-                }
-            }
-            map.values().find_map(first_command_id)
-        }
-        serde_json::Value::Array(items) => items.iter().find_map(first_command_id),
-        _ => None,
     }
 }
 
@@ -4549,71 +4718,6 @@ mod tests {
 
         // Theme engine dark by default
         assert_eq!(state.theme_engine.theme.name, "dark");
-    }
-
-    #[test]
-    fn local_gateway_approval_response_updates_projection_state() {
-        let mut state = TuiState::new("test-model", "test-session");
-        state.app.gateway_approval_items = vec![
-            crate::runtime_control_store::ApprovalSummary {
-                id: "approval-1".to_string(),
-                tool_name: "bash".to_string(),
-                risk: Some("high".to_string()),
-                requester: Some("session".to_string()),
-                input_preview: "rm -rf /tmp/example".to_string(),
-            },
-            crate::runtime_control_store::ApprovalSummary {
-                id: "approval-2".to_string(),
-                tool_name: "edit".to_string(),
-                risk: Some("medium".to_string()),
-                requester: Some("session".to_string()),
-                input_preview: "write file".to_string(),
-            },
-        ];
-        state.app.gateway_pending_approvals = Some(2);
-
-        state.apply_local_gateway_approval_response("approval-1");
-
-        assert_eq!(state.app.gateway_pending_approvals, Some(1));
-        assert_eq!(state.app.gateway_approval_items.len(), 1);
-        assert_eq!(state.app.gateway_approval_items[0].id, "approval-2");
-    }
-
-    #[test]
-    fn local_gateway_task_status_updates_projection_state() {
-        let mut state = TuiState::new("test-model", "test-session");
-        state.app.gateway_tasks = vec![
-            crate::runtime_control_store::TaskSummary {
-                id: "task-1".to_string(),
-                objective: "blocked task".to_string(),
-                status: "blocked".to_string(),
-                current_phase: Some("verify".to_string()),
-                yolo_mode: true,
-                failure_count: 1,
-                review_result: None,
-                artifact_count: 0,
-                blocker_reason: Some("waiting for approval".to_string()),
-            },
-            crate::runtime_control_store::TaskSummary {
-                id: "task-2".to_string(),
-                objective: "running task".to_string(),
-                status: "running".to_string(),
-                current_phase: None,
-                yolo_mode: false,
-                failure_count: 0,
-                review_result: None,
-                artifact_count: 0,
-                blocker_reason: None,
-            },
-        ];
-        state.app.gateway_task_count = Some(2);
-
-        state.apply_local_gateway_task_status("task-1", "completed");
-
-        assert_eq!(state.app.gateway_task_count, Some(2));
-        assert_eq!(state.app.gateway_tasks[0].status, "completed");
-        assert_eq!(state.app.gateway_tasks[0].blocker_reason, None);
-        assert_eq!(state.app.gateway_tasks[1].status, "running");
     }
 
     #[test]
@@ -5270,6 +5374,22 @@ mod tests {
         assert_eq!(state.active_topic_panel, None);
         assert_eq!(state.sidebar_active_tab, TAB_GATEWAY);
         assert_eq!(state.focus_target, FocusTarget::Sidebar);
+    }
+
+    #[test]
+    fn gateway_review_keys_fail_closed_without_a_loaded_pending_review() {
+        let mut state = TuiState::new("m", "s");
+        let event =
+            crossterm::event::Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+
+        assert!(state.handle_gateway_panel_action(&event));
+        assert_eq!(
+            state.gateway_panel.action_status.as_deref(),
+            Some(
+                "evolution.release_review.approve failed: no pending release review selected; press v to refresh"
+            )
+        );
+        assert!(state.gateway_panel.action_receipt.is_none());
     }
 
     #[test]

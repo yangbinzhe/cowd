@@ -12,10 +12,12 @@
 //! connect to MCP servers and invoke their capabilities.
 
 use std::collections::HashMap;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, RwLock};
+use std::thread::JoinHandle;
 
 use crate::mcp::mcp_tool_name;
-use crate::mcp_stdio::McpServerManager;
+use crate::mcp_stdio::{McpServerManager, McpToolDiscoveryReport};
 use serde::{Deserialize, Serialize};
 
 /// Status of a managed MCP server connection.
@@ -69,10 +71,221 @@ pub struct McpServerState {
     pub error_message: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct McpToolRegistry {
     inner: Arc<RwLock<HashMap<String, McpServerState>>>,
-    managers: Arc<RwLock<HashMap<String, Arc<Mutex<McpServerManager>>>>>,
+    workers: Arc<McpWorkerPool>,
+}
+
+enum McpWorkerCommand {
+    Discover {
+        reply: Sender<Result<McpToolDiscoveryReport, String>>,
+    },
+    Call {
+        qualified_tool_name: String,
+        arguments: Option<serde_json::Value>,
+        reply: Sender<Result<serde_json::Value, String>>,
+    },
+    Shutdown {
+        reply: Sender<Result<(), String>>,
+    },
+}
+
+struct McpServerWorker {
+    sender: Sender<McpWorkerCommand>,
+    join: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl McpServerWorker {
+    fn spawn(server_name: &str, manager: McpServerManager) -> Result<Arc<Self>, String> {
+        let (sender, receiver) = mpsc::channel();
+        let thread_name = format!("mcp-server-worker-{server_name}");
+        let join = std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || Self::run(manager, receiver))
+            .map_err(|error| format!("failed to start MCP server worker: {error}"))?;
+        Ok(Arc::new(Self {
+            sender,
+            join: Mutex::new(Some(join)),
+        }))
+    }
+
+    fn run(mut manager: McpServerManager, receiver: Receiver<McpWorkerCommand>) {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                tracing::error!(error = %error, "failed to create MCP server worker runtime");
+                return;
+            }
+        };
+
+        while let Ok(command) = receiver.recv() {
+            match command {
+                McpWorkerCommand::Discover { reply } => {
+                    let report = runtime.block_on(manager.discover_tools_best_effort());
+                    let _ = reply.send(Ok(report));
+                }
+                McpWorkerCommand::Call {
+                    qualified_tool_name,
+                    arguments,
+                    reply,
+                } => {
+                    let result = runtime
+                        .block_on(manager.call_tool(&qualified_tool_name, arguments))
+                        .map_err(|error| error.to_string())
+                        .and_then(|response| {
+                            if let Some(error) = response.error {
+                                return Err(format!(
+                                    "MCP server returned JSON-RPC error for tools/call: {} ({})",
+                                    error.message, error.code
+                                ));
+                            }
+                            let result = response.result.ok_or_else(|| {
+                                "MCP server returned no result for tools/call".to_string()
+                            })?;
+                            serde_json::to_value(result).map_err(|error| {
+                                format!("failed to serialize MCP tool result: {error}")
+                            })
+                        });
+                    let _ = reply.send(result);
+                }
+                McpWorkerCommand::Shutdown { reply } => {
+                    let result = runtime
+                        .block_on(manager.shutdown())
+                        .map_err(|error| error.to_string());
+                    let _ = reply.send(result);
+                    return;
+                }
+            }
+        }
+
+        if let Err(error) = runtime.block_on(manager.shutdown()) {
+            tracing::warn!(error = %error, "failed to shut down MCP server after worker disconnect");
+        }
+    }
+
+    fn call_tool(
+        &self,
+        qualified_tool_name: String,
+        arguments: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, String> {
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.sender
+            .send(McpWorkerCommand::Call {
+                qualified_tool_name,
+                arguments,
+                reply: reply_sender,
+            })
+            .map_err(|_| "MCP server worker is not running".to_string())?;
+        reply_receiver
+            .recv()
+            .map_err(|_| "MCP server worker stopped before returning a result".to_string())?
+    }
+
+    fn discover_tools(&self) -> Result<McpToolDiscoveryReport, String> {
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.sender
+            .send(McpWorkerCommand::Discover {
+                reply: reply_sender,
+            })
+            .map_err(|_| "MCP server worker is not running".to_string())?;
+        reply_receiver
+            .recv()
+            .map_err(|_| "MCP server worker stopped during tool discovery".to_string())?
+    }
+
+    fn shutdown(&self) -> Result<(), String> {
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        let command_result = self.sender.send(McpWorkerCommand::Shutdown {
+            reply: reply_sender,
+        });
+        let shutdown_result = match command_result {
+            Ok(()) => reply_receiver
+                .recv()
+                .map_err(|_| "MCP server worker stopped during shutdown".to_string())?,
+            Err(_) => Ok(()),
+        };
+
+        let join = self
+            .join
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(join) = join {
+            join.join()
+                .map_err(|_| "MCP server worker panicked during shutdown".to_string())?;
+        }
+        shutdown_result
+    }
+}
+
+#[derive(Default)]
+struct McpWorkerPool {
+    workers: RwLock<HashMap<String, Arc<McpServerWorker>>>,
+}
+
+impl McpWorkerPool {
+    fn install(
+        &self,
+        server_name: &str,
+        manager: McpServerManager,
+    ) -> Result<Arc<McpServerWorker>, String> {
+        let worker = McpServerWorker::spawn(server_name, manager)?;
+        let previous = self
+            .workers
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(server_name.to_string(), Arc::clone(&worker));
+        if let Some(previous) = previous {
+            previous.shutdown()?;
+        }
+        Ok(worker)
+    }
+
+    fn get(&self, server_name: &str) -> Option<Arc<McpServerWorker>> {
+        self.workers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(server_name)
+            .cloned()
+    }
+
+    fn remove(&self, server_name: &str) -> Option<Arc<McpServerWorker>> {
+        self.workers
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(server_name)
+    }
+
+    fn shutdown_all(&self) -> Result<(), String> {
+        let workers = {
+            let mut guard = self
+                .workers
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.drain().map(|(_, worker)| worker).collect::<Vec<_>>()
+        };
+        let errors = workers
+            .into_iter()
+            .filter_map(|worker| worker.shutdown().err())
+            .collect::<Vec<_>>();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+}
+
+impl Drop for McpWorkerPool {
+    fn drop(&mut self) {
+        if let Err(error) = self.shutdown_all() {
+            tracing::warn!(error = %error, "failed to shut down MCP worker pool");
+        }
+    }
 }
 
 impl McpToolRegistry {
@@ -81,16 +294,18 @@ impl McpToolRegistry {
         Self::default()
     }
 
-    /// Register a server-specific manager instance.
+    /// Install a server-specific long-lived worker.
     ///
-    /// Each MCP server gets its own `McpServerManager` with its own lock,
-    /// allowing different servers to execute tool calls in parallel.
-    pub fn set_server_manager(&self, server_name: &str, manager: McpServerManager) {
-        let mut managers = self.managers.write().unwrap_or_else(|poisoned| {
-            tracing::warn!("mcp tool bridge managers lock poisoned; recovering");
-            poisoned.into_inner()
-        });
-        managers.insert(server_name.to_owned(), Arc::new(Mutex::new(manager)));
+    /// A worker owns one `McpServerManager` and its Tokio runtime. This keeps
+    /// calls for one stdio server ordered while allowing separate servers to
+    /// execute in parallel without recreating their child process per call.
+    pub fn install_server_manager(
+        &self,
+        server_name: &str,
+        manager: McpServerManager,
+    ) -> Result<McpToolDiscoveryReport, String> {
+        let worker = self.workers.install(server_name, manager)?;
+        worker.discover_tools()
     }
 
     pub fn register_server(
@@ -196,69 +411,6 @@ impl McpToolRegistry {
         }
     }
 
-    fn spawn_tool_call(
-        manager: Arc<Mutex<McpServerManager>>,
-        qualified_tool_name: String,
-        arguments: Option<serde_json::Value>,
-    ) -> Result<serde_json::Value, String> {
-        let join_handle = std::thread::Builder::new()
-            .name(format!("mcp-tool-call-{qualified_tool_name}"))
-            .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|error| format!("failed to create MCP tool runtime: {error}"))?;
-
-                runtime.block_on(async move {
-                    let response = {
-                        let mut manager = manager
-                            .lock()
-                            .map_err(|_| "mcp server manager lock poisoned".to_string())?;
-                        manager
-                            .discover_tools()
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        let response = manager
-                            .call_tool(&qualified_tool_name, arguments)
-                            .await
-                            .map_err(|error| error.to_string());
-                        let shutdown = manager.shutdown().await.map_err(|error| error.to_string());
-
-                        match (response, shutdown) {
-                            (Ok(response), Ok(())) => Ok(response),
-                            (Err(error), Ok(())) | (Err(error), Err(_)) => Err(error),
-                            (Ok(_), Err(error)) => Err(error),
-                        }
-                    }?;
-
-                    if let Some(error) = response.error {
-                        return Err(format!(
-                            "MCP server returned JSON-RPC error for tools/call: {} ({})",
-                            error.message, error.code
-                        ));
-                    }
-
-                    let result = response.result.ok_or_else(|| {
-                        "MCP server returned no result for tools/call".to_string()
-                    })?;
-
-                    serde_json::to_value(result)
-                        .map_err(|error| format!("failed to serialize MCP tool result: {error}"))
-                })
-            })
-            .map_err(|error| format!("failed to spawn MCP tool call thread: {error}"))?;
-
-        join_handle.join().map_err(|panic_payload| {
-            if let Some(message) = panic_payload.downcast_ref::<&str>() {
-                format!("MCP tool call thread panicked: {message}")
-            } else if let Some(message) = panic_payload.downcast_ref::<String>() {
-                format!("MCP tool call thread panicked: {message}")
-            } else {
-                "MCP tool call thread panicked".to_string()
-            }
-        })?
-    }
-
     pub fn call_tool(
         &self,
         server_name: &str,
@@ -289,17 +441,12 @@ impl McpToolRegistry {
 
         drop(inner);
 
-        let managers = self.managers.read().unwrap_or_else(|poisoned| {
-            tracing::warn!("mcp tool bridge managers lock poisoned; recovering");
-            poisoned.into_inner()
-        });
-        let manager = managers
+        let worker = self
+            .workers
             .get(server_name)
-            .cloned()
             .ok_or_else(|| format!("MCP server '{}' manager is not configured", server_name))?;
 
-        Self::spawn_tool_call(
-            manager,
+        worker.call_tool(
             mcp_tool_name(server_name, tool_name),
             (!arguments.is_null()).then(|| arguments.clone()),
         )
@@ -328,7 +475,14 @@ impl McpToolRegistry {
             tracing::warn!("mcp tool bridge registry lock poisoned; recovering");
             poisoned.into_inner()
         });
-        inner.remove(server_name)
+        let removed = inner.remove(server_name);
+        drop(inner);
+        if let Some(worker) = self.workers.remove(server_name) {
+            if let Err(error) = worker.shutdown() {
+                tracing::warn!(server = server_name, error = %error, "failed to shut down MCP server worker");
+            }
+        }
+        removed
     }
 
     /// Number of registered servers.
@@ -345,6 +499,16 @@ impl McpToolRegistry {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    pub fn shutdown_all(&self) -> Result<(), String> {
+        self.workers.shutdown_all()
+    }
+
+    pub fn remove_server_manager(&self, server_name: &str) -> Result<(), String> {
+        self.workers
+            .remove(server_name)
+            .map_or(Ok(()), |worker| worker.shutdown())
+    }
 }
 
 #[cfg(test)]
@@ -354,7 +518,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use super::*;
     use crate::config::{
@@ -386,9 +550,14 @@ mod tests {
         let script_path = root.join("bridge-mcp-server.py");
         let script = [
             "#!/usr/bin/env python3",
-            "import json, os, sys",
+            "import json, os, sys, time",
             "LABEL = os.environ.get('MCP_SERVER_LABEL', 'server')",
             "LOG_PATH = os.environ.get('MCP_LOG_PATH')",
+            "CALL_DELAY_MS = int(os.environ.get('MCP_CALL_DELAY_MS', '0'))",
+            "PID_PATH = os.environ.get('MCP_PID_PATH')",
+            "if PID_PATH:",
+            "    with open(PID_PATH, 'w', encoding='utf-8') as handle:",
+            "        handle.write(str(os.getpid()))",
             "",
             "def log(method):",
             "    if LOG_PATH:",
@@ -451,6 +620,8 @@ mod tests {
             "    elif method == 'tools/call':",
             "        args = request['params'].get('arguments') or {}",
             "        text = args.get('text', '')",
+            "        if CALL_DELAY_MS:",
+            "            time.sleep(CALL_DELAY_MS / 1000)",
             "        send_message({",
             "            'jsonrpc': '2.0',",
             "            'id': request['id'],",
@@ -481,21 +652,55 @@ mod tests {
         server_name: &str,
         log_path: &Path,
     ) -> ScopedMcpServerConfig {
+        manager_server_config_with_delay(script_path, server_name, log_path, None)
+    }
+
+    fn manager_server_config_with_delay(
+        script_path: &Path,
+        server_name: &str,
+        log_path: &Path,
+        call_delay_ms: Option<u64>,
+    ) -> ScopedMcpServerConfig {
+        let mut env = BTreeMap::from([
+            ("MCP_SERVER_LABEL".to_string(), server_name.to_string()),
+            (
+                "MCP_LOG_PATH".to_string(),
+                log_path.to_string_lossy().into_owned(),
+            ),
+        ]);
+        if let Some(call_delay_ms) = call_delay_ms {
+            env.insert("MCP_CALL_DELAY_MS".to_string(), call_delay_ms.to_string());
+        }
         ScopedMcpServerConfig {
             scope: ConfigSource::Local,
             config: McpServerConfig::Stdio(McpStdioServerConfig {
                 command: "python3".to_string(),
                 args: vec![script_path.to_string_lossy().into_owned()],
-                env: BTreeMap::from([
-                    ("MCP_SERVER_LABEL".to_string(), server_name.to_string()),
-                    (
-                        "MCP_LOG_PATH".to_string(),
-                        log_path.to_string_lossy().into_owned(),
-                    ),
-                ]),
+                env,
                 tool_call_timeout_ms: Some(1_000),
             }),
         }
+    }
+
+    fn manager_server_config_with_pid_file(
+        script_path: &Path,
+        server_name: &str,
+        log_path: &Path,
+        pid_path: &Path,
+    ) -> ScopedMcpServerConfig {
+        let mut config = manager_server_config(script_path, server_name, log_path);
+        let McpServerConfig::Stdio(stdio) = &mut config.config else {
+            unreachable!("bridge test config is always stdio");
+        };
+        stdio.env.insert(
+            "MCP_PID_PATH".to_string(),
+            pid_path.to_string_lossy().into_owned(),
+        );
+        config
+    }
+
+    fn manager_for_worker(servers: &BTreeMap<String, ScopedMcpServerConfig>) -> McpServerManager {
+        McpServerManager::from_servers(servers)
     }
 
     #[test]
@@ -617,7 +822,7 @@ mod tests {
             "alpha".to_string(),
             manager_server_config(&script_path, "alpha", &log_path),
         )]);
-        let manager = McpServerManager::from_servers(&servers);
+        let manager = manager_for_worker(&servers);
 
         let registry = McpToolRegistry::new();
         registry.register_server(
@@ -635,11 +840,16 @@ mod tests {
             vec![],
             Some("bridge test server".into()),
         );
-        registry.set_server_manager("alpha", manager);
+        registry
+            .install_server_manager("alpha", manager)
+            .expect("install MCP worker");
 
         let result = registry
             .call_tool("alpha", "echo", &serde_json::json!({"text": "hello"}))
             .expect("should return live MCP result");
+        let second_result = registry
+            .call_tool("alpha", "echo", &serde_json::json!({"text": "again"}))
+            .expect("second call should reuse the live MCP server");
 
         assert_eq!(
             result["structuredContent"]["server"],
@@ -653,13 +863,18 @@ mod tests {
             result["content"][0]["text"],
             serde_json::json!("alpha:hello")
         );
+        assert_eq!(
+            second_result["content"][0]["text"],
+            serde_json::json!("alpha:again")
+        );
 
         let log = fs::read_to_string(&log_path).expect("read log");
         assert_eq!(
             log.lines().collect::<Vec<_>>(),
-            vec!["initialize", "tools/list", "tools/call"]
+            vec!["initialize", "tools/list", "tools/call", "tools/call"]
         );
 
+        drop(registry);
         cleanup_script(&script_path);
     }
 
@@ -875,7 +1090,9 @@ mod tests {
             vec![],
             None,
         );
-        registry.set_server_manager("srv", McpServerManager::from_servers(&servers));
+        registry
+            .install_server_manager("srv", manager_for_worker(&servers))
+            .expect("install MCP worker");
 
         let result = registry
             .call_tool("srv", "echo", &arguments)
@@ -885,7 +1102,178 @@ mod tests {
         assert_eq!(result["structuredContent"]["echoed"], "world");
         assert_eq!(result["content"][0]["text"], "srv:world");
 
+        drop(registry);
         cleanup_script(&script_path);
+    }
+
+    #[test]
+    fn different_mcp_servers_execute_calls_in_parallel() {
+        let script_path = write_bridge_mcp_server_script();
+        let root = script_path.parent().expect("script parent");
+        let alpha_log = root.join("alpha.log");
+        let beta_log = root.join("beta.log");
+        let alpha_servers = BTreeMap::from([(
+            "alpha".to_string(),
+            manager_server_config_with_delay(&script_path, "alpha", &alpha_log, Some(250)),
+        )]);
+        let beta_servers = BTreeMap::from([(
+            "beta".to_string(),
+            manager_server_config_with_delay(&script_path, "beta", &beta_log, Some(250)),
+        )]);
+        let registry = McpToolRegistry::new();
+        for (server_name, manager) in [
+            ("alpha", manager_for_worker(&alpha_servers)),
+            ("beta", manager_for_worker(&beta_servers)),
+        ] {
+            registry.register_server(
+                server_name,
+                McpConnectionStatus::Connected,
+                vec![McpToolInfo {
+                    name: "echo".into(),
+                    description: None,
+                    input_schema: None,
+                }],
+                vec![],
+                None,
+            );
+            registry
+                .install_server_manager(server_name, manager)
+                .expect("install MCP worker");
+        }
+
+        let started = Instant::now();
+        let alpha = {
+            let registry = registry.clone();
+            std::thread::spawn(move || {
+                registry.call_tool("alpha", "echo", &serde_json::json!({"text": "one"}))
+            })
+        };
+        let beta = {
+            let registry = registry.clone();
+            std::thread::spawn(move || {
+                registry.call_tool("beta", "echo", &serde_json::json!({"text": "two"}))
+            })
+        };
+        let alpha = alpha
+            .join()
+            .expect("alpha call thread")
+            .expect("alpha call");
+        let beta = beta.join().expect("beta call thread").expect("beta call");
+        let elapsed = started.elapsed();
+
+        assert_eq!(alpha["structuredContent"]["server"], "alpha");
+        assert_eq!(beta["structuredContent"]["server"], "beta");
+        assert!(
+            elapsed < Duration::from_millis(450),
+            "independent MCP servers must overlap, elapsed={elapsed:?}"
+        );
+
+        drop(registry);
+        cleanup_script(&script_path);
+    }
+
+    #[test]
+    fn same_mcp_server_serializes_calls_without_restarting() {
+        let script_path = write_bridge_mcp_server_script();
+        let root = script_path.parent().expect("script parent");
+        let log_path = root.join("serial.log");
+        let servers = BTreeMap::from([(
+            "serial".to_string(),
+            manager_server_config_with_delay(&script_path, "serial", &log_path, Some(180)),
+        )]);
+        let registry = McpToolRegistry::new();
+        registry.register_server(
+            "serial",
+            McpConnectionStatus::Connected,
+            vec![McpToolInfo {
+                name: "echo".into(),
+                description: None,
+                input_schema: None,
+            }],
+            vec![],
+            None,
+        );
+        registry
+            .install_server_manager("serial", manager_for_worker(&servers))
+            .expect("install MCP worker");
+
+        let started = Instant::now();
+        let first = {
+            let registry = registry.clone();
+            std::thread::spawn(move || {
+                registry.call_tool("serial", "echo", &serde_json::json!({"text": "first"}))
+            })
+        };
+        let second = {
+            let registry = registry.clone();
+            std::thread::spawn(move || {
+                registry.call_tool("serial", "echo", &serde_json::json!({"text": "second"}))
+            })
+        };
+        first
+            .join()
+            .expect("first call thread")
+            .expect("first call");
+        second
+            .join()
+            .expect("second call thread")
+            .expect("second call");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(320),
+            "one MCP server must not interleave stdio calls, elapsed={elapsed:?}"
+        );
+        let log = fs::read_to_string(&log_path).expect("read serial log");
+        assert_eq!(
+            log.lines().collect::<Vec<_>>(),
+            vec!["initialize", "tools/list", "tools/call", "tools/call"]
+        );
+
+        drop(registry);
+        cleanup_script(&script_path);
+    }
+
+    #[test]
+    fn dropping_registry_stops_and_joins_the_mcp_worker_process() {
+        let script_path = write_bridge_mcp_server_script();
+        let root = script_path.parent().expect("script parent");
+        let log_path = root.join("shutdown.log");
+        let pid_path = root.join("server.pid");
+        let servers = BTreeMap::from([(
+            "shutdown".to_string(),
+            manager_server_config_with_pid_file(&script_path, "shutdown", &log_path, &pid_path),
+        )]);
+        let registry = McpToolRegistry::new();
+        registry
+            .install_server_manager("shutdown", manager_for_worker(&servers))
+            .expect("install MCP worker");
+
+        let pid = fs::read_to_string(&pid_path)
+            .expect("server writes its pid during discovery")
+            .trim()
+            .parse::<u32>()
+            .expect("valid server pid");
+
+        drop(registry);
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            let running = std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            if !running {
+                cleanup_script(&script_path);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        cleanup_script(&script_path);
+        panic!("MCP worker child process {pid} remained alive after registry drop");
     }
 
     #[test]

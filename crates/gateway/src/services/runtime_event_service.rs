@@ -1,0 +1,68 @@
+/// Gateway read-only projection facade for Runtime lifecycle events.
+///
+/// The durable event store remains a Runtime implementation detail.  This
+/// facade deliberately has no generic append method: Gateway services must use
+/// a typed Runtime command for every lifecycle mutation they own.
+#[derive(Clone)]
+pub(crate) struct RuntimeEventService {
+    reader: runtime::RuntimeEventReader,
+    #[cfg(test)]
+    fixture: runtime::RuntimeFixtureEventPort,
+}
+
+impl RuntimeEventService {
+    pub(crate) fn from_runtime_services(services: &runtime::RuntimeServices) -> Self {
+        Self {
+            reader: services.event_reader(),
+            #[cfg(test)]
+            fixture: services.fixture_event_port(),
+        }
+    }
+
+    pub(crate) fn list_stream(
+        &self,
+        stream_id: &str,
+    ) -> Result<Vec<runtime::DurableRuntimeEvent>, String> {
+        self.reader.list_stream(stream_id)
+    }
+
+    pub(crate) fn list_scope(
+        &self,
+        scope: runtime::RuntimeEventScope,
+        limit: usize,
+    ) -> Result<Vec<runtime::DurableRuntimeEvent>, String> {
+        self.reader.list_scope(scope, limit)
+    }
+
+    pub(crate) fn all_events(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<runtime::DurableRuntimeEvent>, String> {
+        self.reader.all_events(limit)
+    }
+
+    pub(crate) fn replay_report(
+        &self,
+        limit: usize,
+    ) -> Result<runtime::RuntimeReplayReport, String> {
+        self.reader.replay_report(limit)
+    }
+
+    pub(crate) fn session_timeline_events(
+        &self,
+        session_id: &str,
+        from_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<runtime::DurableRuntimeEvent>, String> {
+        self.reader
+            .session_timeline_events(session_id, from_sequence, limit)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn append_fixture(
+        &self,
+        event: runtime::RuntimeEventInput,
+    ) -> Result<runtime::DurableRuntimeEvent, String> {
+        self.fixture.append_for_test(event)
+    }
+}

@@ -106,9 +106,7 @@ impl HybridSearcher {
             }
             cache
                 .as_ref()
-                .expect("BM25 index must be present after build/hit")
-                .0
-                .rank(query)
+                .map_or_else(Vec::new, |(scorer, _)| scorer.rank(query))
         };
         let bm25_candidates: Vec<_> = bm25_rankings.into_iter().take(over_fetch).collect();
 

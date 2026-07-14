@@ -1,3 +1,14 @@
+// Test assertions intentionally use unwrap/expect/panic; normal library builds remain strict.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -7,7 +18,7 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
-pub mod channel;
+pub mod message;
 
 /// Current wire protocol for Cowd edge sidecars.
 ///
@@ -198,6 +209,8 @@ pub enum SurfaceSupervisorAction {
     Restart,
     Repair,
     HealthCheck,
+    ArchiveDeadLetters,
+    PurgeArchivedEvents,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -754,6 +767,10 @@ pub struct SurfaceSendRequest {
     pub recipient: String,
     pub thread: Option<String>,
     pub text: String,
+    /// Stable caller-owned key. A sidecar that performs external effects must
+    /// return the original provider receipt when this key is replayed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
     #[serde(default)]
     pub metadata: Value,
 }

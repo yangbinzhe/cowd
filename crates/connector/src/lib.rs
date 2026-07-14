@@ -1,3 +1,12 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
 //! Connector contracts, external resources, and connector-local stores.
 //!
 //! This module describes provider accounts, external capabilities, and resource
@@ -19,8 +28,9 @@ use serde_json::Value;
 
 pub use source::{
     builtin_source_adapter_manifests, read_local_source_batch, source_adapter_manifest,
-    SourceAdapterManifest, SourceBatchCursor, SourceFieldSchema, SourceReadPlan, SourceRecordBatch,
-    SourceTableSchema,
+    SourceAdapterManifest, SourceBatchCursor, SourceConnectorState, SourceEventBatch,
+    SourceFieldSchema, SourceIncrementalRunRequest, SourceIncrementalRunResult,
+    SourceIngestionReceipt, SourceReadPlan, SourceRecordBatch, SourceTableSchema, SourceWatermark,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

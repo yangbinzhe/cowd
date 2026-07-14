@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -27,6 +34,7 @@ fn runtime_module_map_covers_core_harness_lifecycle_domains() {
         RuntimeDomain::Recovery,
         RuntimeDomain::Policy,
         RuntimeDomain::RealityBridge,
+        RuntimeDomain::Evolution,
         RuntimeDomain::Skill,
     ] {
         assert!(
@@ -42,10 +50,10 @@ fn runtime_module_map_covers_core_harness_lifecycle_domains() {
         "tool_dispatch",
         "mission_runtime",
         "session_execution",
-        "agent_lifecycle",
-        "team_execution",
-        "steward_runtime",
-        "global_approval_queue",
+        "agent_runtime",
+        "team_instantiation",
+        "mission_command_router",
+        "approval_queue",
         "runtime_event_store",
         "recovery",
     ] {
@@ -69,7 +77,6 @@ fn runtime_root_public_modules_are_classified_by_domain() {
     let allowed_public_modules = [
         "bash_validation",
         "branch_lock",
-        "cached_prompt",
         "cowd_dirs",
         "effect",
         "error",
@@ -138,11 +145,12 @@ fn runtime_source_files_are_grouped_by_architecture_domain() {
         "approval",
         "context",
         "conversation",
+        "evolution",
         "infrastructure",
         "mission",
         "policy",
         "provider",
-        "reality_bridge",
+        "structured_data",
         "recovery",
         "session",
         "skill",

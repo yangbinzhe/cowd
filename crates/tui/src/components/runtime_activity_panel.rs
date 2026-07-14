@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use crate::app::{App, TimelineEntry};
-use crate::components::panel_scroll::{offset_to_u16, PanelScrollState};
+use crate::components::panel_scroll::PanelScrollState;
 use crate::components::{Component, EventResult, RenderContext};
 
 /// Turn-level activity summary for "what's happening now" display.
@@ -60,13 +60,14 @@ pub struct RuntimeActivityPanel {
     stable_hash: String,
     runtime_hash: String,
     dynamic_hash: String,
-    workgraph_status: String,
-    workgraph_graph_id: String,
-    workgraph_board_id: String,
-    workgraph_agent_tasks: usize,
-    workgraph_candidates: usize,
-    workgraph_conflicts: usize,
-    workgraph_completion_pct: String,
+    execution_graph_status: String,
+    execution_graph_graph_id: String,
+    execution_graph_board_id: String,
+    execution_graph_agent_tasks: usize,
+    execution_graph_children: usize,
+    execution_graph_candidates: usize,
+    execution_graph_conflicts: usize,
+    execution_graph_completion_pct: String,
     projection_run_count: usize,
     projection_tool_count: usize,
     projection_selected_count: usize,
@@ -231,33 +232,35 @@ impl RuntimeActivityPanel {
             self.runtime_policy_review = false;
             self.runtime_policy_signals = 0;
         }
-        if let Some(summary) = &app.latest_workgraph_summary {
-            self.workgraph_status = summary.status.clone();
-            self.workgraph_graph_id = summary
+        if let Some(summary) = &app.latest_execution_graph_summary {
+            self.execution_graph_status = summary.status.clone();
+            self.execution_graph_graph_id = summary
                 .graph_id
                 .as_deref()
                 .map(short_id)
                 .unwrap_or_else(|| "n/a".to_string());
-            self.workgraph_board_id = summary
+            self.execution_graph_board_id = summary
                 .board_id
                 .as_deref()
                 .map(short_id)
                 .unwrap_or_else(|| "n/a".to_string());
-            self.workgraph_agent_tasks = summary.agent_tasks;
-            self.workgraph_candidates = summary.memory_candidates;
-            self.workgraph_conflicts = summary.conflicts;
-            self.workgraph_completion_pct = summary
+            self.execution_graph_agent_tasks = summary.agent_tasks;
+            self.execution_graph_children = summary.child_executions;
+            self.execution_graph_candidates = summary.memory_candidates;
+            self.execution_graph_conflicts = summary.conflicts;
+            self.execution_graph_completion_pct = summary
                 .completion_rate
                 .map(|value| format!("{}%", (value * 100.0).round() as u16))
                 .unwrap_or_else(|| "n/a".to_string());
         } else {
-            self.workgraph_status = "n/a".to_string();
-            self.workgraph_graph_id = "n/a".to_string();
-            self.workgraph_board_id = "n/a".to_string();
-            self.workgraph_agent_tasks = 0;
-            self.workgraph_candidates = 0;
-            self.workgraph_conflicts = 0;
-            self.workgraph_completion_pct = "n/a".to_string();
+            self.execution_graph_status = "n/a".to_string();
+            self.execution_graph_graph_id = "n/a".to_string();
+            self.execution_graph_board_id = "n/a".to_string();
+            self.execution_graph_agent_tasks = 0;
+            self.execution_graph_children = 0;
+            self.execution_graph_candidates = 0;
+            self.execution_graph_conflicts = 0;
+            self.execution_graph_completion_pct = "n/a".to_string();
         }
         if let Some(projection) = &app.latest_run_projection {
             self.projection_run_count = projection
@@ -324,7 +327,7 @@ impl RuntimeActivityPanel {
             },
             if has_context { "ready" } else { "pending" },
             self.runtime_policy_agent,
-            self.workgraph_agent_tasks,
+            self.execution_graph_agent_tasks,
             self.provider_status,
             if self.yolo_mode { "on" } else { "off" }
         );
@@ -465,25 +468,26 @@ impl Component for RuntimeActivityPanel {
                 ),
             ]));
         }
-        if self.workgraph_agent_tasks > 0 {
+        if self.execution_graph_agent_tasks > 0 {
             lines.push(Line::from(vec![
-                Span::styled("WG:", Style::default().fg(Color::DarkGray)),
+                Span::styled("Graph:", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     format!(
-                        "{} {} agents {}",
-                        self.workgraph_status,
-                        self.workgraph_completion_pct,
-                        self.workgraph_agent_tasks
+                        "{} {} agents {} children {}",
+                        self.execution_graph_status,
+                        self.execution_graph_completion_pct,
+                        self.execution_graph_agent_tasks,
+                        self.execution_graph_children
                     ),
-                    Style::default().fg(if self.workgraph_status == "completed" {
+                    Style::default().fg(if self.execution_graph_status == "completed" {
                         Color::Green
                     } else {
                         Color::Cyan
                     }),
                 ),
                 Span::styled(
-                    format!("  conflicts {}", self.workgraph_conflicts),
-                    Style::default().fg(if self.workgraph_conflicts > 0 {
+                    format!("  conflicts {}", self.execution_graph_conflicts),
+                    Style::default().fg(if self.execution_graph_conflicts > 0 {
                         Color::Yellow
                     } else {
                         Color::DarkGray
@@ -520,7 +524,7 @@ impl Component for RuntimeActivityPanel {
             }
             let remaining_rows = area
                 .height
-                .saturating_sub(lines.len() as u16)
+                .saturating_sub(u16::try_from(lines.len()).unwrap_or(u16::MAX))
                 .saturating_sub(3)
                 .max(6) as usize;
             let start = self.recent_process.len().saturating_sub(remaining_rows);
@@ -540,12 +544,19 @@ impl Component for RuntimeActivityPanel {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray));
-        self.scroll
-            .sync(lines.len(), area.height.saturating_sub(2).max(1) as usize);
+        self.scroll.sync(
+            lines.len(),
+            usize::from(area.height.saturating_sub(2).max(1)),
+        );
+        let visible = lines
+            .into_iter()
+            .skip(self.scroll.offset)
+            .take(self.scroll.viewport_len)
+            .collect::<Vec<_>>();
         ctx.frame_mut().render_widget(
-            Paragraph::new(lines)
+            Paragraph::new(visible)
                 .block(block)
-                .scroll((offset_to_u16(self.scroll.offset), 0))
+                .scroll((0, 0))
                 .wrap(Wrap { trim: false }),
             area,
         );
@@ -644,9 +655,10 @@ fn process_line(item: &ProcessEvent) -> Line<'static> {
 
 fn process_separator_line(turn: usize, width: u16) -> Line<'static> {
     let label = format!(" #{} ", turn);
-    let width = width.max(label.len() as u16) as usize;
-    let side = width.saturating_sub(label.len()) / 2;
-    let right = width.saturating_sub(label.len()).saturating_sub(side);
+    let label_width = label.chars().count();
+    let width = usize::from(width).max(label_width);
+    let side = width.saturating_sub(label_width) / 2;
+    let right = width.saturating_sub(label_width).saturating_sub(side);
     Line::from(Span::styled(
         format!("{}{}{}", "─".repeat(side), label, "─".repeat(right)),
         Style::default().fg(Color::DarkGray),
@@ -751,12 +763,13 @@ mod tests {
             summary: "ok".to_string(),
             exit_code: Some(0),
         });
-        app.apply_event(CowdEvent::WorkGraphSummary {
-            summary: crate::RuntimeWorkGraphSummary {
+        app.apply_event(CowdEvent::ExecutionGraphSummary {
+            summary: crate::RuntimeExecutionGraphSummary {
                 graph_id: Some("graph-run".to_string()),
                 board_id: Some("board-run".to_string()),
                 status: "completed".to_string(),
                 agent_tasks: 2,
+                child_executions: 0,
                 memory_candidates: 1,
                 conflicts: 1,
                 completion_rate: Some(1.0),
@@ -815,7 +828,7 @@ mod tests {
         assert!(!rendered.contains("200.0k"));
         assert!(!rendered.contains("Model:"));
         assert!(!rendered.contains("Activity:"));
-        assert!(rendered.contains("WG:"));
+        assert!(rendered.contains("Graph:"));
         assert!(rendered.contains("Projection:"));
         assert!(rendered.contains("runs 2 tools 3 mem 4/1 team 1 approvals 1 speed 21.2 tok/s"));
         assert!(!rendered.contains("Process"));

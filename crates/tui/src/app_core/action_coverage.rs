@@ -84,6 +84,30 @@ const REQUIRED_ACTIONS: &[TuiActionCoverage] = &[
         receipt_marker: "record_action_result",
     },
     TuiActionCoverage {
+        action_id: "surface.messages",
+        gateway_route: "/api/surfaces/:id/messages",
+        client_method: "surface_messages",
+        panel_key: "g ledger",
+        state_dispatch: "surface_messages",
+        receipt_marker: "record_action_result",
+    },
+    TuiActionCoverage {
+        action_id: "surface.messages.archive",
+        gateway_route: "/api/surfaces/:id/messages/archive",
+        client_method: "surface_archive_messages",
+        panel_key: "A archive",
+        state_dispatch: "surface_archive_messages",
+        receipt_marker: "require_confirmation",
+    },
+    TuiActionCoverage {
+        action_id: "surface.messages.purge_archived_events",
+        gateway_route: "/api/surfaces/:id/messages/purge-archived-events",
+        client_method: "surface_purge_archived_events",
+        panel_key: "P purge",
+        state_dispatch: "surface_purge_archived_events",
+        receipt_marker: "require_confirmation",
+    },
+    TuiActionCoverage {
         action_id: "surface.deliveries",
         gateway_route: "/api/surfaces/:id/deliveries",
         client_method: "surface_deliveries",
@@ -164,35 +188,11 @@ const REQUIRED_ACTIONS: &[TuiActionCoverage] = &[
         receipt_marker: "AgentTeamPanel",
     },
     TuiActionCoverage {
-        action_id: "mission.session_command.consume",
-        gateway_route: "/api/mission/sessions/:id/inbox/:command_id/consume",
-        client_method: "consume_mission_session_command",
-        panel_key: "c consume",
-        state_dispatch: "consume_mission_session_command",
-        receipt_marker: "GatewayPanel",
-    },
-    TuiActionCoverage {
-        action_id: "mission.session_command.cancel",
-        gateway_route: "/api/mission/sessions/:id/inbox/:command_id/cancel",
-        client_method: "cancel_mission_session_command",
-        panel_key: "C cancel",
-        state_dispatch: "cancel_mission_session_command",
-        receipt_marker: "GatewayPanel",
-    },
-    TuiActionCoverage {
-        action_id: "mission.session_command.retry",
-        gateway_route: "/api/mission/sessions/:id/inbox/:command_id/retry",
-        client_method: "retry_mission_session_command",
-        panel_key: "y retry",
-        state_dispatch: "retry_mission_session_command",
-        receipt_marker: "GatewayPanel",
-    },
-    TuiActionCoverage {
-        action_id: "mission.team.tick",
-        gateway_route: "/api/mission/control/stewards/scheduler",
-        client_method: "tick_mission_steward_scheduler",
-        panel_key: "t steward tick",
-        state_dispatch: "tick_mission_steward_scheduler",
+        action_id: "mission.schedule.tick",
+        gateway_route: "/api/mission/schedules/tick",
+        client_method: "tick_mission_schedules",
+        panel_key: "t schedule tick",
+        state_dispatch: "tick_mission_schedules",
         receipt_marker: "GatewayPanel",
     },
     TuiActionCoverage {
@@ -210,6 +210,14 @@ const REQUIRED_ACTIONS: &[TuiActionCoverage] = &[
         panel_key: "E smoke",
         state_dispatch: "harness_eval_run_smoke",
         receipt_marker: "record_action_result",
+    },
+    TuiActionCoverage {
+        action_id: "evolution.overview",
+        gateway_route: "/api/evolution/diagnoses",
+        client_method: "evolution_diagnoses",
+        panel_key: "v evolution",
+        state_dispatch: "evolution_diagnoses",
+        receipt_marker: "record_evolution_overview",
     },
 ];
 
@@ -236,6 +244,8 @@ mod tests {
     const MISSION_ROUTES: &str = include_str!("../../../gateway/src/api_routes/mission_routes.rs");
     const HARNESS_EVAL_ROUTES: &str =
         include_str!("../../../gateway/src/api_routes/harness_eval_routes.rs");
+    const EVOLUTION_ROUTES: &str =
+        include_str!("../../../gateway/src/api_routes/evolution_routes.rs");
 
     #[test]
     fn action_coverage_has_expected_core_actions() {
@@ -244,12 +254,14 @@ mod tests {
         assert!(ids.contains(&"surface.start"));
         assert!(ids.contains(&"surface.stop"));
         assert!(ids.contains(&"surface.outbox.retry"));
+        assert!(ids.contains(&"surface.messages.archive"));
+        assert!(ids.contains(&"surface.messages.purge_archived_events"));
         assert!(ids.contains(&"skill.validate"));
         assert!(ids.contains(&"skill.run"));
-        assert!(ids.contains(&"mission.session_command.consume"));
         assert!(ids.contains(&"agent.interrupt"));
         assert!(ids.contains(&"harness_eval.run_smoke"));
-        assert!(ids.len() >= 19);
+        assert!(ids.contains(&"evolution.overview"));
+        assert!(ids.len() >= 23);
     }
 
     #[test]
@@ -260,6 +272,7 @@ mod tests {
             RUNTIME_ROUTES,
             MISSION_ROUTES,
             HARNESS_EVAL_ROUTES,
+            EVOLUTION_ROUTES,
         ]
         .join("\n");
         let panel_sources =

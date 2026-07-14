@@ -438,9 +438,6 @@ pub struct TuningConfig {
     /// TTL in milliseconds for the whole `prepare_context` request cache.
     #[serde(default = "default_prepare_context_cache_ttl_ms")]
     pub prepare_context_cache_ttl_ms: u64,
-    /// Whether L4 push (session → permanent) is enabled.
-    #[serde(default = "default_true")]
-    pub l4_push_enabled: bool,
 }
 
 fn default_sandbox_min_lines() -> usize {
@@ -473,10 +470,6 @@ fn default_l2_cache_ttl() -> u64 {
 fn default_prepare_context_cache_ttl_ms() -> u64 {
     500
 }
-fn default_true() -> bool {
-    true
-}
-
 impl Default for TuningConfig {
     fn default() -> Self {
         Self {
@@ -490,7 +483,6 @@ impl Default for TuningConfig {
             l1_cache_ttl_secs: 3600,
             l2_cache_ttl_secs: 300,
             prepare_context_cache_ttl_ms: 500,
-            l4_push_enabled: true,
         }
     }
 }

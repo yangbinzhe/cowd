@@ -1,12 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-
-/// Config warnings buffered before the CowdEventBus is available.
-/// Drained by ConversationRuntime::with_cowd_event_bus().
-pub static PENDING_WARNINGS: std::sync::LazyLock<Mutex<Vec<crate::cowd_event::CowdEvent>>> =
-    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
 
 use serde::{Deserialize, Serialize};
 
@@ -14,7 +8,7 @@ use crate::json::JsonValue;
 use crate::runtime_control::RuntimeControlPolicy;
 use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
 pub use model_protocol::oauth::OAuthConfig;
-pub use model_protocol::provider_config::{ProviderConfig, ProvidersConfig};
+pub use model_protocol::provider_config::{ProviderConfig, ProviderProtocol, ProvidersConfig};
 
 // ── Config Error Types ─────────────────────────────────────────────────
 
@@ -30,6 +24,25 @@ pub enum ConfigError {
     Missing(String),
     #[error("Invalid value for {key}: {message}")]
     Invalid { key: String, message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigDiagnosticSeverity {
+    Warning,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigDiagnostic {
+    pub severity: ConfigDiagnosticSeverity,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigLoadResult {
+    pub config: RuntimeConfig,
+    pub diagnostics: Vec<ConfigDiagnostic>,
 }
 
 // ── Config Source (Precedence) ─────────────────────────────────────────
@@ -395,15 +408,10 @@ impl Default for VectorConfig {
 pub struct MicroCompactConfig {
     #[serde(default = "default_true_bool")]
     pub enabled: bool,
-    #[serde(default = "default_tool_result_max_chars")]
-    pub tool_result_max_chars: u32,
     #[serde(default = "default_decay_factor")]
     pub time_decay_factor: f32,
 }
 
-fn default_tool_result_max_chars() -> u32 {
-    4000
-}
 fn default_decay_factor() -> f32 {
     0.9
 }
@@ -413,7 +421,6 @@ impl Default for MicroCompactConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            tool_result_max_chars: 4000,
             time_decay_factor: 0.9,
         }
     }
@@ -421,42 +428,44 @@ impl Default for MicroCompactConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionCompactConfig {
-    #[serde(default = "default_session_threshold_tokens")]
-    pub threshold_tokens: u32,
-    #[serde(default = "default_session_threshold_ratio_bp")]
-    pub threshold_ratio_bp: u32,
     #[serde(default = "default_preserve_recent")]
     pub preserve_recent: u32,
     #[serde(default = "default_summary_max")]
     pub summary_max_tokens: u32,
-    #[serde(default = "default_buffer_tokens")]
-    pub buffer_tokens: u32,
 }
 
-fn default_session_threshold_tokens() -> u32 {
-    0
-}
-fn default_session_threshold_ratio_bp() -> u32 {
-    7000
-}
 fn default_preserve_recent() -> u32 {
     6
 }
 fn default_summary_max() -> u32 {
     2000
 }
-fn default_buffer_tokens() -> u32 {
-    13000
-}
 
 impl Default for SessionCompactConfig {
     fn default() -> Self {
         Self {
-            threshold_tokens: 0,
-            threshold_ratio_bp: 7000,
             preserve_recent: 6,
             summary_max_tokens: 2000,
-            buffer_tokens: 13000,
+        }
+    }
+}
+
+/// Budget that Runtime may distribute to internal subsystems. It is explicitly
+/// separate from provider request capacity and session compaction decisions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextBudgetConfig {
+    #[serde(default = "default_subsystem_budget_ratio_bp")]
+    pub subsystem_budget_ratio_bp: u32,
+}
+
+const fn default_subsystem_budget_ratio_bp() -> u32 {
+    7000
+}
+
+impl Default for ContextBudgetConfig {
+    fn default() -> Self {
+        Self {
+            subsystem_budget_ratio_bp: default_subsystem_budget_ratio_bp(),
         }
     }
 }
@@ -603,6 +612,7 @@ pub struct RuntimeFeatureConfig {
     providers: ProvidersConfig,
     trusted_roots: Vec<String>,
     memory: MemoryConfig,
+    context_budget: ContextBudgetConfig,
     compression: CompressionConfig,
     gateway: GatewayConfig,
     gate_auto_fix: GateAutoFixConfig,
@@ -723,9 +733,6 @@ pub struct MemoryConfig {
     pub layers: LayerConfig,
     pub extraction: ExtractionConfig,
     pub vector: VectorConfig,
-    /// When true, use AAAK symbolic index instead of full entry injection
-    /// for memory context, saving 70-85% tokens.
-    pub aaak_index_enabled: bool,
     /// Jaccard similarity threshold for coherence filtering in basis points.
     /// 100 = 0.01, 1000 = 0.10 (default), 5000 = 0.50.
     /// Entries with score below this are excluded from context injection.
@@ -756,7 +763,6 @@ impl Default for MemoryConfig {
             layers: LayerConfig::default(),
             extraction: ExtractionConfig::default(),
             vector: VectorConfig::default(),
-            aaak_index_enabled: true,
             coherence_threshold_bp: 1000,
         }
     }
@@ -903,6 +909,10 @@ impl ConfigLoader {
     }
 
     pub fn load(&self) -> Result<RuntimeConfig, ConfigError> {
+        self.load_with_diagnostics().map(|result| result.config)
+    }
+
+    pub fn load_with_diagnostics(&self) -> Result<ConfigLoadResult, ConfigError> {
         let mut merged = BTreeMap::new();
         let mut loaded_entries = Vec::new();
         let mut mcp_servers = BTreeMap::new();
@@ -945,14 +955,17 @@ impl ConfigLoader {
         // Inject config file `env:` section into the process environment.
         inject_config_env(&merged);
 
-        for warning in &all_warnings {
-            tracing::warn!("{warning}");
-            if let Ok(mut w) = PENDING_WARNINGS.lock() {
-                w.push(crate::cowd_event::CowdEvent::Warning {
+        let mut diagnostics = all_warnings
+            .iter()
+            .map(|warning| {
+                tracing::warn!("{warning}");
+                ConfigDiagnostic {
+                    severity: ConfigDiagnosticSeverity::Warning,
+                    code: "config_validation_warning".to_string(),
                     message: warning.to_string(),
-                });
-            }
-        }
+                }
+            })
+            .collect::<Vec<_>>();
 
         let merged_value = JsonValue::Object(merged.clone());
 
@@ -970,20 +983,24 @@ impl ConfigLoader {
             permission_rules: parse_optional_permission_rules(&merged_value)?,
             approval: parse_optional_approval_config(&merged_value)?,
             sandbox: parse_optional_sandbox_config(&merged_value)?,
-            fallbacks: parse_fallbacks(&merged_value),
+            fallbacks: parse_fallbacks(&merged_value, &mut diagnostics),
             providers: parse_optional_providers_config(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
             memory: parse_optional_memory_config(&merged_value)?,
+            context_budget: parse_optional_context_budget_config(&merged_value)?,
             compression: parse_optional_compression_config(&merged_value)?,
             gateway: parse_optional_gateway_config(&merged_value)?,
             gate_auto_fix: parse_optional_gate_auto_fix_config(&merged_value)?,
             runtime_control: parse_optional_runtime_control_config(&merged_value)?,
         };
 
-        Ok(RuntimeConfig {
-            merged,
-            loaded_entries,
-            feature_config,
+        Ok(ConfigLoadResult {
+            config: RuntimeConfig {
+                merged,
+                loaded_entries,
+                feature_config,
+            },
+            diagnostics,
         })
     }
 }
@@ -1016,6 +1033,14 @@ impl RuntimeConfig {
     #[must_use]
     pub fn as_json(&self) -> JsonValue {
         JsonValue::Object(self.merged.clone())
+    }
+
+    /// Return the merged configuration with all credential-bearing branches
+    /// removed. This is the single redaction implementation for user-visible
+    /// diagnostics; prompt construction must never consume it.
+    #[must_use]
+    pub fn redacted_json(&self) -> JsonValue {
+        redact_json_value(self.as_json())
     }
 
     #[must_use]
@@ -1099,6 +1124,11 @@ impl RuntimeConfig {
     }
 
     #[must_use]
+    pub fn context_budget(&self) -> &ContextBudgetConfig {
+        &self.feature_config.context_budget
+    }
+
+    #[must_use]
     pub fn compression(&self) -> &CompressionConfig {
         &self.feature_config.compression
     }
@@ -1117,6 +1147,78 @@ impl RuntimeConfig {
     pub fn runtime_control(&self) -> &RuntimeControlConfig {
         &self.feature_config.runtime_control
     }
+}
+
+/// Redact a serde JSON projection with the same rules as [`RuntimeConfig`].
+/// Gateway uses this only while shaping already-authorized user-facing API
+/// responses. Keeping the traversal here prevents a second, weaker secret
+/// filter from drifting in an outer layer.
+#[must_use]
+pub fn redact_serde_json(mut value: serde_json::Value) -> serde_json::Value {
+    redact_serde_json_in_place(&mut value);
+    value
+}
+
+fn redact_json_value(value: JsonValue) -> JsonValue {
+    match value {
+        JsonValue::Object(entries) => JsonValue::Object(
+            entries
+                .into_iter()
+                .map(|(key, value)| {
+                    if is_sensitive_config_key(&key) {
+                        (key, JsonValue::String("[redacted]".to_string()))
+                    } else {
+                        (key, redact_json_value(value))
+                    }
+                })
+                .collect(),
+        ),
+        JsonValue::Array(values) => {
+            JsonValue::Array(values.into_iter().map(redact_json_value).collect())
+        }
+        value => value,
+    }
+}
+
+fn redact_serde_json_in_place(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(entries) => {
+            for (key, child) in entries.iter_mut() {
+                if is_sensitive_config_key(key) {
+                    *child = serde_json::Value::String("[redacted]".to_string());
+                } else {
+                    redact_serde_json_in_place(child);
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_serde_json_in_place(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_sensitive_config_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    normalized.contains("apikey")
+        || normalized == "token"
+        || normalized.ends_with("token")
+        || normalized == "secret"
+        || normalized.ends_with("secret")
+        || normalized == "password"
+        || normalized.ends_with("password")
+        || normalized == "authorization"
+        || normalized.ends_with("authorization")
+        || normalized == "headers"
+        || normalized.ends_with("headers")
+        || normalized == "env"
+        || normalized.ends_with("env")
 }
 
 impl RuntimeFeatureConfig {
@@ -1217,6 +1319,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn memory(&self) -> &MemoryConfig {
         &self.memory
+    }
+
+    #[must_use]
+    pub fn context_budget(&self) -> &ContextBudgetConfig {
+        &self.context_budget
     }
 
     #[must_use]
@@ -1386,7 +1493,7 @@ fn inject_config_env(merged: &BTreeMap<String, JsonValue>) {
 ///
 /// Examples:
 /// - `CC_MEMORY_ENABLED=false` → `{"memory": {"enabled": false}}`
-/// - `CC_COMPRESSION_SESSION_THRESHOLD_TOKENS=50000` → `{"compression": {"session": {"threshold_tokens": 50000}}}`
+/// - `CC_CONTEXT_BUDGET_SUBSYSTEM_BUDGET_RATIO_BP=7000` → `{"context": {"budget": {"subsystem": {"budget": {"ratio": {"bp": 7000}}}}}}`
 /// - `CC_MODEL=opus` → `{"model": "opus"}`
 fn collect_env_overrides() -> BTreeMap<String, JsonValue> {
     let mut root: BTreeMap<String, JsonValue> = BTreeMap::new();
@@ -1534,9 +1641,41 @@ fn parse_optional_model_context_windows(
                 "merged settings: field model_context_windows.{k} value out of u32 range"
             ))
         })?;
+        if n < 1_024 {
+            return Err(ConfigError::Parse(format!(
+                "merged settings: field model_context_windows.{k} must be at least 1024"
+            )));
+        }
         result.insert(k.clone(), n);
     }
     Ok(result)
+}
+
+fn parse_optional_context_budget_config(
+    root: &JsonValue,
+) -> Result<ContextBudgetConfig, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(ContextBudgetConfig::default());
+    };
+    let Some(value) = object.get("context_budget") else {
+        return Ok(ContextBudgetConfig::default());
+    };
+    let budget = expect_object(value, "merged settings.context_budget")?;
+    let ratio = optional_u32_dual(
+        budget,
+        "subsystem_budget_ratio_bp",
+        "merged settings.context_budget",
+    )?
+    .unwrap_or(ContextBudgetConfig::default().subsystem_budget_ratio_bp);
+    if !(1_000..=9_500).contains(&ratio) {
+        return Err(ConfigError::Parse(
+            "merged settings.context_budget.subsystem_budget_ratio_bp must be between 1000 and 9500"
+                .to_string(),
+        ));
+    }
+    Ok(ContextBudgetConfig {
+        subsystem_budget_ratio_bp: ratio,
+    })
 }
 
 fn parse_optional_hooks_config(root: &JsonValue) -> Result<RuntimeHookConfig, ConfigError> {
@@ -1758,7 +1897,7 @@ fn parse_optional_sandbox_config(root: &JsonValue) -> Result<SandboxConfig, Conf
     })
 }
 
-fn parse_fallbacks(root: &JsonValue) -> Vec<String> {
+fn parse_fallbacks(root: &JsonValue, diagnostics: &mut Vec<ConfigDiagnostic>) -> Vec<String> {
     let Some(object) = root.as_object() else {
         return vec![];
     };
@@ -1772,9 +1911,11 @@ fn parse_fallbacks(root: &JsonValue) -> Vec<String> {
     if let Some(v) = find_key_dual(object, "provider_fallbacks", "merged settings") {
         let msg = "'providerFallbacks' is deprecated, use 'fallbacks' instead. All per-model chains are now merged into a single global list.".to_string();
         tracing::warn!("{msg}");
-        if let Ok(mut w) = PENDING_WARNINGS.lock() {
-            w.push(crate::cowd_event::CowdEvent::Warning { message: msg });
-        }
+        diagnostics.push(ConfigDiagnostic {
+            severity: ConfigDiagnosticSeverity::Warning,
+            code: "deprecated_provider_fallbacks".to_string(),
+            message: msg,
+        });
         return extract_fallbacks_from_legacy(v);
     }
     vec![]
@@ -1843,11 +1984,11 @@ fn parse_optional_providers_config(root: &JsonValue) -> Result<ProvidersConfig, 
         let protocol = optional_string_dual(entry, "protocol", &ctx)?.map(str::to_string);
 
         if let Some(ref p) = protocol {
-            if p != "anthropic" && p != "openai-compat" {
+            if ProviderProtocol::parse(p).is_none() {
                 return Err(ConfigError::Invalid {
                     key: format!("providers.{name}.protocol"),
                     message: format!(
-                        "unsupported protocol '{p}'. Valid values: \"anthropic\", \"openai-compat\""
+                        "unsupported protocol '{p}'. Valid values: \"anthropic\", \"completions\", \"responses\""
                     ),
                 });
             }
@@ -2029,12 +2170,6 @@ fn parse_optional_memory_config(root: &JsonValue) -> Result<MemoryConfig, Config
         layers,
         extraction,
         vector,
-        aaak_index_enabled: optional_bool_dual(
-            mem,
-            "aaak_index_enabled",
-            "merged settings.memory",
-        )?
-        .unwrap_or(MemoryConfig::default().aaak_index_enabled),
         coherence_threshold_bp: optional_u32_dual(
             mem,
             "coherence_threshold_bp",
@@ -2057,12 +2192,6 @@ fn parse_optional_compression_config(root: &JsonValue) -> Result<CompressionConf
         MicroCompactConfig {
             enabled: optional_bool_dual(m, "enabled", "merged settings.compression.micro")?
                 .unwrap_or(MicroCompactConfig::default().enabled),
-            tool_result_max_chars: optional_u32_dual(
-                m,
-                "tool_result_max_chars",
-                "merged settings.compression.micro",
-            )?
-            .unwrap_or(MicroCompactConfig::default().tool_result_max_chars),
             time_decay_factor: optional_f32_dual(
                 m,
                 "time_decay_factor",
@@ -2075,19 +2204,14 @@ fn parse_optional_compression_config(root: &JsonValue) -> Result<CompressionConf
     };
     let session = if let Some(sess_val) = cmp.get("session") {
         let s = expect_object(sess_val, "merged settings.compression.session")?;
+        for removed in ["threshold_tokens", "threshold_ratio_bp", "buffer_tokens"] {
+            if s.contains_key(removed) {
+                return Err(ConfigError::Parse(format!(
+                    "merged settings.compression.session.{removed} was removed; Runtime now compacts from candidate request pressure"
+                )));
+            }
+        }
         SessionCompactConfig {
-            threshold_tokens: optional_u32_dual(
-                s,
-                "threshold_tokens",
-                "merged settings.compression.session",
-            )?
-            .unwrap_or(SessionCompactConfig::default().threshold_tokens),
-            threshold_ratio_bp: optional_u32_dual(
-                s,
-                "threshold_ratio_bp",
-                "merged settings.compression.session",
-            )?
-            .unwrap_or(SessionCompactConfig::default().threshold_ratio_bp),
             preserve_recent: optional_u32_dual(
                 s,
                 "preserve_recent",
@@ -2100,12 +2224,6 @@ fn parse_optional_compression_config(root: &JsonValue) -> Result<CompressionConf
                 "merged settings.compression.session",
             )?
             .unwrap_or(SessionCompactConfig::default().summary_max_tokens),
-            buffer_tokens: optional_u32_dual(
-                s,
-                "buffer_tokens",
-                "merged settings.compression.session",
-            )?
-            .unwrap_or(SessionCompactConfig::default().buffer_tokens),
         }
     } else {
         SessionCompactConfig::default()
@@ -2351,10 +2469,10 @@ fn parse_optional_runtime_control_config(
         let memory = expect_object(memory_value, "merged settings.runtime.control.memory")?;
         if let Some(emit) = optional_bool(
             memory,
-            "emit_pulses_from_workgraph",
+            "emit_pulses_from_execution_graph",
             "merged settings.runtime.control.memory",
         )? {
-            config.policy.memory.emit_pulses_from_workgraph = emit;
+            config.policy.memory.emit_pulses_from_execution_graph = emit;
         }
         if let Some(review) = optional_bool(
             memory,
@@ -2370,6 +2488,38 @@ fn parse_optional_runtime_control_config(
         )? {
             config.policy.memory.max_candidates_per_turn = max;
         }
+    }
+    if let Some(schedule_value) = control.get("mission_schedule") {
+        let schedule = expect_object(
+            schedule_value,
+            "merged settings.runtime.control.mission_schedule",
+        )?;
+        if let Some(enabled) = optional_bool(
+            schedule,
+            "enabled",
+            "merged settings.runtime.control.mission_schedule",
+        )? {
+            config.policy.mission_schedule.enabled = enabled;
+        }
+        if let Some(tick_interval_ms) = optional_u64(
+            schedule,
+            "tick_interval_ms",
+            "merged settings.runtime.control.mission_schedule",
+        )? {
+            config.policy.mission_schedule.tick_interval_ms = tick_interval_ms;
+        }
+        if let Some(grace_ms) = optional_u64(
+            schedule,
+            "grace_ms",
+            "merged settings.runtime.control.mission_schedule",
+        )? {
+            config.policy.mission_schedule.grace_ms = grace_ms;
+        }
+        config
+            .policy
+            .mission_schedule
+            .validate()
+            .map_err(ConfigError::Parse)?;
     }
     if let Some(permission_value) = control.get("permission") {
         let permission = expect_object(
@@ -3001,13 +3151,16 @@ fn deep_merge_objects(
 #[cfg(test)]
 mod tests {
     use super::{
-        deep_merge_objects, parse_optional_compression_config, parse_permission_mode_label,
-        ConfigLoader, ConfigSource, DomainProfile, McpServerConfig, McpTransport,
-        ResolvedPermissionMode, RuntimeHookConfig, RuntimePluginConfig, SessionCompactConfig,
+        deep_merge_objects, parse_optional_compression_config,
+        parse_optional_context_budget_config, parse_optional_model_context_windows,
+        parse_permission_mode_label, redact_serde_json, ConfigLoader, ConfigSource, DomainProfile,
+        McpServerConfig, McpTransport, ProviderProtocol, ResolvedPermissionMode, RuntimeConfig,
+        RuntimeFeatureConfig, RuntimeHookConfig, RuntimePluginConfig, SessionCompactConfig,
         COWD_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
+    use std::collections::BTreeMap;
     use std::fs;
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3271,6 +3424,10 @@ approval:
                   },
                   "context": {
                     "collaboration_budget_tokens": 16000
+                  },
+                  "mission_schedule": {
+                    "tick_interval_ms": 1500,
+                    "grace_ms": 120000
                   }
                 }
               }
@@ -3310,6 +3467,8 @@ approval:
         assert_eq!(runtime.policy.task.max_failures_before_review, 1);
         assert_eq!(runtime.policy.context.collaboration_budget_tokens, 16_000);
         assert_eq!(runtime.policy.memory.max_candidates_per_turn, 3);
+        assert_eq!(runtime.policy.mission_schedule.tick_interval_ms, 1_500);
+        assert_eq!(runtime.policy.mission_schedule.grace_ms, 120_000);
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -3408,6 +3567,98 @@ approval:
         let chain = loaded.fallbacks();
         assert!(chain.is_empty());
         assert_eq!(chain.len(), 0);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_provider_protocols_and_detects_when_unset() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".cowd");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("config.yaml"),
+            r#"{
+              "providers": {
+                "openai": {
+                  "base_url": "https://api.openai.com/v1",
+                  "api_key": "sk-openai",
+                  "models": ["gpt-5"],
+                  "protocol": "responses"
+                },
+                "deepseek": {
+                  "base_url": "https://api.deepseek.com/v1",
+                  "api_key": "sk-deepseek",
+                  "models": ["deepseek-v4-pro"],
+                  "protocol": "completions"
+                },
+                "anthropic": {
+                  "base_url": "https://api.anthropic.com",
+                  "api_key": "sk-ant",
+                  "models": ["claude-sonnet-4-6"]
+                }
+              }
+            }"#,
+        )
+        .expect("write provider settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        // then
+        let providers = loaded.providers();
+        assert_eq!(
+            ProviderProtocol::effective_for_provider(providers.get("openai").unwrap()).unwrap(),
+            ProviderProtocol::Responses
+        );
+        assert_eq!(
+            ProviderProtocol::effective_for_provider(providers.get("deepseek").unwrap()).unwrap(),
+            ProviderProtocol::Completions
+        );
+        assert_eq!(
+            ProviderProtocol::effective_for_provider(providers.get("anthropic").unwrap()).unwrap(),
+            ProviderProtocol::Anthropic
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn rejects_unknown_provider_protocol() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".cowd");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("config.yaml"),
+            r#"{
+              "providers": {
+                "gemini": {
+                  "base_url": "https://generativelanguage.googleapis.com",
+                  "api_key": "sk-test",
+                  "models": ["gemini-2.5-pro"],
+                  "protocol": "gemini-native"
+                }
+              }
+            }"#,
+        )
+        .expect("write provider settings");
+
+        // when
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("config should reject unsupported protocol");
+
+        // then
+        assert!(error.to_string().contains("providers.gemini.protocol"));
+        assert!(error.to_string().contains("responses"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -4057,6 +4308,38 @@ memory:
     }
 
     #[test]
+    fn redacted_json_removes_nested_credential_and_transport_values() {
+        let mut merged = BTreeMap::new();
+        merged.insert(
+            "providers".to_string(),
+            JsonValue::parse(
+                r#"{
+                    "apiKey":"provider-secret",
+                    "headers":{"Authorization":"Bearer secret"},
+                    "env":{"TOKEN":"environment-secret"},
+                    "nested":{"password":"password-secret","safe":"visible"}
+                }"#,
+            )
+            .expect("fixture parses"),
+        );
+        let config = RuntimeConfig {
+            merged,
+            loaded_entries: Vec::new(),
+            feature_config: RuntimeFeatureConfig::default(),
+        };
+
+        let rendered = config.redacted_json().render();
+        assert!(!rendered.contains("provider-secret"));
+        assert!(!rendered.contains("environment-secret"));
+        assert!(!rendered.contains("password-secret"));
+        assert!(rendered.contains("visible"));
+        assert_eq!(
+            redact_serde_json(serde_json::json!({"authorization":"secret","safe":"ok"})),
+            serde_json::json!({"authorization":"[redacted]","safe":"ok"})
+        );
+    }
+
+    #[test]
     fn gateway_webui_dir_reads_configured_static_asset_dir() {
         let root = temp_dir();
         let cwd = root.join("project");
@@ -4171,20 +4454,19 @@ gateway:
     }
 
     #[test]
-    fn compression_session_defaults_to_ratio_based_threshold() {
+    fn compression_session_defaults_to_semantic_checkpoint_controls() {
         let session = SessionCompactConfig::default();
 
-        assert_eq!(session.threshold_tokens, 0);
-        assert_eq!(session.threshold_ratio_bp, 7000);
+        assert_eq!(session.preserve_recent, 6);
+        assert_eq!(session.summary_max_tokens, 2000);
     }
 
     #[test]
-    fn parses_compression_session_threshold_ratio_bp() {
+    fn compression_rejects_removed_ratio_thresholds() {
         let root = JsonValue::parse(
             r#"{
                 "compression": {
                     "micro": {
-                        "tool_result_max_chars": 8000,
                         "time_decay_factor": 1
                     },
                     "session": {
@@ -4203,37 +4485,47 @@ gateway:
         )
         .expect("json should parse");
 
-        let compression =
-            parse_optional_compression_config(&root).expect("compression config should parse");
-
-        assert_eq!(compression.session.threshold_tokens, 0);
-        assert_eq!(compression.session.threshold_ratio_bp, 6500);
-        assert_eq!(compression.session.preserve_recent, 12);
-        assert_eq!(compression.micro.tool_result_max_chars, 8000);
-        assert!((compression.micro.time_decay_factor - 1.0).abs() < f32::EPSILON);
-        assert!(!compression.deep.iterative_update);
-        assert_eq!(compression.circuit_breaker.max_retries, 5);
-        assert_eq!(compression.circuit_breaker.cooldown_secs, 60);
+        let error = parse_optional_compression_config(&root)
+            .expect_err("removed request-ratio threshold must be rejected");
+        assert!(error.to_string().contains("threshold_ratio_bp was removed"));
     }
 
     #[test]
-    fn parses_deprecated_camel_case_compression_keys() {
+    fn parses_context_budget_separately_from_compression() {
         let root = JsonValue::parse(
             r#"{
-                "compression": {
-                    "session": {
-                        "thresholdRatioBp": 6400,
-                        "preserveRecent": 10
-                    }
+                "context_budget": {
+                    "subsystem_budget_ratio_bp": 6400
                 }
             }"#,
         )
         .expect("json should parse");
 
-        let compression =
-            parse_optional_compression_config(&root).expect("compression config should parse");
+        let budget = parse_optional_context_budget_config(&root)
+            .expect("context budget config should parse");
 
-        assert_eq!(compression.session.threshold_ratio_bp, 6400);
-        assert_eq!(compression.session.preserve_recent, 10);
+        assert_eq!(budget.subsystem_budget_ratio_bp, 6400);
+    }
+
+    #[test]
+    fn parses_model_context_window_override_and_rejects_invalid_small_value() {
+        let root = JsonValue::parse(
+            r#"{
+                "model_context_windows": {
+                    "private-model": 32768
+                }
+            }"#,
+        )
+        .expect("json should parse");
+        let windows = parse_optional_model_context_windows(&root)
+            .expect("context window override should parse");
+        assert_eq!(windows["private-model"], 32_768);
+
+        let invalid = JsonValue::parse(r#"{"model_context_windows":{"broken":1023}}"#)
+            .expect("json should parse");
+        assert!(parse_optional_model_context_windows(&invalid)
+            .expect_err("sub-1024 context window must fail validation")
+            .to_string()
+            .contains("at least 1024"));
     }
 }

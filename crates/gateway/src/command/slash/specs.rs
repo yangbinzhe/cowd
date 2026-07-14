@@ -245,9 +245,9 @@ pub const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "compact",
         aliases: &[],
-        summary: "Compact local session history",
+        summary: "Compact the active Gateway session through a semantic checkpoint",
         argument_hint: None,
-        resume_supported: true,
+        resume_supported: false,
     },
     SlashCommandSpec {
         name: "model",
@@ -1368,12 +1368,12 @@ fn palette_command_definitions() -> Vec<CommandDefinition> {
             },
         ),
         (
-            "palette.reload-providers",
-            "Reload Providers",
-            "Reload provider and model routing from runtime config",
+            "palette.refresh-config-status",
+            "Refresh Config Status",
+            "Refresh effective config, provider projection, and Gateway hot-reload status",
             CommandCategory::Config,
             CommandActionTarget::Client {
-                action: "reload-providers".into(),
+                action: "refresh-config-status".into(),
             },
         ),
         (
@@ -1658,9 +1658,6 @@ pub enum SlashCommand {
     Agents {
         args: Option<String>,
     },
-    AgentProfile {
-        agent_id: Option<String>,
-    },
     Skills {
         args: Option<String>,
     },
@@ -1755,9 +1752,6 @@ pub enum SlashCommand {
     },
     Closet {
         topic: Option<String>,
-    },
-    SandboxSearch {
-        query: Option<String>,
     },
     Retry,
     Undo,

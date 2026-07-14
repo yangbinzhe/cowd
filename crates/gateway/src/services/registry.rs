@@ -41,16 +41,24 @@ impl GatewayServices {
         config_home: impl AsRef<std::path::Path>,
     ) -> Self {
         let command_host_runtime = Arc::clone(&runtime);
+        let runtime_services = runtime.runtime_services();
+        let runtime_events = RuntimeEventService::from_runtime_services(runtime_services.as_ref());
         let session_kernel = runtime.session_kernel();
         let lifecycle_kernel = runtime.lifecycle_kernel();
+        let task = TaskService::with_kernel_and_runtime(task_kernel, Arc::clone(&runtime_services));
         Self {
             runtime: Some(runtime),
+            runtime_events,
             surface: SurfaceService::with_host(surface_host),
-            slash: SlashController::new(Some(command_host_runtime)),
+            slash: SlashController::new(Some(command_host_runtime), task.clone()),
             session: SessionService::with_runtime_boundaries(session_kernel, lifecycle_kernel),
-            task: TaskService::with_kernel(task_kernel),
+            task,
             memory: MemoryService::with_manager(memory_manager),
-            approval: ApprovalService::with_gate_and_repository(approval_gate, approval_repository),
+            approval: ApprovalService::with_gate_and_repository(approval_gate, approval_repository)
+                .with_runtime_services(Arc::clone(&runtime_services)),
+            cross_plane: CrossPlaneService::new(Arc::clone(&runtime_services)),
+            mission: MissionService::new()
+                .with_runtime_port(runtime::MissionRuntimePort::new(runtime_services)),
             ..Self::baseline_with_config_home(config_home)
         }
     }
@@ -59,22 +67,32 @@ impl GatewayServices {
         Self::baseline_with_config_home(::runtime::cowd_dirs::config_home_dir())
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "the in-memory cross-plane baseline is a deterministic local dependency for static command projections"
+    )]
     pub(crate) fn baseline_with_config_home(config_home: impl AsRef<std::path::Path>) -> Self {
+        let config_home = config_home.as_ref();
+        let baseline_runtime =
+            runtime::RuntimeServices::in_memory().expect("baseline runtime event projection");
+        let task = TaskService::new();
         Self {
             runtime: None,
+            runtime_events: RuntimeEventService::from_runtime_services(baseline_runtime.as_ref()),
             surface: SurfaceService::new(),
-            slash: SlashController::new(None),
+            slash: SlashController::new(None, task.clone()),
             session: SessionService::new(),
-            task: TaskService::new(),
+            task,
             approval: ApprovalService::new(),
             memory: MemoryService::new(),
             context: ContextService::new(),
             connector: ConnectorService::new(),
-            cross_plane: CrossPlaneService::new(),
+            cross_plane: CrossPlaneService::new(baseline_runtime),
             tool: ToolService::new(),
             system: SystemService::new(),
             audit: AuditService::new(),
             harness_eval: HarnessEvalService::new(),
+            evolution: EvolutionService::new(),
             provider: ProviderService::new(),
             reality: RealityService::new(),
             growth: GrowthService::new_for_config_home(config_home),
@@ -87,6 +105,25 @@ impl GatewayServices {
             owner: "0.9.380 GatewayServices",
             boundary_status: "0620_final_boundary",
         }
+    }
+
+    /// Gateway only projects the Runtime-owned capability snapshot. Baseline
+    /// services used by static command/tests intentionally expose core-only
+    /// capabilities and never perform environment discovery.
+    pub(crate) fn resource_capability_index(&self) -> runtime::ResourceCapabilityIndex {
+        self.runtime
+            .as_ref()
+            .map_or_else(runtime::ResourceCapabilityIndex::default, |runtime| {
+                runtime.resource_capability_index()
+            })
+    }
+
+    pub(crate) fn refresh_resource_capabilities(&self) -> runtime::ResourceCapabilitySnapshot {
+        self.runtime
+            .as_ref()
+            .map_or_else(runtime::ResourceCapabilitySnapshot::default, |runtime| {
+                runtime.refresh_resource_capabilities()
+            })
     }
 
     #[cfg(test)]
@@ -155,6 +192,7 @@ impl GatewayServices {
             self.system.label,
             self.audit.label,
             self.harness_eval.label,
+            self.evolution.label,
             self.provider.label,
             self.reality.label,
             self.growth.label,
@@ -181,6 +219,7 @@ impl GatewayServices {
         contracts.extend(self.system.contracts());
         contracts.extend(self.audit.contracts());
         contracts.extend(self.harness_eval.contracts());
+        contracts.extend(self.evolution.contracts());
         contracts.extend(self.provider.contracts());
         contracts.extend(self.reality.contracts());
         contracts.extend(self.growth.contracts());
@@ -242,6 +281,18 @@ impl GatewayServices {
             ("harness_eval", "latest_report"),
             ("harness_eval", "runs"),
             ("harness_eval", "run_start"),
+            ("evolution", "signals"),
+            ("evolution", "proposals"),
+            ("evolution", "signal_create"),
+            ("evolution", "diagnoses"),
+            ("evolution", "diagnosis_create"),
+            ("evolution", "missions_summary"),
+            ("evolution", "mission_detail"),
+            ("evolution", "proposal_create"),
+            ("evolution", "proposal_detail"),
+            ("evolution", "chain"),
+            ("evolution", "proposal_decision"),
+            ("evolution", "skill_draft"),
             ("provider", "config_projection"),
             ("provider", "model_routing"),
             ("reality", "status"),

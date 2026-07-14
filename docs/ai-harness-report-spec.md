@@ -36,8 +36,17 @@ runs/<stamp>-mission-harness-<level>/
     001-<round>.json
   tool-calls/
     001-<scenario>-<tool>.json
+  requests/
+  responses/
+  events/
+  run-evidence/
+  model-speed/
+  quality-rubric/
   evidence/
+    evidence-manifest.json
+    next-gen-harness-closure.json
     complex-scenarios.json
+    reality-context-eval.json
     real-tool-scenarios.json
     stable-ai-health.json
 ```
@@ -158,6 +167,18 @@ audit trail.
   be distinguished explicitly.
 - The final judgment must state which capabilities are proven, partially
   proven, and still unproven.
+- Every scenario-style report must include `evidence/evidence-manifest.json`
+  with repo, commit, version, command, real-model authorization, token usage,
+  tool calls, and fixture health status.
+- `next-gen-harness-closure` must cover simple direct handling, complex
+  strategy selection, tool batch efficiency, team/agent execution,
+  cross-session dispatch, memory/reality context governance, and
+  conflict/recovery evidence.
+- Report gates must reject unsupported claims: real-model claims with zero
+  provider rounds, tool-validation claims with zero tool calls, orchestration
+  claims with no runtime actions, memory/context claims with no Reality Context
+  evidence, replay/recovery claims with no evidence refs, and external access
+  claims with no connected/healthy fixture evidence.
 
 ## Template
 
@@ -206,6 +227,8 @@ A deep harness run is report-complete only if:
 - `full-analysis-report.md` exists after the AI report-generation step.
 - `report.json` exists.
 - `execution-trace.json` exists.
+- `evidence/evidence-manifest.json` exists.
+- `evidence/next-gen-harness-closure.json` exists.
 - provider detail files exist when provider rounds are present.
 - tool detail files exist when tool calls are present.
 - evidence files exist for scenario suites that ran.

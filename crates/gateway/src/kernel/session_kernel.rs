@@ -3,12 +3,14 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use memory::store::session::{SessionEvent, SessionListOptions, SessionListPage, SessionMessage};
-use memory::{
-    CognitiveContextManager, MemoryError, MemoryPulseReport, RuntimeEvent, RuntimeEventPage,
-    RuntimeEventScope, SessionRecord, UnifiedSessionStore,
+use harness_contract::turn::TurnJournalEnvelope;
+use memory::store::session::{
+    SessionEvent, SessionListOptions, SessionListPage, SessionMessage, SessionMissionOutboxRequest,
 };
-use runtime::{AgentWorkGraph, CollaborationReviewPacket};
+use memory::{
+    MemoryError, SessionDomainEvent, SessionDomainEventPage, SessionDomainScope, SessionRecord,
+    UnifiedSessionStore,
+};
 use tokio::sync::Mutex;
 
 use crate::event_bus::SessionEventBus;
@@ -39,16 +41,7 @@ pub(crate) struct RuntimeCommandResult {
     pub session_id: String,
     pub kind: &'static str,
     pub persisted: bool,
-    pub runtime_event_sequence: Option<usize>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct RuntimeClosedLoopResult {
-    pub session_id: String,
-    pub persisted: bool,
-    pub runtime_event_sequence: Option<usize>,
-    pub memory_pulse: Option<MemoryPulseReport>,
-    pub degraded_reason: Option<String>,
+    pub session_domain_event_sequence: Option<usize>,
 }
 
 impl RuntimeCommand {
@@ -170,6 +163,23 @@ impl SessionKernel {
         Ok(true)
     }
 
+    /// Persist the Session authority record and its one-way Mission lifecycle
+    /// intent in the same SQLite transaction. Runtime bridge workers, not API
+    /// routes, materialize that intent into the Mission event stream.
+    pub(crate) async fn upsert_stored_session_with_mission_outbox(
+        &self,
+        record: &SessionRecord,
+        request: &SessionMissionOutboxRequest,
+    ) -> Result<bool, MemoryError> {
+        let Some(store) = self.unified_store.as_ref() else {
+            return Ok(false);
+        };
+        store
+            .upsert_session_with_mission_outbox(record, request)
+            .await?;
+        Ok(true)
+    }
+
     pub(crate) async fn update_stored_session(
         &self,
         record: &SessionRecord,
@@ -194,6 +204,16 @@ impl SessionKernel {
         } else {
             Ok(false)
         }
+    }
+
+    pub(crate) async fn delete_stored_session_with_mission_outbox(
+        &self,
+        request: &SessionMissionOutboxRequest,
+    ) -> Result<bool, MemoryError> {
+        let Some(store) = self.unified_store.as_ref() else {
+            return Ok(false);
+        };
+        store.delete_session_with_mission_outbox(request).await
     }
 
     pub(crate) async fn stored_message_count(
@@ -254,6 +274,12 @@ impl SessionKernel {
             .into_iter()
             .enumerate()
             .map(|(sequence, mut message)| {
+                let source_message_id = std::mem::take(&mut message.stable_message_id);
+                // `stable_message_id` is globally unique, not scoped by
+                // session. A branch retains the source provenance while
+                // receiving a deterministic identity in its own transcript.
+                message.stable_message_id =
+                    format!("branch:{target_session_id}:{source_message_id}");
                 message.session_id = target_session_id.to_string();
                 message.sequence = sequence;
                 message
@@ -330,7 +356,6 @@ impl SessionKernel {
         let Some(store) = self.unified_store.as_ref() else {
             return Ok(false);
         };
-        let sequence = store.next_event_sequence(session_id).await?;
         let created_at_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis() as u64)
@@ -339,75 +364,69 @@ impl SessionKernel {
             session_id: session_id.to_string(),
             event_type: event_type.to_string(),
             event_json: payload.to_string(),
-            sequence,
+            sequence: 0,
             created_at_ms,
         };
-        store.append_event(&event).await?;
+        store.append_event_allocating_sequence(&event).await?;
         Ok(true)
     }
 
-    pub(crate) async fn append_runtime_event(
+    pub(crate) async fn append_turn_journal_event(
         &self,
         session_id: &str,
-        scope: RuntimeEventScope,
+        envelope: TurnJournalEnvelope,
+    ) -> Result<Option<usize>, MemoryError> {
+        let Some(store) = self.unified_store.as_ref() else {
+            return Ok(None);
+        };
+        if store.get_session(session_id).await?.is_none() {
+            let record = new_api_session_record(session_id, None);
+            store.create_session(&record).await?;
+        }
+        let mut envelope = envelope.with_sequence(0);
+        envelope.session_id = session_id.to_string();
+        let created_at_ms = current_time_ms();
+        let event = SessionEvent {
+            session_id: session_id.to_string(),
+            event_type: "TurnJournal".to_string(),
+            event_json: serde_json::to_string(&envelope)
+                .map_err(|error| MemoryError::Store(error.to_string()))?,
+            sequence: 0,
+            created_at_ms,
+        };
+        let stored = store.append_event_allocating_sequence(&event).await?;
+        Ok(Some(stored.sequence))
+    }
+
+    pub(crate) async fn append_session_domain_event(
+        &self,
+        session_id: &str,
+        scope: SessionDomainScope,
         kind: impl Into<String>,
         payload: serde_json::Value,
     ) -> Result<Option<usize>, MemoryError> {
         let Some(store) = self.unified_store.as_ref() else {
             return Ok(None);
         };
-        let sequence = store.next_event_sequence(session_id).await?;
         let created_at_ms = current_time_ms();
-        let event = RuntimeEvent::new(session_id, sequence, scope, kind, payload, created_at_ms);
-        store.append_runtime_event(&event).await?;
-        Ok(Some(sequence))
+        let event = SessionDomainEvent::new(session_id, 0, scope, kind, payload, created_at_ms);
+        let stored = store
+            .append_session_domain_event_allocating_sequence(&event)
+            .await?;
+        Ok(Some(stored.sequence))
     }
 
-    pub(crate) async fn persist_workgraph_review(
-        &self,
-        graph: &AgentWorkGraph,
-        packet: &CollaborationReviewPacket,
-        memory_manager: Option<&Arc<CognitiveContextManager>>,
-    ) -> Result<RuntimeClosedLoopResult, MemoryError> {
-        let Some(store) = self.unified_store.as_ref() else {
-            return Ok(RuntimeClosedLoopResult {
-                session_id: graph.session_id.clone(),
-                persisted: false,
-                runtime_event_sequence: None,
-                memory_pulse: None,
-                degraded_reason: Some("session store not available".to_string()),
-            });
-        };
-
-        let sequence = store.next_event_sequence(&graph.session_id).await?;
-        let event = graph.reviewed_runtime_event(sequence, packet);
-        store.append_runtime_event(&event).await?;
-
-        let memory_pulse = memory_manager
-            .map(|manager| manager.process_memory_pulse_runtime_event(&event))
-            .transpose()?
-            .flatten();
-
-        Ok(RuntimeClosedLoopResult {
-            session_id: graph.session_id.clone(),
-            persisted: true,
-            runtime_event_sequence: Some(sequence),
-            memory_pulse,
-            degraded_reason: None,
-        })
-    }
-
-    pub(crate) async fn stored_runtime_events_page(
+    pub(crate) async fn stored_session_domain_events_page(
         &self,
         session_id: &str,
         from_sequence: usize,
         limit: usize,
-    ) -> Result<Option<RuntimeEventPage>, MemoryError> {
+    ) -> Result<Option<SessionDomainEventPage>, MemoryError> {
         let Some(store) = self.unified_store.as_ref() else {
             return Ok(None);
         };
         store
-            .runtime_events_page(session_id, from_sequence, limit)
+            .session_domain_events_page(session_id, from_sequence, limit)
             .await
             .map(Some)
     }
@@ -417,7 +436,7 @@ impl SessionKernel {
         session_id: &str,
         from_sequence: usize,
         limit: usize,
-    ) -> Result<Option<RuntimeEventPage>, MemoryError> {
+    ) -> Result<Option<SessionDomainEventPage>, MemoryError> {
         let Some(store) = self.unified_store.as_ref() else {
             return Ok(None);
         };
@@ -441,7 +460,7 @@ impl SessionKernel {
                 session_id,
                 kind,
                 persisted: false,
-                runtime_event_sequence: None,
+                session_domain_event_sequence: None,
             });
         };
 
@@ -474,15 +493,15 @@ impl SessionKernel {
                     session_id,
                     kind,
                     persisted: true,
-                    runtime_event_sequence: None,
+                    session_domain_event_sequence: None,
                 });
             }
         }
 
-        let runtime_event_sequence = self
-            .append_runtime_event(
+        let session_domain_event_sequence = self
+            .append_session_domain_event(
                 &session_id,
-                RuntimeEventScope::Session,
+                SessionDomainScope::Session,
                 kind,
                 serde_json::json!({
                     "command": kind,
@@ -496,7 +515,7 @@ impl SessionKernel {
             session_id,
             kind,
             persisted: true,
-            runtime_event_sequence,
+            session_domain_event_sequence,
         })
     }
 
@@ -541,6 +560,7 @@ impl SessionKernel {
             .delete_events_by_type_from(session_id, "message_appended", 0)
             .await?;
 
+        let mut message_events = Vec::with_capacity(session.messages.len());
         for (sequence, message) in session.messages.iter().enumerate() {
             let message_record = message.to_session_message(session_id, sequence);
             store.insert_message(&message_record).await?;
@@ -548,7 +568,7 @@ impl SessionKernel {
             let message_json =
                 serde_json::from_str::<serde_json::Value>(&message.to_json().render())
                     .unwrap_or(serde_json::Value::Null);
-            let event = SessionEvent {
+            message_events.push(SessionEvent {
                 session_id: session_id.to_string(),
                 event_type: "message_appended".to_string(),
                 event_json: serde_json::json!({
@@ -560,9 +580,11 @@ impl SessionKernel {
                 .to_string(),
                 sequence,
                 created_at_ms: message_record.created_at_ms,
-            };
-            store.append_event(&event).await?;
+            });
         }
+        store
+            .append_events_allocating_sequence(&message_events)
+            .await?;
         Ok(true)
     }
 }
@@ -602,74 +624,6 @@ mod tests {
     use super::{RuntimeCommand, SessionKernel};
     use crate::event_bus::SessionEventBus;
     use crate::gateway::ActiveSessions;
-    use memory::{MaintenanceCandidate, MaintenanceCandidateKind, MaintenanceCandidateStatus};
-    use runtime::{
-        AgentTaskTrace, AgentWorkGraph, CollaborationReviewPacket, CollaborationScorecard,
-        CollaborationTask,
-    };
-
-    fn scorecard() -> CollaborationScorecard {
-        CollaborationScorecard {
-            completion_rate: 1.0,
-            synthesis_lift: 1.2,
-            complementarity_score: 0.7,
-            active_memory_score: 0.5,
-            conflict_count: 0,
-            memory_pulse_count: 1,
-            surfaced_conflicts: Vec::new(),
-        }
-    }
-
-    fn review_packet() -> CollaborationReviewPacket {
-        let now = chrono::Utc::now();
-        CollaborationReviewPacket {
-            board_id: "board-closed-loop".to_string(),
-            parent_run_id: Some("parent-run".to_string()),
-            scorecard: scorecard(),
-            agent_tasks: vec![AgentTaskTrace {
-                task_id: "agent-review".to_string(),
-                parent_run_id: Some("parent-run".to_string()),
-                agent_run_id: Some("agent-run".to_string()),
-                role: "reviewer".to_string(),
-                objective: "review implementation".to_string(),
-                status: "completed".to_string(),
-                context_envelope_id: Some("ctx-1".to_string()),
-                result_summary: "accepted".to_string(),
-                evidence_refs: Vec::new(),
-                collaboration_board_id: "board-closed-loop".to_string(),
-                confidence: 0.9,
-                conflicts: Vec::new(),
-                created_at_ms: 1,
-                updated_at_ms: 2,
-            }],
-            maintenance_candidates: vec![MaintenanceCandidate {
-                id: "candidate-closed-loop".to_string(),
-                kind: MaintenanceCandidateKind::RelationshipRefresh,
-                status: MaintenanceCandidateStatus::Open,
-                entry_ids: Vec::new(),
-                summary: "refresh discovered relationship".to_string(),
-                reason: "agent review".to_string(),
-                confidence: 0.8,
-                source: Some("test".to_string()),
-                source_ref: Some("board-closed-loop".to_string()),
-                created_at: now,
-                updated_at: now,
-            }],
-        }
-    }
-
-    fn reviewed_graph(packet: &CollaborationReviewPacket) -> AgentWorkGraph {
-        let task = CollaborationTask {
-            description: "review implementation".to_string(),
-            required_capabilities: vec!["review".to_string()],
-            subtasks: Vec::new(),
-            review_criteria: None,
-            collaboration_decision: None,
-        };
-        AgentWorkGraph::from_collaboration_task("closed-loop-session", &task)
-            .with_review_packet(packet)
-    }
-
     #[test]
     fn kernel_shares_session_runtime_store_and_event_bus_handles() {
         let active_sessions = Arc::new(ActiveSessions::new());
@@ -800,7 +754,7 @@ mod tests {
             .await
             .unwrap();
         assert!(created.persisted);
-        assert_eq!(created.runtime_event_sequence, Some(0));
+        assert_eq!(created.session_domain_event_sequence, Some(0));
 
         let activated = kernel
             .execute_runtime_command(RuntimeCommand::ActivateSession {
@@ -808,7 +762,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(activated.runtime_event_sequence, Some(1));
+        assert_eq!(activated.session_domain_event_sequence, Some(1));
 
         let archived = kernel
             .execute_runtime_command(RuntimeCommand::ArchiveSession {
@@ -816,7 +770,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(archived.runtime_event_sequence, Some(2));
+        assert_eq!(archived.session_domain_event_sequence, Some(2));
 
         let record = store
             .get_session("lifecycle-session")
@@ -826,7 +780,7 @@ mod tests {
         assert_eq!(record.status, "archived");
 
         let page = kernel
-            .stored_runtime_events_page("lifecycle-session", 0, 10)
+            .stored_session_domain_events_page("lifecycle-session", 0, 10)
             .await
             .unwrap()
             .expect("runtime events page");
@@ -880,73 +834,6 @@ mod tests {
             .unwrap();
 
         assert!(!result.persisted);
-        assert_eq!(result.runtime_event_sequence, None);
-    }
-
-    #[tokio::test]
-    async fn runtime_closed_loop_persists_workgraph_review_event() {
-        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
-        let kernel = SessionKernel::new(
-            Arc::new(ActiveSessions::new()),
-            Some(store.clone()),
-            SessionEventBus::new(),
-        );
-        kernel
-            .execute_runtime_command(RuntimeCommand::CreateSession {
-                session_id: "closed-loop-session".to_string(),
-                model: None,
-            })
-            .await
-            .unwrap();
-        let packet = review_packet();
-        let graph = reviewed_graph(&packet);
-
-        let result = kernel
-            .persist_workgraph_review(&graph, &packet, None)
-            .await
-            .unwrap();
-
-        assert!(result.persisted);
-        assert_eq!(result.runtime_event_sequence, Some(1));
-        assert!(result.memory_pulse.is_none());
-        let page = kernel
-            .stored_runtime_events_page("closed-loop-session", 0, 10)
-            .await
-            .unwrap()
-            .expect("runtime page");
-        assert_eq!(page.total, 2);
-        let review_event = page
-            .events
-            .iter()
-            .find(|event| event.kind == "agent.workgraph.reviewed")
-            .expect("review event");
-        assert_eq!(review_event.scope, memory::RuntimeEventScope::Workgraph);
-        assert_eq!(
-            review_event.payload["maintenance_candidates"][0]["id"],
-            "candidate-closed-loop"
-        );
-    }
-
-    #[tokio::test]
-    async fn runtime_closed_loop_without_store_degrades_without_error() {
-        let kernel = SessionKernel::new(
-            Arc::new(ActiveSessions::new()),
-            None,
-            SessionEventBus::new(),
-        );
-        let packet = review_packet();
-        let graph = reviewed_graph(&packet);
-
-        let result = kernel
-            .persist_workgraph_review(&graph, &packet, None)
-            .await
-            .unwrap();
-
-        assert!(!result.persisted);
-        assert_eq!(result.runtime_event_sequence, None);
-        assert_eq!(
-            result.degraded_reason.as_deref(),
-            Some("session store not available")
-        );
+        assert_eq!(result.session_domain_event_sequence, None);
     }
 }

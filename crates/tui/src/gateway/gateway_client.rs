@@ -158,6 +158,34 @@ impl GatewayApiClient {
         .await
     }
 
+    pub async fn session_input_projection(
+        &self,
+        session_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!(
+            "/api/sessions/{}/input-projection",
+            url_encode(session_id)
+        ))
+        .await
+    }
+
+    pub async fn turn_inbox(
+        &self,
+        session_id: &str,
+        turn_id: Option<&str>,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        let suffix = turn_id
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| format!("?turn_id={}", url_encode(value)))
+            .unwrap_or_default();
+        self.get_json(&format!(
+            "/api/sessions/{}/turn-inbox{}",
+            url_encode(session_id),
+            suffix
+        ))
+        .await
+    }
+
     pub async fn ensure_session(
         &self,
         session_id: &str,
@@ -414,15 +442,11 @@ impl GatewayApiClient {
     pub async fn cancel_session_turn(
         &self,
         session_id: &str,
-        actor_id: &str,
         reason: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             &format!("/api/sessions/{}/cancel", url_encode(session_id)),
-            serde_json::json!({
-                "actor_id": actor_id,
-                "reason": reason,
-            }),
+            serde_json::json!({ "reason": reason }),
         )
         .await
     }
@@ -431,13 +455,20 @@ impl GatewayApiClient {
         &self,
         session_id: &str,
         tx: mpsc::SyncSender<CowdEvent>,
-    ) -> Result<(), GatewayApiError> {
+        after_commit_cursor: Option<u64>,
+    ) -> Result<Option<u64>, GatewayApiError> {
+        let suffix = after_commit_cursor
+            .map(|cursor| format!("?from_cursor={cursor}"))
+            .unwrap_or_default();
         let url = format!(
-            "{}/api/sessions/{}/stream",
+            "{}/api/sessions/{}/stream{suffix}",
             self.base_url,
             url_encode(session_id)
         );
         let mut request = self.client.get(url);
+        if let Some(cursor) = after_commit_cursor {
+            request = request.header("Last-Event-ID", cursor.to_string());
+        }
         if let Some(token) = self
             .auth_token
             .as_deref()
@@ -454,34 +485,31 @@ impl GatewayApiClient {
 
         let mut buffer = String::new();
         let mut stream = response.bytes_stream();
+        let mut latest_cursor = after_commit_cursor;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(GatewayApiError::Http)?;
             buffer.push_str(&String::from_utf8_lossy(&chunk));
             while let Some(index) = buffer.find("\n\n") {
                 let frame = buffer[..index].to_string();
                 buffer.drain(..index + 2);
+                latest_cursor = gateway_sse_frame_commit_cursor(&frame).or(latest_cursor);
                 if let Some(event) = gateway_sse_frame_to_cowd_event(&frame) {
                     let _ = tx.send(event);
                 }
             }
         }
-        Ok(())
+        Ok(latest_cursor)
     }
 
     pub async fn attach_session(
         &self,
         session_id: &str,
-        actor_id: &str,
         surface: &str,
         role: Option<&str>,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             &format!("/api/sessions/{}/attach", url_encode(session_id)),
-            serde_json::json!({
-                "actor_id": actor_id,
-                "surface": surface,
-                "role": role,
-            }),
+            serde_json::json!({ "surface": surface, "role": role }),
         )
         .await
     }
@@ -489,11 +517,11 @@ impl GatewayApiClient {
     pub async fn detach_session(
         &self,
         session_id: &str,
-        actor_id: &str,
+        surface: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             &format!("/api/sessions/{}/detach", url_encode(session_id)),
-            serde_json::json!({ "actor_id": actor_id }),
+            serde_json::json!({ "surface": surface }),
         )
         .await
     }
@@ -550,6 +578,14 @@ impl GatewayApiClient {
         self.get_json("/api/cowd/release-gate").await
     }
 
+    pub async fn gateway_capability_contract(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/gateway/capability-contract").await
+    }
+
+    pub async fn gateway_openai_tools(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/gateway/openai-tools").await
+    }
+
     pub async fn structured_sources(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/cowd/structured/sources").await
     }
@@ -581,14 +617,12 @@ impl GatewayApiClient {
     pub async fn acquire_runtime_session_lease(
         &self,
         session_id: &str,
-        owner: &str,
         mode: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             "/api/runtime/session-leases/acquire",
             serde_json::json!({
                 "session_id": session_id,
-                "owner": owner,
                 "mode": mode,
             }),
         )
@@ -598,14 +632,10 @@ impl GatewayApiClient {
     pub async fn release_runtime_session_lease(
         &self,
         session_id: &str,
-        owner: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             "/api/runtime/session-leases/release",
-            serde_json::json!({
-                "session_id": session_id,
-                "owner": owner,
-            }),
+            serde_json::json!({ "session_id": session_id }),
         )
         .await
     }
@@ -630,9 +660,8 @@ impl GatewayApiClient {
             .await
     }
 
-    pub async fn reload_runtime_providers(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json("/api/runtime/providers/reload", serde_json::json!({}))
-            .await
+    pub async fn config_reload_status(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/runtime/config/reload/status").await
     }
 
     pub async fn runtime_timeline(
@@ -646,6 +675,115 @@ impl GatewayApiClient {
             limit
         ))
         .await
+    }
+
+    pub async fn execution_projection(
+        &self,
+        execution_id: &str,
+        full: bool,
+    ) -> Result<harness_contract::projection::ExecutionProjection, GatewayApiError> {
+        let scope = if full { "full" } else { "summary" };
+        let value = self
+            .get_json(&format!(
+                "/api/runtime/executions/{}?detail_scope={scope}",
+                url_encode(execution_id)
+            ))
+            .await?;
+        serde_json::from_value(value).map_err(|error| GatewayApiError::Url(error.to_string()))
+    }
+
+    pub async fn execution_projection_delta(
+        &self,
+        execution_id: &str,
+        cursor: u64,
+        full: bool,
+    ) -> Result<harness_contract::projection::ProjectionDelta, GatewayApiError> {
+        let scope = if full { "full" } else { "summary" };
+        let value = self
+            .get_json(&format!(
+                "/api/runtime/executions/{}/events?cursor={cursor}&detail_scope={scope}",
+                url_encode(execution_id)
+            ))
+            .await?;
+        serde_json::from_value(value).map_err(|error| GatewayApiError::Url(error.to_string()))
+    }
+
+    pub async fn subscribe_execution_projection_events(
+        &self,
+        execution_id: &str,
+        after_cursor: u64,
+        full: bool,
+        tx: mpsc::SyncSender<CowdEvent>,
+    ) -> Result<u64, GatewayApiError> {
+        let scope = if full { "full" } else { "summary" };
+        let url = format!(
+            "{}/api/runtime/executions/{}/events?cursor={after_cursor}&detail_scope={scope}",
+            self.base_url,
+            url_encode(execution_id),
+        );
+        let mut request = self
+            .client
+            .get(url)
+            .header("Accept", "text/event-stream")
+            .header("Last-Event-ID", after_cursor.to_string());
+        if let Some(token) = self
+            .auth_token
+            .as_deref()
+            .filter(|token| !token.trim().is_empty())
+        {
+            request = request.bearer_auth(token.trim());
+        }
+        let response = request.send().await.map_err(GatewayApiError::Http)?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(GatewayApiError::Status(status, body));
+        }
+
+        let mut buffer = String::new();
+        let mut stream = response.bytes_stream();
+        let mut latest_cursor = after_cursor;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(GatewayApiError::Http)?;
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(index) = buffer.find("\n\n") {
+                let frame = buffer[..index].to_string();
+                buffer.drain(..index + 2);
+                if let Some(cursor) = gateway_sse_frame_commit_cursor(&frame) {
+                    latest_cursor = latest_cursor.max(cursor);
+                }
+                if let Some(delta) = gateway_sse_frame_projection_delta(&frame) {
+                    latest_cursor = latest_cursor.max(delta.target_cursor);
+                    let _ = tx.send(CowdEvent::ExecutionProjectionDelta { delta });
+                } else if gateway_sse_frame_event_name(&frame) == Some("projection_resync") {
+                    let _ = tx.send(CowdEvent::Warning {
+                        message: format!(
+                            "Execution projection requires snapshot resync for {execution_id}"
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(latest_cursor)
+    }
+
+    pub async fn execute_projection_command(
+        &self,
+        execution_id: &str,
+        request: &harness_contract::projection::ExecutionCommandRequest,
+    ) -> Result<harness_contract::projection::ExecutionCommandReceipt, GatewayApiError> {
+        let body = serde_json::to_value(request)
+            .map_err(|error| GatewayApiError::Url(error.to_string()))?;
+        let value = self
+            .post_json(
+                &format!(
+                    "/api/runtime/executions/{}/commands",
+                    url_encode(execution_id)
+                ),
+                body,
+            )
+            .await?;
+        serde_json::from_value(value).map_err(|error| GatewayApiError::Url(error.to_string()))
     }
 
     pub async fn current_context(
@@ -716,12 +854,11 @@ impl GatewayApiClient {
             .await
     }
 
-    pub async fn tick_mission_steward_scheduler(
+    pub async fn tick_mission_schedules(
         &self,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json("/api/mission/control/stewards/scheduler", body)
-            .await
+        self.post_json("/api/mission/schedules/tick", body).await
     }
 
     pub async fn apply_runtime_recovery(&self) -> Result<serde_json::Value, GatewayApiError> {
@@ -735,17 +872,6 @@ impl GatewayApiClient {
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json(&format!("/api/mission/sessions/{}", url_encode(session_id)))
             .await
-    }
-
-    pub async fn mission_session_inbox(
-        &self,
-        session_id: &str,
-    ) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!(
-            "/api/mission/sessions/{}/inbox",
-            url_encode(session_id)
-        ))
-        .await
     }
 
     pub async fn mission_approvals(&self) -> Result<serde_json::Value, GatewayApiError> {
@@ -778,6 +904,32 @@ impl GatewayApiClient {
         .await
     }
 
+    /// Read the Runtime-owned catalog of runnable Team template revisions.
+    pub async fn team_templates(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/team-templates").await
+    }
+
+    /// Submit declarative Team intent. Gateway forwards it to Runtime, which
+    /// resolves template/Agent revisions and constructs the graph.
+    pub async fn instantiate_team_template(
+        &self,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json("/api/team-templates/instantiate", body)
+            .await
+    }
+
+    pub async fn team_working_state(
+        &self,
+        team_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!(
+            "/api/runtime/teams/{}/working-state",
+            url_encode(team_id)
+        ))
+        .await
+    }
+
     pub async fn decide_mission_approval(
         &self,
         approval_id: &str,
@@ -805,62 +957,6 @@ impl GatewayApiClient {
         body: serde_json::Value,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json("/api/mission/proxies", body).await
-    }
-
-    pub async fn route_mission_command(
-        &self,
-        body: serde_json::Value,
-    ) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json("/api/mission/route", body).await
-    }
-
-    pub async fn consume_mission_session_command(
-        &self,
-        session_id: &str,
-        command_id: &str,
-        mode: &str,
-    ) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json(
-            &format!(
-                "/api/mission/sessions/{}/inbox/{}/consume",
-                url_encode(session_id),
-                url_encode(command_id)
-            ),
-            serde_json::json!({ "mode": mode }),
-        )
-        .await
-    }
-
-    pub async fn cancel_mission_session_command(
-        &self,
-        session_id: &str,
-        command_id: &str,
-    ) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json(
-            &format!(
-                "/api/mission/sessions/{}/inbox/{}/cancel",
-                url_encode(session_id),
-                url_encode(command_id)
-            ),
-            serde_json::json!({}),
-        )
-        .await
-    }
-
-    pub async fn retry_mission_session_command(
-        &self,
-        session_id: &str,
-        command_id: &str,
-    ) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json(
-            &format!(
-                "/api/mission/sessions/{}/inbox/{}/retry",
-                url_encode(session_id),
-                url_encode(command_id)
-            ),
-            serde_json::json!({}),
-        )
-        .await
     }
 
     pub async fn runtime_agent_input(
@@ -975,6 +1071,44 @@ impl GatewayApiClient {
         self.get_json(&path).await
     }
 
+    pub async fn message_connectors(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/message-connectors").await
+    }
+
+    pub async fn message_connector_status(
+        &self,
+        name: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!(
+            "/api/message-connectors/{}/status",
+            url_encode(name)
+        ))
+        .await
+    }
+
+    pub async fn message_connector_repair(
+        &self,
+        name: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!("/api/message-connectors/{}/repair", url_encode(name)),
+            serde_json::json!({}),
+        )
+        .await
+    }
+
+    pub async fn message_endpoints(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/message-endpoints").await
+    }
+
+    pub async fn message_routes(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/message-routes").await
+    }
+
+    pub async fn message_bindings(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/message-bindings").await
+    }
+
     pub async fn surface_registry(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/surfaces").await
     }
@@ -1064,6 +1198,38 @@ impl GatewayApiClient {
     pub async fn surface_outbox(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json(&format!("/api/surfaces/{}/outbox", url_encode(id)))
             .await
+    }
+
+    pub async fn surface_messages(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!("/api/surfaces/{}/messages", url_encode(id)))
+            .await
+    }
+
+    pub async fn surface_archive_messages(
+        &self,
+        id: &str,
+        limit: usize,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!("/api/surfaces/{}/messages/archive", url_encode(id)),
+            serde_json::json!({ "limit": limit }),
+        )
+        .await
+    }
+
+    pub async fn surface_purge_archived_events(
+        &self,
+        id: &str,
+        limit: usize,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!(
+                "/api/surfaces/{}/messages/purge-archived-events",
+                url_encode(id)
+            ),
+            serde_json::json!({ "limit": limit }),
+        )
+        .await
     }
 
     pub async fn surface_deliveries(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
@@ -1190,16 +1356,326 @@ impl GatewayApiClient {
         self.get_json("/api/harness-eval/reports").await
     }
 
+    pub async fn harness_eval_report(
+        &self,
+        id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!("/api/harness-eval/reports/{}", url_encode(id)))
+            .await
+    }
+
+    pub async fn harness_eval_report_artifacts(
+        &self,
+        id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!(
+            "/api/harness-eval/reports/{}/artifacts",
+            url_encode(id)
+        ))
+        .await
+    }
+
+    pub async fn harness_eval_report_gate(
+        &self,
+        id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!(
+            "/api/harness-eval/reports/{}/gate",
+            url_encode(id)
+        ))
+        .await
+    }
+
+    pub async fn harness_eval_run_status(
+        &self,
+        id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!("/api/harness-eval/runs/{}", url_encode(id)))
+            .await
+    }
+
     pub async fn harness_eval_run_smoke(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.harness_eval_run(
+            "quick",
+            "low",
+            false,
+            "operator requested harness eval smoke",
+        )
+        .await
+    }
+
+    pub async fn harness_eval_run(
+        &self,
+        level: &str,
+        budget: &str,
+        allow_real_model: bool,
+        objective: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             "/api/harness-eval/runs",
             serde_json::json!({
-                "level": "quick",
-                "budget": "low",
+                "level": level,
+                "budget": budget,
                 "actor": "tui.gateway_panel",
-                "objective": "operator requested harness eval smoke",
-                "allow_real_model": false
+                "objective": objective,
+                "allow_real_model": allow_real_model
             }),
+        )
+        .await
+    }
+
+    pub async fn harness_eval_cancel_run(
+        &self,
+        id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!("/api/harness-eval/runs/{}/cancel", url_encode(id)),
+            serde_json::json!({}),
+        )
+        .await
+    }
+
+    pub async fn evolution_signals(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/evolution/signals").await
+    }
+
+    pub async fn evolution_diagnoses(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/evolution/diagnoses").await
+    }
+
+    pub async fn evolution_missions_summary(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/evolution/missions/summary").await
+    }
+
+    pub async fn evolution_mission_detail(
+        &self,
+        mission_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!(
+            "/api/evolution/missions/{}/detail",
+            url_encode(mission_id)
+        ))
+        .await
+    }
+
+    pub async fn evolution_create_diagnosis(
+        &self,
+        signal_ids: Vec<String>,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            "/api/evolution/diagnoses",
+            serde_json::json!({ "signal_ids": signal_ids }),
+        )
+        .await
+    }
+
+    pub async fn evolution_proposals(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/evolution/proposals").await
+    }
+
+    pub async fn evolution_create_proposal(
+        &self,
+        signal_ids: Vec<String>,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            "/api/evolution/proposals",
+            serde_json::json!({ "signal_ids": signal_ids }),
+        )
+        .await
+    }
+
+    pub async fn evolution_skill_draft(
+        &self,
+        proposal_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!(
+            "/api/evolution/proposals/{}/skill-draft",
+            url_encode(proposal_id)
+        ))
+        .await
+    }
+
+    pub async fn evolution_chain(
+        &self,
+        proposal_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!("/api/evolution/chain/{}", url_encode(proposal_id)))
+            .await
+    }
+
+    pub async fn evolution_candidates(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/evolution/candidates").await
+    }
+
+    pub async fn evolution_candidate_detail(
+        &self,
+        candidate_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!(
+            "/api/evolution/candidates/{}",
+            url_encode(candidate_id)
+        ))
+        .await
+    }
+
+    pub async fn evolution_create_candidate(
+        &self,
+        registration: serde_json::Value,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json("/api/evolution/candidates", registration)
+            .await
+    }
+
+    pub async fn evolution_candidate_canary_review(
+        &self,
+        candidate_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!(
+                "/api/evolution/candidates/{}/reviews/canary",
+                url_encode(candidate_id)
+            ),
+            serde_json::json!({}),
+        )
+        .await
+    }
+
+    /// Ask Runtime's trusted evaluator to evaluate one immutable candidate.
+    /// This endpoint never accepts a caller-supplied verdict or report.
+    pub async fn evolution_candidate_evaluate(
+        &self,
+        candidate_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!(
+                "/api/evolution/candidates/{}/evaluate",
+                url_encode(candidate_id)
+            ),
+            serde_json::json!({}),
+        )
+        .await
+    }
+
+    pub async fn evolution_candidate_stable_review(
+        &self,
+        candidate_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!(
+                "/api/evolution/candidates/{}/reviews/stable",
+                url_encode(candidate_id)
+            ),
+            serde_json::json!({}),
+        )
+        .await
+    }
+
+    pub async fn evolution_reviews(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/evolution/reviews").await
+    }
+
+    pub async fn evolution_review_detail(
+        &self,
+        review_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!("/api/evolution/reviews/{}", url_encode(review_id)))
+            .await
+    }
+
+    /// Queue pointer, rollback, or stop-Canary change through Runtime's
+    /// typed review gate. TUI cannot mutate a release directly.
+    pub async fn evolution_create_release_review(
+        &self,
+        request: serde_json::Value,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json("/api/evolution/reviews", request).await
+    }
+
+    pub async fn evolution_review_decision(
+        &self,
+        review_id: &str,
+        decision: &str,
+        reason: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!("/api/evolution/reviews/{}/decision", url_encode(review_id)),
+            serde_json::json!({ "decision": decision, "reason": reason }),
+        )
+        .await
+    }
+
+    /// Read Runtime's protected evaluation-policy floor. The terminal never
+    /// computes a release verdict or keeps a policy cache of its own.
+    pub async fn evolution_evaluation_policy(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/evolution/evaluation-policy").await
+    }
+
+    pub async fn evolution_evaluation_policy_reviews(
+        &self,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/evolution/evaluation-policy/reviews")
+            .await
+    }
+
+    pub async fn evolution_evaluation_policy_review_decision(
+        &self,
+        review_id: &str,
+        decision: &str,
+        reason: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!(
+                "/api/evolution/evaluation-policy/reviews/{}/decision",
+                url_encode(review_id)
+            ),
+            serde_json::json!({ "decision": decision, "reason": reason }),
+        )
+        .await
+    }
+
+    /// Runtime-owned Managed Agent projection. This is deliberately a single
+    /// aggregate read so TUI cannot stitch a second scheduler state together.
+    pub async fn managed_agents(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/runtime/managed-agents").await
+    }
+
+    pub async fn dispatch_managed_agents(
+        &self,
+        dispatcher_id: &str,
+        limit: usize,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            "/api/runtime/managed-agents/dispatch",
+            serde_json::json!({ "dispatcher_id": dispatcher_id, "limit": limit }),
+        )
+        .await
+    }
+
+    pub async fn trigger_managed_agent(
+        &self,
+        managed_agent_id: &str,
+        request_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!(
+                "/api/runtime/managed-agents/{}/trigger",
+                url_encode(managed_agent_id)
+            ),
+            serde_json::json!({ "request_id": request_id }),
+        )
+        .await
+    }
+
+    pub async fn reset_managed_agent_health(
+        &self,
+        managed_agent_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!(
+                "/api/runtime/managed-agents/{}/health/reset",
+                url_encode(managed_agent_id)
+            ),
+            serde_json::json!({}),
         )
         .await
     }
@@ -1662,7 +2138,13 @@ pub fn gateway_sse_json_to_cowd_event(value: &serde_json::Value) -> Option<CowdE
                 .and_then(serde_json::Value::as_i64)
                 .map(|code| code as i32),
         }),
-        "TurnComplete" | "turn_complete" => Some(CowdEvent::TurnComplete {
+        // A model loop completion is only rendering progress. The durable
+        // SessionRuntimeBridge emits TerminalCommitted after the transcript
+        // write succeeds; only that event is allowed to settle TUI state.
+        "TurnComplete" | "turn_complete" => Some(CowdEvent::Warning {
+            message: "Model output ready; awaiting durable terminal commit".to_string(),
+        }),
+        "TerminalCommitted" | "terminal_committed" => Some(CowdEvent::TurnComplete {
             assistant_text: value
                 .get("assistant_text")
                 .or_else(|| value.get("response"))
@@ -1682,6 +2164,41 @@ pub fn gateway_sse_json_to_cowd_event(value: &serde_json::Value) -> Option<CowdE
                 .unwrap_or("Gateway turn error")
                 .to_string(),
         }),
+        "SessionInputReceived" | "session_input_received" => {
+            let decision = value
+                .get("receipt")
+                .or_else(|| value.get("input"))
+                .and_then(|receipt| receipt.get("decision"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("received");
+            Some(CowdEvent::Warning {
+                message: format!("Session input received: {decision}"),
+            })
+        }
+        "TurnInboxUpdated" | "turn_inbox_updated" => {
+            let pending = value
+                .get("inbox")
+                .and_then(|inbox| inbox.get("pending_count"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default();
+            Some(CowdEvent::Warning {
+                message: format!("Turn inbox updated: {pending} pending"),
+            })
+        }
+        "TurnInputCheckpointConsumed" | "turn_input_checkpoint_consumed" => {
+            let checkpoint = value
+                .get("checkpoint")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("checkpoint");
+            let consumed = value
+                .get("consumed")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len)
+                .unwrap_or_default();
+            Some(CowdEvent::Warning {
+                message: format!("Runtime consumed {consumed} input(s) at {checkpoint}"),
+            })
+        }
         "TurnCancelRequested" | "turn_cancel_requested" => Some(CowdEvent::Warning {
             message: "Gateway cancel request accepted".to_string(),
         }),
@@ -1712,11 +2229,11 @@ pub fn gateway_sse_json_to_cowd_event(value: &serde_json::Value) -> Option<CowdE
             .cloned()
             .and_then(|summary| serde_json::from_value(summary).ok())
             .map(|summary| CowdEvent::RuntimePolicyDecision { summary }),
-        "WorkGraphSummary" | "workgraph_summary" => value
+        "ExecutionGraphSummary" | "execution_graph_summary" => value
             .get("summary")
             .cloned()
             .and_then(|summary| serde_json::from_value(summary).ok())
-            .map(|summary| CowdEvent::WorkGraphSummary { summary }),
+            .map(|summary| CowdEvent::ExecutionGraphSummary { summary }),
         _ => None,
     }
 }
@@ -1735,6 +2252,38 @@ pub fn gateway_sse_frame_to_cowd_event(frame: &str) -> Option<CowdEvent> {
     serde_json::from_str::<serde_json::Value>(&data)
         .ok()
         .and_then(|value| gateway_sse_json_to_cowd_event(&value))
+}
+
+fn gateway_sse_frame_commit_cursor(frame: &str) -> Option<u64> {
+    frame
+        .lines()
+        .find_map(|line| line.strip_prefix("id:"))
+        .map(str::trim)
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn gateway_sse_frame_event_name(frame: &str) -> Option<&str> {
+    frame
+        .lines()
+        .find_map(|line| line.strip_prefix("event:"))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn gateway_sse_frame_projection_delta(
+    frame: &str,
+) -> Option<harness_contract::projection::ProjectionDelta> {
+    if gateway_sse_frame_event_name(frame) != Some("projection_delta") {
+        return None;
+    }
+    let data = frame
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    serde_json::from_str(&data).ok()
 }
 
 #[cfg(test)]
@@ -1783,9 +2332,18 @@ mod tests {
         ));
         assert!(matches!(
             gateway_sse_json_to_cowd_event(&serde_json::json!({
-                "type": "TurnComplete"
+                "type": "TerminalCommitted",
+                "terminal_id": "terminal-1",
+                "response": "done"
             })),
             Some(CowdEvent::TurnComplete { .. })
+        ));
+        assert!(matches!(
+            gateway_sse_json_to_cowd_event(&serde_json::json!({
+                "type": "TurnComplete",
+                "assistant_text": "draft"
+            })),
+            Some(CowdEvent::Warning { .. })
         ));
         assert!(matches!(
             gateway_sse_json_to_cowd_event(&serde_json::json!({
@@ -1810,6 +2368,34 @@ mod tests {
     }
 
     #[test]
+    fn gateway_sse_frame_reads_durable_commit_cursor_from_event_id() {
+        assert_eq!(
+            gateway_sse_frame_commit_cursor("id: 73\ndata: {\"type\":\"TerminalCommitted\"}"),
+            Some(73)
+        );
+        assert_eq!(
+            gateway_sse_frame_commit_cursor("data: {\"type\":\"TextDelta\"}"),
+            None
+        );
+    }
+
+    #[test]
+    fn gateway_sse_frame_parses_canonical_projection_delta_only_from_named_event() {
+        let delta = serde_json::json!({
+            "schema_version": 1,
+            "execution_id": "graph-1",
+            "base_cursor": 4,
+            "target_cursor": 5,
+            "events": []
+        });
+        let frame = format!("id: 5\nevent: projection_delta\ndata: {delta}");
+        let parsed = gateway_sse_frame_projection_delta(&frame).expect("projection delta");
+        assert_eq!(parsed.execution_id, "graph-1");
+        assert_eq!(parsed.target_cursor, 5);
+        assert!(gateway_sse_frame_projection_delta(&format!("data: {delta}")).is_none());
+    }
+
+    #[test]
     fn gateway_sse_frame_maps_data_json() {
         assert!(matches!(
             gateway_sse_frame_to_cowd_event(
@@ -1827,6 +2413,8 @@ mod tests {
             "runtime_snapshot",
             "list_sessions",
             "session_projection",
+            "session_input_projection",
+            "turn_inbox",
             "ensure_session",
             "acquire_session_lease",
             "release_session_lease",
@@ -1841,18 +2429,16 @@ mod tests {
             "pending_approvals",
             "mission_projection",
             "mission_session_detail",
-            "mission_session_inbox",
             "mission_approvals",
             "mission_relations",
             "submit_mission_approval",
             "start_mission_team_runtime",
+            "team_templates",
+            "instantiate_team_template",
+            "team_working_state",
             "decide_mission_approval",
             "add_mission_relation",
             "upsert_mission_proxy",
-            "route_mission_command",
-            "consume_mission_session_command",
-            "cancel_mission_session_command",
-            "retry_mission_session_command",
             "runtime_agent_input",
             "runtime_agent_interrupt",
             "runtime_agent_shutdown",
@@ -1863,6 +2449,12 @@ mod tests {
             "context_snapshot",
             "respond_approval",
             "connector_resources",
+            "message_connectors",
+            "message_connector_status",
+            "message_connector_repair",
+            "message_endpoints",
+            "message_routes",
+            "message_bindings",
             "revalidate_connector_resource",
             "promote_connector_resource_to_memory",
             "chat_session",
@@ -1872,6 +2464,8 @@ mod tests {
             "cowd_projection",
             "cowd_surfaces",
             "cowd_release_gate",
+            "gateway_capability_contract",
+            "gateway_openai_tools",
             "structured_sources",
             "structured_facts",
             "structured_evidence",
@@ -1893,6 +2487,9 @@ mod tests {
             "surface_restart",
             "surface_inbox",
             "surface_outbox",
+            "surface_messages",
+            "surface_archive_messages",
+            "surface_purge_archived_events",
             "surface_deliveries",
             "surface_replay_inbox",
             "surface_retry_outbox",
@@ -1902,7 +2499,39 @@ mod tests {
             "skill_action",
             "harness_eval_latest_report",
             "harness_eval_reports",
+            "harness_eval_report",
+            "harness_eval_report_artifacts",
+            "harness_eval_report_gate",
             "harness_eval_run_smoke",
+            "harness_eval_run",
+            "harness_eval_run_status",
+            "harness_eval_cancel_run",
+            "evolution_signals",
+            "evolution_diagnoses",
+            "evolution_missions_summary",
+            "evolution_mission_detail",
+            "evolution_create_diagnosis",
+            "evolution_proposals",
+            "evolution_create_proposal",
+            "evolution_skill_draft",
+            "evolution_chain",
+            "evolution_candidates",
+            "evolution_candidate_detail",
+            "evolution_create_candidate",
+            "evolution_candidate_evaluate",
+            "evolution_candidate_canary_review",
+            "evolution_candidate_stable_review",
+            "evolution_reviews",
+            "evolution_review_detail",
+            "evolution_create_release_review",
+            "evolution_review_decision",
+            "evolution_evaluation_policy",
+            "evolution_evaluation_policy_reviews",
+            "evolution_evaluation_policy_review_decision",
+            "managed_agents",
+            "dispatch_managed_agents",
+            "trigger_managed_agent",
+            "reset_managed_agent_health",
             "preflight_cross_plane_action",
             "execute_cross_plane_action",
             "cross_plane_policy_simulate",
@@ -1922,10 +2551,171 @@ mod tests {
             "cancel_session_turn",
         ];
         let deleted = ["socket_path", "with_timeout"];
-        assert_eq!(migrated.len(), 97);
+        assert!(
+            migrated.len() >= 136,
+            "gateway inventory should not shrink when routes are migrated"
+        );
+        assert!(migrated.contains(&"session_input_projection"));
+        assert!(migrated.contains(&"turn_inbox"));
         assert_eq!(deleted.len(), 2);
         assert!(!migrated.iter().any(|item| item.trim().is_empty()));
         assert!(!deleted.iter().any(|item| item.trim().is_empty()));
+    }
+
+    #[test]
+    fn evolution_gateway_api_inventory_exposes_runtime_evolution_controls() {
+        let evolution_methods = [
+            "evolution_signals",
+            "evolution_diagnoses",
+            "evolution_missions_summary",
+            "evolution_mission_detail",
+            "evolution_create_diagnosis",
+            "evolution_proposals",
+            "evolution_create_proposal",
+            "evolution_skill_draft",
+            "evolution_chain",
+            "evolution_candidates",
+            "evolution_candidate_detail",
+            "evolution_create_candidate",
+            "evolution_candidate_evaluate",
+            "evolution_candidate_canary_review",
+            "evolution_candidate_stable_review",
+            "evolution_reviews",
+            "evolution_review_detail",
+            "evolution_create_release_review",
+            "evolution_review_decision",
+            "evolution_evaluation_policy",
+            "evolution_evaluation_policy_reviews",
+            "evolution_evaluation_policy_review_decision",
+        ];
+        assert_eq!(evolution_methods.len(), 22);
+        assert!(evolution_methods
+            .iter()
+            .all(|method| method.starts_with("evolution_")));
+    }
+
+    #[test]
+    fn managed_agent_gateway_api_inventory_exposes_runtime_owned_controls() {
+        let managed_agent_methods = [
+            "managed_agents",
+            "dispatch_managed_agents",
+            "trigger_managed_agent",
+            "reset_managed_agent_health",
+        ];
+        assert_eq!(managed_agent_methods.len(), 4);
+        assert!(managed_agent_methods
+            .iter()
+            .all(|method| method.contains("managed_agent")));
+    }
+
+    #[tokio::test]
+    async fn typed_evolution_and_managed_agent_controls_use_gateway_owned_routes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let checks = [
+                (
+                    "GET /api/evolution/evaluation-policy HTTP/1.1",
+                    Vec::<&str>::new(),
+                ),
+                (
+                    "GET /api/evolution/evaluation-policy/reviews HTTP/1.1",
+                    Vec::<&str>::new(),
+                ),
+                (
+                    "POST /api/evolution/reviews/release-1/decision HTTP/1.1",
+                    vec![
+                        "\"decision\":\"approve\"",
+                        "\"reason\":\"operator checked\"",
+                    ],
+                ),
+                (
+                    "POST /api/evolution/evaluation-policy/reviews/policy-1/decision HTTP/1.1",
+                    vec!["\"decision\":\"reject\"", "\"reason\":\"operator checked\""],
+                ),
+                (
+                    "GET /api/runtime/managed-agents HTTP/1.1",
+                    Vec::<&str>::new(),
+                ),
+                (
+                    "POST /api/runtime/managed-agents/dispatch HTTP/1.1",
+                    vec!["\"dispatcher_id\":\"tui-operator\"", "\"limit\":16"],
+                ),
+                (
+                    "POST /api/runtime/managed-agents/agent-1/health/reset HTTP/1.1",
+                    Vec::<&str>::new(),
+                ),
+            ];
+            for (expected_start, expected_fragments) in checks {
+                let (mut socket, _) = listener.accept().await.expect("accept request");
+                let mut buf = vec![0; 4096];
+                let n = socket.read(&mut buf).await.expect("read request");
+                let request = String::from_utf8_lossy(&buf[..n]);
+                assert!(request.starts_with(expected_start), "request was {request}");
+                for fragment in expected_fragments {
+                    assert!(request.contains(fragment), "request was {request}");
+                }
+                assert!(
+                    !request.contains("actor_principal"),
+                    "TUI must not supply an approval actor: {request}"
+                );
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: 11\r\n\r\n{\"ok\":true}",
+                    )
+                    .await
+                    .expect("write response");
+            }
+        });
+
+        let client =
+            GatewayApiClient::new(format!("http://{addr}"), Some("test-token".to_string()))
+                .expect("client");
+        assert_eq!(
+            client.evolution_evaluation_policy().await.expect("policy")["ok"],
+            true
+        );
+        assert_eq!(
+            client
+                .evolution_evaluation_policy_reviews()
+                .await
+                .expect("policy reviews")["ok"],
+            true
+        );
+        assert_eq!(
+            client
+                .evolution_review_decision("release-1", "approve", "operator checked")
+                .await
+                .expect("release decision")["ok"],
+            true
+        );
+        assert_eq!(
+            client
+                .evolution_evaluation_policy_review_decision(
+                    "policy-1",
+                    "reject",
+                    "operator checked",
+                )
+                .await
+                .expect("policy decision")["ok"],
+            true
+        );
+        assert_eq!(client.managed_agents().await.expect("agents")["ok"], true);
+        assert_eq!(
+            client
+                .dispatch_managed_agents("tui-operator", 16)
+                .await
+                .expect("dispatch")["ok"],
+            true
+        );
+        assert_eq!(
+            client
+                .reset_managed_agent_health("agent-1")
+                .await
+                .expect("health reset")["ok"],
+            true
+        );
+        server.await.expect("server task");
     }
 
     #[tokio::test]
@@ -1977,6 +2767,55 @@ mod tests {
         let json = client.cowd_projection("tui").await.expect("json");
         assert_eq!(json["surface"], "tui");
         assert_eq!(json["capability_count"], 1);
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn gateway_contract_endpoints_get_json_with_auth() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let routes = [
+                (
+                    "/api/gateway/capability-contract",
+                    r#"{"kind":"gateway.capability_contract","capability_count":1,"capabilities":[]}"#,
+                ),
+                (
+                    "/api/gateway/openai-tools",
+                    r#"{"kind":"gateway.openai_tools","tool_count":1,"tools":[]}"#,
+                ),
+            ];
+            for (path, body) in routes {
+                let (mut socket, _) = listener.accept().await.expect("accept contract");
+                let mut buf = vec![0; 2048];
+                let n = socket.read(&mut buf).await.expect("read contract");
+                let req = String::from_utf8_lossy(&buf[..n]);
+                assert!(req.starts_with(&format!("GET {path} HTTP/1.1")), "{req}");
+                assert!(req.contains("authorization: Bearer test-token"));
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .expect("write contract");
+            }
+        });
+
+        let client =
+            GatewayApiClient::new(format!("http://{addr}"), Some("test-token".to_string()))
+                .expect("client");
+        let contract = client
+            .gateway_capability_contract()
+            .await
+            .expect("contract");
+        let tools = client.gateway_openai_tools().await.expect("tools");
+        assert_eq!(contract["kind"], "gateway.capability_contract");
+        assert_eq!(tools["kind"], "gateway.openai_tools");
         server.await.expect("server task");
     }
 
@@ -2137,8 +2976,8 @@ mod tests {
             let req = String::from_utf8_lossy(&buf[..n]);
             assert!(req.starts_with("POST /api/runtime/session-leases/acquire HTTP/1.1"));
             assert!(req.contains("\"session_id\":\"session-1\""));
-            assert!(req.contains("\"owner\":\"tui:1\""));
             assert!(req.contains("\"mode\":\"collaborative\""));
+            assert!(!req.contains("\"owner\":"));
             socket
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: 22\r\n\r\n{\"ok\":true,\"lease\":{}}",
@@ -2152,7 +2991,7 @@ mod tests {
             let req = String::from_utf8_lossy(&buf[..n]);
             assert!(req.starts_with("POST /api/runtime/session-leases/release HTTP/1.1"));
             assert!(req.contains("\"session_id\":\"session-1\""));
-            assert!(req.contains("\"owner\":\"tui:1\""));
+            assert!(!req.contains("\"owner\":"));
             socket
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: 27\r\n\r\n{\"ok\":true,\"released\":true}",
@@ -2163,12 +3002,12 @@ mod tests {
 
         let client = GatewayApiClient::new(format!("http://{addr}"), None).expect("client");
         let acquired = client
-            .acquire_runtime_session_lease("session-1", "tui:1", "collaborative")
+            .acquire_runtime_session_lease("session-1", "collaborative")
             .await
             .expect("acquire");
         assert_eq!(acquired["ok"], true);
         let released = client
-            .release_runtime_session_lease("session-1", "tui:1")
+            .release_runtime_session_lease("session-1")
             .await
             .expect("release");
         assert_eq!(released["released"], true);
@@ -2326,6 +3165,100 @@ mod tests {
             .await
             .expect("json");
         assert!(json["resources"].as_array().unwrap().is_empty());
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn message_plane_endpoints_use_gateway_routes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let routes = [
+                (
+                    "GET",
+                    "/api/message-connectors",
+                    r#"{"kind":"message.connector.registry","connectors":[]}"#,
+                ),
+                (
+                    "GET",
+                    "/api/message-connectors/feishu/status",
+                    r#"{"kind":"message.connector.status","connector":"feishu"}"#,
+                ),
+                (
+                    "POST",
+                    "/api/message-connectors/feishu/repair",
+                    r#"{"kind":"message.connector.repair","connector":"feishu"}"#,
+                ),
+                (
+                    "GET",
+                    "/api/message-endpoints",
+                    r#"{"kind":"message.endpoint.directory","endpoints":[]}"#,
+                ),
+                (
+                    "GET",
+                    "/api/message-routes",
+                    r#"{"kind":"message.delivery.routes","routes":[]}"#,
+                ),
+                (
+                    "GET",
+                    "/api/message-bindings",
+                    r#"{"kind":"message.conversation.bindings","bindings":[]}"#,
+                ),
+            ];
+            for (method, path, body) in routes {
+                let (mut socket, _) = listener.accept().await.expect("accept message plane");
+                let mut buf = vec![0; 2048];
+                let n = socket.read(&mut buf).await.expect("read message plane");
+                let req = String::from_utf8_lossy(&buf[..n]);
+                assert!(
+                    req.starts_with(&format!("{method} {path} HTTP/1.1")),
+                    "unexpected request: {req}"
+                );
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .expect("write message plane");
+            }
+        });
+
+        let client = GatewayApiClient::new(format!("http://{addr}"), None).expect("client");
+        assert_eq!(
+            client.message_connectors().await.expect("connectors")["kind"],
+            "message.connector.registry"
+        );
+        assert_eq!(
+            client
+                .message_connector_status("feishu")
+                .await
+                .expect("status")["kind"],
+            "message.connector.status"
+        );
+        assert_eq!(
+            client
+                .message_connector_repair("feishu")
+                .await
+                .expect("repair")["kind"],
+            "message.connector.repair"
+        );
+        assert_eq!(
+            client.message_endpoints().await.expect("endpoints")["kind"],
+            "message.endpoint.directory"
+        );
+        assert_eq!(
+            client.message_routes().await.expect("routes")["kind"],
+            "message.delivery.routes"
+        );
+        assert_eq!(
+            client.message_bindings().await.expect("bindings")["kind"],
+            "message.conversation.bindings"
+        );
         server.await.expect("server task");
     }
 

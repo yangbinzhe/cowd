@@ -1,10 +1,11 @@
 use std::{
+    collections::HashMap,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{atomic::AtomicBool, Arc, Mutex},
 };
 
 use harness_contract::{
-    core::{ExecutionMode, TaskComplexity, TaskRisk},
+    core::{ExecutionPattern, TaskComplexity, TaskRisk},
     growth::{GrowthEvent, GrowthEventInput, GrowthEvidenceRef, GrowthInput, LearningRecord},
     policy::{PolicyDecisionKind, RiskGateReceipt},
 };
@@ -17,8 +18,10 @@ mod approval_service;
 mod connector_service;
 mod context;
 mod context_service;
+mod cross_plane_executor;
 mod cross_plane_service;
 mod error;
+mod evolution_service;
 mod growth_service;
 mod harness_eval_service;
 mod matrix_service;
@@ -29,6 +32,7 @@ mod policy;
 pub(crate) mod reality_service;
 mod receipt;
 mod registry;
+mod runtime_event_service;
 mod session_service;
 mod skill_service;
 mod slash_controller;
@@ -37,10 +41,14 @@ mod system_service;
 mod task_service;
 mod workspace_service;
 
-pub(crate) use agent_service::UpsertAgentTeamProfileRequest;
 pub(crate) use approval_service::ApprovalService;
 pub(crate) use context_service::ContextServiceError;
+pub(crate) use cross_plane_executor::{GatewayConnectorServiceExecutor, GatewayCrossPlaneExecutor};
 pub(crate) use cross_plane_service::CrossPlaneExecutionRecord;
+pub(crate) use evolution_service::{
+    EvolutionProposalCreateRequest, EvolutionProposalDecisionRequest, EvolutionServiceError,
+    EvolutionSignalCreateRequest,
+};
 pub(crate) use growth_service::growth_storage_migrations;
 pub(crate) use harness_eval_service::HarnessEvalServiceError;
 pub(crate) use matrix_service::MatrixService;
@@ -50,20 +58,19 @@ pub(crate) use mfg_service::{
     MfgService,
 };
 pub(crate) use mission_service::{
-    AddMissionRelationHttpRequest, AttachMissionAgentHttpRequest, AttachMissionTeamHttpRequest,
-    ConsumeMissionSessionCommandHttpRequest, DecideMissionApprovalHttpRequest,
-    InterruptMissionStewardHttpRequest, MissionSessionCommandConsumeMode,
-    MissionTeamHandoffHttpRequest, RouteMissionCommandHttpRequest, StartMissionSessionHttpRequest,
-    StartMissionStewardHttpRequest, StartMissionTeamRuntimeHttpRequest,
-    SubmitMissionApprovalHttpRequest, TickMissionStewardHttpRequest, UpsertMissionProxyHttpRequest,
+    AddMissionRelationHttpRequest, CreateMissionScheduleHttpRequest,
+    DecideMissionApprovalHttpRequest, InterpretMissionCommandHttpRequest,
+    StartMissionSessionHttpRequest, SubmitMissionApprovalHttpRequest,
+    UpdateMissionScheduleHttpRequest, UpsertMissionProxyHttpRequest,
 };
 pub(crate) use reality_service::RealityService;
 pub(crate) use receipt::{service_envelope, ServiceEnvelope};
+pub(crate) use runtime_event_service::RuntimeEventService;
 pub(crate) use session_service::{
     ActiveMessagesPage, SessionCompactResult, SessionMessageCounts, SessionService,
     SessionStatsSnapshot, SessionTokenCounts, SessionUpdateRequest,
 };
-pub(crate) use skill_service::profile_provider::runtime_skill_profiles_for_workspace;
+pub(crate) use skill_service::profile_provider::runtime_skill_assets_for_workspace;
 pub(crate) use skill_service::{
     SkillActionRequest, SkillCatalogQuery, SkillFileQuery, SkillMaintenanceEvaluateRequest,
     SkillProjectionQuery, SkillServiceError,
@@ -123,13 +130,15 @@ impl ConnectorService {
 pub(crate) struct CrossPlaneService {
     pub(crate) label: &'static str,
     pub(crate) owner: &'static str,
+    runtime_services: Arc<runtime::RuntimeServices>,
 }
 
 impl CrossPlaneService {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(runtime_services: Arc<runtime::RuntimeServices>) -> Self {
         Self {
             label: "cross_plane",
             owner: "0.9.315 Cross-plane service boundary",
+            runtime_services,
         }
     }
 }
@@ -214,6 +223,26 @@ pub(crate) struct AuditService {
 pub(crate) struct HarnessEvalService {
     pub(crate) label: &'static str,
     pub(crate) owner: &'static str,
+    pub(crate) active_jobs: HarnessEvalJobRegistry,
+}
+
+/// Process-local worker registry owned by the Gateway service instance.
+/// Durable run state remains in `HarnessEvalReportStore`; this only tracks
+/// cancellable workers currently owned by this process.
+#[derive(Clone)]
+pub(crate) struct ActiveHarnessEvalJob {
+    pub(crate) run_id: String,
+    pub(crate) level: String,
+    pub(crate) requested_at_ms: u128,
+    pub(crate) cancel_requested: Arc<AtomicBool>,
+}
+
+pub(crate) type HarnessEvalJobRegistry = Arc<Mutex<HashMap<String, ActiveHarnessEvalJob>>>;
+
+#[derive(Clone)]
+pub(crate) struct EvolutionService {
+    pub(crate) label: &'static str,
+    pub(crate) owner: &'static str,
 }
 
 impl AuditService {
@@ -264,61 +293,87 @@ impl ProviderService {
         runtime_config: &runtime::RuntimeConfig,
     ) -> serde_json::Value {
         let providers = runtime_config.providers();
+        let registry = model_protocol::model_registry::ModelRegistry::load()
+            .unwrap_or_else(|_| model_protocol::model_registry::ModelRegistry::empty());
         let configured_model = runtime_config.model().map(str::to_string);
-        let configured_model_provider = configured_model
-            .as_deref()
-            .and_then(|model| providers.resolve_full(model))
-            .map(|provider| provider.name.clone());
-        let mut provider_rows = providers
+        let config_source = if runtime_config.loaded_entries().is_empty() {
+            "default"
+        } else {
+            "config"
+        };
+        let catalog = provider::ProviderCatalog::from_input(provider::ProviderCatalogInput {
+            providers,
+            registry: &registry,
+            configured_model: configured_model.as_deref(),
+            aliases: runtime_config.aliases(),
+            config_source,
+            extra_sources: Vec::new(),
+            transforms: Vec::new(),
+            warnings: Vec::new(),
+        });
+        let configured_model_provider = catalog
+            .profiles
+            .iter()
+            .find(|profile| profile.id == "default")
+            .and_then(|profile| profile.provider.clone());
+        let catalog_generation = catalog.generation.clone();
+        let provider_count = catalog.providers.len();
+        let provider_model_count = catalog.models.len();
+        let catalog_profiles = catalog.profiles.clone();
+        let catalog_warnings = catalog.warnings.clone();
+        let provider_rows = catalog
             .providers
-            .values()
+            .iter()
             .map(|provider| {
+                let provider_models = catalog
+                    .models
+                    .iter()
+                    .filter(|model| model.provider == provider.id)
+                    .map(|model| model.id.clone())
+                    .collect::<Vec<_>>();
                 serde_json::json!({
                     "name": provider.name,
                     "base_url": provider.base_url,
-                    "protocol": provider.protocol,
-                    "models": provider.models,
-                    "model_count": provider.models.len(),
-                    "credential_present": !provider.api_key.trim().is_empty(),
+                    "protocol": provider.configured_protocol,
+                    "effective_protocol": provider.effective_protocol,
+                    "protocol_configured": provider.protocol_configured,
+                    "models": provider_models,
+                    "model_count": provider.model_count,
+                    "credential_present": provider.credential_present,
+                    "catalog_generation": catalog_generation.clone(),
                 })
             })
             .collect::<Vec<_>>();
-        provider_rows.sort_by(|left, right| {
-            left["name"]
-                .as_str()
-                .unwrap_or("")
-                .cmp(right["name"].as_str().unwrap_or(""))
-        });
-        let selected_model = configured_model.clone();
-        let models = provider_rows
+        let models = catalog
+            .models
             .iter()
-            .flat_map(|provider| {
-                let provider_name = provider["name"].as_str().unwrap_or("").to_string();
-                let selected_model = selected_model.clone();
-                provider["models"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter_map(move |model| {
-                        model.as_str().map(|id| {
-                            serde_json::json!({
-                                "id": id,
-                                "name": id,
-                                "provider": provider_name,
-                                "selected": selected_model.as_deref() == Some(id),
-                            })
-                        })
-                    })
+            .map(|model| {
+                serde_json::json!({
+                    "id": model.id,
+                    "name": model.name,
+                    "display_name": model.display_name,
+                    "provider": model.provider,
+                    "effective_protocol": model.effective_protocol,
+                    "protocol_configured": model.protocol_configured,
+                    "selected": model.selected,
+                    "context_window_tokens": model.context_window_tokens,
+                    "max_output_tokens": model.max_output_tokens,
+                    "capabilities": model.capabilities,
+                    "catalog_generation": catalog_generation.clone(),
+                })
             })
             .collect::<Vec<_>>();
 
         serde_json::json!({
             "envelope": self.envelope("config_projection"),
+            "catalog": catalog,
+            "catalog_generation": catalog_generation,
             "providers": provider_rows,
             "models": models,
-            "provider_count": providers.providers.len(),
-            "provider_model_count": models.len(),
+            "profiles": catalog_profiles,
+            "warnings": catalog_warnings,
+            "provider_count": provider_count,
+            "provider_model_count": provider_model_count,
             "configured_model": configured_model,
             "configured_model_provider": configured_model_provider,
             "configured_model_resolved": configured_model.is_none() || configured_model_provider.is_some(),
@@ -364,10 +419,10 @@ impl GrowthService {
         receipt: &RiskGateReceipt,
     ) -> serde_json::Value {
         let record = LearningRecord::from_input(GrowthInput {
-            selected_mode: if receipt.approval_required {
-                ExecutionMode::HumanConfirm
+            selected_pattern: if receipt.approval_required {
+                ExecutionPattern::Execute
             } else {
-                ExecutionMode::RiskGate
+                ExecutionPattern::Execute
             },
             complexity: TaskComplexity::Moderate,
             risk: if receipt.approval_required {
@@ -384,10 +439,10 @@ impl GrowthService {
         let event = GrowthEvent::from_input(GrowthEventInput {
             session_id: session_id.into(),
             source_event_kind: "approval.risk_receipt".to_string(),
-            strategy_mode: if receipt.approval_required {
-                ExecutionMode::HumanConfirm
+            strategy_pattern: if receipt.approval_required {
+                ExecutionPattern::Execute
             } else {
-                ExecutionMode::RiskGate
+                ExecutionPattern::Execute
             },
             learning_record: record,
             evidence_refs: vec![GrowthEvidenceRef::new(
@@ -470,6 +525,7 @@ pub(crate) struct AgentService {
 pub(crate) struct MissionService {
     pub(crate) label: &'static str,
     pub(crate) owner: &'static str,
+    runtime_port: Option<runtime::MissionRuntimePort>,
 }
 
 impl AgentService {
@@ -488,6 +544,7 @@ impl AgentService {
 #[derive(Clone)]
 pub(crate) struct GatewayServices {
     pub(crate) runtime: Option<Arc<RuntimeService>>,
+    pub(crate) runtime_events: RuntimeEventService,
     pub(crate) surface: SurfaceService,
     pub(crate) slash: SlashController,
     pub(crate) session: SessionService,
@@ -501,6 +558,7 @@ pub(crate) struct GatewayServices {
     pub(crate) system: SystemService,
     pub(crate) audit: AuditService,
     pub(crate) harness_eval: HarnessEvalService,
+    pub(crate) evolution: EvolutionService,
     pub(crate) provider: ProviderService,
     pub(crate) reality: RealityService,
     pub(crate) growth: GrowthService,
@@ -748,6 +806,7 @@ mod tests {
                 "system",
                 "audit",
                 "harness_eval",
+                "evolution",
                 "provider",
                 "reality",
                 "growth",
@@ -788,6 +847,18 @@ mod tests {
             services.harness_eval.envelope("reports").operation,
             "reports"
         );
+        let evolution_contracts = services.evolution.contracts();
+        assert!(evolution_contracts
+            .iter()
+            .any(|contract| contract.operation == "signals"));
+        assert!(evolution_contracts
+            .iter()
+            .any(|contract| contract.operation == "proposals"));
+        assert!(evolution_contracts.iter().all(|contract| {
+            !contract.operation.contains("candidate")
+                && !contract.operation.contains("sandbox")
+                && !contract.operation.contains("rollback")
+        }));
         assert_eq!(
             services.provider.config_projection_contract().operation,
             "config_projection"
@@ -850,7 +921,7 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         let record = LearningRecord::from_input(GrowthInput {
-            selected_mode: ExecutionMode::PlanExecute,
+            selected_pattern: ExecutionPattern::Execute,
             complexity: TaskComplexity::Complex,
             risk: TaskRisk::Medium,
             context_omitted: 0,
@@ -862,7 +933,7 @@ mod tests {
         let event = GrowthEvent::from_input(GrowthEventInput {
             session_id: "growth-session-1".to_string(),
             source_event_kind: "runtime.harness_contract.trace".to_string(),
-            strategy_mode: ExecutionMode::PlanExecute,
+            strategy_pattern: ExecutionPattern::Execute,
             learning_record: record,
             evidence_refs: vec![GrowthEvidenceRef::new(
                 "runtime_trace",

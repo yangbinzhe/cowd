@@ -58,6 +58,11 @@ impl ToolDagPlan {
             edges,
         }
     }
+
+    #[must_use]
+    pub fn to_tool_requests(&self) -> Vec<ToolRequest> {
+        to_tool_requests(&self.tasks, &self.edges)
+    }
 }
 
 #[must_use]

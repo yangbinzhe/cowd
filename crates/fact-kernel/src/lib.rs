@@ -1,3 +1,12 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
 //! Unified fact semantics for Cowd memory, matrix, and growth.
 //!
 //! This crate contains contracts only.  It must not depend on Memory stores,

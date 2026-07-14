@@ -75,23 +75,26 @@ fn runtime_has_no_surface_sdk_dependency(repo_root: &Path) -> SourceSelfAuditChe
 
 fn gateway_owns_surface_boundary(repo_root: &Path) -> SourceSelfAuditCheck {
     let path = repo_root.join("crates/gateway/Cargo.toml");
-    let channel_routes = repo_root.join("crates/gateway/src/api_routes/channel_routes.rs");
+    let message_connector_routes =
+        repo_root.join("crates/gateway/src/api_routes/message_connector_routes.rs");
     let source = read_source(&path);
-    let route_source = read_source(&channel_routes);
+    let route_source = read_source(&message_connector_routes);
     let passed = source.as_deref().is_some_and(|source| {
         source.contains("surface = { path = \"../surface\" }")
             && !source.contains("channel = { path = \"../channel\" }")
             && !source.contains("channel-adapters = ")
-    }) && route_source
-        .as_deref()
-        .is_some_and(|source| source.contains("surface::channel"));
+    }) && route_source.as_deref().is_some_and(|source| {
+        source.contains("surface::message")
+            && source.contains("MessageConnectorContract")
+            && source.contains("/api/message-connectors")
+    });
     check(
         "gateway.owns_surface_boundary",
         "gateway",
         passed,
-        "gateway must expose channel APIs through Surface contracts without adapter SDK coupling",
-        vec![path, channel_routes],
-        "depend on surface, use surface::channel contracts, and keep platform SDKs behind JSONL Edge sidecars",
+        "gateway must expose message connector APIs through Surface contracts without adapter SDK coupling",
+        vec![path, message_connector_routes],
+        "depend on surface, use surface::message contracts, and keep platform SDKs behind JSONL Edge sidecars",
     )
 }
 
@@ -99,7 +102,7 @@ fn runtime_host_uses_runtime_service(repo_root: &Path) -> SourceSelfAuditCheck {
     let path = repo_root.join("crates/gateway/src/runtime_host/mod.rs");
     let source = read_source(&path);
     let passed = source.as_deref().is_some_and(|source| {
-        source.contains("RuntimeService::new(") && !source.contains(".run_turn_async(")
+        source.contains("RuntimeService::new(") && source.contains("runtime_services")
     });
     check(
         "gateway.runtime_host_uses_runtime_service",
@@ -107,7 +110,7 @@ fn runtime_host_uses_runtime_service(repo_root: &Path) -> SourceSelfAuditCheck {
         passed,
         "external inbound execution must go through RuntimeService",
         vec![path],
-        "replace direct runtime.run_turn_async calls with RuntimeService::run_turn_with_timeout and preserve turn receipts",
+        "submit through RuntimeService::run_turn -> StandardRuntimeHost::submit_turn and preserve turn receipts",
     )
 }
 

@@ -1,9 +1,17 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
 use model_protocol::provider_config::ProviderConfig;
 use provider::{
     ContentBlockDelta, InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
     ProviderClient, StreamEvent,
 };
 use serde_json::Value;
+use std::path::PathBuf;
 
 #[tokio::test]
 #[ignore = "requires COWD_AI_HARNESS_LIVE=1 and configured provider credentials"]
@@ -21,7 +29,7 @@ async fn provider_config_live_smoke_returns_structured_health_signal() {
             expected_value: "live_provider",
         },
         LiveProbe {
-            name: "simple_direct_answer",
+            name: "simple_answer",
             max_tokens: 96,
             prompt:
                 "A user asks: what is 2+2? Return only JSON: {\"status\":\"ok\",\"route\":\"direct\",\"answer\":\"4\"}",
@@ -257,9 +265,64 @@ fn fallback_provider_from_env(model: &str) -> Option<ProviderConfig> {
         base_url,
         api_key,
         models: vec![model.to_string()],
-        name: "env-openai-compatible".to_string(),
-        protocol: Some("openai-compat".to_string()),
+        name: "env-completions".to_string(),
+        protocol: Some("completions".to_string()),
     })
+}
+
+fn cowd_config_path() -> PathBuf {
+    std::env::var_os("COWD_CONFIG_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".cowd")
+                .join("config.yaml")
+        })
+}
+
+fn provider_from_cowd_config(model: &str) -> Option<ProviderConfig> {
+    let contents = std::fs::read_to_string(cowd_config_path()).ok()?;
+    let value = serde_yaml::from_str::<serde_yaml::Value>(&contents).ok()?;
+    let root = value.as_mapping()?;
+    let providers = root
+        .get(serde_yaml::Value::String("providers".to_string()))?
+        .as_mapping()?;
+    for (name, provider) in providers {
+        let name = name.as_str()?.to_string();
+        let provider = provider.as_mapping()?;
+        let models = provider
+            .get(serde_yaml::Value::String("models".to_string()))
+            .and_then(serde_yaml::Value::as_sequence)?
+            .iter()
+            .filter_map(serde_yaml::Value::as_str)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        if !models.iter().any(|candidate| candidate == model) {
+            continue;
+        }
+        let base_url = provider
+            .get(serde_yaml::Value::String("base_url".to_string()))
+            .and_then(serde_yaml::Value::as_str)?
+            .to_string();
+        let api_key = provider
+            .get(serde_yaml::Value::String("api_key".to_string()))
+            .and_then(serde_yaml::Value::as_str)?
+            .to_string();
+        let protocol = provider
+            .get(serde_yaml::Value::String("protocol".to_string()))
+            .and_then(serde_yaml::Value::as_str)
+            .map(ToString::to_string);
+        return Some(ProviderConfig {
+            base_url,
+            api_key,
+            models,
+            name,
+            protocol,
+        });
+    }
+    None
 }
 
 fn live_env() -> Option<LiveEnv> {
@@ -272,7 +335,8 @@ fn live_env() -> Option<LiveEnv> {
         .ok()
         .or_else(|| std::env::var("OPENAI_MODEL").ok())
         .expect("live validation requires COWD_AI_HARNESS_LIVE_MODEL or OPENAI_MODEL");
-    let provider = fallback_provider_from_env(&model)
+    let provider = provider_from_cowd_config(&model)
+        .or_else(|| fallback_provider_from_env(&model))
         .unwrap_or_else(|| panic!("no provider configured for live model {model:?}"));
     let provider_name = provider.name.clone();
     let client = ProviderClient::from_config(&provider).expect("provider client should build");
@@ -290,10 +354,11 @@ async fn send_live_probe(
 ) -> Result<MessageResponse, provider::ApiError> {
     let mut last_empty: Option<MessageResponse> = None;
     for attempt in 1..=3 {
+        let max_tokens = live_probe_max_tokens(requested_model, probe.max_tokens, attempt);
         let response = client
             .send_message(&MessageRequest {
                 model: requested_model.to_string(),
-                max_tokens: probe.max_tokens,
+                max_tokens,
                 messages: vec![InputMessage::user_text(probe.prompt)],
                 system: Some(
                     "You are validating an AI harness. Return strict JSON only; no markdown."
@@ -308,17 +373,41 @@ async fn send_live_probe(
             return Ok(response);
         }
         eprintln!(
-            "live_provider probe={} attempt={attempt} returned empty text response_id={} stop_reason={:?} total_tokens={}",
+            "live_provider probe={} attempt={attempt} max_tokens={} returned empty text response_id={} stop_reason={:?} total_tokens={}",
             probe.name,
+            max_tokens,
             response.id,
             response.stop_reason,
             response.total_tokens()
         );
         last_empty = Some(response);
-        tokio::time::sleep(std::time::Duration::from_millis(250 * attempt)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(250 * u64::from(attempt))).await;
     }
 
     Ok(last_empty.expect("at least one live attempt should have run"))
+}
+
+fn live_probe_max_tokens(model: &str, requested: u32, attempt: u32) -> u32 {
+    if let Ok(value) = std::env::var("COWD_AI_HARNESS_LIVE_MAX_TOKENS") {
+        if let Ok(parsed) = value.parse::<u32>() {
+            if parsed > 0 {
+                return requested.max(parsed);
+            }
+        }
+    }
+
+    let model = model.to_ascii_lowercase();
+    let model_floor = if model.contains("deepseek")
+        || model.contains("qwen")
+        || model.contains("step")
+        || model.contains("glm")
+    {
+        512
+    } else {
+        requested
+    };
+    let retry_floor = model_floor.saturating_mul(attempt).min(1024);
+    requested.max(retry_floor)
 }
 
 fn response_text(response: &MessageResponse) -> String {

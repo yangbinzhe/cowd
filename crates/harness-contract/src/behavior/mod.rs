@@ -1,6 +1,6 @@
 //! Behavior policy checks for avoiding over-engineering while preserving safety.
 
-use crate::core::{ExecutionMode, TaskRisk};
+use crate::core::{ExecutionPattern, TaskRisk};
 use crate::strategy::StrategyDecision;
 use serde::{Deserialize, Serialize};
 
@@ -10,7 +10,7 @@ pub enum RecommendedScope {
     Direct,
     MinimalPatch,
     PlannedChange,
-    WorkGraph,
+    ExecutionGraph,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,10 +58,8 @@ pub fn decide_behavior_policy(prompt: &str, strategy: &StrategyDecision) -> Beha
     }
 
     if matches!(
-        strategy.mode,
-        ExecutionMode::SupervisorSubagents
-            | ExecutionMode::ParallelWorktree
-            | ExecutionMode::DeliberationSearch
+        strategy.pattern,
+        ExecutionPattern::Collaborate | ExecutionPattern::Deliberate | ExecutionPattern::Supervise
     ) && !prompt_lower.contains("复杂")
         && !prompt_lower.contains("全量")
         && !prompt_lower.contains("架构")
@@ -83,11 +81,13 @@ pub fn decide_behavior_policy(prompt: &str, strategy: &StrategyDecision) -> Beha
         );
     }
 
-    let recommended_scope = match strategy.mode {
-        ExecutionMode::DirectAnswer => RecommendedScope::Direct,
-        ExecutionMode::FastEdit => RecommendedScope::MinimalPatch,
-        ExecutionMode::PlanExecute | ExecutionMode::ReActLoop => RecommendedScope::PlannedChange,
-        _ => RecommendedScope::WorkGraph,
+    let recommended_scope = match strategy.pattern {
+        ExecutionPattern::Direct => RecommendedScope::Direct,
+        ExecutionPattern::Explore => RecommendedScope::Direct,
+        ExecutionPattern::Execute => RecommendedScope::PlannedChange,
+        ExecutionPattern::Deliberate
+        | ExecutionPattern::Collaborate
+        | ExecutionPattern::Supervise => RecommendedScope::ExecutionGraph,
     };
     let requires_scope_downgrade = !overengineering_risks.is_empty();
     let requires_human_review = requires_scope_downgrade

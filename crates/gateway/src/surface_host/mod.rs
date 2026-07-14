@@ -19,7 +19,8 @@ mod types;
 pub(crate) use ingress::spawn_surface_ingress_dispatcher;
 pub(crate) use message_store::{
     SurfaceDeliveryEvent, SurfaceInboxReceipt, SurfaceInboxRecord, SurfaceMessageSnapshot,
-    SurfaceMessageStore, SurfaceOutboxRecord,
+    SurfaceMessageStore, SurfaceOutboxRecord, SurfaceTriggerEventReceipt,
+    SurfaceTriggerEventRecord,
 };
 pub(crate) use types::{
     SurfaceDiscoveryFailure, SurfaceDiscoveryReport, SurfaceHostHealth, SurfaceResourceSummary,
@@ -57,7 +58,15 @@ impl SurfaceHost {
         let message_root = roots
             .first()
             .map(|root| root.join(".cowd-edge-messages"))
-            .unwrap_or_else(|| SurfaceMessageStore::default_root(Path::new(".")));
+            .unwrap_or_else(isolated_message_root);
+        Self::with_configs_and_message_root(roots, configs, message_root)
+    }
+
+    pub(crate) fn with_configs_and_message_root(
+        roots: Vec<PathBuf>,
+        configs: BTreeMap<String, serde_json::Value>,
+        message_root: PathBuf,
+    ) -> Self {
         Self::with_configs_and_message_store(
             roots,
             configs,
@@ -132,6 +141,19 @@ fn edge_manifest_roots(root: &Path) -> Vec<PathBuf> {
     .collect()
 }
 
+fn cowd_config_home() -> PathBuf {
+    std::env::var_os("COWD_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cowd")))
+        .unwrap_or_else(|| PathBuf::from(".cowd"))
+}
+
+fn isolated_message_root() -> PathBuf {
+    std::env::temp_dir()
+        .join("cowd-surface-messages")
+        .join(uuid::Uuid::new_v4().to_string())
+}
+
 impl Default for SurfaceHost {
     fn default() -> Self {
         Self::new(Vec::new())
@@ -158,6 +180,77 @@ mod tests {
         assert!(roots.contains(&root.join("connectors").join("message")));
         assert!(roots.contains(&root.join("connectors").join("source")));
         assert!(roots.contains(&root.join("connectors").join("automation")));
+    }
+
+    #[test]
+    fn surface_host_empty_roots_message_store_does_not_use_current_directory() {
+        let host = SurfaceHost::with_configs(Vec::new(), BTreeMap::new());
+        assert_ne!(
+            host.message_store_root(),
+            Path::new("."),
+            "surface message store must not default to the source/current directory"
+        );
+        assert!(host
+            .message_store_root()
+            .components()
+            .any(|component| component.as_os_str() == "cowd-surface-messages"));
+    }
+
+    #[tokio::test]
+    async fn reload_manifests_upserts_and_prunes_removed_edges() {
+        let root =
+            std::env::temp_dir().join(format!("cowd-edge-reload-test-{}", uuid::Uuid::new_v4()));
+        let surface_dir = root.join("echo");
+        fs::create_dir_all(&surface_dir).unwrap();
+        let manifest_path = surface_dir.join(SURFACE_MANIFEST_FILE);
+        fs::write(
+            &manifest_path,
+            r#"{
+                "schema": "cowd.surface.v1",
+                "id": "echo",
+                "name": "Echo Surface",
+                "version": "1.0.0",
+                "kind": "external-integration",
+                "entry": "./cowd-edge-echo",
+                "transport": "stdio-jsonl",
+                "capabilities": ["send_text"],
+                "default_enabled": true
+            }"#,
+        )
+        .unwrap();
+
+        let host = SurfaceHost::new(vec![root.clone()]);
+        let first = host.reload_manifests().await;
+        assert_eq!(first.discovered, 1);
+        assert!(first.removed.is_empty());
+        assert_eq!(host.get("echo").unwrap().version, "1.0.0");
+
+        fs::write(
+            &manifest_path,
+            r#"{
+                "schema": "cowd.surface.v1",
+                "id": "echo",
+                "name": "Echo Surface",
+                "version": "2.0.0",
+                "kind": "external-integration",
+                "entry": "./cowd-edge-echo",
+                "transport": "stdio-jsonl",
+                "capabilities": ["send_text", "receive_text"],
+                "default_enabled": true
+            }"#,
+        )
+        .unwrap();
+        let second = host.reload_manifests().await;
+        assert_eq!(second.discovered, 1);
+        assert_eq!(host.get("echo").unwrap().version, "2.0.0");
+
+        fs::remove_dir_all(&surface_dir).unwrap();
+        let third = host.reload_manifests().await;
+        assert_eq!(third.discovered, 0);
+        assert_eq!(third.removed, vec!["echo".to_string()]);
+        assert!(host.get("echo").is_none());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
@@ -203,6 +296,7 @@ mod tests {
                 recipient: "room-1".to_string(),
                 thread: None,
                 text: "hello".to_string(),
+                idempotency_key: None,
                 metadata: serde_json::Value::Null,
             })
             .await
@@ -374,6 +468,7 @@ done
                 recipient: "room-1".to_string(),
                 thread: None,
                 text: "hello".to_string(),
+                idempotency_key: None,
                 metadata: serde_json::Value::Null,
             })
             .await

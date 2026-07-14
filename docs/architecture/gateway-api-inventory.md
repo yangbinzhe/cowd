@@ -1,7 +1,14 @@
 # Gateway API Inventory
 
-Gateway is the shared runtime API for TUI and WebUI. This inventory records the
-active contract groups that must remain available during the entrypoint split.
+Full generated route reference: [`../api/gateway-api-reference.md`](../api/gateway-api-reference.md).
+Gateway API framework and relationship model: [`gateway-api-framework.md`](gateway-api-framework.md).
+
+Gateway is the shared runtime API for TUI, WebUI, surfaces, connectors, and AI
+runtime control. The runtime source of truth is
+`GET /api/gateway/capability-contract`; `GET /api/gateway/openapi.json` and
+`GET /api/gateway/openai-tools` are derived machine-readable projections.
+This inventory records the active contract groups that must remain available
+during entrypoint and surface evolution.
 
 | group | status | consumers | purpose |
 |---|---|---|---|

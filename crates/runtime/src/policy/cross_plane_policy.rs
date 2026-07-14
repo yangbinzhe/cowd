@@ -8,8 +8,6 @@ use chrono::{DateTime, Utc};
 use harness_contract::policy::{CrossPlaneRisk, DataClassification};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::Path;
 use std::sync::{Arc, OnceLock, RwLock};
 use uuid::Uuid;
 
@@ -175,6 +173,8 @@ pub struct CrossPlaneExecutionReceipt {
     pub blockers: Vec<String>,
     pub audit_record_id: Option<String>,
     #[serde(default)]
+    pub execution_graph_id: Option<String>,
+    #[serde(default)]
     pub dispatch_target: Option<CrossPlaneDispatchTarget>,
     #[serde(default)]
     pub dispatch_outcome: Option<CrossPlaneDispatchOutcome>,
@@ -203,6 +203,7 @@ impl CrossPlaneExecutionReceipt {
             decision,
             blockers,
             audit_record_id,
+            execution_graph_id: None,
             dispatch_target: None,
             dispatch_outcome: None,
         }
@@ -223,6 +224,12 @@ impl CrossPlaneExecutionReceipt {
         dispatch_outcome: Option<CrossPlaneDispatchOutcome>,
     ) -> Self {
         self.dispatch_outcome = dispatch_outcome;
+        self
+    }
+
+    #[must_use]
+    pub fn with_execution_graph_id(mut self, execution_graph_id: Option<String>) -> Self {
+        self.execution_graph_id = execution_graph_id;
         self
     }
 }
@@ -251,6 +258,23 @@ pub struct CrossPlaneDispatchOutcome {
 }
 
 impl CrossPlaneDispatchOutcome {
+    #[must_use]
+    pub fn delivery_uncertain(
+        platform: impl Into<String>,
+        operation: impl Into<String>,
+        session_key: impl Into<String>,
+    ) -> Self {
+        Self {
+            attempted_at: Utc::now(),
+            platform: platform.into(),
+            operation: operation.into(),
+            session_key: session_key.into(),
+            status: "delivery_uncertain".to_string(),
+            error: Some("external delivery requires manual reconciliation".to_string()),
+            provider_message_id: None,
+        }
+    }
+
     #[must_use]
     pub fn sent(
         platform: impl Into<String>,
@@ -641,39 +665,6 @@ impl CrossPlaneControlPlane {
         state.executions = snapshot.executions;
     }
 
-    pub fn load_from_path(&self, path: &Path) -> Result<(), String> {
-        if !path.exists() {
-            return Ok(());
-        }
-        let text = fs::read_to_string(path)
-            .map_err(|err| format!("failed to read cross-plane state: {err}"))?;
-        let snapshot = serde_json::from_str::<CrossPlaneControlSnapshot>(&text)
-            .map_err(|err| format!("failed to parse cross-plane state: {err}"))?;
-        self.replace_snapshot(snapshot);
-        Ok(())
-    }
-
-    pub fn save_to_path(&self, path: &Path) -> Result<(), String> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|err| format!("failed to create cross-plane state dir: {err}"))?;
-        }
-        let text = serde_json::to_string_pretty(&self.snapshot())
-            .map_err(|err| format!("failed to encode cross-plane state: {err}"))?;
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("control-state.json");
-        let tmp_path = path.with_file_name(format!(".{file_name}.tmp-{}", Uuid::new_v4()));
-        fs::write(&tmp_path, text)
-            .map_err(|err| format!("failed to write cross-plane state temp file: {err}"))?;
-        if let Err(err) = fs::rename(&tmp_path, path) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(format!("failed to replace cross-plane state: {err}"));
-        }
-        Ok(())
-    }
-
     #[must_use]
     pub fn list_identities(&self) -> Vec<CrossPlaneIdentityBinding> {
         self.inner
@@ -846,6 +837,39 @@ impl CrossPlaneControlPlane {
         if overflow > 0 {
             state.executions.drain(0..overflow);
         }
+    }
+
+    pub fn reconcile_execution(
+        &self,
+        idempotency_key: &str,
+        outcome: CrossPlaneDispatchOutcome,
+    ) -> Option<CrossPlaneExecutionReceipt> {
+        let mut state = self.inner.write().unwrap_or_else(|err| err.into_inner());
+        let receipt = state
+            .executions
+            .iter_mut()
+            .rev()
+            .find(|receipt| receipt.idempotency_key.as_deref() == Some(idempotency_key))?;
+        match outcome.status.as_str() {
+            "sent" => {
+                receipt.status = "dispatched".into();
+                receipt.dispatch_status = "sent".into();
+                receipt.blockers.clear();
+            }
+            "failed" => {
+                receipt.status = "blocked".into();
+                receipt.dispatch_status = "dispatch_failed".into();
+                receipt.blockers = outcome.error.clone().into_iter().collect();
+            }
+            _ => {
+                receipt.status = "delivery_uncertain".into();
+                receipt.dispatch_status = "blocked_reconciliation".into();
+                receipt.blockers = vec!["delivery_uncertain:manual_reconciliation_required".into()];
+            }
+        }
+        receipt.dispatch_outcome = Some(outcome);
+        receipt.timestamp = Utc::now();
+        Some(receipt.clone())
     }
 
     #[must_use]
@@ -1320,10 +1344,13 @@ fn identity_trust_rank(trust: IdentityTrust) -> u8 {
 }
 
 fn identity_contact_keys(identity_ref: &str) -> Vec<String> {
-    static EMAIL_RE: OnceLock<Regex> = OnceLock::new();
-    let email_re = EMAIL_RE.get_or_init(|| {
-        Regex::new(r"(?i)[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}").expect("valid email regex")
-    });
+    static EMAIL_RE: OnceLock<Option<Regex>> = OnceLock::new();
+    let Some(email_re) = EMAIL_RE
+        .get_or_init(|| Regex::new(r"(?i)[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}").ok())
+        .as_ref()
+    else {
+        return Vec::new();
+    };
     let mut keys = Vec::new();
     for matched in email_re.find_iter(identity_ref) {
         keys.push(format!("email:{}", matched.as_str().to_ascii_lowercase()));
@@ -2055,33 +2082,6 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_snapshot_roundtrips_to_json_file() {
-        let control = CrossPlaneControlPlane::new();
-        control.upsert_identity(CrossPlaneIdentityBinding::verified(
-            "user:yi",
-            "channel://wechat/user/u1",
-        ));
-        control.upsert_grant(CrossPlaneGrant::persistent(
-            "user:yi",
-            "service.mock.docs.read",
-        ));
-        let mut action = CrossPlaneAction::new("user:yi", "service.mock.docs.read");
-        action.identity_trust = IdentityTrust::Verified;
-        let _ = control.decide_and_audit(action, now());
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cross-plane.json");
-        control.save_to_path(&path).unwrap();
-
-        let restored = CrossPlaneControlPlane::new();
-        restored.load_from_path(&path).unwrap();
-
-        assert_eq!(restored.list_identities().len(), 1);
-        assert_eq!(restored.list_grants().len(), 1);
-        assert_eq!(restored.list_audit(10, 0).len(), 1);
-    }
-
-    #[test]
     fn control_plane_audit_is_bounded_to_recent_records() {
         let control = CrossPlaneControlPlane::new();
         for idx in 0..(MAX_CROSS_PLANE_AUDIT_RECORDS + 3) {
@@ -2107,30 +2107,5 @@ mod tests {
             snapshot.audit[0].action.session_id.as_deref(),
             Some("session-3")
         );
-    }
-
-    #[test]
-    fn control_plane_save_is_atomic_and_cleans_temp_files() {
-        let control = CrossPlaneControlPlane::new();
-        control.upsert_identity(CrossPlaneIdentityBinding::verified(
-            "user:yi",
-            "channel://wechat/user/u1",
-        ));
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("control-state.json");
-
-        control.save_to_path(&path).unwrap();
-
-        assert!(path.exists());
-        let temp_files = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
-            .count();
-        assert_eq!(temp_files, 0);
-
-        let restored = CrossPlaneControlPlane::new();
-        restored.load_from_path(&path).unwrap();
-        assert_eq!(restored.list_identities().len(), 1);
     }
 }

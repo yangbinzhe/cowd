@@ -1,13 +1,14 @@
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use sandbox_launcher::{program_command, SandboxLaunchSpec};
 use surface::{
-    normalize_surface_id, SurfaceActionRequest, SurfaceDescriptor, SurfaceError,
-    SurfaceFailureKind, SurfaceFrame, SurfaceLifecycle, SurfaceOperationResult, SurfaceRoute,
-    SurfaceRuntimeSnapshot, SurfaceRuntimeStatus, SurfaceSendRequest,
+    message::MessageActionKind, normalize_surface_id, SurfaceActionRequest, SurfaceDescriptor,
+    SurfaceError, SurfaceFailureKind, SurfaceFrame, SurfaceLifecycle, SurfaceOperationResult,
+    SurfaceRoute, SurfaceRuntimeSnapshot, SurfaceRuntimeStatus, SurfaceSendRequest,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::sync::oneshot;
@@ -148,13 +149,17 @@ impl SurfaceHost {
             return Ok(SurfaceOperationResult::unavailable(&request.surface));
         }
         let surface_id = normalize_surface_id(&request.surface);
+        let mut metadata = request.metadata;
+        if let Some(idempotency_key) = request.idempotency_key {
+            metadata["idempotency_key"] = serde_json::Value::String(idempotency_key);
+        }
         let frame = SurfaceFrame::Send {
             id: SurfaceFrame::new_id(),
             surface: surface_id.clone(),
             recipient: request.recipient,
             thread: request.thread,
             text: request.text,
-            metadata: request.metadata,
+            metadata,
         };
         self.invoke(surface, frame).await
     }
@@ -205,7 +210,7 @@ impl SurfaceHost {
         }
         self.action(SurfaceActionRequest {
             surface: descriptor.id,
-            action: "callback.dispatch".to_string(),
+            action: MessageActionKind::CallbackDispatch.as_str().to_string(),
             payload: serde_json::json!({
                 "path": normalize_request_path(path),
                 "method": method.to_ascii_uppercase(),
@@ -400,8 +405,21 @@ fn invoke_sidecar(
         }
     }
 
-    let mut child = Command::new(&command_path)
-        .current_dir(working_dir.as_deref().unwrap_or_else(|| Path::new(".")))
+    let workspace_root = working_dir
+        .as_deref()
+        .ok_or_else(|| SurfaceError::Invocation {
+            surface: surface_id.clone(),
+            reason: "one-shot sidecar manifest has no parent directory".to_string(),
+        })?;
+    let mut sandbox = SandboxLaunchSpec::workspace(workspace_root);
+    sandbox.working_directory = Some(workspace_root.to_path_buf());
+    let prepared =
+        program_command(&command_path, &sandbox).map_err(|error| SurfaceError::Invocation {
+            surface: surface_id.clone(),
+            reason: format!("sidecar sandbox unavailable: {error}"),
+        })?;
+    let mut child = prepared
+        .into_command()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -510,6 +528,7 @@ mod tests {
                 recipient: "chat-a".to_string(),
                 thread: Some("thread-a".to_string()),
                 text: "hello".to_string(),
+                idempotency_key: None,
                 metadata: serde_json::json!({
                     "reply_to": "om_external",
                     "local_reply_to": "om_external:replay:local",

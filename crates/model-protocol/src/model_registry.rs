@@ -273,15 +273,6 @@ impl ModelResolver {
         }
     }
 
-    /// Create a resolver with only the built-in fallback table (no config).
-    #[must_use]
-    pub fn default() -> Self {
-        Self {
-            config_aliases: HashMap::new(),
-            builtin_aliases: Self::default_builtins(),
-        }
-    }
-
     /// Resolve an alias, returning the canonical model name.
     /// Falls back to returning the input unchanged when no alias matches.
     #[must_use]
@@ -342,8 +333,12 @@ impl ModelResolver {
 }
 
 impl Default for ModelResolver {
+    /// Create a resolver with only the built-in fallback table (no config).
     fn default() -> Self {
-        Self::default()
+        Self {
+            config_aliases: HashMap::new(),
+            builtin_aliases: Self::default_builtins(),
+        }
     }
 }
 

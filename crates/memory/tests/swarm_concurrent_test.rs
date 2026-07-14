@@ -1,4 +1,11 @@
-//! Swarm concurrency stress test: 5 agents write to L4 simultaneously.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
+//! Concurrent scoped-memory stress test: 5 agents write L3 evidence simultaneously.
 //!
 //! Verifies:
 //! - Zero data loss under concurrent writes
@@ -28,7 +35,7 @@ fn make_entry(agent_id: &str, idx: u32, content: &str, scope: MemoryScope) -> Me
     let tag = format!("agent-{agent_id}-entry-{idx}");
     MemoryEntry {
         id: uuid::Uuid::new_v4(),
-        layer: MemoryLayer::L4,
+        layer: MemoryLayer::L3,
         category: MemoryCategory::Shared,
         priority: Priority::Normal,
         source: MemorySource::AutoExtracted,
@@ -63,9 +70,6 @@ async fn test_swarm_5_agents_concurrent_writes_no_data_loss() {
     let orch =
         Arc::new(MemoryOrchestrator::from_store(test_config(), Arc::clone(&store), None).unwrap());
 
-    // Set a common project scope for all agents.
-    orch.set_active_scope(MemoryScope::Project("concurrent-project".into()));
-
     const AGENTS: usize = 5;
     const ENTRIES_PER_AGENT: usize = 10;
     const TOTAL: usize = AGENTS * ENTRIES_PER_AGENT;
@@ -93,25 +97,25 @@ async fn test_swarm_5_agents_concurrent_writes_no_data_loss() {
     }
 
     // Verify: all entries survived
-    let l4_meta = orch.list_layer(MemoryLayer::L4).await.unwrap();
+    let l3_meta = orch.list_layer(MemoryLayer::L3).await.unwrap();
     assert_eq!(
-        l4_meta.len(),
+        l3_meta.len(),
         TOTAL,
-        "Expected {TOTAL} entries in L4, got {}",
-        l4_meta.len()
+        "Expected {TOTAL} entries in L3, got {}",
+        l3_meta.len()
     );
 
     // Verify each entry is retrievable
-    for meta in &l4_meta {
+    for meta in &l3_meta {
         let entry = orch.recall(&meta.id).await.unwrap();
         assert!(entry.is_some(), "Entry {} should be retrievable", meta.id);
     }
 
-    // Verify layer distribution (all should be L4)
-    let retrieved = orch.list_layer(MemoryLayer::L4).await.unwrap();
+    // Verify layer distribution (all should be L3)
+    let retrieved = orch.list_layer(MemoryLayer::L3).await.unwrap();
     for meta in &retrieved {
         let e = orch.recall(&meta.id).await.unwrap().unwrap();
-        assert_eq!(e.layer, MemoryLayer::L4, "All entries should be in L4");
+        assert_eq!(e.layer, MemoryLayer::L3, "All entries should be in L3");
     }
 }
 
@@ -129,8 +133,6 @@ async fn test_swarm_source_agent_tracking() {
         Arc::new(MemoryOrchestrator::from_store(test_config(), Arc::clone(&store), None).unwrap());
 
     // Set common scope
-    orch.set_active_scope(MemoryScope::Project("tracking-project".into()));
-
     const AGENTS: usize = 5;
     const ENTRIES_PER_AGENT: usize = 4;
 
@@ -151,8 +153,8 @@ async fn test_swarm_source_agent_tracking() {
         h.await.unwrap();
     }
 
-    // Fetch all L4 entries and verify source_agent
-    let metas = orch.list_layer(MemoryLayer::L4).await.unwrap();
+    // Fetch all L3 entries and verify source_agent
+    let metas = orch.list_layer(MemoryLayer::L3).await.unwrap();
     assert_eq!(metas.len(), AGENTS * ENTRIES_PER_AGENT);
 
     let mut agent_counts: std::collections::HashMap<String, usize> =
@@ -193,13 +195,11 @@ async fn test_swarm_cross_agent_conflict_detection() {
     let orch = MemoryOrchestrator::from_store(test_config(), Arc::clone(&store), None).unwrap();
 
     // Agent A registers a fact
-    orch.set_active_agent("agent-planner".into());
-    orch.set_active_scope(MemoryScope::Project("conflict-proj".into()));
 
     let fact_a_id = uuid::Uuid::new_v4();
     let entry_a = MemoryEntry {
         id: fact_a_id,
-        layer: MemoryLayer::L4,
+        layer: MemoryLayer::L3,
         category: MemoryCategory::Decision,
         priority: Priority::High,
         source: MemorySource::Import,
@@ -226,11 +226,10 @@ async fn test_swarm_cross_agent_conflict_detection() {
     assert_eq!(got_a.source_agent.as_deref(), Some("agent-planner"));
 
     // Agent B writes a contradictory fact
-    orch.set_active_agent("agent-executor".into());
     let fact_b_id = uuid::Uuid::new_v4();
     let entry_b = MemoryEntry {
         id: fact_b_id,
-        layer: MemoryLayer::L4,
+        layer: MemoryLayer::L3,
         category: MemoryCategory::Decision,
         priority: Priority::High,
         source: MemorySource::Import,
@@ -284,12 +283,10 @@ async fn test_swarm_scope_isolation() {
     let orch = MemoryOrchestrator::from_store(test_config(), Arc::clone(&store), None).unwrap();
 
     // Agent 1 writes to project-alpha
-    orch.set_active_agent("agent-alpha".into());
-    orch.set_active_scope(MemoryScope::Project("project-alpha".into()));
     for j in 0..5 {
         let entry = MemoryEntry {
             id: uuid::Uuid::new_v4(),
-            layer: MemoryLayer::L4,
+            layer: MemoryLayer::L3,
             category: MemoryCategory::Shared,
             priority: Priority::Normal,
             source: MemorySource::AutoExtracted,
@@ -313,12 +310,10 @@ async fn test_swarm_scope_isolation() {
     }
 
     // Agent 2 writes to project-beta
-    orch.set_active_agent("agent-beta".into());
-    orch.set_active_scope(MemoryScope::Project("project-beta".into()));
     for j in 0..3 {
         let entry = MemoryEntry {
             id: uuid::Uuid::new_v4(),
-            layer: MemoryLayer::L4,
+            layer: MemoryLayer::L3,
             category: MemoryCategory::Shared,
             priority: Priority::Normal,
             source: MemorySource::AutoExtracted,
@@ -342,7 +337,7 @@ async fn test_swarm_scope_isolation() {
     }
 
     // All entries should be persisted (8 total)
-    let all = orch.list_layer(MemoryLayer::L4).await.unwrap();
+    let all = orch.list_layer(MemoryLayer::L3).await.unwrap();
     assert_eq!(all.len(), 8, "Expected 8 total entries across scopes");
 
     // Verify scope isolation: recall entries and verify their scope values

@@ -10,12 +10,19 @@ use ratatui::{
 
 use crate::app::App;
 use crate::components::{Component, EventResult, RenderContext};
-use crate::runtime_control_store::{SurfaceEventSummary, SurfaceHealthSummary, SurfaceSummary};
+use crate::runtime_control_store::{
+    MessageBindingSummary, MessageConnectorSummary, MessageEndpointSummary, MessageRouteSummary,
+    SurfaceEventSummary, SurfaceHealthSummary, SurfaceSummary,
+};
 
 pub struct SurfacePanel {
     surfaces: Vec<SurfaceSummary>,
     health: Option<SurfaceHealthSummary>,
     events: Vec<SurfaceEventSummary>,
+    message_connectors: Vec<MessageConnectorSummary>,
+    message_endpoints: Vec<MessageEndpointSummary>,
+    message_routes: Vec<MessageRouteSummary>,
+    message_bindings: Vec<MessageBindingSummary>,
     selected: usize,
     last_status: Option<String>,
     last_receipt: Option<serde_json::Value>,
@@ -28,6 +35,10 @@ impl SurfacePanel {
             surfaces: Vec::new(),
             health: None,
             events: Vec::new(),
+            message_connectors: Vec::new(),
+            message_endpoints: Vec::new(),
+            message_routes: Vec::new(),
+            message_bindings: Vec::new(),
             selected: 0,
             last_status: None,
             last_receipt: None,
@@ -39,6 +50,10 @@ impl SurfacePanel {
         self.surfaces = app.gateway_surfaces.clone();
         self.health = app.gateway_surface_health.clone();
         self.events = app.gateway_surface_events.clone();
+        self.message_connectors = app.gateway_message_connectors.clone();
+        self.message_endpoints = app.gateway_message_endpoints.clone();
+        self.message_routes = app.gateway_message_routes.clone();
+        self.message_bindings = app.gateway_message_bindings.clone();
         if self.selected >= self.surfaces.len() {
             self.selected = self.surfaces.len().saturating_sub(1);
         }
@@ -141,6 +156,38 @@ impl Component for SurfacePanel {
                 Style::default().fg(Color::White),
             ),
         ]));
+        if !self.message_connectors.is_empty()
+            || !self.message_endpoints.is_empty()
+            || !self.message_routes.is_empty()
+            || !self.message_bindings.is_empty()
+        {
+            let ready = self
+                .message_connectors
+                .iter()
+                .filter(|connector| {
+                    connector.enabled
+                        && connector.configured
+                        && !connector.circuit_open
+                        && !matches!(
+                            connector.runtime_status.as_str(),
+                            "failed" | "error" | "unavailable" | "circuit-open"
+                        )
+                })
+                .count();
+            lines.push(Line::from(vec![
+                Span::styled("Message Plane: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!(
+                        "{ready}/{} connectors  endpoints {}  routes {}  bindings {}",
+                        self.message_connectors.len(),
+                        self.message_endpoints.len(),
+                        self.message_routes.len(),
+                        self.message_bindings.len()
+                    ),
+                    Style::default().fg(Color::Cyan),
+                ),
+            ]));
+        }
         lines.push(Line::from(vec![
             Span::styled("Next: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
@@ -149,7 +196,7 @@ impl Component for SurfacePanel {
             ),
         ]));
         lines.push(Line::from(Span::styled(
-            "Keys: j/k  h health  s start  x stop  r restart  R repair  m send  a action  i inbox  o outbox  v deliveries  p replay  d retry  D dlq",
+            "Keys: j/k  h health  s start  x stop  r restart  R repair  m send  a action  g ledger  i inbox  o outbox  v deliveries  p replay  d retry  D dlq  A archive  P purge",
             Style::default().fg(Color::DarkGray),
         )));
         if let Some(status) = &self.last_status {
@@ -284,6 +331,35 @@ impl Component for SurfacePanel {
                     Style::default().fg(Color::DarkGray),
                 ),
             ]));
+            let connector_matches = self
+                .message_connectors
+                .iter()
+                .filter(|connector| {
+                    connector.connector == surface.id || connector.name == surface.id
+                })
+                .collect::<Vec<_>>();
+            if !connector_matches.is_empty() {
+                let summary = connector_matches
+                    .iter()
+                    .take(2)
+                    .map(|connector| {
+                        format!(
+                            "{}:{}:{}",
+                            connector.connector,
+                            connector.configuration_status,
+                            connector.runtime_status
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                lines.push(Line::from(vec![
+                    Span::styled("Message: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        compact(&summary, area.width.saturating_sub(11) as usize),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                ]));
+            }
         }
 
         if !self.events.is_empty() {
@@ -421,6 +497,31 @@ fn receipt_summary(receipt: &serde_json::Value) -> String {
         .get("kind")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("receipt");
+    if kind == "surface.messages" {
+        let snapshot = receipt.get("snapshot").unwrap_or(receipt);
+        let root = receipt
+            .get("message_root")
+            .or_else(|| snapshot.get("message_root"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-");
+        let active_outbox = snapshot
+            .get("active_outbox")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        let dead_letters = snapshot
+            .get("dead_letters")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        let archived = snapshot
+            .get("archived_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        return format!(
+            "{kind} active_outbox={active_outbox} dead_letters={dead_letters} archived={archived} root={root}"
+        );
+    }
     let status = receipt
         .get("status")
         .or_else(|| receipt.get("ok"))
@@ -477,6 +578,48 @@ mod tests {
                 ..Default::default()
             },
         ];
+        app.gateway_message_connectors =
+            vec![crate::runtime_control_store::MessageConnectorSummary {
+                connector: "webui".to_string(),
+                name: "webui".to_string(),
+                configuration_status: "configured".to_string(),
+                runtime_status: "ready".to_string(),
+                enabled: true,
+                configured: true,
+                capability_count: 2,
+                missing_required_count: 0,
+                consecutive_failures: 0,
+                restart_count: 0,
+                circuit_open: false,
+            }];
+        app.gateway_message_endpoints =
+            vec![crate::runtime_control_store::MessageEndpointSummary {
+                endpoint_id: "message:webui:user".to_string(),
+                connector: "webui".to_string(),
+                kind: "User".to_string(),
+                status: "configured".to_string(),
+                configured: true,
+                capability_count: 1,
+            }];
+        app.gateway_message_routes = vec![crate::runtime_control_store::MessageRouteSummary {
+            route_id: "message:webui:default".to_string(),
+            connector: "webui".to_string(),
+            policy: "origin".to_string(),
+            status: "configured".to_string(),
+            configured: true,
+            capability_count: 1,
+            runtime_status: "ready".to_string(),
+        }];
+        app.gateway_message_bindings = vec![crate::runtime_control_store::MessageBindingSummary {
+            binding_id: "message:webui:user:thread".to_string(),
+            connector: "webui".to_string(),
+            endpoint: "user".to_string(),
+            direction: "inbound".to_string(),
+            status: "processed".to_string(),
+            runtime_session_id: Some("session".to_string()),
+            resource_count: 0,
+            last_seen_at_ms: Some(1),
+        }];
 
         let mut panel = SurfacePanel::new();
         panel.sync_from_app(&app);
@@ -490,6 +633,8 @@ mod tests {
         assert!(joined.contains("Surfaces"), "{joined}");
         assert!(joined.contains("Summary:"), "{joined}");
         assert!(joined.contains("Next:"), "{joined}");
+        assert!(joined.contains("Message Plane:"), "{joined}");
+        assert!(joined.contains("1/1 connectors"), "{joined}");
         assert!(joined.contains("tui"), "{joined}");
         assert!(joined.contains("webui"), "{joined}");
         assert!(!joined.contains("channel.feishu"), "{joined}");

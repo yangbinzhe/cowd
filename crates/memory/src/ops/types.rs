@@ -12,6 +12,8 @@ use fact_kernel::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use harness_contract::context::EvidenceAccessRef;
+
 use crate::project_scope::MemoryScope;
 
 // --- Primitive type aliases ---
@@ -206,7 +208,10 @@ fn memory_scope_fact_key(scope: &MemoryScope) -> String {
         MemoryScope::Project(id) => format!("project:{id}"),
         MemoryScope::Session(id) => format!("session:{id}"),
         MemoryScope::Task(id) => format!("task:{id}"),
-        MemoryScope::Agent(id) => format!("agent:{id}"),
+        MemoryScope::AgentDefinitionLineage(id) => format!("agent_definition:{id}"),
+        MemoryScope::AgentInstance(id) => format!("agent_instance:{id}"),
+        MemoryScope::TeamRun(id) => format!("team_run:{id}"),
+        MemoryScope::LegacyUnresolvedAgent(id) => format!("legacy_agent:{id}"),
     }
 }
 
@@ -463,6 +468,44 @@ pub struct Message {
     pub pinned: bool,
 }
 
+/// Durable receipt used when a tool result's canonical raw payload has already
+/// been committed to the session evidence ledger.
+///
+/// The receipt is embedded in [`Message::content`] rather than adding another
+/// field to the widely constructed `Message` carrier. This keeps legacy
+/// messages readable while making replacement of raw content explicitly
+/// conditional on a retrievable durable reference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanonicalRawEvidence {
+    pub schema_version: u32,
+    pub access: EvidenceAccessRef,
+    pub preview: String,
+}
+
+impl CanonicalRawEvidence {
+    pub const SCHEMA_VERSION: u32 = 1;
+
+    #[must_use]
+    pub fn new(access: EvidenceAccessRef, preview: impl Into<String>) -> Self {
+        Self {
+            schema_version: Self::SCHEMA_VERSION,
+            access,
+            preview: preview.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_durable(&self) -> bool {
+        self.schema_version == Self::SCHEMA_VERSION
+            && self.access.is_durable()
+            && !self.access.evidence_ref.0.ref_type.trim().is_empty()
+            && !self.access.evidence_ref.0.id.trim().is_empty()
+            && !self.access.sha256.trim().is_empty()
+    }
+}
+
+const CANONICAL_RAW_RECEIPT_PREFIX: &str = "[cowd-canonical-raw:v1]";
+
 impl Message {
     /// Create a simple user message.
     #[must_use]
@@ -517,6 +560,33 @@ impl Message {
     #[must_use]
     pub fn is_tool_result(&self) -> bool {
         self.role == MessageRole::Tool
+    }
+
+    /// Replace a tool result body with a durable canonical-raw receipt.
+    ///
+    /// Returns `false` and leaves the message untouched when this is not a tool
+    /// result or the receipt cannot prove durable retrieval.
+    pub fn replace_with_canonical_raw_receipt(&mut self, receipt: &CanonicalRawEvidence) -> bool {
+        if !self.is_tool_result() || !receipt.is_durable() {
+            return false;
+        }
+        let Ok(payload) = serde_json::to_string(receipt) else {
+            return false;
+        };
+        self.content = format!("{CANONICAL_RAW_RECEIPT_PREFIX}\n{payload}");
+        true
+    }
+
+    /// Decode the canonical raw receipt carried by this message, if present.
+    #[must_use]
+    pub fn canonical_raw_evidence(&self) -> Option<CanonicalRawEvidence> {
+        let payload = self
+            .content
+            .strip_prefix(CANONICAL_RAW_RECEIPT_PREFIX)?
+            .trim_start();
+        serde_json::from_str::<CanonicalRawEvidence>(payload)
+            .ok()
+            .filter(CanonicalRawEvidence::is_durable)
     }
 }
 
@@ -677,6 +747,7 @@ fn default_search_mode() -> String {
 #[cfg(test)]
 mod fact_kernel_bridge_tests {
     use super::*;
+    use harness_contract::core::EvidenceRef;
 
     fn sample_entry() -> MemoryEntry {
         let now = Utc::now();
@@ -740,5 +811,38 @@ mod fact_kernel_bridge_tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].fact.id, record.id);
         assert!(service.evaluate_health().is_empty());
+    }
+
+    #[test]
+    fn tool_message_replaces_raw_only_with_durable_receipt() {
+        let raw = "canonical raw output";
+        let mut message = Message::tool_result("call-1", "bash", raw);
+        let invalid = CanonicalRawEvidence::new(
+            EvidenceAccessRef::durable(
+                EvidenceRef::durable("raw-1"),
+                "",
+                raw.len() as u64,
+                "text/plain",
+                "retrieve raw-1",
+                "session:test",
+            ),
+            "preview",
+        );
+        assert!(!message.replace_with_canonical_raw_receipt(&invalid));
+        assert_eq!(message.content, raw);
+
+        let receipt = CanonicalRawEvidence::new(
+            EvidenceAccessRef::durable(
+                EvidenceRef::durable("raw-1"),
+                "sha256:abc",
+                raw.len() as u64,
+                "text/plain",
+                "retrieve raw-1",
+                "session:test",
+            ),
+            "preview",
+        );
+        assert!(message.replace_with_canonical_raw_receipt(&receipt));
+        assert_eq!(message.canonical_raw_evidence(), Some(receipt));
     }
 }

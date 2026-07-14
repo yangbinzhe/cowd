@@ -72,7 +72,7 @@ pub struct ChatView {
 
     // ── Render cache ──
     cached_chat_lines: Vec<Line<'static>>,
-    entry_line_counts: Vec<u16>,
+    entry_line_counts: Vec<usize>,
     msg_version: u64,
     last_drawn_version: u64,
     lines_dirty: bool,
@@ -219,7 +219,7 @@ impl ChatView {
             .map(Vec::len)
             .unwrap_or_default();
         self.memory_candidate_count = app
-            .latest_workgraph_summary
+            .latest_execution_graph_summary
             .as_ref()
             .map(|summary| summary.memory_candidates)
             .unwrap_or_default();
@@ -318,18 +318,18 @@ impl ChatView {
 
     /// Scroll so the entry at the given index is visible.
     pub fn scroll_to_entry(&mut self, entry_idx: usize) {
-        let vh = self.scroll_state.viewport_height.max(1) as usize;
+        let vh = self.scroll_state.viewport_height.max(1);
         let mut offset: usize = 0;
         for i in 0..entry_idx.min(self.entry_line_counts.len()) {
-            offset += self.entry_line_counts[i] as usize + 1;
+            offset += self.entry_line_counts[i] + 1;
         }
-        let entry_h = self.entry_line_counts.get(entry_idx).copied().unwrap_or(1) as usize;
+        let entry_h = self.entry_line_counts.get(entry_idx).copied().unwrap_or(1);
 
-        let scroll = self.scroll_state.offset as usize;
+        let scroll = self.scroll_state.offset;
         if offset < scroll {
-            self.scroll_state.offset = offset as u16;
+            self.scroll_state.offset = offset;
         } else if offset + entry_h > scroll + vh {
-            self.scroll_state.offset = offset.saturating_sub(vh.saturating_sub(entry_h)) as u16;
+            self.scroll_state.offset = offset.saturating_sub(vh.saturating_sub(entry_h));
         }
     }
 
@@ -342,12 +342,8 @@ impl ChatView {
             .iter()
             .filter(|entry| Self::renders_in_main_chat(entry))
             .count();
-        let mut total: usize = self
-            .entry_line_counts
-            .iter()
-            .map(|&c| c as usize)
-            .sum::<usize>()
-            + n.saturating_sub(1); // separators between entries, not after last
+        let mut total: usize =
+            self.entry_line_counts.iter().copied().sum::<usize>() + n.saturating_sub(1); // separators between entries, not after last
         if total == 0 && self.timeline.is_empty() {
             total = 1;
         }
@@ -363,7 +359,7 @@ impl ChatView {
 impl Component for ChatView {
     fn render(&mut self, ctx: &mut RenderContext, area: Rect) {
         let viewport_h = area.height as usize;
-        self.scroll_state.viewport_height = viewport_h as u16;
+        self.scroll_state.viewport_height = viewport_h;
 
         // ── Build line buffer before computing scroll bounds ──
         // Scroll is intentionally based on the exact line buffer we render.
@@ -388,16 +384,16 @@ impl Component for ChatView {
         let total_lines = self.cached_chat_lines.len().max(1);
 
         // ── Post-render size callback: sync actual content height ──
-        self.scroll_state.set_content_size(total_lines as u16);
+        self.scroll_state.set_content_size(total_lines);
 
         // ── Auto-scroll ──
         if self.scroll_state.auto_scroll && total_lines > viewport_h {
-            self.scroll_state.offset = (total_lines.saturating_sub(viewport_h)) as u16;
+            self.scroll_state.offset = total_lines.saturating_sub(viewport_h);
         }
-        let scroll_off =
-            self.scroll_state
-                .offset
-                .min(total_lines.saturating_sub(viewport_h).max(0) as u16) as usize;
+        let scroll_off = self
+            .scroll_state
+            .offset
+            .min(total_lines.saturating_sub(viewport_h));
 
         // ── Compact mode: summary view ──
         if self.compact_mode {
@@ -412,7 +408,14 @@ impl Component for ChatView {
         }
 
         // ── Build visible lines ──
-        let mut visible_lines = self.cached_chat_lines.clone();
+        let visible_end = scroll_off
+            .saturating_add(viewport_h.max(1))
+            .min(self.cached_chat_lines.len());
+        let mut visible_lines = if self.cached_chat_lines.is_empty() {
+            vec![Line::raw("")]
+        } else {
+            self.cached_chat_lines[scroll_off..visible_end].to_vec()
+        };
 
         // ── Apply search highlight (Task 17) ──
         if !self.search_query.is_empty() && !self.search_matches.is_empty() {
@@ -435,10 +438,10 @@ impl Component for ChatView {
         frame.render_widget(Clear, area);
 
         let paragraph = Paragraph::new(Text::from(visible_lines))
-            // No Wrap here: wrapping makes rendered height depend on terminal
-            // width while scroll offset is line-based. Clipping long lines is
-            // less harmful than a viewport that cannot reliably reach top/bottom.
-            .scroll((scroll_off as u16, 0));
+            // The model tracks an unbounded logical offset. The widget receives
+            // only the visible slice, so Ratatui's u16 scroll coordinate cannot
+            // truncate a long conversation.
+            .scroll((0, 0));
         frame.render_widget(paragraph, area);
     }
 
@@ -533,12 +536,12 @@ impl ChatView {
 
 impl ChatView {
     /// Pre-compute per-entry line counts.
-    fn compute_entry_line_counts(&self) -> Vec<u16> {
+    fn compute_entry_line_counts(&self) -> Vec<usize> {
         self.timeline
             .iter()
             .map(|e| {
                 if Self::renders_in_main_chat(e) {
-                    e.expanded_lines() as u16
+                    e.expanded_lines()
                 } else {
                     0
                 }
@@ -757,12 +760,12 @@ impl ChatView {
             return;
         }
 
-        let prefix_count: usize =
-            self.entry_line_counts
-                .iter()
-                .take(n.saturating_sub(1))
-                .sum::<u16>()
-                .saturating_add((n.saturating_sub(1)) as u16) as usize;
+        let prefix_count: usize = self
+            .entry_line_counts
+            .iter()
+            .take(n.saturating_sub(1))
+            .sum::<usize>()
+            .saturating_add(n.saturating_sub(1));
 
         let last_entry = self.timeline[n - 1].clone();
         if !Self::renders_in_main_chat(&last_entry) {
@@ -784,7 +787,7 @@ impl ChatView {
         Self::build_entry(&last_entry, is_focused, &mut self.cached_chat_lines, &theme);
 
         if let Some(count) = self.entry_line_counts.get_mut(n - 1) {
-            *count = (self.cached_chat_lines.len() - before_len) as u16;
+            *count = self.cached_chat_lines.len() - before_len;
         }
 
         if let Some(spinner) = spinner_str {
@@ -882,7 +885,9 @@ impl ChatView {
                         }
                     } else {
                         let mut chars = remaining.char_indices();
-                        let (_, ch) = chars.next().expect("remaining is not empty");
+                        let Some((_, ch)) = chars.next() else {
+                            break;
+                        };
                         let next = chars.next().map(|(idx, _)| idx).unwrap_or(remaining.len());
                         spans.push(Span::styled(
                             ch.to_string(),
@@ -1509,7 +1514,7 @@ mod tests {
         view.timeline = (0..20)
             .map(|i| make_message("user", &format!("msg {i}")))
             .collect();
-        view.entry_line_counts = vec![1u16; 20];
+        view.entry_line_counts = vec![1usize; 20];
         view.msg_version = 1;
         view.lines_dirty = true;
 
@@ -1601,7 +1606,7 @@ mod tests {
         view.timeline = (0..10)
             .map(|i| make_message("user", &format!("msg {i}")))
             .collect();
-        view.entry_line_counts = vec![1u16; 10];
+        view.entry_line_counts = vec![1usize; 10];
         view.scroll_state.offset = 0;
 
         // Scroll to entry 8 (near the bottom)
@@ -1729,10 +1734,10 @@ mod tests {
 
         let _ = render_view(&mut view, 80, 10);
 
-        let max_offset =
-            view.cached_chat_lines
-                .len()
-                .saturating_sub(view.scroll_state.viewport_height as usize) as u16;
+        let max_offset = view
+            .cached_chat_lines
+            .len()
+            .saturating_sub(view.scroll_state.viewport_height);
         assert_eq!(view.scroll_state.offset, max_offset);
         assert!(max_offset > 0);
     }
@@ -1759,6 +1764,27 @@ mod tests {
         let _ = render_view(&mut view, 80, 8);
         assert_eq!(view.scroll_state.offset, bottom);
         assert!(view.scroll_state.auto_scroll);
+    }
+
+    #[test]
+    fn long_chat_renders_the_visible_slice_without_u16_scroll_truncation() {
+        let mut view = ChatView::new();
+        view.cached_chat_lines = (0..70_000)
+            .map(|index| Line::raw(format!("line {index}")))
+            .collect();
+        view.msg_version = 0;
+        view.last_drawn_version = 0;
+        view.lines_dirty = false;
+        view.scroll_state.auto_scroll = true;
+
+        let _ = render_view(&mut view, 80, 8);
+
+        assert_eq!(view.scroll_state.offset, 69_992);
+        assert!(view.scroll_state.offset > usize::from(u16::MAX));
+
+        view.scroll_state.scroll_to_top();
+        let _ = render_view(&mut view, 80, 8);
+        assert_eq!(view.scroll_state.offset, 0);
     }
 
     #[test]

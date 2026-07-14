@@ -136,11 +136,21 @@ impl AutonomyProfileCatalog {
 
     #[must_use]
     pub fn decide(&self, input: AutonomyDecisionInput) -> AutonomyDecision {
-        let profile = self.get(input.profile_id).unwrap_or_else(|| {
-            self.get(AutonomyProfileId::Supervised)
-                .expect("built-in supervised profile")
-        });
-        profile.decide(input)
+        if let Some(profile) = self
+            .get(input.profile_id)
+            .or_else(|| self.get(AutonomyProfileId::Supervised))
+        {
+            return profile.decide(input);
+        }
+        AutonomyDecision {
+            profile_id: input.profile_id,
+            decision: AutonomyDecisionKind::Deny,
+            reason: "autonomy profile catalog is empty".to_string(),
+            evidence: vec!["autonomy_catalog_empty".to_string()],
+            requested_risk: input.requested_risk,
+            policy_basis: vec!["fail_closed".to_string()],
+            permission_mode: PermissionMode::ReadOnly,
+        }
     }
 }
 
@@ -265,8 +275,8 @@ fn built_in_profiles() -> Vec<AutonomyProfileSpec> {
             "after every action",
             &["any write", "external side effect", "medium or higher risk"],
             &[
-                CollaborationTemplateId::SingleExecutor,
-                CollaborationTemplateId::DebateConsensus,
+                CollaborationTemplateId::DirectExecutor,
+                CollaborationTemplateId::DebateCriticArbiter,
             ],
         ),
         profile(
@@ -297,11 +307,11 @@ fn built_in_profiles() -> Vec<AutonomyProfileSpec> {
                 "external side effect",
             ],
             &[
-                CollaborationTemplateId::SingleExecutor,
-                CollaborationTemplateId::PlanExecuteReview,
+                CollaborationTemplateId::DirectExecutor,
+                CollaborationTemplateId::PlannerExecutorVerifier,
                 CollaborationTemplateId::ImplementationReviewFix,
-                CollaborationTemplateId::DebateConsensus,
-                CollaborationTemplateId::FanoutResearchSynthesis,
+                CollaborationTemplateId::DebateCriticArbiter,
+                CollaborationTemplateId::ParallelResearchSynthesis,
             ],
         ),
         profile(
@@ -325,12 +335,12 @@ fn built_in_profiles() -> Vec<AutonomyProfileSpec> {
                 "release publish",
             ],
             &[
-                CollaborationTemplateId::SingleExecutor,
-                CollaborationTemplateId::PlanExecuteReview,
+                CollaborationTemplateId::DirectExecutor,
+                CollaborationTemplateId::PlannerExecutorVerifier,
                 CollaborationTemplateId::ImplementationReviewFix,
-                CollaborationTemplateId::DebateConsensus,
-                CollaborationTemplateId::FanoutResearchSynthesis,
-                CollaborationTemplateId::LongRunningProject,
+                CollaborationTemplateId::DebateCriticArbiter,
+                CollaborationTemplateId::ParallelResearchSynthesis,
+                CollaborationTemplateId::LongRunningWorkstreams,
             ],
         ),
         profile(
@@ -353,12 +363,12 @@ fn built_in_profiles() -> Vec<AutonomyProfileSpec> {
                 "irreversible external operation",
             ],
             &[
-                CollaborationTemplateId::SingleExecutor,
-                CollaborationTemplateId::PlanExecuteReview,
+                CollaborationTemplateId::DirectExecutor,
+                CollaborationTemplateId::PlannerExecutorVerifier,
                 CollaborationTemplateId::ImplementationReviewFix,
-                CollaborationTemplateId::DebateConsensus,
-                CollaborationTemplateId::FanoutResearchSynthesis,
-                CollaborationTemplateId::LongRunningProject,
+                CollaborationTemplateId::DebateCriticArbiter,
+                CollaborationTemplateId::ParallelResearchSynthesis,
+                CollaborationTemplateId::LongRunningWorkstreams,
                 CollaborationTemplateId::IncidentResponse,
             ],
         ),
@@ -386,12 +396,12 @@ fn built_in_profiles() -> Vec<AutonomyProfileSpec> {
             "periodic steward report and every delegated approval",
             &["high risk action", "policy conflict", "budget pressure"],
             &[
-                CollaborationTemplateId::SingleExecutor,
-                CollaborationTemplateId::PlanExecuteReview,
+                CollaborationTemplateId::DirectExecutor,
+                CollaborationTemplateId::PlannerExecutorVerifier,
                 CollaborationTemplateId::ImplementationReviewFix,
-                CollaborationTemplateId::DebateConsensus,
-                CollaborationTemplateId::FanoutResearchSynthesis,
-                CollaborationTemplateId::LongRunningProject,
+                CollaborationTemplateId::DebateCriticArbiter,
+                CollaborationTemplateId::ParallelResearchSynthesis,
+                CollaborationTemplateId::LongRunningWorkstreams,
             ],
         ),
     ]
@@ -496,7 +506,7 @@ mod tests {
             profile_id: AutonomyProfileId::Stewarded,
             requested_risk: TaskRisk::Low,
             requested_tool: Some("read_file".to_string()),
-            template_id: Some(CollaborationTemplateId::PlanExecuteReview),
+            template_id: Some(CollaborationTemplateId::PlannerExecutorVerifier),
             requires_write: false,
             is_critical_operation: false,
         });
@@ -514,7 +524,7 @@ mod tests {
             profile_id: AutonomyProfileId::Cautious,
             requested_risk: TaskRisk::Low,
             requested_tool: Some("bash".to_string()),
-            template_id: Some(CollaborationTemplateId::SingleExecutor),
+            template_id: Some(CollaborationTemplateId::DirectExecutor),
             requires_write: false,
             is_critical_operation: false,
         });

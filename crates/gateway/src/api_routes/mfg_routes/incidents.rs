@@ -1,3 +1,7 @@
+use axum::extract::Extension;
+
+use crate::api_routes::{principal_actor_id, AuthenticatedPrincipal};
+
 use super::*;
 
 pub(super) async fn mfg_incident_create_handler(
@@ -57,27 +61,15 @@ pub(super) async fn mfg_incident_create_handler(
         .task
         .start_goal(format!("MFG incident analysis: {title}"), false)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-    let (task, graph) = state
-        .services
-        .agent
-        .enrich_mfg_evidence_agent_graph(
-            &state.services.task,
-            &state.services.session,
-            &task,
-            &packet,
-        )
-        .await
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-
     let mut incident = MfgIncident::new(title);
     incident.attention_id = packet.attention_id.clone();
     incident.evidence_packet_id = Some(packet.packet_id.clone());
     incident.task_id = Some(task.id.clone());
-    incident.agent_graph_id = Some(graph.graph_id.clone());
-    let incident = state
+    let (incident, workflow_graph) = state
         .services
         .mfg
-        .create_incident(&state.config_home, &incident)
+        .open_store(&state.config_home)
+        .and_then(|store| store.create_incident_workflow(&incident, &packet))
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.incident",
@@ -85,7 +77,7 @@ pub(super) async fn mfg_incident_create_handler(
         "session_id": request.session_id,
         "incident": incident,
         "task": task,
-        "agent_graph": graph,
+        "workflow_graph": workflow_graph,
         "context_item": state.services.context.structured_evidence_item(&packet),
     })))
 }
@@ -154,10 +146,12 @@ pub(super) async fn mfg_incident_room_handler(
         .mfg
         .recommend_playbooks_for_incident(&state.config_home, &id, 5)
         .unwrap_or_default();
-    let agent_graph = incident
-        .task_id
-        .as_deref()
-        .and_then(|task_id| state.services.task.agent_graph(task_id).ok().flatten());
+    let workflow_graph = state
+        .services
+        .mfg
+        .open_store(&state.config_home)
+        .and_then(|store| store.workflow_graph_for_incident(&id))
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.incident_room",
         "incident": incident,
@@ -167,7 +161,7 @@ pub(super) async fn mfg_incident_room_handler(
         "executions": executions,
         "memory_cases": memory_cases,
         "playbooks": playbooks,
-        "agent_graph": agent_graph,
+        "workflow_graph": workflow_graph,
     })))
 }
 
@@ -319,24 +313,19 @@ pub(super) async fn mfg_incident_skill_plan_handler(
         context.packet.as_ref(),
         request.limit.unwrap_or(3).clamp(1, 8),
     );
-    let graph = state
+    let workflow_graph = state
         .services
-        .agent
-        .plan_mfg_skill_agent_nodes(
-            &state.services.task,
-            &state.services.session,
-            &context.incident,
-            &plan,
-        )
-        .await
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+        .mfg
+        .open_store(&state.config_home)
+        .and_then(|store| store.plan_incident_workflow_skills(&id, &plan))
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.skill.plan",
         "request_id": request.request_id,
         "session_id": request.session_id,
         "incident_id": id,
         "plan": plan,
-        "agent_graph": graph,
+        "workflow_graph": workflow_graph,
     })))
 }
 
@@ -363,22 +352,12 @@ pub(super) async fn mfg_incident_skill_run_handler(
         context.analysis.as_ref(),
         context.packet.as_ref(),
     );
-    let run = state
+    let (run, workflow_graph) = state
         .services
         .mfg
-        .record_skill_run(&state.config_home, &run)
+        .open_store(&state.config_home)
+        .and_then(|store| store.record_skill_run_and_complete_workflow(&run))
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    let graph = state
-        .services
-        .agent
-        .complete_mfg_skill_agent_node(
-            &state.services.task,
-            &state.services.session,
-            &context.incident,
-            &run,
-        )
-        .await
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     append_mfg_execution_outcome(
         &state,
         session_id
@@ -394,7 +373,7 @@ pub(super) async fn mfg_incident_skill_run_handler(
         "session_id": session_id,
         "incident_id": id,
         "skill_run": run,
-        "agent_graph": graph,
+        "workflow_graph": workflow_graph,
     })))
 }
 
@@ -505,9 +484,10 @@ pub(super) async fn mfg_execution_get_handler(
 pub(super) async fn mfg_execution_cross_plane_bridge_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
-    Json(request): Json<MfgCrossPlaneBridgeRequest>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Json(intent): Json<MfgCrossPlaneBridgeIntent>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    state.services.cross_plane.ensure_loaded(&state.config_home);
+    let request = intent.into_request(principal_actor_id(&principal));
     let execution = state
         .services
         .mfg
@@ -555,15 +535,46 @@ pub(super) async fn mfg_execution_cross_plane_bridge_handler(
         .services
         .cross_plane
         .decide_connector_action(&snapshot, action, &mode, now);
-    let receipt = state.services.mfg.record_cross_plane_bridge_receipt(
-        &state.services.cross_plane,
-        idempotency_key,
-        mode.clone(),
-        action,
-        decision,
-        evidence,
-    );
-    state.services.cross_plane.save_state(&state.config_home);
+    let receipt = if mode == "commit" && decision.decision == runtime::PolicyDecisionKind::Allow {
+        let graph_key = idempotency_key
+            .clone()
+            .unwrap_or_else(|| format!("mfg-{}", uuid::Uuid::new_v4()));
+        let target = runtime::CrossPlaneDispatchTarget::from_action(
+            &action,
+            Some("feishu"),
+            Some("send_text"),
+        )
+        .unwrap_or_default();
+        let executor = std::sync::Arc::new(crate::services::GatewayCrossPlaneExecutor::new(
+            state.services.surface.clone(),
+            target.clone(),
+            state.services.cross_plane.runtime_control(),
+        ));
+        let projection = state
+            .services
+            .cross_plane
+            .execute_commit_graph(&action, &decision, &graph_key, executor)
+            .await
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+        state
+            .services
+            .cross_plane
+            .record_message_dispatch_graph(
+                graph_key,
+                action,
+                decision,
+                evidence,
+                target,
+                &projection,
+            )
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+    } else {
+        state
+            .services
+            .cross_plane
+            .record_non_commit_action(idempotency_key, mode.clone(), action, decision, evidence)
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+    };
     let execution = state
         .services
         .mfg

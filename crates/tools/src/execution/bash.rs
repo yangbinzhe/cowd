@@ -1,9 +1,10 @@
 use std::env;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use sandbox_launcher::{shell_command, SandboxLaunchSpec};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -58,9 +59,18 @@ pub struct BashCommandOutput {
 }
 
 pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
-    let cwd = resolve_cwd(input.cwd.as_deref())?;
+    let workspace = env::current_dir()?;
+    execute_bash_in_workspace(input, workspace)
+}
+
+pub fn execute_bash_in_workspace(
+    input: BashCommandInput,
+    workspace_root: impl AsRef<Path>,
+) -> io::Result<BashCommandOutput> {
+    let workspace_root = workspace_root.as_ref().canonicalize()?;
+    let cwd = resolve_cwd(input.cwd.as_deref(), &workspace_root)?;
     if input.run_in_background.unwrap_or(false) {
-        let child = prepare_command(&input.command, &cwd, false)
+        let child = prepare_command(&input.command, &workspace_root, &cwd, false)?
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -84,28 +94,38 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
         });
     }
 
-    execute_bash_sync(input, cwd)
+    execute_bash_sync(input, workspace_root, cwd)
 }
 
-fn resolve_cwd(cwd: Option<&str>) -> io::Result<PathBuf> {
+fn resolve_cwd(cwd: Option<&str>, workspace_root: &Path) -> io::Result<PathBuf> {
     match cwd {
         Some(cwd) => {
             let path = PathBuf::from(cwd);
-            if path.is_absolute() {
-                Ok(path)
+            let resolved = if path.is_absolute() {
+                path
             } else {
-                Ok(env::current_dir()?.join(path))
+                workspace_root.join(path)
+            }
+            .canonicalize()?;
+            if resolved.starts_with(workspace_root) {
+                Ok(resolved)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "bash cwd must remain inside the leased workspace",
+                ))
             }
         }
-        None => env::current_dir(),
+        None => Ok(workspace_root.to_path_buf()),
     }
 }
 
 fn execute_bash_sync(
     input: BashCommandInput,
+    workspace_root: PathBuf,
     cwd: std::path::PathBuf,
 ) -> io::Result<BashCommandOutput> {
-    let mut command = prepare_command(&input.command, &cwd, false);
+    let mut command = prepare_command(&input.command, &workspace_root, &cwd, false)?;
     let output = if let Some(timeout_ms) = input.timeout {
         let mut child = command.spawn()?;
         let started = std::time::Instant::now();
@@ -173,13 +193,20 @@ fn execute_bash_sync(
     })
 }
 
-fn prepare_command(command: &str, cwd: &std::path::Path, create_dirs: bool) -> Command {
+fn prepare_command(
+    command: &str,
+    workspace_root: &Path,
+    cwd: &Path,
+    create_dirs: bool,
+) -> io::Result<Command> {
     if create_dirs {
         let _ = std::fs::create_dir_all(cwd);
     }
-    let mut cmd = Command::new("sh");
-    cmd.arg("-lc").arg(command).current_dir(cwd);
-    cmd
+    let mut spec = SandboxLaunchSpec::workspace(workspace_root.to_path_buf());
+    spec.working_directory = Some(cwd.to_path_buf());
+    shell_command(command, &spec)
+        .map(|prepared| prepared.into_command())
+        .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error.to_string()))
 }
 
 fn truncate_output(value: &str) -> String {

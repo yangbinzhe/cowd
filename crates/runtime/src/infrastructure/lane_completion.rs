@@ -16,7 +16,7 @@ use crate::{
     PolicyCondition, PolicyEngine, PolicyRule, ReviewStatus,
 };
 
-type AgentOutput = crate::AgentSnapshot;
+type AgentOutput = crate::AgentRunSnapshot;
 
 /// Detects if a lane should be automatically marked as completed.
 ///
@@ -29,19 +29,12 @@ pub(crate) fn detect_lane_completion(
     has_pushed: bool,
 ) -> Option<LaneContext> {
     // Must be finished without errors
-    if output.error.is_some() {
+    if output.failure.is_some() {
         return None;
     }
 
     // Must have finished status
-    if !output.status.eq_ignore_ascii_case("completed")
-        && !output.status.eq_ignore_ascii_case("finished")
-    {
-        return None;
-    }
-
-    // Must have no current blocker
-    if output.current_blocker.is_some() {
+    if output.status != harness_contract::agent::AgentStatus::Completed {
         return None;
     }
 
@@ -132,22 +125,23 @@ mod tests {
 
     fn test_output() -> AgentOutput {
         AgentOutput {
+            run_id: "run-test".to_string(),
             agent_id: "test-lane-1".to_string(),
-            name: "Test Agent".to_string(),
-            description: "Test".to_string(),
-            subagent_type: None,
+            task_id: "task-test".to_string(),
+            session_id: "session-test".to_string(),
+            graph_id: "graph-test".to_string(),
+            node_id: "node-test".to_string(),
+            attempt: 1,
+            expected_graph_revision: 1,
+            backend: crate::AgentBackendKind::InProcess,
+            status: harness_contract::agent::AgentStatus::Completed,
+            revision: 1,
             model: None,
-            status: "Finished".to_string(),
-            backend: crate::AgentExecutionBackendKind::InProcess,
-            output_file: "/tmp/test.output".to_string(),
-            manifest_file: "/tmp/test.manifest".to_string(),
-            created_at: "2024-01-01T00:00:00Z".to_string(),
-            started_at: Some("2024-01-01T00:00:00Z".to_string()),
-            completed_at: Some("2024-01-01T00:00:00Z".to_string()),
-            lane_events: vec![],
-            derived_state: "working".to_string(),
-            current_blocker: None,
-            error: None,
+            provider: None,
+            binding: None,
+            started_at_ms: 1,
+            updated_at_ms: 1,
+            failure: None,
         }
     }
 
@@ -166,7 +160,7 @@ mod tests {
     #[test]
     fn no_completion_when_error_present() {
         let mut output = test_output();
-        output.error = Some("Build failed".to_string());
+        output.failure = Some("Build failed".to_string());
 
         let result = detect_lane_completion(&output, true, true);
         assert!(result.is_none());
@@ -175,7 +169,7 @@ mod tests {
     #[test]
     fn no_completion_when_not_finished() {
         let mut output = test_output();
-        output.status = "Running".to_string();
+        output.status = harness_contract::agent::AgentStatus::Running;
 
         let result = detect_lane_completion(&output, true, true);
         assert!(result.is_none());

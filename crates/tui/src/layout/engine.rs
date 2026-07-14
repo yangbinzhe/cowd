@@ -58,7 +58,7 @@ impl TabBar {
                 x += 1;
             }
 
-            let label_width = label.len() as u16;
+            let label_width = crate::components::base::terminal_len(label.chars().count());
             let label_area = Rect::new(
                 x,
                 area.y,
@@ -100,12 +100,11 @@ impl TabBar {
                 cursor += 1;
             }
 
-            let label = if tab.icon.is_some() {
-                format!(" {} {} ", tab.icon.as_ref().unwrap(), tab.label)
-            } else {
-                format!(" {} ", tab.label)
+            let label = match tab.icon.as_ref() {
+                Some(icon) => format!(" {icon} {} ", tab.label),
+                None => format!(" {} ", tab.label),
             };
-            let w = label.len() as u16;
+            let w = crate::components::base::terminal_len(label.chars().count());
             let end = cursor + w;
 
             // Clip to area boundary

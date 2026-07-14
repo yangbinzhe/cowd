@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -8,14 +9,18 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use futures::StreamExt;
+use harness_contract::projection::{ExecutionCommandKind, ExecutionCommandRequest};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::app::{PendingResource, SystemNoticeKind};
 use crate::context_tokens::ContextWorkspaceEntry;
+use crate::events::CowdEventSender;
 use crate::gateway_client::{default_auth_token, GatewayApiClient};
 use crate::state::{ProcessedKey, TuiState};
 use crate::{config_migration, cowd_event_channel, error_recovery, CowdEvent, FileEntry};
+
+static SHARED_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct GatewayTuiConfig {
@@ -50,16 +55,14 @@ impl GatewayTuiConfig {
     }
 }
 
-pub fn terminal_entry() {
-    if let Err(error) = run_gateway_tui(GatewayTuiConfig::from_env_args()) {
-        eprintln!("error: {error}");
-        std::process::exit(1);
-    }
+pub fn terminal_entry() -> Result<(), Box<dyn std::error::Error>> {
+    run_gateway_tui(GatewayTuiConfig::from_env_args())
 }
 
 pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::error::Error>> {
     error_recovery::install_tui_panic_hook();
     let migration_report = config_migration::run_startup_migration();
+    let runtime = initialize_shared_rt()?;
 
     let accessibility_enabled = std::env::var("COWD_TUI_ACCESSIBILITY")
         .map(|value| value == "1" || value == "true")
@@ -87,7 +90,6 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
     state.add_system_notice(SystemNoticeKind::Info, &config.startup_banner);
     state.add_system_notice(SystemNoticeKind::Info, &config.connected_line);
 
-    let gateway_actor_id = format!("tui:{}", std::process::id());
     let mut gateway_lease_owner: Option<String> = None;
     let gateway_client = GatewayApiClient::ensure_running_with_retry(default_auth_token())?
         .ok_or_else(|| {
@@ -95,11 +97,11 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                 .to_string()
         })?;
     let gateway_session_ids = attach_gateway_session(
+        runtime,
         &gateway_client,
         &tui_tx,
         &mut state,
         &config,
-        &gateway_actor_id,
         &mut gateway_lease_owner,
     )?;
 
@@ -115,7 +117,7 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
     if !migration_report.contains("nothing to migrate") {
         state.add_system_notice(SystemNoticeKind::Info, &migration_report);
     }
-    match list_workspace_files(&gateway_client) {
+    match list_workspace_files(runtime, &gateway_client) {
         Ok(files) => {
             state.prompt.set_workspace_entries(
                 files
@@ -134,8 +136,9 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
     send_session_list(&tui_tx, gateway_session_ids, &session_id);
 
     let startup_ready = true;
-    let res = shared_rt().block_on(async {
+    let res = runtime.block_on(async {
         let mut reader = crossterm::event::EventStream::new();
+        let mut execution_projection_stream = None;
         loop {
             tokio::select! {
                 Some(Ok(event)) = reader.next() => {
@@ -207,6 +210,15 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                                         }
                                         continue;
                                     }
+                                    if let Some(command) = execution_command_from_input(&text) {
+                                        dispatch_execution_projection_command(
+                                            &gateway_client,
+                                            &tui_tx,
+                                            &state,
+                                            command,
+                                        );
+                                        continue;
+                                    }
                                     if text.starts_with('/') {
                                         dispatch_gateway_slash(
                                             &gateway_client,
@@ -214,13 +226,6 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                                             &mut state,
                                             &session_id,
                                             &text,
-                                        );
-                                        continue;
-                                    }
-                                    if state.is_loading || state.turn_active {
-                                        state.add_system_notice(
-                                            SystemNoticeKind::Warning,
-                                            "Already processing, please wait...",
                                         );
                                         continue;
                                     }
@@ -247,7 +252,6 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                                         &gateway_client,
                                         &tui_tx,
                                         &session_id,
-                                        &gateway_actor_id,
                                     );
                                 }
                                 ProcessedKey::Nothing => {}
@@ -256,7 +260,13 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_millis(16)) => {
-                    drain_cowd_events_state(&tui_rx, &mut state);
+                    drain_cowd_events_state(
+                        &tui_rx,
+                        &mut state,
+                        &gateway_client,
+                        &tui_tx,
+                        &mut execution_projection_stream,
+                    ).await;
                     state.update_startup_phase(startup_ready);
                     if state.turn_active {
                         state.tick();
@@ -268,11 +278,10 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
         Ok::<(), Box<dyn std::error::Error>>(())
     });
 
-    if let Some(owner) = gateway_lease_owner.as_deref() {
-        let _ =
-            shared_rt().block_on(gateway_client.release_runtime_session_lease(&session_id, owner));
+    if gateway_lease_owner.is_some() {
+        let _ = runtime.block_on(gateway_client.release_runtime_session_lease(&session_id));
     }
-    let _ = shared_rt().block_on(gateway_client.detach_session(&session_id, &gateway_actor_id));
+    let _ = runtime.block_on(gateway_client.detach_session(&session_id, "tui"));
     if raw_mode_enabled {
         disable_raw_mode()?;
     }
@@ -285,14 +294,14 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
 }
 
 fn attach_gateway_session(
+    runtime: &tokio::runtime::Runtime,
     gateway_client: &GatewayApiClient,
     event_tx: &crate::events::CowdEventSender,
     state: &mut TuiState,
     config: &GatewayTuiConfig,
-    gateway_actor_id: &str,
     gateway_lease_owner: &mut Option<String>,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let status = shared_rt()
+    let status = runtime
         .block_on(gateway_client.status())
         .map_err(|err| format!("Gateway API is required for TUI: {err}"))?;
     state.app.server_running = true;
@@ -312,7 +321,7 @@ fn attach_gateway_session(
         &format!("Gateway API connected: {active_api_sessions} active sessions, uptime {server_uptime_secs}s"),
     );
 
-    let ensured = shared_rt()
+    let ensured = runtime
         .block_on(gateway_client.ensure_session(&config.session_id, &config.model))
         .map_err(|err| format!("Gateway session attach failed: {err}"))?;
     state.app.active_api_sessions = ensured
@@ -339,9 +348,8 @@ fn attach_gateway_session(
         &format!("Gateway session {action}: {ensured_session_id}"),
     );
 
-    match shared_rt().block_on(gateway_client.attach_session(
+    match runtime.block_on(gateway_client.attach_session(
         &ensured_session_id,
-        gateway_actor_id,
         "tui",
         Some("writer"),
     )) {
@@ -360,7 +368,7 @@ fn attach_gateway_session(
                         .unwrap_or_default()
                 ),
             );
-            match shared_rt().block_on(gateway_client.replay_session(&ensured_session_id, 0, 100)) {
+            match runtime.block_on(gateway_client.replay_session(&ensured_session_id, 0, 100)) {
                 Ok(replay) => state.add_system_notice(
                     SystemNoticeKind::Info,
                     &format!(
@@ -387,12 +395,9 @@ fn attach_gateway_session(
         ),
     }
 
-    let lease_owner = gateway_actor_id.to_string();
-    match shared_rt().block_on(gateway_client.acquire_runtime_session_lease(
-        &ensured_session_id,
-        &lease_owner,
-        "collaborative",
-    )) {
+    match runtime.block_on(
+        gateway_client.acquire_runtime_session_lease(&ensured_session_id, "collaborative"),
+    ) {
         Ok(lease) => {
             *gateway_lease_owner = lease
                 .get("owner")
@@ -424,7 +429,7 @@ fn attach_gateway_session(
         ),
     }
 
-    let snapshot = shared_rt().block_on(
+    let snapshot = runtime.block_on(
         crate::runtime_control_store::refresh_runtime_control_snapshot(
             Some(gateway_client),
             Some(&config.session_id),
@@ -435,7 +440,7 @@ fn attach_gateway_session(
     let components = snapshot.runtime_components.unwrap_or_default();
     let degraded_reasons = snapshot.degraded_reasons.clone();
     snapshot.apply_to_app(&mut state.app);
-    match shared_rt().block_on(gateway_client.session_projection(&config.session_id)) {
+    match runtime.block_on(gateway_client.session_projection(&config.session_id)) {
         Ok(projection) => {
             state.app.apply_run_projection(projection);
             state.add_system_notice(
@@ -464,14 +469,29 @@ fn attach_gateway_session(
     let event_client = gateway_client.clone();
     let event_session_id = config.session_id.clone();
     let event_tx = event_tx.clone();
-    let _event_bridge = shared_rt().spawn(async move {
-        if let Err(err) = event_client
-            .subscribe_session_events(&event_session_id, event_tx.clone())
-            .await
-        {
-            let _ = event_tx.send(CowdEvent::TurnError {
-                error: format!("Gateway event stream stopped: {err}"),
-            });
+    let _event_bridge = runtime.spawn(async move {
+        let mut after_commit_cursor = None;
+        let mut retry_delay = Duration::from_millis(250);
+        loop {
+            match event_client
+                .subscribe_session_events(&event_session_id, event_tx.clone(), after_commit_cursor)
+                .await
+            {
+                Ok(cursor) => {
+                    after_commit_cursor = cursor.or(after_commit_cursor);
+                    let _ = event_tx.send(CowdEvent::Warning {
+                        message: "Gateway event stream ended; resuming from durable cursor"
+                            .to_string(),
+                    });
+                }
+                Err(err) => {
+                    let _ = event_tx.send(CowdEvent::Warning {
+                        message: format!("Gateway event stream interrupted: {err}; retrying"),
+                    });
+                }
+            }
+            tokio::time::sleep(retry_delay).await;
+            retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
         }
     });
     state.add_system_notice(
@@ -519,7 +539,7 @@ fn dispatch_gateway_slash(
     let command_session_id = session_id.to_string();
     let slash_client = gateway_client.clone();
     let command_tx = tx.clone();
-    shared_rt().spawn(async move {
+    spawn_tui_task(tx, async move {
         let args = serde_json::json!({
             "input": command_input,
             "session_id": command_session_id,
@@ -561,7 +581,7 @@ fn dispatch_gateway_message(
     let event_client = gateway_client.clone();
     let event_session_id = session_id.to_string();
     let event_tx = tx.clone();
-    shared_rt().spawn(async move {
+    spawn_tui_task(tx, async move {
         match event_client
             .send_message_with_resources(&event_session_id, &text, &resource_ids)
             .await
@@ -572,6 +592,55 @@ fn dispatch_gateway_message(
                         ids: resource_ids.clone(),
                     });
                 }
+                if let Some(graph_id) = value
+                    .get("execution")
+                    .and_then(|execution| execution.get("graph_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|graph_id| !graph_id.trim().is_empty())
+                {
+                    let _ = event_tx.send(CowdEvent::ExecutionGraphSummary {
+                        summary: crate::RuntimeExecutionGraphSummary {
+                            graph_id: Some(graph_id.to_string()),
+                            board_id: None,
+                            status: "running".to_string(),
+                            agent_tasks: 0,
+                            child_executions: 0,
+                            memory_candidates: 0,
+                            conflicts: 0,
+                            completion_rate: Some(0.0),
+                            synthesis_lift: None,
+                            complementarity_score: None,
+                        },
+                    });
+                }
+                let mode = value
+                    .get("mode")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                if mode == "started_new_turn" {
+                    let turn_id = value
+                        .get("turn")
+                        .and_then(|turn| turn.get("turn_id"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("turn");
+                    let _ = event_tx.send(CowdEvent::Warning {
+                        message: format!(
+                            "Gateway accepted turn {turn_id}; streaming will continue via SSE"
+                        ),
+                    });
+                    return;
+                }
+                if mode == "attached_to_active_turn" {
+                    let decision = value
+                        .get("input")
+                        .and_then(|input| input.get("decision"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("attached");
+                    let _ = event_tx.send(CowdEvent::Warning {
+                        message: format!("Input attached to active turn: {decision}"),
+                    });
+                    return;
+                }
                 if let Some(response) = value
                     .get("response")
                     .and_then(serde_json::Value::as_str)
@@ -581,17 +650,8 @@ fn dispatch_gateway_message(
                         text: response.to_string(),
                     });
                 }
-                let _ = event_tx.send(CowdEvent::TurnComplete {
-                    assistant_text: value
-                        .get("response")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    iterations: value
-                        .get("iterations")
-                        .and_then(serde_json::Value::as_u64)
-                        .map(|value| value as u32)
-                        .unwrap_or_default(),
+                let _ = event_tx.send(CowdEvent::Warning {
+                    message: "Gateway accepted input; awaiting durable terminal commit".to_string(),
                 });
             }
             Err(err) => {
@@ -619,15 +679,13 @@ fn dispatch_gateway_cancel(
     gateway_client: &GatewayApiClient,
     tx: &crate::events::CowdEventSender,
     session_id: &str,
-    actor_id: &str,
 ) {
     let cancel_client = gateway_client.clone();
     let cancel_session_id = session_id.to_string();
-    let cancel_actor_id = actor_id.to_string();
     let cancel_tx = tx.clone();
-    shared_rt().spawn(async move {
+    spawn_tui_task(tx, async move {
         match cancel_client
-            .cancel_session_turn(&cancel_session_id, &cancel_actor_id, "tui_user_cancel")
+            .cancel_session_turn(&cancel_session_id, "tui_user_cancel")
             .await
         {
             Ok(receipt) => {
@@ -648,11 +706,121 @@ fn dispatch_gateway_cancel(
     });
 }
 
-fn drain_cowd_events_state(rx: &crate::CowdEventReceiver, state: &mut TuiState) {
+fn execution_command_from_input(input: &str) -> Option<ExecutionCommandKind> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "/execution pause" | "/execution/pause" => Some(ExecutionCommandKind::Pause),
+        "/execution resume" | "/execution/resume" => Some(ExecutionCommandKind::Resume),
+        "/execution cancel" | "/execution/cancel" => Some(ExecutionCommandKind::Cancel),
+        "/execution replan" | "/execution/replan" => Some(ExecutionCommandKind::Replan),
+        _ => None,
+    }
+}
+
+fn dispatch_execution_projection_command(
+    gateway_client: &GatewayApiClient,
+    tx: &crate::events::CowdEventSender,
+    state: &TuiState,
+    command: ExecutionCommandKind,
+) {
+    let Some(projection) = state.app.latest_execution_projection.as_ref() else {
+        let _ = tx.send(CowdEvent::Warning {
+            message: "No active execution projection is available for this command".to_string(),
+        });
+        return;
+    };
+    let available = projection
+        .available_commands
+        .iter()
+        .find(|candidate| candidate.command == command);
+    if available.is_some_and(|candidate| !candidate.available) {
+        let _ = tx.send(CowdEvent::Warning {
+            message: available
+                .and_then(|candidate| candidate.reason.clone())
+                .unwrap_or_else(|| "The current execution state rejects this command".to_string()),
+        });
+        return;
+    }
+    let client = gateway_client.clone();
+    let task_tx = tx.clone();
+    let execution_id = projection.execution_id.clone();
+    let expected_revision = projection.revision;
+    spawn_tui_task(tx, async move {
+        let receipt = client
+            .execute_projection_command(
+                &execution_id,
+                &ExecutionCommandRequest {
+                    command_id: format!("tui-execution-command-{}", uuid::Uuid::new_v4()),
+                    expected_revision,
+                    command,
+                    payload: serde_json::json!({"source": "tui"}),
+                },
+            )
+            .await;
+        match receipt {
+            Ok(receipt) => {
+                let _ = task_tx.send(CowdEvent::Warning {
+                    message: format!(
+                        "Execution command {:?}: {} (revision {})",
+                        command, receipt.status, receipt.accepted_revision
+                    ),
+                });
+            }
+            Err(error) => {
+                let _ = task_tx.send(CowdEvent::TurnError {
+                    error: format!("Execution command {:?} failed: {error}", command),
+                });
+            }
+        }
+    });
+}
+
+async fn drain_cowd_events_state(
+    rx: &crate::CowdEventReceiver,
+    state: &mut TuiState,
+    gateway_client: &GatewayApiClient,
+    event_tx: &CowdEventSender,
+    execution_projection_stream: &mut Option<String>,
+) {
     let mut count = 0;
     let limit = if state.turn_active { 64 } else { 256 };
     while let Ok(event) = rx.try_recv() {
+        let execution_id = match &event {
+            CowdEvent::ExecutionGraphSummary { summary } => summary.graph_id.clone(),
+            _ => None,
+        };
+        if let CowdEvent::ExecutionProjectionDelta { delta } = &event {
+            apply_execution_projection_delta(gateway_client, state, delta).await;
+            count += 1;
+            if count >= limit {
+                break;
+            }
+            continue;
+        }
         state.apply_event(event);
+        if let Some(execution_id) = execution_id {
+            match gateway_client
+                .execution_projection(&execution_id, false)
+                .await
+            {
+                Ok(projection) => {
+                    let cursor = projection.cursor;
+                    state.app.apply_execution_projection(projection);
+                    if execution_projection_stream.as_deref() != Some(execution_id.as_str()) {
+                        *execution_projection_stream = Some(execution_id.clone());
+                        spawn_execution_projection_stream(
+                            gateway_client.clone(),
+                            execution_id,
+                            cursor,
+                            event_tx.clone(),
+                        );
+                    }
+                }
+                Err(error) => state.add_system_notice(
+                    SystemNoticeKind::Warning,
+                    &format!("Execution projection unavailable: {error}"),
+                ),
+            }
+        }
         count += 1;
         if count >= limit {
             break;
@@ -660,8 +828,78 @@ fn drain_cowd_events_state(rx: &crate::CowdEventReceiver, state: &mut TuiState) 
     }
 }
 
-fn list_workspace_files(gateway_client: &GatewayApiClient) -> Result<Vec<FileEntry>, String> {
-    let projection = shared_rt()
+async fn apply_execution_projection_delta(
+    gateway_client: &GatewayApiClient,
+    state: &mut TuiState,
+    delta: &crate::protocol::ProjectionDelta,
+) {
+    let Some(projection) = state.app.latest_execution_projection.as_ref() else {
+        return;
+    };
+    let mut reducer = crate::protocol::ExecutionProjectionReducer::default();
+    reducer.install_snapshot(projection);
+    let should_refresh = !delta.events.is_empty()
+        || matches!(
+            reducer.apply_delta(delta),
+            crate::protocol::ProjectionDeltaApply::ResyncRequired
+        );
+    if should_refresh {
+        match gateway_client
+            .execution_projection(&delta.execution_id, false)
+            .await
+        {
+            Ok(snapshot) => state.app.apply_execution_projection(snapshot),
+            Err(error) => state.add_system_notice(
+                SystemNoticeKind::Warning,
+                &format!("Execution projection resync failed: {error}"),
+            ),
+        }
+    }
+}
+
+fn spawn_execution_projection_stream(
+    gateway_client: GatewayApiClient,
+    execution_id: String,
+    initial_cursor: u64,
+    event_tx: CowdEventSender,
+) {
+    let failure_tx = event_tx.clone();
+    spawn_tui_task(&failure_tx, async move {
+        let mut cursor = initial_cursor;
+        let mut retry_delay = Duration::from_millis(250);
+        loop {
+            match gateway_client
+                .subscribe_execution_projection_events(
+                    &execution_id,
+                    cursor,
+                    false,
+                    event_tx.clone(),
+                )
+                .await
+            {
+                Ok(next_cursor) => {
+                    cursor = cursor.max(next_cursor);
+                    retry_delay = Duration::from_millis(250);
+                }
+                Err(error) => {
+                    let _ = event_tx.send(CowdEvent::Warning {
+                        message: format!(
+                            "Execution projection stream interrupted for {execution_id}: {error}; retrying"
+                        ),
+                    });
+                }
+            }
+            tokio::time::sleep(retry_delay).await;
+            retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
+        }
+    });
+}
+
+fn list_workspace_files(
+    runtime: &tokio::runtime::Runtime,
+    gateway_client: &GatewayApiClient,
+) -> Result<Vec<FileEntry>, String> {
+    let projection = runtime
         .block_on(gateway_client.workspace_files_recursive(None, 5_000))
         .map_err(|error| error.to_string())?;
     parse_workspace_files_projection(&projection)
@@ -775,15 +1013,36 @@ fn format_connected_line(model: &str) -> String {
     format!("Connected: {model} via {provider}")
 }
 
-fn shared_rt() -> &'static tokio::runtime::Runtime {
-    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_name("cowd-tui")
-            .build()
-            .expect("failed to build TUI runtime")
-    })
+fn initialize_shared_rt() -> std::io::Result<&'static tokio::runtime::Runtime> {
+    if let Some(runtime) = SHARED_RUNTIME.get() {
+        return Ok(runtime);
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("cowd-tui")
+        .build()?;
+    let _ = SHARED_RUNTIME.set(runtime);
+    SHARED_RUNTIME
+        .get()
+        .ok_or_else(|| std::io::Error::other("TUI runtime initialization was not retained"))
+}
+
+fn shared_rt() -> Option<&'static tokio::runtime::Runtime> {
+    SHARED_RUNTIME.get()
+}
+
+fn spawn_tui_task<F>(event_tx: &CowdEventSender, task: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let Some(runtime) = shared_rt() else {
+        let _ = event_tx.send(CowdEvent::TurnError {
+            error: "TUI async runtime is unavailable; restart the terminal session".to_string(),
+        });
+        return;
+    };
+    runtime.spawn(task);
 }
 
 #[cfg(test)]
@@ -806,6 +1065,20 @@ mod tests {
         );
         assert!(attach_path_from_command("/status").is_none());
         assert!(attach_path_from_command("/attachment").is_none());
+    }
+
+    #[test]
+    fn execution_commands_are_explicit_and_do_not_capture_other_slash_input() {
+        assert_eq!(
+            execution_command_from_input("/execution pause"),
+            Some(ExecutionCommandKind::Pause)
+        );
+        assert_eq!(
+            execution_command_from_input(" /execution/replan "),
+            Some(ExecutionCommandKind::Replan)
+        );
+        assert_eq!(execution_command_from_input("/status"), None);
+        assert_eq!(execution_command_from_input("/execution unknown"), None);
     }
 
     #[test]
