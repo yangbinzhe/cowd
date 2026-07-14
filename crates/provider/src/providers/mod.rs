@@ -472,7 +472,10 @@ mod tests {
         assert_eq!(detect_provider_kind("grok"), ProviderKind::Xai);
         assert_eq!(
             detect_provider_kind("claude-sonnet-4-6"),
-            ProviderKind::Anthropic
+    // Last resort: if no provider matched and no env vars are set, default
+    // to OpenAi (most common case) instead of Anthropic which would fail
+    // with missing credentials on systems without Anthropic access.
+    ProviderKind::OpenAi
         );
     }
 
