@@ -45,6 +45,19 @@ pub struct ToolExposurePolicy {
 #[derive(Debug, Clone, Default)]
 pub struct ToolExposurePlanner;
 
+/// 常用工具白名单：在动态暴露模式下自动激活，无需模型先调用 ToolSearch。
+/// 这些工具是几乎所有编程任务的基础操作，延迟激活会浪费模型轮次。
+const HOT_TOOLS: &[&str] = &[
+    "read_file",
+    "read_many",
+    "write_file",
+    "edit_file",
+    "bash",
+    "grep",
+    "glob",
+    "list_files",
+];
+
 impl ToolExposurePlanner {
     #[must_use]
     pub fn plan(
@@ -66,7 +79,13 @@ impl ToolExposurePlanner {
             .filter(|id| eligible_ids.contains(id))
             .collect::<BTreeSet<_>>();
         let active = if policy.supports_dynamic_exposure {
-            bootstrap.clone()
+            let mut active = bootstrap.clone();
+            for hot_tool in HOT_TOOLS {
+                if eligible_ids.contains(*hot_tool) {
+                    active.insert((*hot_tool).to_string());
+                }
+            }
+            active
         } else {
             eligible_ids.clone()
         };
@@ -218,10 +237,10 @@ mod tests {
             catalog_revision: 3,
             descriptors: vec![
                 descriptor("tool_search", ToolPermissionMode::ReadOnly),
-                descriptor("read_file", ToolPermissionMode::ReadOnly),
+                descriptor("custom_reader", ToolPermissionMode::ReadOnly),
                 descriptor("write_file", ToolPermissionMode::WorkspaceWrite),
             ],
-            activation_candidates: vec!["read_file".to_string(), "write_file".to_string()],
+            activation_candidates: vec!["custom_reader".to_string(), "write_file".to_string()],
         };
         let policy = ToolExposurePolicy {
             allowed_ids: BTreeSet::new(),
@@ -234,10 +253,10 @@ mod tests {
 
         assert_eq!(
             activation.activated_ids().collect::<Vec<_>>(),
-            vec!["read_file"]
+            vec!["custom_reader"]
         );
         assert_eq!(state.revision, 2);
-        assert!(state.active.contains("read_file"));
+        assert!(state.active.contains("custom_reader"));
         assert!(!state.active.contains("write_file"));
     }
 
@@ -262,5 +281,82 @@ mod tests {
         assert!(state.fallback_full);
         assert!(state.active.contains("read_file"));
         assert!(!state.active.contains("write_file"));
+    }
+
+    #[test]
+    fn hot_tools_are_active_in_dynamic_exposure_mode() {
+        let receipt = ToolDiscoveryReceipt {
+            query: String::new(),
+            catalog_revision: 1,
+            descriptors: vec![
+                descriptor("tool_search", ToolPermissionMode::ReadOnly),
+                descriptor("read_file", ToolPermissionMode::ReadOnly),
+                descriptor("write_file", ToolPermissionMode::WorkspaceWrite),
+                descriptor("bash", ToolPermissionMode::WorkspaceWrite),
+                descriptor("mcp_custom_tool", ToolPermissionMode::ReadOnly),
+            ],
+            activation_candidates: Vec::new(),
+        };
+        let policy = ToolExposurePolicy {
+            allowed_ids: BTreeSet::new(),
+            maximum_permission: ToolPermissionMode::WorkspaceWrite,
+            supports_dynamic_exposure: true,
+        };
+
+        let state = ToolExposurePlanner.plan(&receipt, ["tool_search".to_string()], &policy);
+        assert!(state.active.contains("read_file"));
+        assert!(state.active.contains("write_file"));
+        assert!(state.active.contains("bash"));
+        assert!(!state.active.contains("mcp_custom_tool"));
+    }
+
+    #[test]
+    fn hot_tools_not_in_catalog_are_not_activated() {
+        let receipt = ToolDiscoveryReceipt {
+            query: String::new(),
+            catalog_revision: 1,
+            descriptors: vec![
+                descriptor("tool_search", ToolPermissionMode::ReadOnly),
+                descriptor("read_file", ToolPermissionMode::ReadOnly),
+            ],
+            activation_candidates: Vec::new(),
+        };
+        let policy = ToolExposurePolicy {
+            allowed_ids: BTreeSet::new(),
+            maximum_permission: ToolPermissionMode::ReadOnly,
+            supports_dynamic_exposure: true,
+        };
+
+        let state = ToolExposurePlanner.plan(&receipt, ["tool_search".to_string()], &policy);
+        assert!(state.active.contains("read_file"));
+        assert!(!state.active.contains("write_file"));
+        assert!(!state.active.contains("bash"));
+    }
+
+    #[test]
+    fn non_hot_tools_remain_deferred() {
+        let receipt = ToolDiscoveryReceipt {
+            query: String::new(),
+            catalog_revision: 1,
+            descriptors: vec![
+                descriptor("tool_search", ToolPermissionMode::ReadOnly),
+                descriptor("read_file", ToolPermissionMode::ReadOnly),
+                descriptor("iacc_ingest", ToolPermissionMode::ReadOnly),
+                descriptor("mcp_connector", ToolPermissionMode::ReadOnly),
+            ],
+            activation_candidates: Vec::new(),
+        };
+        let policy = ToolExposurePolicy {
+            allowed_ids: BTreeSet::new(),
+            maximum_permission: ToolPermissionMode::ReadOnly,
+            supports_dynamic_exposure: true,
+        };
+
+        let state = ToolExposurePlanner.plan(&receipt, ["tool_search".to_string()], &policy);
+        assert!(state.active.contains("read_file"));
+        assert!(!state.active.contains("iacc_ingest"));
+        assert!(!state.active.contains("mcp_connector"));
+        assert!(state.deferred.contains("iacc_ingest"));
+        assert!(state.deferred.contains("mcp_connector"));
     }
 }

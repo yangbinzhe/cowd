@@ -94,6 +94,11 @@ impl CollaborationTemplateMatcher {
                 "阶段",
                 "里程碑",
                 "全盘",
+                "全面规划",
+                "规划",
+                "演进",
+                "evolve",
+                "roadmap",
             ],
         ) {
             (

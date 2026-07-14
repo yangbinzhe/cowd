@@ -8133,7 +8133,7 @@ mod tests {
         fn available_tool_names(&self) -> Vec<String> {
             vec![
                 "ToolSearch".to_string(),
-                "read_file".to_string(),
+                "custom_reader".to_string(),
                 "grep_search".to_string(),
             ]
         }
@@ -8232,7 +8232,7 @@ mod tests {
         assert_eq!(projections[1].active_ids, vec!["ToolSearch"]);
         assert!(projections[1]
             .deferred_ids
-            .contains(&"read_file".to_string()));
+            .contains(&"custom_reader".to_string()));
     }
 
     #[derive(Clone)]
@@ -8287,21 +8287,21 @@ mod tests {
                 "query": "read files",
                 "catalog_revision": 0,
                 "descriptors": [{
-                    "canonical_id": "read_file",
-                    "display_name": "read_file",
+                    "canonical_id": "custom_reader",
+                    "display_name": "custom_reader",
                     "source": "test",
                     "schema_hash": "read-v1",
                     "required_permission": "read_only",
                     "permission_source": "test",
                     "health": "healthy"
                 }],
-                "activation_candidates": ["read_file"]
+                "activation_candidates": ["custom_reader"]
             })
             .to_string())
         }
 
         fn available_tool_names(&self) -> Vec<String> {
-            vec!["ToolSearch".to_string(), "read_file".to_string()]
+            vec!["ToolSearch".to_string(), "custom_reader".to_string()]
         }
 
         fn classify_tool_safety(
@@ -8347,8 +8347,8 @@ mod tests {
                 .lock()
                 .unwrap()
                 .as_ref()
-                .is_some_and(|state| state.active.contains("read_file")),
-            "ToolSearch must activate read_file before the following provider request"
+                .is_some_and(|state| state.active.contains("custom_reader")),
+            "ToolSearch must activate custom_reader before the following provider request"
         );
         runtime
             .execute_model_step("inspect files", false)
@@ -8359,8 +8359,8 @@ mod tests {
         assert_eq!(projections.len(), 2);
         assert_eq!(projections[0].catalog_revision, 0);
         assert_eq!(projections[0].active_ids, vec!["ToolSearch"]);
-        assert_eq!(projections[0].deferred_ids, vec!["read_file"]);
-        assert!(projections[1].active_ids.contains(&"read_file".to_string()));
+        assert_eq!(projections[0].deferred_ids, vec!["custom_reader"]);
+        assert!(projections[1].active_ids.contains(&"custom_reader".to_string()));
         assert!(projections[1].exposure_revision > projections[0].exposure_revision);
     }
 
