@@ -631,7 +631,10 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
                         ]
                     },
                     "reason": { "type": "string" },
-                    "template_hint": { "type": "string" },
+                    "template_hint": {
+                        "type": "string",
+                        "description": "Optional published builtin Team template path such as cowd/parallel-research-synthesis. Choose only the high-level template; Runtime resolves its immutable roles, cardinalities, dependencies, and focus partitions. Do not attempt to provide role ids or a graph in this tool call."
+                    },
                     "capabilities": { "type": "array", "items": { "type": "string" } },
                     "evidence_refs": { "type": "array", "items": { "type": "string" } },
                     "surface": { "type": "string" },

@@ -51,7 +51,11 @@ pub struct NodeExecutionTicket {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeExecutionOutcome {
     pub result: ExecutionNodeResult,
-    pub domain_events: Vec<crate::runtime_event_store::RuntimeTransactionEventInput>,
+    /// Internal graph-commit side effects.  Third-party node executors can
+    /// return a result, but cannot construct arbitrary ledger transactions
+    /// through the public execution outcome API.
+    #[serde(skip)]
+    pub(crate) domain_events: Vec<crate::runtime_event_store::RuntimeTransactionEventInput>,
     pub replan: Option<ExecutionGraphReplan>,
 }
 

@@ -20,6 +20,8 @@ pub enum ApprovalSourceKind {
     Team,
     Mission,
     Steward,
+    /// A Runtime-governed release decision for an evolution candidate.
+    Evolution,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,10 +75,9 @@ pub struct SubmitGlobalApprovalRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GlobalApprovalDecision {
+pub struct ApprovalDecisionCommand {
     pub approval_id: String,
     pub approved: bool,
-    pub decided_by: String,
     pub reason: String,
 }
 
@@ -195,11 +196,13 @@ impl ApprovalQueue {
 
     pub fn decide(
         &self,
-        decision: GlobalApprovalDecision,
+        principal: &crate::VerifiedPrincipal,
+        decision: ApprovalDecisionCommand,
     ) -> Result<GlobalApprovalDecisionReceipt, String> {
-        if decision.decided_by.trim().is_empty() {
-            return Err("decided_by must not be empty".to_string());
+        if !principal.is_human_interactive() || !principal.has_capability("approval.respond") {
+            return Err("approval_human_interactive_capability_required".to_string());
         }
+        let decided_by = principal.claims().principal_id.clone();
         let mut requests = self
             .requests
             .lock()
@@ -207,6 +210,14 @@ impl ApprovalQueue {
         let request = requests
             .get_mut(&decision.approval_id)
             .ok_or_else(|| format!("approval request not found: {}", decision.approval_id))?;
+        // Evolution release decisions bind a signed, one-time lease to the
+        // immutable review evidence and must be committed by
+        // EvolutionGovernanceService. Letting this generic queue decide the
+        // approval would leave a release review approved without its matching
+        // Runtime release assignment.
+        if request.source.kind == ApprovalSourceKind::Evolution {
+            return Err("evolution_release_requires_typed_decision_service".to_string());
+        }
         if request.status != GlobalApprovalStatus::Pending {
             return Ok(GlobalApprovalDecisionReceipt {
                 approval_id: request.approval_id.clone(),
@@ -226,9 +237,9 @@ impl ApprovalQueue {
             status: next_status,
             route_back: request.source.clone(),
             message: if decision.approved {
-                format!("approved by {}", decision.decided_by)
+                format!("approved by {decided_by}")
             } else {
-                format!("denied by {}: {}", decision.decided_by, decision.reason)
+                format!("denied by {decided_by}: {}", decision.reason)
             },
         };
         let stream_id = format!("approval:{}", request.approval_id);
@@ -246,7 +257,7 @@ impl ApprovalQueue {
                     scope: RuntimeEventScope::Approval,
                     kind: "approval.decided".to_string(),
                     status: Some(next_status.as_str().to_string()),
-                    actor: Some(decision.decided_by),
+                    actor: Some(decided_by),
                     refs: approval_source_refs(&request.source),
                     payload: serde_json::json!({
                         "approved": decision.approved,
@@ -510,13 +521,16 @@ mod tests {
             .expect("approval submitted");
 
         assert_eq!(queue.pending().len(), 1);
+        let principal = crate::security::test_human_interactive_principal();
         let receipt = queue
-            .decide(GlobalApprovalDecision {
-                approval_id: request.approval_id.clone(),
-                approved: true,
-                decided_by: "human".to_string(),
-                reason: "looks safe".to_string(),
-            })
+            .decide(
+                &principal,
+                ApprovalDecisionCommand {
+                    approval_id: request.approval_id.clone(),
+                    approved: true,
+                    reason: "looks safe".to_string(),
+                },
+            )
             .expect("approval decided");
 
         assert_eq!(receipt.status, GlobalApprovalStatus::Approved);
@@ -542,12 +556,14 @@ mod tests {
             })
             .expect("approval submitted");
         queue
-            .decide(GlobalApprovalDecision {
-                approval_id: request.approval_id.clone(),
-                approved: true,
-                decided_by: "human".to_string(),
-                reason: "reviewed".to_string(),
-            })
+            .decide(
+                &crate::security::test_human_interactive_principal(),
+                ApprovalDecisionCommand {
+                    approval_id: request.approval_id.clone(),
+                    approved: true,
+                    reason: "reviewed".to_string(),
+                },
+            )
             .expect("approval decided");
 
         queue.refresh();
@@ -609,12 +625,14 @@ mod tests {
             )
             .unwrap();
         queue
-            .decide(GlobalApprovalDecision {
-                approval_id: request.approval_id.clone(),
-                approved: true,
-                decided_by: "human".to_string(),
-                reason: "approved".to_string(),
-            })
+            .decide(
+                &crate::security::test_human_interactive_principal(),
+                ApprovalDecisionCommand {
+                    approval_id: request.approval_id.clone(),
+                    approved: true,
+                    reason: "approved".to_string(),
+                },
+            )
             .unwrap();
 
         let restarted = ApprovalQueue::new(store);

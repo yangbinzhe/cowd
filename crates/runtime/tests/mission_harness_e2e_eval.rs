@@ -81,7 +81,7 @@ fn mission_harness_quick_eval_covers_core_runtime_loop_and_writes_report() {
                 summary: "inspect runtime event evidence".to_string(),
                 risk: TaskRisk::Low,
                 requested_tool: Some("read_file".to_string()),
-                template_id: Some(CollaborationTemplateId::ExecuteReview),
+                template_id: Some(CollaborationTemplateId::PlannerExecutorVerifier),
                 requires_write: false,
                 is_critical_operation: false,
                 evidence_refs: vec!["mission-eval".to_string()],

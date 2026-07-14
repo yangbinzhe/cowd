@@ -14,8 +14,6 @@
         clippy::unreachable
     )
 )]
-#[path = "static/agent_static.rs"]
-mod agent_static;
 mod api_routes;
 #[path = "core/bootstrap.rs"]
 mod bootstrap;
@@ -84,6 +82,14 @@ mod surface_host;
 mod task_kernel;
 
 pub use boundary_policy::{GatewayBoundaryPolicy, GatewayResponsibility};
+
+/// Feature-gated black-box integration harness. This intentionally exposes
+/// only a fully assembled API router, never Gateway internals or mutation
+/// shortcuts.
+#[cfg(feature = "test-support")]
+pub mod test_support {
+    pub use crate::api_routes::test_support::GatewayTestHarness;
+}
 
 use std::collections::BTreeSet;
 use std::env;
@@ -2352,16 +2358,8 @@ fn run_resume_command(
             })
         }
         SlashCommand::Agents { args } => {
-            let cwd = env::current_dir()?;
-            let agent_service = GatewayServices::baseline().agent;
-            let message = agent_service.command_text(&cwd, args.as_deref())?;
-            let json = agent_service.command_json(&cwd, args.as_deref())?;
-            Ok(ResumeCommandOutcome {
-                session: session.clone(),
-                session_path: None,
-                message: Some(message),
-                json: Some(json),
-            })
+            let _ = args;
+            Err("resumed /agents is unavailable without the Runtime Definition service; start the Gateway and use the Agents workspace".into())
         }
         SlashCommand::Skills { args } => {
             if let SkillSlashDispatch::Invoke(_) = classify_skills_slash_command(args.as_deref()) {
@@ -2520,7 +2518,6 @@ fn run_resume_command(
         | SlashCommand::Tag { .. }
         | SlashCommand::OutputStyle { .. }
         | SlashCommand::AddDir { .. }
-        | SlashCommand::AgentProfile { .. }
         | SlashCommand::Handoff { .. }
         | SlashCommand::SubAgent { .. }
         | SlashCommand::Pipeline { .. }
@@ -3528,27 +3525,10 @@ pub(crate) fn workspace_context_item(session: &Session, model_ctx: u32) -> runti
     runtime::ContextRuntimeKernel::workspace_item(&packet)
 }
 
-pub(crate) fn active_evolution_capability_overlay_for_config_home(
-    config_home: impl AsRef<std::path::Path>,
-) -> runtime::ActiveEvolutionCapabilityOverlay {
-    let registry =
-        runtime::EvolutionAppliedCapabilityRegistry::new(config_home.as_ref().join("evolution"));
-    registry
-        .list()
-        .map(|records| runtime::ActiveEvolutionCapabilityOverlay::from_records(&records))
-        .unwrap_or_default()
-}
-
-pub(crate) fn current_active_evolution_capability_overlay(
-) -> runtime::ActiveEvolutionCapabilityOverlay {
-    active_evolution_capability_overlay_for_config_home(runtime::cowd_dirs::config_home_dir())
-}
-
 pub(crate) fn runtime_capability_context_item(
     tool_definitions: &[runtime::ProviderToolDefinition],
     allowed_tools: Option<&AllowedToolSet>,
     model_ctx: u32,
-    active_evolution: &runtime::ActiveEvolutionCapabilityOverlay,
 ) -> runtime::ContextItem {
     let tool_names = tool_definitions
         .iter()
@@ -3575,39 +3555,29 @@ pub(crate) fn runtime_capability_context_item(
         })
         .collect::<Vec<_>>();
     let runtime_query = if has_tool("runtime_capabilities") {
-        "runtime_capabilities=available"
+        "runtime_capabilities=registered"
     } else {
-        "runtime_capabilities=unavailable"
+        "runtime_capabilities=not_registered"
     };
     let runtime_orchestration = if has_tool("runtime_orchestrate") {
-        "runtime_orchestrate=available"
+        "runtime_orchestrate=registered"
     } else {
-        "runtime_orchestrate=unavailable"
+        "runtime_orchestrate=not_registered"
     };
     let allowed_state = allowed_tools.map_or_else(
         || "allowed_tools=all available registry tools".to_string(),
         |allowed| format!("allowed_tools=restricted count={}", allowed.len()),
     );
-    let active_evolution_summary = if active_evolution.active_count == 0 {
-        "active_evolution_capabilities=none".to_string()
-    } else {
-        format!(
-            "active_evolution_capabilities={}; overlays={}",
-            active_evolution.active_count,
-            active_evolution.active_summaries(3).join(" || ")
-        )
-    };
     let content = format!(
-        "# Active runtime capability map\n\
+        "# Runtime capability catalog\n\
 model_context_window={model_ctx}\n\
-available_tool_count={}\n\
+registered_tool_count={}\n\
 {allowed_state}\n\
 {runtime_query}\n\
 {runtime_orchestration}\n\
-{active_evolution_summary}\n\
-batch_readonly_tools={}\n\
-prepared_readonly_tools={}\n\
-Guidance: for independent read-only evidence, request multiple tool calls together or use tool_batch_readonly/read_many/grep_many when available; distinguish model-callable tools from runtime-owned collaboration/subagent affordances; for complex architecture or validation work, shape the task so runtime orchestration can attach collaborators when available; when a path repeats, query runtime_capabilities or re-plan before continuing.",
+registered_batch_readonly_tools={}\n\
+registered_prepared_readonly_tools={}\n\
+Important: this is a filtered backend catalog, not the current provider function schema set. Runtime injects the authoritative per-request function-call contract separately. Call only functions in that contract; use ToolSearch to activate eligible deferred candidates. For independent read-only evidence, request multiple active calls together. Distinguish model-callable tools from runtime-owned collaboration/subagent affordances; for complex work, use active runtime orchestration when present. When a path repeats, re-plan from retained evidence rather than querying the same capability catalog again.",
         tool_definitions.len(),
         if batch_tools.is_empty() {
             "none".to_string()
@@ -6911,29 +6881,12 @@ mod tests {
             },
         ];
 
-        let overlay = runtime::ActiveEvolutionCapabilityOverlay {
-            active_count: 1,
-            rolled_back_count: 0,
-            capabilities: vec![runtime::ActiveEvolutionCapabilitySummary {
-                version_id: "version-test".to_string(),
-                candidate_id: "candidate-test".to_string(),
-                kind: "runtime_policy".to_string(),
-                adapter: "runtime_policy_overlay".to_string(),
-                owner: "runtime".to_string(),
-                status: "active".to_string(),
-                goal_ids: vec!["runtime_efficiency".to_string()],
-                policy_effects: vec!["prefer_parallel_tools".to_string()],
-                evidence_refs: vec!["artifact-test".to_string()],
-            }],
-        };
-        let item = runtime_capability_context_item(&tools, None, 1_000_000, &overlay);
+        let item = runtime_capability_context_item(&tools, None, 1_000_000);
 
         assert_eq!(item.source, runtime::ContextSourceKind::RuntimeHeader);
         assert_eq!(item.role, runtime::ContextRole::Orientation);
-        assert!(item.content.contains("runtime_capabilities=available"));
-        assert!(item.content.contains("runtime_orchestrate=unavailable"));
-        assert!(item.content.contains("active_evolution_capabilities=1"));
-        assert!(item.content.contains("prefer_parallel_tools"));
+        assert!(item.content.contains("runtime_capabilities=registered"));
+        assert!(item.content.contains("runtime_orchestrate=not_registered"));
         assert!(item.content.contains("read_many"));
         assert!(item.content.contains("tool_batch_readonly"));
     }
@@ -7352,28 +7305,21 @@ UU conflicted.rs",
     }
 
     #[test]
-    fn resume_agents_command_returns_structured_catalog_json() {
+    fn resume_agents_command_requires_runtime_definition_service() {
         let _guard = env_lock();
         let root = temp_dir();
         fs::create_dir_all(&root).expect("root dir");
         let session_path = root.join("session.json");
         let session = Session::new();
-        let outcome = with_current_dir(&root, || {
+        let error = with_current_dir(&root, || {
             run_resume_command(
                 &session_path,
                 &session,
                 &SlashCommand::Agents { args: None },
             )
-            .expect("resume agents should work")
+            .expect_err("resume cannot construct a separate definition catalog")
         });
-        let json = outcome.json.expect("agents json should exist");
-        assert_eq!(json["kind"], "agents");
-        assert_eq!(json["action"], "list");
-        assert!(json
-            .get("agents")
-            .and_then(serde_json::Value::as_array)
-            .is_some());
-        assert!(json.get("text").is_none());
+        assert!(error.to_string().contains("Runtime Definition service"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

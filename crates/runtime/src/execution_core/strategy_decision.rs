@@ -249,7 +249,7 @@ fn build_runtime_execution_decision_inner(
             why: "complex evidence can be acquired through an evidence graph".to_string(),
         });
     }
-    if template_decision.template_id == CollaborationTemplateId::DebateConsensus
+    if template_decision.template_id == CollaborationTemplateId::DebateCriticArbiter
         && recommended_pattern != ExecutionPattern::Deliberate
     {
         candidate_patterns.push(RuntimeExecutionPatternCandidate {
@@ -439,7 +439,7 @@ fn action_hints(
         }],
         ExecutionPattern::Deliberate => vec![RuntimeExecutionActionHint {
             action: "request_deliberation".to_string(),
-            template_hint: Some("debate_consensus".to_string()),
+            template_hint: Some("cowd/debate-critic-arbiter".to_string()),
             reason: "resolve competing options with evidence-backed arbitration".to_string(),
         }],
         ExecutionPattern::Collaborate => vec![RuntimeExecutionActionHint {

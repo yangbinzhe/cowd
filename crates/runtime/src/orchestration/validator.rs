@@ -70,10 +70,10 @@ pub fn validate_request(
     if request
         .constraints
         .max_parallel_agents
-        .is_some_and(|count| count > 4)
+        .is_some_and(|count| count == 0)
     {
         status = "rejected".to_string();
-        findings.push("max_parallel_agents_exceeded".to_string());
+        findings.push("max_parallel_agents_must_be_positive".to_string());
     }
     if request.action == RuntimeOrchestrationAction::RequestTeam
         && request.session_id.as_deref().is_none_or(str::is_empty)
@@ -122,7 +122,6 @@ pub fn validate_request(
                 .recommended_template
                 .map(|template| template.as_str().to_string())
         }),
-        selected_protocol: request.protocol.clone(),
         reason: request.reason.clone().unwrap_or_else(|| {
             "runtime compiled model intent through the leased strategy decision".to_string()
         }),
@@ -130,7 +129,8 @@ pub fn validate_request(
         validation_findings: findings,
         required_approval,
         budget: json!({
-            "max_parallel_agents": request.constraints.max_parallel_agents.unwrap_or(2),
+            "requested_max_parallel_agents": request.constraints.max_parallel_agents,
+            "parallelism_owner": "runtime_team_instantiation_resource_policy",
             "plan_only": request.action == RuntimeOrchestrationAction::PlanOnly,
             "strategy_lease_id": execution.lease.lease_id,
         }),

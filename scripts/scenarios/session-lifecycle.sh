@@ -12,10 +12,15 @@ FAILED=0
 WORKDIR="$TMP_DIR/workspace"
 CONFIG_HOME="$TMP_DIR/config"
 HOME_DIR="$TMP_DIR/home"
-SOCKET="$TMP_DIR/cowd.sock"
 GATEWAY_LOG="$TMP_DIR/gateway.log"
+API_TOKEN="session-lifecycle-$$_credential"
+AUTH_BROKER_BIN="${COWD_AUTH_BROKER_BIN:-$TARGET_ROOT/debug/cowd-auth-broker}"
 SESSION_ID="session-lifecycle-session-$$"
 SCENARIO_API_KEY="${ANTHROPIC_API_KEY:-test-dummy-key-for-session-lifecycle-scenario}"
+
+curl() {
+  command curl -H "Authorization: Bearer $API_TOKEN" "$@"
+}
 
 cleanup() {
   if [[ "$FAILED" == "1" && "${COWD_SESSION_LIFECYCLE_KEEP_TMP:-}" == "1" ]]; then
@@ -58,6 +63,10 @@ if ss -ltnp | rg -q ":$PORT\\b"; then
   echo "port $PORT is already in use" >&2
   exit 1
 fi
+if [[ ! -x "$AUTH_BROKER_BIN" ]]; then
+  echo "cowd-auth-broker is required at $AUTH_BROKER_BIN" >&2
+  exit 1
+fi
 
 if [[ ! -x "$BIN" ]]; then
   echo "missing cowd binary at $BIN; run cargo build -p cli first" >&2
@@ -87,7 +96,8 @@ gateway:
       host: "127.0.0.1"
       port: $PORT
       auth:
-        enabled: false
+        enabled: true
+        token: "$API_TOKEN"
 EOF
 cp "$CONFIG_HOME/config.yaml" "$HOME_DIR/.cowd/config.yaml"
 cp "$CONFIG_HOME/config.yaml" "$WORKDIR/.cowd/config.yaml"
@@ -95,59 +105,39 @@ cp "$CONFIG_HOME/config.yaml" "$WORKDIR/.cowd/config.yaml"
 tmux new-session -d -s "$GATEWAY_SESSION" \
   "bash -lc \"cd '$WORKDIR' && \
     export COWD_CONFIG_HOME='$CONFIG_HOME' && \
-    export COWD_DAEMON_SOCKET='$SOCKET' && \
+    export COWD_AUTH_BROKER_BIN='$AUTH_BROKER_BIN' && \
     export HOME='$HOME_DIR' && \
     '$BIN' gateway run >'$GATEWAY_LOG' 2>&1\""
 
 for _ in {1..120}; do
-  if [[ -S "$SOCKET" ]] && curl -fsS "$BASE_URL/health" >/dev/null 2>&1; then
+  if curl -fsS "$BASE_URL/health" >/dev/null 2>&1; then
     break
   fi
   sleep 0.25
 done
 
-[[ -S "$SOCKET" ]]
 curl -fsS "$BASE_URL/health" >/dev/null
 
-python3 - "$SOCKET" "$SESSION_ID" <<'PY'
-import json
-import socket
-import sys
-
-sock_path, session_id = sys.argv[1:3]
-
-def request(payload):
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-        client.connect(sock_path)
-        client.sendall(json.dumps(payload).encode("utf-8") + b"\n")
-        data = b""
-        while not data.endswith(b"\n"):
-            chunk = client.recv(65536)
-            if not chunk:
-                break
-            data += chunk
-        response = json.loads(data.decode("utf-8").strip())
-        if not response.get("ok"):
-            raise SystemExit(json.dumps(response, ensure_ascii=False))
-        return response
-
-request({"cmd": "ensure_session", "protocol_version": 1, "session_id": session_id, "model": "claude-sonnet-4-6"})
-first = request({"cmd": "session.attach", "protocol_version": 1, "session_id": session_id, "actor_id": "tui:session-lifecycle", "surface": "tui", "role": "writer"})
-assert first["event"]["sequence"] == 0, first
-second = request({"cmd": "session.attach", "protocol_version": 1, "session_id": session_id, "actor_id": "web:session-lifecycle", "surface": "webui", "role": "reader"})
-assert second["event"]["sequence"] == 1, second
-snapshot = request({"cmd": "session.lifecycle", "protocol_version": 1, "session_id": session_id})
-assert snapshot["snapshot"]["state"] == "attached", snapshot
-assert len(snapshot["snapshot"]["attachments"]) == 2, snapshot
-detached = request({"cmd": "session.detach", "protocol_version": 1, "session_id": session_id, "actor_id": "tui:session-lifecycle"})
-assert detached["snapshot"]["state"] == "attached", detached
-assert len(detached["snapshot"]["attachments"]) == 1, detached
-replay = request({"cmd": "session.replay", "protocol_version": 1, "session_id": session_id, "from_sequence": 0, "limit": 20})
-assert replay["ok"] is True, replay
-runtime = request({"cmd": "runtime.snapshot", "protocol_version": 1})
-assert session_id in runtime.get("sessions", []), runtime
-assert any(item["session_id"] == session_id for item in runtime.get("lifecycle", [])), runtime
-PY
+curl -fsS -X POST "$BASE_URL/api/sessions/$SESSION_ID/ensure" \
+  -H 'content-type: application/json' \
+  -d '{"model":"claude-sonnet-4-6"}' \
+  | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("ok") is True and data.get("session_id") == sys.argv[1], data' "$SESSION_ID"
+for attachment in '{"surface":"tui","role":"writer"}' '{"surface":"webui","role":"reader"}'; do
+  curl -fsS -X POST "$BASE_URL/api/sessions/$SESSION_ID/attach" \
+    -H 'content-type: application/json' \
+    -d "$attachment" \
+    | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("ok") is True, data'
+done
+curl -fsS "$BASE_URL/api/sessions/$SESSION_ID/lifecycle" \
+  | python3 -c 'import json,sys; data=json.load(sys.stdin); snapshot=data.get("snapshot",{}); assert data.get("ok") is True and snapshot.get("state") == "attached" and len(snapshot.get("attachments",[])) == 2, data'
+curl -fsS -X POST "$BASE_URL/api/sessions/$SESSION_ID/detach" \
+  -H 'content-type: application/json' \
+  -d '{"surface":"tui"}' \
+  | python3 -c 'import json,sys; data=json.load(sys.stdin); snapshot=data.get("snapshot",{}); assert data.get("ok") is True and snapshot.get("state") == "attached" and len(snapshot.get("attachments",[])) == 1 and snapshot["attachments"][0]["actor"]["surface"] == "webui", data'
+curl -fsS "$BASE_URL/api/sessions/$SESSION_ID/replay?from_sequence=0&limit=20" \
+  | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("ok") is True and data.get("total", 0) >= 3, data'
+curl -fsS "$BASE_URL/api/runtime/snapshot" \
+  | python3 -c 'import json,sys; data=json.load(sys.stdin); assert sys.argv[1] in (data.get("sessions") or []), data' "$SESSION_ID"
 
 tmux kill-session -t "$GATEWAY_SESSION" >/dev/null 2>&1 || true
 echo "session lifecycle scenario passed"

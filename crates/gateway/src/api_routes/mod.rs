@@ -10,11 +10,12 @@ use std::{
 use axum::{
     body::Body,
     extract::State as AxumState,
-    http::{header, HeaderMap, Request, StatusCode},
+    http::{header, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json},
     Router,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use runtime::approval_gate::SmartApprovalGate;
 #[cfg(test)]
 use runtime::ApprovalConfig;
@@ -59,6 +60,7 @@ mod edge_routes;
 mod evolution_routes;
 mod growth_routes;
 mod harness_eval_routes;
+mod managed_agent_routes;
 mod matrix_outcomes;
 mod matrix_routes;
 pub(crate) mod memory_routes;
@@ -97,6 +99,36 @@ pub struct AppState {
     pub profile_manager: Arc<ProfileManager>,
     pub services: Arc<GatewayServices>,
     pub session_lease_registry: Option<Arc<session::SessionLeaseRegistry>>,
+}
+
+/// Request identity derived exclusively by Gateway authentication middleware.
+/// Route payloads must never carry actor or capability fields.
+#[derive(Debug, Clone)]
+pub(crate) struct AuthenticatedPrincipal(pub(crate) runtime::VerifiedPrincipal);
+
+pub(super) const WEB_SESSION_COOKIE: &str = "cowd_web_session";
+
+/// Stable audit principal derived only from the verified Gateway credential.
+///
+/// HTTP payloads may describe an external identity reference, but never choose
+/// the principal on whose behalf an effect is authorized or recorded.
+pub(crate) fn principal_actor_id(principal: &AuthenticatedPrincipal) -> String {
+    format!("principal:{}", principal.0.claims().principal_id)
+}
+
+/// Lifecycle attachments identify a verified principal at a concrete surface.
+///
+/// A person may observe the same session in TUI and WebUI at once.  The
+/// lifecycle kernel keys attachments by actor id, so using only the principal
+/// would make the later surface silently replace the earlier one.  The
+/// surface remains descriptive input, while the authenticated principal is
+/// always supplied by the Gateway.
+pub(crate) fn surface_actor_id(principal: &AuthenticatedPrincipal, surface: &str) -> String {
+    format!(
+        "{}:surface:{}",
+        principal_actor_id(principal),
+        surface.trim()
+    )
 }
 
 impl AppState {
@@ -144,54 +176,504 @@ impl AppState {
 
 // ── Auth middleware ────────────────────────────────────────────
 
-/// If `auth_token` is set on `AppState`, require `Authorization: Bearer <token>`.
-/// When `auth_token` is `None`, all requests are allowed (no auth configured).
+/// Attach a server-derived principal to every protected request.  Same-origin
+/// headers are browser metadata, not proof of identity, and are deliberately
+/// never accepted as an authentication bypass.
 async fn auth_middleware(
     AxumState(state): AxumState<Arc<AppState>>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    if let Some(token) = &state.auth_token {
-        if is_webui_internal_request(request.headers()) {
-            return Ok(next.run(request).await);
-        }
-
+    let claims = if let Some(token) = &state.auth_token {
         let auth_header = request
             .headers()
             .get(header::AUTHORIZATION)
             .and_then(|v: &axum::http::HeaderValue| v.to_str().ok());
 
         match auth_header {
-            Some(h) if h == format!("Bearer {token}") => Ok(next.run(request).await),
-            _ => Err((
-                StatusCode::UNAUTHORIZED,
-                Json(ErrorResponse {
-                    error: "unauthorized".to_string(),
-                }),
-            )),
+            Some(h) if h == format!("Bearer {token}") => {
+                authenticated_human_principal(&state.config_home, token).map_err(|error| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: format!("authentication_authority_error:{error}"),
+                        }),
+                    )
+                })?
+            }
+            _ => web_session_principal(
+                &state.config_home,
+                request.headers(),
+                state.auth_token.as_deref(),
+            )
+            .map_err(|error| {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(ErrorResponse {
+                        error: format!("unauthorized:{error}"),
+                    }),
+                )
+            })?,
         }
     } else {
-        Ok(next.run(request).await)
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            test_human_principal()
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "authentication_not_configured".to_string(),
+            }),
+        ));
+    };
+    request
+        .extensions_mut()
+        .insert(AuthenticatedPrincipal(claims));
+    Ok(next.run(request).await)
+}
+
+pub(super) fn authenticated_human_principal(
+    config_home: &std::path::Path,
+    token: &str,
+) -> Result<runtime::VerifiedPrincipal, String> {
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        let client = auth_broker::BrokerClient::new(auth_broker::BrokerClient::default_socket(
+            config_home.join("auth-broker"),
+        ));
+        let (envelope, public_key) = client
+            .authenticate_human(token, human_capabilities(), Some(5 * 60 * 1_000))
+            .map_err(|error| error.to_string())?;
+        let lifecycle = client
+            .credential_lifecycle()
+            .map_err(|error| error.to_string())?;
+        if lifecycle.status != auth_broker::CredentialLifecycleStatus::Active {
+            return Err("local human credential is revoked".to_string());
+        }
+        return runtime::PrincipalVerifier::from_base64(&envelope.key_id, &public_key)
+            .map_err(|error| error.to_string())?
+            .requiring_credential_epoch(lifecycle.credential_epoch)
+            .verify(&envelope)
+            .map_err(|error| error.to_string());
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        let (envelope, public_key) = auth_broker::test_support::issue_human_principal(
+            config_home.join("auth-broker"),
+            token,
+            human_capabilities(),
+            Some(5 * 60 * 1_000),
+        )
+        .map_err(|error| error.to_string())?;
+        runtime::PrincipalVerifier::from_base64(&envelope.key_id, &public_key)
+            .map_err(|error| error.to_string())?
+            .verify(&envelope)
+            .map_err(|error| error.to_string())
     }
 }
 
-fn is_webui_internal_request(headers: &HeaderMap) -> bool {
-    let Some(fetch_site) = headers
-        .get("sec-fetch-site")
-        .and_then(|value| value.to_str().ok())
-    else {
-        return false;
-    };
-
-    if fetch_site != "same-origin" {
-        return false;
+/// Mint a short-lived browser session from a local human credential. The
+/// browser receives only a broker-signed principal envelope, never the raw
+/// credential. Gateway has no signing key and verifies this envelope again on
+/// every protected request.
+pub(super) fn issue_web_session(
+    config_home: &std::path::Path,
+    credential: &str,
+) -> Result<String, String> {
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        let client = auth_broker::BrokerClient::new(auth_broker::BrokerClient::default_socket(
+            config_home.join("auth-broker"),
+        ));
+        let (envelope, public_key) = client
+            .authenticate_human(credential, human_capabilities(), Some(5 * 60 * 1_000))
+            .map_err(|error| error.to_string())?;
+        let lifecycle = client
+            .credential_lifecycle()
+            .map_err(|error| error.to_string())?;
+        if lifecycle.status != auth_broker::CredentialLifecycleStatus::Active {
+            return Err("local human credential is revoked".to_string());
+        }
+        verify_human_envelope(&envelope, &public_key, lifecycle.credential_epoch)?;
+        return encode_web_session(&envelope);
     }
 
-    let destination = headers
-        .get("sec-fetch-dest")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("");
-    destination == "empty" || destination == "document"
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        let (envelope, public_key) = auth_broker::test_support::issue_human_principal(
+            config_home.join("auth-broker"),
+            credential,
+            human_capabilities(),
+            Some(5 * 60 * 1_000),
+        )
+        .map_err(|error| error.to_string())?;
+        verify_human_envelope(&envelope, &public_key, 0)?;
+        encode_web_session(&envelope)
+    }
+}
+
+pub(super) fn web_session_principal(
+    config_home: &std::path::Path,
+    headers: &axum::http::HeaderMap,
+    test_credential: Option<&str>,
+) -> Result<runtime::VerifiedPrincipal, String> {
+    let encoded = cookie_value(headers, WEB_SESSION_COOKIE)
+        .ok_or_else(|| "missing_browser_session".to_string())?;
+    if encoded.len() > 8_192 {
+        return Err("browser_session_too_large".to_string());
+    }
+    let bytes = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|error| format!("invalid_browser_session:{error}"))?;
+    let envelope =
+        serde_json::from_slice::<harness_contract::security::SignedPrincipalEnvelope>(&bytes)
+            .map_err(|error| format!("invalid_browser_session:{error}"))?;
+
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        let _ = test_credential;
+        let client = auth_broker::BrokerClient::new(auth_broker::BrokerClient::default_socket(
+            config_home.join("auth-broker"),
+        ));
+        let (key_id, public_key) = client.trust_metadata().map_err(|error| error.to_string())?;
+        if envelope.key_id != key_id {
+            return Err("browser_session_authority_mismatch".to_string());
+        }
+        let lifecycle = client
+            .credential_lifecycle()
+            .map_err(|error| error.to_string())?;
+        if lifecycle.status != auth_broker::CredentialLifecycleStatus::Active {
+            return Err("local_human_credential_revoked".to_string());
+        }
+        return verify_human_envelope(&envelope, &public_key, lifecycle.credential_epoch);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        let (_, public_key) = auth_broker::test_support::issue_human_principal(
+            config_home.join("auth-broker"),
+            test_credential.ok_or_else(|| "test_browser_session_credential_missing".to_string())?,
+            human_capabilities(),
+            Some(5 * 60 * 1_000),
+        )
+        .map_err(|error| error.to_string())?;
+        verify_human_envelope(&envelope, &public_key, 0)
+    }
+}
+
+fn verify_human_envelope(
+    envelope: &harness_contract::security::SignedPrincipalEnvelope,
+    public_key: &str,
+    credential_epoch: u64,
+) -> Result<runtime::VerifiedPrincipal, String> {
+    let verifier = runtime::PrincipalVerifier::from_base64(&envelope.key_id, public_key)
+        .map_err(|error| error.to_string())?;
+    let verifier = if credential_epoch == 0 {
+        verifier
+    } else {
+        verifier.requiring_credential_epoch(credential_epoch)
+    };
+    verifier.verify(envelope).map_err(|error| error.to_string())
+}
+
+fn encode_web_session(
+    envelope: &harness_contract::security::SignedPrincipalEnvelope,
+) -> Result<String, String> {
+    serde_json::to_vec(envelope)
+        .map(|value| URL_SAFE_NO_PAD.encode(value))
+        .map_err(|error| error.to_string())
+}
+
+pub(super) fn cookie_value<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())?
+        .split(';')
+        .map(str::trim)
+        .find_map(|pair| pair.split_once('='))
+        .and_then(|(key, value)| (key == name).then_some(value))
+}
+
+/// Ask the isolated local authority for a short-lived, action-bound human
+/// decision lease. The Gateway receives only a signed envelope and the
+/// authority public key; signing material never enters the process.
+pub(super) fn issue_human_decision_lease(
+    config_home: &std::path::Path,
+    credential: &str,
+    review_id: impl Into<String>,
+    action: impl Into<String>,
+    scope: impl Into<String>,
+    evidence_digest: impl Into<String>,
+    expires_at_ms: u64,
+) -> Result<(harness_contract::security::SignedDecisionLease, String), String> {
+    let review_id = review_id.into();
+    let action = action.into();
+    let scope = scope.into();
+    let evidence_digest = evidence_digest.into();
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        let client = auth_broker::BrokerClient::new(auth_broker::BrokerClient::default_socket(
+            config_home.join("auth-broker"),
+        ));
+        return client
+            .issue_decision_lease(
+                credential,
+                review_id,
+                action,
+                scope,
+                evidence_digest,
+                expires_at_ms,
+            )
+            .map_err(|error| error.to_string());
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        auth_broker::test_support::issue_decision_lease(
+            config_home.join("auth-broker"),
+            credential,
+            review_id,
+            action,
+            scope,
+            evidence_digest,
+            expires_at_ms,
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+
+fn human_capabilities() -> Vec<String> {
+    vec![
+        "approval.respond".to_string(),
+        "definition.manage".to_string(),
+        "evolution.release.manage".to_string(),
+        "runtime.maintenance.manage".to_string(),
+        "runtime.outbox.retry".to_string(),
+    ]
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn test_human_principal() -> runtime::VerifiedPrincipal {
+    static PRINCIPAL: std::sync::OnceLock<runtime::VerifiedPrincipal> = std::sync::OnceLock::new();
+    PRINCIPAL
+        .get_or_init(|| {
+            let (envelope, public_key) = auth_broker::test_support::issue_human_principal(
+                std::env::temp_dir().join("cowd-gateway-test-auth"),
+                "test-only-credential",
+                human_capabilities(),
+                None,
+            )
+            .expect("test principal envelope");
+            runtime::PrincipalVerifier::from_base64(&envelope.key_id, &public_key)
+                .expect("test verifier")
+                .verify(&envelope)
+                .expect("test verified principal")
+        })
+        .clone()
+}
+
+/// Minimal, feature-gated fixture for external black-box route tests.
+///
+/// The harness uses the same `api_router` and Runtime-backed `GatewayServices`
+/// construction as the in-crate route tests. It deliberately exposes no
+/// handlers, no raw stores, and no authentication bypass outside the explicit
+/// `test-support` feature.
+#[cfg(feature = "test-support")]
+pub mod test_support {
+    use std::{path::PathBuf, sync::Arc, time::Instant};
+
+    use approval::FileApprovalRepository;
+    use axum::Router;
+    use runtime::{
+        approval_gate::SmartApprovalGate, permission_enforcer::DestructivePatternDetector,
+        ApprovalConfig, ProfileManager,
+    };
+    use tools::ToolCatalog;
+
+    use super::{api_router, AppState};
+    use crate::{
+        event_bus::SessionEventBus, gateway::ActiveSessions, runtime_service::RuntimeService,
+        services::GatewayServices, session_kernel::SessionKernel, task_kernel::TaskKernel,
+    };
+
+    pub struct GatewayTestHarness {
+        state: Arc<AppState>,
+    }
+
+    impl GatewayTestHarness {
+        pub fn in_memory() -> Result<Self, String> {
+            Self::in_memory_with_optional_auth_token(None)
+        }
+
+        /// Construct the same in-memory production router with bearer
+        /// authentication enabled. This is intentionally test-support only so
+        /// black-box tests can prove missing and invalid credentials are
+        /// rejected without exposing a production authentication bypass.
+        pub fn in_memory_with_auth_token(token: impl Into<String>) -> Result<Self, String> {
+            let token = token.into();
+            if token.trim().is_empty() {
+                return Err("test auth token must not be empty".to_string());
+            }
+            Self::in_memory_with_optional_auth_token(Some(token))
+        }
+
+        fn in_memory_with_optional_auth_token(auth_token: Option<String>) -> Result<Self, String> {
+            let root = unique_test_root("gateway-api-harness");
+            let config_home = root.join("config");
+            let workspace_root = root.join("workspace");
+            std::fs::create_dir_all(&config_home).map_err(|error| error.to_string())?;
+            std::fs::create_dir_all(&workspace_root).map_err(|error| error.to_string())?;
+
+            let sessions = Arc::new(ActiveSessions::new());
+            let event_bus = SessionEventBus::new();
+            let session_store = Arc::new(
+                memory::session_store::UnifiedSessionStore::open_in_memory()
+                    .map_err(|error| error.to_string())?,
+            );
+            let session_kernel = Arc::new(SessionKernel::new(
+                Arc::clone(&sessions),
+                Some(Arc::clone(&session_store)),
+                Arc::clone(&event_bus),
+            ));
+            let lifecycle_kernel = Arc::new(
+                crate::session_lifecycle_kernel::SessionLifecycleKernel::with_store(Arc::clone(
+                    &session_store,
+                )),
+            );
+            let task_kernel = Arc::new(
+                TaskKernel::open(root.join("tasks.json")).map_err(|error| error.to_string())?,
+            );
+            let runtime_services =
+                runtime::RuntimeServices::in_memory().map_err(|error| error.to_string())?;
+            runtime_services
+                .install_session_store(session_store)
+                .map_err(|error| error.to_string())?;
+            let runtime = Arc::new(
+                RuntimeService::new(
+                    sessions,
+                    Arc::new(session::SessionLeaseRegistry::default()),
+                    session_kernel,
+                    lifecycle_kernel,
+                    Instant::now(),
+                    Arc::new(runtime::ProviderRegistry::empty()),
+                    Arc::new(runtime::UpgradeCoordinator::new()),
+                    runtime_services,
+                )
+                .map_err(|error| error.to_string())?
+                .with_tool_host(Arc::new(tools::ToolHost::builtin(
+                    "gateway-black-box-test",
+                    workspace_root.clone(),
+                ))),
+            );
+            let approval_gate = Arc::new(SmartApprovalGate::new(
+                Arc::new(DestructivePatternDetector::new(workspace_root.clone())),
+                ApprovalConfig::default(),
+                None,
+            ));
+            let approval_repository = FileApprovalRepository::new(
+                root.join("approval-history.json"),
+                root.join("always-approved.json"),
+            );
+            let services = Arc::new(GatewayServices::new_with_config_home(
+                runtime,
+                task_kernel,
+                Arc::new(crate::surface_host::SurfaceHost::default()),
+                None,
+                approval_gate,
+                approval_repository,
+                &config_home,
+            ));
+            let profiles = Arc::new(ProfileManager::new_with_profiles_dir(
+                config_home.join("profiles"),
+            ));
+            profiles.initialize().map_err(|error| error.to_string())?;
+
+            Ok(Self {
+                state: Arc::new(AppState {
+                    tool_registry: Arc::new(ToolCatalog::builtin()),
+                    config: None,
+                    event_bus,
+                    static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
+                    approval_gate: None,
+                    auth_token,
+                    workspace_root,
+                    config_home,
+                    profile_id: "default".to_string(),
+                    profile_manager: profiles,
+                    services,
+                    session_lease_registry: None,
+                }),
+            })
+        }
+
+        pub fn router(&self) -> Router {
+            api_router(Arc::clone(&self.state))
+        }
+
+        /// Seed one terminal Surface-to-Runtime handoff through the production
+        /// ledger APIs. Black-box tests use this only to establish a durable
+        /// dead-letter precondition that no public ingress route can create
+        /// deterministically; their assertions still traverse `api_router`.
+        pub fn seed_dead_letter_trigger_event(
+            &self,
+            surface: &str,
+            event_id: &str,
+        ) -> Result<String, String> {
+            let normalized_surface = surface::normalize_surface_id(surface);
+            let payload = serde_json::json!({
+                "event_id": event_id,
+                "surface": normalized_surface,
+                "fixture": "gateway-test-support",
+            });
+            let trigger = harness_contract::managed_agent::ManagedAgentTriggerEvent {
+                event_id: event_id.to_string(),
+                source_id: normalized_surface.clone(),
+                source_kind: "surface".to_string(),
+                event_type: "fixture.trigger".to_string(),
+                subject: format!("fixture:{event_id}"),
+                payload_ref: format!("surface://{normalized_surface}/events/{event_id}"),
+                payload_digest: format!("sha256:{event_id}"),
+                occurred_at_ms: 1,
+                source_sequence: Some(1),
+                idempotency_key: format!("surface:{normalized_surface}:{event_id}"),
+                source_capabilities: vec!["surface.event.receive".to_string()],
+                attributes: std::collections::BTreeMap::new(),
+                trace_refs: vec!["test-support".to_string()],
+            };
+            let receipt = self.state.services.surface.record_trigger_event_received(
+                &normalized_surface,
+                "fixture.trigger",
+                &trigger,
+                &payload,
+            )?;
+            let key = receipt.record.idempotency_key;
+            for _ in 0..receipt.record.max_attempts {
+                self.state
+                    .services
+                    .surface
+                    .mark_trigger_event_dispatching(&key)?
+                    .ok_or_else(|| "fixture trigger event was not dispatchable".to_string())?;
+                let updated = self
+                    .state
+                    .services
+                    .surface
+                    .mark_trigger_event_failed(&key, "fixture delivery failure")?;
+                if updated.status == "dead_letter" {
+                    return Ok(key);
+                }
+            }
+            Err("fixture trigger event did not reach dead_letter".to_string())
+        }
+    }
+
+    fn unique_test_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("cowd-{label}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("gateway test root should be writable");
+        root
+    }
 }
 
 // ── Router ─────────────────────────────────────────────────────
@@ -212,6 +694,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .merge(evolution_routes::router())
         .merge(growth_routes::router())
         .merge(harness_eval_routes::router())
+        .merge(managed_agent_routes::router())
         .merge(matrix_routes::router())
         .merge(mfg_routes::router())
         .merge(mission_routes::router())
@@ -565,6 +1048,20 @@ pub(crate) mod tests {
         task_kernel: Arc<TaskKernel>,
         surface_host: Option<Arc<crate::surface_host::SurfaceHost>>,
     ) -> Arc<crate::services::GatewayServices> {
+        test_services_for_workspace(
+            session_kernel,
+            task_kernel,
+            surface_host,
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        )
+    }
+
+    fn test_services_for_workspace(
+        session_kernel: Arc<SessionKernel>,
+        task_kernel: Arc<TaskKernel>,
+        surface_host: Option<Arc<crate::surface_host::SurfaceHost>>,
+        tool_workspace_root: PathBuf,
+    ) -> Arc<crate::services::GatewayServices> {
         let sessions = Arc::new(ActiveSessions::new());
         let runtime_services =
             runtime::RuntimeServices::in_memory().expect("test runtime services");
@@ -590,7 +1087,11 @@ pub(crate) mod tests {
                 Arc::new(runtime::UpgradeCoordinator::new()),
                 runtime_services,
             )
-            .expect("test runtime service"),
+            .expect("test runtime service")
+            .with_tool_host(Arc::new(tools::ToolHost::builtin(
+                "gateway-test-runtime",
+                tool_workspace_root,
+            ))),
         );
         let approval_dir =
             std::env::temp_dir().join(format!("cowd-api-approval-{}", uuid::Uuid::new_v4()));
@@ -688,11 +1189,16 @@ pub(crate) mod tests {
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: None,
-            workspace_root,
+            workspace_root: workspace_root.clone(),
             config_home,
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_kernel, task_kernel, surface_host),
+            services: test_services_for_workspace(
+                session_kernel,
+                task_kernel,
+                surface_host,
+                workspace_root,
+            ),
             session_lease_registry: None,
         })
     }
@@ -755,11 +1261,16 @@ pub(crate) mod tests {
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: None,
-            workspace_root,
+            workspace_root: workspace_root.clone(),
             config_home,
             profile_id: "enterprise".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_kernel, task_kernel, None),
+            services: test_services_for_workspace(
+                session_kernel,
+                task_kernel,
+                None,
+                workspace_root,
+            ),
             session_lease_registry: None,
         })
     }
@@ -818,7 +1329,7 @@ pub(crate) mod tests {
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: None,
-            workspace_root,
+            workspace_root: workspace_root.clone(),
             config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
@@ -874,11 +1385,16 @@ pub(crate) mod tests {
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: None,
-            workspace_root,
+            workspace_root: workspace_root.clone(),
             config_home,
             profile_id: "enterprise".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_kernel, task_kernel, None),
+            services: test_services_for_workspace(
+                session_kernel,
+                task_kernel,
+                None,
+                workspace_root,
+            ),
             session_lease_registry: None,
         })
     }
@@ -907,6 +1423,54 @@ pub(crate) mod tests {
                 .unified_store()
                 .expect("service store should exist")
         ));
+    }
+
+    #[tokio::test]
+    async fn agent_catalog_route_consumes_runtime_definition_projection() {
+        let app = api_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/agents/catalog")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("catalog json");
+        assert_eq!(value["source"], "runtime.definition_catalog");
+        assert!(value["agents"].is_array());
+        assert!(value.get("working_directory").is_none());
+        assert!(value["summary"].get("shadowed").is_none());
+    }
+
+    #[tokio::test]
+    async fn team_template_route_consumes_runtime_definition_projection() {
+        let app = api_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/team-templates")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("templates json");
+        assert_eq!(value["source"], "runtime.definition_catalog");
+        let templates = value["templates"].as_array().expect("template list");
+        assert!(templates.len() >= 8);
+        assert!(templates.iter().any(|template| {
+            template["revision_ref"]["template_id"] == "builtin/cowd/parallel-research-synthesis"
+        }));
     }
 
     #[tokio::test]
@@ -952,16 +1516,15 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        let event_store = state
+        let delivery = state
             .services
             .runtime
             .as_ref()
             .unwrap()
             .runtime_services()
-            .event_store()
-            .clone();
-        event_store
-            .enqueue_session_terminal(
+            .session_terminal_delivery();
+        delivery
+            .enqueue(
                 "terminal-poison",
                 "assistant-1",
                 "outbox-session",
@@ -969,13 +1532,13 @@ pub(crate) mod tests {
                 "bad payload",
             )
             .unwrap();
-        let terminal_claim = event_store
-            .claim_session_terminals("test-worker", 1, 10, 1)
+        let terminal_claim = delivery
+            .claim("test-worker", 1, 10, 1)
             .unwrap()
             .pop()
             .unwrap();
-        event_store
-            .fail_session_terminal(
+        delivery
+            .fail(
                 "terminal-poison",
                 "test-worker",
                 terminal_claim.revision,
@@ -1020,7 +1583,7 @@ pub(crate) mod tests {
                         .uri(format!("/api/runtime/outbox/{direction}/{id}/retry"))
                         .header("content-type", "application/json")
                         .body(Body::from(
-                            serde_json::json!({"actor":"operator","reason":"repaired"}).to_string(),
+                            serde_json::json!({"reason":"repaired"}).to_string(),
                         ))
                         .unwrap(),
                 )
@@ -1034,6 +1597,19 @@ pub(crate) mod tests {
         let path = std::env::temp_dir().join(format!("cowd-api-{label}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    fn gateway_test_actor() -> String {
+        "principal:local-human".to_string()
+    }
+
+    fn cross_plane_intent_from_action(action: &serde_json::Value) -> serde_json::Value {
+        let mut intent = action.clone();
+        intent
+            .as_object_mut()
+            .expect("cross-plane action projection must be an object")
+            .remove("actor_principal");
+        intent
     }
 
     async fn wait_for_harness_eval_route_status(
@@ -1456,7 +2032,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn evolution_routes_link_signal_proposal_skill_draft_and_sandbox_eval() {
+    async fn evolution_discovery_routes_have_no_gateway_owned_candidate_or_release_path() {
         let workspace = test_temp_dir("evolution-route-workspace");
         let app = api_router(test_state_with_config_runtime_and_workspace(
             serde_json::json!({}),
@@ -1553,34 +2129,6 @@ pub(crate) mod tests {
             .unwrap()
             .contains("Acceptance Gates"));
 
-        let candidate = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/evolution/proposals/{proposal_id}/candidates"))
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "baseline_ref": "baseline:main",
-                            "candidate_ref": "candidate:worktree"
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(candidate.status(), StatusCode::OK);
-        let candidate_body = to_bytes(candidate.into_body(), usize::MAX).await.unwrap();
-        let candidate_json: serde_json::Value = serde_json::from_slice(&candidate_body).unwrap();
-        let candidate_id = candidate_json["candidate"]["candidate_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        assert_eq!(candidate_json["candidate"]["mainline_modified"], false);
-        assert_eq!(candidate_json["plan"]["target_owner"], "reality_core");
-
         let candidates = app
             .clone()
             .oneshot(
@@ -1594,121 +2142,8 @@ pub(crate) mod tests {
         assert_eq!(candidates.status(), StatusCode::OK);
         let candidates_body = to_bytes(candidates.into_body(), usize::MAX).await.unwrap();
         let candidates_json: serde_json::Value = serde_json::from_slice(&candidates_body).unwrap();
-        assert_eq!(candidates_json["count"], 1);
-
-        let blocked_adoption = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/evolution/candidates/{candidate_id}/adoption"))
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"status":"approved_for_adoption"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(blocked_adoption.status(), StatusCode::BAD_REQUEST);
-
-        let sandbox = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/evolution/candidates/{candidate_id}/run"))
-                    .header("content-type", "application/json")
-                    .body(Body::from("{}"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(sandbox.status(), StatusCode::OK);
-        let sandbox_body = to_bytes(sandbox.into_body(), usize::MAX).await.unwrap();
-        let sandbox_json: serde_json::Value = serde_json::from_slice(&sandbox_body).unwrap();
-        assert_eq!(sandbox_json["eval"]["mainline_modified"], false);
-        assert_eq!(
-            sandbox_json["eval"]["candidate_id"].as_str(),
-            Some(candidate_id.as_str())
-        );
-        assert!(
-            sandbox_json["eval"]["artifact_paths"]
-                .as_array()
-                .unwrap()
-                .len()
-                >= 3
-        );
-
-        let adopted = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/evolution/candidates/{candidate_id}/adoption"))
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"status":"approved_for_adoption"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(adopted.status(), StatusCode::OK);
-        let adopted_body = to_bytes(adopted.into_body(), usize::MAX).await.unwrap();
-        let adopted_json: serde_json::Value = serde_json::from_slice(&adopted_body).unwrap();
-        assert_eq!(adopted_json["receipt"]["accepted"], true);
-
-        let comparison = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/evolution/candidates/{candidate_id}/evaluate"))
-                    .header("content-type", "application/json")
-                    .body(Body::from("{}"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(comparison.status(), StatusCode::OK);
-        let comparison_body = to_bytes(comparison.into_body(), usize::MAX).await.unwrap();
-        let comparison_json: serde_json::Value = serde_json::from_slice(&comparison_body).unwrap();
-        assert_eq!(comparison_json["comparison"]["regression_count"], 0);
-
-        let promotion = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/evolution/candidates/{candidate_id}/promote"))
-                    .header("content-type", "application/json")
-                    .body(Body::from("{}"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(promotion.status(), StatusCode::OK);
-        let promotion_body = to_bytes(promotion.into_body(), usize::MAX).await.unwrap();
-        let promotion_json: serde_json::Value = serde_json::from_slice(&promotion_body).unwrap();
-        assert_eq!(promotion_json["promotion"]["accepted"], true);
-        let version_id = promotion_json["promotion"]["version_record"]["version_id"]
-            .as_str()
-            .expect("version id");
-
-        let rollback = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/evolution/versions/{version_id}/rollback"))
-                    .header("content-type", "application/json")
-                    .body(Body::from("{}"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(rollback.status(), StatusCode::OK);
-        let rollback_body = to_bytes(rollback.into_body(), usize::MAX).await.unwrap();
-        let rollback_json: serde_json::Value = serde_json::from_slice(&rollback_body).unwrap();
-        assert_eq!(rollback_json["rollback"]["accepted"], true);
-        assert_eq!(rollback_json["memory"]["kind"], "recovery_pattern");
+        assert_eq!(candidates_json["owner"], "runtime");
+        assert!(candidates_json["candidates"].is_array());
 
         let chain = app
             .clone()
@@ -2443,8 +2878,19 @@ pub(crate) mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::json!({
+                            "request_id": "mission-route-team",
+                            "team_id": "mission-route-team",
+                            "session_id": session_a,
+                            "selection_mode": "explicit",
+                            "template_selector": {
+                                "kind": "latest_stable",
+                                "template_id": "builtin/cowd/execute-review"
+                            },
                             "objective": "research architecture and review implementation",
-                            "backend": "in_process"
+                            "acceptance": ["summary", "evidence"],
+                            "permission_lease": "read_only",
+                            "model_lease": "default",
+                            "resource_scopes": ["session:mission-route"]
                         })
                         .to_string(),
                     ))
@@ -4791,6 +5237,7 @@ pub(crate) mod tests {
                 revision: 0,
                 model: None,
                 provider: None,
+                binding: None,
                 started_at_ms: 1,
                 updated_at_ms: 1,
                 failure: None,
@@ -4872,6 +5319,7 @@ pub(crate) mod tests {
                 revision: 0,
                 model: None,
                 provider: None,
+                binding: None,
                 started_at_ms: 1,
                 updated_at_ms: 1,
                 failure: None,
@@ -4900,130 +5348,6 @@ pub(crate) mod tests {
             assert_eq!(json["receipt"]["accepted"], false);
             assert_eq!(json["receipt"]["reject_reason"], "unsupported_by_backend");
         }
-    }
-
-    #[tokio::test]
-    async fn agent_team_profiles_crud_persists_receipts() {
-        let workspace = test_temp_dir("agent-team-profiles");
-        let config_home = test_temp_dir("agent-team-profiles-config");
-        let app = api_router(test_state_with_workspace(
-            workspace.clone(),
-            config_home.clone(),
-        ));
-
-        let create = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/agents/team-profiles")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "id": "qa-review-team",
-                            "name": "QA Review Team",
-                            "objective": "review manufacturing quality incidents",
-                            "leader": "planner",
-                            "members": ["planner", "executor", "reviewer"],
-                            "policy": { "max_parallel_agents": 3 },
-                            "evaluation": { "success_metric": "accepted_review" }
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(create.status(), StatusCode::CREATED);
-        let body = to_bytes(create.into_body(), usize::MAX).await.unwrap();
-        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(created["profile"]["id"], "qa-review-team");
-        assert_eq!(
-            created["receipt"]["changed_refs"][0],
-            "agent-team-profile:qa-review-team"
-        );
-
-        let list = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/agents/team-profiles")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(list.status(), StatusCode::OK);
-        let body = to_bytes(list.into_body(), usize::MAX).await.unwrap();
-        let listed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(listed["count"], 1);
-
-        let detail = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/agents/team-profiles/qa-review-team")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(detail.status(), StatusCode::OK);
-
-        let update = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("PUT")
-                    .uri("/api/agents/team-profiles/qa-review-team")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "name": "QA Review Team",
-                            "objective": "review incident and release evidence",
-                            "leader": "reviewer",
-                            "members": ["planner", "reviewer"],
-                            "policy": { "max_parallel_agents": 2 },
-                            "evaluation": { "quality_gate": "all_tests_pass" }
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(update.status(), StatusCode::OK);
-        let body = to_bytes(update.into_body(), usize::MAX).await.unwrap();
-        let updated: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(updated["profile"]["leader"], "reviewer");
-        assert_eq!(updated["receipt"]["status"], "ok");
-
-        let delete = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("DELETE")
-                    .uri("/api/agents/team-profiles/qa-review-team")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(delete.status(), StatusCode::OK);
-
-        let missing = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/agents/team-profiles/qa-review-team")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
-
-        let _ = std::fs::remove_dir_all(workspace);
-        let _ = std::fs::remove_dir_all(config_home);
     }
 
     #[tokio::test]
@@ -6280,7 +6604,6 @@ pub(crate) mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::json!({
-                            "actor_id": "tui:test",
                             "reason": "test_cancel",
                         })
                         .to_string(),
@@ -6294,7 +6617,7 @@ pub(crate) mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["ok"], true);
         assert_eq!(json["status"], "cancel_requested");
-        assert_eq!(json["actor_id"], "tui:test");
+        assert_eq!(json["actor_id"], "principal:local-human");
         assert_eq!(json["aborted"], false);
         assert_eq!(json["run_id"], serde_json::Value::Null);
     }
@@ -6413,7 +6736,7 @@ pub(crate) mod tests {
         };
 
         let state = test_state_with_store(store);
-        state.services.runtime_events.store().append(event).unwrap();
+        state.services.runtime_events.append_fixture(event).unwrap();
         let app = api_router(state);
         let response = app
             .oneshot(
@@ -6470,11 +6793,11 @@ pub(crate) mod tests {
             .unwrap();
         let state = test_state_with_store(store);
         let graph_id = "graph:terminal-session";
+        let child_graph_id = "graph:terminal-session:team";
         state
             .services
             .runtime_events
-            .store()
-            .append(runtime::RuntimeEventInput {
+            .append_fixture(runtime::RuntimeEventInput {
                 stream_id: graph_id.to_string(),
                 scope: runtime::RuntimeEventScope::ExecutionGraph,
                 kind: "execution_graph.planned".to_string(),
@@ -6487,8 +6810,45 @@ pub(crate) mod tests {
         state
             .services
             .runtime_events
-            .store()
-            .append(runtime::RuntimeEventInput {
+            .append_fixture(runtime::RuntimeEventInput {
+                stream_id: child_graph_id.to_string(),
+                scope: runtime::RuntimeEventScope::ExecutionGraph,
+                kind: "execution_graph.planned".to_string(),
+                status: Some("running".to_string()),
+                actor: Some("test".to_string()),
+                refs: Vec::new(),
+                payload: serde_json::json!({
+                    "event": "planned",
+                    "graph": {
+                        "id": child_graph_id,
+                        "node_statuses": {"researcher": "planned"},
+                        "nodes": [{"kind": "agent_task", "id": "researcher"}]
+                    }
+                }),
+            })
+            .unwrap();
+        state
+            .services
+            .runtime_events
+            .append_fixture(runtime::RuntimeEventInput {
+                stream_id: format!("execution-lineage:{graph_id}"),
+                scope: runtime::RuntimeEventScope::Relation,
+                kind: "execution.lineage.child_registered.v1".to_string(),
+                status: Some("registered".to_string()),
+                actor: Some("test".to_string()),
+                refs: Vec::new(),
+                payload: serde_json::json!({
+                    "parent_execution_id": graph_id,
+                    "parent_node_id": "model",
+                    "child_execution_id": child_graph_id,
+                    "child_objective": "parallel review"
+                }),
+            })
+            .unwrap();
+        state
+            .services
+            .runtime_events
+            .append_fixture(runtime::RuntimeEventInput {
                 stream_id: "session-terminal:timeline-terminal".to_string(),
                 scope: runtime::RuntimeEventScope::SessionInput,
                 kind: "runtime.session.terminal_requested".to_string(),
@@ -6522,6 +6882,16 @@ pub(crate) mod tests {
             .unwrap()
             .iter()
             .any(|event| event["kind"] == "execution_graph.planned"));
+        assert_eq!(json["execution_graph_summary"]["count"], 1);
+        assert_eq!(json["execution_graph_summary"]["agent_tasks"], 1);
+        assert_eq!(
+            json["execution_graph_summary"]["latest"]["graph_id"],
+            child_graph_id
+        );
+        assert_eq!(
+            json["agent_value"]["status"], "unproven",
+            "operational graph visibility must not fabricate collaboration lift"
+        );
     }
 
     #[tokio::test]
@@ -6569,11 +6939,14 @@ pub(crate) mod tests {
         state
             .services
             .runtime_events
-            .append(
-                session_id,
-                runtime::RuntimeEventScope::ExecutionGraph,
-                "agent.execution_graph.reviewed",
-                serde_json::json!({
+            .append_fixture(runtime::RuntimeEventInput {
+                stream_id: session_id.to_string(),
+                scope: runtime::RuntimeEventScope::ExecutionGraph,
+                kind: "agent.execution_graph.reviewed".to_string(),
+                status: None,
+                actor: Some("test".to_string()),
+                refs: Vec::new(),
+                payload: serde_json::json!({
                     "value_verdict": {
                         "positive_lift": true,
                         "continue_multi_agent": true,
@@ -6581,7 +6954,7 @@ pub(crate) mod tests {
                         "reasons": ["positive_multi_agent_lift"]
                     }
                 }),
-            )
+            })
             .unwrap();
         store
             .append_session_domain_event(&memory::SessionDomainEvent::new(
@@ -6880,7 +7253,6 @@ runtime:
                     .body(Body::from(
                         serde_json::json!({
                             "session_id": "session-a",
-                            "owner": "tui:one",
                             "mode": "exclusive"
                         })
                         .to_string(),
@@ -6893,7 +7265,7 @@ runtime:
         let body = to_bytes(acquire.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["ok"], true);
-        assert_eq!(json["owner"], "tui:one");
+        assert_eq!(json["owner"], "principal:local-human");
         assert_eq!(json["mode"], "exclusive");
         assert!(json["acquired_at_ms"].as_u64().is_some());
 
@@ -6931,7 +7303,7 @@ runtime:
         assert_eq!(json["components"]["session"]["leases"]["total"], 1);
         assert_eq!(
             json["components"]["session"]["leases"]["leases"][0]["owner"],
-            "tui:one"
+            "principal:local-human"
         );
 
         let release = app
@@ -6943,7 +7315,6 @@ runtime:
                     .body(Body::from(
                         serde_json::json!({
                             "session_id": "session-a",
-                            "owner": "tui:one"
                         })
                         .to_string(),
                     ))
@@ -8540,7 +8911,8 @@ providers:
             ))
         ));
 
-        let approval_id = format!("approval:{graph_id}:{}", approval.id);
+        let approval_id =
+            runtime::execution_core::graph::executors::graph_approval_id(&graph_id, &approval.id);
         let app = api_router(state);
         let response = app
             .clone()
@@ -8561,10 +8933,15 @@ providers:
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body: serde_json::Value =
-            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
+        let status = response.status();
+        let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "graph approval response: {}",
+            String::from_utf8_lossy(&response_body)
+        );
+        let body: serde_json::Value = serde_json::from_slice(&response_body).unwrap();
         assert_eq!(body["execution_graph"]["graph_id"], graph_id);
         assert_eq!(body["execution_graph"]["node_status"], "completed");
 
@@ -8665,7 +9042,10 @@ providers:
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 
-        let approval_id = format!("approval:{}:{}", projection.graph_id, approval.node_id);
+        let approval_id = runtime::execution_core::graph::executors::graph_approval_id(
+            &projection.graph_id,
+            &approval.node_id,
+        );
         let response = api_router(state)
             .oneshot(
                 Request::builder()
@@ -9057,7 +9437,6 @@ providers:
 
         let key = format!("mock-docs-{}", uuid::Uuid::new_v4());
         let request = serde_json::json!({
-            "actor_principal": format!("user:{key}"),
             "tool_id": "service.local.docs.read",
             "resource_id": "doc-1",
             "title": "Architecture",
@@ -9146,7 +9525,6 @@ providers:
             workspace.clone(),
         ));
         let request = serde_json::json!({
-            "actor_principal": "user:resource-persistence",
             "tool_id": "service.local.docs.read",
             "resource_id": "persisted-doc",
             "title": "Persisted Runtime Resource",
@@ -9228,7 +9606,6 @@ providers:
             workspace,
         ));
         let request = serde_json::json!({
-            "actor_principal": "user:connector-resource-revalidate",
             "tool_id": "service.local.docs.read",
             "resource_id": "revalidate-doc",
             "title": "Revalidate Doc",
@@ -9303,7 +9680,6 @@ providers:
         );
         let app = api_router(test_state_with_memory_and_workspace(manager, tmp.clone()));
         let request = serde_json::json!({
-            "actor_principal": "user:connector-resource-memory",
             "tool_id": "service.local.docs.read",
             "resource_id": "memory-doc",
             "title": "Memory Bridge Doc",
@@ -9409,7 +9785,7 @@ providers:
     async fn cross_plane_policy_simulation_does_not_consume_single_use_grant() {
         let app = api_router(test_state());
         let suffix = uuid::Uuid::new_v4().to_string();
-        let principal = format!("user:test-{suffix}");
+        let principal = gateway_test_actor();
         let capability = format!("service.feishu.drive.download.{suffix}");
         let grant_id = format!("grant-{suffix}");
         let grant = serde_json::json!({
@@ -9442,7 +9818,6 @@ providers:
         assert_eq!(response.status(), StatusCode::OK);
 
         let action = serde_json::json!({
-            "actor_principal": principal,
             "source_channel": "channel://wechat/chat/test",
             "session_id": "test-session",
             "requested_capability": capability,
@@ -9510,10 +9885,10 @@ providers:
     }
 
     #[tokio::test]
-    async fn connector_service_commit_queues_graph_without_consuming_grant() {
+    async fn connector_service_commit_consumes_single_use_grant_after_effect_receipt() {
         let app = api_router(test_state());
         let suffix = uuid::Uuid::new_v4().to_string();
-        let principal = format!("user:service-commit-{suffix}");
+        let principal = gateway_test_actor();
         let capability = "service.local.docs.read";
         let grant_id = format!("grant-service-commit-{suffix}");
         let grant = serde_json::json!({
@@ -9545,7 +9920,6 @@ providers:
         assert_eq!(response.status(), StatusCode::OK);
 
         let execute = serde_json::json!({
-            "actor_principal": principal,
             "source_channel": "channel://wechat/chat/service-commit",
             "session_id": "service-commit-session",
             "tool_id": capability,
@@ -9596,10 +9970,10 @@ providers:
             .iter()
             .find(|record| record["action"]["actor_principal"] == principal)
             .expect("commit planning must be audited");
-        assert!(planned["evidence"]["consumed_grant_id"].is_null());
+        assert_eq!(planned["evidence"]["consumed_grant_id"], grant_id);
+        assert_eq!(planned["evidence"]["remaining_uses_after"], 0);
 
         let action = serde_json::json!({
-            "actor_principal": principal,
             "requested_capability": capability,
             "provider_account": "local.docs",
             "source_channel": "channel://wechat/chat/service-commit",
@@ -9684,7 +10058,7 @@ providers:
         let app = api_router(test_state());
         let suffix = uuid::Uuid::new_v4().to_string();
         let email = format!("policy-{suffix}@example.com");
-        let principal = format!("user:policy-{suffix}");
+        let principal = gateway_test_actor();
         let capability = format!("service.feishu.drive.download.{suffix}");
 
         let identity = serde_json::json!({
@@ -9731,7 +10105,6 @@ providers:
         }
 
         let action = serde_json::json!({
-            "actor_principal": "",
             "actor_identity_ref": format!("channel://wechat/user/policy?email={email}"),
             "source_channel": "channel://wechat/chat/test",
             "session_id": "test-session",
@@ -9779,7 +10152,7 @@ providers:
         })));
         let suffix = uuid::Uuid::new_v4().to_string();
         let email = format!("preflight-{suffix}@example.com");
-        let principal = format!("user:preflight-{suffix}");
+        let principal = gateway_test_actor();
         let capability = format!("service.feishu.drive.download.{suffix}");
         let identity = serde_json::json!({
             "id": format!("idb-preflight-{suffix}"),
@@ -9825,7 +10198,6 @@ providers:
         }
 
         let action = serde_json::json!({
-            "actor_principal": "",
             "actor_identity_ref": format!("channel://wechat/user/preflight?email={email}"),
             "source_channel": "channel://wechat/chat/test",
             "session_id": "test-session",
@@ -9908,7 +10280,7 @@ providers:
             }
         })));
         let suffix = uuid::Uuid::new_v4().to_string();
-        let principal = format!("user:execute-dry-run-{suffix}");
+        let principal = gateway_test_actor();
         let capability = format!("channel.feishu.send_text.{suffix}");
         let grant_id = format!("grant-execute-dry-run-{suffix}");
         let grant = serde_json::json!({
@@ -9940,7 +10312,6 @@ providers:
         assert_eq!(response.status(), StatusCode::OK);
 
         let action = serde_json::json!({
-            "actor_principal": principal,
             "actor_identity_ref": null,
             "source_channel": "channel://wechat/chat/test",
             "session_id": "test-session",
@@ -9989,7 +10360,9 @@ providers:
                     .method("POST")
                     .uri("/api/cross-plane/policy/simulate")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(json["action"].to_string()))
+                    .body(Body::from(
+                        cross_plane_intent_from_action(&json["action"]).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -10005,7 +10378,9 @@ providers:
                     .method("POST")
                     .uri("/api/cross-plane/policy/simulate")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(json["action"].to_string()))
+                    .body(Body::from(
+                        cross_plane_intent_from_action(&json["action"]).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -10028,7 +10403,7 @@ providers:
             }
         })));
         let suffix = uuid::Uuid::new_v4().to_string();
-        let principal = format!("user:execute-idempotent-{suffix}");
+        let principal = gateway_test_actor();
         let capability = format!("channel.feishu.send_text.{suffix}");
         let grant = serde_json::json!({
             "id": format!("grant-execute-idempotent-{suffix}"),
@@ -10062,7 +10437,6 @@ providers:
             "mode": "dry_run",
             "idempotency_key": format!("idem-{suffix}"),
             "action": {
-                "actor_principal": principal,
                 "actor_identity_ref": null,
                 "source_channel": "channel://wechat/chat/test",
                 "session_id": "test-session",
@@ -10150,7 +10524,7 @@ providers:
             }
         })));
         let suffix = uuid::Uuid::new_v4().to_string();
-        let principal = format!("user:execute-commit-{suffix}");
+        let principal = gateway_test_actor();
         let capability = format!("channel.feishu.send_text.{suffix}");
         let grant = serde_json::json!({
             "id": format!("grant-execute-commit-{suffix}"),
@@ -10181,7 +10555,6 @@ providers:
         assert_eq!(response.status(), StatusCode::OK);
 
         let action = serde_json::json!({
-            "actor_principal": principal,
             "actor_identity_ref": null,
             "source_channel": "channel://wechat/chat/test",
             "session_id": "test-session",
@@ -10232,7 +10605,9 @@ providers:
                     .method("POST")
                     .uri("/api/cross-plane/policy/simulate")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(json["action"].to_string()))
+                    .body(Body::from(
+                        cross_plane_intent_from_action(&json["action"]).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -10304,7 +10679,7 @@ providers:
             None,
         ));
         let suffix = uuid::Uuid::new_v4().to_string();
-        let principal = format!("user:dispatch-target-{suffix}");
+        let principal = gateway_test_actor();
         let capability = format!("channel.feishu.send_text.{suffix}");
         let grant = serde_json::json!({
             "id": format!("grant-dispatch-target-{suffix}"),
@@ -10335,7 +10710,6 @@ providers:
         assert_eq!(grant_response.status(), StatusCode::OK);
 
         let action = serde_json::json!({
-            "actor_principal": principal,
             "actor_identity_ref": null,
             "source_channel": "channel://wechat/chat/source",
             "session_id": "test-session",
@@ -10394,7 +10768,7 @@ providers:
             None,
         ));
         let suffix = uuid::Uuid::new_v4().to_string();
-        let principal = format!("user:dispatch-receipt-{suffix}");
+        let principal = gateway_test_actor();
         let capability = format!("channel.feishu.send_text.{suffix}");
         let grant = serde_json::json!({
             "id": format!("grant-dispatch-receipt-{suffix}"),
@@ -10428,7 +10802,6 @@ providers:
             "mode": "dry_run",
             "idempotency_key": format!("idem-dispatch-receipt-{suffix}"),
             "action": {
-                "actor_principal": principal,
                 "actor_identity_ref": null,
                 "source_channel": "channel://wechat/chat/source",
                 "session_id": "test-session",
@@ -10499,7 +10872,7 @@ providers:
             None,
         ));
         let suffix = uuid::Uuid::new_v4().to_string();
-        let principal = format!("user:dispatch-live-{suffix}");
+        let principal = gateway_test_actor();
         let capability = format!("channel.feishu.send_text.{suffix}");
         let grant = serde_json::json!({
             "id": format!("grant-dispatch-live-{suffix}"),
@@ -10533,7 +10906,6 @@ providers:
             "mode": "commit",
             "idempotency_key": format!("idem-dispatch-live-{suffix}"),
             "action": {
-                "actor_principal": principal,
                 "actor_identity_ref": null,
                 "source_channel": "channel://wechat/chat/source",
                 "session_id": "test-session",
@@ -10592,7 +10964,7 @@ providers:
             None,
         ));
         let suffix = uuid::Uuid::new_v4().to_string();
-        let principal = format!("user:dispatch-image-{suffix}");
+        let principal = gateway_test_actor();
         let capability = format!("channel.feishu.send_image.{suffix}");
         let grant = serde_json::json!({
             "id": format!("grant-dispatch-image-{suffix}"),
@@ -10626,7 +10998,6 @@ providers:
             "mode": "commit",
             "idempotency_key": format!("idem-dispatch-image-{suffix}"),
             "action": {
-                "actor_principal": principal,
                 "actor_identity_ref": null,
                 "source_channel": "channel://wechat/chat/source",
                 "session_id": "test-session",
@@ -10686,7 +11057,7 @@ providers:
             workspace.clone(),
         ));
         let suffix = uuid::Uuid::new_v4().to_string();
-        let principal = format!("user:dispatch-file-{suffix}");
+        let principal = gateway_test_actor();
         let capability = format!("channel.feishu.send_file.{suffix}");
         let grant = serde_json::json!({
             "id": format!("grant-dispatch-file-{suffix}"),
@@ -10720,7 +11091,6 @@ providers:
             "mode": "commit",
             "idempotency_key": format!("idem-dispatch-file-{suffix}"),
             "action": {
-                "actor_principal": principal,
                 "actor_identity_ref": null,
                 "source_channel": "channel://wechat/chat/source",
                 "session_id": "test-session",
@@ -10786,7 +11156,7 @@ providers:
             workspace,
         ));
         let suffix = uuid::Uuid::new_v4().to_string();
-        let principal = format!("user:dispatch-file-block-{suffix}");
+        let principal = gateway_test_actor();
         let capability = format!("channel.feishu.send_file.{suffix}");
         let grant = serde_json::json!({
             "id": format!("grant-dispatch-file-block-{suffix}"),
@@ -10820,7 +11190,6 @@ providers:
             "mode": "commit",
             "idempotency_key": format!("idem-dispatch-file-block-{suffix}"),
             "action": {
-                "actor_principal": principal,
                 "actor_identity_ref": null,
                 "source_channel": "channel://wechat/chat/source",
                 "session_id": "test-session",
@@ -10989,7 +11358,6 @@ providers:
             workspace,
         ));
         let request = serde_json::json!({
-            "actor_principal": "user:context-resource",
             "tool_id": "service.local.docs.read",
             "resource_id": "context-doc",
             "title": "Context Resource Plan",
@@ -11052,7 +11420,6 @@ providers:
             workspace,
         ));
         let request = serde_json::json!({
-            "actor_principal": "user:resource-evidence",
             "tool_id": "service.local.docs.read",
             "resource_id": "evidence-doc",
             "title": "Evidence Resource",
@@ -12185,9 +12552,9 @@ providers:
         );
         manager
             .create_entry(
-                MemoryLayer::L4,
+                MemoryLayer::L3,
                 MemoryCategory::Shared,
-                "Team Decision",
+                "Durable Decision Candidate",
                 "Use SessionKernel as the source of truth for v0.8.10.",
                 Priority::High,
                 vec!["team_relevant".into()],
@@ -12236,19 +12603,19 @@ providers:
             .await
             .unwrap();
         let layers_json: serde_json::Value = serde_json::from_slice(&layers_body).unwrap();
-        let l4_count = layers_json["layers"]
+        let l3_count = layers_json["layers"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|layer| layer["layer"] == "L4")
+            .find(|layer| layer["layer"] == "L3")
             .and_then(|layer| layer["entry_count"].as_u64())
             .unwrap_or_default();
-        assert_eq!(l4_count, 1);
+        assert_eq!(l3_count, 1);
 
         let entries_response = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/memory/L4")
+                    .uri("/api/memory/L3")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -12260,7 +12627,10 @@ providers:
             .unwrap();
         let entries_json: serde_json::Value = serde_json::from_slice(&entries_body).unwrap();
         assert_eq!(entries_json["entries"].as_array().unwrap().len(), 1);
-        assert_eq!(entries_json["entries"][0]["title"], "Team Decision");
+        assert_eq!(
+            entries_json["entries"][0]["title"],
+            "Durable Decision Candidate"
+        );
     }
 
     #[tokio::test]
@@ -12581,7 +12951,7 @@ providers:
     }
 
     #[tokio::test]
-    async fn webui_same_origin_requests_bypass_browser_token_handling() {
+    async fn same_origin_headers_do_not_bypass_bearer_authentication() {
         let sessions = Arc::new(ActiveSessions::new());
         let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionEventBus::new();
@@ -12614,7 +12984,7 @@ providers:
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

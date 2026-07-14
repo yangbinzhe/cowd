@@ -160,6 +160,7 @@ impl RuntimeService {
             .session_input_router()
             .cloned()
             .ok_or_else(|| "durable SessionInputRouter is required".to_string())?;
+        let workspace_root = runtime_services.workspace_root().to_path_buf();
         let resource_capabilities = runtime::ResourceCapabilityIndex::default();
         let _ = resource_capabilities.refresh_from_environment();
         Ok(Self {
@@ -178,10 +179,7 @@ impl RuntimeService {
             provider_registry,
             upgrade_coordinator,
             config_reload: Arc::new(crate::runtime_host::config_reload::ConfigReloadState::new()),
-            tool_host: Arc::new(tools::ToolHost::builtin(
-                "gateway-runtime",
-                std::env::current_dir().unwrap_or_default(),
-            )),
+            tool_host: Arc::new(tools::ToolHost::builtin("gateway-runtime", workspace_root)),
             resource_capabilities,
             runtime_services,
             session_input_router,
@@ -222,8 +220,8 @@ impl RuntimeService {
         );
         if let Some(terminal) = self
             .runtime_services
-            .event_store()
-            .session_terminal(&terminal_id)
+            .session_terminal_delivery()
+            .get(&terminal_id)
             .map_err(|error| error.to_string())?
         {
             if let Some(resolution) = self.session_input_router.record_target_terminal(
@@ -281,8 +279,8 @@ impl RuntimeService {
         }
         let terminal = self
             .runtime_services
-            .event_store()
-            .session_terminal(&terminal_id)
+            .session_terminal_delivery()
+            .get(&terminal_id)
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("runtime committed no terminal for {}", record.request_id))?;
         if let Some(resolution) = self.session_input_router.record_target_terminal(
@@ -2090,8 +2088,8 @@ mod tests {
             .build()
             .unwrap();
         services
-            .event_store()
-            .enqueue_session_terminal(
+            .session_terminal_delivery()
+            .enqueue(
                 "turn-terminal:restart-request",
                 "assistant-restart-message",
                 "restart-session",

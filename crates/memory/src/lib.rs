@@ -97,8 +97,6 @@ pub mod memory_cluster;
 #[allow(private_interfaces)]
 #[path = "kernel/memory_pulse.rs"]
 pub mod memory_pulse;
-#[path = "lifecycle/memory_sync.rs"]
-pub mod memory_sync;
 #[path = "kernel/memory_usage.rs"]
 pub mod memory_usage;
 #[path = "ingestion/miner.rs"]
@@ -192,7 +190,6 @@ pub use knowledge::{
     KnowledgeSnapshot, KnowledgeStore, KnowledgeStoreError, SqliteKnowledgeStore,
     UsageFeedbackLoop,
 };
-pub use layers::shared::{L4Event, L4EventBus, L4Operation};
 pub use maintenance::{
     scan_maintenance_candidates, MaintenanceCandidate, MaintenanceCandidateAction,
     MaintenanceCandidateFilter, MaintenanceCandidateKind, MaintenanceCandidateStatus,
@@ -208,7 +205,7 @@ pub use memory_pulse::{
     MemoryPulseTransition,
 };
 pub use memory_usage::{summarize_usage, MemoryUsageSignal, MemoryUsageSummary};
-pub use orchestrator::MemoryOrchestrator;
+pub use orchestrator::{L4PromotionCommand, MemoryOrchestrator};
 pub use runtime_event::{
     SessionDomainEvent, SessionDomainEventPage, SessionDomainRef, SessionDomainScope,
     SESSION_DOMAIN_EVENT_TYPE,
@@ -266,7 +263,6 @@ pub use performance_monitor::{AutoTuner, PerformanceMonitor, PerformanceReport};
 pub use agent_directory::{AgentDirectory, AgentInfo, AgentStatus, ReputationScore};
 
 // --- Memory sync re-exports (P8.4) ---
-pub use memory_sync::MemorySyncProtocol;
 
 // --- Entity registry re-exports (P9.3) ---
 pub use entity_registry::{DisambiguationKey, EntityRecord, EntityRegistry, EvolutionRecord};

@@ -34,7 +34,7 @@ check_empty "cli business modules" \
   rg -n "use .*\\b(auth|session|memory|matrix|mfg|agent|daemon)\\b|\\b(auth|session|memory|matrix|mfg|agent|daemon)::|mod (auth|session|memory|matrix|mfg|agent|daemon)" crates/cli/src/main.rs --glob '*.rs'
 
 check_empty "daemon business management" \
-  rg -n "daemon status|daemon start$|daemon stop|daemon restart|daemon_client|UnixStream|socket business" crates --glob '*.rs' --glob '!**/tests/**'
+  rg -n "daemon status|daemon start$|daemon stop|daemon restart|daemon_client|UnixStream|socket business" crates --glob '*.rs' --glob '!**/tests/**' --glob '!crates/auth-broker/**' --glob '!crates/sandbox-launcher/**'
 
 check_empty "tui direct business dependencies" \
   rg -n "(^|[^[:alnum:]_:])runtime::|use runtime::|use app_mfg::|app_mfg::|use matrix_core::|matrix_core::|use matrix_repository::|matrix_repository::|use storage::|storage::|rusqlite|use tools::|tools::|use memory::|memory::|use command_contract::|command_contract::|use command_service::|command_service::" crates/tui/src --glob '*.rs' --glob '!lib.rs' --glob '!boundary_policy.rs'

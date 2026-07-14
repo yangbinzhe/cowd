@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -27,6 +27,20 @@ const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(128);
 const DEFAULT_MAX_RETRIES: u32 = 8;
+// Some DeepSeek-compatible deployments emit a documented DSML envelope in
+// `content` instead of OpenAI's structured `tool_calls`. This is intentionally
+// narrow: generic XML-shaped model text must remain text and never become an
+// executable tool invocation.
+const DSML_TOOL_CALLS_OPEN: &str = "<｜｜DSML｜｜tool_calls>";
+const DSML_TOOL_CALLS_CLOSE: &str = "</｜｜DSML｜｜tool_calls>";
+const DSML_INVOKE_OPEN: &str = "<｜｜DSML｜｜invoke ";
+const DSML_INVOKE_CLOSE: &str = "</｜｜DSML｜｜invoke>";
+const DSML_PARAMETER_OPEN: &str = "<｜｜DSML｜｜parameter ";
+const DSML_PARAMETER_CLOSE: &str = "</｜｜DSML｜｜parameter>";
+const COMPAT_TOOL_USE_FENCE_OPEN: &str = "```tool_use";
+const COMPAT_JSON_FENCE_OPEN: &str = "```json";
+const COMPAT_TOOL_CALL_OPEN: &str = "<tool_call>";
+const COMPAT_TOOL_CALL_CLOSE: &str = "</tool_call>";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenAiCompatConfig {
@@ -582,10 +596,16 @@ struct StreamState {
     stop_reason: Option<String>,
     usage: Option<Usage>,
     tool_calls: BTreeMap<u32, ToolCallState>,
+    exposed_tool_names: BTreeSet<String>,
+    // Hold only a possible provider tool-frame prefix for ordinary text. Once
+    // a frame begins, buffer it until it can be strictly validated against
+    // the current request's exposed tool contracts.
+    dsml_prefix: String,
+    dsml_frame: Option<String>,
 }
 
 impl StreamState {
-    fn new(model: String, _tools: &[ToolDefinition]) -> Self {
+    fn new(model: String, tools: &[ToolDefinition]) -> Self {
         Self {
             model,
             message_started: false,
@@ -597,6 +617,9 @@ impl StreamState {
             stop_reason: None,
             usage: None,
             tool_calls: BTreeMap::new(),
+            exposed_tool_names: tools.iter().map(|tool| tool.name.clone()).collect(),
+            dsml_prefix: String::new(),
+            dsml_frame: None,
         }
     }
 
@@ -720,6 +743,17 @@ impl StreamState {
         self.finished = true;
 
         let mut events = Vec::new();
+        if let Some(frame) = self.dsml_frame.take() {
+            if let Some(calls) = parse_compat_tool_calls(&frame, &self.exposed_tool_names) {
+                self.emit_dsml_tool_calls(calls, &mut events);
+            } else {
+                self.emit_text_content(frame, &mut events);
+            }
+        }
+        if !self.dsml_prefix.is_empty() {
+            let pending_text = std::mem::take(&mut self.dsml_prefix);
+            self.emit_text_content(pending_text, &mut events);
+        }
         // Close reasoning block if started but not yet finished.
         if self.reasoning_started && !self.reasoning_finished {
             self.reasoning_finished = true;
@@ -775,7 +809,85 @@ impl StreamState {
     }
 
     fn ingest_text_content(&mut self, content: String, events: &mut Vec<StreamEvent>) {
-        self.emit_text_content(content, events);
+        if let Some(frame) = self.dsml_frame.as_mut() {
+            frame.push_str(&content);
+            return;
+        }
+
+        self.dsml_prefix.push_str(&content);
+        if let Some(marker_offset) = first_compat_tool_marker(&self.dsml_prefix) {
+            let frame = self.dsml_prefix.split_off(marker_offset);
+            if !self.dsml_prefix.is_empty() {
+                let preceding_text = std::mem::take(&mut self.dsml_prefix);
+                self.emit_text_content(preceding_text, events);
+            }
+            self.dsml_frame = Some(frame);
+            return;
+        }
+
+        let retained = longest_compat_tool_prefix_suffix(&self.dsml_prefix);
+        let released_len = self.dsml_prefix.len().saturating_sub(retained.len());
+        if released_len > 0 {
+            let released = self.dsml_prefix[..released_len].to_string();
+            self.dsml_prefix = retained;
+            self.emit_text_content(released, events);
+        }
+    }
+
+    fn emit_dsml_tool_calls(&mut self, calls: Vec<DsmlToolCall>, events: &mut Vec<StreamEvent>) {
+        self.close_visible_content(events);
+        let mut index = self.next_synthetic_tool_index();
+        for call in calls {
+            events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                index,
+                content_block: OutputContentBlock::ToolUse {
+                    id: call.id,
+                    name: call.name,
+                    input: json!({}),
+                },
+            }));
+            events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                index,
+                delta: ContentBlockDelta::InputJsonDelta {
+                    partial_json: call.input.to_string(),
+                },
+            }));
+            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                index,
+            }));
+            index = index.saturating_add(1);
+        }
+        self.stop_reason = Some("tool_use".to_string());
+    }
+
+    fn next_synthetic_tool_index(&self) -> u32 {
+        let mut highest = self
+            .tool_calls
+            .values()
+            .map(ToolCallState::block_index)
+            .max();
+        if self.reasoning_started {
+            highest = Some(highest.unwrap_or(0).max(0));
+        }
+        if self.text_started {
+            highest = Some(highest.unwrap_or(0).max(self.reasoning_started as u32));
+        }
+        highest.map_or(0, |index| index.saturating_add(1))
+    }
+
+    fn close_visible_content(&mut self, events: &mut Vec<StreamEvent>) {
+        if self.reasoning_started && !self.reasoning_finished {
+            self.reasoning_finished = true;
+            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                index: 0,
+            }));
+        }
+        if self.text_started && !self.text_finished {
+            self.text_finished = true;
+            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                index: self.reasoning_started as u32,
+            }));
+        }
     }
 
     fn emit_text_content(&mut self, content: String, events: &mut Vec<StreamEvent>) {
@@ -1576,7 +1688,7 @@ fn should_request_stream_usage(config: OpenAiCompatConfig) -> bool {
 fn normalize_chat_completion_response(
     model: &str,
     response: ChatCompletionResponse,
-    _exposed_tools: &[ToolDefinition],
+    exposed_tools: &[ToolDefinition],
 ) -> Result<MessageResponse, ApiError> {
     let choice = response
         .choices
@@ -1599,7 +1711,19 @@ fn normalize_chat_completion_response(
         });
     }
     if let Some(text) = choice.message.content.filter(|value| !value.is_empty()) {
-        content.push(OutputContentBlock::Text { text });
+        let exposed_tool_names = exposed_tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<BTreeSet<_>>();
+        if let Some(calls) = parse_compat_tool_calls(&text, &exposed_tool_names) {
+            content.extend(calls.into_iter().map(|call| OutputContentBlock::ToolUse {
+                id: call.id,
+                name: call.name,
+                input: call.input,
+            }));
+        } else {
+            content.push(OutputContentBlock::Text { text });
+        }
     }
     for tool_call in choice.message.tool_calls {
         content.push(OutputContentBlock::ToolUse {
@@ -1690,6 +1814,260 @@ fn normalize_responses_response(model: &str, response: ResponsesApiResponse) -> 
 
 fn parse_tool_arguments(arguments: &str) -> Value {
     serde_json::from_str(arguments).unwrap_or_else(|_| json!({ "raw": arguments }))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct DsmlToolCall {
+    id: String,
+    name: String,
+    input: Value,
+}
+
+fn parse_dsml_tool_calls(
+    text: &str,
+    exposed_tool_names: &BTreeSet<String>,
+) -> Option<Vec<DsmlToolCall>> {
+    let body = text
+        .trim()
+        .strip_prefix(DSML_TOOL_CALLS_OPEN)?
+        .strip_suffix(DSML_TOOL_CALLS_CLOSE)?;
+    let mut remaining = body.trim();
+    let mut calls = Vec::new();
+
+    while !remaining.is_empty() {
+        let after_open = remaining.strip_prefix(DSML_INVOKE_OPEN)?;
+        let tag_end = after_open.find('>')?;
+        let attributes = parse_dsml_attributes(&after_open[..tag_end])?;
+        if attributes.len() != 1 {
+            return None;
+        }
+        let name = attributes.get("name")?.clone();
+        if !exposed_tool_names.contains(&name) {
+            return None;
+        }
+        let after_tag = &after_open[tag_end + 1..];
+        let (parameters, after_close) = after_tag.split_once(DSML_INVOKE_CLOSE)?;
+        let mut parameter_source = parameters.trim();
+        let mut input = serde_json::Map::new();
+        while !parameter_source.is_empty() {
+            let after_parameter_open = parameter_source.strip_prefix(DSML_PARAMETER_OPEN)?;
+            let parameter_tag_end = after_parameter_open.find('>')?;
+            let parameter_attributes =
+                parse_dsml_attributes(&after_parameter_open[..parameter_tag_end])?;
+            if parameter_attributes.len() != 2 {
+                return None;
+            }
+            let parameter_name = parameter_attributes.get("name")?.clone();
+            let is_string = match parameter_attributes.get("string")?.as_str() {
+                "true" => true,
+                "false" => false,
+                _ => return None,
+            };
+            let parameter_after_tag = &after_parameter_open[parameter_tag_end + 1..];
+            let (value, after_parameter_close) =
+                parameter_after_tag.split_once(DSML_PARAMETER_CLOSE)?;
+            let value = if is_string {
+                Value::String(value.to_string())
+            } else {
+                serde_json::from_str(value).ok()?
+            };
+            if input.insert(parameter_name, value).is_some() {
+                return None;
+            }
+            parameter_source = after_parameter_close.trim();
+        }
+        calls.push(DsmlToolCall {
+            id: format!("dsml-tool-{}", calls.len()),
+            name,
+            input: Value::Object(input),
+        });
+        remaining = after_close.trim();
+    }
+
+    (!calls.is_empty()).then_some(calls)
+}
+
+fn parse_compat_tool_calls(
+    text: &str,
+    exposed_tool_names: &BTreeSet<String>,
+) -> Option<Vec<DsmlToolCall>> {
+    parse_dsml_tool_calls(text, exposed_tool_names)
+        .or_else(|| parse_fenced_tool_call(text, exposed_tool_names))
+        .or_else(|| parse_tagged_tool_call(text, exposed_tool_names))
+}
+
+fn parse_fenced_tool_call(
+    text: &str,
+    exposed_tool_names: &BTreeSet<String>,
+) -> Option<Vec<DsmlToolCall>> {
+    let trimmed = text.trim();
+    if let Some(body) = trimmed
+        .strip_prefix(COMPAT_TOOL_USE_FENCE_OPEN)
+        .and_then(|body| body.strip_suffix("```"))
+    {
+        let body = body.trim_start_matches(['\r', '\n']).trim();
+        let (name, arguments) = body.split_once('\n')?;
+        let name = name.trim();
+        if !exposed_tool_names.contains(name) {
+            return None;
+        }
+        let input = serde_json::from_str::<Value>(arguments.trim()).ok()?;
+        if !input.is_object() {
+            return None;
+        }
+        return Some(vec![DsmlToolCall {
+            id: "compat-tool-0".to_string(),
+            name: name.to_string(),
+            input,
+        }]);
+    }
+
+    let body = trimmed
+        .strip_prefix(COMPAT_JSON_FENCE_OPEN)?
+        .strip_suffix("```")?
+        .trim_start_matches(['\r', '\n'])
+        .trim();
+    let value = serde_json::from_str::<Value>(body).ok()?;
+    let object = value.as_object()?;
+    if object.len() != 2 || !object.contains_key("tool") || !object.contains_key("arguments") {
+        return None;
+    }
+    let name = object.get("tool")?.as_str()?;
+    if !exposed_tool_names.contains(name) {
+        return None;
+    }
+    let input = object.get("arguments")?.clone();
+    if !input.is_object() {
+        return None;
+    }
+    Some(vec![DsmlToolCall {
+        id: "compat-tool-0".to_string(),
+        name: name.to_string(),
+        input,
+    }])
+}
+
+fn parse_tagged_tool_call(
+    text: &str,
+    exposed_tool_names: &BTreeSet<String>,
+) -> Option<Vec<DsmlToolCall>> {
+    let mut body = text
+        .trim()
+        .strip_prefix(COMPAT_TOOL_CALL_OPEN)?
+        .strip_suffix(COMPAT_TOOL_CALL_CLOSE)?
+        .trim();
+    let mut name = None;
+    let mut input = serde_json::Map::new();
+    while !body.is_empty() {
+        let tag_end = body.find('>')?;
+        let tag = body.strip_prefix('<')?[..tag_end.saturating_sub(1)].trim();
+        if tag.is_empty()
+            || !tag
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            return None;
+        }
+        let after_open = &body[tag_end + 1..];
+        let close = format!("</{tag}>");
+        let (raw_value, remaining) = after_open.split_once(&close)?;
+        if raw_value.contains('<') || raw_value.contains('>') {
+            return None;
+        }
+        match tag {
+            "tool_name" => {
+                if name.replace(raw_value.trim().to_string()).is_some() {
+                    return None;
+                }
+            }
+            "parameters" => {
+                let parameters = serde_json::from_str::<Value>(raw_value.trim()).ok()?;
+                let parameters = parameters.as_object()?;
+                for (key, value) in parameters {
+                    if input.insert(key.clone(), value.clone()).is_some() {
+                        return None;
+                    }
+                }
+            }
+            parameter_name => {
+                if input
+                    .insert(
+                        parameter_name.to_string(),
+                        Value::String(raw_value.trim().to_string()),
+                    )
+                    .is_some()
+                {
+                    return None;
+                }
+            }
+        }
+        body = remaining.trim();
+    }
+    let name = name?;
+    if !exposed_tool_names.contains(&name) {
+        return None;
+    }
+    Some(vec![DsmlToolCall {
+        id: "compat-tool-0".to_string(),
+        name,
+        input: Value::Object(input),
+    }])
+}
+
+fn parse_dsml_attributes(source: &str) -> Option<BTreeMap<String, String>> {
+    let mut attributes = BTreeMap::new();
+    for token in source.split_whitespace() {
+        let (key, value) = token.split_once('=')?;
+        let value = value.strip_prefix('"')?.strip_suffix('"')?;
+        if key.is_empty()
+            || value.contains('<')
+            || value.contains('>')
+            || attributes
+                .insert(key.to_string(), value.to_string())
+                .is_some()
+        {
+            return None;
+        }
+    }
+    (!attributes.is_empty()).then_some(attributes)
+}
+
+fn compat_tool_markers() -> [&'static str; 4] {
+    [
+        DSML_TOOL_CALLS_OPEN,
+        COMPAT_TOOL_USE_FENCE_OPEN,
+        COMPAT_JSON_FENCE_OPEN,
+        COMPAT_TOOL_CALL_OPEN,
+    ]
+}
+
+fn first_compat_tool_marker(text: &str) -> Option<usize> {
+    compat_tool_markers()
+        .iter()
+        .filter_map(|marker| text.find(marker))
+        .min()
+}
+
+fn longest_compat_tool_prefix_suffix(text: &str) -> String {
+    let max_marker_prefix = compat_tool_markers()
+        .iter()
+        .map(|marker| marker.len().saturating_sub(1))
+        .max()
+        .unwrap_or(0);
+    let max_len = text.len().min(max_marker_prefix);
+    for length in (1..=max_len).rev() {
+        if !text.is_char_boundary(text.len() - length) {
+            continue;
+        }
+        let suffix = &text[text.len() - length..];
+        if compat_tool_markers()
+            .iter()
+            .any(|marker| marker.starts_with(suffix))
+        {
+            return suffix.to_string();
+        }
+    }
+    String::new()
 }
 
 fn next_sse_frame(buffer: &mut Vec<u8>) -> Option<String> {
@@ -2029,8 +2407,9 @@ impl StringExt for String {
 mod tests {
     use super::{
         build_chat_completion_request, build_responses_request, chat_completions_endpoint,
-        is_reasoning_model, normalize_finish_reason, openai_tool_choice, parse_tool_arguments,
-        responses_endpoint, OpenAiCompatClient, OpenAiCompatConfig, OpenAiWireProtocol,
+        is_reasoning_model, normalize_finish_reason, openai_tool_choice, parse_compat_tool_calls,
+        parse_dsml_tool_calls, parse_tool_arguments, responses_endpoint, OpenAiCompatClient,
+        OpenAiCompatConfig, OpenAiWireProtocol,
     };
     use crate::error::ApiError;
     use crate::types::{
@@ -2382,19 +2761,205 @@ mod tests {
                 usage: None,
             })
             .expect("stream chunk");
-        assert!(initial.iter().any(|event| matches!(
+        assert!(initial.iter().all(|event| !matches!(
+            event,
+            StreamEvent::ContentBlockStart(start)
+                if matches!(&start.content_block, OutputContentBlock::ToolUse { .. })
+        )));
+
+        let terminal = state.finish().expect("stream finish");
+        assert!(terminal.iter().any(|event| matches!(
             event,
             StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
                 delta: ContentBlockDelta::TextDelta { text },
                 ..
-            }) if text.contains("<tool_call>")
+            }) if text.contains("<function=read_file>")
         )));
-
-        let terminal = state.finish().expect("stream finish");
         assert!(terminal.iter().all(|event| !matches!(
             event,
             StreamEvent::ContentBlockStart(start)
                 if matches!(&start.content_block, OutputContentBlock::ToolUse { .. })
+        )));
+    }
+
+    #[test]
+    fn strict_dsml_parser_accepts_only_exposed_tools_and_typed_parameters() {
+        let exposed = std::collections::BTreeSet::from([
+            "ListMcpResources".to_string(),
+            "ReadMcpResource".to_string(),
+        ]);
+        let calls = parse_dsml_tool_calls(
+            "<｜｜DSML｜｜tool_calls>\n<｜｜DSML｜｜invoke name=\"ListMcpResources\"></｜｜DSML｜｜invoke>\n<｜｜DSML｜｜invoke name=\"ReadMcpResource\"><｜｜DSML｜｜parameter name=\"uri\" string=\"true\">file://workspace/Cargo.toml</｜｜DSML｜｜parameter><｜｜DSML｜｜parameter name=\"line\" string=\"false\">12</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke>\n</｜｜DSML｜｜tool_calls>",
+            &exposed,
+        )
+        .expect("strict DSML frame");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "ListMcpResources");
+        assert_eq!(calls[0].input, json!({}));
+        assert_eq!(calls[1].id, "dsml-tool-1");
+        assert_eq!(
+            calls[1].input,
+            json!({"uri":"file://workspace/Cargo.toml", "line": 12})
+        );
+        assert!(parse_dsml_tool_calls(
+            "<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"shell\"></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>",
+            &exposed,
+        )
+        .is_none());
+        assert!(parse_dsml_tool_calls(
+            "<tool_call><function=ReadMcpResource></tool_call>",
+            &exposed,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn compatibility_parser_accepts_only_exact_exposed_tool_frames() {
+        let exposed = std::collections::BTreeSet::from([
+            "ToolSearch".to_string(),
+            "workspace_snapshot".to_string(),
+        ]);
+
+        let json_call = parse_compat_tool_calls(
+            "```json\n{\"tool\":\"ToolSearch\",\"arguments\":{\"pattern\":\"//!\",\"glob\":\"*.rs\"}}\n```",
+            &exposed,
+        )
+        .expect("strict fenced JSON tool frame");
+        assert_eq!(json_call[0].name, "ToolSearch");
+        assert_eq!(json_call[0].input, json!({"pattern":"//!", "glob":"*.rs"}));
+
+        let tool_use = parse_compat_tool_calls(
+            "```tool_use\nToolSearch\n{\"pattern\":\"RuntimeHost\"}\n```",
+            &exposed,
+        )
+        .expect("strict tool_use frame");
+        assert_eq!(tool_use[0].name, "ToolSearch");
+        assert_eq!(tool_use[0].input, json!({"pattern":"RuntimeHost"}));
+
+        let tagged = parse_compat_tool_calls(
+            "<tool_call><tool_name>workspace_snapshot</tool_name><path>crates/memory</path><parameters>{\"include_files\":true}</parameters></tool_call>",
+            &exposed,
+        )
+        .expect("strict tagged tool frame");
+        assert_eq!(tagged[0].name, "workspace_snapshot");
+        assert_eq!(
+            tagged[0].input,
+            json!({"path":"crates/memory", "include_files":true})
+        );
+
+        assert!(parse_compat_tool_calls(
+            "```json\n{\"tool\":\"shell\",\"arguments\":{}}\n```",
+            &exposed,
+        )
+        .is_none());
+        assert!(parse_compat_tool_calls(
+            "```json\n{\"tool\":\"ToolSearch\",\"arguments\":{},\"comment\":\"run it\"}\n```",
+            &exposed,
+        )
+        .is_none());
+        assert!(parse_compat_tool_calls(
+            "Use this example: <tool_call><tool_name>ToolSearch</tool_name><parameters>{}</parameters></tool_call>",
+            &exposed,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn streaming_compatibility_frame_becomes_tool_use_without_leaking_text() {
+        use super::{ChatCompletionChunk, ChunkChoice, ChunkDelta, StreamState};
+        use crate::types::{ContentBlockDelta, OutputContentBlock, StreamEvent};
+
+        let tool = ToolDefinition {
+            name: "ToolSearch".to_string(),
+            description: Some("search tools".to_string()),
+            input_schema: json!({"type":"object"}),
+        };
+        let mut state = StreamState::new("deepseek-v4-flash".to_string(), &[tool]);
+        for content in ["```tool_", "use\nToolSearch\n{\"pattern\":\"read\"}\n```"] {
+            let events = state
+                .ingest_chunk(ChatCompletionChunk {
+                    id: "message-compat".to_string(),
+                    model: Some("deepseek-v4-flash".to_string()),
+                    choices: vec![ChunkChoice {
+                        delta: ChunkDelta {
+                            content: Some(content.to_string()),
+                            ..ChunkDelta::default()
+                        },
+                        finish_reason: Some("stop".to_string()),
+                    }],
+                    usage: None,
+                })
+                .expect("stream chunk");
+            assert!(events.iter().all(|event| !matches!(
+                event,
+                StreamEvent::ContentBlockDelta(delta)
+                    if matches!(&delta.delta, ContentBlockDelta::TextDelta { text } if text.contains("tool_use"))
+            )));
+        }
+
+        let terminal = state.finish().expect("stream finish");
+        assert!(terminal.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockStart(start)
+                if matches!(&start.content_block, OutputContentBlock::ToolUse { name, .. }
+                    if name == "ToolSearch")
+        )));
+        assert!(terminal.iter().any(|event| matches!(
+            event,
+            StreamEvent::MessageDelta(delta) if delta.delta.stop_reason.as_deref() == Some("tool_use")
+        )));
+    }
+
+    #[test]
+    fn streaming_strict_dsml_frame_becomes_tool_use_without_leaking_text() {
+        use super::{ChatCompletionChunk, ChunkChoice, ChunkDelta, StreamState};
+        use crate::types::{ContentBlockDelta, OutputContentBlock, StreamEvent};
+
+        let tool = ToolDefinition {
+            name: "ListMcpResources".to_string(),
+            description: Some("list resources".to_string()),
+            input_schema: json!({"type":"object"}),
+        };
+        let mut state = StreamState::new("deepseek-v4-flash".to_string(), &[tool]);
+        for content in [
+            "<｜｜DSML｜｜tool_",
+            "calls><｜｜DSML｜｜invoke name=\"ListMcpResources\"></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>",
+        ] {
+            let events = state
+                .ingest_chunk(ChatCompletionChunk {
+                    id: "message-dsml".to_string(),
+                    model: Some("deepseek-v4-flash".to_string()),
+                    choices: vec![ChunkChoice {
+                        delta: ChunkDelta {
+                            content: Some(content.to_string()),
+                            ..ChunkDelta::default()
+                        },
+                        finish_reason: Some("stop".to_string()),
+                    }],
+                    usage: None,
+                })
+                .expect("stream chunk");
+            assert!(events.iter().all(|event| !matches!(
+                event,
+                StreamEvent::ContentBlockDelta(delta)
+                    if matches!(&delta.delta, ContentBlockDelta::TextDelta { text } if text.contains("DSML"))
+            )));
+        }
+        let terminal = state.finish().expect("stream finish");
+        assert!(terminal.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockStart(start)
+                if matches!(&start.content_block, OutputContentBlock::ToolUse { name, input, .. }
+                    if name == "ListMcpResources" && input == &json!({}))
+        )));
+        assert!(terminal.iter().all(|event| !matches!(
+            event,
+            StreamEvent::ContentBlockDelta(delta)
+                if matches!(&delta.delta, ContentBlockDelta::TextDelta { text } if text.contains("DSML"))
+        )));
+        assert!(terminal.iter().any(|event| matches!(
+            event,
+            StreamEvent::MessageDelta(delta) if delta.delta.stop_reason.as_deref() == Some("tool_use")
         )));
     }
 

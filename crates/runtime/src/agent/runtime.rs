@@ -3,8 +3,9 @@ use std::sync::{Arc, RwLock, Weak};
 
 use async_trait::async_trait;
 use harness_contract::agent::{
-    AgentCommand, AgentCommandReceipt, AgentCommandRejectReason, AgentCommandRequest, AgentInput,
-    AgentLifecycleEvent, AgentReturnPacket, AgentStatus, AgentTaskPacket, AgentTerminalStatus,
+    AgentBindingSnapshot, AgentCommand, AgentCommandReceipt, AgentCommandRejectReason,
+    AgentCommandRequest, AgentInput, AgentLifecycleEvent, AgentReturnPacket, AgentStatus,
+    AgentTaskPacket, AgentTerminalStatus, RevisionSelector,
 };
 use harness_contract::execution_graph::{ExecutionEdgeKind, ExecutionNodeKind};
 use serde::{Deserialize, Serialize};
@@ -14,7 +15,11 @@ use crate::runtime_event_store::{
     AppendTransactionRequest, ExpectedStreamRevision, RuntimeEventInput, RuntimeEventRef,
     RuntimeEventScope,
 };
-use crate::{ProviderRegistry, RuntimeEventStore, RuntimeServices};
+use crate::{
+    project_self_models, AgentRunEvaluation, AgentSelfModel, ProviderRegistry, RuntimeEventStore,
+    RuntimeServices,
+};
+use sha2::{Digest, Sha256};
 
 use crate::agent_catalog::AgentCatalog;
 use crate::agent_model_selector::{AgentModelSelection, AgentModelSelector};
@@ -36,6 +41,8 @@ pub struct AgentRunSnapshot {
     pub revision: u64,
     pub model: Option<String>,
     pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<AgentBindingSnapshot>,
     pub started_at_ms: u64,
     pub updated_at_ms: u64,
     pub failure: Option<String>,
@@ -444,6 +451,7 @@ impl AgentRuntime {
             }
         }
         let packet = self.attach_predecessor_context(packet).await?;
+        let packet = self.ensure_runtime_binding(packet)?;
         let backend_kind = backend_from_packet(&packet);
         let selection = match self.selector.select(nonempty(&packet.model_lease)) {
             Ok(selection) => selection,
@@ -465,6 +473,7 @@ impl AgentRuntime {
                         revision: 0,
                         model: None,
                         provider: None,
+                        binding: packet.binding.clone(),
                         started_at_ms: now_ms(),
                         updated_at_ms: now_ms(),
                         failure: Some(failure.clone()),
@@ -477,6 +486,50 @@ impl AgentRuntime {
                 return Ok(returned);
             }
         };
+        let binding = packet
+            .binding
+            .as_ref()
+            .ok_or_else(|| "Runtime failed to materialize Agent Binding".to_string())?;
+        if !binding.model_policy.allowed_models.is_empty()
+            && !binding
+                .model_policy
+                .allowed_models
+                .contains(&selection.model)
+        {
+            let failure = format!(
+                "selected model `{}` is outside Binding model policy for {}@{}",
+                selection.model,
+                binding.definition_ref.definition_id.as_str(),
+                binding.definition_ref.revision
+            );
+            let returned = blocked_return(&packet, failure.clone());
+            self.persist_snapshot(
+                AgentRunSnapshot {
+                    run_id: packet.run_id.clone(),
+                    agent_id: packet.agent_id.clone(),
+                    task_id: packet.task_id.clone(),
+                    session_id: packet.session_id.clone(),
+                    graph_id: packet.graph_id.clone(),
+                    node_id: packet.node_id.clone(),
+                    attempt: packet.attempt,
+                    expected_graph_revision: packet.expected_graph_revision,
+                    backend: backend_kind,
+                    status: AgentStatus::Blocked,
+                    revision: 0,
+                    model: Some(selection.model),
+                    provider: Some(selection.provider),
+                    binding: packet.binding.clone(),
+                    started_at_ms: now_ms(),
+                    updated_at_ms: now_ms(),
+                    failure: Some(failure.clone()),
+                },
+                "agent.blocked",
+                &failure,
+                None,
+                Some(returned.clone()),
+            )?;
+            return Ok(returned);
+        }
         let snapshot = AgentRunSnapshot {
             run_id: packet.run_id.clone(),
             agent_id: packet.agent_id.clone(),
@@ -491,6 +544,7 @@ impl AgentRuntime {
             revision: 0,
             model: Some(selection.model.clone()),
             provider: Some(selection.provider.clone()),
+            binding: packet.binding.clone(),
             started_at_ms: now_ms(),
             updated_at_ms: now_ms(),
             failure: None,
@@ -537,14 +591,66 @@ impl AgentRuntime {
         terminal.status = terminal_status(returned.status);
         terminal.updated_at_ms = now_ms();
         terminal.failure = returned.failure.clone();
-        self.persist_snapshot(
+        let evaluation =
+            AgentRunEvaluation::from_terminal(&packet, &returned, terminal.updated_at_ms);
+        let refresh_canary_observation = evaluation.as_ref().is_some_and(|evaluation| {
+            evaluation.release_channel == Some(harness_contract::agent::ReleaseChannel::Canary)
+        });
+        self.persist_snapshot_with_evaluation(
             terminal,
             "agent.terminal",
             "terminal",
             None,
             Some(returned.clone()),
+            evaluation,
         )?;
+        if refresh_canary_observation {
+            if let Some(services) = self.services() {
+                if let Err(error) = services.refresh_evolution_canary_observations() {
+                    // The terminal run is already durably committed. Canary
+                    // observation is a replayable projection and will be
+                    // rebuilt before any Stable-review request, so do not
+                    // turn a completed user task into a false failure here.
+                    tracing::warn!(
+                        agent_id = %packet.agent_id,
+                        run_id = %packet.run_id,
+                        error = %error,
+                        "failed to refresh replayable Canary observation"
+                    );
+                }
+            }
+        }
         Ok(returned)
+    }
+
+    /// Immutable per-run evidence, written only with a terminal lifecycle
+    /// event. This projection deliberately groups by Definition revision and
+    /// environment instead of mutable instance reputation.
+    #[must_use]
+    pub fn evaluations(&self) -> Vec<AgentRunEvaluation> {
+        let Ok(events) = self
+            .event_store
+            .list_scope(RuntimeEventScope::Evolution, 100_000)
+        else {
+            return Vec::new();
+        };
+        let mut evaluations = events
+            .into_iter()
+            .filter(|event| event.kind == "agent.run_evaluated")
+            .filter_map(|event| event.payload.get("evaluation").cloned())
+            .filter_map(|value| serde_json::from_value::<AgentRunEvaluation>(value).ok())
+            .collect::<Vec<_>>();
+        evaluations.sort_by(|left, right| {
+            left.created_at_ms
+                .cmp(&right.created_at_ms)
+                .then_with(|| left.evaluation_id.cmp(&right.evaluation_id))
+        });
+        evaluations
+    }
+
+    #[must_use]
+    pub fn self_models(&self) -> Vec<AgentSelfModel> {
+        project_self_models(self.evaluations())
     }
 
     /// Persist a bounded lifecycle progress marker for an active Agent.
@@ -563,6 +669,82 @@ impl AgentRuntime {
         snapshot.updated_at_ms = now_ms();
         self.persist_snapshot(snapshot, kind, message, None, None)
             .map(|_| ())
+    }
+
+    /// Verify the immutable Runtime Binding persisted with an AgentTask node.
+    /// New executable packets are compiled before graph registration; Runtime
+    /// intentionally rejects an unbound payload rather than selecting a
+    /// default Definition during execution or recovery.
+    fn ensure_runtime_binding(&self, packet: AgentTaskPacket) -> Result<AgentTaskPacket, String> {
+        let binding = packet.binding.as_ref().ok_or_else(|| {
+            "unbound AgentTaskPacket is not executable; compile AgentTaskIntent before graph registration"
+                .to_string()
+        })?;
+        binding.validate().map_err(|error| error.to_string())?;
+        if packet.agent_id != binding.instance.instance_id {
+            return Err(
+                "AgentTaskPacket agent_id must equal its Binding instance identity".to_string(),
+            );
+        }
+        if binding.data_lease.session_id != packet.session_id
+            || binding.data_lease.task_id != packet.task_id
+            || binding.data_lease.team_id != packet.team_id
+        {
+            return Err("AgentTaskPacket binding data lease does not match task identity".into());
+        }
+        if let Some(services) = self.services() {
+            let resolved = if binding.evaluation.is_some() {
+                services
+                    .validate_agent_evaluation_binding(binding)
+                    .map_err(|error| {
+                        format!("AgentTaskPacket evaluation Binding is not runnable: {error}")
+                    })?;
+                services
+                    .definition_registry()
+                    .resolve_agent_canary(&binding.definition_ref)
+                    .map_err(|error| {
+                        format!(
+                            "AgentTaskPacket evaluation Binding cannot resolve its candidate revision: {error}"
+                        )
+                    })?
+            } else if binding.release.as_ref().is_some_and(|release| {
+                release.channel == harness_contract::agent::ReleaseChannel::Canary
+            }) {
+                services
+                    .validate_agent_binding_release(binding)
+                    .map_err(|error| {
+                        format!("AgentTaskPacket Canary Binding is not runnable: {error}")
+                    })?;
+                services
+                    .definition_registry()
+                    .resolve_agent_canary(&binding.definition_ref)
+                    .map_err(|error| {
+                        format!(
+                            "AgentTaskPacket Canary Binding cannot resolve its revision: {error}"
+                        )
+                    })?
+            } else {
+                services
+                    .definition_registry()
+                    .resolve_agent(
+                        &binding.definition_ref.definition_id,
+                        RevisionSelector::ExactApprovedRevision {
+                            revision: binding.definition_ref.revision,
+                        },
+                    )
+                    .map_err(|error| format!("AgentTaskPacket Binding is not runnable: {error}"))?
+            };
+            if resolved.revision.content_digest != binding.definition_digest
+                || resolved.agent_markdown != binding.instructions
+            {
+                return Err(
+                    "AgentTaskPacket Binding content does not match the approved Definition"
+                        .to_string(),
+                );
+            }
+            verify_binding_against_definition(binding, &resolved.revision.manifest)?;
+        }
+        Ok(packet)
     }
 
     /// Derive bounded peer context from the canonical graph projection before a
@@ -642,7 +824,11 @@ impl AgentRuntime {
             let role = predecessor_packet
                 .constraints
                 .iter()
-                .find_map(|constraint| constraint.strip_prefix("protocol_role:"))
+                .find_map(|constraint| {
+                    constraint
+                        .strip_prefix("team_role:")
+                        .or_else(|| constraint.strip_prefix("protocol_role:"))
+                })
                 .unwrap_or(predecessor_packet.agent_id.as_str());
             let available = remaining.saturating_sub(96);
             if available == 0 {
@@ -807,11 +993,23 @@ impl AgentRuntime {
 
     fn persist_snapshot(
         &self,
+        snapshot: AgentRunSnapshot,
+        kind: &str,
+        message: &str,
+        receipt: Option<AgentCommandReceipt>,
+        returned: Option<AgentReturnPacket>,
+    ) -> Result<AgentCommandReceipt, String> {
+        self.persist_snapshot_with_evaluation(snapshot, kind, message, receipt, returned, None)
+    }
+
+    fn persist_snapshot_with_evaluation(
+        &self,
         mut snapshot: AgentRunSnapshot,
         kind: &str,
         message: &str,
         receipt: Option<AgentCommandReceipt>,
         returned: Option<AgentReturnPacket>,
+        evaluation: Option<AgentRunEvaluation>,
     ) -> Result<AgentCommandReceipt, String> {
         let stream_id = agent_stream_id(&snapshot.agent_id);
         snapshot.revision = self
@@ -824,30 +1022,90 @@ impl AgentRuntime {
             receipt: receipt.clone(),
             returned: returned.clone(),
         };
-        self.event_store
-            .append(RuntimeEventInput {
-                stream_id,
-                scope: RuntimeEventScope::Agent,
-                kind: kind.into(),
-                status: Some(message.into()),
-                actor: Some("agent_runtime".into()),
-                refs: vec![
-                    RuntimeEventRef {
-                        kind: "run".into(),
-                        id: snapshot.run_id.clone(),
-                    },
-                    RuntimeEventRef {
-                        kind: "graph".into(),
-                        id: snapshot.graph_id.clone(),
-                    },
-                    RuntimeEventRef {
-                        kind: "node".into(),
-                        id: snapshot.node_id.clone(),
-                    },
-                ],
-                payload: serde_json::to_value(payload).map_err(|error| error.to_string())?,
-            })
-            .map_err(|error| error.to_string())?;
+        let agent_event = RuntimeEventInput {
+            stream_id: stream_id.clone(),
+            scope: RuntimeEventScope::Agent,
+            kind: kind.into(),
+            status: Some(message.into()),
+            actor: Some("agent_runtime".into()),
+            refs: vec![
+                RuntimeEventRef {
+                    kind: "run".into(),
+                    id: snapshot.run_id.clone(),
+                },
+                RuntimeEventRef {
+                    kind: "graph".into(),
+                    id: snapshot.graph_id.clone(),
+                },
+                RuntimeEventRef {
+                    kind: "node".into(),
+                    id: snapshot.node_id.clone(),
+                },
+            ],
+            payload: serde_json::to_value(payload).map_err(|error| error.to_string())?,
+        };
+        if let Some(evaluation) = evaluation {
+            let evaluation_stream = agent_evaluation_stream(&evaluation.run_id);
+            let evaluation_revision = self
+                .event_store
+                .stream_revision(&evaluation_stream)
+                .map_err(|error| error.to_string())?;
+            self.event_store
+                .append_transaction(AppendTransactionRequest {
+                    transaction_id: format!(
+                        "agent-terminal-evaluation:{}:{}",
+                        snapshot.run_id, evaluation.evaluation_id
+                    ),
+                    expected_streams: vec![
+                        ExpectedStreamRevision {
+                            stream_id: stream_id.clone(),
+                            expected_revision: snapshot.revision.saturating_sub(1),
+                        },
+                        ExpectedStreamRevision {
+                            stream_id: evaluation_stream.clone(),
+                            expected_revision: evaluation_revision,
+                        },
+                    ],
+                    events: vec![
+                        agent_event.into(),
+                        RuntimeEventInput {
+                            stream_id: evaluation_stream,
+                            scope: RuntimeEventScope::Evolution,
+                            kind: "agent.run_evaluated".to_string(),
+                            status: Some(if evaluation.is_success() {
+                                "completed".to_string()
+                            } else {
+                                "failed".to_string()
+                            }),
+                            actor: Some("runtime.agent_evaluation".to_string()),
+                            refs: vec![
+                                RuntimeEventRef {
+                                    kind: "run".to_string(),
+                                    id: evaluation.run_id.clone(),
+                                },
+                                RuntimeEventRef {
+                                    kind: "agent_definition".to_string(),
+                                    id: format!(
+                                        "{}@{}",
+                                        evaluation.definition_id, evaluation.definition_revision
+                                    ),
+                                },
+                                RuntimeEventRef {
+                                    kind: "binding".to_string(),
+                                    id: evaluation.binding_digest.clone(),
+                                },
+                            ],
+                            payload: serde_json::json!({"evaluation": evaluation}),
+                        }
+                        .into(),
+                    ],
+                })
+                .map_err(|error| error.to_string())?;
+        } else {
+            self.event_store
+                .append(agent_event)
+                .map_err(|error| error.to_string())?;
+        }
         let mut records = self
             .records
             .write()
@@ -934,6 +1192,10 @@ fn agent_stream_id(agent_id: &str) -> String {
     format!("agent:{agent_id}")
 }
 
+fn agent_evaluation_stream(run_id: &str) -> String {
+    format!("agent-evaluation:{run_id}")
+}
+
 fn legacy_import_stream_id(source_id: &str) -> String {
     format!("agent-migration:{source_id}")
 }
@@ -986,12 +1248,78 @@ fn validate_legacy_record(record: &LegacyAgentStateRecord) -> Result<(), String>
 }
 
 fn backend_from_packet(packet: &AgentTaskPacket) -> AgentBackendKind {
-    packet
-        .constraints
+    match packet.binding.as_ref().map(|binding| &binding.executor) {
+        Some(harness_contract::agent::AgentExecutorPolicy::ProcessJsonl { .. }) => {
+            AgentBackendKind::ProcessJsonl
+        }
+        _ => AgentBackendKind::InProcess,
+    }
+}
+
+fn verify_binding_against_definition(
+    binding: &AgentBindingSnapshot,
+    manifest: &harness_contract::agent::AgentDefinitionManifest,
+) -> Result<(), String> {
+    if binding.executor != manifest.executor {
+        return Err("AgentTaskPacket Binding executor differs from the Definition".to_string());
+    }
+    if binding.model_policy != manifest.model_policy {
+        return Err("AgentTaskPacket Binding model policy differs from the Definition".to_string());
+    }
+    if binding.effective_capabilities.iter().any(|capability| {
+        !manifest
+            .capability_contract
+            .capability_ceiling
+            .contains(capability)
+    }) {
+        return Err(
+            "AgentTaskPacket Binding expands the Definition capability ceiling".to_string(),
+        );
+    }
+    if binding
+        .skill_refs
         .iter()
-        .any(|constraint| constraint == "backend:process_jsonl")
-        .then_some(AgentBackendKind::ProcessJsonl)
-        .unwrap_or(AgentBackendKind::InProcess)
+        .any(|skill| !manifest.capability_contract.skill_refs.contains(skill))
+    {
+        return Err("AgentTaskPacket Binding exposes an undeclared Skill".to_string());
+    }
+    if binding.tool_contract_refs.iter().any(|tool_ref| {
+        !binding
+            .effective_capabilities
+            .contains(&crate::agent::binding::capability_required_by_tool_contract(tool_ref))
+    }) {
+        return Err(
+            "AgentTaskPacket Binding exposes a Tool outside its effective capability grant"
+                .to_string(),
+        );
+    }
+    if binding
+        .data_lease
+        .read_scopes
+        .iter()
+        .any(|scope| !manifest.cognitive_policy.read_scopes.contains(scope))
+        || (binding.data_lease.team_working_state_visible
+            && !manifest.cognitive_policy.team_working_state_visible)
+        || binding.data_lease.write_mode
+            == harness_contract::agent::CognitiveWriteMode::CandidateOnly
+            && manifest.cognitive_policy.write_mode
+                == harness_contract::agent::CognitiveWriteMode::None
+    {
+        return Err("AgentTaskPacket Binding expands the Definition cognitive policy".to_string());
+    }
+    let expected_digest = binding_digest(binding)?;
+    if binding.binding_digest != expected_digest {
+        return Err("AgentTaskPacket Binding digest is invalid".to_string());
+    }
+    Ok(())
+}
+
+fn binding_digest(binding: &AgentBindingSnapshot) -> Result<String, String> {
+    let mut unsigned = binding.clone();
+    unsigned.binding_digest.clear();
+    serde_json::to_string(&unsigned)
+        .map(|encoded| format!("{:x}", Sha256::digest(encoded.as_bytes())))
+        .map_err(|error| format!("failed to encode Agent Binding: {error}"))
 }
 
 fn predecessor_context_limit(budget_tokens: u64) -> usize {
@@ -1090,6 +1418,7 @@ mod tests {
 
     use super::*;
     use crate::config::{ProviderConfig, ProvidersConfig};
+    use harness_contract::agent::{AgentCapability, AgentDefinitionId, DefinitionScope};
     use harness_contract::context::ContextBudgetLeaseRef;
 
     struct CompletedBackend;
@@ -1163,10 +1492,52 @@ mod tests {
         )
     }
 
+    fn test_binding(agent_id: &str) -> AgentBindingSnapshot {
+        AgentBindingSnapshot {
+            binding_id: format!("binding:{agent_id}"),
+            definition_ref: harness_contract::agent::AgentDefinitionRevisionRef {
+                definition_id: AgentDefinitionId::new(DefinitionScope::Builtin, "cowd/direct")
+                    .expect("builtin id"),
+                revision: 1,
+            },
+            definition_digest: "a".repeat(64),
+            instructions: "# Test\n\nComplete the test task.\n".to_string(),
+            instance: harness_contract::agent::AgentInstanceRef {
+                instance_id: format!("instance:{agent_id}"),
+                role_slot_id: None,
+            },
+            executor: harness_contract::agent::AgentExecutorPolicy::CowdNative,
+            model_policy: harness_contract::agent::AgentModelPolicy {
+                profile: "test".to_string(),
+                allowed_models: vec!["fast".to_string()],
+                fallback_allowed: true,
+            },
+            effective_capabilities: vec![AgentCapability::Read],
+            skill_refs: Vec::new(),
+            tool_contract_refs: Vec::new(),
+            data_lease: harness_contract::agent::AgentDataLease {
+                session_id: "session-1".to_string(),
+                task_id: "task-1".to_string(),
+                team_id: None,
+                read_scopes: vec![harness_contract::agent::CognitiveReadScope::Session],
+                write_mode: harness_contract::agent::CognitiveWriteMode::CandidateOnly,
+                team_working_state_visible: false,
+                fact_boundaries: Vec::new(),
+                fact_refs: Vec::new(),
+                matrix_snapshot_refs: Vec::new(),
+            },
+            release: None,
+            evaluation: None,
+            binding_digest: "b".repeat(64),
+        }
+    }
+
     fn task(agent_id: &str) -> AgentTaskPacket {
+        let binding = test_binding(agent_id);
+        let instance_id = binding.instance.instance_id.clone();
         AgentTaskPacket {
             run_id: format!("run-{agent_id}"),
-            agent_id: agent_id.into(),
+            agent_id: instance_id.clone(),
             task_id: "task-1".into(),
             session_id: "session-1".into(),
             mission_id: None,
@@ -1184,7 +1555,9 @@ mod tests {
             allowed_skills: Vec::new(),
             permission_lease: "read_only".into(),
             model_lease: "fast".into(),
-            budget_lease: ContextBudgetLeaseRef::new("budget-1", agent_id, "agent", 1000, 1),
+            budget_lease: ContextBudgetLeaseRef::new("budget-1", instance_id, "agent", 1000, 1),
+            binding: Some(binding),
+            managed_invocation: None,
             idempotency_key: format!("idempotency-{agent_id}"),
         }
     }
@@ -1204,6 +1577,7 @@ mod tests {
             revision: 0,
             model: Some("fast".into()),
             provider: Some("test".into()),
+            binding: None,
             started_at_ms: 1,
             updated_at_ms: 1,
             failure: None,
@@ -1318,6 +1692,11 @@ mod tests {
             AgentStatus::Completed
         );
         assert_eq!(runtime.events(&packet.agent_id).len(), 3);
+        let evaluations = runtime.evaluations();
+        assert_eq!(evaluations.len(), 1);
+        assert_eq!(evaluations[0].definition_revision, 1);
+        assert_eq!(evaluations[0].binding_digest, "b".repeat(64));
+        assert_eq!(runtime.self_models().len(), 1);
         let replayed_return = runtime
             .execute_task(packet.clone())
             .await
@@ -1326,6 +1705,8 @@ mod tests {
         assert_eq!(runtime.events(&packet.agent_id).len(), 3);
 
         let restored = AgentRuntime::new(store, configured_registry());
+        assert_eq!(restored.evaluations().len(), 1);
+        assert_eq!(restored.self_models()[0].run_count, 1);
         let snapshot = restored.get(&packet.agent_id).expect("replayed snapshot");
         assert_eq!(snapshot.status, AgentStatus::Completed);
         assert_eq!(snapshot.graph_id, packet.graph_id);
@@ -1362,6 +1743,7 @@ mod tests {
                 revision: 0,
                 model: Some("fast".into()),
                 provider: Some("test".into()),
+                binding: None,
                 started_at_ms: 1,
                 updated_at_ms: 1,
                 failure: None,
@@ -1453,6 +1835,7 @@ mod tests {
                 revision: 0,
                 model: Some("fast".into()),
                 provider: Some("test".into()),
+                binding: None,
                 started_at_ms: 1,
                 updated_at_ms: 1,
                 failure: None,

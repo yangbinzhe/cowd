@@ -14,6 +14,7 @@ use mcp::McpService;
 use serde_json::Value;
 
 use crate::lsp_client::LspRegistry;
+use crate::path_policy::WorkspacePathPolicy;
 use crate::tool_cache::{ToolCache, ToolCacheStats};
 use crate::tool_orchestrator::describe_tool_effect;
 use crate::ToolCatalog;
@@ -130,6 +131,7 @@ impl ToolHost {
         ToolHostLease {
             workspace_id: self.workspace_id.clone(),
             workspace_root: self.workspace_root.clone(),
+            path_policy: Arc::new(WorkspacePathPolicy::new(&self.workspace_root)),
             revision,
             snapshot,
             cache: Arc::clone(&self.cache),
@@ -167,6 +169,7 @@ impl ToolHost {
 pub struct ToolHostLease {
     workspace_id: String,
     workspace_root: PathBuf,
+    path_policy: Arc<WorkspacePathPolicy>,
     revision: u64,
     snapshot: Arc<ToolHostSnapshot>,
     cache: Arc<ToolCache>,
@@ -193,6 +196,11 @@ impl ToolHostLease {
     #[must_use]
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
+    }
+
+    #[must_use]
+    pub fn path_policy(&self) -> &WorkspacePathPolicy {
+        &self.path_policy
     }
 
     #[must_use]

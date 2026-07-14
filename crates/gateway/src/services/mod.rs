@@ -41,15 +41,13 @@ mod system_service;
 mod task_service;
 mod workspace_service;
 
-pub(crate) use agent_service::UpsertAgentTeamProfileRequest;
 pub(crate) use approval_service::ApprovalService;
 pub(crate) use context_service::ContextServiceError;
 pub(crate) use cross_plane_executor::{GatewayConnectorServiceExecutor, GatewayCrossPlaneExecutor};
 pub(crate) use cross_plane_service::CrossPlaneExecutionRecord;
 pub(crate) use evolution_service::{
-    EvolutionCandidateAdoptionRequest, EvolutionCandidateCreateRequest,
-    EvolutionCandidateDecisionRequest, EvolutionProposalCreateRequest,
-    EvolutionProposalDecisionRequest, EvolutionServiceError, EvolutionSignalCreateRequest,
+    EvolutionProposalCreateRequest, EvolutionProposalDecisionRequest, EvolutionServiceError,
+    EvolutionSignalCreateRequest,
 };
 pub(crate) use growth_service::growth_storage_migrations;
 pub(crate) use harness_eval_service::HarnessEvalServiceError;
@@ -62,9 +60,8 @@ pub(crate) use mfg_service::{
 pub(crate) use mission_service::{
     AddMissionRelationHttpRequest, CreateMissionScheduleHttpRequest,
     DecideMissionApprovalHttpRequest, InterpretMissionCommandHttpRequest,
-    StartMissionSessionHttpRequest, StartMissionTeamRuntimeHttpRequest,
-    SubmitMissionApprovalHttpRequest, UpdateMissionScheduleHttpRequest,
-    UpsertMissionProxyHttpRequest,
+    StartMissionSessionHttpRequest, SubmitMissionApprovalHttpRequest,
+    UpdateMissionScheduleHttpRequest, UpsertMissionProxyHttpRequest,
 };
 pub(crate) use reality_service::RealityService;
 pub(crate) use receipt::{service_envelope, ServiceEnvelope};
@@ -73,7 +70,7 @@ pub(crate) use session_service::{
     ActiveMessagesPage, SessionCompactResult, SessionMessageCounts, SessionService,
     SessionStatsSnapshot, SessionTokenCounts, SessionUpdateRequest,
 };
-pub(crate) use skill_service::profile_provider::runtime_skill_profiles_for_workspace;
+pub(crate) use skill_service::profile_provider::runtime_skill_assets_for_workspace;
 pub(crate) use skill_service::{
     SkillActionRequest, SkillCatalogQuery, SkillFileQuery, SkillMaintenanceEvaluateRequest,
     SkillProjectionQuery, SkillServiceError,
@@ -857,18 +854,11 @@ mod tests {
         assert!(evolution_contracts
             .iter()
             .any(|contract| contract.operation == "proposals"));
-        assert!(evolution_contracts
-            .iter()
-            .any(|contract| contract.operation == "candidates"));
-        assert!(evolution_contracts
-            .iter()
-            .any(|contract| contract.operation == "candidate_create"));
-        assert!(evolution_contracts
-            .iter()
-            .any(|contract| contract.operation == "sandbox_evals"));
-        assert!(evolution_contracts
-            .iter()
-            .any(|contract| contract.operation == "sandbox_eval_start"));
+        assert!(evolution_contracts.iter().all(|contract| {
+            !contract.operation.contains("candidate")
+                && !contract.operation.contains("sandbox")
+                && !contract.operation.contains("rollback")
+        }));
         assert_eq!(
             services.provider.config_projection_contract().operation,
             "config_projection"

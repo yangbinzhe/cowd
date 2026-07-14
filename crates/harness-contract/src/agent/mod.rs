@@ -8,6 +8,23 @@ use crate::core::{ExecutionPattern, TaskRisk};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod definition;
+
+pub use crate::evaluation::{
+    EvaluationContract, EvaluationMetricDirection, EvaluationMetricSource, EvaluationMetricSpec,
+    EvaluationMissingValuePolicy, EvaluationMultiplicityCorrection, EvaluationPolicyFloor,
+    EvaluationScenarioObservation, EvaluationScenarioSpec, EvaluationStoppingRule,
+};
+pub use definition::{
+    AgentBindingSnapshot, AgentCapability, AgentCapabilityContract, AgentCognitivePolicy,
+    AgentDataLease, AgentDefinitionId, AgentDefinitionManifest, AgentDefinitionRevision,
+    AgentDefinitionRevisionRef, AgentEvaluationBinding, AgentEvaluationContract,
+    AgentExecutorPolicy, AgentInstanceRef, AgentModelPolicy, AgentReleaseBinding,
+    CognitiveReadScope, CognitiveWriteMode, DefaultPointer, DefinitionScope, ReleaseAssignment,
+    ReleaseAssignmentStatus, ReleaseAuthorization, ReleaseChannel, RevisionLifecycle,
+    RevisionSelector, ValidationError,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentTerminalStatus {
@@ -17,6 +34,54 @@ pub enum AgentTerminalStatus {
     Blocked,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTaskIntent {
+    /// Optional Runtime-catalog identity selected by a protocol or Team role.
+    /// It is only compilation input; it never becomes the runtime instance
+    /// identity exposed on a durable `AgentTaskPacket`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_agent_id: Option<String>,
+    /// Exact Definition revision mandated by a durable Team Template or
+    /// another Runtime-owned planner. When absent, Runtime may use the
+    /// selected catalog entry or a bounded builtin fallback for a generic
+    /// dynamic request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition_ref: Option<AgentDefinitionRevisionRef>,
+    /// Optional role grant ceiling supplied with `definition_ref`. Runtime
+    /// intersects it with the Definition contract; an empty value never means
+    /// "all capabilities".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub granted_capabilities: Vec<AgentCapability>,
+    pub run_id: String,
+    pub task_id: String,
+    pub session_id: String,
+    pub mission_id: Option<String>,
+    pub team_id: Option<String>,
+    pub graph_id: String,
+    pub node_id: String,
+    pub attempt: u32,
+    pub expected_graph_revision: u64,
+    pub objective: String,
+    pub acceptance: Vec<String>,
+    pub constraints: Vec<String>,
+    pub context_refs: Vec<String>,
+    pub evidence_refs: Vec<EvidenceAccessRef>,
+    pub allowed_tools: Vec<String>,
+    pub allowed_skills: Vec<String>,
+    pub permission_lease: String,
+    pub model_lease: String,
+    pub budget_lease: ContextBudgetLeaseRef,
+    /// Runtime-issued lifecycle fence for a Managed Agent invocation.  The
+    /// binding compiler carries this unchanged into the executable packet;
+    /// only Runtime can use it to authorize fenced external effects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_invocation: Option<crate::managed_agent::ManagedAgentInvocationFence>,
+    pub idempotency_key: String,
+}
+
+/// An executable, immutable Agent command prepared by Runtime.  Planning
+/// components create [`AgentTaskIntent`]; only Runtime binding compilation can
+/// produce this packet for a new graph node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentTaskPacket {
     pub run_id: String,
@@ -39,6 +104,14 @@ pub struct AgentTaskPacket {
     pub permission_lease: String,
     pub model_lease: String,
     pub budget_lease: ContextBudgetLeaseRef,
+    /// The exact Runtime-compiled execution Binding. Runtime refuses to
+    /// execute an unbound packet; the optional wire form exists only so an
+    /// older persisted graph can be upgraded by the Runtime before its first
+    /// `agent.prepared` event is committed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<AgentBindingSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_invocation: Option<crate::managed_agent::ManagedAgentInvocationFence>,
     pub idempotency_key: String,
 }
 

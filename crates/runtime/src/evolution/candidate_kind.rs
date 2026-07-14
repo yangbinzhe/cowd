@@ -6,6 +6,7 @@ use super::planner::EvolutionProposalKind;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvolutionCandidateKind {
+    AgentDefinition,
     RuntimePolicy,
     ContextPolicy,
     MemoryGovernance,
@@ -22,7 +23,8 @@ pub enum EvolutionCandidateKind {
 }
 
 impl EvolutionCandidateKind {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
+        Self::AgentDefinition,
         Self::RuntimePolicy,
         Self::ContextPolicy,
         Self::MemoryGovernance,
@@ -41,6 +43,7 @@ impl EvolutionCandidateKind {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::AgentDefinition => "agent_definition",
             Self::RuntimePolicy => "runtime_policy",
             Self::ContextPolicy => "context_policy",
             Self::MemoryGovernance => "memory_governance",
@@ -60,6 +63,7 @@ impl EvolutionCandidateKind {
     #[must_use]
     pub const fn promotion_adapter(self) -> &'static str {
         match self {
+            Self::AgentDefinition => "AgentDefinitionPromotion",
             Self::RuntimePolicy => "RuntimePolicyPromotion",
             Self::ContextPolicy => "ContextPolicyPromotion",
             Self::MemoryGovernance => "MemoryGovernancePromotion",
@@ -79,6 +83,7 @@ impl EvolutionCandidateKind {
     #[must_use]
     pub const fn default_scenarios(self) -> &'static [&'static str] {
         match self {
+            Self::AgentDefinition => &["agent_definition_behavior", "agent_definition_safety"],
             Self::RuntimePolicy => &["tool_batch_efficiency", "complex_strategy_selection"],
             Self::ContextPolicy => &["context_pressure", "memory_reality_context_governance"],
             Self::MemoryGovernance => &["memory_recall_precision", "pollution_control"],

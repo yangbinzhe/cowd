@@ -31,7 +31,7 @@ impl DeliberationPlan {
             objective: objective.to_string(),
             execution_pattern: ExecutionPattern::Deliberate,
             mode: DeliberationMode::DebateConsensus,
-            template_hint: CollaborationTemplateId::DebateConsensus,
+            template_hint: CollaborationTemplateId::DebateCriticArbiter,
             candidate_count: 3,
             evaluation_contract:
                 "Generate competing options, critique assumptions, merge the strongest path, and list unresolved risks."
@@ -48,7 +48,10 @@ mod tests {
     fn deliberation_plan_uses_debate_consensus_template() {
         let plan = DeliberationPlan::for_objective("评估两种架构取舍");
         assert_eq!(plan.execution_pattern, ExecutionPattern::Deliberate);
-        assert_eq!(plan.template_hint, CollaborationTemplateId::DebateConsensus);
+        assert_eq!(
+            plan.template_hint,
+            CollaborationTemplateId::DebateCriticArbiter
+        );
         assert!(plan.evaluation_contract.contains("critique"));
     }
 }

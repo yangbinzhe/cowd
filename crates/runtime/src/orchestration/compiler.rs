@@ -6,9 +6,9 @@ use harness_contract::turn::{SessionDispatchAction, SessionDispatchCommand, Sess
 use thiserror::Error;
 
 use crate::execution_core::{
-    ExecutionCompileError, ExecutionCompileRequest, ExecutionGraphCompiler, ProtocolCompileRequest,
-    ProtocolId, ProtocolRef, ProtocolRegistry,
+    ExecutionCompileError, ExecutionCompileRequest, ExecutionGraphCompiler,
 };
+use crate::TeamRuntime;
 
 use super::{RuntimeOrchestrationAction, RuntimeOrchestrationPlan, RuntimeOrchestrationRequest};
 
@@ -20,13 +20,16 @@ pub enum OrchestrationCompileError {
     Protocol(String),
     #[error("runtime action `{0}` has no executable protocol mapping")]
     ProtocolUnavailable(&'static str),
+    #[error("Team instantiation requires an active Runtime service")]
+    TeamRuntimeRequired,
+    #[error("Team template instantiation failed: {0}")]
+    TeamInstantiation(String),
 }
 
 #[derive(Debug, Clone)]
 pub struct CompiledOrchestration {
     pub graph: ExecutionGraph,
     pub command: ExecutionGraphCommand,
-    pub protocol: Option<ProtocolRef>,
     pub execute_without_protocol: bool,
 }
 
@@ -36,89 +39,70 @@ pub fn compile_orchestration(
     request: &RuntimeOrchestrationRequest,
     plan: &RuntimeOrchestrationPlan,
     parent_execution: Option<harness_contract::execution_graph::ExecutionParentBinding>,
+    team_runtime: Option<&TeamRuntime>,
 ) -> Result<CompiledOrchestration, OrchestrationCompileError> {
     if request.action == RuntimeOrchestrationAction::DispatchSession {
         return compile_session_dispatch(request_id, request, parent_execution);
     }
-    let protocol = select_protocol(request, plan)?;
-    let mut graph = if let Some(protocol) = &protocol {
-        let mut protocol_request = ProtocolCompileRequest::new(
-            protocol.clone(),
-            format!("protocol-graph:{request_id}"),
-            request.session_id.clone().unwrap_or_default(),
-            request.intent.clone(),
-        );
-        protocol_request.parent_execution = parent_execution.clone();
-        protocol_request.team_id = Some(format!("protocol-team:{request_id}"));
-        protocol_request.context_refs = request.capabilities.clone();
-        protocol_request.allowed_tools = request
-            .capabilities
-            .iter()
-            .filter_map(|capability| capability.strip_prefix("tool:").map(str::to_string))
-            .collect();
-        if parent_execution.is_some() {
-            protocol_request.allowed_tools.retain(|tool| {
-                !matches!(
-                    tool.as_str(),
-                    "runtime_orchestrate" | "runtime_capabilities"
-                )
-            });
-        }
-        protocol_request.allowed_skills = request
-            .capabilities
-            .iter()
-            .filter_map(|capability| capability.strip_prefix("skill:").map(str::to_string))
-            .collect();
-        protocol_request.permission_lease = if request.constraints.requires_write == Some(true) {
-            "workspace_write".to_string()
-        } else {
-            "read_only".to_string()
-        };
-        // Team protocol packets must inherit the model bound to the parent
-        // session. `default` is retained only for direct Runtime callers that
-        // intentionally have no gateway/session binding.
-        protocol_request.model_lease = request
-            .model_lease
-            .as_deref()
-            .filter(|model| !model.trim().is_empty())
-            .unwrap_or("default")
-            .to_string();
-        protocol_request.backend_constraint = request
-            .capabilities
-            .iter()
-            .find(|capability| capability.as_str() == "backend:process_jsonl")
-            .cloned();
-        protocol_request.budget_lease_id = format!("runtime-orchestration:{request_id}");
-        protocol_request.budget_tokens = 0;
-        protocol_request.budget_revision = 1;
-        protocol_request.resource_scopes = orchestration_resource_scopes(request);
-        protocol_request.fanout = request
-            .constraints
-            .max_parallel_agents
-            .unwrap_or(2)
-            .clamp(2, 4);
-        protocol_request.enable_repair = matches!(
-            request.action,
-            RuntimeOrchestrationAction::RequestReflexionRetry
-        );
-        ProtocolRegistry::resolve(protocol)
-            .map_err(|error| OrchestrationCompileError::Protocol(error.to_string()))?;
-        ProtocolRegistry::compile(&protocol_request)
-            .map_err(|error| OrchestrationCompileError::Protocol(error.to_string()))?
-    } else {
-        ExecutionGraphCompiler.compile(ExecutionCompileRequest {
-            objective: request.intent.clone(),
-            payload_ref: format!("runtime-orchestration:{request_id}"),
-            target: plan.execution_decision.compile_target,
-            resource_scopes: orchestration_resource_scopes(request),
-        })?
-    };
+    if let Some(fallback_template_path) = team_template_path(request, plan) {
+        let team_runtime = team_runtime.ok_or(OrchestrationCompileError::TeamRuntimeRequired)?;
+        // `template_hint` is part of the model/human request and wins over a
+        // strategy fallback.  Every role-scoped override must therefore use
+        // that same resolved template path.  Using the fallback here used to
+        // attach (for example) a `workstream` override to an explicitly
+        // selected research template, which makes a valid Team request fail
+        // before Runtime can create a graph.
+        let selected_template_path = requested_template_path(request, fallback_template_path);
+        let template_selector = requested_template_selector(selected_template_path)?;
+        let instantiated = team_runtime
+            .plan(harness_contract::team::TeamInstantiationRequest {
+                request_id: request_id.to_string(),
+                team_id: format!("runtime-team:{request_id}"),
+                session_id: request.session_id.clone().unwrap_or_default(),
+                mission_id: None,
+                parent_execution: parent_execution.clone(),
+                selection_mode: harness_contract::team::TeamSelectionMode::ModelAssisted,
+                template_selector,
+                objective: request.intent.clone(),
+                acceptance: Vec::new(),
+                risk: None,
+                role_binding_overrides: Vec::new(),
+                cardinality_overrides: team_cardinality_overrides(request, selected_template_path)?,
+                focus_partition_plans: request.focus_partition_plans.clone(),
+                permission_lease: if request.constraints.requires_write == Some(true) {
+                    "workspace_write".to_string()
+                } else {
+                    "read_only".to_string()
+                },
+                model_lease: request
+                    .model_lease
+                    .as_deref()
+                    .filter(|model| !model.trim().is_empty())
+                    .unwrap_or("default")
+                    .to_string(),
+                budget_lease: None,
+                managed_invocation: None,
+                resource_scopes: orchestration_resource_scopes(request),
+            })
+            .map_err(OrchestrationCompileError::TeamInstantiation)?;
+        let expected_revision = instantiated.graph.revision;
+        return Ok(CompiledOrchestration {
+            graph: instantiated.graph,
+            command: ExecutionGraphCommand::Start { expected_revision },
+            execute_without_protocol: true,
+        });
+    }
+    let mut graph = ExecutionGraphCompiler.compile(ExecutionCompileRequest {
+        objective: request.intent.clone(),
+        payload_ref: format!("runtime-orchestration:{request_id}"),
+        target: plan.execution_decision.compile_target,
+        resource_scopes: orchestration_resource_scopes(request),
+    })?;
     graph.parent_execution = parent_execution;
     let expected_revision = graph.revision;
     Ok(CompiledOrchestration {
         graph,
         command: ExecutionGraphCommand::Start { expected_revision },
-        protocol,
         execute_without_protocol: false,
     })
 }
@@ -195,56 +179,86 @@ fn compile_session_dispatch(
     Ok(CompiledOrchestration {
         graph,
         command: ExecutionGraphCommand::Start { expected_revision },
-        protocol: None,
         execute_without_protocol: true,
     })
 }
 
-fn select_protocol(
-    request: &RuntimeOrchestrationRequest,
-    plan: &RuntimeOrchestrationPlan,
-) -> Result<Option<ProtocolRef>, OrchestrationCompileError> {
-    if let Some(protocol) = request.protocol.clone() {
-        return protocol_is_compatible(request.action, protocol.id)
-            .then_some(Some(protocol))
-            .ok_or(OrchestrationCompileError::ProtocolUnavailable(
-                request.action.as_str(),
-            ));
-    }
-
-    let protocol = match request.action {
-        RuntimeOrchestrationAction::RequestDeliberation => ProtocolId::Debate,
-        RuntimeOrchestrationAction::RequestReflexionRetry => ProtocolId::ReviewFix,
-        RuntimeOrchestrationAction::RequestTeam => {
-            match plan.collaboration_decision.protocol_id.as_deref() {
-                Some("debate@1") => ProtocolId::Debate,
-                Some("review_fix@1") => ProtocolId::ReviewFix,
-                Some("incident@1") => ProtocolId::Incident,
-                // A generic multi-agent request has no caller-supplied role
-                // topology. JPS is the canonical bounded team protocol rather
-                // than pretending a V5 custom-role graph was started.
-                _ => ProtocolId::Jps,
-            }
-        }
-        _ => return Ok(None),
-    };
-    Ok(Some(ProtocolRef::new(protocol, 1)))
+fn requested_template_path<'a>(
+    request: &'a RuntimeOrchestrationRequest,
+    fallback_path: &'a str,
+) -> &'a str {
+    request
+        .template_hint
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(fallback_path)
+        .trim()
+        .strip_prefix("builtin/")
+        .unwrap_or_else(|| {
+            request
+                .template_hint
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(fallback_path)
+                .trim()
+        })
 }
 
-fn protocol_is_compatible(action: RuntimeOrchestrationAction, protocol: ProtocolId) -> bool {
-    matches!(
-        (action, protocol),
-        (
-            RuntimeOrchestrationAction::RequestDeliberation,
-            ProtocolId::Debate | ProtocolId::Jps
-        ) | (
-            RuntimeOrchestrationAction::RequestReflexionRetry,
-            ProtocolId::ReviewFix
-        ) | (
-            RuntimeOrchestrationAction::RequestTeam,
-            ProtocolId::Debate | ProtocolId::Jps | ProtocolId::ReviewFix | ProtocolId::Incident
-        )
+fn requested_template_selector(
+    requested: &str,
+) -> Result<harness_contract::team::TeamTemplateSelector, OrchestrationCompileError> {
+    let template_id = harness_contract::team::TeamTemplateDefinitionId::new(
+        harness_contract::agent::DefinitionScope::Builtin,
+        requested,
     )
+    .map_err(|error| {
+        OrchestrationCompileError::TeamInstantiation(format!(
+            "template_hint must name a builtin versioned Team template, got `{requested}`: {error}"
+        ))
+    })?;
+    Ok(harness_contract::team::TeamTemplateSelector::LatestStable { template_id })
+}
+
+fn team_template_path(
+    request: &RuntimeOrchestrationRequest,
+    plan: &RuntimeOrchestrationPlan,
+) -> Option<&'static str> {
+    use RuntimeOrchestrationAction as Action;
+
+    match request.action {
+        Action::RequestDeliberation => Some("cowd/debate-critic-arbiter"),
+        Action::RequestReflexionRetry | Action::RequestVerification => {
+            Some("cowd/implementation-review-fix")
+        }
+        Action::RequestTeam => Some(plan.collaboration_decision.template_id.template_path()),
+        _ => None,
+    }
+}
+
+fn team_cardinality_overrides(
+    request: &RuntimeOrchestrationRequest,
+    template_path: &str,
+) -> Result<Vec<harness_contract::team::TeamRoleCardinalityOverride>, OrchestrationCompileError> {
+    let Some(count) = request.constraints.max_parallel_agents else {
+        return Ok(Vec::new());
+    };
+    let role_id = match template_path {
+        "cowd/parallel-research-synthesis" => "researcher",
+        "cowd/debate-critic-arbiter" => "proposer",
+        "cowd/matrix-scenario-ensemble" => "scenario",
+        "cowd/long-running-workstreams" => "workstream",
+        _ => return Ok(Vec::new()),
+    };
+    let count = u16::try_from(count).map_err(|_| {
+        OrchestrationCompileError::TeamInstantiation(
+            "requested maximum parallel Agent count exceeds the Team contract representation"
+                .to_string(),
+        )
+    })?;
+    Ok(vec![harness_contract::team::TeamRoleCardinalityOverride {
+        role_id: role_id.to_string(),
+        cardinality: harness_contract::team::RoleCardinalityPolicy::Fixed { count },
+    }])
 }
 
 fn orchestration_resource_scopes(request: &RuntimeOrchestrationRequest) -> Vec<String> {
@@ -279,11 +293,11 @@ pub fn guidance_for_compile_result(compiled: bool) -> String {
 mod tests {
     use super::*;
     use crate::orchestration::planner::plan_runtime_orchestration;
-    use harness_contract::agent::AgentTaskPacket;
     use harness_contract::execution_graph::ExecutionParentBinding;
 
     #[test]
     fn nested_protocol_agents_do_not_receive_orchestration_tools() {
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
         let request = RuntimeOrchestrationRequest {
             intent: "team architecture review".to_string(),
             model_lease: Some("test-model".to_string()),
@@ -292,7 +306,7 @@ mod tests {
             action: RuntimeOrchestrationAction::RequestTeam,
             reason: Some("test nested delegation boundary".to_string()),
             template_hint: None,
-            protocol: None,
+            focus_partition_plans: Vec::new(),
             capabilities: vec![
                 "tool:runtime_orchestrate".to_string(),
                 "tool:runtime_capabilities".to_string(),
@@ -311,17 +325,20 @@ mod tests {
                 execution_id: "parent-graph".to_string(),
                 node_id: "parent-graph:tool-batch".to_string(),
             }),
+            Some(services.team_runtime().as_ref()),
         )
-        .expect("nested protocol compiles");
+        .expect("nested Team template compiles");
 
         let packets = compiled
             .graph
             .nodes
             .iter()
             .filter(|node| node.kind == ExecutionNodeKind::AgentTask)
-            .map(|node| serde_json::from_str::<AgentTaskPacket>(&node.payload_ref))
+            .map(|node| {
+                serde_json::from_str::<harness_contract::agent::AgentTaskPacket>(&node.payload_ref)
+            })
             .collect::<Result<Vec<_>, _>>()
-            .expect("canonical agent packets");
+            .expect("canonical bound agent packets");
         assert!(!packets.is_empty());
         for packet in &packets {
             assert!(!packet.allowed_tools.iter().any(|tool| matches!(
@@ -329,9 +346,64 @@ mod tests {
                 "runtime_orchestrate" | "runtime_capabilities"
             )));
         }
-        assert!(packets
+        assert!(packets.iter().all(|packet| packet.binding.is_some()));
+    }
+
+    #[test]
+    fn explicit_template_owns_its_parallel_role_override() {
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
+        let request = RuntimeOrchestrationRequest {
+            // This wording deliberately lets strategy prefer durable
+            // workstreams. The explicit published template must still be the
+            // source of truth for role-scoped constraints.
+            intent: "run several durable workstreams with a synthesis".to_string(),
+            model_lease: Some("test-model".to_string()),
+            session_id: Some("session-root".to_string()),
+            target_session_id: None,
+            action: RuntimeOrchestrationAction::RequestTeam,
+            reason: Some("test explicit template constraint ownership".to_string()),
+            template_hint: Some("cowd/parallel-research-synthesis".to_string()),
+            focus_partition_plans: Vec::new(),
+            capabilities: vec!["tool:read_file".to_string()],
+            evidence_refs: Vec::new(),
+            constraints: crate::RuntimeOrchestrationConstraints {
+                max_parallel_agents: Some(3),
+                ..Default::default()
+            },
+            surface: None,
+        };
+        let plan = plan_runtime_orchestration(&request);
+        let compiled = compile_orchestration(
+            "explicit-template-role-override",
+            &request,
+            &plan,
+            None,
+            Some(services.team_runtime().as_ref()),
+        )
+        .expect("selected Team template compiles with its own role override");
+
+        let role_ids = compiled
+            .graph
+            .nodes
             .iter()
-            .any(|packet| { packet.allowed_tools.contains(&"read_file".to_string()) }));
-        assert!(packets.iter().any(|packet| packet.allowed_tools.is_empty()));
+            .filter_map(|node| {
+                serde_json::from_str::<harness_contract::agent::AgentTaskPacket>(&node.payload_ref)
+                    .ok()
+                    .and_then(|packet| {
+                        packet.constraints.iter().find_map(|constraint| {
+                            constraint.strip_prefix("team_role:").map(str::to_string)
+                        })
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            role_ids
+                .iter()
+                .filter(|role| role.as_str() == "researcher")
+                .count(),
+            3
+        );
+        assert!(role_ids.iter().any(|role| role == "synthesizer"));
+        assert!(!role_ids.iter().any(|role| role == "workstream"));
     }
 }

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State as AxumState},
+    extract::{Extension, Path, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -11,13 +11,12 @@ use axum::{
 use crate::services::{
     AddMissionRelationHttpRequest, CreateMissionScheduleHttpRequest,
     DecideMissionApprovalHttpRequest, InterpretMissionCommandHttpRequest,
-    StartMissionSessionHttpRequest, StartMissionTeamRuntimeHttpRequest,
-    SubmitMissionApprovalHttpRequest, UpdateMissionScheduleHttpRequest,
-    UpsertMissionProxyHttpRequest,
+    StartMissionSessionHttpRequest, SubmitMissionApprovalHttpRequest,
+    UpdateMissionScheduleHttpRequest, UpsertMissionProxyHttpRequest,
 };
 use memory::{SessionMissionOutboxOperation, SessionMissionOutboxRequest, SessionRecord};
 
-use super::{api_error, AppState, ErrorResponse};
+use super::{api_error, AppState, AuthenticatedPrincipal, ErrorResponse};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -391,14 +390,22 @@ async fn submit_mission_approval_handler(
 async fn decide_mission_approval_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(body): Json<DecideMissionApprovalHttpRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     state
         .services
         .mission
-        .decide_approval(&id, body)
+        .decide_approval(&id, body, &principal.0)
         .map(Json)
-        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))
+        .map_err(|error| {
+            let status = if error == "approval_human_interactive_capability_required" {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            api_error(status, error)
+        })
 }
 
 async fn add_mission_relation_handler(
@@ -548,7 +555,7 @@ async fn close_mission_session_handler(
 async fn start_mission_team_runtime_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(body): Json<StartMissionTeamRuntimeHttpRequest>,
+    Json(body): Json<harness_contract::team::TeamInstantiationRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     state
         .services

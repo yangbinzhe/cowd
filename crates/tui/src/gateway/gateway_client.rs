@@ -442,15 +442,11 @@ impl GatewayApiClient {
     pub async fn cancel_session_turn(
         &self,
         session_id: &str,
-        actor_id: &str,
         reason: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             &format!("/api/sessions/{}/cancel", url_encode(session_id)),
-            serde_json::json!({
-                "actor_id": actor_id,
-                "reason": reason,
-            }),
+            serde_json::json!({ "reason": reason }),
         )
         .await
     }
@@ -508,17 +504,12 @@ impl GatewayApiClient {
     pub async fn attach_session(
         &self,
         session_id: &str,
-        actor_id: &str,
         surface: &str,
         role: Option<&str>,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             &format!("/api/sessions/{}/attach", url_encode(session_id)),
-            serde_json::json!({
-                "actor_id": actor_id,
-                "surface": surface,
-                "role": role,
-            }),
+            serde_json::json!({ "surface": surface, "role": role }),
         )
         .await
     }
@@ -526,11 +517,11 @@ impl GatewayApiClient {
     pub async fn detach_session(
         &self,
         session_id: &str,
-        actor_id: &str,
+        surface: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             &format!("/api/sessions/{}/detach", url_encode(session_id)),
-            serde_json::json!({ "actor_id": actor_id }),
+            serde_json::json!({ "surface": surface }),
         )
         .await
     }
@@ -626,14 +617,12 @@ impl GatewayApiClient {
     pub async fn acquire_runtime_session_lease(
         &self,
         session_id: &str,
-        owner: &str,
         mode: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             "/api/runtime/session-leases/acquire",
             serde_json::json!({
                 "session_id": session_id,
-                "owner": owner,
                 "mode": mode,
             }),
         )
@@ -643,14 +632,10 @@ impl GatewayApiClient {
     pub async fn release_runtime_session_lease(
         &self,
         session_id: &str,
-        owner: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             "/api/runtime/session-leases/release",
-            serde_json::json!({
-                "session_id": session_id,
-                "owner": owner,
-            }),
+            serde_json::json!({ "session_id": session_id }),
         )
         .await
     }
@@ -916,6 +901,32 @@ impl GatewayApiClient {
             ),
             body,
         )
+        .await
+    }
+
+    /// Read the Runtime-owned catalog of runnable Team template revisions.
+    pub async fn team_templates(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/team-templates").await
+    }
+
+    /// Submit declarative Team intent. Gateway forwards it to Runtime, which
+    /// resolves template/Agent revisions and constructs the graph.
+    pub async fn instantiate_team_template(
+        &self,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json("/api/team-templates/instantiate", body)
+            .await
+    }
+
+    pub async fn team_working_state(
+        &self,
+        team_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!(
+            "/api/runtime/teams/{}/working-state",
+            url_encode(team_id)
+        ))
         .await
     }
 
@@ -1509,58 +1520,28 @@ impl GatewayApiClient {
 
     pub async fn evolution_create_candidate(
         &self,
-        proposal_id: &str,
+        registration: serde_json::Value,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json(
-            &format!(
-                "/api/evolution/proposals/{}/candidates",
-                url_encode(proposal_id)
-            ),
-            serde_json::json!({
-                "baseline_ref": "baseline:current",
-                "candidate_ref": "candidate:sandbox"
-            }),
-        )
-        .await
+        self.post_json("/api/evolution/candidates", registration)
+            .await
     }
 
-    pub async fn evolution_candidate_decision(
+    pub async fn evolution_candidate_canary_review(
         &self,
         candidate_id: &str,
-        status: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             &format!(
-                "/api/evolution/candidates/{}/decision",
+                "/api/evolution/candidates/{}/reviews/canary",
                 url_encode(candidate_id)
             ),
-            serde_json::json!({ "status": status }),
-        )
-        .await
-    }
-
-    pub async fn evolution_candidate_sandbox_run(
-        &self,
-        candidate_id: &str,
-    ) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json(
-            &format!("/api/evolution/candidates/{}/run", url_encode(candidate_id)),
             serde_json::json!({}),
         )
         .await
     }
 
-    pub async fn evolution_candidate_artifacts(
-        &self,
-        candidate_id: &str,
-    ) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!(
-            "/api/evolution/candidates/{}/artifacts",
-            url_encode(candidate_id)
-        ))
-        .await
-    }
-
+    /// Ask Runtime's trusted evaluator to evaluate one immutable candidate.
+    /// This endpoint never accepts a caller-supplied verdict or report.
     pub async fn evolution_candidate_evaluate(
         &self,
         candidate_id: &str,
@@ -1575,24 +1556,13 @@ impl GatewayApiClient {
         .await
     }
 
-    pub async fn evolution_candidate_comparison(
-        &self,
-        candidate_id: &str,
-    ) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!(
-            "/api/evolution/candidates/{}/comparison",
-            url_encode(candidate_id)
-        ))
-        .await
-    }
-
-    pub async fn evolution_candidate_promote(
+    pub async fn evolution_candidate_stable_review(
         &self,
         candidate_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             &format!(
-                "/api/evolution/candidates/{}/promote",
+                "/api/evolution/candidates/{}/reviews/stable",
                 url_encode(candidate_id)
             ),
             serde_json::json!({}),
@@ -1600,36 +1570,114 @@ impl GatewayApiClient {
         .await
     }
 
-    pub async fn evolution_adoptions(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/evolution/adoptions").await
+    pub async fn evolution_reviews(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/evolution/reviews").await
     }
 
-    pub async fn evolution_active_capabilities(
+    pub async fn evolution_review_detail(
         &self,
+        review_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/evolution/active-capabilities").await
+        self.get_json(&format!("/api/evolution/reviews/{}", url_encode(review_id)))
+            .await
     }
 
-    pub async fn evolution_version_rollback(
+    /// Queue pointer, rollback, or stop-Canary change through Runtime's
+    /// typed review gate. TUI cannot mutate a release directly.
+    pub async fn evolution_create_release_review(
         &self,
-        version_id: &str,
+        request: serde_json::Value,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json("/api/evolution/reviews", request).await
+    }
+
+    pub async fn evolution_review_decision(
+        &self,
+        review_id: &str,
+        decision: &str,
+        reason: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!(
-                "/api/evolution/versions/{}/rollback",
-                url_encode(version_id)
-            ),
-            serde_json::json!({}),
+            &format!("/api/evolution/reviews/{}/decision", url_encode(review_id)),
+            serde_json::json!({ "decision": decision, "reason": reason }),
         )
         .await
     }
 
-    pub async fn evolution_memory(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/evolution/memory").await
+    /// Read Runtime's protected evaluation-policy floor. The terminal never
+    /// computes a release verdict or keeps a policy cache of its own.
+    pub async fn evolution_evaluation_policy(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/evolution/evaluation-policy").await
     }
 
-    pub async fn evolution_sandbox_evals(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/evolution/sandbox-evals").await
+    pub async fn evolution_evaluation_policy_reviews(
+        &self,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/evolution/evaluation-policy/reviews")
+            .await
+    }
+
+    pub async fn evolution_evaluation_policy_review_decision(
+        &self,
+        review_id: &str,
+        decision: &str,
+        reason: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!(
+                "/api/evolution/evaluation-policy/reviews/{}/decision",
+                url_encode(review_id)
+            ),
+            serde_json::json!({ "decision": decision, "reason": reason }),
+        )
+        .await
+    }
+
+    /// Runtime-owned Managed Agent projection. This is deliberately a single
+    /// aggregate read so TUI cannot stitch a second scheduler state together.
+    pub async fn managed_agents(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/runtime/managed-agents").await
+    }
+
+    pub async fn dispatch_managed_agents(
+        &self,
+        dispatcher_id: &str,
+        limit: usize,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            "/api/runtime/managed-agents/dispatch",
+            serde_json::json!({ "dispatcher_id": dispatcher_id, "limit": limit }),
+        )
+        .await
+    }
+
+    pub async fn trigger_managed_agent(
+        &self,
+        managed_agent_id: &str,
+        request_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!(
+                "/api/runtime/managed-agents/{}/trigger",
+                url_encode(managed_agent_id)
+            ),
+            serde_json::json!({ "request_id": request_id }),
+        )
+        .await
+    }
+
+    pub async fn reset_managed_agent_health(
+        &self,
+        managed_agent_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!(
+                "/api/runtime/managed-agents/{}/health/reset",
+                url_encode(managed_agent_id)
+            ),
+            serde_json::json!({}),
+        )
+        .await
     }
 
     pub async fn connector_service_tools(
@@ -2385,6 +2433,9 @@ mod tests {
             "mission_relations",
             "submit_mission_approval",
             "start_mission_team_runtime",
+            "team_templates",
+            "instantiate_team_template",
+            "team_working_state",
             "decide_mission_approval",
             "add_mission_relation",
             "upsert_mission_proxy",
@@ -2467,17 +2518,20 @@ mod tests {
             "evolution_candidates",
             "evolution_candidate_detail",
             "evolution_create_candidate",
-            "evolution_candidate_decision",
-            "evolution_candidate_sandbox_run",
-            "evolution_candidate_artifacts",
             "evolution_candidate_evaluate",
-            "evolution_candidate_comparison",
-            "evolution_candidate_promote",
-            "evolution_adoptions",
-            "evolution_active_capabilities",
-            "evolution_version_rollback",
-            "evolution_memory",
-            "evolution_sandbox_evals",
+            "evolution_candidate_canary_review",
+            "evolution_candidate_stable_review",
+            "evolution_reviews",
+            "evolution_review_detail",
+            "evolution_create_release_review",
+            "evolution_review_decision",
+            "evolution_evaluation_policy",
+            "evolution_evaluation_policy_reviews",
+            "evolution_evaluation_policy_review_decision",
+            "managed_agents",
+            "dispatch_managed_agents",
+            "trigger_managed_agent",
+            "reset_managed_agent_health",
             "preflight_cross_plane_action",
             "execute_cross_plane_action",
             "cross_plane_policy_simulate",
@@ -2498,7 +2552,7 @@ mod tests {
         ];
         let deleted = ["socket_path", "with_timeout"];
         assert!(
-            migrated.len() >= 129,
+            migrated.len() >= 136,
             "gateway inventory should not shrink when routes are migrated"
         );
         assert!(migrated.contains(&"session_input_projection"));
@@ -2523,22 +2577,145 @@ mod tests {
             "evolution_candidates",
             "evolution_candidate_detail",
             "evolution_create_candidate",
-            "evolution_candidate_decision",
-            "evolution_candidate_sandbox_run",
-            "evolution_candidate_artifacts",
             "evolution_candidate_evaluate",
-            "evolution_candidate_comparison",
-            "evolution_candidate_promote",
-            "evolution_adoptions",
-            "evolution_active_capabilities",
-            "evolution_version_rollback",
-            "evolution_memory",
-            "evolution_sandbox_evals",
+            "evolution_candidate_canary_review",
+            "evolution_candidate_stable_review",
+            "evolution_reviews",
+            "evolution_review_detail",
+            "evolution_create_release_review",
+            "evolution_review_decision",
+            "evolution_evaluation_policy",
+            "evolution_evaluation_policy_reviews",
+            "evolution_evaluation_policy_review_decision",
         ];
-        assert_eq!(evolution_methods.len(), 23);
+        assert_eq!(evolution_methods.len(), 22);
         assert!(evolution_methods
             .iter()
             .all(|method| method.starts_with("evolution_")));
+    }
+
+    #[test]
+    fn managed_agent_gateway_api_inventory_exposes_runtime_owned_controls() {
+        let managed_agent_methods = [
+            "managed_agents",
+            "dispatch_managed_agents",
+            "trigger_managed_agent",
+            "reset_managed_agent_health",
+        ];
+        assert_eq!(managed_agent_methods.len(), 4);
+        assert!(managed_agent_methods
+            .iter()
+            .all(|method| method.contains("managed_agent")));
+    }
+
+    #[tokio::test]
+    async fn typed_evolution_and_managed_agent_controls_use_gateway_owned_routes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let checks = [
+                (
+                    "GET /api/evolution/evaluation-policy HTTP/1.1",
+                    Vec::<&str>::new(),
+                ),
+                (
+                    "GET /api/evolution/evaluation-policy/reviews HTTP/1.1",
+                    Vec::<&str>::new(),
+                ),
+                (
+                    "POST /api/evolution/reviews/release-1/decision HTTP/1.1",
+                    vec![
+                        "\"decision\":\"approve\"",
+                        "\"reason\":\"operator checked\"",
+                    ],
+                ),
+                (
+                    "POST /api/evolution/evaluation-policy/reviews/policy-1/decision HTTP/1.1",
+                    vec!["\"decision\":\"reject\"", "\"reason\":\"operator checked\""],
+                ),
+                (
+                    "GET /api/runtime/managed-agents HTTP/1.1",
+                    Vec::<&str>::new(),
+                ),
+                (
+                    "POST /api/runtime/managed-agents/dispatch HTTP/1.1",
+                    vec!["\"dispatcher_id\":\"tui-operator\"", "\"limit\":16"],
+                ),
+                (
+                    "POST /api/runtime/managed-agents/agent-1/health/reset HTTP/1.1",
+                    Vec::<&str>::new(),
+                ),
+            ];
+            for (expected_start, expected_fragments) in checks {
+                let (mut socket, _) = listener.accept().await.expect("accept request");
+                let mut buf = vec![0; 4096];
+                let n = socket.read(&mut buf).await.expect("read request");
+                let request = String::from_utf8_lossy(&buf[..n]);
+                assert!(request.starts_with(expected_start), "request was {request}");
+                for fragment in expected_fragments {
+                    assert!(request.contains(fragment), "request was {request}");
+                }
+                assert!(
+                    !request.contains("actor_principal"),
+                    "TUI must not supply an approval actor: {request}"
+                );
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: 11\r\n\r\n{\"ok\":true}",
+                    )
+                    .await
+                    .expect("write response");
+            }
+        });
+
+        let client =
+            GatewayApiClient::new(format!("http://{addr}"), Some("test-token".to_string()))
+                .expect("client");
+        assert_eq!(
+            client.evolution_evaluation_policy().await.expect("policy")["ok"],
+            true
+        );
+        assert_eq!(
+            client
+                .evolution_evaluation_policy_reviews()
+                .await
+                .expect("policy reviews")["ok"],
+            true
+        );
+        assert_eq!(
+            client
+                .evolution_review_decision("release-1", "approve", "operator checked")
+                .await
+                .expect("release decision")["ok"],
+            true
+        );
+        assert_eq!(
+            client
+                .evolution_evaluation_policy_review_decision(
+                    "policy-1",
+                    "reject",
+                    "operator checked",
+                )
+                .await
+                .expect("policy decision")["ok"],
+            true
+        );
+        assert_eq!(client.managed_agents().await.expect("agents")["ok"], true);
+        assert_eq!(
+            client
+                .dispatch_managed_agents("tui-operator", 16)
+                .await
+                .expect("dispatch")["ok"],
+            true
+        );
+        assert_eq!(
+            client
+                .reset_managed_agent_health("agent-1")
+                .await
+                .expect("health reset")["ok"],
+            true
+        );
+        server.await.expect("server task");
     }
 
     #[tokio::test]
@@ -2799,8 +2976,8 @@ mod tests {
             let req = String::from_utf8_lossy(&buf[..n]);
             assert!(req.starts_with("POST /api/runtime/session-leases/acquire HTTP/1.1"));
             assert!(req.contains("\"session_id\":\"session-1\""));
-            assert!(req.contains("\"owner\":\"tui:1\""));
             assert!(req.contains("\"mode\":\"collaborative\""));
+            assert!(!req.contains("\"owner\":"));
             socket
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: 22\r\n\r\n{\"ok\":true,\"lease\":{}}",
@@ -2814,7 +2991,7 @@ mod tests {
             let req = String::from_utf8_lossy(&buf[..n]);
             assert!(req.starts_with("POST /api/runtime/session-leases/release HTTP/1.1"));
             assert!(req.contains("\"session_id\":\"session-1\""));
-            assert!(req.contains("\"owner\":\"tui:1\""));
+            assert!(!req.contains("\"owner\":"));
             socket
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: 27\r\n\r\n{\"ok\":true,\"released\":true}",
@@ -2825,12 +3002,12 @@ mod tests {
 
         let client = GatewayApiClient::new(format!("http://{addr}"), None).expect("client");
         let acquired = client
-            .acquire_runtime_session_lease("session-1", "tui:1", "collaborative")
+            .acquire_runtime_session_lease("session-1", "collaborative")
             .await
             .expect("acquire");
         assert_eq!(acquired["ok"], true);
         let released = client
-            .release_runtime_session_lease("session-1", "tui:1")
+            .release_runtime_session_lease("session-1")
             .await
             .expect("release");
         assert_eq!(released["released"], true);

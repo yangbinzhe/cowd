@@ -46,6 +46,7 @@ use crate::{
     extractor::MemoryExtractor,
     fresh_context::FreshContextManager,
     handoff::HandoffManager,
+    kernel::{memory_scope_visible_to_ctx, scoped_entry_scope, MemoryTurnContext},
     maintenance::{
         scan_maintenance_candidates, MaintenanceCandidate, MaintenanceCandidateFilter,
         MaintenanceCandidateStatus, MaintenanceQueue, MaintenanceScanConfig,
@@ -121,6 +122,23 @@ struct CachedPreparedContext {
     cached_at: Instant,
 }
 
+/// Work handed to the asynchronous extractor. The immutable turn context is
+/// part of the payload because this work can complete while another Agent is
+/// active; it must never inherit that unrelated Agent's identity or scope.
+#[derive(Clone)]
+struct BackgroundExtractionRequest {
+    turn: MemoryTurnContext,
+    messages: Vec<Message>,
+}
+
+/// Extracted entries waiting for the foreground persistence boundary. The
+/// source turn remains attached until the batch is committed.
+#[derive(Clone)]
+struct PendingLlmEntries {
+    turn: MemoryTurnContext,
+    entries: Vec<MemoryEntry>,
+}
+
 // ---------------------------------------------------------------------------
 // CognitiveContextManager
 // ---------------------------------------------------------------------------
@@ -169,10 +187,10 @@ pub struct CognitiveContextManager {
     #[allow(dead_code)]
     background_watcher: Mutex<Option<BackgroundWatcherHandle>>,
     /// Sender for queuing messages to the background LLM extraction worker.
-    extract_tx: mpsc::UnboundedSender<Vec<Message>>,
+    extract_tx: mpsc::UnboundedSender<BackgroundExtractionRequest>,
     /// Pending memory entries from the background LLM extraction worker,
     /// drained at the start of each turn-end cycle.
-    pending_llm_entries: Arc<Mutex<Vec<MemoryEntry>>>,
+    pending_llm_entries: Arc<Mutex<Vec<PendingLlmEntries>>>,
     /// Handle to the background LLM extraction task.
     #[allow(dead_code)]
     extract_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -180,8 +198,6 @@ pub struct CognitiveContextManager {
     fresh_ctx: FreshContextManager,
     /// Context rotation monitor for GSD-style health warnings.
     context_rot_monitor: Mutex<ContextRotMonitor>,
-    /// Active agent ID for peer context discovery.
-    current_agent: Mutex<Option<String>>,
     /// Queue of child agent delegation results, consumed by on_turn_end.
     delegation_results: Mutex<Vec<DelegationResult>>,
     /// BM25-based session resume for context recovery from prior sessions.
@@ -210,8 +226,6 @@ pub struct CognitiveContextManager {
     l1_cache: Mutex<Option<CachedLayer>>,
     /// Cache for L2 (project) layer entries.
     l2_cache: Arc<Mutex<Option<CachedLayer>>>,
-    /// Receiver for L4 push notifications from the event bus.
-    l4_event_rx: Mutex<Option<tokio::sync::broadcast::Receiver<crate::layers::shared::L4Event>>>,
     /// Short-lived cache for identical prepare_context requests.
     prepare_context_cache: Mutex<Option<CachedPreparedContext>>,
     /// Monotonic version for invalidating derived context after memory writes.
@@ -222,8 +236,6 @@ pub struct CognitiveContextManager {
     auto_tuner: AutoTuner,
     /// Cross-agent entity evolution tracker (P9.3).
     entity_registry: Mutex<Option<crate::entity_registry::EntityRegistry>>,
-    /// Cross-agent L4 memory sync protocol (P7).
-    memory_sync: Option<Arc<crate::memory_sync::MemorySyncProtocol>>,
 }
 
 impl CognitiveContextManager {
@@ -291,8 +303,9 @@ impl CognitiveContextManager {
         let extractor = Arc::new(extractor);
 
         // ── Background LLM extraction worker ────────────────────────────────
-        let (extract_tx, mut extract_rx) = mpsc::unbounded_channel::<Vec<Message>>();
-        let pending_llm_entries: Arc<Mutex<Vec<MemoryEntry>>> = Arc::new(Mutex::new(Vec::new()));
+        let (extract_tx, mut extract_rx) = mpsc::unbounded_channel::<BackgroundExtractionRequest>();
+        let pending_llm_entries: Arc<Mutex<Vec<PendingLlmEntries>>> =
+            Arc::new(Mutex::new(Vec::new()));
 
         let bg_extractor = Arc::clone(&extractor);
         let bg_pending = Arc::clone(&pending_llm_entries);
@@ -301,7 +314,7 @@ impl CognitiveContextManager {
         let extract_handle = tokio::spawn(async move {
             let mut last_run = Instant::now();
             let debounce = Duration::from_secs(extractor_debounce_secs);
-            while let Some(messages) = extract_rx.recv().await {
+            while let Some(request) = extract_rx.recv().await {
                 if last_run.elapsed() < debounce {
                     tracing::debug!(
                         elapsed = ?last_run.elapsed(),
@@ -310,7 +323,7 @@ impl CognitiveContextManager {
                     continue;
                 }
                 if bg_extractor.llm_client().is_some() {
-                    match bg_extractor.llm_extract(&messages).await {
+                    match bg_extractor.llm_extract(&request.messages).await {
                         Ok(llm_entries) => {
                             let final_entries = bg_extractor.finalize_entries(llm_entries);
                             if !final_entries.is_empty() {
@@ -319,7 +332,10 @@ impl CognitiveContextManager {
                                     "background LLM extract: {} entries ready for merge",
                                     final_entries.len()
                                 );
-                                bg_pending.lock().extend(final_entries);
+                                bg_pending.lock().push(PendingLlmEntries {
+                                    turn: request.turn,
+                                    entries: final_entries,
+                                });
                             }
                         }
                         Err(e) => {
@@ -502,7 +518,6 @@ impl CognitiveContextManager {
             drift: DriftDetector::new(config.drift.clone()),
             fresh_ctx: FreshContextManager::new(config.budget.context_window),
             context_rot_monitor: Mutex::new(ContextRotMonitor::new(RotMetrics::default())),
-            current_agent: Mutex::new(None),
             delegation_results: Mutex::new(Vec::new()),
             session_resume,
             project_scope_mgr: None,
@@ -517,13 +532,11 @@ impl CognitiveContextManager {
             l0_cache: Mutex::new(None),
             l1_cache: Mutex::new(None),
             l2_cache,
-            l4_event_rx: Mutex::new(orchestrator.l4_event_bus().map(|bus| bus.subscribe())),
             prepare_context_cache: Mutex::new(None),
             memory_revision: AtomicU64::new(0),
             perf_monitor: PerformanceMonitor::default(),
             auto_tuner: AutoTuner::new(config.tuning.clone()),
             entity_registry: Mutex::new(None),
-            memory_sync: None,
             config,
             orchestrator,
             vector_index,
@@ -596,52 +609,6 @@ impl CognitiveContextManager {
         self
     }
 
-    pub fn with_memory_sync(mut self, sync: Arc<crate::memory_sync::MemorySyncProtocol>) -> Self {
-        self.memory_sync = Some(sync);
-        self
-    }
-
-    /// Initialise the MemorySyncProtocol from the internal orchestrator and
-    /// L4 event bus. This shares the orchestrator Arc so the sync protocol
-    /// can access L4 independently.
-    pub fn init_memory_sync(mut self) -> Self {
-        let event_bus = self
-            .orchestrator
-            .l4_event_bus()
-            .cloned()
-            .unwrap_or_else(|| Arc::new(crate::layers::shared::L4EventBus::new(256)));
-        let sync = Arc::new(crate::memory_sync::MemorySyncProtocol::new(
-            Arc::clone(&self.orchestrator),
-            event_bus,
-        ));
-        self.memory_sync = Some(sync);
-        self
-    }
-
-    /// Set the active agent for source_agent tagging and peer context discovery.
-    pub fn set_active_agent(&self, agent_id: String) {
-        self.orchestrator.set_active_agent(agent_id.clone());
-        *self.current_agent.lock() = Some(agent_id);
-    }
-
-    /// Set the active session ID for auto-filling new entries and intra-turn
-    /// peer perception.
-    pub fn set_active_session(&self, session_id: String) {
-        self.orchestrator.set_active_session(session_id);
-    }
-
-    /// Set the ownership scope used by automatic post-turn extraction.
-    /// Runtime's `MemoryKernel` derives this from the active turn context so
-    /// extractor output cannot retain the placeholder `session_` scope.
-    pub fn set_active_scope(&self, scope: MemoryScope) {
-        self.orchestrator.set_active_scope(scope);
-    }
-
-    /// Get the current active session ID (if set).
-    pub fn active_session_id(&self) -> Option<String> {
-        self.orchestrator.active_session_id()
-    }
-
     pub(crate) async fn kernel_kv_put(&self, key: &str, value: &str) -> Result<()> {
         self.orchestrator.store().kv_put(key, value).await
     }
@@ -679,16 +646,18 @@ impl CognitiveContextManager {
         &self,
         query: &str,
         messages: &[Message],
-        session_id: Option<&str>,
-        active_session_id: Option<&str>,
-        current_agent: Option<&str>,
+        turn: &MemoryTurnContext,
         budget: &TokenBudget,
     ) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         query.hash(&mut hasher);
-        session_id.hash(&mut hasher);
-        active_session_id.hash(&mut hasher);
-        current_agent.hash(&mut hasher);
+        turn.session_id.hash(&mut hasher);
+        turn.project_id.hash(&mut hasher);
+        turn.agent_id.hash(&mut hasher);
+        turn.definition_lineage_id.hash(&mut hasher);
+        turn.team_id.hash(&mut hasher);
+        turn.task_id.hash(&mut hasher);
+        turn.cognitive_read_scopes.hash(&mut hasher);
         budget.total.hash(&mut hasher);
         budget.available.hash(&mut hasher);
         self.config
@@ -790,7 +759,20 @@ impl CognitiveContextManager {
         Ok(())
     }
 
-    /// Assemble the optimal context for the upcoming model turn.
+    /// Compatibility entry point for non-runtime callers. Runtime-owned
+    /// execution must call [`Self::prepare_context_for_turn`] with its exact
+    /// immutable turn identity and data lease.
+    pub async fn prepare_context(
+        &self,
+        query: &str,
+        messages: &[Message],
+        session_id: Option<&str>,
+    ) -> Result<PreparedContext> {
+        let turn = MemoryTurnContext::new(session_id.unwrap_or("memory-api"), "memory-api");
+        self.prepare_context_for_turn(&turn, query, messages).await
+    }
+
+    /// Assemble the optimal context for one explicitly identified model turn.
     ///
     /// Implements "progressive disclosure":
     /// 1. Load fixed layers L0 + L1.
@@ -799,57 +781,18 @@ impl CognitiveContextManager {
     /// 4. Surface triggered seeds.
     /// 5. Sample context window pressure.
     /// 6. Compress if needed.
-    pub async fn prepare_context(
+    pub async fn prepare_context_for_turn(
         &self,
+        turn: &MemoryTurnContext,
         query: &str,
         messages: &[Message],
-        session_id: Option<&str>,
     ) -> Result<PreparedContext> {
         let _prepare_start = Instant::now();
         let mut entries: Vec<MemoryEntry> = Vec::new();
 
-        // ═══════════════════════════════════════════════════════════════════
-        // Step -1: Drain pending L4 push events — other agents' writes
-        //          become immediately visible without waiting for a pull.
-        // ═══════════════════════════════════════════════════════════════════
-        let pending_l4_events = {
-            let mut pending = Vec::new();
-            let mut rx_guard = self.l4_event_rx.lock();
-            if let Some(ref mut rx) = *rx_guard {
-                while let Ok(event) = rx.try_recv() {
-                    pending.push(event);
-                }
-            }
-            pending
-        };
-        for event in pending_l4_events {
-            if event.operation == crate::layers::shared::L4Operation::Insert {
-                if let Ok(memory_id) = uuid::Uuid::parse_str(&event.memory_id) {
-                    if let Ok(Some(entry)) = self.orchestrator.recall(&memory_id).await {
-                        entries.push(entry);
-                        tracing::debug!(
-                            memory_id = %memory_id,
-                            agent = %event.agent_id,
-                            title = %event.title,
-                            "L4 push: loaded new shared entry from event bus"
-                        );
-                    }
-                }
-            }
-        }
-
-        let budget = self.compute_budget();
-        let current_agent = self.current_agent.lock().clone();
-        let current_session = self.orchestrator.active_session_id();
+        let budget = self.compute_budget(&turn.agent_id);
         let cache_revision = self.memory_revision.load(Ordering::Relaxed);
-        let cache_key = self.prepare_context_cache_key(
-            query,
-            messages,
-            session_id,
-            current_session.as_deref(),
-            current_agent.as_deref(),
-            &budget,
-        );
+        let cache_key = self.prepare_context_cache_key(query, messages, turn, &budget);
         if entries.is_empty() {
             if let Some(context) = self.cached_prepared_context(cache_key, cache_revision) {
                 let elapsed = _prepare_start.elapsed();
@@ -861,34 +804,6 @@ impl CognitiveContextManager {
                     "prepare_context cache hit"
                 );
                 return Ok(context);
-            }
-        }
-
-        // ═══════════════════════════════════════════════════════════════════
-        // Step 0: L4 team query — pull shared entries from other agents
-        //         before loading base layers (feature-gated).
-        // ═══════════════════════════════════════════════════════════════════
-        if self.config.tuning.l4_push_enabled {
-            match self
-                .orchestrator
-                .team_query(&query, Some(&MemoryScope::Global), 5)
-                .await
-            {
-                Ok(mut team_entries) => {
-                    for entry in &mut team_entries {
-                        entry.priority = Priority::High;
-                        entry.tags.push("l4_team_query".into());
-                    }
-                    let count = team_entries.len();
-                    entries.extend(team_entries);
-                    tracing::debug!(count, "prepare_context: injected {} L4 team entries", count);
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        error = %e,
-                        "prepare_context: L4 team query failed"
-                    );
-                }
             }
         }
 
@@ -1173,50 +1088,11 @@ impl CognitiveContextManager {
             .min(u64::from(u32::MAX)) as u32;
 
         // ═══════════════════════════════════════════════════════════════════
-        // Group 2: Peer context + L4 recall + L3 recall + SessionResume — all independent
+        // Group 2: L3 recall + session resume. Runtime's binding-aware
+        // RealityRecallPort injects any promoted L4 knowledge explicitly;
+        // cognitive preparation must not broadcast peer or global Team state.
         // ═══════════════════════════════════════════════════════════════════
-        let ((peers, realtime_peers), l4_project, l4_global, l3_result, resume_result) = tokio::join!(
-            // Peer context: regular + realtime
-            async {
-                if let Some(ref agent) = current_agent {
-                    let peers = self
-                        .orchestrator
-                        .recall_peer_context(query, agent, 3, 5)
-                        .await
-                        .unwrap_or_default();
-                    let realtime = if let Some(ref sid) = current_session {
-                        self.orchestrator
-                            .recall_peer_context_realtime(query, agent, sid, 2, 3)
-                            .await
-                            .unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    };
-                    (peers, realtime)
-                } else {
-                    (Vec::new(), Vec::new())
-                }
-            },
-            // L4 project-scoped recall
-            async {
-                match self.orchestrator.recall_l4_project(query, 5).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::warn!(error=%e, "L4 project recall failed");
-                        Vec::new()
-                    }
-                }
-            },
-            // L4 global-scoped recall
-            async {
-                match self.orchestrator.recall_l4_global(query, 5).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::warn!(error=%e, "L4 global recall failed");
-                        Vec::new()
-                    }
-                }
-            },
+        let (l3_result, resume_result) = tokio::join!(
             // L3 deep recall (hybrid semantic + BM25)
             async {
                 self.orchestrator
@@ -1239,93 +1115,6 @@ impl CognitiveContextManager {
                 }
             },
         );
-
-        // Process peer context results
-        if current_agent.is_some() {
-            for entry in peers {
-                let peer_id = entry.source_agent.as_deref().unwrap_or("unknown");
-                let prefixed_content = format!("[PEER: {peer_id}] {}", entry.content);
-                use crate::types::{MemoryCategory, MemoryLayer, MemorySource, Priority};
-                entries.push(MemoryEntry {
-                    id: uuid::Uuid::new_v4(),
-                    layer: MemoryLayer::L4,
-                    category: MemoryCategory::Shared,
-                    priority: Priority::Normal,
-                    source: MemorySource::Import,
-                    title: format!("Peer context from {peer_id}"),
-                    content: prefixed_content,
-                    embedding: None,
-                    tags: vec!["peer".into(), "l4".into()],
-                    relations: vec![],
-                    confidence: 0.8,
-                    access_count: 0,
-                    staleness: 0.0,
-                    created_at: Utc::now(),
-                    updated_at: Utc::now(),
-                    last_accessed_at: None,
-                    scope: MemoryScope::default(),
-                    session_id: None,
-                    source_agent: None,
-                    visibility: crate::types::AgentVisibility::default(),
-                });
-            }
-            for entry in realtime_peers {
-                let peer_id = entry.source_agent.as_deref().unwrap_or("unknown");
-                let prefixed_content = format!("[REALTIME PEER: {peer_id}] {}", entry.content);
-                use crate::types::{MemoryCategory, MemoryLayer, MemorySource, Priority};
-                entries.push(MemoryEntry {
-                    id: uuid::Uuid::new_v4(),
-                    layer: MemoryLayer::L4,
-                    category: MemoryCategory::Shared,
-                    priority: Priority::High,
-                    source: MemorySource::Import,
-                    title: format!("Realtime peer context from {peer_id}"),
-                    content: prefixed_content,
-                    embedding: None,
-                    tags: vec!["peer".into(), "realtime".into(), "l4".into()],
-                    relations: vec![],
-                    confidence: 0.9,
-                    access_count: 0,
-                    staleness: 0.0,
-                    created_at: Utc::now(),
-                    updated_at: Utc::now(),
-                    last_accessed_at: None,
-                    scope: MemoryScope::default(),
-                    session_id: None,
-                    source_agent: None,
-                    visibility: crate::types::AgentVisibility::default(),
-                });
-            }
-        }
-
-        // Process L4 recall results (filter against already-surfaced)
-        for entry in l4_project.into_iter().chain(l4_global) {
-            if !already_surfaced.contains(&entry.id) {
-                already_surfaced.insert(entry.id);
-                entries.push(entry);
-            }
-        }
-
-        // P10: Recall L4 collaboration synthesis results via MemorySyncProtocol
-        if let Some(ref sync) = self.memory_sync {
-            let agent_id = current_agent.as_deref().unwrap_or_default();
-            match sync
-                .import_from_l4("collaboration-synthesis", agent_id)
-                .await
-            {
-                Ok(synthesis_entries) => {
-                    for entry in synthesis_entries {
-                        if !already_surfaced.contains(&entry.id) {
-                            already_surfaced.insert(entry.id);
-                            entries.push(entry);
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!(error = %e, "memory_sync: import_from_l4 failed");
-                }
-            }
-        }
 
         // ── Process L3 results: hybrid re-ranking ──
         let deep_entries = l3_result?;
@@ -1388,13 +1177,11 @@ impl CognitiveContextManager {
         }
 
         // ── Session isolation filter (via ContextFence) ──
-        if let Some(sid) = session_id {
-            let fence = crate::context_fence::fence_from_session(sid, None, None);
-            entries = crate::context_fence::filter_through_fence(&entries, &fence)
-                .into_iter()
-                .cloned()
-                .collect();
-        }
+        let fence = crate::context_fence::fence_from_session(&turn.session_id, None, None);
+        entries = crate::context_fence::filter_through_fence(&entries, &fence)
+            .into_iter()
+            .cloned()
+            .collect();
 
         // ── Step 4: check seed triggers and inject as high-priority L1 entries ──
         let query_words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
@@ -1463,34 +1250,6 @@ impl CognitiveContextManager {
         // Context preparation never mutates a transcript. Semantic session
         // checkpoints are created only by Runtime after a real provider
         // preflight proves that required input cannot fit.
-
-        // ── Step 6b: inject current swarm hot topics from L4 ────────────────
-        let hot_topics = self.orchestrator.hot_topics(300).await;
-        if !hot_topics.is_empty() {
-            let topics_str = hot_topics.join(", ");
-            entries.push(MemoryEntry {
-                id: uuid::Uuid::new_v4(),
-                layer: MemoryLayer::L4,
-                category: MemoryCategory::Shared,
-                priority: Priority::Low,
-                source: MemorySource::AutoExtracted,
-                title: "Swarm Hot Topics".into(),
-                content: format!("Active swarm topics: {topics_str}"),
-                embedding: None,
-                tags: vec!["swarm".into(), "hot_topics".into()],
-                relations: vec![],
-                confidence: 0.8,
-                access_count: 0,
-                staleness: 0.0,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-                last_accessed_at: None,
-                scope: MemoryScope::default(),
-                session_id: None,
-                source_agent: None,
-                visibility: crate::types::AgentVisibility::default(),
-            });
-        }
 
         // Step 6c: inject recent entity evolutions from other agents
         {
@@ -1623,6 +1382,11 @@ impl CognitiveContextManager {
             tracing::debug!("symbol-memory linking: code context present, linking reserved for Phase 4 get_callers/get_callees integration");
         }
 
+        // Every backend search is deliberately over-inclusive for recall
+        // quality. Before the prepared context is cached or exposed, enforce
+        // the immutable Binding-derived lease again at this final boundary.
+        entries.retain(|entry| memory_scope_visible_to_ctx(&entry.scope, turn));
+
         // ── Assemble PreparedContext ─────────────────────────────────────────
         let total_tokens = self.estimate_tokens_entries(&entries);
         let depth_scale = if total_tokens > budget.available {
@@ -1672,7 +1436,14 @@ impl CognitiveContextManager {
     // `run_memory_post_turn` coordinates the post-turn helpers below. Runtime
     // owns transcript compaction, so this manager only extracts memories and
     // performs drift, seed, index, and graph maintenance.
-    /// Extract memories from the current turn's messages and persist them.
+    /// Compatibility entry point for non-runtime callers. Runtime-owned
+    /// post-turn work must use [`Self::extract_and_remember_for_turn`].
+    pub async fn extract_and_remember(&self, messages: &[Message]) -> Result<()> {
+        let turn = MemoryTurnContext::new("memory-api", "memory-api");
+        self.extract_and_remember_for_turn(&turn, messages).await
+    }
+
+    /// Extract memories from one explicitly identified turn and persist them.
     ///
     /// This covers steps 0, 0b, and 11 from the full turn-end sequence:
     ///   - Heuristic extraction from conversation messages (fast, sync)
@@ -1682,7 +1453,11 @@ impl CognitiveContextManager {
     ///   - Batch-embed new entries into the vector index
     ///
     /// Failures are logged and swallowed so they never abort the turn.
-    pub async fn extract_and_remember(&self, messages: &[Message]) -> Result<()> {
+    pub async fn extract_and_remember_for_turn(
+        &self,
+        turn: &MemoryTurnContext,
+        messages: &[Message],
+    ) -> Result<()> {
         let _extract_start = Instant::now();
         // ── 0. Extract and persist memories ──────────────────────────────────
         let mut pending_embeddings: Vec<(MemoryId, String)> = Vec::new();
@@ -1707,22 +1482,29 @@ impl CognitiveContextManager {
                 let mut pending = self.pending_llm_entries.lock();
                 std::mem::take(&mut *pending)
             };
-            if !drained.is_empty() {
-                let drained_count = drained.len();
-                for entry in &drained {
+            for pending in drained {
+                let drained_count = pending.entries.len();
+                for entry in &pending.entries {
                     pending_embeddings.push((entry.id, entry.content.clone()));
                 }
-                match self.orchestrator.remember_batch(drained).await {
+                match self
+                    .orchestrator
+                    .remember_batch_for_turn(&pending.turn, pending.entries)
+                    .await
+                {
                     Ok(_) => {
                         tracing::info!(
                             count = drained_count,
-                            "extract_and_remember: persisted {} background LLM entries",
-                            drained_count
+                            session_id = %pending.turn.session_id,
+                            agent_id = %pending.turn.agent_id,
+                            "extract_and_remember: persisted background LLM entries"
                         );
                     }
                     Err(e) => {
                         tracing::error!(
                             error = %e,
+                            session_id = %pending.turn.session_id,
+                            agent_id = %pending.turn.agent_id,
                             "extract_and_remember: background LLM entries persist failed"
                         );
                     }
@@ -1744,22 +1526,11 @@ impl CognitiveContextManager {
                     pending_embeddings.push((entry.id, entry.content.clone()));
                 }
 
-                for entry in &heuristic_entries {
-                    if should_auto_share_heuristic_memory(entry) {
-                        let _ = self
-                            .orchestrator
-                            .team_remember(
-                                &entry.title,
-                                &entry.content,
-                                Priority::Normal,
-                                vec![format!("{:?}", entry.category)],
-                                MemoryScope::Project(String::new()),
-                            )
-                            .await;
-                    }
-                }
-
-                match self.orchestrator.remember_batch(heuristic_entries).await {
+                match self
+                    .orchestrator
+                    .remember_batch_for_turn(turn, heuristic_entries)
+                    .await
+                {
                     Ok(_) => {
                         tracing::debug!(
                             "extract_and_remember: heuristic memories persisted successfully"
@@ -1775,7 +1546,10 @@ impl CognitiveContextManager {
 
                 // Queue LLM Pass 5 for background processing (non-blocking).
                 if self.extractor.llm_client().is_some() {
-                    let _ = self.extract_tx.send(messages.to_vec());
+                    let _ = self.extract_tx.send(BackgroundExtractionRequest {
+                        turn: turn.clone(),
+                        messages: messages.to_vec(),
+                    });
                     tracing::debug!(
                         "extract_and_remember: queued messages for background LLM extraction"
                     );
@@ -1907,11 +1681,22 @@ impl CognitiveContextManager {
         Ok(())
     }
 
-    /// Run the full post-turn sequence.
-    ///
-    /// Convenience wrapper that preserves full post-turn behavior while
-    /// running extraction and drift/seed checks in parallel.
+    /// Compatibility entry point for non-runtime callers. Runtime-owned
+    /// execution must use [`Self::on_turn_end_for_turn`] with its immutable
+    /// turn context.
     pub async fn on_turn_end(&self, messages: &mut Vec<Message>) -> Result<()> {
+        let turn = MemoryTurnContext::new("memory-api", "memory-api");
+        self.on_turn_end_for_turn(&turn, messages).await
+    }
+
+    /// Run the full post-turn sequence for one explicitly identified turn.
+    /// Extraction and drift/seed checks remain parallel, but every write is
+    /// attributed to `turn` rather than an ambient process-global identity.
+    pub async fn on_turn_end_for_turn(
+        &self,
+        turn: &MemoryTurnContext,
+        messages: &mut Vec<Message>,
+    ) -> Result<()> {
         // ── Delegation observation ────────────────────────────────────────────
         {
             let drained: Vec<_> = {
@@ -1919,55 +1704,26 @@ impl CognitiveContextManager {
                 delegation_queue.drain(..).collect()
             };
             for d in drained {
-                let title = format!(
-                    "delegation:{}:{}",
-                    d.agent_role,
-                    truncate_summary(&d.task, 40)
+                tracing::debug!(
+                    agent_role = %d.agent_role,
+                    task = %truncate_summary(&d.task, 40),
+                    "delegation observation retained for Runtime TeamWorkingState; no direct L4 write"
                 );
-                let content = format!(
-                    "Agent: {}\nTask: {}\nResult: {}",
-                    d.agent_role, d.task, d.result
-                );
-                let tags = vec!["delegation".into(), d.agent_role.clone()];
-                if let Err(e) = self
-                    .orchestrator
-                    .write(
-                        MemoryLayer::L4,
-                        MemoryCategory::Shared,
-                        &title,
-                        &content,
-                        Priority::Normal,
-                        MemorySource::AutoExtracted,
-                        tags,
-                        MemoryScope::default(),
-                    )
-                    .await
-                {
-                    tracing::warn!("delegation observation write failed: {e}");
-                } else {
-                    tracing::info!(agent_role = %d.agent_role, "delegation result written to L4");
-                }
             }
         }
 
-        // P7: Sync new L4 entries to peer agents via MemorySyncProtocol
-        if let Some(ref sync) = self.memory_sync {
-            let agent_id = self.current_agent.lock().clone().unwrap_or_default();
-            let _ = sync.import_from_l4("memory_update", &agent_id).await;
-        }
-
         // ── Extract ∥ Drift+Seeds ── Maintenance ──────────────────────
-        let (extract_result, drift_result) =
-            tokio::join!(async { self.extract_and_remember(messages).await }, async {
-                self.run_drift_and_seeds(messages).await
-            },);
+        let (extract_result, drift_result) = tokio::join!(
+            async { self.extract_and_remember_for_turn(turn, messages).await },
+            async { self.run_drift_and_seeds(messages).await },
+        );
         if let Err(error) = extract_result {
             tracing::warn!(%error, "on_turn_end: extraction failed");
         }
         if let Err(error) = drift_result {
             tracing::warn!(%error, "on_turn_end: drift and seeds failed");
         }
-        let result = self.run_memory_maintenance(messages).await;
+        let result = self.run_memory_maintenance(turn, messages).await;
 
         // ── Auto-tune evaluation ──────────────────────────────────────────
         if self.auto_tuner.evaluate(&self.perf_monitor) {
@@ -1992,7 +1748,11 @@ impl CognitiveContextManager {
     ///
     /// Call this *after* `extract_and_remember` and `run_drift_and_seeds`
     /// have completed (whether sequentially or via `tokio::join!`).
-    pub async fn run_memory_maintenance(&self, messages: &mut Vec<Message>) -> Result<()> {
+    pub async fn run_memory_maintenance(
+        &self,
+        turn: &MemoryTurnContext,
+        messages: &mut Vec<Message>,
+    ) -> Result<()> {
         let _post_turn_start = Instant::now();
         // ── 0c. Auto-correct contradictions via fact checker ──────────────
         {
@@ -2123,7 +1883,7 @@ impl CognitiveContextManager {
         // ── 8. Context rotation health check ────────────────────────────────
         {
             let total_tokens: u64 = messages.iter().map(|m| u64::from(m.token_estimate())).sum();
-            let budget = self.compute_budget();
+            let budget = self.compute_budget(&turn.agent_id);
             let mut monitor = self.context_rot_monitor.lock();
             match monitor.check(total_tokens, budget.total) {
                 crate::context_rot::RotAlert::Warning(msg) => tracing::warn!("{msg}"),
@@ -2207,7 +1967,65 @@ impl CognitiveContextManager {
     /// If a write guard is configured, the write is checked against the
     /// guard's layer permissions. Denied writes return
     /// [`MemoryError::WriteDenied`].
+    /// Persist an entry with an explicit Runtime turn. This is the production
+    /// route used by [`MemoryKernel`]; ownership is never inferred from a
+    /// mutable manager field.
+    pub async fn remember_for_turn(
+        &self,
+        turn: &MemoryTurnContext,
+        mut entry: MemoryEntry,
+    ) -> Result<()> {
+        entry
+            .session_id
+            .get_or_insert_with(|| turn.session_id.clone());
+        entry
+            .source_agent
+            .get_or_insert_with(|| turn.agent_id.clone());
+        entry.scope = scoped_entry_scope(turn, &entry);
+        self.remember_inner(entry, Some(turn)).await
+    }
+
+    /// Persist an entry supplied by a non-runtime caller. It receives a
+    /// deterministic `memory-api` identity when the caller omits ownership,
+    /// rather than reading mutable process-wide state.
     pub async fn remember(&self, entry: MemoryEntry) -> Result<()> {
+        self.remember_inner(entry, None).await
+    }
+
+    async fn remember_inner(
+        &self,
+        mut entry: MemoryEntry,
+        turn: Option<&MemoryTurnContext>,
+    ) -> Result<()> {
+        // CognitiveContextManager is the ordinary Runtime/API memory path;
+        // it must never be a second L4 promotion route.  Runtime's
+        // L4PromotionService owns the governed candidate lifecycle and calls
+        // the orchestrator's typed promotion command directly.
+        if entry.layer == MemoryLayer::L4 {
+            return Err(MemoryError::WriteDenied {
+                layer: "L4".to_string(),
+                write_source: "cognitive_memory_write_requires_l4_promotion_service".to_string(),
+            });
+        }
+        // Direct manager callers are administrative/non-runtime callers. They
+        // still receive a deterministic identity instead of reviving the old
+        // process-wide active state or persisting the `session_` sentinel.
+        let fallback_turn = MemoryTurnContext::new(
+            entry.session_id.as_deref().unwrap_or("memory-api"),
+            entry.source_agent.as_deref().unwrap_or("memory-api"),
+        )
+        .with_project_id(match &entry.scope {
+            MemoryScope::Project(project) if !project.trim().is_empty() => Some(project.clone()),
+            _ => None,
+        });
+        let turn = turn.unwrap_or(&fallback_turn);
+        entry
+            .session_id
+            .get_or_insert_with(|| turn.session_id.clone());
+        entry
+            .source_agent
+            .get_or_insert_with(|| turn.agent_id.clone());
+        entry.scope = scoped_entry_scope(turn, &entry);
         // Check write guard
         let policy = self.check_write_access(entry.layer);
         if !policy.is_allowed() {
@@ -2238,13 +2056,13 @@ impl CognitiveContextManager {
                         &entry.content,
                         self.config.tuning.audit_truncate_len,
                     ),
-                    agent_id: None,
-                    session_id: None,
+                    agent_id: entry.source_agent.clone(),
+                    session_id: entry.session_id.clone(),
                 });
             }
         }
 
-        self.orchestrator.remember(entry).await?;
+        self.orchestrator.remember_for_turn(turn, entry).await?;
         self.invalidate_prepare_context_cache();
         Ok(())
     }
@@ -2287,6 +2105,18 @@ impl CognitiveContextManager {
     /// List all memory entries across layers.
     pub async fn list_all_entries(&self) -> Result<Vec<crate::types::MemoryEntry>> {
         self.orchestrator.store().list_all().await
+    }
+
+    /// Read held scope migrations for operator review. These records remain
+    /// excluded from normal recall until an explicit classification command is
+    /// implemented by the management layer.
+    pub async fn legacy_scope_migration_reports(
+        &self,
+    ) -> Result<Vec<crate::store::sqlite::LegacyScopeMigrationReport>> {
+        self.orchestrator
+            .store()
+            .legacy_scope_migration_reports()
+            .await
     }
 
     /// Snapshot the active token budget configuration used by the kernel.
@@ -3044,16 +2874,11 @@ impl CognitiveContextManager {
     ///
     /// Role multipliers: Planner=0.40, Executor=0.25, Reviewer=0.15, Orchestrator=0.50.
     /// Unknown roles default to Orchestrator (0.50).
-    fn compute_budget(&self) -> TokenBudget {
+    fn compute_budget(&self, agent_id: &str) -> TokenBudget {
         if self.config.budget.runtime_managed {
             return BudgetCalculator::new(self.config.budget.clone()).make_budget();
         }
-        let role = self
-            .current_agent
-            .lock()
-            .clone()
-            .unwrap_or_else(|| "Orchestrator".to_string());
-        BudgetCalculator::new(self.config.budget.clone()).make_role_budget(&role)
+        BudgetCalculator::new(self.config.budget.clone()).make_role_budget(agent_id)
     }
 
     /// Verify cross-store consistency: KG ↔ MemoryStore ↔ Verbatim ↔ Closet.
@@ -3311,29 +3136,6 @@ impl CognitiveContextManager {
         self.perf_monitor
             .report(&tuning_config, tuning_applied, last_tuning)
     }
-}
-
-fn should_auto_share_heuristic_memory(entry: &MemoryEntry) -> bool {
-    if entry.confidence <= 0.7 {
-        return false;
-    }
-    if matches!(
-        entry.category,
-        MemoryCategory::UserPreference | MemoryCategory::CompressedSummary
-    ) {
-        return false;
-    }
-    if entry
-        .tags
-        .iter()
-        .any(|tag| matches!(tag.as_str(), "preference" | "user" | "tool" | "pattern"))
-    {
-        return false;
-    }
-    matches!(
-        entry.category,
-        MemoryCategory::Decision | MemoryCategory::Reference | MemoryCategory::ProjectKnowledge
-    )
 }
 
 // ---------------------------------------------------------------------------

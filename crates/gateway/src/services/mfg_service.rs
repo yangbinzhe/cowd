@@ -16,56 +16,40 @@ use matrix_core::{
     MatrixMetricDefinition, MatrixOntologyPack, MatrixQualityGateDecision, MatrixSourcePack,
 };
 use runtime::{CrossPlaneAction, CrossPlaneExecutionReceipt, IdentityTrust};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 mod cross_plane;
 mod delivery;
 
-#[derive(Debug, Deserialize)]
+/// Internal execution request. Gateway API handlers construct this only after
+/// deriving the audit principal from authenticated middleware.
+#[derive(Debug)]
 pub(crate) struct MfgCrossPlaneBridgeRequest {
-    #[serde(default = "default_mfg_bridge_mode")]
     pub(crate) mode: String,
-    #[serde(default)]
     pub(crate) idempotency_key: Option<String>,
-    #[serde(default)]
-    pub(crate) actor_principal: Option<String>,
-    #[serde(default)]
+    pub(crate) actor_principal: String,
     pub(crate) actor_identity_ref: Option<String>,
-    #[serde(default)]
     pub(crate) source_channel: Option<String>,
-    #[serde(default)]
     pub(crate) requested_capability: Option<String>,
-    #[serde(default)]
     pub(crate) provider_account: Option<String>,
-    #[serde(default)]
     pub(crate) target_ref: Option<String>,
-    #[serde(default)]
     pub(crate) resource_ref: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+/// Internal delivery request. It is intentionally not deserializable from an
+/// HTTP payload because the actor is a Gateway-owned security boundary.
+#[derive(Debug)]
 pub(crate) struct MfgCockpitReportDeliveryRequest {
-    #[serde(default = "default_mfg_bridge_mode")]
     pub(crate) mode: String,
-    #[serde(default)]
     pub(crate) idempotency_key: Option<String>,
-    #[serde(default)]
-    pub(crate) actor_principal: Option<String>,
-    #[serde(default)]
+    pub(crate) actor_principal: String,
     pub(crate) actor_identity_ref: Option<String>,
-    #[serde(default)]
     pub(crate) source_channel: Option<String>,
-    #[serde(default)]
     pub(crate) requested_capability: Option<String>,
-    #[serde(default)]
     pub(crate) provider_account: Option<String>,
-    #[serde(default)]
     pub(crate) target_ref: Option<String>,
-    #[serde(default)]
     pub(crate) resource_ref: Option<String>,
-    #[serde(default)]
     pub(crate) channel: Option<String>,
-    #[serde(default)]
     pub(crate) template_id: Option<String>,
 }
 

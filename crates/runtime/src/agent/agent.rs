@@ -3,6 +3,11 @@
 //! This module intentionally contains no provider loop, process spawning, or
 //! lifecycle state. Real agent execution is owned by `AgentRuntime`.
 
+#[path = "binding.rs"]
+pub mod binding;
+#[path = "definition/mod.rs"]
+pub mod definition;
+
 use harness_contract::context::{
     AgentReturnContextEnvelope, ContextArtifact, ContextArtifactKind, ContextRetentionPolicy,
     EvidenceRef,

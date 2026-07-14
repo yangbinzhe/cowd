@@ -32,6 +32,9 @@ impl AgentSelector {
 mod tests {
     use super::*;
     use crate::{AgentCatalogEntry, ProviderRegistry, RuntimeEventStore};
+    use harness_contract::agent::{
+        AgentDefinitionId, AgentDefinitionRevisionRef, AgentEvaluationContract, DefinitionScope,
+    };
 
     #[test]
     fn selects_catalog_identity_without_creating_a_second_lifecycle() {
@@ -41,9 +44,17 @@ mod tests {
         ));
         let catalog = Arc::new(AgentCatalog::new());
         catalog.upsert(AgentCatalogEntry {
+            definition_ref: AgentDefinitionRevisionRef::new(
+                AgentDefinitionId::new(DefinitionScope::Workspace, "reviewer").unwrap(),
+                1,
+            )
+            .unwrap(),
             agent_id: "reviewer".into(),
+            name: "Reviewer".into(),
+            description: "Reviews evidence".into(),
             capabilities: vec!["review".into()],
-            reputation: 10,
+            scope: DefinitionScope::Workspace,
+            evaluation: AgentEvaluationContract::single_release_gate("review", "evidence"),
         });
         let selected = AgentSelector::new(catalog, runtime).select(&["review".into()]);
         assert_eq!(selected.unwrap().agent_id, "reviewer");

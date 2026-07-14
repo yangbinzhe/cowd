@@ -268,6 +268,11 @@ fn capability_domain(route: &GatewayRouteManifestEntry) -> String {
         "message" => "session.message".to_string(),
         "cross_plane" => "cross_plane".to_string(),
         "harness_eval" => "harness_eval".to_string(),
+        // Managed Agent is a Runtime scheduling capability, not a separate
+        // Gateway business domain. Keeping this mapping prevents API
+        // discovery, TUI visibility and model affordances from drifting from
+        // the Runtime owner.
+        "managed_agent" => "runtime".to_string(),
         "public" => "public".to_string(),
         other => other.to_string(),
     }
@@ -278,6 +283,13 @@ fn auth_mode(path: &str) -> &'static str {
         || path == "/healthz"
         || path == "/readyz"
         || path == "/api/webui/manifest"
+        || matches!(
+            path,
+            "/api/gateway/route-manifest"
+                | "/api/gateway/capability-contract"
+                | "/api/gateway/openapi.json"
+                | "/api/gateway/openai-tools"
+        )
         || path.starts_with("/api/auth/")
     {
         "public"
@@ -1080,14 +1092,19 @@ mod tests {
         assert!(contract.coverage.ai_visible_count > 0);
         assert!(contract.capabilities.iter().any(|capability| {
             capability.http.path == "/api/gateway/capability-contract"
-                && capability.domain == "core"
-                && capability.auth == "bearer"
+                && capability.domain == "public"
+                && capability.auth == "public"
         }));
         assert!(contract.capabilities.iter().any(|capability| {
             capability.http.path == "/api/cross-plane/summary"
                 && capability.domain == "cross_plane"
                 && capability.http.criticality == "p1"
                 && capability.surface_visibility.llm
+        }));
+        assert!(contract.capabilities.iter().any(|capability| {
+            capability.http.path == "/api/runtime/managed-agents"
+                && capability.domain == "runtime"
+                && capability.http.criticality == "p1"
         }));
     }
 
@@ -1097,6 +1114,10 @@ mod tests {
         assert_eq!(document["openapi"], "3.1.0");
         assert!(document["paths"]["/api/gateway/capability-contract"]["get"].is_object());
         assert!(document["paths"]["/api/sessions/{id}/messages"]["post"].is_object());
+        assert!(document["paths"]["/api/runtime/managed-agents"]["get"].is_object());
+        assert!(document["paths"]["/api/runtime/managed-agents/{id}/trigger"]["post"].is_object());
+        assert!(document["paths"]["/api/surfaces/{id}/trigger-events"]["get"].is_object());
+        assert!(document["paths"]["/api/surfaces/{id}/trigger-events/retry"]["post"].is_object());
         assert!(document["paths"]["/api/sessions/:id/messages"].is_null());
         assert_eq!(
             document["x-cowd-contract"]["route_count"],

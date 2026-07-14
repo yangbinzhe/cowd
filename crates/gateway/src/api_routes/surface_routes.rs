@@ -55,6 +55,14 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             get(get_surface_deliveries_handler),
         )
         .route(
+            "/api/surfaces/:id/trigger-events",
+            get(get_surface_trigger_events_handler),
+        )
+        .route(
+            "/api/surfaces/:id/trigger-events/retry",
+            post(retry_surface_trigger_event_handler),
+        )
+        .route(
             "/api/surfaces/:id/inbox/:message_id/replay",
             post(replay_surface_inbox_handler),
         )
@@ -112,6 +120,11 @@ struct PurgeMessagesBody {
     older_than_ms: Option<i64>,
     #[serde(default = "default_archive_limit")]
     limit: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct TriggerEventRetryBody {
+    idempotency_key: String,
 }
 
 fn default_archive_limit() -> usize {
@@ -221,6 +234,37 @@ async fn get_surface_status_handler(
         "surface": normalized,
         "runtime": runtime,
         "events": events,
+    })))
+}
+
+async fn get_surface_trigger_events_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let surface = surface::normalize_surface_id(&id);
+    let events = state.services.surface.trigger_events(&surface);
+    Json(serde_json::json!({
+        "kind": "surface.trigger_events",
+        "surface": surface,
+        "events": events,
+    }))
+}
+
+async fn retry_surface_trigger_event_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<TriggerEventRetryBody>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let surface = surface::normalize_surface_id(&id);
+    let event = state
+        .services
+        .surface
+        .retry_trigger_event(&surface, &body.idempotency_key)
+        .map_err(|error| api_error(StatusCode::CONFLICT, error))?;
+    Ok(Json(serde_json::json!({
+        "kind": "surface.trigger_event.retry_accepted",
+        "surface": surface,
+        "event": event,
     })))
 }
 

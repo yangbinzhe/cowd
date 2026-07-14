@@ -11,8 +11,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use super::{managed_actions, SurfaceHost};
 use super::{
     SurfaceDeliveryEvent, SurfaceInboxReceipt, SurfaceInboxRecord, SurfaceMessageSnapshot,
-    SurfaceOutboxRecord,
+    SurfaceOutboxRecord, SurfaceTriggerEventReceipt, SurfaceTriggerEventRecord,
 };
+use harness_contract::managed_agent::ManagedAgentTriggerEvent;
 
 impl SurfaceHost {
     pub(crate) async fn events(&self, surface: &str) -> Vec<SurfaceFrame> {
@@ -87,12 +88,63 @@ impl SurfaceHost {
         self.messages.mark_inbox_failed(idempotency_key, error)
     }
 
+    pub(crate) fn record_trigger_event_received(
+        &self,
+        surface: &str,
+        event_type: &str,
+        trigger: &ManagedAgentTriggerEvent,
+        payload: &serde_json::Value,
+    ) -> Result<SurfaceTriggerEventReceipt, String> {
+        self.messages
+            .record_trigger_event_received(surface, event_type, trigger, payload)
+    }
+
+    pub(crate) fn mark_trigger_event_dispatching(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<SurfaceTriggerEventRecord>, String> {
+        self.messages
+            .mark_trigger_event_dispatching(idempotency_key)
+    }
+
+    pub(crate) fn mark_trigger_event_accepted(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<SurfaceTriggerEventRecord, String> {
+        self.messages.mark_trigger_event_accepted(idempotency_key)
+    }
+
+    pub(crate) fn mark_trigger_event_failed(
+        &self,
+        idempotency_key: &str,
+        error: impl Into<String>,
+    ) -> Result<SurfaceTriggerEventRecord, String> {
+        self.messages
+            .mark_trigger_event_failed(idempotency_key, error)
+    }
+
+    pub(crate) fn retry_trigger_event(
+        &self,
+        surface: &str,
+        idempotency_key: &str,
+    ) -> Result<SurfaceTriggerEventRecord, String> {
+        self.messages.retry_trigger_event(surface, idempotency_key)
+    }
+
+    pub(crate) fn due_trigger_event_retries(&self) -> Vec<SurfaceTriggerEventRecord> {
+        self.messages.due_trigger_event_retries()
+    }
+
     pub(crate) fn inbox(&self, surface: &str) -> Vec<SurfaceInboxRecord> {
         self.messages.list_inbox(surface)
     }
 
     pub(crate) fn outbox(&self, surface: &str) -> Vec<SurfaceOutboxRecord> {
         self.messages.list_outbox(surface)
+    }
+
+    pub(crate) fn trigger_events(&self, surface: &str) -> Vec<SurfaceTriggerEventRecord> {
+        self.messages.list_trigger_events(surface)
     }
 
     pub(crate) fn all_inbox(&self) -> Vec<SurfaceInboxRecord> {

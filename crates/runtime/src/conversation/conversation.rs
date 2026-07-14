@@ -80,6 +80,10 @@ use crate::permissions::{PermissionContext, PermissionOutcome, PermissionPolicy}
 use crate::runtime_control::RuntimeControlPolicy;
 use crate::runtime_harness::{RuntimeAiKernel, RuntimeAiKernelTrace};
 use crate::session::{ContentBlock, ConversationMessage, MessageEvent, Session, SessionEventLog};
+use crate::skill::{
+    memory_candidate_from_skill_activation, skill_memory_candidate_session_event,
+    RuntimeSkillPromptAsset, SkillActivationEngine, SkillActivationInput, SkillMemoryPolicy,
+};
 use crate::tool_execution_plan::{ToolExecutionPlan, ToolExecutionPolicyValidationReport};
 use crate::tool_invocation::{
     now_ms, ToolFailureKind, ToolInvocationRecord, DEFAULT_OUTPUT_REF_MIN_LINES,
@@ -353,7 +357,7 @@ fn required_team_orchestration_call(objective: &str) -> ModelToolCall {
             "intent": objective,
             "action": "request_team",
             "reason": "the user explicitly requires an actually started collaboration team",
-            "template_hint": "research_synthesis",
+            "template_hint": "cowd/parallel-research-synthesis",
             "constraints": {
                 "max_parallel_agents": 3,
                 "risk": "low",
@@ -455,8 +459,22 @@ fn rate_per_second(count: u64, duration_ms: u64) -> Option<f64> {
     Some(count as f64 / (duration_ms as f64 / 1_000.0))
 }
 
-fn bootstrap_tool_ids() -> [String; 2] {
-    ["ToolSearch".to_string(), "runtime_capabilities".to_string()]
+fn bootstrap_tool_ids(
+    maximum_permission: harness_contract::tool::ToolPermissionMode,
+) -> Vec<String> {
+    let mut bootstrap = vec!["ToolSearch".to_string(), "runtime_capabilities".to_string()];
+    // Stateful orchestration is a runtime-native capability. When the current
+    // policy already permits workspace writes, exposing it up front lets the
+    // model intentionally start a real team or execution graph instead of
+    // repeatedly querying a catalog that it cannot act on. Read-only turns
+    // never expose it and still retain explicit discovery for evidence tools.
+    if !matches!(
+        maximum_permission,
+        harness_contract::tool::ToolPermissionMode::ReadOnly
+    ) {
+        bootstrap.push("runtime_orchestrate".to_string());
+    }
+    bootstrap
 }
 
 fn tool_exposure_for_catalog(
@@ -472,7 +490,25 @@ fn tool_exposure_for_catalog(
         maximum_permission,
         supports_dynamic_exposure: true,
     };
-    ToolExposurePlanner.plan(discovery, bootstrap_tool_ids(), &policy)
+    ToolExposurePlanner.plan(discovery, bootstrap_tool_ids(maximum_permission), &policy)
+}
+
+#[cfg(test)]
+mod tool_exposure_contract_tests {
+    use super::bootstrap_tool_ids;
+    use harness_contract::tool::ToolPermissionMode;
+
+    #[test]
+    fn stateful_runtime_orchestration_is_bootstrapped_only_when_policy_allows_write() {
+        assert_eq!(
+            bootstrap_tool_ids(ToolPermissionMode::ReadOnly),
+            vec!["ToolSearch", "runtime_capabilities"]
+        );
+        assert_eq!(
+            bootstrap_tool_ids(ToolPermissionMode::WorkspaceWrite),
+            vec!["ToolSearch", "runtime_capabilities", "runtime_orchestrate"]
+        );
+    }
 }
 
 fn fallback_tool_discovery_receipt(
@@ -995,6 +1031,15 @@ pub struct ConversationRuntime<C, T> {
     memory_manager: Option<Arc<CognitiveContextManager>>,
     /// Human-readable memory status message. `None` when healthy; `Some(msg)` when degraded.
     memory_status: Option<String>,
+    /// Runtime-owned Fact/Matrix recall boundary for this conversation.  It
+    /// is populated only from a compiled Binding, never from a Surface field.
+    reality_recall: Option<(
+        crate::RealityRecallPort,
+        harness_contract::agent::AgentBindingSnapshot,
+    )>,
+    /// Latest lease-filtered Fact/Matrix recall report, retained for runtime
+    /// audit and projections without turning Gateway into a context assembler.
+    last_reality_recall_report: std::sync::Mutex<Option<crate::RealityRecallReport>>,
     /// Optional tool callback for real-time visualization (P0-2).
     tool_callback: Option<Arc<dyn ToolCallback>>,
     /// Optional managed SQLite session store for messages and domain events.
@@ -1021,6 +1066,20 @@ pub struct ConversationRuntime<C, T> {
     skill_profiles: Vec<SkillCapabilityProfile>,
     /// Agent-scoped Skill visibility and adapter policy.
     agent_skill_profile: AgentSkillProfile,
+    /// Gateway-inspected PromptOnly assets keyed by Skill identity. Runtime
+    /// chooses among these assets but never discovers or reads packages.
+    skill_prompt_assets: Vec<RuntimeSkillPromptAsset>,
+    /// Immutable identity supplied by Runtime for memory operations. A child
+    /// Agent Run uses its Binding instance ID rather than the primary-turn
+    /// placeholder, so concurrent instances do not share an ambient author.
+    memory_agent_id: String,
+    /// Optional reusable Definition lineage for Binding-scoped memory recall.
+    memory_definition_lineage_id: Option<String>,
+    /// Optional Team visibility boundary supplied by the Agent Binding.
+    memory_team_id: Option<String>,
+    /// Explicit Binding lease for memory recall. Both primary conversations
+    /// and child Agents receive only the scopes in their compiled Binding.
+    memory_read_scopes: Vec<harness_contract::agent::CognitiveReadScope>,
     /// P2-2: Current project phase (Discovery→Planning→Building→Reviewing→Shipping→Graduated).
     project_phase: String,
     /// Optional commit quality gate evaluator (PreFlight, Revision, Escalation, Abort).
@@ -1165,10 +1224,8 @@ where
                     });
                     match handle.join() {
                         Ok(Ok(mgr)) => {
-                            mgr.set_active_agent("primary".to_string());
-                            let mgr = mgr.init_memory_sync();
                             tracing::debug!(
-                                "memory: CognitiveContextManager initialised, active_agent=primary"
+                                "memory: CognitiveContextManager initialised with explicit per-turn identity"
                             );
                             (Some(Arc::new(mgr)), None)
                         }
@@ -1193,10 +1250,8 @@ where
                     {
                         Ok(rt) => match rt.block_on(CognitiveContextManager::new(mem_cfg)) {
                             Ok(mgr) => {
-                                mgr.set_active_agent("primary".to_string());
-                                let mgr = mgr.init_memory_sync();
                                 tracing::debug!(
-                                    "memory: CognitiveContextManager initialised, active_agent=primary"
+                                    "memory: CognitiveContextManager initialised with explicit per-turn identity"
                                 );
                                 (Some(Arc::new(mgr)), None)
                             }
@@ -1254,6 +1309,8 @@ where
             session_tracer: None,
             memory_manager,
             memory_status,
+            reality_recall: None,
+            last_reality_recall_report: std::sync::Mutex::new(None),
             tool_callback: None,
             session_store: None,
             transcript_persistence: true,
@@ -1271,6 +1328,17 @@ where
             approval_gate: None,
             skill_profiles: Vec::new(),
             agent_skill_profile: AgentSkillProfile::default(),
+            skill_prompt_assets: Vec::new(),
+            memory_agent_id: "primary".to_string(),
+            memory_definition_lineage_id: None,
+            memory_team_id: None,
+            memory_read_scopes: vec![
+                harness_contract::agent::CognitiveReadScope::Session,
+                harness_contract::agent::CognitiveReadScope::Team,
+                harness_contract::agent::CognitiveReadScope::WorkspaceKnowledge,
+                harness_contract::agent::CognitiveReadScope::Project,
+                harness_contract::agent::CognitiveReadScope::DefinitionLineage,
+            ],
             project_phase: "Discovery".to_string(),
             gate_evaluator: Some(Arc::new(
                 crate::gates::GateEvaluator::new().with_default_gates(),
@@ -1404,6 +1472,85 @@ where
             .unwrap_or_default()
     }
 
+    async fn activate_skills_for_turn(&self, user_input: &str) -> Result<(), RuntimeError> {
+        if self.skill_profiles.is_empty() {
+            return Ok(());
+        }
+
+        let session = self.session();
+        let activation = SkillActivationEngine::activate(SkillActivationInput {
+            session_id: session.session_id,
+            turn_index: session.messages.len(),
+            query: user_input.to_string(),
+            capability_refs: Vec::new(),
+            available_profiles: self.skill_profiles.clone(),
+            agent_profile: self.agent_skill_profile.clone(),
+        });
+
+        if let Some(invocation) = activation.selected_invocation.as_ref() {
+            if let Some(asset) = self
+                .skill_prompt_assets
+                .iter()
+                .find(|asset| asset.skill_id == invocation.skill_id)
+            {
+                let mut item = ContextItem::new(
+                    format!(
+                        "runtime-skill:{}:{}",
+                        asset.skill_id, activation.activation.turn_index
+                    ),
+                    ContextSourceKind::Task,
+                    ContextRole::Instruction,
+                    format!(
+                        "# Activated skill: {}\nversion: {}\nsource: {}\n\n{}",
+                        asset.skill_id,
+                        asset.version.as_deref().unwrap_or("unversioned"),
+                        asset.source_ref,
+                        asset.content
+                    ),
+                );
+                item.authority = ContextAuthority::Project;
+                item.source_id = Some(format!("skill:{}", asset.skill_id));
+                item.source_version = asset.version.clone();
+                item.source_reason = Some("runtime selected prompt-only skill".to_string());
+                item.evidence = vec![asset.source_ref.clone()];
+                self.push_next_model_context_item(item);
+            }
+        }
+
+        let Some(store) = self.session_store.as_ref() else {
+            return Ok(());
+        };
+        let activation_event = activation.activation.to_session_domain_event(0);
+        store
+            .append_session_domain_event_allocating_sequence(&activation_event)
+            .await
+            .map_err(|error| {
+                RuntimeError::new(format!(
+                    "runtime skill activation persistence failed for session {}: {error}",
+                    activation.activation.session_id
+                ))
+            })?;
+        if let Some(candidate) = memory_candidate_from_skill_activation(
+            &activation.activation,
+            &SkillMemoryPolicy::default(),
+        ) {
+            if let Some(event) =
+                skill_memory_candidate_session_event(&activation.activation, &candidate, 0)
+            {
+                store
+                    .append_session_domain_event_allocating_sequence(&event)
+                    .await
+                    .map_err(|error| {
+                        RuntimeError::new(format!(
+                            "runtime skill memory bridge persistence failed for session {}: {error}",
+                            activation.activation.session_id
+                        ))
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
     /// Require one text-only provider response after a governed evidence
     /// checkpoint. The normal dynamic tool exposure is restored afterwards.
     pub(crate) fn require_next_model_final_response(&self) {
@@ -1497,6 +1644,123 @@ where
             .lock()
             .ok()
             .and_then(|guard| guard.as_ref().map(|state| state.projection(schema_tokens)))
+    }
+
+    /// Overlay Gateway's catalog-level capability result with the Runtime-owned
+    /// provider schema projection for this exact request. Gateway can describe
+    /// every registered backend tool, but only Conversation knows which schemas
+    /// were actually sent to the model after discovery and permission filtering.
+    fn project_runtime_capabilities_for_model(&self, output: &str) -> String {
+        let Ok(mut response) = serde_json::from_str::<serde_json::Value>(output) else {
+            tracing::warn!("runtime_capabilities returned non-JSON output");
+            return output.to_string();
+        };
+        let Some(object) = response.as_object_mut() else {
+            tracing::warn!("runtime_capabilities returned a non-object JSON value");
+            return output.to_string();
+        };
+        let Some(exposure) = self.current_tool_exposure_projection() else {
+            return output.to_string();
+        };
+
+        let catalog_tool_names = object
+            .remove("available_tool_names")
+            .unwrap_or_else(|| serde_json::json!([]));
+        let active_function_schemas = exposure.active_ids.clone();
+        let runtime_orchestrate_active = active_function_schemas
+            .iter()
+            .any(|name| name == "runtime_orchestrate");
+        let tool_search_active = active_function_schemas
+            .iter()
+            .any(|name| name == "ToolSearch");
+
+        object.insert("catalog_tool_names".to_string(), catalog_tool_names);
+        object.insert(
+            "tool_visibility".to_string(),
+            serde_json::json!({
+                "active_function_schemas": active_function_schemas,
+                "deferred_catalog_tools": exposure.deferred_ids,
+                "catalog_revision": exposure.catalog_revision,
+                "exposure_revision": exposure.exposure_revision,
+                "activation_protocol": if tool_search_active {
+                    "Call ToolSearch once with a focused query. Accepted candidates become callable native function schemas on the next model request."
+                } else {
+                    "No discovery schema is active on this request; do not simulate a deferred catalog tool."
+                }
+            }),
+        );
+
+        if let Some(strategy) = object
+            .get_mut("strategy")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            strategy.insert(
+                "model_callable_tools".to_string(),
+                serde_json::json!(exposure.active_ids),
+            );
+        }
+
+        let orchestration_backend_available = object
+            .get("runtime_orchestrate")
+            .and_then(|value| value.get("available"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if let Some(orchestration) = object
+            .get_mut("runtime_orchestrate")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            orchestration.insert(
+                "schema_active".to_string(),
+                serde_json::Value::Bool(runtime_orchestrate_active),
+            );
+            orchestration.insert(
+                "available".to_string(),
+                serde_json::Value::Bool(
+                    orchestration_backend_available && runtime_orchestrate_active,
+                ),
+            );
+            if !runtime_orchestrate_active {
+                let reasons = orchestration
+                    .entry("blocked_reasons")
+                    .or_insert_with(|| serde_json::json!([]));
+                if let Some(reasons) = reasons.as_array_mut() {
+                    if !reasons
+                        .iter()
+                        .any(|reason| reason == "runtime_orchestrate_not_active_in_current_schema")
+                    {
+                        reasons.push(serde_json::json!(
+                            "runtime_orchestrate_not_active_in_current_schema"
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(action_plane) = object
+            .get_mut("action_plane")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            action_plane.insert(
+                "can_execute_now".to_string(),
+                serde_json::Value::Bool(
+                    orchestration_backend_available && runtime_orchestrate_active,
+                ),
+            );
+            if !runtime_orchestrate_active {
+                action_plane.insert(
+                    "recommended_next_tool".to_string(),
+                    serde_json::Value::String(if tool_search_active {
+                        "ToolSearch".to_string()
+                    } else {
+                        "none".to_string()
+                    }),
+                );
+            }
+        }
+
+        serde_json::to_string(&response).unwrap_or_else(|error| {
+            tracing::warn!(%error, "failed to serialize projected runtime capabilities");
+            output.to_string()
+        })
     }
 
     fn activate_tool_discovery(&self, output: &str) {
@@ -1922,14 +2186,16 @@ where
         true
     }
 
-    fn memory_turn_context(&self, agent_id: impl Into<String>) -> MemoryTurnContext {
+    fn memory_turn_context(&self) -> MemoryTurnContext {
         let session = self.session();
         let project_id = memory_project_id_for_session(&session);
         let task_id = Some(format!("session-task-{}", session.session_id));
-        MemoryTurnContext::new(session.session_id, agent_id)
+        MemoryTurnContext::new(session.session_id, self.memory_agent_id.clone())
+            .with_definition_lineage_id(self.memory_definition_lineage_id.clone())
             .with_project_id(project_id)
             .with_task_id(task_id)
-            .with_team_id(None)
+            .with_team_id(self.memory_team_id.clone())
+            .with_cognitive_read_scopes(self.memory_read_scopes.clone())
     }
 
     fn build_context_turn_report(
@@ -2019,7 +2285,9 @@ where
         ));
         let mut selected_items = self.external_context_items();
         if let Ok(cwd) = std::env::current_dir() {
-            selected_items.extend(crate::prompt::discover_project_context_items(&cwd));
+            selected_items.extend(crate::prompt::discover_project_context_items_for_profile(
+                &cwd, profile,
+            ));
         }
         selected_items.extend(self.tool_trace_context_items());
         selected_items.extend(dynamic_items);
@@ -2203,7 +2471,7 @@ where
 
     /// Attach the durable store that owns tool, graph, agent, and task execution state.
     #[must_use]
-    pub fn with_runtime_event_store(mut self, store: Arc<RuntimeEventStore>) -> Self {
+    pub(crate) fn with_runtime_event_store(mut self, store: Arc<RuntimeEventStore>) -> Self {
         self.runtime_event_store = Some(store);
         self
     }
@@ -2254,6 +2522,32 @@ where
     #[must_use]
     pub fn with_agent_skill_profile(mut self, profile: AgentSkillProfile) -> Self {
         self.agent_skill_profile = profile;
+        self
+    }
+
+    /// Provide prompt assets already inspected by the Skill layer. Only an
+    /// asset selected by Runtime is injected for a single model request.
+    #[must_use]
+    pub fn with_skill_prompt_assets(mut self, assets: Vec<RuntimeSkillPromptAsset>) -> Self {
+        self.skill_prompt_assets = assets;
+        self
+    }
+
+    /// Bind the Runtime's immutable Agent instance identity to memory
+    /// operations for this conversation. This is set only by Runtime-owned
+    /// child execution, never by a Surface request field.
+    #[must_use]
+    pub fn with_memory_identity(
+        mut self,
+        agent_id: impl Into<String>,
+        definition_lineage_id: Option<String>,
+        team_id: Option<String>,
+        read_scopes: Vec<harness_contract::agent::CognitiveReadScope>,
+    ) -> Self {
+        self.memory_agent_id = agent_id.into();
+        self.memory_definition_lineage_id = definition_lineage_id;
+        self.memory_team_id = team_id;
+        self.memory_read_scopes = read_scopes;
         self
     }
 
@@ -2415,6 +2709,30 @@ where
     pub fn with_memory_manager(mut self, manager: Arc<CognitiveContextManager>) -> Self {
         self.memory_manager = Some(manager);
         self
+    }
+
+    /// Attach the Runtime-owned Fact/Matrix recall port to this conversation.
+    /// The Binding is immutable for the host lifetime, so each turn evaluates
+    /// the same data lease rather than re-resolving a surface default.
+    #[must_use]
+    pub fn with_reality_binding(
+        mut self,
+        port: crate::RealityRecallPort,
+        binding: harness_contract::agent::AgentBindingSnapshot,
+    ) -> Self {
+        self.reality_recall = Some((port, binding));
+        self
+    }
+
+    /// Return the source-level report for the most recently assembled model
+    /// context.  The report proves a lease was applied even when it selected
+    /// no Fact or Matrix evidence.
+    #[must_use]
+    pub fn last_reality_recall_report(&self) -> Option<crate::RealityRecallReport> {
+        self.last_reality_recall_report
+            .lock()
+            .ok()
+            .and_then(|report| report.clone())
     }
 
     pub fn with_gate_evaluator(mut self, evaluator: crate::gates::GateEvaluator) -> Self {
@@ -2597,6 +2915,7 @@ where
                 &ConversationMessage::user_text(user_input.to_string()),
                 self.session().messages.len().wrapping_sub(1),
             );
+            self.activate_skills_for_turn(user_input).await?;
         }
 
         let strategy_input = self.strategy_input_for_turn(user_input);
@@ -2718,9 +3037,12 @@ where
         );
         let apply_runtime_controls = |prompt: &mut PromptAssembly| {
             prompt.push_trusted_system(crate::evidence_planner::evidence_plan_prompt(&evidence));
-            prompt.push_trusted_system(crate::execution_core::runtime_execution_guidance_prompt(
-                &decision,
-            ));
+            prompt.push_trusted_system(
+                crate::execution_core::runtime_execution_guidance_prompt_with_tool_exposure(
+                    &decision,
+                    Some(&exposure.projection(0)),
+                ),
+            );
             if text_only_response {
                 prompt.push_trusted_system(
                     "## Terminal response boundary\nThis request is a text-only terminal checkpoint. The executable tool set for this request is empty, regardless of any earlier capability inventory or historical tool receipts in the context. Do not emit native function calls, simulated tool markup, JSON commands, new plans, or more work. Use only retained evidence receipts to produce the best final answer now. State unresolved facts explicitly instead of performing another search.".to_string(),
@@ -3730,7 +4052,11 @@ where
                 if tool_name == "ToolSearch" && !is_error {
                     self.activate_tool_discovery(&output);
                 }
-                let mut combined = output;
+                let mut combined = if tool_name == "runtime_capabilities" && !is_error {
+                    self.project_runtime_capabilities_for_model(&output)
+                } else {
+                    output
+                };
                 for msg in pre_hook_result.messages() {
                     combined.push_str("\n");
                     combined.push_str(msg);
@@ -4367,7 +4693,7 @@ where
                 event_end_exclusive: Some(plan.source_message_end),
                 raw_refs: raw_refs.clone(),
             };
-            let ctx = self.memory_turn_context("primary");
+            let ctx = self.memory_turn_context();
             let checkpoint_id = deterministic_checkpoint_id(
                 &original_session.session_id,
                 plan.source_message_start,
@@ -4482,7 +4808,7 @@ where
             tracing::info!(checkpoint_id = %checkpoint.checkpoint_id, "replaying semantic checkpoint fact projection");
         }
         if let (Some(mgr), Some(receipt_mut)) = (&self.memory_manager, receipt.as_mut()) {
-            let ctx = self.memory_turn_context("primary");
+            let ctx = self.memory_turn_context();
             let kernel = MemoryKernel::new(Arc::clone(mgr));
             match kernel.checkpoint_compaction(&ctx, checkpoint).await {
                 Ok(memory_receipt) => {
@@ -4767,26 +5093,11 @@ where
     ) -> PromptAssembly {
         let _perf_start = std::time::Instant::now();
 
-        let evolution_context_items = match crate::evolution_memory_context_items(
-            crate::cowd_dirs::config_home_dir(),
-            user_input,
-            &[],
-            4,
-        ) {
-            Ok(items) => items,
-            Err(error) => {
-                tracing::warn!(%error, "evolution memory activation unavailable");
-                Vec::new()
-            }
-        };
+        let runtime_reality_context_items = self.runtime_reality_context_items(user_input);
 
         let Some(mgr) = self.memory_manager.as_ref() else {
-            let unavailable_sources = if evolution_context_items.is_empty() {
-                vec![ContextSourceKind::Memory]
-            } else {
-                Vec::new()
-            };
-            let mut dynamic_items = evolution_context_items;
+            let unavailable_sources = vec![ContextSourceKind::Memory];
+            let mut dynamic_items = runtime_reality_context_items;
             dynamic_items.extend(next_model_context_items);
             let envelope = self.build_context_envelope(
                 user_input,
@@ -4860,7 +5171,7 @@ where
             .collect();
 
         let session_id = self.session().session_id;
-        let memory_ctx = self.memory_turn_context("primary");
+        let memory_ctx = self.memory_turn_context();
         let kernel = MemoryKernel::new(Arc::clone(mgr));
         let memory_budget = self.runtime_budget_plan().memory_retrieval_budget;
         let memory_budget_tokens = memory_budget.retrieval_budget.min(u64::from(u32::MAX));
@@ -4891,7 +5202,7 @@ where
                             token_estimate: 0,
                         })
                         .collect();
-                    let mut dynamic_items = evolution_context_items;
+                    let mut dynamic_items = runtime_reality_context_items;
                     dynamic_items.extend(next_model_context_items);
                     let envelope = self.build_context_envelope(
                         user_input,
@@ -4986,7 +5297,7 @@ where
                     })
                     .collect::<Vec<_>>();
                 let mut dynamic_items = dynamic_items;
-                dynamic_items.extend(evolution_context_items);
+                dynamic_items.extend(runtime_reality_context_items);
                 dynamic_items.extend(next_model_context_items);
                 let mut knowledge_report = None;
                 if let Some(activation) = knowledge_activation {
@@ -5008,12 +5319,8 @@ where
                 if let Some(cb) = &self.memory_callback {
                     cb.on_memory_update(Vec::new(), &format!("memory error: {err}"));
                 }
-                let unavailable_sources = if evolution_context_items.is_empty() {
-                    vec![ContextSourceKind::Memory]
-                } else {
-                    Vec::new()
-                };
-                let mut dynamic_items = evolution_context_items;
+                let unavailable_sources = vec![ContextSourceKind::Memory];
+                let mut dynamic_items = runtime_reality_context_items;
                 dynamic_items.extend(next_model_context_items);
                 let envelope = self.build_context_envelope(
                     user_input,
@@ -5025,6 +5332,26 @@ where
                 self.finalize_context_prompt(user_input, envelope, None)
             }
         }
+    }
+
+    fn runtime_reality_context_items(&self, user_input: &str) -> Vec<ContextItem> {
+        let Some((port, binding)) = &self.reality_recall else {
+            return Vec::new();
+        };
+        let report = port.recall_for_binding(binding, user_input, 16);
+        for source in &report.sources {
+            if source.status == "degraded" {
+                tracing::warn!(
+                    source = ?source.source,
+                    detail = ?source.detail,
+                    "Runtime Fact/Matrix recall degraded"
+                );
+            }
+        }
+        if let Ok(mut last_report) = self.last_reality_recall_report.lock() {
+            *last_report = Some(report.clone());
+        }
+        report.items
     }
 
     /// Perform post-turn memory housekeeping (micro-compact, drift, seeds).
@@ -5062,7 +5389,7 @@ where
         Option<Arc<dyn MemoryCallback>>,
     )> {
         let mgr = Arc::clone(self.memory_manager.as_ref()?);
-        let memory_ctx = self.memory_turn_context("primary");
+        let memory_ctx = self.memory_turn_context();
 
         // Convert session messages to memory's Message type for post-turn extraction.
         // DESIGN: Tool blocks are excluded (same rationale as prepare_reality_context).
@@ -5764,7 +6091,6 @@ where
             "collaboration": {
                 "template_id": trace.collaboration_decision.template_id.as_str(),
                 "rationale": trace.collaboration_decision.rationale,
-                "protocol_id": trace.collaboration_decision.protocol_id,
             },
             "context": {
                 "epoch_id": trace.context_epoch.epoch_id,
@@ -6639,11 +6965,12 @@ mod tests {
     use super::{
         apply_explicit_team_requirement, build_cc_memory_config_with_budget,
         deterministic_checkpoint_id, enforce_explicit_team_requirement,
-        image_user_message_from_path, is_runtime_team_orchestration_call, prepared_vision_payload,
-        preview_chars, provider_transport_policy, rate_per_second,
-        required_team_orchestration_call, tool_batch_pattern, vision_user_message, ApiClient,
-        ApiRequest, AssistantEvent, CognitiveContextManager, ConversationRuntime, ModelStepIntent,
-        ModelToolCall, RuntimeError, StaticToolExecutor,
+        image_user_message_from_path, is_runtime_team_orchestration_call,
+        memory_project_id_for_session, prepared_vision_payload, preview_chars,
+        provider_transport_policy, rate_per_second, required_team_orchestration_call,
+        tool_batch_pattern, vision_user_message, ApiClient, ApiRequest, AssistantEvent,
+        CognitiveContextManager, ConversationRuntime, ModelStepIntent, ModelToolCall, RuntimeError,
+        StaticToolExecutor, ToolExposureState,
     };
     use crate::config::RuntimeFeatureConfig;
     use crate::context_runtime::{
@@ -6654,14 +6981,25 @@ mod tests {
     use crate::permissions::{PermissionMode, PermissionPolicy};
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
     use crate::{
-        resolve_context_budget_tokens, PromptAssembly, RuntimeBudgetInputs, RuntimeBudgetPlan,
+        resolve_context_budget_tokens, PromptAssembly, RealityRecallPort, RuntimeBudgetInputs,
+        RuntimeBudgetPlan,
     };
     use futures::stream::Stream;
+    use harness_contract::agent::{
+        AgentBindingSnapshot, AgentCapability, AgentDataLease, AgentDefinitionId,
+        AgentDefinitionRevisionRef, AgentExecutorPolicy, AgentInstanceRef, AgentModelPolicy,
+        CognitiveReadScope, CognitiveWriteMode, DefinitionScope,
+    };
+    use harness_contract::skill::{
+        AgentSkillProfile, SkillAdapterKind, SkillCapabilityProfile, SkillDetectedRuntime,
+        SkillEntrypoint, SkillKind, SkillLifecycleStatus, SkillRiskLevel,
+    };
     use model_protocol::usage::TokenUsage;
     use std::fs;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use storage::{SqliteConnectionFactory, StorageRegistry};
 
     fn rendered_prompt(prompt: &PromptAssembly) -> String {
         let mut segments = prompt.trusted_system.clone();
@@ -6741,6 +7079,18 @@ mod tests {
         assert_eq!(
             tool_batch_pattern(&calls),
             harness_contract::core::ExecutionPattern::Collaborate
+        );
+    }
+
+    #[test]
+    fn required_team_orchestration_uses_a_published_builtin_template() {
+        let call = required_team_orchestration_call("必须实际启动团队");
+        assert_eq!(call.name, "runtime_orchestrate");
+        let input = serde_json::from_str::<serde_json::Value>(&call.input)
+            .expect("runtime orchestration input is JSON");
+        assert_eq!(
+            input["template_hint"],
+            serde_json::json!("cowd/parallel-research-synthesis")
         );
     }
 
@@ -7590,6 +7940,113 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct PromptRecordingApi(Arc<std::sync::Mutex<Vec<ApiRequest>>>);
+
+    impl ApiClient for PromptRecordingApi {
+        fn stream(
+            &mut self,
+            request: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            self.0.lock().expect("request recorder").push(request);
+            Box::pin(futures::stream::iter(vec![
+                Ok(AssistantEvent::TextDelta("skill-aware result".to_string())),
+                Ok(AssistantEvent::MessageStop),
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn first_model_step_activates_skill_persists_bridge_and_injects_asset() {
+        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        let session = Session::new();
+        let session_id = session.session_id.clone();
+        store
+            .create_session(&memory::SessionRecord {
+                session_id: session_id.clone(),
+                platform: "test".to_string(),
+                chat_id: "skill-activation".to_string(),
+                user_id: None,
+                model: Some("test-model".to_string()),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                last_activity: "2026-01-01T00:00:00Z".to_string(),
+                message_count: 0,
+                reset_policy: "None".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .unwrap();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let profile = SkillCapabilityProfile {
+            skill_id: "release-evidence".to_string(),
+            name: "Release Evidence".to_string(),
+            version: Some("1.0.0".to_string()),
+            source_root: "/skills/release-evidence".to_string(),
+            package_fingerprint: "test".to_string(),
+            kind: SkillKind::Workflow,
+            lifecycle_status: SkillLifecycleStatus::UsablePrompt,
+            adapters: vec![SkillAdapterKind::PromptOnly],
+            risk_level: SkillRiskLevel::Low,
+            entrypoints: vec![SkillEntrypoint {
+                runtime: SkillDetectedRuntime::Markdown,
+                path: "SKILL.md".to_string(),
+                adapter: SkillAdapterKind::PromptOnly,
+                command_hint: None,
+            }],
+            inspection_summary: vec!["release evidence planning".to_string()],
+            structured_dependencies: Vec::new(),
+        };
+        let mut runtime = ConversationRuntime::new(
+            session,
+            PromptRecordingApi(Arc::clone(&requests)),
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory()
+        .with_session_store(Arc::clone(&store))
+        .with_skill_profiles(vec![profile])
+        .with_agent_skill_profile(AgentSkillProfile {
+            adapter_ceiling: vec![SkillAdapterKind::PromptOnly],
+            ..AgentSkillProfile::default()
+        })
+        .with_skill_prompt_assets(vec![super::RuntimeSkillPromptAsset {
+            skill_id: "release-evidence".to_string(),
+            version: Some("1.0.0".to_string()),
+            content: "Require release evidence before accepting completion.".to_string(),
+            source_ref: "skill://release-evidence/SKILL.md".to_string(),
+        }]);
+        runtime.model = Some("test-model".to_string());
+
+        runtime
+            .execute_model_step("prepare release evidence", true)
+            .await
+            .expect("first skill-aware model step");
+
+        let events = store
+            .session_domain_events_page(&session_id, 0, 20)
+            .await
+            .expect("skill domain events");
+        assert!(events.events.iter().any(|event| {
+            event.kind == "skill_candidates"
+                && event.payload["source"] == "conversation_runtime.skill_activation"
+                && event.payload["selected"] == "release-evidence"
+        }));
+        assert!(events.events.iter().any(|event| {
+            event.kind == "skill_memory_candidate"
+                && event.payload["source"] == "conversation_runtime.skill_memory_candidate"
+                && event.payload["selected"] == "release-evidence"
+        }));
+        let requests = requests.lock().expect("request recorder");
+        assert_eq!(requests.len(), 1);
+        assert!(rendered_prompt(&requests[0].prompt)
+            .contains("Require release evidence before accepting completion."));
+    }
+
     struct RuntimeAwareApi(Arc<std::sync::atomic::AtomicBool>);
 
     impl ApiClient for RuntimeAwareApi {
@@ -7665,6 +8122,67 @@ mod tests {
                 "grep_search".to_string(),
             ]
         }
+    }
+
+    #[test]
+    fn capability_receipt_projects_current_schema_separately_from_catalog() {
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            ExposureToolExecutor,
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+        *runtime.tool_exposure_state.lock().expect("exposure state") = Some(ToolExposureState {
+            catalog_revision: 5,
+            bootstrap: ["ToolSearch".to_string(), "runtime_capabilities".to_string()]
+                .into_iter()
+                .collect(),
+            active: ["ToolSearch".to_string(), "runtime_capabilities".to_string()]
+                .into_iter()
+                .collect(),
+            deferred: ["read_many".to_string(), "runtime_orchestrate".to_string()]
+                .into_iter()
+                .collect(),
+            reason: "bootstrap tools exposed".to_string(),
+            revision: 2,
+            fallback_full: false,
+        });
+
+        let projected = runtime.project_runtime_capabilities_for_model(
+            &serde_json::json!({
+                "available_tool_names": ["ToolSearch", "runtime_capabilities", "read_many", "runtime_orchestrate"],
+                "runtime_orchestrate": {"available": true, "blocked_reasons": []},
+                "action_plane": {"can_execute_now": true},
+                "strategy": {"model_callable_tools": ["ToolSearch", "runtime_capabilities", "read_many", "runtime_orchestrate"]}
+            })
+            .to_string(),
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&projected).expect("projected capability JSON");
+
+        assert_eq!(
+            value["catalog_tool_names"],
+            serde_json::json!([
+                "ToolSearch",
+                "runtime_capabilities",
+                "read_many",
+                "runtime_orchestrate"
+            ])
+        );
+        assert_eq!(
+            value["tool_visibility"]["active_function_schemas"],
+            serde_json::json!(["ToolSearch", "runtime_capabilities"])
+        );
+        assert_eq!(
+            value["strategy"]["model_callable_tools"],
+            serde_json::json!(["ToolSearch", "runtime_capabilities"])
+        );
+        assert_eq!(value["runtime_orchestrate"]["available"], false);
+        assert_eq!(value["runtime_orchestrate"]["schema_active"], false);
+        assert_eq!(value["action_plane"]["can_execute_now"], false);
+        assert_eq!(value["action_plane"]["recommended_next_tool"], "ToolSearch");
     }
 
     #[tokio::test]
@@ -8385,6 +8903,8 @@ mod tests {
             ..Default::default()
         };
         let mgr = Arc::new(CognitiveContextManager::new(mem_cfg).await.unwrap());
+        let session = Session::new();
+        let project_id = memory_project_id_for_session(&session).expect("workspace project id");
         let now = chrono::Utc::now();
         mgr.remember(memory::types::MemoryEntry {
             id: memory::types::MemoryId::new_v4(),
@@ -8403,7 +8923,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             last_accessed_at: None,
-            scope: memory::MemoryScope::Project("cowd-develop".to_string()),
+            scope: memory::MemoryScope::Project(project_id.clone()),
             session_id: None,
             source_agent: None,
             visibility: memory::types::AgentVisibility::Shared,
@@ -8417,8 +8937,14 @@ mod tests {
         assert!(loaded_l1
             .iter()
             .any(|entry| entry.title == "User preference: 不要使用工具或编排"));
+        let memory_turn = memory::MemoryTurnContext::new("test-session", "primary")
+            .with_project_id(Some(project_id));
         let prepared = mgr
-            .prepare_context("请先使用 runtime_capabilities 调用工具分析", &[], None)
+            .prepare_context_for_turn(
+                &memory_turn,
+                "请先使用 runtime_capabilities 调用工具分析",
+                &[],
+            )
             .await
             .unwrap();
         assert!(
@@ -8435,7 +8961,7 @@ mod tests {
         );
 
         let rt = ConversationRuntime::new(
-            Session::new(),
+            session,
             MockApi,
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
@@ -8546,54 +9072,109 @@ mod tests {
         assert!(rank(MemoryLayer::L3) > rank(MemoryLayer::L4));
     }
 
-    // ── T2: active session tracking ────────────────────────────
-
-    /// Integration test: verify that `prepare_reality_context` and
-    /// `run_memory_post_turn` both call `set_active_session` on the
-    /// memory manager before operating.
-    ///
-    /// Requires tempfile + memory DB, so marked `#[ignore]` for CI.
-    #[ignore]
     #[tokio::test(flavor = "multi_thread")]
-    async fn prepare_reality_context_sets_active_session() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("test.db");
-        let blob_dir = tmp.path().join("blobs");
-        std::fs::create_dir_all(&blob_dir).unwrap();
+    async fn runtime_reality_binding_injects_only_leased_fact_evidence_into_the_prompt() {
+        let home = tempfile::tempdir().expect("temporary config home");
+        let registry = StorageRegistry::default_for_config_home(home.path());
+        let handle = registry.sqlite_handle("fact").expect("fact handle");
+        std::fs::create_dir_all(handle.path.parent().expect("fact parent")).expect("fact parent");
+        let connection = SqliteConnectionFactory::default()
+            .open_handle(handle)
+            .expect("fact database");
+        connection
+            .execute_batch(
+                "CREATE TABLE fact_records (
+                    fact_id TEXT PRIMARY KEY,
+                    fact_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );",
+            )
+            .expect("fact schema");
+        let mut fact = fact_kernel::FactRecord::new(
+            "supply.policy",
+            "east allocation requires expedited approval",
+        );
+        fact.id = fact_kernel::FactId::from_string("primary-turn-fact");
+        connection
+            .execute(
+                "INSERT INTO fact_records (fact_id, fact_type, status, payload_json, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    fact.id.as_str(),
+                    &fact.fact_type,
+                    &fact.status,
+                    serde_json::to_string(&fact).expect("fact payload"),
+                    fact.updated_at.to_rfc3339(),
+                ],
+            )
+            .expect("persist fact");
 
-        let store = memory::config::StoreConfig {
-            sqlite_path: db_path,
-            blob_dir,
-            enable_vector_index: false,
-            ..Default::default()
+        let binding = AgentBindingSnapshot {
+            binding_id: "binding:primary-reality".to_string(),
+            definition_ref: AgentDefinitionRevisionRef::new(
+                AgentDefinitionId::new(DefinitionScope::Builtin, "cowd/explore")
+                    .expect("definition id"),
+                1,
+            )
+            .expect("revision ref"),
+            definition_digest: "a".repeat(64),
+            instructions: "# Test\n".to_string(),
+            instance: AgentInstanceRef {
+                instance_id: "instance:primary-reality".to_string(),
+                role_slot_id: None,
+            },
+            executor: AgentExecutorPolicy::CowdNative,
+            model_policy: AgentModelPolicy {
+                profile: "test".to_string(),
+                allowed_models: vec!["test".to_string()],
+                fallback_allowed: false,
+            },
+            effective_capabilities: vec![AgentCapability::Read],
+            skill_refs: Vec::new(),
+            tool_contract_refs: Vec::new(),
+            data_lease: AgentDataLease {
+                session_id: "session-primary".to_string(),
+                task_id: "task-primary".to_string(),
+                team_id: None,
+                read_scopes: vec![CognitiveReadScope::Session],
+                write_mode: CognitiveWriteMode::CandidateOnly,
+                team_working_state_visible: false,
+                fact_boundaries: Vec::new(),
+                fact_refs: vec!["fact:primary-turn-fact".to_string()],
+                matrix_snapshot_refs: Vec::new(),
+            },
+            release: None,
+            evaluation: None,
+            binding_digest: "b".repeat(64),
         };
-        let mem_cfg = memory::config::MemoryConfig {
-            store,
-            ..Default::default()
-        };
-
-        let mgr = Arc::new(CognitiveContextManager::new(mem_cfg).await.unwrap());
-        let session = Session::new();
-        let session_id = session.session_id.clone();
-
-        let rt = ConversationRuntime::new(
+        let mut session = Session::new();
+        session.session_id = "session-primary".to_string();
+        let runtime = ConversationRuntime::new(
             session,
             MockApi,
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
             vec!["system".to_string()],
         )
-        .with_memory_manager(mgr.clone());
+        .without_memory()
+        .with_reality_binding(RealityRecallPort::for_config_home(home.path()), binding);
 
-        // Act — prepare_reality_context should set the active session
-        let _ = rt.prepare_reality_context("test query").await;
-
-        // Assert — verify the memory manager recorded the session
-        let active = mgr.active_session_id();
-        assert_eq!(
-            active,
-            Some(session_id),
-            "active_session should be set after prepare_reality_context"
-        );
+        let prompt = runtime
+            .prepare_reality_context("how should east allocation proceed")
+            .await;
+        let rendered = rendered_prompt(&prompt);
+        assert!(rendered.contains("east allocation requires expedited approval"));
+        let envelope = runtime.last_context_envelope().expect("context envelope");
+        assert!(envelope
+            .selected
+            .iter()
+            .any(|item| item.source == ContextSourceKind::Fact));
+        let report = runtime
+            .last_reality_recall_report()
+            .expect("reality recall report");
+        assert_eq!(report.sources[0].status, "enabled_and_wired");
+        assert_eq!(report.sources[0].selected_count, 1);
     }
 }

@@ -122,7 +122,11 @@ pub fn fence_from_session(
     _scope: Option<&str>,
     layers: Option<&[u8]>,
 ) -> ContextFence {
-    ContextFence::new(format!("session:{session_id}")).allow_layers(layers.unwrap_or(&[0, 1, 2]))
+    // Scope authorization is enforced by `MemoryTurnContext` after every
+    // retrieval source returns. A session fence must not silently discard L3
+    // long-term recall or L4 team evidence before that typed policy runs.
+    ContextFence::new(format!("session:{session_id}"))
+        .allow_layers(layers.unwrap_or(&[0, 1, 2, 3, 4]))
 }
 
 #[cfg(test)]

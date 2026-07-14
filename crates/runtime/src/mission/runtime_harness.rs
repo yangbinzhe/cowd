@@ -730,7 +730,7 @@ mod tests {
         );
         assert_eq!(
             trace.collaboration_decision.template_id,
-            CollaborationTemplateId::SingleExecutor
+            CollaborationTemplateId::DirectExecutor
         );
     }
 
@@ -847,9 +847,8 @@ mod tests {
         assert!(quality.has_synthesize_node);
         assert_eq!(
             trace.collaboration_decision.template_id,
-            CollaborationTemplateId::LongRunningProject
+            CollaborationTemplateId::LongRunningWorkstreams
         );
-        assert!(trace.collaboration_decision.protocol_id.is_none());
     }
 
     #[test]
@@ -865,11 +864,7 @@ mod tests {
 
         assert_eq!(
             trace.collaboration_decision.template_id,
-            CollaborationTemplateId::DebateConsensus
-        );
-        assert_eq!(
-            trace.collaboration_decision.protocol_id.as_deref(),
-            Some("debate@1")
+            CollaborationTemplateId::DebateCriticArbiter
         );
     }
 }

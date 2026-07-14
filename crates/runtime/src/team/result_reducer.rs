@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -57,6 +58,7 @@ impl SynthesizeBackend for TeamResultReducer {
         let mut usage = ExecutionUsage::default();
         let mut blockers = Vec::new();
         let mut allows_unresolved = false;
+        let terminal_agent_nodes = terminal_agent_node_ids(&graph);
 
         for node in graph.nodes.iter().filter(|node| {
             node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask
@@ -93,7 +95,9 @@ impl SynthesizeBackend for TeamResultReducer {
                 .any(|constraint| constraint == "protocol_allows_unresolved:true");
             match returned.status {
                 AgentTerminalStatus::Completed => {
-                    summaries.push(format!("## {}\n{}", packet.agent_id, returned.outcome))
+                    if terminal_agent_nodes.contains(&node.id) {
+                        summaries.push(format!("## {}\n{}", packet.agent_id, returned.outcome));
+                    }
                 }
                 AgentTerminalStatus::Failed
                 | AgentTerminalStatus::Cancelled
@@ -153,5 +157,58 @@ impl SynthesizeBackend for TeamResultReducer {
             usage,
             finished_at_ms: crate::tool_invocation::now_ms(),
         }))
+    }
+}
+
+fn terminal_agent_node_ids(
+    graph: &harness_contract::execution_graph::ExecutionGraph,
+) -> BTreeSet<String> {
+    let agent_nodes = graph
+        .nodes
+        .iter()
+        .filter(|node| node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask)
+        .map(|node| node.id.as_str())
+        .collect::<BTreeSet<_>>();
+    agent_nodes
+        .iter()
+        .filter(|node_id| {
+            !graph.edges.iter().any(|edge| {
+                edge.from == **node_id
+                    && edge.kind == harness_contract::execution_graph::ExecutionEdgeKind::DependsOn
+                    && agent_nodes.contains(edge.to.as_str())
+            })
+        })
+        .map(|node_id| (*node_id).to_string())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use harness_contract::execution_graph::{
+        ExecutionEdge, ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec,
+    };
+
+    use super::terminal_agent_node_ids;
+
+    #[test]
+    fn only_topology_terminal_agent_publishes_the_team_answer() {
+        let mut graph = ExecutionGraph::new("research");
+        let mut researcher =
+            ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent_task", "{}");
+        researcher.id = "researcher".into();
+        let mut synthesizer =
+            ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent_task", "{}");
+        synthesizer.id = "synthesizer".into();
+        graph.nodes.extend([researcher, synthesizer]);
+        graph.edges.push(ExecutionEdge {
+            from: "researcher".into(),
+            to: "synthesizer".into(),
+            kind: ExecutionEdgeKind::DependsOn,
+        });
+
+        assert_eq!(
+            terminal_agent_node_ids(&graph),
+            std::collections::BTreeSet::from(["synthesizer".to_string()])
+        );
     }
 }

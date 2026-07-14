@@ -764,10 +764,10 @@ async fn replay_materialized_terminal_events(
     let Some(runtime) = state.services.runtime.as_ref() else {
         return Vec::new();
     };
-    let event_store = Arc::clone(runtime.runtime_services().event_store());
+    let delivery = runtime.runtime_services().session_terminal_delivery();
     let session_id = session_id.to_string();
     let records = tokio::task::spawn_blocking(move || {
-        event_store.materialized_session_terminals_after(&session_id, after_cursor, 500)
+        delivery.materialized_after(&session_id, after_cursor, 500)
     })
     .await
     .ok()

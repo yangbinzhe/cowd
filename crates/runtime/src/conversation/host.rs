@@ -20,7 +20,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use futures::{stream, StreamExt};
-use harness_contract::agent::AgentTaskPacket;
+use harness_contract::agent::AgentTaskIntent;
 use harness_contract::execution_graph::{
     ExecutionEdge, ExecutionEdgeKind, ExecutionNodeKind, ExecutionNodeResult, ExecutionNodeSpec,
     ExecutionNodeStatus, ExecutionUsage,
@@ -83,6 +83,20 @@ where
     pub external_context_items: Vec<ContextItem>,
     pub skill_profiles: Vec<SkillCapabilityProfile>,
     pub agent_skill_profile: AgentSkillProfile,
+    pub skill_prompt_assets: Vec<crate::RuntimeSkillPromptAsset>,
+    /// Runtime-owned Agent instance identity for scoped memory operations.
+    pub memory_agent_id: String,
+    /// Exact Agent Definition lineage permitted for reusable cognitive recall.
+    /// Both primary and delegated turns receive this only from a Runtime
+    /// compiled Binding.
+    pub memory_definition_lineage_id: Option<String>,
+    /// Runtime-owned Team visibility boundary for scoped memory operations.
+    pub memory_team_id: Option<String>,
+    /// Runtime-owned Binding read lease for scoped memory operations.
+    pub memory_read_scopes: Vec<harness_contract::agent::CognitiveReadScope>,
+    /// Immutable primary or delegated Binding used for Fact/Matrix context
+    /// assembly. Surface callers cannot supply this directly.
+    pub reality_binding: Option<harness_contract::agent::AgentBindingSnapshot>,
     /// Optional runtime-owned parent graph/node for nested agent turns.
     /// Surface-originated turns leave this empty.
     pub execution_parent: Option<harness_contract::execution_graph::ExecutionParentBinding>,
@@ -118,7 +132,21 @@ where
         .with_explicit_team_escalation(config.execution_parent.is_none())
         .with_runtime_event_store(Arc::clone(services.event_store()))
         .with_skill_profiles(config.skill_profiles)
-        .with_agent_skill_profile(config.agent_skill_profile);
+        .with_agent_skill_profile(config.agent_skill_profile)
+        .with_skill_prompt_assets(config.skill_prompt_assets)
+        .with_memory_identity(
+            config.memory_agent_id,
+            config.memory_definition_lineage_id,
+            config.memory_team_id,
+            config.memory_read_scopes,
+        );
+        if let Some(memory_manager) = services.memory_manager() {
+            runtime = runtime.with_memory_manager(memory_manager);
+        }
+        if let Some(binding) = config.reality_binding {
+            runtime = runtime
+                .with_reality_binding(services.reality_recall_port().as_ref().clone(), binding);
+        }
         runtime.set_active_model(active_model);
 
         if let Some(store) = config.session_store {
@@ -225,6 +253,13 @@ where
 
     pub fn set_context_profile(&self, profile: ContextProfile) {
         self.runtime_ref().set_context_profile(profile);
+    }
+
+    /// Control whether this host may publish transcript rows. Delegated
+    /// Agent hosts disable it while retaining durable evidence and domain
+    /// events under the parent Session authority.
+    pub fn set_transcript_persistence(&mut self, enabled: bool) {
+        self.runtime_mut().set_transcript_persistence(enabled);
     }
 
     pub fn inject_resume_context(&self, packet: ResumeContextPacket) {
@@ -1533,9 +1568,11 @@ where
                         agent_node.executor_kind =
                             crate::execution_core::graph::executors::AgentTaskExecutor::KIND
                                 .to_string();
-                        let packet = AgentTaskPacket {
+                        let intent = AgentTaskIntent {
+                            selected_agent_id: None,
+                            definition_ref: None,
+                            granted_capabilities: Vec::new(),
                             run_id: format!("agent-run:{}", agent_node.id),
-                            agent_id: format!("agent:{}", agent_node.id),
                             task_id: agent_node.id.clone(),
                             session_id: state.session_id.clone(),
                             mission_id: None,
@@ -1564,8 +1601,19 @@ where
                                 0,
                                 0,
                             ),
+                            managed_invocation: None,
                             idempotency_key: agent_node.idempotency_key.clone(),
                         };
+                        let resource_scopes = resource_scopes_for_agent_intent(&intent);
+                        let packet =
+                            self.services
+                                .compile_agent_task_intent(intent)
+                                .map_err(|error| NodeExecutorError::Poll {
+                                    node_id: ticket.node_id.clone(),
+                                    reason: format!(
+                                    "compile AgentTask Binding before graph persistence: {error}"
+                                ),
+                                })?;
                         agent_node.payload_ref =
                             serde_json::to_string(&packet).map_err(|error| {
                                 NodeExecutorError::Poll {
@@ -1573,7 +1621,7 @@ where
                                     reason: error.to_string(),
                                 }
                             })?;
-                        agent_node.resource_scopes = resource_scopes_for_agent_packet(&packet);
+                        agent_node.resource_scopes = resource_scopes;
                         vec![
                             agent_node,
                             dynamic_node(
@@ -2476,12 +2524,15 @@ fn bound_runtime_tool_request(
         tool_name: call.name.clone(),
         input: call.input.clone(),
         category: crate::tool_orchestrator::ToolSafetyCategory::from_tool_name(&call.name),
+        authorization: None,
         session_id: Some(session_id.to_string()),
         model_lease: model_lease.map(ToString::to_string),
         parent_execution: Some(harness_contract::execution_graph::ExecutionParentBinding {
             execution_id: ticket.graph_id.clone(),
             node_id: ticket.node_id.clone(),
         }),
+        evaluation_isolated: false,
+        managed_invocation: None,
     }
 }
 
@@ -2719,9 +2770,17 @@ fn final_answer_recovery_reason(text: &str, workspace_root: &std::path::Path) ->
         return Some("empty final answer".to_string());
     }
     let normalized = text.to_ascii_lowercase();
-    if ["<tool_call", "<function=", "<parameter=", "</tool_call>"]
-        .iter()
-        .any(|marker| normalized.contains(marker))
+    if [
+        "<tool_call",
+        "<function=",
+        "<parameter=",
+        "</tool_call>",
+        "<｜｜dsml｜｜tool_calls>",
+        "<｜｜dsml｜｜invoke",
+        "```tool_use",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
     {
         return Some("simulated tool-call markup in a final answer".to_string());
     }
@@ -2773,10 +2832,17 @@ fn terminal_recovery_retry_budget(lease: &crate::execution_core::ExecutionBudget
 /// that starts with markup remains invalid and follows governed recovery.
 fn strip_trailing_simulated_tool_markup(text: String) -> String {
     let normalized = text.to_ascii_lowercase();
-    let start = ["<tool_call", "<function=", "<parameter="]
-        .iter()
-        .filter_map(|marker| normalized.find(marker))
-        .min();
+    let start = [
+        "<tool_call",
+        "<function=",
+        "<parameter=",
+        "<｜｜dsml｜｜tool_calls>",
+        "<｜｜dsml｜｜invoke",
+        "```tool_use",
+    ]
+    .iter()
+    .filter_map(|marker| normalized.find(marker))
+    .min();
     let Some(start) = start else {
         return text;
     };
@@ -2784,7 +2850,10 @@ fn strip_trailing_simulated_tool_markup(text: String) -> String {
     let lower_suffix = suffix.to_ascii_lowercase();
     let is_direct_markup = lower_suffix.starts_with("<tool_call")
         || lower_suffix.starts_with("<function=")
-        || lower_suffix.starts_with("<parameter=");
+        || lower_suffix.starts_with("<parameter=")
+        || lower_suffix.starts_with("<｜｜dsml｜｜tool_calls>")
+        || lower_suffix.starts_with("<｜｜dsml｜｜invoke")
+        || lower_suffix.starts_with("```tool_use");
     (start > 0 && is_direct_markup)
         .then(|| text[..start].trim_end().to_string())
         .unwrap_or(text)
@@ -2904,14 +2973,42 @@ fn tool_batch_fingerprint(calls: &[ModelToolCall]) -> String {
     let mut actions = calls
         .iter()
         .map(|call| {
-            let input = serde_json::from_str::<serde_json::Value>(&call.input)
-                .map(|value| value.to_string())
-                .unwrap_or_else(|_| call.input.clone());
+            let input = canonical_tool_input_for_governance(call);
             format!("{}:{input}", call.name)
         })
         .collect::<Vec<_>>();
     actions.sort();
     format!("tool_action:{}", sha256_digest(&actions.join("\n")))
+}
+
+/// Capability discovery is a control-plane lookup, not new evidence. Provider
+/// wording in `intent` is intentionally excluded so paraphrased repeated
+/// queries are visible to the InterventionPolicy instead of resetting its
+/// novelty/progress accounting. Detail, surface, and profile remain because
+/// they change the returned capability view.
+fn canonical_tool_input_for_governance(call: &ModelToolCall) -> String {
+    let parsed = serde_json::from_str::<serde_json::Value>(&call.input).ok();
+    if call.name.eq_ignore_ascii_case("runtime_capabilities") {
+        let object = parsed.as_ref().and_then(serde_json::Value::as_object);
+        let detail = object
+            .and_then(|value| value.get("detail"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("summary");
+        let surface = object
+            .and_then(|value| value.get("surface"))
+            .and_then(serde_json::Value::as_str);
+        let profile = object
+            .and_then(|value| value.get("profile"))
+            .and_then(serde_json::Value::as_str);
+        return serde_json::json!({
+            "detail": detail,
+            "surface": surface,
+            "profile": profile,
+        })
+        .to_string();
+    }
+    parsed.map_or_else(|| call.input.clone(), |value| value.to_string())
 }
 
 /// Derive stable evidence coverage keys without treating provider-generated
@@ -3188,15 +3285,15 @@ fn tool_batches_for_turn(calls: &[ModelToolCall]) -> Result<Vec<Vec<ModelToolCal
     Ok(ordered)
 }
 
-fn resource_scopes_for_agent_packet(packet: &AgentTaskPacket) -> Vec<String> {
-    let mut scopes = vec![format!("session:{}", packet.session_id)];
+fn resource_scopes_for_agent_intent(intent: &AgentTaskIntent) -> Vec<String> {
+    let mut scopes = vec![format!("session:{}", intent.session_id)];
     scopes.extend(
-        packet
+        intent
             .constraints
             .iter()
             .filter_map(|constraint| constraint.strip_prefix("resource:").map(str::to_owned)),
     );
-    if packet
+    if intent
         .constraints
         .iter()
         .any(|constraint| constraint == "worktree_isolation")
@@ -4134,6 +4231,34 @@ mod tests {
     }
 
     #[test]
+    fn capability_query_fingerprint_ignores_paraphrased_intent_but_respects_detail() {
+        let first = ModelToolCall {
+            id: "provider-a".into(),
+            name: "runtime_capabilities".into(),
+            input: r#"{"intent":"检查当前运行时能力"}"#.into(),
+            depends_on: Vec::new(),
+        };
+        let paraphrased = ModelToolCall {
+            id: "provider-b".into(),
+            input: r#"{"intent":"请再告诉我有哪些团队能力"}"#.into(),
+            ..first.clone()
+        };
+        let templates = ModelToolCall {
+            id: "provider-c".into(),
+            input: r#"{"intent":"查看团队","detail":"team_templates"}"#.into(),
+            ..first.clone()
+        };
+        assert_eq!(
+            tool_batch_fingerprint(&[first.clone()]),
+            tool_batch_fingerprint(&[paraphrased])
+        );
+        assert_ne!(
+            tool_batch_fingerprint(&[first]),
+            tool_batch_fingerprint(&[templates])
+        );
+    }
+
+    #[test]
     fn unusable_final_output_requires_one_governed_recovery() {
         let workspace = tempfile::tempdir().expect("workspace");
         std::fs::create_dir_all(workspace.path().join("crates/runtime/src"))
@@ -4149,6 +4274,13 @@ mod tests {
         );
         assert_eq!(
             final_answer_recovery_reason("<tool_call><function=read_file>", workspace.path()),
+            Some("simulated tool-call markup in a final answer".to_string())
+        );
+        assert_eq!(
+            final_answer_recovery_reason(
+                "<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"read_file\"></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>",
+                workspace.path()
+            ),
             Some("simulated tool-call markup in a final answer".to_string())
         );
         assert_eq!(
@@ -4171,6 +4303,13 @@ mod tests {
         assert_eq!(
             strip_trailing_simulated_tool_markup(
                 "Verified conclusion.\n<tool_call><function=read_file></function></tool_call>"
+                    .to_string()
+            ),
+            "Verified conclusion."
+        );
+        assert_eq!(
+            strip_trailing_simulated_tool_markup(
+                "Verified conclusion.\n<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"read_file\"></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>"
                     .to_string()
             ),
             "Verified conclusion."

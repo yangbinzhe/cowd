@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::execution_core::ProtocolRef;
+use harness_contract::team::FocusPartitionPlan;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeOrchestrationRequest {
@@ -21,10 +21,12 @@ pub struct RuntimeOrchestrationRequest {
     pub reason: Option<String>,
     #[serde(default)]
     pub template_hint: Option<String>,
-    /// Optional explicit protocol contract. When omitted, runtime selects a
-    /// compatible protocol from the requested action and template semantics.
+    /// Optional explicit focus plan for the selected Team template.
+    /// This is an API/human authoring contract. Provider-originated tool calls
+    /// are intentionally stripped at Gateway: Runtime owns model-selected
+    /// template topology and resolves its role slots itself.
     #[serde(default)]
-    pub protocol: Option<ProtocolRef>,
+    pub focus_partition_plans: Vec<FocusPartitionPlan>,
     #[serde(default)]
     pub capabilities: Vec<String>,
     #[serde(default)]

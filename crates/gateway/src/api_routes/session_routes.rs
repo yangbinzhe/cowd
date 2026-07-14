@@ -5,7 +5,7 @@ use std::{
 };
 
 use axum::{
-    extract::{Path, Query, State as AxumState},
+    extract::{Extension, Path, Query, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -17,7 +17,9 @@ use memory::store::session::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::{new_api_session_record, AppState, ErrorResponse};
+use super::{
+    new_api_session_record, surface_actor_id, AppState, AuthenticatedPrincipal, ErrorResponse,
+};
 use crate::services::{
     SessionMessageCounts, SessionStatsSnapshot, SessionTokenCounts, SessionUpdateRequest,
 };
@@ -170,6 +172,7 @@ fn session_runtime_services(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GetEventsParams {
     #[serde(default)]
     from_seq: Option<usize>,
@@ -180,6 +183,7 @@ struct GetEventsParams {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SearchMessagesParams {
     q: String,
     #[serde(default = "default_search_limit")]
@@ -187,19 +191,21 @@ struct SearchMessagesParams {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SessionAttachRequest {
-    actor_id: String,
     surface: String,
     #[serde(default)]
     role: Option<String>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SessionDetachRequest {
-    actor_id: String,
+    surface: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SessionReplayParams {
     #[serde(default)]
     from_sequence: Option<usize>,
@@ -214,13 +220,15 @@ fn default_search_limit() -> usize {
 async fn attach_session_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(body): Json<SessionAttachRequest>,
 ) -> Json<serde_json::Value> {
+    let actor_id = surface_actor_id(&principal, &body.surface);
     Json(
         state
             .services
             .session
-            .attach_session_value(&id, &body.actor_id, &body.surface, body.role.as_deref())
+            .attach_session_value(&id, &actor_id, &body.surface, body.role.as_deref())
             .await,
     )
 }
@@ -228,13 +236,15 @@ async fn attach_session_handler(
 async fn detach_session_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(body): Json<SessionDetachRequest>,
 ) -> Json<serde_json::Value> {
+    let actor_id = surface_actor_id(&principal, &body.surface);
     Json(
         state
             .services
             .session
-            .detach_session_value(&id, &body.actor_id)
+            .detach_session_value(&id, &actor_id)
             .await,
     )
 }
@@ -290,9 +300,8 @@ struct SearchMessagesResponse {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CancelSessionTurnRequest {
-    #[serde(default)]
-    actor_id: Option<String>,
     #[serde(default)]
     reason: Option<String>,
 }
@@ -975,6 +984,7 @@ async fn get_session(
 async fn cancel_session_turn_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(body): Json<CancelSessionTurnRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     if id.trim().is_empty() {
@@ -1008,12 +1018,7 @@ async fn cancel_session_turn_handler(
         ));
     }
 
-    let actor_id = body
-        .actor_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("unknown");
+    let actor_id = format!("principal:{}", principal.0.claims().principal_id);
     let reason = body
         .reason
         .as_deref()

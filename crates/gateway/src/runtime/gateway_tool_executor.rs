@@ -238,7 +238,6 @@ impl GatewayToolExecutor {
         if tool_name == "runtime_capabilities" {
             let input: RuntimeCapabilitiesRequest = serde_json::from_value(value)
                 .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-            let active_evolution = crate::current_active_evolution_capability_overlay();
             let leased_decision = self
                 .runtime_execution_decision
                 .lock()
@@ -250,7 +249,6 @@ impl GatewayToolExecutor {
                     input.surface.as_deref(),
                     input.profile.as_deref(),
                     input.detail.as_deref(),
-                    &active_evolution,
                     leased_decision.as_ref(),
                     &self.available_tool_names(),
                 ),
@@ -289,6 +287,7 @@ impl GatewayToolExecutor {
                 .map_err(|error| {
                     ToolError::new(format!("invalid runtime_orchestrate input: {error}"))
                 })?;
+            sanitize_model_orchestration_request(&mut request);
             self.bind_delegated_capabilities(&mut request);
             let services = self.runtime_services.get().cloned().ok_or_else(|| {
                 ToolError::new("runtime_orchestrate requires the workspace RuntimeServices Runner")
@@ -573,6 +572,21 @@ impl GatewayToolExecutor {
     }
 }
 
+/// A provider can select an objective, a published Team template, and safe
+/// ceilings. It cannot construct runtime topology. Focus plans remain a
+/// deliberate human/API authoring capability, while model-originated team
+/// requests always let Runtime resolve the template's versioned role contract.
+fn sanitize_model_orchestration_request(request: &mut runtime::RuntimeOrchestrationRequest) {
+    if !request.focus_partition_plans.is_empty() {
+        tracing::info!(
+            discarded_focus_plan_count = request.focus_partition_plans.len(),
+            action = %request.action.as_str(),
+            "discarded model-supplied Team focus partitions; Runtime owns template topology"
+        );
+        request.focus_partition_plans.clear();
+    }
+}
+
 fn resource_capability_keywords(kind: &str, mime: Option<&str>, intent: &str) -> Vec<String> {
     let mut keywords = vec![kind.to_string()];
     // Installed command names describe implementation details rather than the
@@ -748,6 +762,39 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
         request: &runtime::RuntimeToolExecutionRequest,
     ) -> runtime::RuntimeToolExecutionOutcome {
         let evidence_ref = format!("gateway-tool:{}", request.tool_use_id);
+        if request.evaluation_isolated && request.category != runtime::ToolSafetyCategory::ReadOnly
+        {
+            return runtime::RuntimeToolExecutionOutcome {
+                tool_use_id: request.tool_use_id.clone(),
+                tool_name: request.tool_name.clone(),
+                status: runtime::RuntimeToolExecutionStatus::BlockedPermission,
+                category: request.category,
+                output: None,
+                error: Some(
+                    "paired evaluation permits only read-only tools; use a dedicated sandboxed evaluation executor for mutations"
+                        .to_string(),
+                ),
+                evidence_ref,
+            };
+        }
+        if request.managed_invocation.is_some() && request.tool_name == "runtime_orchestrate" {
+            // `runtime_orchestrate` would create a child graph whose task
+            // packets do not belong to this invocation's effect outbox. A
+            // Managed Agent must select a Managed Team target instead, so all
+            // child roles inherit the same durable invocation fence.
+            return runtime::RuntimeToolExecutionOutcome {
+                tool_use_id: request.tool_use_id.clone(),
+                tool_name: request.tool_name.clone(),
+                status: runtime::RuntimeToolExecutionStatus::BlockedPermission,
+                category: request.category,
+                output: None,
+                error: Some(
+                    "managed Agent cannot invoke runtime_orchestrate; use a Managed Team definition so every child role inherits the invocation fence"
+                        .to_string(),
+                ),
+                evidence_ref,
+            };
+        }
         let value = match serde_json::from_str(&request.input) {
             Ok(value) => value,
             Err(error) => {
@@ -762,6 +809,70 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                 };
             }
         };
+        let managed_effect = if request.category != runtime::ToolSafetyCategory::ReadOnly {
+            if let Some(fence) = request.managed_invocation.as_ref() {
+                let Some(services) = self.runtime_services.get().cloned() else {
+                    return runtime::RuntimeToolExecutionOutcome {
+                        tool_use_id: request.tool_use_id.clone(),
+                        tool_name: request.tool_name.clone(),
+                        status: runtime::RuntimeToolExecutionStatus::BlockedPermission,
+                        category: request.category,
+                        output: None,
+                        error: Some(
+                            "managed Agent side effect is blocked because Gateway has no Runtime effect-fence service"
+                                .to_string(),
+                        ),
+                        evidence_ref,
+                    };
+                };
+                let effect_id = format!("tool:{}:{}", request.tool_name, request.tool_use_id);
+                match services.begin_managed_agent_effect(
+                    fence,
+                    &effect_id,
+                    format!("runtime_tool:{:?}", request.category).to_ascii_lowercase(),
+                    request.idempotency_key.clone(),
+                    format!(
+                        "runtime-tool:{}:{}",
+                        request.tool_name, request.idempotency_key
+                    ),
+                ) {
+                    Ok(runtime::ManagedAgentEffectPermit::Execute { .. }) => {
+                        Some((fence.clone(), effect_id, services))
+                    }
+                    Ok(runtime::ManagedAgentEffectPermit::AlreadyCompleted { record }) => {
+                        return runtime::RuntimeToolExecutionOutcome {
+                            tool_use_id: request.tool_use_id.clone(),
+                            tool_name: request.tool_name.clone(),
+                            status: runtime::RuntimeToolExecutionStatus::Executed,
+                            category: request.category,
+                            output: Some(format!(
+                                "managed effect was already completed; receipt={}",
+                                record.receipt_ref.unwrap_or_else(|| "unknown".to_string())
+                            )),
+                            error: None,
+                            evidence_ref,
+                        };
+                    }
+                    Err(error) => {
+                        return runtime::RuntimeToolExecutionOutcome {
+                            tool_use_id: request.tool_use_id.clone(),
+                            tool_name: request.tool_name.clone(),
+                            status: runtime::RuntimeToolExecutionStatus::BlockedPermission,
+                            category: request.category,
+                            output: None,
+                            error: Some(format!(
+                                "managed Agent side effect failed Runtime fencing: {error}"
+                            )),
+                            evidence_ref,
+                        };
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let result = if request.tool_name == "ToolSearch" {
             self.execute_search_tool(value)
         } else if is_gateway_runtime_control_tool(&request.tool_name) {
@@ -774,28 +885,75 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                     parent_execution: request.parent_execution.as_ref(),
                 },
             )
+        } else if let Some(authorization) = request.authorization.as_ref() {
+            <Self as ToolExecutor>::execute_authorized(
+                self,
+                authorization,
+                &request.tool_name,
+                &request.input,
+            )
         } else {
-            <Self as ToolExecutor>::execute(self, &request.tool_name, &request.input)
+            Err(ToolError::new(format!(
+                "ordinary tool `{}` requires Runtime authorization",
+                request.tool_name
+            )))
         };
         match result {
-            Ok(output) => runtime::RuntimeToolExecutionOutcome {
-                tool_use_id: request.tool_use_id.clone(),
-                tool_name: request.tool_name.clone(),
-                status: runtime::RuntimeToolExecutionStatus::Executed,
-                category: request.category,
-                output: Some(output),
-                error: None,
-                evidence_ref,
-            },
-            Err(error) => runtime::RuntimeToolExecutionOutcome {
-                tool_use_id: request.tool_use_id.clone(),
-                tool_name: request.tool_name.clone(),
-                status: runtime::RuntimeToolExecutionStatus::Failed,
-                category: request.category,
-                output: None,
-                error: Some(error.to_string()),
-                evidence_ref,
-            },
+            Ok(output) => {
+                if let Some((fence, effect_id, services)) = managed_effect {
+                    if let Err(error) = services.complete_managed_agent_effect(
+                        &fence,
+                        &effect_id,
+                        evidence_ref.clone(),
+                    ) {
+                        let _ = services.reconcile_managed_agent_effect(
+                            &fence,
+                            &effect_id,
+                            format!(
+                                "tool returned success but effect receipt commit failed: {error}"
+                            ),
+                        );
+                        return runtime::RuntimeToolExecutionOutcome {
+                            tool_use_id: request.tool_use_id.clone(),
+                            tool_name: request.tool_name.clone(),
+                            status: runtime::RuntimeToolExecutionStatus::Failed,
+                            category: request.category,
+                            output: None,
+                            error: Some(format!(
+                                "managed Agent effect may have completed but its receipt requires reconciliation: {error}"
+                            )),
+                            evidence_ref,
+                        };
+                    }
+                }
+                runtime::RuntimeToolExecutionOutcome {
+                    tool_use_id: request.tool_use_id.clone(),
+                    tool_name: request.tool_name.clone(),
+                    status: runtime::RuntimeToolExecutionStatus::Executed,
+                    category: request.category,
+                    output: Some(output),
+                    error: None,
+                    evidence_ref,
+                }
+            }
+            Err(error) => {
+                if let Some((fence, effect_id, services)) = managed_effect {
+                    let _ = services.reconcile_managed_agent_effect(
+                        &fence,
+                        &effect_id,
+                        format!("tool adapter returned error: {error}"),
+                    );
+                }
+                runtime::RuntimeToolExecutionOutcome {
+                    tool_use_id: request.tool_use_id.clone(),
+                    tool_name: request.tool_name.clone(),
+                    status: runtime::RuntimeToolExecutionStatus::Failed,
+                    category: request.category,
+                    output: None,
+                    error: Some(error.to_string()),
+                    evidence_ref,
+                }
+            }
         }
     }
 
@@ -819,6 +977,18 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                 input_schema: definition.input_schema,
             })
             .collect()
+    }
+
+    fn delegated_tool_effect_descriptor(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
+        self.has_tool(tool_name).then(|| {
+            self.tool_host
+                .pin_snapshot()
+                .describe_effect(tool_name, input)
+        })
     }
 }
 
@@ -1120,7 +1290,7 @@ mod tests {
             action: runtime::RuntimeOrchestrationAction::RequestTeam,
             reason: None,
             template_hint: None,
-            protocol: None,
+            focus_partition_plans: Vec::new(),
             capabilities: vec![
                 "tool:runtime_orchestrate".to_string(),
                 "tool:unknown_tool".to_string(),
@@ -1149,5 +1319,26 @@ mod tests {
         assert!(request
             .capabilities
             .contains(&"backend:process_jsonl".to_string()));
+    }
+
+    #[test]
+    fn model_orchestration_cannot_supply_template_role_topology() {
+        let mut request: runtime::RuntimeOrchestrationRequest = serde_json::from_value(json!({
+            "intent": "parallel architecture review",
+            "action": "request_team",
+            "focus_partition_plans": [{
+                "role_id": "invented_role",
+                "slots": [{
+                    "focus_id": "runtime",
+                    "boundary": "runtime only",
+                    "evidence_responsibility": "source evidence"
+                }]
+            }]
+        }))
+        .expect("model request parses before Gateway normalization");
+
+        sanitize_model_orchestration_request(&mut request);
+
+        assert!(request.focus_partition_plans.is_empty());
     }
 }

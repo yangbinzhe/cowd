@@ -216,6 +216,9 @@ mod tests {
 
     #[test]
     fn fresh_branch_passes() {
+        let _guard = crate::test_process_environment_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_dir();
         init_repo(&root);
 
@@ -233,6 +236,9 @@ mod tests {
 
     #[test]
     fn fresh_branch_ahead_of_main_still_fresh() {
+        let _guard = crate::test_process_environment_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_dir();
         init_repo(&root);
 
@@ -251,6 +257,9 @@ mod tests {
 
     #[test]
     fn stale_branch_detected_with_correct_behind_count_and_missing_fixes() {
+        let _guard = crate::test_process_environment_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_dir();
         init_repo(&root);
 
@@ -282,6 +291,9 @@ mod tests {
 
     #[test]
     fn diverged_branch_detection() {
+        let _guard = crate::test_process_environment_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_dir();
         init_repo(&root);
 

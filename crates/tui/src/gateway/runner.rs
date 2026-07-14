@@ -90,7 +90,6 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
     state.add_system_notice(SystemNoticeKind::Info, &config.startup_banner);
     state.add_system_notice(SystemNoticeKind::Info, &config.connected_line);
 
-    let gateway_actor_id = format!("tui:{}", std::process::id());
     let mut gateway_lease_owner: Option<String> = None;
     let gateway_client = GatewayApiClient::ensure_running_with_retry(default_auth_token())?
         .ok_or_else(|| {
@@ -103,7 +102,6 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
         &tui_tx,
         &mut state,
         &config,
-        &gateway_actor_id,
         &mut gateway_lease_owner,
     )?;
 
@@ -254,7 +252,6 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                                         &gateway_client,
                                         &tui_tx,
                                         &session_id,
-                                        &gateway_actor_id,
                                     );
                                 }
                                 ProcessedKey::Nothing => {}
@@ -281,10 +278,10 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
         Ok::<(), Box<dyn std::error::Error>>(())
     });
 
-    if let Some(owner) = gateway_lease_owner.as_deref() {
-        let _ = runtime.block_on(gateway_client.release_runtime_session_lease(&session_id, owner));
+    if gateway_lease_owner.is_some() {
+        let _ = runtime.block_on(gateway_client.release_runtime_session_lease(&session_id));
     }
-    let _ = runtime.block_on(gateway_client.detach_session(&session_id, &gateway_actor_id));
+    let _ = runtime.block_on(gateway_client.detach_session(&session_id, "tui"));
     if raw_mode_enabled {
         disable_raw_mode()?;
     }
@@ -302,7 +299,6 @@ fn attach_gateway_session(
     event_tx: &crate::events::CowdEventSender,
     state: &mut TuiState,
     config: &GatewayTuiConfig,
-    gateway_actor_id: &str,
     gateway_lease_owner: &mut Option<String>,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let status = runtime
@@ -354,7 +350,6 @@ fn attach_gateway_session(
 
     match runtime.block_on(gateway_client.attach_session(
         &ensured_session_id,
-        gateway_actor_id,
         "tui",
         Some("writer"),
     )) {
@@ -400,12 +395,9 @@ fn attach_gateway_session(
         ),
     }
 
-    let lease_owner = gateway_actor_id.to_string();
-    match runtime.block_on(gateway_client.acquire_runtime_session_lease(
-        &ensured_session_id,
-        &lease_owner,
-        "collaborative",
-    )) {
+    match runtime.block_on(
+        gateway_client.acquire_runtime_session_lease(&ensured_session_id, "collaborative"),
+    ) {
         Ok(lease) => {
             *gateway_lease_owner = lease
                 .get("owner")
@@ -687,15 +679,13 @@ fn dispatch_gateway_cancel(
     gateway_client: &GatewayApiClient,
     tx: &crate::events::CowdEventSender,
     session_id: &str,
-    actor_id: &str,
 ) {
     let cancel_client = gateway_client.clone();
     let cancel_session_id = session_id.to_string();
-    let cancel_actor_id = actor_id.to_string();
     let cancel_tx = tx.clone();
     spawn_tui_task(tx, async move {
         match cancel_client
-            .cancel_session_turn(&cancel_session_id, &cancel_actor_id, "tui_user_cancel")
+            .cancel_session_turn(&cancel_session_id, "tui_user_cancel")
             .await
         {
             Ok(receipt) => {

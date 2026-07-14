@@ -39,6 +39,8 @@ pub enum ExecutionCommitError {
     GraphStreamCollision(String),
     #[error("domain event for stream `{0}` has no stable idempotency key")]
     MissingDomainIdempotency(String),
+    #[error("graph executor cannot emit protected domain scope `{0}`")]
+    ProtectedDomainScope(String),
     #[error("execution commit blocking task failed: {0}")]
     BlockingTask(String),
     #[error("execution graph replan is invalid: {0}")]
@@ -275,6 +277,14 @@ impl ExecutionCommitService {
         let node_event = node_transition_event(&next, node_id, from, to, result);
         let mut events = vec![node_event];
         events.extend(domain_events);
+        if let Some(working_state) = crate::team_working_state::terminal_working_state_event(
+            &next,
+            node_id,
+            to,
+            next.node_results.get(node_id),
+        ) {
+            events.push(working_state);
+        }
         self.append_graph_event(&next, graph.revision, transaction_id, graph_event, events)
     }
 
@@ -382,6 +392,14 @@ impl ExecutionCommitService {
             Some(result.clone()),
         )];
         events.extend(domain_events);
+        if let Some(working_state) = crate::team_working_state::terminal_working_state_event(
+            &next,
+            node_id,
+            to,
+            next.node_results.get(node_id),
+        ) {
+            events.push(working_state);
+        }
         self.append_graph_event(
             &next,
             graph.revision,
@@ -748,6 +766,26 @@ impl ExecutionCommitService {
             .any(|event| event.event.stream_id == graph.id)
         {
             return Err(ExecutionCommitError::GraphStreamCollision(graph.id.clone()));
+        }
+        if let Some(event) = domain_events.iter().find(|event| {
+            !matches!(
+                event.event.scope,
+                RuntimeEventScope::ExecutionNode
+                    | RuntimeEventScope::Goal
+                    | RuntimeEventScope::SessionInput
+                    | RuntimeEventScope::Relation
+                    | RuntimeEventScope::Team
+                    // Approval decisions are generated from a canonical
+                    // ExecutionGraph command and must commit atomically with
+                    // the node transition. Blocking this scope leaves a
+                    // graph approved in neither the graph nor the durable
+                    // approval projection.
+                    | RuntimeEventScope::Approval
+            )
+        }) {
+            return Err(ExecutionCommitError::ProtectedDomainScope(
+                event.event.scope.as_str().to_string(),
+            ));
         }
         if let Some(event) = domain_events
             .iter()

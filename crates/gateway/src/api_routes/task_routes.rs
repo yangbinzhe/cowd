@@ -32,6 +32,7 @@ pub(super) fn router() -> Router<Arc<AppState>> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StartTaskRequest {
     objective: String,
     #[serde(default)]
@@ -39,11 +40,13 @@ struct StartTaskRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TaskFailureRequest {
     reason: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StartTaskPhaseRequest {
     name: String,
     objective: String,
@@ -56,6 +59,7 @@ struct StartTaskPhaseRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TaskPhaseArtifactRequest {
     #[serde(default = "default_task_artifact_kind")]
     kind: String,
@@ -64,6 +68,7 @@ struct TaskPhaseArtifactRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TaskPhaseReviewRequest {
     result: String,
     #[serde(default)]
@@ -95,7 +100,7 @@ async fn start_task_handler(
     state
         .services
         .task
-        .record_lifecycle_event(&state.services.runtime_events, &task, "task.started")
+        .record_lifecycle_event(&task, "task.started")
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok((StatusCode::CREATED, Json(task)))
 }
@@ -120,7 +125,7 @@ async fn start_task_phase_handler(
     state
         .services
         .task
-        .record_lifecycle_event(&state.services.runtime_events, &task, "task.phase.started")
+        .record_lifecycle_event(&task, "task.phase.started")
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok((StatusCode::CREATED, Json(task)))
 }
@@ -138,11 +143,7 @@ async fn record_task_phase_artifact_handler(
     state
         .services
         .task
-        .record_lifecycle_event(
-            &state.services.runtime_events,
-            &task,
-            "task.phase.artifact.recorded",
-        )
+        .record_lifecycle_event(&task, "task.phase.artifact.recorded")
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(Json(task))
 }
@@ -160,7 +161,7 @@ async fn review_task_phase_handler(
     state
         .services
         .task
-        .record_lifecycle_event(&state.services.runtime_events, &task, "task.phase.reviewed")
+        .record_lifecycle_event(&task, "task.phase.reviewed")
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(Json(task))
 }
@@ -177,7 +178,7 @@ async fn cancel_task_handler(
     state
         .services
         .task
-        .record_lifecycle_event(&state.services.runtime_events, &task, "task.cancelled")
+        .record_lifecycle_event(&task, "task.cancelled")
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(Json(task))
 }
@@ -194,7 +195,7 @@ async fn complete_task_handler(
     state
         .services
         .task
-        .record_lifecycle_event(&state.services.runtime_events, &task, "task.completed")
+        .record_lifecycle_event(&task, "task.completed")
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(Json(task))
 }
@@ -217,7 +218,7 @@ async fn record_task_failure_handler(
     state
         .services
         .task
-        .record_lifecycle_event(&state.services.runtime_events, &task, kind)
+        .record_lifecycle_event(&task, kind)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(Json(task))
 }

@@ -237,14 +237,14 @@ impl NodeExecutor for PostCommitExecutor {
                 .push(crate::runtime_event_store::RuntimeTransactionEventInput {
                     event: crate::RuntimeEventInput {
                         stream_id: format!("side-effect:{}", ticket.node_id),
-                        scope: crate::RuntimeEventScope::SessionInput,
+                        scope: crate::RuntimeEventScope::AgentDefinition,
                         kind: "test.side_effect".to_string(),
                         status: None,
                         actor: None,
                         refs: Vec::new(),
                         payload: serde_json::Value::Null,
                     },
-                    idempotency_key: None,
+                    idempotency_key: Some(format!("protected:{}", ticket.idempotency_key)),
                     schema_version: 1,
                 });
         }
@@ -1557,7 +1557,7 @@ async fn process_side_effect_hook_runs_only_after_graph_commit() {
         terminal.executor_kind = "post_commit".to_string();
         graph.nodes.push(terminal);
         let result = runner.start(graph).await;
-        assert_eq!(result.is_ok(), !invalid_domain_event);
+        assert_eq!(result.is_ok(), !invalid_domain_event, "{result:?}");
         assert_eq!(
             executor.after_commits.load(Ordering::SeqCst),
             expected_after_commits

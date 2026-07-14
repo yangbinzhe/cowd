@@ -581,6 +581,12 @@ async fn memory_layer_handler(
     let Some(layer) = parse_memory_layer(&layer) else {
         return Err(api_error(StatusCode::BAD_REQUEST, "invalid memory layer"));
     };
+    if layer == MemoryLayer::L4 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "L4 is promoted Runtime knowledge and cannot be created through the memory API",
+        ));
+    }
 
     if let Some(mgr) = state.services.memory.manager() {
         match mgr.list_layer_full_entries(layer).await {
@@ -645,13 +651,7 @@ async fn create_memory_entry_handler(
         .scope
         .as_deref()
         .and_then(|scope| scope.parse::<MemoryScope>().ok())
-        .unwrap_or_else(|| {
-            if layer == MemoryLayer::L4 {
-                MemoryScope::Global
-            } else {
-                MemoryScope::default()
-            }
-        });
+        .unwrap_or_default();
 
     let id = MemoryId::new_v4();
     let entry = MemoryEntry {

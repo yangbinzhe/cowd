@@ -39,7 +39,6 @@ fn bench_config(sqlite_path: &std::path::Path) -> MemoryConfig {
 fn cached_prepare_config(sqlite_path: &std::path::Path) -> MemoryConfig {
     MemoryConfig {
         tuning: TuningConfig {
-            l4_push_enabled: false,
             prefetch_hot_topics: 0,
             prepare_context_cache_ttl_ms: 60_000,
             ..Default::default()

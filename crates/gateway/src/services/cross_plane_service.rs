@@ -120,6 +120,21 @@ impl CrossPlaneService {
         &self,
         record: CrossPlaneExecutionRecord,
     ) -> Result<(String, CrossPlaneExecutionReceipt), runtime::CrossPlaneRuntimeError> {
+        self.record_action_execution_with_effect_commit(record, false)
+    }
+
+    pub(crate) fn record_completed_effect_execution(
+        &self,
+        record: CrossPlaneExecutionRecord,
+    ) -> Result<(String, CrossPlaneExecutionReceipt), runtime::CrossPlaneRuntimeError> {
+        self.record_action_execution_with_effect_commit(record, true)
+    }
+
+    fn record_action_execution_with_effect_commit(
+        &self,
+        record: CrossPlaneExecutionRecord,
+        consume_single_use_grant: bool,
+    ) -> Result<(String, CrossPlaneExecutionReceipt), runtime::CrossPlaneRuntimeError> {
         let audit_record = CrossPlaneAuditRecord::new(
             record.action.clone(),
             record.decision.clone(),
@@ -141,9 +156,15 @@ impl CrossPlaneService {
         .with_dispatch_target(record.dispatch_target)
         .with_dispatch_outcome(record.dispatch_outcome)
         .with_execution_graph_id(record.execution_graph_id);
-        self.runtime_services
-            .cross_plane()
-            .record_action_execution(audit_record, receipt)
+        if consume_single_use_grant {
+            self.runtime_services
+                .cross_plane()
+                .record_completed_effect_execution(audit_record, receipt)
+        } else {
+            self.runtime_services
+                .cross_plane()
+                .record_action_execution(audit_record, receipt)
+        }
     }
 
     pub(crate) fn decide_connector_action(
@@ -222,7 +243,7 @@ impl CrossPlaneService {
             .and_then(|value| serde_json::from_str::<CrossPlaneDispatchOutcome>(value).ok());
         let (status, dispatch_status, audit_result, audit_summary, blockers) =
             graph_receipt_state(outcome.as_ref());
-        let (_, receipt) = self.record_action_execution(CrossPlaneExecutionRecord {
+        let (_, receipt) = self.record_completed_effect_execution(CrossPlaneExecutionRecord {
             idempotency_key: Some(idempotency_key),
             mode: "commit".to_string(),
             status: status.to_string(),

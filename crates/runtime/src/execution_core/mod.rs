@@ -33,7 +33,9 @@ pub use graph::{
     NodeExecutionTicket, NodeExecutor, NodeExecutorError, NodeExecutorRegistry, ScopedNodeBackend,
     ScopedNodeExecutor,
 };
-pub use model_affordance::runtime_execution_guidance_prompt;
+pub use model_affordance::{
+    runtime_execution_guidance_prompt, runtime_execution_guidance_prompt_with_tool_exposure,
+};
 pub use orchestration_binding::{
     runtime_orchestration_action_guidance, runtime_orchestration_actions,
 };
@@ -59,9 +61,12 @@ pub use rewoo_plan::{
 pub use safety_fuse::{
     ExecutionBudgetLease, SafetyFuseDecision, SafetyFusePolicy, SafetyFuseSignals,
 };
+#[cfg(feature = "test-fixtures")]
+pub use services::RuntimeFixtureEventPort;
 pub use services::{
     ExecutionStartupRecoveryError, ExecutionStartupRecoveryRecord, ExecutionStartupRecoveryReport,
-    RuntimeServices, RuntimeServicesBuilder, RuntimeServicesError,
+    RuntimeEventReader, RuntimeServices, RuntimeServicesBuilder, RuntimeServicesError,
+    SessionTerminalDeliveryPort, TaskLifecycleEvent, TaskLifecycleKind,
 };
 pub use strategy_decision::{
     action_selection_report_for_decision, build_runtime_action_selection_report,

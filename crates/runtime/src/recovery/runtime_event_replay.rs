@@ -56,7 +56,10 @@ pub struct RuntimeReplayReport {
 pub struct RuntimeEventReplayer;
 
 impl RuntimeEventReplayer {
-    pub fn report(store: &RuntimeEventStore, limit: usize) -> Result<RuntimeReplayReport, String> {
+    pub(crate) fn report(
+        store: &RuntimeEventStore,
+        limit: usize,
+    ) -> Result<RuntimeReplayReport, String> {
         let events = store.all_events(limit)?;
         let mut scope_counts = BTreeMap::new();
         let mut latest_by_stream: BTreeMap<String, DurableRuntimeEvent> = BTreeMap::new();
@@ -129,7 +132,11 @@ pub fn candidate_from_action(action: &RuntimeRecoveryAction) -> Option<RuntimeRe
         | RuntimeEventScope::SessionCommand => "runtime.session",
         RuntimeEventScope::Team => "runtime.team_projection",
         RuntimeEventScope::Agent => "runtime.agent_lifecycle",
+        RuntimeEventScope::AgentDefinition => "runtime.agent_definition",
+        RuntimeEventScope::TeamTemplate => "runtime.team_template",
         RuntimeEventScope::Approval => "runtime.approval_queue",
+        RuntimeEventScope::Evolution => "runtime.evolution",
+        RuntimeEventScope::ManagedAgent => "runtime.managed_agent_dispatcher",
         // Steward events from prior builds have no active lifecycle owner.
         // They remain replayable evidence only and can never restart work.
         RuntimeEventScope::Steward => "runtime.agent_policy",

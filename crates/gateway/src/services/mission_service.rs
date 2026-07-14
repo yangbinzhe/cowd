@@ -3,6 +3,7 @@ use serde::Deserialize;
 use super::{service_envelope, MissionService, ServiceEnvelope};
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct StartMissionSessionHttpRequest {
     pub(crate) title: String,
     #[serde(default)]
@@ -54,17 +55,6 @@ const fn default_schedule_priority() -> u8 {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct StartMissionTeamRuntimeHttpRequest {
-    pub(crate) objective: String,
-    #[serde(default)]
-    pub(crate) model: Option<String>,
-    #[serde(default)]
-    pub(crate) backend: Option<runtime::AgentBackendKind>,
-    #[serde(default)]
-    pub(crate) approval_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 pub(crate) struct SubmitMissionApprovalHttpRequest {
     pub(crate) source: runtime::ApprovalSource,
     pub(crate) action: String,
@@ -76,14 +66,15 @@ pub(crate) struct SubmitMissionApprovalHttpRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DecideMissionApprovalHttpRequest {
     pub(crate) approved: bool,
-    pub(crate) decided_by: String,
     #[serde(default)]
     pub(crate) reason: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AddMissionRelationHttpRequest {
     pub(crate) from_session_id: String,
     pub(crate) to_session_id: String,
@@ -94,6 +85,7 @@ pub(crate) struct AddMissionRelationHttpRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct UpsertMissionProxyHttpRequest {
     pub(crate) session_id: String,
     pub(crate) summary: String,
@@ -106,6 +98,7 @@ pub(crate) struct UpsertMissionProxyHttpRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct InterpretMissionCommandHttpRequest {
     pub(crate) current_session_id: String,
     pub(crate) command_text: String,
@@ -494,73 +487,34 @@ impl MissionService {
     pub(crate) async fn start_team_runtime(
         &self,
         session_id: &str,
-        request: StartMissionTeamRuntimeHttpRequest,
+        request: harness_contract::team::TeamInstantiationRequest,
     ) -> Result<serde_json::Value, String> {
         if self.runtime().session(session_id).is_none() {
             return Err(format!("mission session not found: {session_id}"));
         }
-        if request.objective.trim().is_empty() {
-            return Err("team objective must not be empty".to_string());
+        request.validate().map_err(|error| error.to_string())?;
+        if request.session_id != session_id {
+            return Err(format!(
+                "Team request session `{}` does not match mission route session `{session_id}`",
+                request.session_id
+            ));
         }
-        let team_id = format!("team-{}", uuid::Uuid::new_v4());
-        let model_lease = request.model.unwrap_or_default();
-        let backend_constraint = request.backend.map(|backend| match backend {
-            runtime::AgentBackendKind::InProcess => "backend:in_process".to_string(),
-            runtime::AgentBackendKind::ProcessJsonl => "backend:process_jsonl".to_string(),
+        let request_projection = serde_json::json!({
+            "request_id": request.request_id,
+            "team_id": request.team_id,
+            "selection_mode": request.selection_mode,
+            "template_selector": request.template_selector,
+            "model_lease": request.model_lease,
+            "permission_lease": request.permission_lease,
+            "resource_scopes": request.resource_scopes,
         });
-        let roles = vec![
-            harness_contract::team::TeamRoleSpec {
-                role_id: "executor".to_string(),
-                responsibility: "produce an evidence-backed solution for the requested objective"
-                    .to_string(),
-                required_capabilities: vec!["analysis".to_string()],
-                allowed_tools: vec!["read_file".to_string(), "search".to_string()],
-                acceptance: vec!["propose a complete result with evidence".to_string()],
-                evidence_duties: vec!["source evidence".to_string()],
-            },
-            harness_contract::team::TeamRoleSpec {
-                role_id: "reviewer".to_string(),
-                responsibility: "independently review the solution for gaps, conflicts, and risks"
-                    .to_string(),
-                required_capabilities: vec!["review".to_string()],
-                allowed_tools: vec!["read_file".to_string(), "search".to_string()],
-                acceptance: vec!["report verified risks and unresolved issues".to_string()],
-                evidence_duties: vec!["review evidence".to_string()],
-            },
-        ];
-        let team = self
-            .runtime()
-            .start_team(runtime::StartTeamRequest {
-                team_id,
-                session_id: session_id.to_string(),
-                objective: request.objective,
-                template_id: harness_contract::team::TeamTemplateId::ExecuteReview,
-                roles,
-                role_dependencies: vec![runtime::TeamRoleDependency {
-                    from_role_id: "executor".to_string(),
-                    to_role_id: "reviewer".to_string(),
-                }],
-                lift_input: runtime::CollaborationLiftInput {
-                    independent_work_items: 2,
-                    domain_count: 2,
-                    shared_write_scope: false,
-                    review_required: true,
-                    provider_healthy: true,
-                    budget_allows_parallelism: true,
-                    requested_parallelism: 2,
-                },
-                permission_lease: "read_only".to_string(),
-                model_lease,
-                backend_constraint,
-            })
-            .await?;
+        let team = self.runtime().instantiate_team(request).await?;
         Ok(serde_json::json!({
             "envelope": self.session_control_contract(),
             "ok": true,
             "status": team.status,
             "team": team,
-            "requested_backend": request.backend,
-            "approval_id": request.approval_id,
+            "requested_team": request_projection,
             "mission": self.runtime().projection(),
         }))
     }
@@ -591,15 +545,19 @@ impl MissionService {
         &self,
         approval_id: &str,
         request: DecideMissionApprovalHttpRequest,
+        principal: &runtime::VerifiedPrincipal,
     ) -> Result<serde_json::Value, String> {
-        let receipt = self
-            .runtime()
-            .decide_approval(runtime::GlobalApprovalDecision {
+        if !principal.is_human_interactive() || !principal.has_capability("approval.respond") {
+            return Err("approval_human_interactive_capability_required".to_string());
+        }
+        let receipt = self.runtime().decide_approval(
+            principal,
+            runtime::ApprovalDecisionCommand {
                 approval_id: approval_id.to_string(),
                 approved: request.approved,
-                decided_by: request.decided_by,
                 reason: request.reason,
-            })?;
+            },
+        )?;
         Ok(serde_json::json!({
             "envelope": self.approval_command_contract(),
             "ok": true,
@@ -678,24 +636,6 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn start_mission_team_runtime_request_rejects_unknown_fields() {
-        let error =
-            serde_json::from_value::<StartMissionTeamRuntimeHttpRequest>(serde_json::json!({
-                "objective": "review the implementation",
-                "backend": "in_process",
-                "execution_pattern": "manual_mailbox",
-            }))
-            .expect_err("unknown fields must be rejected");
-
-        assert!(
-            error
-                .to_string()
-                .contains("unknown field `execution_pattern`"),
-            "unexpected error: {error}"
-        );
-    }
-
     #[tokio::test]
     async fn mission_service_projects_runtime_control_surfaces() {
         let service = scoped_mission_service();
@@ -764,12 +704,7 @@ mod tests {
         let started = service
             .start_team_runtime(
                 &session_id,
-                StartMissionTeamRuntimeHttpRequest {
-                    objective: "answer one delegated question".to_string(),
-                    model: None,
-                    backend: Some(runtime::AgentBackendKind::InProcess),
-                    approval_id: None,
-                },
+                team_request(&session_id, "answer one delegated question"),
             )
             .await
             .expect("team");
@@ -778,6 +713,38 @@ mod tests {
         assert!(started["mission"]["team_projection"]["teams"]
             .as_array()
             .is_some_and(|teams| !teams.is_empty()));
+    }
+
+    fn team_request(
+        session_id: &str,
+        objective: &str,
+    ) -> harness_contract::team::TeamInstantiationRequest {
+        harness_contract::team::TeamInstantiationRequest {
+            request_id: "mission-team-request".to_string(),
+            team_id: "mission-team".to_string(),
+            session_id: session_id.to_string(),
+            mission_id: None,
+            parent_execution: None,
+            selection_mode: harness_contract::team::TeamSelectionMode::Explicit,
+            template_selector: harness_contract::team::TeamTemplateSelector::LatestStable {
+                template_id: harness_contract::team::TeamTemplateDefinitionId::new(
+                    harness_contract::agent::DefinitionScope::Builtin,
+                    "cowd/execute-review",
+                )
+                .expect("builtin Team template"),
+            },
+            objective: objective.to_string(),
+            acceptance: vec!["summary".to_string(), "evidence".to_string()],
+            risk: None,
+            role_binding_overrides: Vec::new(),
+            cardinality_overrides: Vec::new(),
+            focus_partition_plans: Vec::new(),
+            permission_lease: "read_only".to_string(),
+            model_lease: "default".to_string(),
+            budget_lease: None,
+            managed_invocation: None,
+            resource_scopes: vec!["session:mission".to_string()],
+        }
     }
 
     #[test]

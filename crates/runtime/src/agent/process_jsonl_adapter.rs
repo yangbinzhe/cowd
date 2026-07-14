@@ -283,6 +283,8 @@ mod tests {
                 1000,
                 1,
             ),
+            binding: None,
+            managed_invocation: None,
             idempotency_key: "process-idempotency-1".into(),
         }
     }

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use harness_contract::core::TaskRisk;
 use harness_contract::execution_graph::{
     ExecutionFailure, ExecutionNodeResult, ExecutionNodeSpec, ExecutionNodeStatus, ExecutionUsage,
@@ -42,9 +43,30 @@ impl ApprovalNodeExecutor {
     pub fn new(queue: Arc<ApprovalQueue>) -> Self {
         Self { queue }
     }
-    fn approval_id(graph_id: &str, node_id: &str) -> String {
-        format!("approval:{graph_id}:{node_id}")
-    }
+}
+
+/// Stable, unambiguous approval identity for one graph node. Graph and node
+/// IDs themselves contain `:` in the canonical Runtime format, so raw string
+/// concatenation cannot be parsed safely at Gateway boundaries.
+#[must_use]
+pub fn graph_approval_id(graph_id: &str, node_id: &str) -> String {
+    format!(
+        "approval:v1:{}:{}",
+        URL_SAFE_NO_PAD.encode(graph_id),
+        URL_SAFE_NO_PAD.encode(node_id)
+    )
+}
+
+/// Decode a Runtime graph approval identity. Legacy colon-concatenated IDs
+/// are deliberately rejected: they were ambiguous and could target the wrong
+/// graph or node when either identifier contained a colon.
+#[must_use]
+pub fn parse_graph_approval_id(approval_id: &str) -> Option<(String, String)> {
+    let encoded = approval_id.strip_prefix("approval:v1:")?;
+    let (graph, node) = encoded.split_once(':')?;
+    let graph = String::from_utf8(URL_SAFE_NO_PAD.decode(graph).ok()?).ok()?;
+    let node = String::from_utf8(URL_SAFE_NO_PAD.decode(node).ok()?).ok()?;
+    (!graph.trim().is_empty() && !node.trim().is_empty()).then_some((graph, node))
 }
 
 #[async_trait]
@@ -102,7 +124,7 @@ impl NodeExecutor for ApprovalNodeExecutor {
                 node_id: ticket.node_id.clone(),
                 reason: error.to_string(),
             })?;
-        let approval_id = Self::approval_id(&ticket.graph_id, &ticket.node_id);
+        let approval_id = graph_approval_id(&ticket.graph_id, &ticket.node_id);
         let request = self
             .queue
             .submit_scoped(
@@ -161,7 +183,7 @@ impl NodeExecutor for ApprovalNodeExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{GlobalApprovalDecision, RuntimeEventStore};
+    use crate::{ApprovalDecisionCommand, RuntimeEventStore};
     use harness_contract::execution_graph::{ExecutionGraph, ExecutionNodeKind};
 
     #[tokio::test]
@@ -188,12 +210,14 @@ mod tests {
         assert_eq!(waiting.status, ExecutionNodeStatus::WaitingApproval);
         let approval_id = waiting.result_ref.unwrap();
         queue
-            .decide(GlobalApprovalDecision {
-                approval_id,
-                approved: true,
-                decided_by: "test".into(),
-                reason: "reviewed".into(),
-            })
+            .decide(
+                &crate::security::test_human_interactive_principal(),
+                ApprovalDecisionCommand {
+                    approval_id,
+                    approved: true,
+                    reason: "reviewed".into(),
+                },
+            )
             .unwrap();
         let completed = executor.poll_or_await(&ticket).await.unwrap().result;
         assert_eq!(completed.status, ExecutionNodeStatus::Completed);

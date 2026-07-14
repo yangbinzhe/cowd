@@ -10,10 +10,10 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::bash::{execute_bash, BashCommandInput, BashCommandOutput};
+use crate::bash::{BashCommandInput, BashCommandOutput};
 use crate::checkpoint::{
-    checkpoint_create, checkpoint_diff, checkpoint_list, checkpoint_restore, CheckpointCreateInput,
-    CheckpointDiffInput, CheckpointRestoreInput,
+    checkpoint_create_in, checkpoint_diff_in, checkpoint_list_in, checkpoint_restore_in,
+    CheckpointCreateInput, CheckpointDiffInput, CheckpointRestoreInput,
 };
 use crate::file_ops::{
     edit_file, glob_search, grep_search, read_file, write_file, GrepSearchInput,
@@ -24,6 +24,7 @@ use crate::lane_policy::{iso8601_now, LaneContext};
 use crate::mutation_plan::{
     apply_mutations, preview_mutations, MutationApplyInput, MutationPreviewInput,
 };
+use crate::path_policy::WorkspacePathPolicy;
 use crate::permissions::{EnforcementResult, PermissionEnforcer, PermissionMode};
 use crate::prepared::{
     prepare_readonly_invocations, PreparedReadonlyLeaf, PreparedToolCall, PreparedToolInvocation,
@@ -58,11 +59,6 @@ thread_local! {
         "tools-test",
         std::env::current_dir().unwrap_or_default(),
     );
-}
-
-#[cfg(test)]
-fn reset_test_tool_host() {
-    TEST_TOOL_HOST.with(|host| host.pin_snapshot().cache().reset());
 }
 
 pub(crate) fn execute_with_lease(
@@ -127,7 +123,7 @@ pub(crate) fn execute_tool_with_enforcer(
             let bash_input: BashCommandInput = from_value(input)?;
             let classified_mode = classify_bash_permission(&bash_input.command);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
-            run_bash(bash_input)
+            run_bash(lease, bash_input)
         }
         "read_file" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
@@ -148,7 +144,8 @@ pub(crate) fn execute_tool_with_enforcer(
         }
         "mutation_preview" | "edit_many_preview" | "patch_plan" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<MutationPreviewInput>(input).and_then(run_mutation_preview)
+            from_value::<MutationPreviewInput>(input)
+                .and_then(|parsed| run_mutation_preview(lease, parsed))
         }
         "apply_patch_transaction" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
@@ -157,15 +154,17 @@ pub(crate) fn execute_tool_with_enforcer(
         }
         "checkpoint_create" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<CheckpointCreateInput>(input).and_then(run_checkpoint_create)
+            from_value::<CheckpointCreateInput>(input)
+                .and_then(|parsed| run_checkpoint_create(lease, parsed))
         }
         "checkpoint_list" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            run_checkpoint_list()
+            run_checkpoint_list(lease)
         }
         "checkpoint_diff" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<CheckpointDiffInput>(input).and_then(run_checkpoint_diff)
+            from_value::<CheckpointDiffInput>(input)
+                .and_then(|parsed| run_checkpoint_diff(lease, parsed))
         }
         "checkpoint_restore" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
@@ -234,9 +233,12 @@ pub(crate) fn execute_tool_with_enforcer(
         "ToolSearch" => {
             from_value::<ToolSearchInput>(input).and_then(|parsed| run_tool_search(lease, parsed))
         }
-        "NotebookEdit" => from_value::<NotebookEditInput>(input).and_then(run_notebook_edit),
+        "NotebookEdit" => from_value::<NotebookEditInput>(input)
+            .and_then(|parsed| run_notebook_edit(lease, parsed)),
         "Sleep" => from_value::<SleepInput>(input).and_then(run_sleep),
-        "SendUserMessage" | "Brief" => from_value::<BriefInput>(input).and_then(run_brief),
+        "SendUserMessage" | "Brief" => {
+            from_value::<BriefInput>(input).and_then(|parsed| run_brief(lease, parsed))
+        }
         "Config" => from_value::<ConfigInput>(input).and_then(run_config),
         "EnterPlanMode" => from_value::<EnterPlanModeInput>(input).and_then(run_enter_plan_mode),
         "ExitPlanMode" => from_value::<ExitPlanModeInput>(input).and_then(run_exit_plan_mode),
@@ -269,7 +271,7 @@ pub(crate) fn execute_tool_with_enforcer(
         }
         "vision_analyze" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            run_vision_analyze(input)
+            run_vision_analyze(lease, input)
         }
         "execute_code" => {
             use crate::sandbox_exec::execute_code;
@@ -640,7 +642,7 @@ fn run_testing_permission(input: TestingPermissionInput) -> Result<String, Strin
 /// a base64-encoded representation along with metadata, suitable for passing
 /// to a multimodal LLM. The actual LLM vision call is handled by the
 /// ConversationRuntime, not this tool — this tool prepares the image data.
-fn run_vision_analyze(input: &Value) -> Result<String, String> {
+fn run_vision_analyze(lease: &ToolHostLease, input: &Value) -> Result<String, String> {
     let image_path = input
         .get("image_path")
         .and_then(|v| v.as_str())
@@ -657,7 +659,10 @@ fn run_vision_analyze(input: &Value) -> Result<String, String> {
         .unwrap_or("auto");
 
     // Validate the image file exists and is a supported format
-    let path = std::path::Path::new(image_path);
+    let path = lease
+        .path_policy()
+        .resolve(image_path)
+        .map_err(io_to_string)?;
     if !path.exists() {
         return Err(format!("Image file not found: {}", image_path));
     }
@@ -682,7 +687,7 @@ fn run_vision_analyze(input: &Value) -> Result<String, String> {
     };
 
     // Read and base64-encode the image
-    let image_data = std::fs::read(path)
+    let image_data = std::fs::read(&path)
         .map_err(|e| format!("Failed to read image file '{}': {}", image_path, e))?;
 
     let base64_data = base64::engine::general_purpose::STANDARD.encode(&image_data);
@@ -772,12 +777,15 @@ fn has_dangerous_paths(command: &str) -> bool {
     false
 }
 
-fn run_bash(input: BashCommandInput) -> Result<String, String> {
+fn run_bash(lease: &ToolHostLease, input: BashCommandInput) -> Result<String, String> {
     if let Some(output) = workspace_test_branch_preflight(&input.command, None) {
         return serde_json::to_string_pretty(&output).map_err(|error| error.to_string());
     }
-    serde_json::to_string_pretty(&execute_bash(input).map_err(|error| error.to_string())?)
-        .map_err(|error| error.to_string())
+    serde_json::to_string_pretty(
+        &crate::bash::execute_bash_in_workspace(input, lease.workspace_root())
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn workspace_test_branch_preflight(
@@ -942,10 +950,14 @@ fn branch_divergence_output(
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_read_file(lease: &ToolHostLease, input: ReadFileInput) -> Result<String, String> {
-    let fingerprint = file_fingerprint(&input.path);
-    let scope = file_cache_scope(&input.path);
+    let resolved = lease
+        .path_policy()
+        .resolve(&input.path)
+        .map_err(io_to_string)?;
+    let fingerprint = file_fingerprint(&resolved);
+    let scope = file_cache_scope(&resolved);
     cached_json_tool(lease, "read_file", &input, &fingerprint, &scope, || {
-        read_file(&input.path, input.offset, input.limit).map_err(io_to_string)
+        read_file(lease.path_policy(), &input.path, input.offset, input.limit).map_err(io_to_string)
     })
 }
 
@@ -966,9 +978,16 @@ fn run_read_many(
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_write_file(lease: &ToolHostLease, input: WriteFileInput) -> Result<String, String> {
-    let scope = file_cache_scope(&input.path);
-    create_auto_checkpoint("write_file")?;
-    let output = to_pretty_json(write_file(&input.path, &input.content).map_err(io_to_string)?);
+    let scope = file_cache_scope(
+        &lease
+            .path_policy()
+            .resolve(&input.path)
+            .map_err(io_to_string)?,
+    );
+    create_auto_checkpoint(lease, "write_file")?;
+    let output = to_pretty_json(
+        write_file(lease.path_policy(), &input.path, &input.content).map_err(io_to_string)?,
+    );
     if output.is_ok() {
         lease.cache().invalidate_scope(&scope);
     }
@@ -977,10 +996,16 @@ fn run_write_file(lease: &ToolHostLease, input: WriteFileInput) -> Result<String
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_edit_file(lease: &ToolHostLease, input: EditFileInput) -> Result<String, String> {
-    let scope = file_cache_scope(&input.path);
-    create_auto_checkpoint("edit_file")?;
+    let scope = file_cache_scope(
+        &lease
+            .path_policy()
+            .resolve(&input.path)
+            .map_err(io_to_string)?,
+    );
+    create_auto_checkpoint(lease, "edit_file")?;
     let output = to_pretty_json(
         edit_file(
+            lease.path_policy(),
             &input.path,
             &input.old_string,
             &input.new_string,
@@ -995,8 +1020,11 @@ fn run_edit_file(lease: &ToolHostLease, input: EditFileInput) -> Result<String, 
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_mutation_preview(input: MutationPreviewInput) -> Result<String, String> {
-    to_pretty_json(preview_mutations(input).map_err(io_to_string)?)
+fn run_mutation_preview(
+    lease: &ToolHostLease,
+    input: MutationPreviewInput,
+) -> Result<String, String> {
+    to_pretty_json(preview_mutations(lease.path_policy(), input).map_err(io_to_string)?)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -1004,39 +1032,51 @@ fn run_apply_patch_transaction(
     lease: &ToolHostLease,
     input: MutationApplyInput,
 ) -> Result<String, String> {
-    create_auto_checkpoint("apply_patch_transaction")?;
-    let applied = apply_mutations(input).map_err(io_to_string)?;
+    create_auto_checkpoint(lease, "apply_patch_transaction")?;
+    let applied = apply_mutations(lease.path_policy(), input).map_err(io_to_string)?;
     for file in &applied.applied {
-        lease
-            .cache()
-            .invalidate_scope(&file_cache_scope(&file.path));
+        lease.cache().invalidate_scope(&file_cache_scope(
+            &lease
+                .path_policy()
+                .resolve(&file.path)
+                .map_err(io_to_string)?,
+        ));
     }
     to_pretty_json(applied)
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_checkpoint_create(input: CheckpointCreateInput) -> Result<String, String> {
-    to_pretty_json(checkpoint_create(input).map_err(io_to_string)?)
+fn run_checkpoint_create(
+    lease: &ToolHostLease,
+    input: CheckpointCreateInput,
+) -> Result<String, String> {
+    to_pretty_json(checkpoint_create_in(lease.workspace_root(), input).map_err(io_to_string)?)
 }
 
-fn create_auto_checkpoint(tool_name: &str) -> Result<(), String> {
+fn create_auto_checkpoint(lease: &ToolHostLease, tool_name: &str) -> Result<(), String> {
     if std::env::var("COWD_AUTO_CHECKPOINT").ok().as_deref() != Some("1") {
         return Ok(());
     }
-    checkpoint_create(CheckpointCreateInput {
-        label: Some(format!("auto-before-{tool_name}")),
-    })
+    checkpoint_create_in(
+        lease.workspace_root(),
+        CheckpointCreateInput {
+            label: Some(format!("auto-before-{tool_name}")),
+        },
+    )
     .map(|_| ())
     .map_err(io_to_string)
 }
 
-fn run_checkpoint_list() -> Result<String, String> {
-    to_pretty_json(checkpoint_list().map_err(io_to_string)?)
+fn run_checkpoint_list(lease: &ToolHostLease) -> Result<String, String> {
+    to_pretty_json(checkpoint_list_in(lease.workspace_root()).map_err(io_to_string)?)
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_checkpoint_diff(input: CheckpointDiffInput) -> Result<String, String> {
-    to_pretty_json(checkpoint_diff(input).map_err(io_to_string)?)
+fn run_checkpoint_diff(
+    lease: &ToolHostLease,
+    input: CheckpointDiffInput,
+) -> Result<String, String> {
+    to_pretty_json(checkpoint_diff_in(lease.workspace_root(), input).map_err(io_to_string)?)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -1044,7 +1084,8 @@ fn run_checkpoint_restore(
     lease: &ToolHostLease,
     input: CheckpointRestoreInput,
 ) -> Result<String, String> {
-    let output = to_pretty_json(checkpoint_restore(input).map_err(io_to_string)?);
+    let output =
+        to_pretty_json(checkpoint_restore_in(lease.workspace_root(), input).map_err(io_to_string)?);
     if output.is_ok() {
         lease.cache().invalidate_all();
     }
@@ -1053,10 +1094,11 @@ fn run_checkpoint_restore(
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_glob_search(lease: &ToolHostLease, input: GlobSearchInputValue) -> Result<String, String> {
-    let fingerprint = scope_fingerprint(input.path.as_deref());
-    let scope = directory_cache_scope(input.path.as_deref());
+    let fingerprint = scope_fingerprint(lease.path_policy(), input.path.as_deref())?;
+    let scope = directory_cache_scope(lease.path_policy(), input.path.as_deref())?;
     cached_json_tool(lease, "glob_search", &input, &fingerprint, &scope, || {
-        glob_search(&input.pattern, input.path.as_deref()).map_err(io_to_string)
+        glob_search(lease.path_policy(), &input.pattern, input.path.as_deref())
+            .map_err(io_to_string)
     })
 }
 
@@ -1077,10 +1119,10 @@ fn run_glob_many(
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_grep_search(lease: &ToolHostLease, input: GrepSearchInput) -> Result<String, String> {
-    let fingerprint = scope_fingerprint(input.path.as_deref());
-    let scope = directory_cache_scope(input.path.as_deref());
+    let fingerprint = scope_fingerprint(lease.path_policy(), input.path.as_deref())?;
+    let scope = directory_cache_scope(lease.path_policy(), input.path.as_deref())?;
     cached_json_tool(lease, "grep_search", &input, &fingerprint, &scope, || {
-        grep_search(&input).map_err(io_to_string)
+        grep_search(lease.path_policy(), &input).map_err(io_to_string)
     })
 }
 
@@ -1105,22 +1147,25 @@ fn run_workspace_snapshot(
     input: WorkspaceSnapshotInput,
 ) -> Result<String, String> {
     let snapshot_input = input.clone();
-    let fingerprint = workspace_snapshot_fingerprint(&input);
+    let fingerprint = workspace_snapshot_fingerprint(lease.path_policy(), &input)?;
     cached_json_tool(
         lease,
         "workspace_snapshot",
         &input,
         &fingerprint,
         "workspace:.",
-        || workspace_snapshot_value(snapshot_input),
+        || workspace_snapshot_value(lease, snapshot_input),
     )
 }
 
-fn workspace_snapshot_value(input: WorkspaceSnapshotInput) -> Result<Value, String> {
+fn workspace_snapshot_value(
+    lease: &ToolHostLease,
+    input: WorkspaceSnapshotInput,
+) -> Result<Value, String> {
     let include_git = input.include_git.unwrap_or(true);
     let include_files = input.include_files.unwrap_or(true);
     let max_files = input.max_files.unwrap_or(500).clamp(1, 5000);
-    let cwd = std::env::current_dir().map_err(io_to_string)?;
+    let cwd = lease.path_policy().workspace_root().to_path_buf();
 
     let git = if include_git {
         Some(json!({
@@ -1139,12 +1184,8 @@ fn workspace_snapshot_value(input: WorkspaceSnapshotInput) -> Result<Value, Stri
             if files.len() >= max_files {
                 break;
             }
-            let root_path = if Path::new(&root).is_absolute() {
-                PathBuf::from(root)
-            } else {
-                cwd.join(root)
-            };
-            collect_snapshot_files(&root_path, max_files, &mut files);
+            let root_path = lease.path_policy().resolve(&root).map_err(io_to_string)?;
+            collect_snapshot_files(lease.path_policy(), &root_path, max_files, &mut files);
         }
         files.sort();
         files.dedup();
@@ -1203,20 +1244,28 @@ where
     Ok(output)
 }
 
-fn file_cache_scope(path: &str) -> String {
-    format!("file:{}", absolutize_path(path).to_string_lossy())
+fn file_cache_scope(path: &Path) -> String {
+    format!("file:{}", path.to_string_lossy())
 }
 
-fn directory_cache_scope(path: Option<&str>) -> String {
+fn directory_cache_scope(
+    policy: &WorkspacePathPolicy,
+    path: Option<&str>,
+) -> Result<String, String> {
     match path {
-        Some(path) => format!("directory:{}", absolutize_path(path).to_string_lossy()),
-        None => "workspace:.".to_string(),
+        Some(path) => Ok(format!(
+            "directory:{}",
+            policy
+                .resolve(path)
+                .map_err(io_to_string)?
+                .to_string_lossy()
+        )),
+        None => Ok("workspace:.".to_string()),
     }
 }
 
-fn file_fingerprint(path: &str) -> String {
-    let resolved = absolutize_path(path);
-    let content_hash = match std::fs::File::open(&resolved) {
+fn file_fingerprint(resolved: &Path) -> String {
+    let content_hash = match std::fs::File::open(resolved) {
         Ok(mut file) => {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             let mut buffer = [0_u8; 8192];
@@ -1230,7 +1279,7 @@ fn file_fingerprint(path: &str) -> String {
         }
         Err(_) => String::from("missing"),
     };
-    let Ok(metadata) = std::fs::metadata(&resolved) else {
+    let Ok(metadata) = std::fs::metadata(resolved) else {
         return format!("missing:{}", resolved.to_string_lossy());
     };
     let modified = metadata
@@ -1247,20 +1296,24 @@ fn file_fingerprint(path: &str) -> String {
     ) + &format!(":{content_hash}")
 }
 
-fn scope_fingerprint(path: Option<&str>) -> String {
-    let root = path
-        .map(absolutize_path)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+fn scope_fingerprint(policy: &WorkspacePathPolicy, path: Option<&str>) -> Result<String, String> {
+    let root = match path {
+        Some(path) => policy.resolve(path).map_err(io_to_string)?,
+        None => policy.workspace_root().to_path_buf(),
+    };
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     root.to_string_lossy().hash(&mut hasher);
     let complete = hash_path_scope(&root, &mut hasher, &mut 0usize);
     if !complete {
-        return String::from("uncacheable");
+        return Ok(String::from("uncacheable"));
     }
-    format!("scope:{:016x}", hasher.finish())
+    Ok(format!("scope:{:016x}", hasher.finish()))
 }
 
-fn workspace_snapshot_fingerprint(input: &WorkspaceSnapshotInput) -> String {
+fn workspace_snapshot_fingerprint(
+    policy: &WorkspacePathPolicy,
+    input: &WorkspaceSnapshotInput,
+) -> Result<String, String> {
     let mut parts = Vec::new();
     if input.include_git.unwrap_or(true) {
         parts.push(git_stdout(&["rev-parse", "HEAD"]).unwrap_or_default());
@@ -1272,21 +1325,10 @@ fn workspace_snapshot_fingerprint(input: &WorkspaceSnapshotInput) -> String {
             .clone()
             .unwrap_or_else(|| vec![String::from(".")]);
         for root in roots {
-            parts.push(scope_fingerprint(Some(&root)));
+            parts.push(scope_fingerprint(policy, Some(&root))?);
         }
     }
-    parts.join("\n")
-}
-
-fn absolutize_path(path: &str) -> PathBuf {
-    let path = Path::new(path);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(path)
-    }
+    Ok(parts.join("\n"))
 }
 
 fn hash_path_scope(
@@ -1477,28 +1519,36 @@ fn is_allowed_readonly_batch_tool(name: &str) -> bool {
     )
 }
 
-fn collect_snapshot_files(root: &Path, max_files: usize, files: &mut Vec<String>) {
+fn collect_snapshot_files(
+    policy: &WorkspacePathPolicy,
+    root: &Path,
+    max_files: usize,
+    files: &mut Vec<String>,
+) {
     if files.len() >= max_files {
         return;
     }
-    let Ok(metadata) = std::fs::metadata(root) else {
+    let Ok(resolved_root) = policy.ensure_resolved_path(root) else {
+        return;
+    };
+    let Ok(metadata) = std::fs::metadata(&resolved_root) else {
         return;
     };
     if metadata.is_file() {
-        files.push(root.to_string_lossy().into_owned());
+        files.push(resolved_root.to_string_lossy().into_owned());
         return;
     }
-    if !metadata.is_dir() || should_skip_snapshot_dir(root) {
+    if !metadata.is_dir() || should_skip_snapshot_dir(&resolved_root) {
         return;
     }
-    let Ok(entries) = std::fs::read_dir(root) else {
+    let Ok(entries) = std::fs::read_dir(&resolved_root) else {
         return;
     };
     for entry in entries.flatten() {
         if files.len() >= max_files {
             break;
         }
-        collect_snapshot_files(&entry.path(), max_files, files);
+        collect_snapshot_files(policy, &entry.path(), max_files, files);
     }
 }
 
@@ -1508,7 +1558,14 @@ fn should_skip_snapshot_dir(path: &Path) -> bool {
         .is_some_and(|name| {
             matches!(
                 name,
-                ".git" | "target" | "node_modules" | "dist" | "build" | ".cache" | "coverage"
+                ".git"
+                    | ".cowd"
+                    | "target"
+                    | "node_modules"
+                    | "dist"
+                    | "build"
+                    | ".cache"
+                    | "coverage"
             )
         })
 }
@@ -1670,16 +1727,16 @@ fn run_tool_search(lease: &ToolHostLease, input: ToolSearchInput) -> Result<Stri
     to_pretty_json(execute_tool_search(lease, input))
 }
 
-fn run_notebook_edit(input: NotebookEditInput) -> Result<String, String> {
-    to_pretty_json(execute_notebook_edit(input)?)
+fn run_notebook_edit(lease: &ToolHostLease, input: NotebookEditInput) -> Result<String, String> {
+    to_pretty_json(execute_notebook_edit(lease.path_policy(), input)?)
 }
 
 fn run_sleep(input: SleepInput) -> Result<String, String> {
     to_pretty_json(execute_sleep(input)?)
 }
 
-fn run_brief(input: BriefInput) -> Result<String, String> {
-    to_pretty_json(execute_brief(input)?)
+fn run_brief(lease: &ToolHostLease, input: BriefInput) -> Result<String, String> {
+    to_pretty_json(execute_brief(lease.path_policy(), input)?)
 }
 
 fn run_config(input: ConfigInput) -> Result<String, String> {
@@ -2801,8 +2858,11 @@ fn canonical_tool_token(value: &str) -> String {
 }
 
 #[allow(clippy::too_many_lines)]
-fn execute_notebook_edit(input: NotebookEditInput) -> Result<NotebookEditOutput, String> {
-    let path = std::path::PathBuf::from(&input.notebook_path);
+fn execute_notebook_edit(
+    policy: &WorkspacePathPolicy,
+    input: NotebookEditInput,
+) -> Result<NotebookEditOutput, String> {
+    let path = policy.resolve(&input.notebook_path).map_err(io_to_string)?;
     if path.extension().and_then(|ext| ext.to_str()) != Some("ipynb") {
         return Err(String::from(
             "File must be a Jupyter notebook (.ipynb file).",
@@ -2985,7 +3045,7 @@ fn execute_sleep(input: SleepInput) -> Result<SleepOutput, String> {
     })
 }
 
-fn execute_brief(input: BriefInput) -> Result<BriefOutput, String> {
+fn execute_brief(policy: &WorkspacePathPolicy, input: BriefInput) -> Result<BriefOutput, String> {
     if input.message.trim().is_empty() {
         return Err(String::from("message must not be empty"));
     }
@@ -2996,7 +3056,7 @@ fn execute_brief(input: BriefInput) -> Result<BriefOutput, String> {
         .map(|paths| {
             paths
                 .iter()
-                .map(|path| resolve_attachment(path))
+                .map(|path| resolve_attachment(policy, path))
                 .collect::<Result<Vec<_>, String>>()
         })
         .transpose()?;
@@ -3012,8 +3072,11 @@ fn execute_brief(input: BriefInput) -> Result<BriefOutput, String> {
     })
 }
 
-fn resolve_attachment(path: &str) -> Result<ResolvedAttachment, String> {
-    let resolved = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
+fn resolve_attachment(
+    policy: &WorkspacePathPolicy,
+    path: &str,
+) -> Result<ResolvedAttachment, String> {
+    let resolved = policy.resolve(path).map_err(io_to_string)?;
     let metadata = std::fs::metadata(&resolved).map_err(|error| error.to_string())?;
     Ok(ResolvedAttachment {
         path: resolved.display().to_string(),
@@ -3885,7 +3948,7 @@ mod tests {
     use std::net::{SocketAddr, TcpListener};
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
 
@@ -3896,8 +3959,7 @@ mod tests {
     use serde_json::json;
 
     fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        crate::test_process_environment_lock()
     }
 
     fn temp_path(name: &str) -> PathBuf {
@@ -3906,6 +3968,15 @@ mod tests {
             .expect("time")
             .as_nanos();
         std::env::temp_dir().join(format!("cowd-tools-{unique}-{name}"))
+    }
+
+    fn execute_in_workspace(
+        root: &Path,
+        name: &str,
+        input: &serde_json::Value,
+    ) -> Result<String, String> {
+        let host = crate::ToolHost::builtin("tools-test-workspace", root);
+        super::execute_with_lease(&host.pin_snapshot(), name, input)
     }
 
     fn run_git(cwd: &Path, args: &[&str]) {
@@ -4571,6 +4642,7 @@ mod tests {
     #[test]
     fn notebook_edit_replaces_inserts_and_deletes_cells() {
         let path = temp_path("notebook.ipynb");
+        let root = path.parent().expect("notebook parent");
         std::fs::write(
             &path,
             r#"{
@@ -4584,7 +4656,8 @@ mod tests {
         )
         .expect("write notebook");
 
-        let replaced = execute_tool(
+        let replaced = execute_in_workspace(
+            root,
             "NotebookEdit",
             &json!({
                 "notebook_path": path.display().to_string(),
@@ -4598,7 +4671,8 @@ mod tests {
         assert_eq!(replaced_output["cell_id"], "cell-a");
         assert_eq!(replaced_output["cell_type"], "code");
 
-        let inserted = execute_tool(
+        let inserted = execute_in_workspace(
+            root,
             "NotebookEdit",
             &json!({
                 "notebook_path": path.display().to_string(),
@@ -4611,7 +4685,8 @@ mod tests {
         .expect("NotebookEdit insert should succeed");
         let inserted_output: serde_json::Value = serde_json::from_str(&inserted).expect("json");
         assert_eq!(inserted_output["cell_type"], "markdown");
-        let appended = execute_tool(
+        let appended = execute_in_workspace(
+            root,
             "NotebookEdit",
             &json!({
                 "notebook_path": path.display().to_string(),
@@ -4623,7 +4698,8 @@ mod tests {
         let appended_output: serde_json::Value = serde_json::from_str(&appended).expect("json");
         assert_eq!(appended_output["cell_type"], "code");
 
-        let deleted = execute_tool(
+        let deleted = execute_in_workspace(
+            root,
             "NotebookEdit",
             &json!({
                 "notebook_path": path.display().to_string(),
@@ -4651,8 +4727,10 @@ mod tests {
     #[test]
     fn notebook_edit_rejects_invalid_inputs() {
         let text_path = temp_path("notebook.txt");
+        let root = text_path.parent().expect("notebook parent");
         fs::write(&text_path, "not a notebook").expect("write text file");
-        let wrong_extension = execute_tool(
+        let wrong_extension = execute_in_workspace(
+            root,
             "NotebookEdit",
             &json!({
                 "notebook_path": text_path.display().to_string(),
@@ -4670,7 +4748,8 @@ mod tests {
         )
         .expect("write empty notebook");
 
-        let missing_source = execute_tool(
+        let missing_source = execute_in_workspace(
+            root,
             "NotebookEdit",
             &json!({
                 "notebook_path": empty_notebook.display().to_string(),
@@ -4680,7 +4759,8 @@ mod tests {
         .expect_err("insert without source should fail");
         assert!(missing_source.contains("new_source is required"));
 
-        let missing_cell = execute_tool(
+        let missing_cell = execute_in_workspace(
+            root,
             "NotebookEdit",
             &json!({
                 "notebook_path": empty_notebook.display().to_string(),
@@ -4698,7 +4778,8 @@ mod tests {
         fs::create_dir_all(&root).expect("bash cwd should exist");
         let cwd = root.to_string_lossy().to_string();
 
-        let success = execute_tool(
+        let success = execute_in_workspace(
+            &root,
             "bash",
             &json!({ "command": "printf 'hello'", "cwd": cwd, "dangerouslyDisableSandbox": true }),
         )
@@ -4707,7 +4788,8 @@ mod tests {
         assert_eq!(success_output["stdout"], "hello");
         assert_eq!(success_output["interrupted"], false);
 
-        let failure = execute_tool(
+        let failure = execute_in_workspace(
+            &root,
             "bash",
             &json!({ "command": "printf 'oops' >&2; exit 7", "cwd": cwd, "dangerouslyDisableSandbox": true }),
         )
@@ -4719,7 +4801,8 @@ mod tests {
             .expect("stderr")
             .contains("oops"));
 
-        let timeout = execute_tool(
+        let timeout = execute_in_workspace(
+            &root,
             "bash",
             &json!({ "command": "sleep 1", "cwd": cwd, "timeout": 10, "dangerouslyDisableSandbox": true }),
         )
@@ -4732,7 +4815,8 @@ mod tests {
             .expect("stderr")
             .contains("Command exceeded timeout"));
 
-        let background = execute_tool(
+        let background = execute_in_workspace(
+            &root,
             "bash",
             &json!({ "command": "sleep 1", "cwd": cwd, "run_in_background": true, "dangerouslyDisableSandbox": true }),
         )
@@ -5059,37 +5143,40 @@ mod tests {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        super::reset_test_tool_host();
         let root = temp_path("tool-cache-suite");
         fs::create_dir_all(root.join("src")).expect("create root");
         let file = root.join("src/lib.rs");
         fs::write(&file, "alpha\n").expect("write file");
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
+        let host = crate::ToolHost::builtin("tool-cache-suite", &root);
+        let lease = host.pin_snapshot();
 
-        execute_tool("read_file", &json!({ "path": "src/lib.rs" })).expect("first read");
-        execute_tool("read_file", &json!({ "path": "src/lib.rs" })).expect("second read");
-        let stats = execute_tool("tool_cache_stats", &json!({})).expect("stats");
+        super::execute_with_lease(&lease, "read_file", &json!({ "path": "src/lib.rs" }))
+            .expect("first read");
+        super::execute_with_lease(&lease, "read_file", &json!({ "path": "src/lib.rs" }))
+            .expect("second read");
+        let stats =
+            super::execute_with_lease(&lease, "tool_cache_stats", &json!({})).expect("stats");
         let stats_value: serde_json::Value = serde_json::from_str(&stats).expect("json");
         assert_eq!(stats_value["hits"], 1);
         assert_eq!(stats_value["entries"], 1);
 
-        execute_tool(
+        super::execute_with_lease(
+            &lease,
             "write_file",
             &json!({ "path": "src/lib.rs", "content": "omega\n" }),
         )
         .expect("write invalidates cache");
-        let stats = execute_tool("tool_cache_stats", &json!({})).expect("stats after write");
+        let stats = super::execute_with_lease(&lease, "tool_cache_stats", &json!({}))
+            .expect("stats after write");
         let stats_value: serde_json::Value = serde_json::from_str(&stats).expect("json");
         assert_eq!(stats_value["invalidations"], 1);
         assert_eq!(stats_value["scopeEpochs"], 1);
-        let reread = execute_tool("read_file", &json!({ "path": "src/lib.rs" }))
-            .expect("reread should not use stale cache");
+        let reread =
+            super::execute_with_lease(&lease, "read_file", &json!({ "path": "src/lib.rs" }))
+                .expect("reread should not use stale cache");
         assert!(reread.contains("omega"));
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
-        super::reset_test_tool_host();
     }
 
     #[test]
@@ -5097,27 +5184,29 @@ mod tests {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        super::reset_test_tool_host();
         let root = temp_path("tool-cache-external-suite");
         fs::create_dir_all(root.join("src")).expect("create root");
         let file = root.join("src/lib.rs");
         fs::write(&file, "alpha\n").expect("write file");
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
+        let host = crate::ToolHost::builtin("tool-cache-external-suite", &root);
+        let lease = host.pin_snapshot();
 
-        let first = execute_tool("read_file", &json!({ "path": "src/lib.rs" })).expect("first");
+        let first =
+            super::execute_with_lease(&lease, "read_file", &json!({ "path": "src/lib.rs" }))
+                .expect("first");
         assert!(first.contains("alpha"));
         fs::write(&file, "omega\n").expect("external write");
-        let second = execute_tool("read_file", &json!({ "path": "src/lib.rs" })).expect("second");
+        let second =
+            super::execute_with_lease(&lease, "read_file", &json!({ "path": "src/lib.rs" }))
+                .expect("second");
         assert!(second.contains("omega"));
-        let stats = execute_tool("tool_cache_stats", &json!({})).expect("stats");
+        let stats =
+            super::execute_with_lease(&lease, "tool_cache_stats", &json!({})).expect("stats");
         let stats_value: serde_json::Value = serde_json::from_str(&stats).expect("json");
         assert_eq!(stats_value["hits"], 0);
         assert_eq!(stats_value["misses"], 2);
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
-        super::reset_test_tool_host();
     }
 
     #[test]
@@ -5260,24 +5349,35 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_path("checkpoint-suite");
+        let unrelated_cwd = temp_path("checkpoint-unrelated-cwd");
         fs::create_dir_all(root.join("src")).expect("create root");
+        fs::create_dir_all(&unrelated_cwd).expect("create unrelated cwd");
         let file = root.join("src/lib.rs");
         fs::write(&file, "alpha\n").expect("write file");
         let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
+        std::env::set_current_dir(&unrelated_cwd).expect("set unrelated cwd");
 
-        let created = execute_tool("checkpoint_create", &json!({ "label": "before edit" }))
-            .expect("checkpoint create should succeed");
+        let created = execute_in_workspace(
+            &root,
+            "checkpoint_create",
+            &json!({ "label": "before edit" }),
+        )
+        .expect("checkpoint create should succeed");
         let created_value: serde_json::Value = serde_json::from_str(&created).expect("json");
         let checkpoint_id = created_value["id"]
             .as_str()
             .expect("checkpoint id")
             .to_string();
+        assert!(root.join(".cowd/checkpoints").is_dir());
+        assert!(
+            !unrelated_cwd.join(".cowd/checkpoints").exists(),
+            "checkpoint state must remain in the leased workspace rather than process cwd"
+        );
 
         fs::write(&file, "omega\n").expect("mutate file");
         fs::write(root.join("src/new.rs"), "new\n").expect("add file");
         fs::remove_file(&file).expect("delete file");
-        let diff = execute_tool("checkpoint_diff", &json!({ "id": checkpoint_id }))
+        let diff = execute_in_workspace(&root, "checkpoint_diff", &json!({ "id": checkpoint_id }))
             .expect("checkpoint diff should succeed");
         let diff_value: serde_json::Value = serde_json::from_str(&diff).expect("json");
         assert_eq!(diff_value["type"], "checkpoint_diff");
@@ -5293,12 +5393,13 @@ mod tests {
             .any(|file| file.as_str() == Some("src/new.rs")));
 
         let checkpoint_id = created_value["id"].as_str().expect("checkpoint id");
-        execute_tool("checkpoint_restore", &json!({ "id": checkpoint_id }))
+        execute_in_workspace(&root, "checkpoint_restore", &json!({ "id": checkpoint_id }))
             .expect("checkpoint restore should succeed");
         assert_eq!(fs::read_to_string(&file).expect("read restored"), "alpha\n");
         assert!(!root.join("src/new.rs").exists());
 
-        let listed = execute_tool("checkpoint_list", &json!({})).expect("checkpoint list");
+        let listed =
+            execute_in_workspace(&root, "checkpoint_list", &json!({})).expect("checkpoint list");
         let listed_value: serde_json::Value = serde_json::from_str(&listed).expect("json");
         assert_eq!(listed_value["type"], "checkpoint_list");
         assert!(!listed_value["checkpoints"]
@@ -5308,6 +5409,7 @@ mod tests {
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(unrelated_cwd);
     }
 
     #[test]
@@ -5540,8 +5642,10 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::write(&attachment, b"png-data").expect("write attachment");
+        let root = attachment.parent().expect("attachment parent");
 
-        let result = execute_tool(
+        let result = execute_in_workspace(
+            root,
             "SendUserMessage",
             &json!({
                 "message": "hello user",
@@ -5960,13 +6064,15 @@ printf 'pwsh:%s' "$1"
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_path("perm-read");
         fs::create_dir_all(&root).expect("create root");
-        let file = root.join("readable.txt");
-        fs::write(&file, "content\n").expect("write test file");
+        fs::write(root.join("readable.txt"), "content\n").expect("write test file");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
 
         let registry = read_only_registry();
-        let result = registry.execute("read_file", &json!({ "path": file.display().to_string() }));
+        let result = registry.execute("read_file", &json!({ "path": "readable.txt" }));
         assert!(result.is_ok(), "read_file should be allowed: {result:?}");
 
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
     }
 

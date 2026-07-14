@@ -3,13 +3,16 @@ use std::{
     sync::Arc,
 };
 
+use harness_contract::agent::{
+    AgentCapability, AgentDefinitionId, DefinitionScope, RevisionSelector,
+};
 use harness_contract::skill::{AgentSkillProfile, SkillAdapterKind};
 use runtime::{PermissionMode, Session};
 
 use crate::gateway_tool_executor::GatewayToolExecutor;
 use crate::runtime_bootstrap::RuntimeBootstrapState;
 use crate::runtime_entry::GatewayRuntimeEntry;
-use crate::services::runtime_skill_profiles_for_workspace;
+use crate::services::runtime_skill_assets_for_workspace;
 use crate::{
     filter_tool_specs, inject_auto_resume_context, merge_resume_context_packets, permission_policy,
     runtime_capability_context_item, semantic_checkpoint_resume_context_packet,
@@ -136,15 +139,15 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
         .workspace_root()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    let skill_profiles = runtime_skill_profiles_for_workspace(&workspace_root);
+    let skill_assets = runtime_skill_assets_for_workspace(&workspace_root);
+    runtime_services.replace_skill_catalog(runtime::RuntimeSkillCatalog::new(
+        skill_assets.profiles,
+        skill_assets.prompt_assets,
+    ));
+    let skill_catalog = runtime_services.skill_catalog();
     let tool_definitions = filter_tool_specs(&tool_registry, allowed_tools.as_ref());
-    let active_evolution = crate::current_active_evolution_capability_overlay();
-    let capability_item = runtime_capability_context_item(
-        &tool_definitions,
-        allowed_tools.as_ref(),
-        model_ctx,
-        &active_evolution,
-    );
+    let capability_item =
+        runtime_capability_context_item(&tool_definitions, allowed_tools.as_ref(), model_ctx);
     let runtime_session_id = session.session_id.clone();
     let tool_executor = std::sync::Arc::new(
         GatewayToolExecutor::from_tool_host(
@@ -159,6 +162,16 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
     tool_executor
         .bind_runtime_services(Arc::clone(&runtime_services))
         .map_err(std::io::Error::other)?;
+    let primary_binding = primary_turn_binding(&runtime_services, session_id)?;
+    let primary_memory_agent_id = primary_binding.instance.instance_id.clone();
+    let primary_definition_lineage = Some(
+        primary_binding
+            .definition_ref
+            .definition_id
+            .as_str()
+            .to_string(),
+    );
+    let primary_memory_read_scopes = primary_binding.data_lease.read_scopes.clone();
     let runtime = runtime::StandardRuntimeHost::new(runtime::StandardRuntimeHostConfig {
         session,
         provider_registry,
@@ -177,8 +190,14 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
             Box::new(GatewayHookProgressReporter) as Box<dyn runtime::HookProgressReporter>
         }),
         external_context_items: vec![workspace_item, capability_item],
-        skill_profiles,
+        skill_profiles: skill_catalog.profiles(),
         agent_skill_profile: default_runtime_agent_skill_profile(),
+        skill_prompt_assets: skill_catalog.prompt_assets(),
+        memory_agent_id: primary_memory_agent_id,
+        memory_definition_lineage_id: primary_definition_lineage,
+        memory_team_id: None,
+        memory_read_scopes: primary_memory_read_scopes,
+        reality_binding: Some(primary_binding),
         execution_parent: None,
         runtime_services,
     })
@@ -191,6 +210,26 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
         inject_auto_resume_context(&entry, session_resume_packet, session_id);
     entry.set_resume_context_loaded(resume_context_loaded);
     Ok(entry)
+}
+
+fn primary_turn_binding(
+    runtime_services: &runtime::RuntimeServices,
+    session_id: &str,
+) -> Result<harness_contract::agent::AgentBindingSnapshot, Box<dyn std::error::Error>> {
+    let definition_id = AgentDefinitionId::new(DefinitionScope::Builtin, "cowd/explore")
+        .map_err(std::io::Error::other)?;
+    let mut request = runtime::agent::binding::AgentBindingRequest::new(
+        definition_id,
+        RevisionSelector::LatestApprovedStable,
+        format!("instance:primary:{session_id}"),
+        session_id,
+        format!("primary-turn:{session_id}"),
+    );
+    request.granted_capabilities = vec![AgentCapability::Read, AgentCapability::Search];
+    Ok(runtime_services
+        .compile_agent_binding(request)
+        .map(|compiled| compiled.snapshot)
+        .map_err(std::io::Error::other)?)
 }
 
 fn default_runtime_agent_skill_profile() -> AgentSkillProfile {

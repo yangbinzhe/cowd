@@ -980,15 +980,16 @@ fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
         production_part(&read_repo("crates/gateway/src/services/task_service.rs")).to_string();
     assert!(
         task_service.contains("pub(crate) fn record_lifecycle_event")
-            && task_service.contains("runtime_events: &RuntimeEventService")
+            && task_service.contains("runtime::TaskLifecycleEvent")
+            && task_service.contains(".record_task_lifecycle(")
             && !task_service.contains("ensure_task_session_record"),
-        "task service must write lifecycle state to the scoped runtime store without fake sessions"
+        "task service must write lifecycle state through the Runtime-owned writer without fake sessions"
     );
     let task_routes =
         production_part(&read_repo("crates/gateway/src/api_routes/task_routes.rs")).to_string();
     assert!(
         !task_routes.contains("async fn append_task_runtime_event")
-            && task_routes.contains(".record_lifecycle_event(&state.services.runtime_events"),
+            && task_routes.contains(".record_lifecycle_event(&task,"),
         "task routes must delegate lifecycle projection to TaskService"
     );
     let context_routes = production_part(&read_repo(
@@ -1946,8 +1947,9 @@ fn v3_bidirectional_outboxes_have_started_production_pumps() {
 
     assert!(ingress_bridge.contains("claim_session_runtime_outbox"));
     assert!(ingress_bridge.contains("ack_session_runtime_outbox"));
-    assert!(delivery_bridge.contains("claim_session_terminals"));
-    assert!(delivery_bridge.contains("ack_session_terminal"));
+    assert!(delivery_bridge.contains("SessionTerminalDeliveryPort"));
+    assert!(delivery_bridge.contains("claim_store.claim("));
+    assert!(delivery_bridge.contains("event_store.acknowledge("));
     assert!(
         services.contains("SessionRuntimeBridge") || services.contains("SessionInputRouter"),
         "workspace RuntimeServices must own the durable session bridge"

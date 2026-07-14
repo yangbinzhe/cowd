@@ -717,51 +717,6 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
         }
     };
     let team_id = format!("harness-eval-team-{}", uuid::Uuid::new_v4());
-    let team_build = match runtime::TeamBuilder.build(runtime::TeamBuildRequest {
-        team_id: team_id.clone(),
-        session_id: session.session_id.clone(),
-        objective: objective.to_string(),
-        template_id: harness_contract::team::TeamTemplateId::FanoutResearchSynthesis,
-        roles: vec![
-            harness_contract::team::TeamRoleSpec {
-                role_id: "analysis".to_string(),
-                responsibility: "independent architecture analysis".to_string(),
-                required_capabilities: vec!["analysis".to_string()],
-                allowed_tools: vec!["read_file".to_string()],
-                acceptance: vec!["cite evidence".to_string()],
-                evidence_duties: vec!["source evidence".to_string()],
-            },
-            harness_contract::team::TeamRoleSpec {
-                role_id: "review".to_string(),
-                responsibility: "independent adversarial review".to_string(),
-                required_capabilities: vec!["review".to_string()],
-                allowed_tools: vec!["read_file".to_string()],
-                acceptance: vec!["identify risk".to_string()],
-                evidence_duties: vec!["review evidence".to_string()],
-            },
-        ],
-        role_dependencies: Vec::new(),
-        selected_agent_profiles: std::collections::BTreeMap::new(),
-        verdict: harness_contract::team::TeamLiftVerdict {
-            accepted: true,
-            max_parallel_agents: 2,
-            reasons: vec!["independent analysis and review".to_string()],
-            resized_from: 2,
-        },
-        permission_lease: "read_only".to_string(),
-        model_lease: "harness_eval".to_string(),
-        backend_constraint: None,
-    }) {
-        Ok(team_build) => team_build,
-        Err(error) => {
-            return mission_runtime_collaboration_failure(
-                started,
-                objective,
-                "build_team_execution_graph",
-                error,
-            );
-        }
-    };
     let capability = runtime::resolve_agent_capability(runtime::AgentCapabilityRequest {
         role_id: "executor".to_string(),
         allowed_capabilities: vec![
@@ -783,12 +738,50 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
             );
         }
     };
+    let team_plan = match runtime_services.team_runtime().plan(
+        harness_contract::team::TeamInstantiationRequest {
+            request_id: format!("harness-eval-request-{team_id}"),
+            team_id: team_id.clone(),
+            session_id: session.session_id.clone(),
+            mission_id: None,
+            parent_execution: None,
+            selection_mode: harness_contract::team::TeamSelectionMode::Explicit,
+            template_selector: harness_contract::team::TeamTemplateSelector::LatestStable {
+                template_id: harness_contract::team::TeamTemplateDefinitionId::new(
+                    harness_contract::agent::DefinitionScope::Builtin,
+                    "cowd/parallel-research-synthesis",
+                )
+                .expect("builtin Team template id"),
+            },
+            objective: objective.to_string(),
+            acceptance: vec!["summary".to_string(), "evidence".to_string()],
+            risk: None,
+            role_binding_overrides: Vec::new(),
+            cardinality_overrides: Vec::new(),
+            focus_partition_plans: Vec::new(),
+            permission_lease: "read_only".to_string(),
+            model_lease: "harness_eval".to_string(),
+            budget_lease: None,
+            managed_invocation: None,
+            resource_scopes: Vec::new(),
+        },
+    ) {
+        Ok(team_plan) => team_plan,
+        Err(error) => {
+            return mission_runtime_collaboration_failure(
+                started,
+                objective,
+                "plan_team_execution_graph",
+                error,
+            );
+        }
+    };
     let relation = match runtime_services.session_relations().add_relation(
         &session.session_id,
         format!("{}-review", session.session_id),
         runtime::SessionRelationKind::ConflictsWith,
         "review lane disputes unbounded execution",
-        vec![format!("execution_graph:{}", team_build.graph.id)],
+        vec![format!("execution_graph:{}", team_plan.graph.id)],
     ) {
         Ok(relation) => relation,
         Err(error) => {
@@ -829,21 +822,21 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
         ),
         (
             "template_selected",
-            collaboration.template_id != runtime::CollaborationTemplateId::SingleExecutor,
+            collaboration.template_id != runtime::CollaborationTemplateId::DirectExecutor,
         ),
         (
             "execution_graph_quality",
-            harness_contract::execution_graph::validate_execution_graph(&team_build.graph).is_ok()
-                && team_build.graph.nodes.iter().any(|node| {
+            harness_contract::execution_graph::validate_execution_graph(&team_plan.graph).is_ok()
+                && team_plan.graph.nodes.iter().any(|node| {
                     node.kind == harness_contract::execution_graph::ExecutionNodeKind::Verify
                 })
-                && team_build.graph.nodes.iter().any(|node| {
+                && team_plan.graph.nodes.iter().any(|node| {
                     node.kind == harness_contract::execution_graph::ExecutionNodeKind::Synthesize
                 }),
         ),
         (
             "collaboration_graph_compiler",
-            team_build.bindings.len() == 2,
+            team_plan.role_slots.len() >= 2,
         ),
         (
             "capability_binding",
@@ -893,18 +886,18 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
             "runtime_actions": ["continue_single", "use_team_template", "build_execution_graph", "dispatch_session", "request_arbiter", "parallel_tool_batch"],
         },
         "execution_graph": {
-            "execution_graph_id": team_build.graph.id,
-            "node_count": team_build.graph.nodes.len(),
-            "edge_count": team_build.graph.edges.len(),
-            "is_dag": harness_contract::execution_graph::validate_execution_graph(&team_build.graph).is_ok(),
-            "has_verify_node": team_build.graph.nodes.iter().any(|node| node.kind == harness_contract::execution_graph::ExecutionNodeKind::Verify),
-            "has_synthesize_node": team_build.graph.nodes.iter().any(|node| node.kind == harness_contract::execution_graph::ExecutionNodeKind::Synthesize),
-            "ready_node_ids": team_build.graph.nodes.iter().filter(|node| node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask).map(|node| node.id.clone()).collect::<Vec<_>>(),
+            "execution_graph_id": team_plan.graph.id,
+            "node_count": team_plan.graph.nodes.len(),
+            "edge_count": team_plan.graph.edges.len(),
+            "is_dag": harness_contract::execution_graph::validate_execution_graph(&team_plan.graph).is_ok(),
+            "has_verify_node": team_plan.graph.nodes.iter().any(|node| node.kind == harness_contract::execution_graph::ExecutionNodeKind::Verify),
+            "has_synthesize_node": team_plan.graph.nodes.iter().any(|node| node.kind == harness_contract::execution_graph::ExecutionNodeKind::Synthesize),
+            "ready_node_ids": team_plan.graph.nodes.iter().filter(|node| node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask).map(|node| node.id.clone()).collect::<Vec<_>>(),
             "blocked_node_ids": Vec::<String>::new(),
         },
         "agents": {
             "team_id": team_id,
-            "role_count": team_build.tasks.len(),
+            "role_count": team_plan.role_slots.len(),
             "capability_summary": capability.capability_summary,
             "allowed_tools": capability.allowed_tools,
             "permission_mode": format!("{:?}", capability.permission_mode),
@@ -930,14 +923,14 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
         },
         "evidence_refs": [
             format!("team:{team_id}"),
-            format!("execution_graph:{}", team_build.graph.id),
+            format!("execution_graph:{}", team_plan.graph.id),
             format!("session-relation:{}", relation.relation_id),
-            format!("synthesis:{}", team_build.graph.id)
+            format!("synthesis:{}", team_plan.graph.id)
         ],
         "terminal_evidence": {
-            "agent_terminal_count": team_build.tasks.len(),
+            "agent_terminal_count": team_plan.role_slots.len(),
             "mailbox_completed_count": 1,
-            "synthesis_receipt_id": format!("synthesis:{}", team_build.graph.id),
+            "synthesis_receipt_id": format!("synthesis:{}", team_plan.graph.id),
             "session_relation_count": 1,
             "runtime_turn_result_count": 1,
             "recovery_applied_count": usize::from(conflict_count > 0),

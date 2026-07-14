@@ -5,7 +5,7 @@
     clippy::unreachable
 )]
 
-use harness_contract::agent::AgentTaskPacket;
+use harness_contract::agent::AgentTaskIntent;
 use harness_contract::execution_graph::{
     validate_execution_graph, ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind,
 };
@@ -32,8 +32,8 @@ fn request(protocol: ProtocolId, graph_id: &str) -> ProtocolCompileRequest {
     request
 }
 
-fn packet(node: &harness_contract::execution_graph::ExecutionNodeSpec) -> AgentTaskPacket {
-    serde_json::from_str(&node.payload_ref).expect("canonical AgentTaskPacket")
+fn packet(node: &harness_contract::execution_graph::ExecutionNodeSpec) -> AgentTaskIntent {
+    serde_json::from_str(&node.payload_ref).expect("canonical AgentTaskIntent")
 }
 
 fn role_nodes<'a>(graph: &'a ExecutionGraph, role: &str) -> Vec<&'a str> {
@@ -68,7 +68,7 @@ fn registry_contains_only_valid_available_v1_protocols() {
 }
 
 #[test]
-fn all_compilers_emit_only_canonical_task_verify_and_synthesize_nodes() {
+fn all_compilers_emit_binding_ready_task_intents_before_runtime_materializes_packets() {
     for (protocol, graph_id) in [
         (ProtocolId::Debate, "protocol-debate"),
         (ProtocolId::Jps, "protocol-jps"),
@@ -107,6 +107,9 @@ fn all_compilers_emit_only_canonical_task_verify_and_synthesize_nodes() {
             assert_eq!(task.node_id, node.id);
             assert_eq!(task.expected_graph_revision, 0);
             assert_eq!(task.budget_lease.max_tokens, 4_096);
+            assert!(task.definition_ref.is_none());
+            assert!(task.selected_agent_id.is_none());
+            assert!(task.granted_capabilities.is_empty());
             assert_eq!(
                 task.constraints
                     .iter()

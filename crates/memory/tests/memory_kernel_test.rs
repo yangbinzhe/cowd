@@ -143,11 +143,22 @@ async fn memory_kernel_binds_session_agent_scope() {
     let kernel = MemoryKernel::new(Arc::clone(&manager));
     let ctx = MemoryTurnContext::new("session-kernel", "agent-planner");
 
+    let remembered = entry(MemoryLayer::L2, MemorySource::AutoExtracted, "turn-scoped");
+    let remembered_id = remembered.id;
+    kernel.remember(&ctx, remembered).await.unwrap();
+
     let prepared = kernel.prepare(&ctx, "anything", &[]).await.unwrap();
 
+    let stored = manager
+        .get_entry(&remembered_id.to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.session_id.as_deref(), Some("session-kernel"));
+    assert_eq!(stored.source_agent.as_deref(), Some("agent-planner"));
     assert_eq!(
-        manager.active_session_id(),
-        Some("session-kernel".to_string())
+        stored.scope,
+        MemoryScope::Session("session-kernel".to_string())
     );
     assert_eq!(
         prepared.total_tokens,
@@ -361,7 +372,7 @@ async fn memory_kernel_remember_binds_session_agent_and_scope() {
     assert_eq!(stored_private.source_agent.as_deref(), Some("agent-writer"));
     assert_eq!(
         stored_private.scope,
-        MemoryScope::Agent("agent-writer".to_string())
+        MemoryScope::AgentInstance("agent-writer".to_string())
     );
 }
 
@@ -377,7 +388,10 @@ async fn memory_kernel_remember_replaces_default_project_scope() {
     let mut ctx = MemoryTurnContext::new("session-project", "agent-shared");
     ctx.project_id = Some("project-beta".to_string());
 
-    let mut shared_entry = entry(MemoryLayer::L4, MemorySource::Import, "shared decision");
+    // Ordinary Runtime facts are scoped L3. L4 is reserved for the separate
+    // governed Team promotion path and is intentionally not writable through
+    // MemoryKernel.
+    let mut shared_entry = entry(MemoryLayer::L3, MemorySource::Import, "shared decision");
     shared_entry.scope = MemoryScope::Project("default".to_string());
     shared_entry.visibility = AgentVisibility::Shared;
     let shared_id = shared_entry.id;
@@ -1215,10 +1229,6 @@ async fn memory_kernel_post_turn_preserves_turn_success() {
     let result = kernel.post_turn(&ctx, &mut messages).await;
 
     assert!(result.is_ok());
-    assert_eq!(
-        manager.active_session_id(),
-        Some("session-post-turn".to_string())
-    );
 }
 
 #[tokio::test]
@@ -1235,4 +1245,62 @@ async fn concurrent_agents_do_not_share_memory_turn_context() {
     assert_eq!(a.agent_id, "agent-a");
     assert_eq!(b.session_id, "session-b");
     assert_eq!(b.agent_id, "agent-b");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_kernel_turns_do_not_cross_write_or_recall_identity() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new(test_config(&tmp.path().join("concurrent-turns.db")))
+            .await
+            .unwrap(),
+    );
+    let kernel = MemoryKernel::new(Arc::clone(&manager));
+    let ctx_a = MemoryTurnContext::new("session-a", "agent-a");
+    let ctx_b = MemoryTurnContext::new("session-b", "agent-b");
+
+    let mut a_entry = entry(
+        MemoryLayer::L2,
+        MemorySource::AutoExtracted,
+        "agent-a evidence",
+    );
+    a_entry.content = "agent-a private turn evidence".to_string();
+    let a_id = a_entry.id;
+    let mut b_entry = entry(
+        MemoryLayer::L2,
+        MemorySource::AutoExtracted,
+        "agent-b evidence",
+    );
+    b_entry.content = "agent-b private turn evidence".to_string();
+    let b_id = b_entry.id;
+
+    let writer_a = {
+        let kernel = kernel.clone();
+        let ctx_a = ctx_a.clone();
+        async move {
+            tokio::task::yield_now().await;
+            kernel.remember(&ctx_a, a_entry).await.unwrap();
+        }
+    };
+    let writer_b = {
+        let kernel = kernel.clone();
+        async move {
+            tokio::task::yield_now().await;
+            kernel.remember(&ctx_b, b_entry).await.unwrap();
+        }
+    };
+    tokio::join!(writer_a, writer_b);
+
+    let a = manager.get_entry(&a_id.to_string()).await.unwrap().unwrap();
+    let b = manager.get_entry(&b_id.to_string()).await.unwrap().unwrap();
+    assert_eq!(a.session_id.as_deref(), Some("session-a"));
+    assert_eq!(a.source_agent.as_deref(), Some("agent-a"));
+    assert_eq!(a.scope, MemoryScope::Session("session-a".to_string()));
+    assert_eq!(b.session_id.as_deref(), Some("session-b"));
+    assert_eq!(b.source_agent.as_deref(), Some("agent-b"));
+    assert_eq!(b.scope, MemoryScope::Session("session-b".to_string()));
+
+    let visible_to_a = kernel.prepare(&ctx_a, "turn evidence", &[]).await.unwrap();
+    assert!(visible_to_a.entries.iter().any(|item| item.id == a_id));
+    assert!(!visible_to_a.entries.iter().any(|item| item.id == b_id));
 }

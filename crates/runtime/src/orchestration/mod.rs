@@ -12,7 +12,7 @@ pub mod validator;
 
 use crate::execution_core::{graph::ExecutionRunReport, RuntimeExecutionDecision};
 use crate::RuntimeServices;
-use harness_contract::agent::AgentTaskPacket;
+use harness_contract::agent::{AgentTaskIntent, AgentTaskPacket};
 use harness_contract::execution_graph::{
     ExecutionGraph, ExecutionGraphProjection, ExecutionNodeKind, ExecutionNodeStatus,
 };
@@ -81,9 +81,21 @@ pub async fn submit_runtime_orchestration_request(
         return apply_reused_team_execution(result, reused);
     }
 
-    let graph_id = compiled.graph.id.clone();
-    let compiled_team = declares_team(&compiled.graph);
-    match services.graph_runner().start(compiled.graph).await {
+    let graph = match services.compile_graph_agent_intents(compiled.graph) {
+        Ok(graph) => graph,
+        Err(error) => {
+            result.status = "blocked".to_string();
+            result.decision.status = result.status.clone();
+            result
+                .decision
+                .validation_findings
+                .push(format!("agent_binding_compilation_failed:{error}"));
+            return result;
+        }
+    };
+    let graph_id = graph.id.clone();
+    let compiled_team = declares_team(&graph);
+    match services.graph_runner().start(graph).await {
         Ok(report) => match services.graph_runner().projection(&graph_id).await {
             Ok(projection) => {
                 let terminal = projection.terminal_result_ref.clone();
@@ -104,7 +116,6 @@ pub async fn submit_runtime_orchestration_request(
                 result.execution = json!({
                     "type": "execution_graph_run",
                     "status": result.status,
-                    "protocol": compiled.protocol,
                     "report": report,
                     "projection": projection,
                     "terminal_result_ref": terminal,
@@ -141,7 +152,6 @@ pub async fn submit_runtime_orchestration_request(
 #[derive(Debug)]
 struct ReusedTeamExecution {
     graph_id: String,
-    protocol: Option<crate::execution_core::ProtocolRef>,
     projection: ExecutionGraphProjection,
 }
 
@@ -179,7 +189,6 @@ async fn find_reusable_team_execution(
             .ok()?;
         return Some(ReusedTeamExecution {
             graph_id: link.child_execution_id,
-            protocol: protocol_for_graph(&graph),
             projection,
         });
     }
@@ -199,13 +208,10 @@ fn apply_reused_team_execution(
     } else {
         "completed".to_string()
     };
-    result.protocol = reused.protocol;
-    result.decision.selected_protocol = result.protocol.clone();
     result.decision.status = result.status.clone();
     result.execution = json!({
         "type": "execution_graph_reused",
         "status": result.status,
-        "protocol": result.protocol,
         "report": report,
         "projection": reused.projection,
         "terminal_result_ref": terminal,
@@ -228,33 +234,19 @@ fn apply_reused_team_execution(
 fn declares_team(graph: &ExecutionGraph) -> bool {
     graph.nodes.iter().any(|node| {
         node.kind == ExecutionNodeKind::AgentTask
-            && serde_json::from_str::<AgentTaskPacket>(&node.payload_ref)
-                .ok()
-                .and_then(|packet| packet.team_id)
+            && task_packet_or_intent(&node.payload_ref)
+                .and_then(|(_, team_id)| team_id)
                 .is_some_and(|team_id| !team_id.trim().is_empty())
     })
 }
 
-fn protocol_for_graph(graph: &ExecutionGraph) -> Option<crate::execution_core::ProtocolRef> {
-    graph.nodes.iter().find_map(|node| {
-        if node.kind != ExecutionNodeKind::AgentTask {
-            return None;
-        }
-        let packet = serde_json::from_str::<AgentTaskPacket>(&node.payload_ref).ok()?;
-        packet.constraints.iter().find_map(|constraint| {
-            let value = constraint.strip_prefix("protocol:")?;
-            let (id, version) = value.rsplit_once('@')?;
-            let id = match id {
-                "debate" => crate::execution_core::ProtocolId::Debate,
-                "jps" => crate::execution_core::ProtocolId::Jps,
-                "review_fix" => crate::execution_core::ProtocolId::ReviewFix,
-                "incident" => crate::execution_core::ProtocolId::Incident,
-                _ => return None,
-            };
-            let version = version.parse::<u32>().ok()?;
-            Some(crate::execution_core::ProtocolRef::new(id, version))
-        })
-    })
+fn task_packet_or_intent(payload: &str) -> Option<(Vec<String>, Option<String>)> {
+    if let Ok(packet) = serde_json::from_str::<AgentTaskPacket>(payload) {
+        return Some((packet.constraints, packet.team_id));
+    }
+    serde_json::from_str::<AgentTaskIntent>(payload)
+        .ok()
+        .map(|intent| (intent.constraints, intent.team_id))
 }
 
 fn same_objective(left: &str, right: &str) -> bool {
@@ -351,7 +343,7 @@ fn report_from_projection(projection: &ExecutionGraphProjection) -> ExecutionRun
 
 fn should_execute(result: &RuntimeOrchestrationResult, compiled: &CompiledOrchestration) -> bool {
     result.status == "compiled"
-        && (compiled.protocol.is_some() || compiled.execute_without_protocol)
+        && compiled.execute_without_protocol
         && result.decision.status == "compiled"
 }
 
@@ -397,7 +389,13 @@ fn compile_runtime_orchestration(
     let compiled = if decision.status == "rejected" || decision.status == "needs_approval" {
         None
     } else {
-        match compiler::compile_orchestration(&request_id, &request, &plan, parent_execution) {
+        match compiler::compile_orchestration(
+            &request_id,
+            &request,
+            &plan,
+            parent_execution,
+            services.map(|services| services.team_runtime().as_ref()),
+        ) {
             Ok(compiled) => Some(compiled),
             Err(error) => {
                 decision.status = "unavailable".to_string();
@@ -409,9 +407,6 @@ fn compile_runtime_orchestration(
         }
     };
     let compiled_ok = compiled.is_some();
-    decision.selected_protocol = compiled
-        .as_ref()
-        .and_then(|compiled| compiled.protocol.clone());
     let status = if decision.status == "rejected" || decision.status == "needs_approval" {
         decision.status.clone()
     } else if compiled_ok {
@@ -434,7 +429,6 @@ fn compile_runtime_orchestration(
                 "status": "compiled",
                 "graph": compiled.graph,
                 "command": compiled.command,
-                "protocol": compiled.protocol,
             })
         },
     );
@@ -443,9 +437,6 @@ fn compile_runtime_orchestration(
         RuntimeOrchestrationResult {
             request_id,
             status,
-            protocol: compiled
-                .as_ref()
-                .and_then(|compiled| compiled.protocol.clone()),
             decision,
             execution,
             evidence,
@@ -572,7 +563,7 @@ mod tests {
             action,
             reason: None,
             template_hint: None,
-            protocol: None,
+            focus_partition_plans: Vec::new(),
             capabilities: Vec::new(),
             evidence_refs: Vec::new(),
             constraints: Default::default(),
@@ -688,7 +679,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deliberation_runs_the_protocol_graph_and_returns_one_terminal_result() {
+    async fn deliberation_instantiates_the_template_graph_and_returns_one_terminal_result() {
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace = temp.path().join("workspace");
         std::fs::create_dir_all(&workspace).expect("workspace");
@@ -726,10 +717,7 @@ mod tests {
         .await;
 
         assert_eq!(result.status, "completed", "{result:?}");
-        assert_eq!(
-            result.protocol.as_ref().map(|item| item.id),
-            Some(crate::execution_core::ProtocolId::Debate)
-        );
+        assert!(result.execution.get("protocol").is_none());
         assert_eq!(result.execution["type"], "execution_graph_run");
         assert!(result.execution["terminal_result_ref"]
             .as_str()

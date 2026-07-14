@@ -13,9 +13,8 @@ use harness_contract::turn::{SessionDispatchAction, SessionHandoff};
 
 use crate::runtime_event_store::RuntimeTransactionEventInput;
 use crate::{
-    ExecutionGraphHost, GlobalApprovalDecision, MissionCommandInterpreter,
-    MissionInterpretedCommand, RuntimeEventInput, RuntimeEventRef, RuntimeEventScope,
-    RuntimeServices, SessionRelationKind,
+    ExecutionGraphHost, MissionCommandInterpreter, MissionInterpretedCommand, RuntimeEventInput,
+    RuntimeEventRef, RuntimeEventScope, RuntimeServices, SessionRelationKind,
 };
 
 pub async fn execute_mission_command(
@@ -142,22 +141,8 @@ async fn execute(
         }
         (MissionCommandTarget::Approval { approval_id }, MissionCommandAction::Approve)
         | (MissionCommandTarget::Approval { approval_id }, MissionCommandAction::Reject) => {
-            let approved = matches!(command.action, MissionCommandAction::Approve);
-            let receipt = services.approval_queue().decide(GlobalApprovalDecision {
-                approval_id: approval_id.clone(),
-                approved,
-                decided_by: non_empty_actor(&command.actor),
-                reason: command
-                    .payload
-                    .get("reason")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            })?;
-            Ok((
-                serde_json::json!({ "receipt": receipt }),
-                command.evidence_refs.clone(),
-            ))
+            let _ = approval_id;
+            Err("mission approval decisions require an authenticated VerifiedPrincipal command port".to_string())
         }
         (MissionCommandTarget::Relation { .. }, MissionCommandAction::Link) => {
             let relation = parse_relation(command)?;

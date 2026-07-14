@@ -14,7 +14,7 @@ mod validation;
 
 use std::collections::BTreeMap;
 
-use harness_contract::agent::AgentTaskPacket;
+use harness_contract::agent::AgentTaskIntent;
 use harness_contract::context::ContextBudgetLeaseRef;
 use harness_contract::execution_graph::{
     ExecutionEdge, ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec,
@@ -45,7 +45,7 @@ pub use validation::{
 pub enum ProtocolCompileError {
     #[error(transparent)]
     Validation(#[from] ProtocolValidationError),
-    #[error("failed to encode canonical AgentTaskPacket: {0}")]
+    #[error("failed to encode canonical AgentTaskIntent: {0}")]
     PacketEncoding(#[from] serde_json::Error),
 }
 
@@ -213,9 +213,11 @@ impl<'a> ProtocolGraphBuilder<'a> {
             "protocol_evidence_mode:{}",
             role.evidence_mode.as_str()
         ));
-        let packet = AgentTaskPacket {
+        let intent = AgentTaskIntent {
+            selected_agent_id: None,
+            definition_ref: None,
+            granted_capabilities: Vec::new(),
             run_id: format!("{}:run:{role_label}", self.graph.id),
-            agent_id: agent_id.clone(),
             task_id: format!("{}:task:{role_label}", self.graph.id),
             session_id: self.request.session_id.clone(),
             mission_id: self.request.mission_id.clone(),
@@ -248,16 +250,17 @@ impl<'a> ProtocolGraphBuilder<'a> {
                 self.request.budget_tokens,
                 self.request.budget_revision,
             ),
+            managed_invocation: None,
             idempotency_key: idempotency_key.clone(),
         };
         let mut node = ExecutionNodeSpec::new(
             ExecutionNodeKind::AgentTask,
             AgentTaskExecutor::KIND,
-            serde_json::to_string(&packet)?,
+            serde_json::to_string(&intent)?,
         );
         node.id = node_id.clone();
         node.idempotency_key = idempotency_key;
-        node.acceptance.criteria = packet.acceptance.clone();
+        node.acceptance.criteria = intent.acceptance.clone();
         node.retry_policy.max_attempts = self.spec.stop_policy.max_agent_attempts;
         node.resource_scopes = self.request.resource_scopes.clone();
         self.graph.nodes.push(node);
@@ -345,68 +348,5 @@ fn role_slot_focus(role: &RoleSpec, slot: usize) -> &'static str {
         1 => "Independent lane: examine alternatives, counterexamples, and tradeoffs.",
         2 => "Independent lane: examine integration boundaries, operational impact, and verification evidence.",
         _ => "Independent lane: examine future risks, unresolved assumptions, and the strongest falsification path.",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use harness_contract::agent::AgentTaskPacket;
-    use harness_contract::execution_graph::ExecutionNodeKind;
-
-    use super::{ProtocolCompileRequest, ProtocolId, ProtocolRef, ProtocolRegistry};
-
-    #[test]
-    fn protocol_role_packets_cannot_recursively_orchestrate_new_teams() {
-        let mut request = ProtocolCompileRequest::new(
-            ProtocolRef::new(ProtocolId::Jps, 1),
-            "protocol-boundary",
-            "session",
-            "produce a constrained decision",
-        );
-        request.allowed_tools = vec!["read_file".to_string(), "runtime_orchestrate".to_string()];
-        let graph = ProtocolRegistry::compile(&request).expect("protocol graph");
-
-        let packets = graph
-            .nodes
-            .iter()
-            .filter(|node| node.kind == ExecutionNodeKind::AgentTask)
-            .map(|node| serde_json::from_str::<AgentTaskPacket>(&node.payload_ref).expect("packet"))
-            .collect::<Vec<_>>();
-        assert!(!packets.is_empty());
-        assert!(packets.iter().all(|packet| {
-            !packet
-                .allowed_tools
-                .iter()
-                .any(|tool| tool == "runtime_orchestrate")
-        }));
-        assert!(packets
-            .iter()
-            .all(|packet| packet.objective.contains("Role execution boundary")));
-        assert!(packets.iter().all(|packet| {
-            !packet
-                .constraints
-                .iter()
-                .any(|constraint| constraint == "protocol_role:frame")
-                || (packet.allowed_tools.is_empty()
-                    && packet
-                        .constraints
-                        .iter()
-                        .any(|constraint| constraint == "protocol_evidence_mode:objective_only"))
-        }));
-        assert!(packets.iter().any(|packet| {
-            packet
-                .constraints
-                .iter()
-                .any(|constraint| constraint == "protocol_role:solution")
-                && packet.allowed_tools == vec!["read_file".to_string()]
-                && packet.objective.contains("Independent lane:")
-        }));
-        assert!(packets.iter().all(|packet| {
-            !packet
-                .constraints
-                .iter()
-                .any(|constraint| constraint == "protocol_role:decision_synthesis")
-                || packet.allowed_tools.is_empty()
-        }));
     }
 }

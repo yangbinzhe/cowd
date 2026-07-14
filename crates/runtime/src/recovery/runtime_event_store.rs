@@ -4,7 +4,7 @@
 //! node, goal, agent, team, and mission projections therefore observe one
 //! monotonic commit cursor and never a partially appended multi-stream update.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const STORE_SCHEMA_VERSION: i64 = 3;
+const STORE_SCHEMA_VERSION: i64 = 4;
 const EVENT_SCHEMA_VERSION: u32 = 1;
 const MAX_TRANSACTION_EVENTS: usize = 10_000;
 const MAX_TRANSACTION_BYTES: usize = 32 * 1024 * 1024;
@@ -34,12 +34,18 @@ pub enum RuntimeEventScope {
     SessionCommand,
     Team,
     Agent,
+    AgentDefinition,
+    TeamTemplate,
     Approval,
+    Evolution,
     Relation,
     Steward,
     Task,
     Worker,
     Schedule,
+    /// Durable definitions, invocations, dispatcher fences and effect-outbox
+    /// receipts for Runtime-managed Agent automation.
+    ManagedAgent,
     Tool,
     Recovery,
     CrossPlane,
@@ -58,12 +64,16 @@ impl RuntimeEventScope {
             Self::SessionCommand => "session_command",
             Self::Team => "team",
             Self::Agent => "agent",
+            Self::AgentDefinition => "agent_definition",
+            Self::TeamTemplate => "team_template",
             Self::Approval => "approval",
+            Self::Evolution => "evolution",
             Self::Relation => "relation",
             Self::Steward => "steward",
             Self::Task => "task",
             Self::Worker => "worker",
             Self::Schedule => "schedule",
+            Self::ManagedAgent => "managed_agent",
             Self::Tool => "tool",
             Self::Recovery => "recovery",
             Self::CrossPlane => "cross_plane",
@@ -81,12 +91,16 @@ impl RuntimeEventScope {
             "session_command" => Ok(Self::SessionCommand),
             "team" => Ok(Self::Team),
             "agent" => Ok(Self::Agent),
+            "agent_definition" => Ok(Self::AgentDefinition),
+            "team_template" => Ok(Self::TeamTemplate),
             "approval" => Ok(Self::Approval),
+            "evolution" => Ok(Self::Evolution),
             "relation" => Ok(Self::Relation),
             "steward" => Ok(Self::Steward),
             "task" => Ok(Self::Task),
             "worker" => Ok(Self::Worker),
             "schedule" => Ok(Self::Schedule),
+            "managed_agent" => Ok(Self::ManagedAgent),
             "tool" => Ok(Self::Tool),
             "recovery" => Ok(Self::Recovery),
             "cross_plane" => Ok(Self::CrossPlane),
@@ -113,6 +127,8 @@ pub enum RuntimeEventStoreError {
     },
     #[error("invalid runtime event transaction: {0}")]
     InvalidTransaction(String),
+    #[error("decision lease `{lease_id}` has already been consumed")]
+    DecisionLeaseAlreadyConsumed { lease_id: String },
     #[error("runtime event store SQL failure: {0}")]
     Sql(#[from] rusqlite::Error),
     #[error("runtime event serialization failure: {0}")]
@@ -378,6 +394,129 @@ impl RuntimeEventStore {
         Ok(receipt)
     }
 
+    /// Atomically records a previously verified human decision lease.  This
+    /// is deliberately narrower than the generic event transaction API: it
+    /// cannot create lifecycle events and a duplicate lease is rejected.
+    pub(crate) fn consume_verified_decision_lease(
+        &self,
+        lease_id: &str,
+        principal_id: &str,
+        review_id: &str,
+        action: &str,
+        scope: &str,
+        evidence_digest: &str,
+        credential_epoch: u64,
+        consumed_at_ms: u64,
+    ) -> RuntimeEventStoreResult<()> {
+        if lease_id.trim().is_empty()
+            || principal_id.trim().is_empty()
+            || review_id.trim().is_empty()
+            || action.trim().is_empty()
+            || scope.trim().is_empty()
+            || evidence_digest.trim().is_empty()
+        {
+            return Err(RuntimeEventStoreError::InvalidTransaction(
+                "decision lease consumption requires non-empty bound claims".to_string(),
+            ));
+        }
+        let mut conn = lock_connection(&self.conn);
+        let tx = conn.transaction()?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO runtime_consumed_decision_leases \
+             (lease_id, principal_id, review_id, action, scope, evidence_digest, credential_epoch, consumed_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                lease_id,
+                principal_id,
+                review_id,
+                action,
+                scope,
+                evidence_digest,
+                credential_epoch as i64,
+                consumed_at_ms as i64,
+            ],
+        )?;
+        if inserted == 0 {
+            return Err(RuntimeEventStoreError::DecisionLeaseAlreadyConsumed {
+                lease_id: lease_id.to_string(),
+            });
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Commit lifecycle events and consume one already-verified human lease in
+    /// the same SQLite transaction.  A release decision is never allowed to
+    /// consume authorization first and mutate a projection later: either both
+    /// durable effects become visible or neither does.
+    pub(crate) fn append_transaction_with_verified_decision_lease(
+        &self,
+        request: AppendTransactionRequest,
+        lease: &crate::VerifiedDecisionLease,
+    ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
+        validate_decision_lease_claims(
+            lease.lease_id(),
+            lease.principal_id(),
+            lease.review_id(),
+            lease.action(),
+            lease.scope(),
+            lease.evidence_digest(),
+        )?;
+        validate_transaction(&request)?;
+        let mut conn = lock_connection(&self.conn);
+        let tx = conn.transaction()?;
+        let receipt = append_transaction_in_tx(&tx, &request, None)?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO runtime_consumed_decision_leases \
+             (lease_id, principal_id, review_id, action, scope, evidence_digest, credential_epoch, consumed_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                lease.lease_id(),
+                lease.principal_id(),
+                lease.review_id(),
+                lease.action(),
+                lease.scope(),
+                lease.evidence_digest(),
+                lease.credential_epoch() as i64,
+                now_ms() as i64,
+            ],
+        )?;
+        if inserted == 0 {
+            // A retry of the exact committed transaction is safe only when
+            // the stored lease claims are identical. Any other replay is an
+            // authorization error, even if the event transaction happens to
+            // have an idempotent key collision.
+            let existing = tx.query_row(
+                "SELECT principal_id, review_id, action, scope, evidence_digest, credential_epoch \
+                     FROM runtime_consumed_decision_leases WHERE lease_id = ?1",
+                params![lease.lease_id()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )?;
+            let matches = existing.0 == lease.principal_id()
+                && existing.1 == lease.review_id()
+                && existing.2 == lease.action()
+                && existing.3 == lease.scope()
+                && existing.4 == lease.evidence_digest()
+                && existing.5 == lease.credential_epoch() as i64;
+            if !receipt.duplicate || !matches {
+                return Err(RuntimeEventStoreError::DecisionLeaseAlreadyConsumed {
+                    lease_id: lease.lease_id().to_string(),
+                });
+            }
+        }
+        tx.commit()?;
+        Ok(receipt)
+    }
+
     pub fn append_batch_if_revision(
         &self,
         stream_id: impl Into<String>,
@@ -500,8 +639,29 @@ impl RuntimeEventStore {
             .map(|reference| reference.id.clone())
             .collect::<BTreeSet<_>>();
         let mut related = terminal_requests;
-        for graph_id in graph_ids {
+        let mut pending = graph_ids.into_iter().collect::<VecDeque<_>>();
+        let mut visited = BTreeSet::new();
+        while let Some(graph_id) = pending.pop_front() {
+            if visited.len() >= limit || !visited.insert(graph_id.clone()) {
+                continue;
+            }
             related.extend(self.list_stream(&graph_id)?);
+            let lineage_stream = format!("execution-lineage:{graph_id}");
+            let lineage_events = self.list_stream(&lineage_stream)?;
+            for event in &lineage_events {
+                if event.kind != "execution.lineage.child_registered.v1" {
+                    continue;
+                }
+                if let Some(child_id) = event
+                    .payload
+                    .get("child_execution_id")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    pending.push_back(child_id.to_string());
+                }
+            }
+            related.extend(lineage_events);
         }
         related.sort_by_key(|event| (event.commit_cursor, event.transaction_index));
         related.dedup_by(|left, right| left.event_id == right.event_id);
@@ -980,6 +1140,16 @@ fn create_current_tables(tx: &Transaction<'_>) -> RuntimeEventStoreResult<()> {
             last_error TEXT,
             materialized_at INTEGER,
             revision INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS runtime_consumed_decision_leases (
+            lease_id TEXT PRIMARY KEY,
+            principal_id TEXT NOT NULL,
+            review_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            evidence_digest TEXT NOT NULL,
+            credential_epoch INTEGER NOT NULL,
+            consumed_at_ms INTEGER NOT NULL
         );",
     )?;
 
@@ -1095,7 +1265,9 @@ fn migrate_legacy_runtime_events(tx: &Transaction<'_>) -> RuntimeEventStoreResul
          CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_events_stream_idempotency
             ON runtime_events(stream_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
          CREATE INDEX IF NOT EXISTS idx_runtime_commits_cursor
-            ON runtime_commits(commit_cursor);",
+            ON runtime_commits(commit_cursor);
+         CREATE INDEX IF NOT EXISTS idx_runtime_consumed_decision_leases_review
+            ON runtime_consumed_decision_leases(review_id, action);",
     )?;
     Ok(())
 }
@@ -1107,6 +1279,7 @@ fn validate_schema(conn: &Connection) -> RuntimeEventStoreResult<()> {
         "runtime_transaction_streams",
         "runtime_stream_heads",
         "runtime_session_outbox",
+        "runtime_consumed_decision_leases",
     ] {
         if !table_exists(conn, table)? {
             return Err(RuntimeEventStoreError::Corrupt(format!(
@@ -1246,6 +1419,28 @@ fn append_transaction_in_tx(
         event_ids,
         duplicate: false,
     })
+}
+
+fn validate_decision_lease_claims(
+    lease_id: &str,
+    principal_id: &str,
+    review_id: &str,
+    action: &str,
+    scope: &str,
+    evidence_digest: &str,
+) -> RuntimeEventStoreResult<()> {
+    if lease_id.trim().is_empty()
+        || principal_id.trim().is_empty()
+        || review_id.trim().is_empty()
+        || action.trim().is_empty()
+        || scope.trim().is_empty()
+        || evidence_digest.trim().is_empty()
+    {
+        return Err(RuntimeEventStoreError::InvalidTransaction(
+            "decision lease consumption requires non-empty bound claims".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn insert_terminal_in_tx(
@@ -1561,6 +1756,7 @@ mod tests {
     fn session_execution_events_follow_durable_terminal_graph_reference() {
         let store = RuntimeEventStore::try_open_in_memory().expect("event store");
         let graph_id = "graph:session-a";
+        let child_graph_id = "graph:session-a:team";
         store
             .append(input(
                 graph_id,
@@ -1568,6 +1764,28 @@ mod tests {
                 "execution_graph.planned",
             ))
             .unwrap();
+        let mut child = input(
+            child_graph_id,
+            RuntimeEventScope::ExecutionGraph,
+            "execution_graph.planned",
+        );
+        child.payload = serde_json::json!({
+            "event": "planned",
+            "graph": {"id": child_graph_id, "nodes": [{"kind": "agent_task"}]},
+        });
+        store.append(child).unwrap();
+        let mut lineage = input(
+            &format!("execution-lineage:{graph_id}"),
+            RuntimeEventScope::Relation,
+            "execution.lineage.child_registered.v1",
+        );
+        lineage.payload = serde_json::json!({
+            "parent_execution_id": graph_id,
+            "parent_node_id": "model",
+            "child_execution_id": child_graph_id,
+            "child_objective": "parallel review",
+        });
+        store.append(lineage).unwrap();
         let mut terminal = input(
             "session-terminal:request-a",
             RuntimeEventScope::SessionInput,
@@ -1586,6 +1804,13 @@ mod tests {
         assert!(related
             .iter()
             .any(|event| event.stream_id == graph_id && event.kind == "execution_graph.planned"));
+        assert!(related.iter().any(|event| {
+            event.stream_id == child_graph_id && event.kind == "execution_graph.planned"
+        }));
+        assert!(related.iter().any(|event| {
+            event.stream_id == format!("execution-lineage:{graph_id}")
+                && event.kind == "execution.lineage.child_registered.v1"
+        }));
         assert!(related
             .iter()
             .any(|event| event.kind == "runtime.session.terminal_requested"));
@@ -1746,6 +1971,53 @@ mod tests {
             .unwrap()
             .expect("idempotent event");
         assert_eq!(event.kind, "node.running");
+    }
+
+    #[test]
+    fn decision_lease_consumption_is_durable_and_replay_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime-events.db");
+        let store = RuntimeEventStore::try_open(&path).expect("event store");
+        store
+            .consume_verified_decision_lease(
+                "lease-1",
+                "human-1",
+                "candidate:c-1",
+                "promote",
+                "evolution.candidate:c-1",
+                "sha256:evidence",
+                2,
+                10,
+            )
+            .expect("first consumption");
+        assert!(matches!(
+            store.consume_verified_decision_lease(
+                "lease-1",
+                "human-1",
+                "candidate:c-1",
+                "promote",
+                "evolution.candidate:c-1",
+                "sha256:evidence",
+                2,
+                11,
+            ),
+            Err(RuntimeEventStoreError::DecisionLeaseAlreadyConsumed { .. })
+        ));
+        drop(store);
+        let reopened = RuntimeEventStore::try_open(&path).expect("reopen");
+        assert!(matches!(
+            reopened.consume_verified_decision_lease(
+                "lease-1",
+                "human-1",
+                "candidate:c-1",
+                "promote",
+                "evolution.candidate:c-1",
+                "sha256:evidence",
+                2,
+                12,
+            ),
+            Err(RuntimeEventStoreError::DecisionLeaseAlreadyConsumed { .. })
+        ));
     }
 
     #[test]

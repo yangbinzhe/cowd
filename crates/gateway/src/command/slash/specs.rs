@@ -1658,9 +1658,6 @@ pub enum SlashCommand {
     Agents {
         args: Option<String>,
     },
-    AgentProfile {
-        agent_id: Option<String>,
-    },
     Skills {
         args: Option<String>,
     },

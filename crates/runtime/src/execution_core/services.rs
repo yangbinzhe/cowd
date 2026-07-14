@@ -2,9 +2,19 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use harness_contract::agent::{
+    AgentEvaluationBinding, AgentReleaseBinding, AgentTaskIntent, AgentTaskPacket,
+    AgentTerminalStatus, ReleaseChannel, RevisionSelector,
+};
+use harness_contract::context::ContextBudgetLeaseRef;
+use harness_contract::evaluation::{EvaluationScenarioObservation, EvaluationScenarioSpec};
 use harness_contract::execution_graph::{
-    ExecutionGraph, ExecutionGraphCommand, ExecutionNodeStatus,
+    ExecutionGraph, ExecutionGraphCommand, ExecutionNodeKind, ExecutionNodeStatus,
+};
+use harness_contract::team::{
+    TeamInstantiationRequest, TeamSelectionMode, TeamTemplateRevisionRef, TeamTemplateSelector,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -23,15 +33,24 @@ use super::graph::{
     ScopeLockError, ScopeLockManager, WorktreeLeaseError, WorktreeLeaseManager,
 };
 use super::protocols::ProtocolResultReducer;
+use crate::agent::binding::request_for_intent;
+use crate::agent::definition::ExplicitTomlAgentImport;
 use crate::runtime_event_store::RuntimeEventStoreError;
 use crate::{
-    AgentRuntime, AgentRuntimeResolver, ApprovalQueue, ConflictArbiter, InProcessAgentWorker,
-    MissionEvidenceBus, MissionRuntime, MissionScheduleStore, ProcessJsonlAdapter,
-    RuntimeEventStore, SessionInputRouter, SessionRelationGraph, TeamResultReducer, TeamRuntime,
+    AgentBindingCompiler, AgentBindingRequest, AgentDefinitionDraftReceipt, AgentRuntime,
+    AgentRuntimeResolver, ApprovalQueue, CompiledAgentBinding, ConflictArbiter,
+    DefinitionRegistryError, DurableRuntimeEvent, InProcessAgentWorker,
+    ManagedAgentRuntimeDispatchReport, MissionEvidenceBus, MissionRuntime, MissionScheduleStore,
+    ProcessJsonlAdapter, RealityRecallPort, RuntimeDefinitionRegistry, RuntimeEventInput,
+    RuntimeEventReplayer, RuntimeEventScope, RuntimeEventStore, RuntimeSessionOutboxFailureClass,
+    RuntimeSessionOutboxHealth, RuntimeSessionOutboxRecord, SessionInputRouter,
+    SessionRelationGraph, TeamResultReducer, TeamRuntime,
 };
 
 #[derive(Debug, Error)]
 pub enum RuntimeServicesError {
+    #[error(transparent)]
+    DefinitionRegistry(#[from] DefinitionRegistryError),
     #[error(transparent)]
     EventStore(#[from] RuntimeEventStoreError),
     #[error(transparent)]
@@ -100,11 +119,240 @@ pub struct ExecutionStartupRecoveryError {
 pub struct RuntimeServicesBuilder {
     cowd_home: PathBuf,
     workspace_root: PathBuf,
+    builtin_definitions_root: Option<PathBuf>,
     resource_quotas: Vec<(ExecutionResourceKind, ResourceQuota)>,
     provider_registry: Arc<crate::ProviderRegistry>,
     tool_execution_host: Option<Arc<dyn crate::RuntimeExecutionHost>>,
     session_store: Option<Arc<memory::UnifiedSessionStore>>,
+    memory_manager: Option<Arc<memory::CognitiveContextManager>>,
+    evolution_eval_runner: Option<Arc<dyn crate::EvolutionEvalRunner>>,
+    skill_catalog: crate::RuntimeSkillCatalog,
     mission_schedule_policy: crate::MissionSchedulePolicy,
+}
+
+/// Read-only projection port for the durable runtime ledger.
+///
+/// Gateway and surfaces receive this port rather than the SQLite-backed event
+/// store.  Keeping the store private prevents a projection consumer from
+/// silently becoming another lifecycle event writer.
+#[derive(Clone)]
+pub struct RuntimeEventReader {
+    store: Arc<RuntimeEventStore>,
+}
+
+impl RuntimeEventReader {
+    pub fn list_stream(&self, stream_id: &str) -> Result<Vec<DurableRuntimeEvent>, String> {
+        self.store.list_stream(stream_id)
+    }
+
+    pub fn list_scope(
+        &self,
+        scope: RuntimeEventScope,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        self.store.list_scope(scope, limit)
+    }
+
+    pub fn all_events(&self, limit: usize) -> Result<Vec<DurableRuntimeEvent>, String> {
+        self.store.all_events(limit)
+    }
+
+    pub fn replay_report(&self, limit: usize) -> Result<crate::RuntimeReplayReport, String> {
+        RuntimeEventReplayer::report(&self.store, limit)
+    }
+
+    pub fn session_timeline_events(
+        &self,
+        session_id: &str,
+        from_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        let mut events = self
+            .store
+            .list_stream(session_id)?
+            .into_iter()
+            .filter(|event| event.sequence >= from_sequence)
+            .collect::<Vec<_>>();
+        events.extend(
+            self.store
+                .execution_events_for_session(session_id, 0, limit)?,
+        );
+        events.sort_by_key(|event| (event.created_at_ms, event.sequence));
+        events.dedup_by(|left, right| {
+            left.event_id == right.event_id
+                || (left.stream_id == right.stream_id
+                    && left.sequence == right.sequence
+                    && left.kind == right.kind)
+        });
+        Ok(events)
+    }
+}
+
+/// Fixture-only ledger writer used by downstream unit tests to seed durable
+/// historical state. Production Gateway paths never receive this capability.
+#[cfg(feature = "test-fixtures")]
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct RuntimeFixtureEventPort {
+    store: Arc<RuntimeEventStore>,
+}
+
+#[cfg(feature = "test-fixtures")]
+impl RuntimeFixtureEventPort {
+    pub fn append_for_test(&self, event: RuntimeEventInput) -> Result<DurableRuntimeEvent, String> {
+        self.store.append(event)
+    }
+}
+
+/// Narrow delivery port for the Gateway-owned surface delivery worker.
+///
+/// It deliberately exposes only the terminal-outbox state machine.  It cannot
+/// append arbitrary runtime events or access graph/approval transactions.
+#[derive(Clone)]
+pub struct SessionTerminalDeliveryPort {
+    store: Arc<RuntimeEventStore>,
+}
+
+impl SessionTerminalDeliveryPort {
+    pub fn enqueue(
+        &self,
+        terminal_id: &str,
+        message_id: &str,
+        session_id: &str,
+        commit_cursor: u64,
+        payload_ref: &str,
+    ) -> Result<RuntimeSessionOutboxRecord, RuntimeEventStoreError> {
+        self.store.enqueue_session_terminal(
+            terminal_id,
+            message_id,
+            session_id,
+            commit_cursor,
+            payload_ref,
+        )
+    }
+
+    pub fn get(
+        &self,
+        terminal_id: &str,
+    ) -> Result<Option<RuntimeSessionOutboxRecord>, RuntimeEventStoreError> {
+        self.store.session_terminal(terminal_id)
+    }
+
+    pub fn claim(
+        &self,
+        worker_id: &str,
+        now_ms: u64,
+        lease_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<RuntimeSessionOutboxRecord>, RuntimeEventStoreError> {
+        self.store
+            .claim_session_terminals(worker_id, now_ms, lease_ms, limit)
+    }
+
+    pub fn acknowledge(
+        &self,
+        terminal_id: &str,
+        worker_id: &str,
+        expected_revision: u64,
+        now_ms: u64,
+    ) -> Result<RuntimeSessionOutboxRecord, RuntimeEventStoreError> {
+        self.store
+            .ack_session_terminal(terminal_id, worker_id, expected_revision, now_ms)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn fail(
+        &self,
+        terminal_id: &str,
+        worker_id: &str,
+        expected_revision: u64,
+        class: RuntimeSessionOutboxFailureClass,
+        error: &str,
+        retry_at_ms: u64,
+        max_attempts: u32,
+        now_ms: u64,
+    ) -> Result<RuntimeSessionOutboxRecord, RuntimeEventStoreError> {
+        self.store.fail_session_terminal(
+            terminal_id,
+            worker_id,
+            expected_revision,
+            class,
+            error,
+            retry_at_ms,
+            max_attempts,
+            now_ms,
+        )
+    }
+
+    pub fn health(&self) -> Result<RuntimeSessionOutboxHealth, RuntimeEventStoreError> {
+        self.store.session_terminal_health()
+    }
+
+    pub fn blocked(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RuntimeSessionOutboxRecord>, RuntimeEventStoreError> {
+        self.store.blocked_session_terminals(limit)
+    }
+
+    pub fn materialized_after(
+        &self,
+        session_id: &str,
+        after_commit_cursor: u64,
+        limit: usize,
+    ) -> Result<Vec<RuntimeSessionOutboxRecord>, RuntimeEventStoreError> {
+        self.store
+            .materialized_session_terminals_after(session_id, after_commit_cursor, limit)
+    }
+
+    pub fn retry_blocked(
+        &self,
+        terminal_id: &str,
+        actor: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<RuntimeSessionOutboxRecord, RuntimeEventStoreError> {
+        self.store
+            .retry_session_terminal(terminal_id, actor, reason, now_ms)
+    }
+}
+
+/// The only task-lifecycle families that the Gateway task projection may
+/// persist.  Arbitrary caller supplied runtime event kinds are intentionally
+/// not accepted at this boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskLifecycleKind {
+    Started,
+    PhaseStarted,
+    PhaseArtifactRecorded,
+    PhaseReviewed,
+    Cancelled,
+    Completed,
+    FailureRecorded,
+    Blocked,
+}
+
+impl TaskLifecycleKind {
+    #[must_use]
+    pub const fn event_kind(self) -> &'static str {
+        match self {
+            Self::Started => "task.started",
+            Self::PhaseStarted => "task.phase.started",
+            Self::PhaseArtifactRecorded => "task.phase.artifact.recorded",
+            Self::PhaseReviewed => "task.phase.reviewed",
+            Self::Cancelled => "task.cancelled",
+            Self::Completed => "task.completed",
+            Self::FailureRecorded => "task.failure.recorded",
+            Self::Blocked => "task.blocked",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskLifecycleEvent {
+    pub task_id: String,
+    pub kind: TaskLifecycleKind,
+    pub payload: serde_json::Value,
 }
 
 impl RuntimeServicesBuilder {
@@ -135,6 +383,41 @@ impl RuntimeServicesBuilder {
         self
     }
 
+    /// Install the only Memory kernel that Runtime-owned conversation hosts may
+    /// use. Gateway may construct and monitor this component, but it must not
+    /// assemble Memory context on behalf of a turn.
+    #[must_use]
+    pub fn memory_manager(mut self, manager: Arc<memory::CognitiveContextManager>) -> Self {
+        self.memory_manager = Some(manager);
+        self
+    }
+
+    /// Inject a trusted evaluator at the composition root. Runtime owns the
+    /// immutable comparison contract; evaluator implementations belong to
+    /// `harness-eval` or another explicitly trusted adapter.
+    #[must_use]
+    pub fn evolution_eval_runner(mut self, runner: Arc<dyn crate::EvolutionEvalRunner>) -> Self {
+        self.evolution_eval_runner = Some(runner);
+        self
+    }
+
+    /// Install the inspected Skill snapshot at the Runtime composition root.
+    /// Workers can activate these profiles but never discover packages.
+    #[must_use]
+    pub fn skill_catalog(mut self, catalog: crate::RuntimeSkillCatalog) -> Self {
+        self.skill_catalog = catalog;
+        self
+    }
+
+    /// Bind builtin Definitions to the installation bundle selected by the
+    /// launcher. User and workspace Definitions are never inferred from this
+    /// path; it is only the trusted builtin scope root.
+    #[must_use]
+    pub fn builtin_definitions_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.builtin_definitions_root = Some(root.into());
+        self
+    }
+
     #[must_use]
     pub fn mission_schedule_policy(mut self, policy: crate::MissionSchedulePolicy) -> Self {
         self.mission_schedule_policy = policy;
@@ -150,8 +433,23 @@ impl RuntimeServicesBuilder {
             .join("agents")
             .join("team-runtime")
             .join("state.json");
+        let legacy_team_profile_path = self.cowd_home.join("agents").join("team-profiles.json");
+        let legacy_team_profile_archive_root = self.cowd_home.join("migrations").join("teams");
         let workspace_root = canonical_workspace_root(&self.workspace_root)?;
         let workspace_key = workspace_key(&workspace_root);
+        let storage_layout = storage::StorageLayout::default_for_config_home(&self.cowd_home);
+        let builtin_definitions_root = self.builtin_definitions_root.unwrap_or_else(|| {
+            // An unconfigured installation has no runnable builtin Definitions
+            // yet. This explicit empty bundle root preserves scope separation;
+            // the launcher supplies the verified release-bundle root before
+            // builtin bootstrap is enabled.
+            self.cowd_home.join("runtime").join("builtin-definitions")
+        });
+        let definition_registry = Arc::new(RuntimeDefinitionRegistry::from_storage_layout(
+            &storage_layout,
+            builtin_definitions_root,
+            &workspace_root,
+        )?);
         let state_root = self
             .cowd_home
             .join("runtime")
@@ -170,6 +468,7 @@ impl RuntimeServicesBuilder {
             resource_state_root.join("worktree-leases.json"),
         )?);
         let services = Arc::new(RuntimeServices::assemble(
+            self.cowd_home.clone(),
             workspace_root,
             workspace_key,
             Arc::new(RuntimeEventStore::try_open(
@@ -180,7 +479,11 @@ impl RuntimeServicesBuilder {
             self.resource_quotas,
             self.provider_registry,
             self.tool_execution_host,
+            self.memory_manager,
+            self.evolution_eval_runner,
+            self.skill_catalog,
             self.mission_schedule_policy,
+            definition_registry,
         )?);
         services.agent_runtime.bind_services(Arc::clone(&services));
         services
@@ -195,9 +498,17 @@ impl RuntimeServicesBuilder {
             .agent_runtime
             .block_unrecoverable_replayed_runs()
             .map_err(RuntimeServicesError::AgentRuntime)?;
+        services.materialize_evolution_release_assignments()?;
         services
             .team_runtime()
             .import_legacy_state_file(&legacy_team_state_path)
+            .map_err(RuntimeServicesError::Mission)?;
+        services
+            .team_runtime()
+            .archive_legacy_profile_file(
+                &legacy_team_profile_path,
+                &legacy_team_profile_archive_root,
+            )
             .map_err(RuntimeServicesError::Mission)?;
         if let Some(store) = self.session_store {
             services.install_session_store(store)?;
@@ -217,25 +528,33 @@ pub struct RuntimeServices {
     agent_task_executor: Arc<AgentTaskExecutor>,
     agent_runtime: Arc<AgentRuntime>,
     team_runtime: Arc<TeamRuntime>,
+    l4_promotion_service: Arc<crate::L4PromotionService>,
     verify_executor: Arc<VerifyNodeExecutor>,
     synthesize_executor: Arc<SynthesizeNodeExecutor>,
     graph_state_store: ExecutionGraphStateStore,
     commit_service: ExecutionCommitService,
     graph_runner: Arc<ExecutionGraphRunner>,
     approval_queue: Arc<ApprovalQueue>,
+    evolution_governance: Arc<crate::EvolutionGovernanceService>,
     mission_evidence: Arc<MissionEvidenceBus>,
     conflict_resolver: Arc<ConflictArbiter>,
     resource_manager: Arc<ExecutionResourceManager>,
     scope_locks: Arc<ScopeLockManager>,
     worktree_leases: Arc<WorktreeLeaseManager>,
+    definition_registry: Arc<RuntimeDefinitionRegistry>,
     cross_plane: Arc<CrossPlaneRuntimeService>,
     mission_runtime: Arc<MissionRuntime>,
     mission_schedules: Arc<MissionScheduleStore>,
+    managed_agents: Arc<crate::ManagedAgentDispatcher>,
     mission_schedule_policy: Arc<RwLock<crate::MissionSchedulePolicy>>,
     session_relations: Arc<SessionRelationGraph>,
     goal_store: Arc<GoalStore>,
     provider_registry: Arc<crate::ProviderRegistry>,
     tool_execution_host: Option<Arc<dyn crate::RuntimeExecutionHost>>,
+    memory_manager: Option<Arc<memory::CognitiveContextManager>>,
+    evolution_eval_runner: Option<Arc<dyn crate::EvolutionEvalRunner>>,
+    skill_catalog: Arc<RwLock<crate::RuntimeSkillCatalog>>,
+    reality_recall_port: Arc<RealityRecallPort>,
     session_dispatch_executor: Arc<crate::session_execution::SessionDispatchNodeExecutor>,
     session_input_router: OnceLock<Arc<SessionInputRouter>>,
 }
@@ -249,10 +568,14 @@ impl RuntimeServices {
         RuntimeServicesBuilder {
             cowd_home: cowd_home.into(),
             workspace_root: workspace_root.into(),
+            builtin_definitions_root: None,
             resource_quotas: default_resource_quotas(),
             provider_registry: Arc::new(crate::ProviderRegistry::empty()),
             tool_execution_host: None,
             session_store: None,
+            memory_manager: None,
+            evolution_eval_runner: None,
+            skill_catalog: crate::RuntimeSkillCatalog::default(),
             mission_schedule_policy: crate::MissionSchedulePolicy::default(),
         }
     }
@@ -260,7 +583,18 @@ impl RuntimeServices {
     pub fn in_memory() -> Result<Arc<Self>, RuntimeServicesError> {
         let workspace_key = format!("in-memory-{}", uuid::Uuid::new_v4());
         let workspace_root = PathBuf::from(format!("/{workspace_key}"));
+        let definition_root = std::env::temp_dir()
+            .join("cowd-runtime-services")
+            .join(&workspace_key)
+            .join("definitions");
+        let config_home = definition_root.join("config-home");
+        let definition_registry = Arc::new(RuntimeDefinitionRegistry::from_storage_layout(
+            &storage::StorageLayout::default_for_config_home(&config_home),
+            definition_root.join("builtin"),
+            &workspace_root,
+        )?);
         let services = Arc::new(Self::assemble(
+            config_home,
             workspace_root,
             workspace_key.clone(),
             Arc::new(RuntimeEventStore::try_open_in_memory()?),
@@ -274,7 +608,11 @@ impl RuntimeServices {
             default_resource_quotas(),
             Arc::new(crate::ProviderRegistry::empty()),
             None,
+            None,
+            None,
+            crate::RuntimeSkillCatalog::default(),
             crate::MissionSchedulePolicy::default(),
+            definition_registry,
         )?);
         services.agent_runtime.bind_services(Arc::clone(&services));
         services
@@ -289,11 +627,13 @@ impl RuntimeServices {
             .agent_runtime
             .block_unrecoverable_replayed_runs()
             .map_err(RuntimeServicesError::AgentRuntime)?;
+        services.materialize_evolution_release_assignments()?;
         Ok(services)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn assemble(
+        cowd_home: PathBuf,
         workspace_root: PathBuf,
         workspace_key: String,
         event_store: Arc<RuntimeEventStore>,
@@ -302,7 +642,11 @@ impl RuntimeServices {
         resource_quotas: Vec<(ExecutionResourceKind, ResourceQuota)>,
         provider_registry: Arc<crate::ProviderRegistry>,
         tool_execution_host: Option<Arc<dyn crate::RuntimeExecutionHost>>,
+        memory_manager: Option<Arc<memory::CognitiveContextManager>>,
+        evolution_eval_runner: Option<Arc<dyn crate::EvolutionEvalRunner>>,
+        skill_catalog: crate::RuntimeSkillCatalog,
         mission_schedule_policy: crate::MissionSchedulePolicy,
+        definition_registry: Arc<RuntimeDefinitionRegistry>,
     ) -> Result<Self, RuntimeServicesError> {
         let executor_registry = Arc::new(NodeExecutorRegistry::new());
         let graph_state_store = ExecutionGraphStateStore::new(Arc::clone(&event_store));
@@ -315,6 +659,9 @@ impl RuntimeServices {
             Arc::clone(&event_store),
             Arc::clone(&provider_registry),
         ));
+        agent_runtime
+            .catalog()
+            .replace_all(definition_registry.runnable_agent_catalog()?);
         agent_task_executor.install_resolver(Arc::new(AgentRuntimeResolver::new(Arc::clone(
             &agent_runtime,
         ))));
@@ -331,6 +678,10 @@ impl RuntimeServices {
         let session_dispatch_executor =
             Arc::new(crate::session_execution::SessionDispatchNodeExecutor::new());
         let approval_queue = Arc::new(ApprovalQueue::new(Arc::clone(&event_store)));
+        let evolution_governance = Arc::new(crate::EvolutionGovernanceService::new(
+            Arc::clone(&event_store),
+            Arc::clone(&approval_queue),
+        ));
         install_builtin_executors(
             &executor_registry,
             vec![
@@ -362,6 +713,13 @@ impl RuntimeServices {
             graph_state_store.clone(),
             Arc::clone(&agent_runtime),
             Arc::clone(&event_store),
+            Arc::clone(&definition_registry),
+            Arc::clone(&resource_manager),
+            Arc::clone(&evolution_governance),
+        ));
+        let l4_promotion_service = Arc::new(crate::L4PromotionService::new(
+            Arc::clone(&event_store),
+            memory_manager.clone(),
         ));
         let gate_store = Arc::clone(&event_store);
         let gate_workspace = workspace_key.clone();
@@ -392,6 +750,16 @@ impl RuntimeServices {
             MissionScheduleStore::event_sourced(Arc::clone(&event_store), workspace_key.clone())
                 .map_err(RuntimeServicesError::Mission)?,
         );
+        let managed_agents = Arc::new(
+            crate::ManagedAgentDispatcher::event_sourced(
+                Arc::clone(&event_store),
+                workspace_key.clone(),
+            )
+            .map_err(RuntimeServicesError::Mission)?,
+        );
+        managed_agents
+            .recover(now_ms())
+            .map_err(RuntimeServicesError::Mission)?;
         let session_relations = Arc::new(
             SessionRelationGraph::event_sourced(Arc::clone(&event_store), workspace_key.clone())
                 .map_err(RuntimeServicesError::Mission)?,
@@ -407,25 +775,33 @@ impl RuntimeServices {
             agent_task_executor,
             agent_runtime,
             team_runtime,
+            l4_promotion_service,
             verify_executor,
             synthesize_executor,
             graph_state_store,
             commit_service,
             graph_runner,
             approval_queue,
+            evolution_governance,
             mission_evidence,
             conflict_resolver,
             resource_manager,
             scope_locks,
             worktree_leases,
+            definition_registry,
             cross_plane: Arc::new(CrossPlaneRuntimeService::open(Arc::clone(&event_store))?),
             mission_runtime: Arc::new(mission_runtime),
             mission_schedules,
+            managed_agents,
             mission_schedule_policy: Arc::new(RwLock::new(mission_schedule_policy)),
             session_relations,
             goal_store,
             provider_registry,
             tool_execution_host,
+            memory_manager,
+            evolution_eval_runner,
+            skill_catalog: Arc::new(RwLock::new(skill_catalog)),
+            reality_recall_port: Arc::new(RealityRecallPort::for_config_home(cowd_home)),
             session_dispatch_executor,
             session_input_router: OnceLock::new(),
         })
@@ -455,8 +831,309 @@ impl RuntimeServices {
     pub fn workspace_key(&self) -> &str {
         &self.workspace_key
     }
-    pub fn event_store(&self) -> &Arc<RuntimeEventStore> {
+
+    /// Runtime-owned access to the shared cognitive manager. Callers can use
+    /// it only through Runtime host construction; Gateway does not receive a
+    /// prompt-assembly capability from this accessor.
+    #[must_use]
+    pub fn memory_manager(&self) -> Option<Arc<memory::CognitiveContextManager>> {
+        self.memory_manager.clone()
+    }
+
+    /// Return a stable copy for primary or delegated turn construction.
+    /// Replacing the catalog later cannot alter an already-created turn.
+    #[must_use]
+    pub fn skill_catalog(&self) -> crate::RuntimeSkillCatalog {
+        self.skill_catalog
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Gateway's composition boundary may refresh an inspected package
+    /// snapshot. Runtime retains sole ownership of activation and injection.
+    pub fn replace_skill_catalog(&self, catalog: crate::RuntimeSkillCatalog) {
+        *self
+            .skill_catalog
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = catalog;
+    }
+
+    #[must_use]
+    pub fn l4_promotion_service(&self) -> &Arc<crate::L4PromotionService> {
+        &self.l4_promotion_service
+    }
+
+    /// Runtime-owned read port for Fact and Matrix context. Each call requires
+    /// a Binding and verifies its data lease before exposing model context.
+    #[must_use]
+    pub fn reality_recall_port(&self) -> &Arc<RealityRecallPort> {
+        &self.reality_recall_port
+    }
+
+    /// Runtime-owned, scope-qualified Agent and Team Definition registry.
+    /// Gateway and surfaces consume this projection; they do not scan
+    /// arbitrary workspace directories to construct runnable identities.
+    #[must_use]
+    pub fn definition_registry(&self) -> &Arc<RuntimeDefinitionRegistry> {
+        &self.definition_registry
+    }
+
+    /// Rebuild the executable Agent index after a Definition release state
+    /// changes. The operation replaces, rather than merges, cached entries so
+    /// stopped or revoked Definitions cannot remain selectable.
+    pub fn refresh_definition_catalog(&self) -> Result<(), RuntimeServicesError> {
+        self.agent_runtime
+            .catalog()
+            .replace_all(self.definition_registry.runnable_agent_catalog()?);
+        Ok(())
+    }
+
+    /// Import one caller-selected external Agent TOML document as a local
+    /// Draft through the Runtime ownership boundary.
+    ///
+    /// This command deliberately does not release the Definition, update a
+    /// default pointer, or refresh the runnable catalog. Those are separate
+    /// human-authorized Runtime commands, so an import can never become an
+    /// executable identity merely by reaching the Gateway.
+    pub fn import_agent_toml_draft(
+        &self,
+        import: ExplicitTomlAgentImport,
+    ) -> Result<AgentDefinitionDraftReceipt, RuntimeServicesError> {
+        self.definition_registry
+            .import_agent_toml_draft(import)
+            .map_err(RuntimeServicesError::from)
+    }
+
+    /// Compile one exact Agent Definition execution Binding through the
+    /// Runtime composition root. Gateway, Teams and Surfaces submit only a
+    /// restricted request; they never resolve Definition paths or construct
+    /// executable snapshots themselves.
+    pub fn compile_agent_binding(
+        &self,
+        request: AgentBindingRequest,
+    ) -> Result<CompiledAgentBinding, RuntimeServicesError> {
+        let routing_identity = format!(
+            "{}|{}|{}|{}",
+            request.session_id,
+            request.task_id,
+            request.instance_id,
+            request.team_id.as_deref().unwrap_or("direct")
+        );
+        let compiler = AgentBindingCompiler::new(Arc::clone(&self.definition_registry));
+        let selected_canary = self
+            .evolution_governance
+            .select_agent_canary_assignment(
+                &request.definition_id,
+                &request.selector,
+                &routing_identity,
+            )
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+        if let Some(assignment) = selected_canary {
+            let crate::EvolutionCandidateSubject::AgentDefinition { revision_ref } =
+                &assignment.subject
+            else {
+                return Err(RuntimeServicesError::Invariant(
+                    "agent Canary routing selected a non-Agent Definition subject".to_string(),
+                ));
+            };
+            let resolved = self
+                .definition_registry
+                .resolve_agent_canary(revision_ref)
+                .map_err(RuntimeServicesError::from)?;
+            return compiler
+                .compile_resolved(
+                    request,
+                    resolved,
+                    Some(AgentReleaseBinding {
+                        assignment_id: assignment.assignment_id,
+                        generation: assignment.generation,
+                        channel: ReleaseChannel::Canary,
+                    }),
+                )
+                .map_err(|error| RuntimeServicesError::AgentRuntime(error.to_string()));
+        }
+        compiler
+            .compile(request)
+            .map_err(|error| RuntimeServicesError::AgentRuntime(error.to_string()))
+    }
+
+    /// Turn one non-executable planning intent into the immutable packet that
+    /// a graph runner may persist.  This is the sole Runtime-owned boundary
+    /// where a catalog choice becomes an instance identity and data lease.
+    pub fn compile_agent_task_intent(
+        &self,
+        intent: AgentTaskIntent,
+    ) -> Result<AgentTaskPacket, RuntimeServicesError> {
+        let selected = intent
+            .selected_agent_id
+            .as_deref()
+            .and_then(|agent_id| self.agent_runtime.catalog().get(agent_id));
+        let request = request_for_intent(&intent, selected)
+            .map_err(|error| RuntimeServicesError::AgentRuntime(error.to_string()))?;
+        let compiled = self.compile_agent_binding(request)?;
+        compiled
+            .snapshot
+            .compile_task_packet(intent)
+            .map_err(|error| RuntimeServicesError::AgentRuntime(error.to_string()))
+    }
+
+    /// Validate release provenance immediately before a compiled Agent packet
+    /// is admitted. Canary packets are deliberately rechecked because a
+    /// human StopCanary decision may occur after planning but before worker
+    /// start; Stable packets continue through the normal Definition resolver.
+    pub(crate) fn validate_agent_binding_release(
+        &self,
+        binding: &harness_contract::agent::AgentBindingSnapshot,
+    ) -> Result<(), RuntimeServicesError> {
+        let Some(release) = &binding.release else {
+            return Ok(());
+        };
+        match release.channel {
+            ReleaseChannel::Canary => self
+                .evolution_governance
+                .validate_agent_canary_binding(
+                    &binding.definition_ref,
+                    &release.assignment_id,
+                    release.generation,
+                )
+                .map_err(|error| RuntimeServicesError::Invariant(error.to_string())),
+            ReleaseChannel::Stable | ReleaseChannel::Shadow => {
+                Err(RuntimeServicesError::Invariant(
+                    "Runtime only accepts explicit release provenance for active Canary Bindings"
+                        .to_string(),
+                ))
+            }
+        }
+    }
+
+    /// Compile every Agent intent before graph registration.  A graph that
+    /// already contains an executable packet is rejected instead of being
+    /// silently re-bound, preventing recovery or a surface from replacing an
+    /// immutable Binding after planning.
+    pub fn compile_graph_agent_intents(
+        &self,
+        mut graph: ExecutionGraph,
+    ) -> Result<ExecutionGraph, RuntimeServicesError> {
+        for node in &mut graph.nodes {
+            if node.kind != ExecutionNodeKind::AgentTask {
+                continue;
+            }
+            let intent: AgentTaskIntent = serde_json::from_str(&node.payload_ref).map_err(|_| {
+                RuntimeServicesError::AgentRuntime(format!(
+                    "AgentTask node `{}` must contain an unbound AgentTaskIntent before registration",
+                    node.id
+                ))
+            })?;
+            if intent.node_id != node.id {
+                return Err(RuntimeServicesError::AgentRuntime(format!(
+                    "AgentTask intent node identity `{}` does not match graph node `{}`",
+                    intent.node_id, node.id
+                )));
+            }
+            let packet = self.compile_agent_task_intent(intent)?;
+            node.payload_ref = serde_json::to_string(&packet).map_err(|error| {
+                RuntimeServicesError::AgentRuntime(format!(
+                    "encode Runtime-bound AgentTask node `{}`: {error}",
+                    node.id
+                ))
+            })?;
+        }
+        Ok(graph)
+    }
+    pub(crate) fn event_store(&self) -> &Arc<RuntimeEventStore> {
         &self.event_store
+    }
+
+    /// Read-only durable event projection for Gateway and Surface consumers.
+    #[must_use]
+    pub fn event_reader(&self) -> RuntimeEventReader {
+        RuntimeEventReader {
+            store: Arc::clone(&self.event_store),
+        }
+    }
+
+    #[cfg(feature = "test-fixtures")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn fixture_event_port(&self) -> RuntimeFixtureEventPort {
+        RuntimeFixtureEventPort {
+            store: Arc::clone(&self.event_store),
+        }
+    }
+
+    /// Delivery-only terminal outbox port for the Gateway session bridge.
+    #[must_use]
+    pub fn session_terminal_delivery(&self) -> SessionTerminalDeliveryPort {
+        SessionTerminalDeliveryPort {
+            store: Arc::clone(&self.event_store),
+        }
+    }
+
+    /// Consume an already verified human decision lease exactly once.  The
+    /// signed lease is verified before it reaches this method; this Runtime
+    /// command persists the replay fence alongside the workspace ledger so a
+    /// process restart cannot resurrect a release decision.
+    pub fn consume_verified_decision_lease(
+        &self,
+        lease: crate::VerifiedDecisionLease,
+    ) -> Result<(), String> {
+        let consumed_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        self.event_store
+            .consume_verified_decision_lease(
+                lease.lease_id(),
+                lease.principal_id(),
+                lease.review_id(),
+                lease.action(),
+                lease.scope(),
+                lease.evidence_digest(),
+                lease.credential_epoch(),
+                consumed_at_ms,
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    /// Persist a task lifecycle transition through the Runtime-owned task
+    /// writer.  Gateway supplies task projection data but cannot choose an
+    /// arbitrary ledger scope, actor or event family.
+    pub fn record_task_lifecycle(
+        &self,
+        event: TaskLifecycleEvent,
+    ) -> Result<DurableRuntimeEvent, String> {
+        if event.task_id.trim().is_empty() {
+            return Err("task lifecycle event requires task_id".to_string());
+        }
+        self.event_store.append(RuntimeEventInput {
+            stream_id: event.task_id,
+            scope: RuntimeEventScope::Task,
+            kind: event.kind.event_kind().to_string(),
+            status: None,
+            actor: Some("gateway-task-command".to_string()),
+            refs: Vec::new(),
+            payload: event.payload,
+        })
+    }
+
+    /// Runtime-owned startup migration command.  Gateway may trigger the
+    /// command at startup but never obtains the raw event-store committer.
+    pub fn import_legacy_execution_receipt(
+        &self,
+        receipt_path: &Path,
+        version: &str,
+    ) -> Result<(), String> {
+        crate::upgrade::LegacyExecutionImporter::new(
+            Arc::clone(&self.event_store),
+            &self.workspace_key,
+            &self.workspace_root,
+            version,
+        )
+        .import_receipt_file(receipt_path)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
     }
     pub fn executor_registry(&self) -> &Arc<NodeExecutorRegistry> {
         &self.executor_registry
@@ -475,6 +1152,30 @@ impl RuntimeServices {
     }
     pub fn agent_runtime(&self) -> &Arc<AgentRuntime> {
         &self.agent_runtime
+    }
+
+    /// Runtime-owned, immutable terminal run evidence. Consumers receive
+    /// projections only and cannot amend a Definition's self-model directly.
+    #[must_use]
+    pub fn agent_run_evaluations(&self) -> Vec<crate::AgentRunEvaluation> {
+        self.agent_runtime.evaluations()
+    }
+
+    #[must_use]
+    pub fn agent_self_models(&self) -> Vec<crate::AgentSelfModel> {
+        self.agent_runtime.self_models()
+    }
+
+    /// Recompute all active Canary observations from the canonical terminal
+    /// Agent evidence. The method is intentionally idempotent and does not
+    /// authorize Stable promotion; it only refreshes the evidence consumed by
+    /// the separate typed Stable-review gate.
+    pub fn refresh_evolution_canary_observations(
+        &self,
+    ) -> Result<Vec<crate::EvolutionGovernanceCandidate>, RuntimeServicesError> {
+        self.evolution_governance
+            .refresh_canary_observations_from_agent_runs(&self.agent_runtime.evaluations())
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
     }
     pub fn team_runtime(&self) -> &Arc<TeamRuntime> {
         &self.team_runtime
@@ -496,6 +1197,611 @@ impl RuntimeServices {
     }
     pub fn approval_queue(&self) -> &Arc<ApprovalQueue> {
         &self.approval_queue
+    }
+    /// Runtime is the single owner of evolution candidates, evaluation
+    /// eligibility and release-change review projections. Gateway and
+    /// surfaces consume this service rather than keeping a second registry.
+    pub fn evolution_candidate(
+        &self,
+        candidate_id: &str,
+    ) -> Result<crate::EvolutionGovernanceCandidate, RuntimeServicesError> {
+        self.evolution_governance
+            .candidate(candidate_id)
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
+    }
+
+    pub fn evolution_candidates(
+        &self,
+    ) -> Result<Vec<crate::EvolutionGovernanceCandidate>, RuntimeServicesError> {
+        self.evolution_governance
+            .list_candidates()
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
+    }
+
+    pub fn evolution_release_reviews(
+        &self,
+    ) -> Result<Vec<crate::ReleaseChangeReview>, RuntimeServicesError> {
+        self.evolution_governance
+            .list_reviews()
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
+    }
+
+    pub fn evolution_release_review(
+        &self,
+        review_id: &str,
+    ) -> Result<crate::ReleaseChangeReview, RuntimeServicesError> {
+        self.evolution_governance
+            .review(review_id)
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
+    }
+
+    /// The active floor is a Runtime event projection. Gateway may display it
+    /// but cannot supply a looser policy while registering or releasing a
+    /// candidate.
+    #[must_use]
+    pub fn evolution_evaluation_policy_floor(
+        &self,
+    ) -> harness_contract::evaluation::EvaluationPolicyFloor {
+        self.evolution_governance.evaluation_policy_floor()
+    }
+
+    pub fn evolution_evaluation_policy_reviews(
+        &self,
+    ) -> Result<Vec<crate::EvaluationPolicyChangeReview>, RuntimeServicesError> {
+        self.evolution_governance
+            .list_evaluation_policy_reviews()
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
+    }
+
+    pub fn request_evolution_evaluation_policy_change(
+        &self,
+        intent: crate::EvaluationPolicyChangeIntent,
+    ) -> Result<crate::EvaluationPolicyChangeReview, RuntimeServicesError> {
+        self.evolution_governance
+            .request_evaluation_policy_change(intent)
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
+    }
+
+    pub fn decide_evolution_evaluation_policy_change(
+        &self,
+        principal: &crate::VerifiedPrincipal,
+        lease: &crate::VerifiedDecisionLease,
+        review_id: &str,
+        decision: crate::ReleaseChangeReviewDecision,
+        reason: String,
+    ) -> Result<Option<harness_contract::evaluation::EvaluationPolicyFloor>, RuntimeServicesError>
+    {
+        self.evolution_governance
+            .decide_evaluation_policy_change(principal, lease, review_id, decision, reason)
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
+    }
+
+    pub fn request_evolution_canary_review(
+        &self,
+        candidate_id: &str,
+    ) -> Result<crate::ReleaseChangeReview, RuntimeServicesError> {
+        self.evolution_governance
+            .request_canary_review(candidate_id)
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
+    }
+
+    pub fn request_evolution_stable_review(
+        &self,
+        candidate_id: &str,
+    ) -> Result<crate::ReleaseChangeReview, RuntimeServicesError> {
+        self.refresh_evolution_canary_observations()?;
+        self.evolution_governance
+            .request_stable_review(candidate_id)
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
+    }
+
+    /// Queue a non-candidate release/pointer change behind the same immutable
+    /// Runtime review and human-decision boundary used by Canary and Stable.
+    /// The referenced revision is validated before a pending review exists,
+    /// preventing a surface from creating a pointer request for a missing
+    /// Definition or Template.
+    pub fn request_evolution_release_change(
+        &self,
+        request: crate::ReleaseChangeRequest,
+    ) -> Result<crate::ReleaseChangeReview, RuntimeServicesError> {
+        match &request.subject {
+            crate::EvolutionCandidateSubject::AgentDefinition { revision_ref } => {
+                self.definition_registry
+                    .agents()
+                    .read_revision(&revision_ref)
+                    .map_err(DefinitionRegistryError::Agent)?;
+                if let Some(harness_contract::agent::RevisionSelector::ExactApprovedRevision {
+                    revision,
+                }) = request.selector.as_ref()
+                {
+                    let target = harness_contract::agent::AgentDefinitionRevisionRef::new(
+                        revision_ref.definition_id.clone(),
+                        *revision,
+                    )
+                    .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+                    self.definition_registry
+                        .agents()
+                        .read_revision(&target)
+                        .map_err(DefinitionRegistryError::Agent)?;
+                }
+            }
+            crate::EvolutionCandidateSubject::TeamTemplate { revision_ref } => {
+                self.definition_registry
+                    .teams()
+                    .read_revision(&revision_ref)
+                    .map_err(DefinitionRegistryError::Team)?;
+                if let Some(harness_contract::agent::RevisionSelector::ExactApprovedRevision {
+                    revision,
+                }) = request.selector.as_ref()
+                {
+                    let target = harness_contract::team::TeamTemplateRevisionRef::new(
+                        revision_ref.template_id.clone(),
+                        *revision,
+                    )
+                    .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+                    self.definition_registry
+                        .teams()
+                        .read_revision(&target)
+                        .map_err(DefinitionRegistryError::Team)?;
+                }
+            }
+        }
+        self.evolution_governance
+            .request_release_change(request)
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
+    }
+
+    /// Accept an immutable Canary observation from a trusted Runtime-side
+    /// evaluator. There is deliberately no Gateway HTTP route for raw
+    /// observation payloads: untrusted clients cannot manufacture the
+    /// evidence required for Stable promotion.
+    pub fn record_evolution_canary_observation(
+        &self,
+        observation: crate::CanaryObservationReport,
+    ) -> Result<crate::EvolutionGovernanceCandidate, RuntimeServicesError> {
+        self.evolution_governance
+            .record_canary_observation(observation)
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
+    }
+
+    /// Register a Draft evolution candidate only after both the baseline and
+    /// proposed Definition revisions are present in the registered Runtime
+    /// stores. Gateway never receives direct Definition-store write access.
+    pub fn register_evolution_candidate(
+        &self,
+        intent: crate::EvolutionCandidateIntent,
+    ) -> Result<crate::EvolutionGovernanceCandidate, RuntimeServicesError> {
+        let evaluation_contract = match &intent.subject {
+            crate::EvolutionCandidateSubject::AgentDefinition { revision_ref } => {
+                if intent.baseline_revision >= revision_ref.revision {
+                    return Err(RuntimeServicesError::Invariant(
+                        "evolution candidate revision must be newer than its baseline".to_string(),
+                    ));
+                }
+                let candidate = self
+                    .definition_registry
+                    .agents()
+                    .read_revision(&revision_ref)
+                    .map_err(DefinitionRegistryError::Agent)?;
+                let baseline = harness_contract::agent::AgentDefinitionRevisionRef::new(
+                    revision_ref.definition_id.clone(),
+                    intent.baseline_revision,
+                )
+                .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+                let baseline = self
+                    .definition_registry
+                    .agents()
+                    .read_revision(&baseline)
+                    .map_err(DefinitionRegistryError::Agent)?;
+                if !candidate
+                    .revision
+                    .manifest
+                    .evaluation
+                    .is_noninferior_to(&baseline.revision.manifest.evaluation)
+                {
+                    return Err(RuntimeServicesError::Invariant(
+                        "candidate Agent Definition weakens the baseline evaluation contract; submit a separate policy review"
+                            .to_string(),
+                    ));
+                }
+                baseline.revision.manifest.evaluation.clone()
+            }
+            crate::EvolutionCandidateSubject::TeamTemplate { revision_ref } => {
+                if intent.baseline_revision >= revision_ref.revision {
+                    return Err(RuntimeServicesError::Invariant(
+                        "evolution candidate revision must be newer than its baseline".to_string(),
+                    ));
+                }
+                let candidate = self
+                    .definition_registry
+                    .teams()
+                    .read_revision(&revision_ref)
+                    .map_err(DefinitionRegistryError::Team)?;
+                let baseline = harness_contract::team::TeamTemplateRevisionRef::new(
+                    revision_ref.template_id.clone(),
+                    intent.baseline_revision,
+                )
+                .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+                let baseline = self
+                    .definition_registry
+                    .teams()
+                    .read_revision(&baseline)
+                    .map_err(DefinitionRegistryError::Team)?;
+                ensure_team_evaluation_contract_noninferior(
+                    &baseline.revision.manifest,
+                    &candidate.revision.manifest,
+                )?;
+                baseline.revision.manifest.evaluation.clone()
+            }
+        };
+        self.evolution_governance
+            .register_candidate(crate::EvolutionCandidateRegistration {
+                candidate_id: intent.candidate_id,
+                subject: intent.subject,
+                baseline_revision: intent.baseline_revision,
+                evaluation_contract,
+                source_evidence_refs: intent.source_evidence_refs,
+                canary_policy: intent.canary_policy,
+            })
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
+    }
+
+    /// Run a registered candidate through the composition-root evaluator and
+    /// record only its immutable Runtime comparison report. An absent runner
+    /// is an explicit configuration error, never a permissive fallback or a
+    /// Gateway-calculated verdict.
+    pub async fn evaluate_evolution_candidate(
+        &self,
+        candidate_id: &str,
+    ) -> Result<crate::EvolutionGovernanceCandidate, RuntimeServicesError> {
+        let candidate = self
+            .evolution_governance
+            .candidate(candidate_id)
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+        let runner = self.evolution_eval_runner.as_ref().ok_or_else(|| {
+            RuntimeServicesError::Invariant("evolution_evaluator_not_configured".to_string())
+        })?;
+        let report = runner
+            .evaluate(&candidate)
+            .await
+            .map_err(RuntimeServicesError::Invariant)?;
+        if report.candidate_id != candidate.candidate_id
+            || report.evaluation_contract_digest != candidate.evaluation_contract_digest()
+        {
+            return Err(RuntimeServicesError::Invariant(
+                "evolution_evaluator_report_binding_mismatch".to_string(),
+            ));
+        }
+        self.evolution_governance
+            .record_comparison(report)
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
+    }
+
+    /// Execute the correct concrete Runtime path for one immutable paired
+    /// evaluation scenario. The evaluator receives only this port; it cannot
+    /// choose an Agent shortcut for a Team candidate or obtain release
+    /// authority from an execution result.
+    pub async fn execute_evolution_scenario(
+        &self,
+        candidate_id: &str,
+        scenario: &EvaluationScenarioSpec,
+        sample_index: u32,
+    ) -> Result<(EvaluationScenarioObservation, EvaluationScenarioObservation), RuntimeServicesError>
+    {
+        let candidate = self.evolution_candidate(candidate_id)?;
+        match &candidate.subject {
+            crate::EvolutionCandidateSubject::AgentDefinition { .. } => {
+                self.execute_evolution_agent_scenario(candidate_id, scenario, sample_index)
+                    .await
+            }
+            crate::EvolutionCandidateSubject::TeamTemplate { .. } => {
+                self.execute_evolution_team_scenario(candidate_id, scenario, sample_index)
+                    .await
+            }
+        }
+    }
+
+    /// Execute one real paired Agent scenario through Runtime. Both packets
+    /// use normal AgentRuntime/provider/tool lifecycle; only the candidate
+    /// packet carries the narrow evaluation provenance that permits a
+    /// published-but-not-released revision to be resolved. This operation
+    /// returns observations, never an eligibility or rollout decision.
+    pub async fn execute_evolution_agent_scenario(
+        &self,
+        candidate_id: &str,
+        scenario: &EvaluationScenarioSpec,
+        sample_index: u32,
+    ) -> Result<(EvaluationScenarioObservation, EvaluationScenarioObservation), RuntimeServicesError>
+    {
+        scenario
+            .validate()
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+        validate_evolution_scenario_isolation(scenario)?;
+        let candidate = self.evolution_candidate(candidate_id)?;
+        let crate::EvolutionCandidateSubject::AgentDefinition { revision_ref } = &candidate.subject
+        else {
+            return Err(RuntimeServicesError::Invariant(
+                "paired Agent scenario execution requires an Agent Definition candidate"
+                    .to_string(),
+            ));
+        };
+        if !candidate
+            .evaluation_contract
+            .scenario_refs
+            .iter()
+            .any(|configured| configured == &scenario.scenario_ref)
+        {
+            return Err(RuntimeServicesError::Invariant(
+                "scenario is absent from the candidate's immutable evaluation contract".to_string(),
+            ));
+        }
+        let baseline_ref = harness_contract::agent::AgentDefinitionRevisionRef::new(
+            revision_ref.definition_id.clone(),
+            candidate.baseline_revision,
+        )
+        .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+        let baseline = self
+            .definition_registry
+            .resolve_agent(
+                &baseline_ref.definition_id,
+                RevisionSelector::ExactApprovedRevision {
+                    revision: baseline_ref.revision,
+                },
+            )
+            .map_err(RuntimeServicesError::from)?;
+        let proposed = self
+            .definition_registry
+            .resolve_agent_canary(revision_ref)
+            .map_err(RuntimeServicesError::from)?;
+        let baseline_packet = self.compile_evolution_scenario_packet(
+            &candidate,
+            scenario,
+            baseline,
+            None,
+            "baseline",
+            sample_index,
+        )?;
+        let candidate_packet = self.compile_evolution_scenario_packet(
+            &candidate,
+            scenario,
+            proposed,
+            Some(AgentEvaluationBinding {
+                candidate_id: candidate.candidate_id.clone(),
+                scenario_ref: scenario.scenario_ref.clone(),
+            }),
+            "candidate",
+            sample_index,
+        )?;
+        let started = Instant::now();
+        let baseline_return = self
+            .agent_runtime
+            .execute_task(baseline_packet.clone())
+            .await
+            .map_err(RuntimeServicesError::AgentRuntime)?;
+        let baseline_elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        let started = Instant::now();
+        let candidate_return = self
+            .agent_runtime
+            .execute_task(candidate_packet.clone())
+            .await
+            .map_err(RuntimeServicesError::AgentRuntime)?;
+        let candidate_elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        Ok((
+            scenario_observation(
+                &baseline_packet,
+                &baseline_return,
+                scenario,
+                baseline_elapsed_ms,
+            ),
+            scenario_observation(
+                &candidate_packet,
+                &candidate_return,
+                scenario,
+                candidate_elapsed_ms,
+            ),
+        ))
+    }
+
+    /// Execute baseline and candidate Team Template revisions through the
+    /// canonical Team graph compiler. Candidate selection is evaluation-only
+    /// and never creates a rollout assignment, while every role still uses
+    /// its pinned approved Agent revision and normal graph lifecycle.
+    async fn execute_evolution_team_scenario(
+        &self,
+        candidate_id: &str,
+        scenario: &EvaluationScenarioSpec,
+        sample_index: u32,
+    ) -> Result<(EvaluationScenarioObservation, EvaluationScenarioObservation), RuntimeServicesError>
+    {
+        scenario
+            .validate()
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+        validate_evolution_scenario_isolation(scenario)?;
+        let candidate = self.evolution_candidate(candidate_id)?;
+        let crate::EvolutionCandidateSubject::TeamTemplate { revision_ref } = &candidate.subject
+        else {
+            return Err(RuntimeServicesError::Invariant(
+                "paired Team scenario execution requires a Team Template candidate".to_string(),
+            ));
+        };
+        if !candidate
+            .evaluation_contract
+            .scenario_refs
+            .iter()
+            .any(|configured| configured == &scenario.scenario_ref)
+        {
+            return Err(RuntimeServicesError::Invariant(
+                "scenario is absent from the candidate's immutable evaluation contract".to_string(),
+            ));
+        }
+        let baseline_ref = TeamTemplateRevisionRef::new(
+            revision_ref.template_id.clone(),
+            candidate.baseline_revision,
+        )
+        .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+        let baseline_request = evolution_team_request(
+            &candidate,
+            scenario,
+            &baseline_ref,
+            "baseline",
+            sample_index,
+        );
+        let candidate_request = evolution_team_request(
+            &candidate,
+            scenario,
+            revision_ref,
+            "candidate",
+            sample_index,
+        );
+        let started = Instant::now();
+        let baseline = self
+            .team_runtime
+            .instantiate_evaluation(baseline_request, None, &scenario.allowed_tools)
+            .await
+            .map_err(RuntimeServicesError::Invariant)?;
+        let baseline_elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        let started = Instant::now();
+        let proposed = self
+            .team_runtime
+            .instantiate_evaluation(
+                candidate_request,
+                Some(revision_ref),
+                &scenario.allowed_tools,
+            )
+            .await
+            .map_err(RuntimeServicesError::Invariant)?;
+        let candidate_elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        Ok((
+            team_scenario_observation(
+                &baseline,
+                &self.agent_runtime.evaluations(),
+                scenario,
+                baseline_ref.revision,
+                baseline_elapsed_ms,
+            ),
+            team_scenario_observation(
+                &proposed,
+                &self.agent_runtime.evaluations(),
+                scenario,
+                revision_ref.revision,
+                candidate_elapsed_ms,
+            ),
+        ))
+    }
+
+    fn compile_evolution_scenario_packet(
+        &self,
+        candidate: &crate::EvolutionGovernanceCandidate,
+        scenario: &EvaluationScenarioSpec,
+        resolved: crate::agent::definition::ResolvedAgentDefinition,
+        evaluation: Option<AgentEvaluationBinding>,
+        side: &str,
+        sample_index: u32,
+    ) -> Result<AgentTaskPacket, RuntimeServicesError> {
+        let revision_ref = resolved.revision.revision_ref.clone();
+        let run_id = format!(
+            "evolution-eval:{}:{}:{}:{}:{}",
+            candidate.candidate_id,
+            scenario.scenario_ref,
+            side,
+            revision_ref.revision,
+            sample_index
+        );
+        let task_id = format!("{run_id}:task");
+        let session_id = format!("evolution-eval:{}", candidate.candidate_id);
+        let mut request = AgentBindingRequest::new(
+            revision_ref.definition_id.clone(),
+            RevisionSelector::ExactApprovedRevision {
+                revision: revision_ref.revision,
+            },
+            format!("instance:{run_id}"),
+            session_id.clone(),
+            task_id.clone(),
+        );
+        request.granted_capabilities = resolved
+            .revision
+            .manifest
+            .capability_contract
+            .capability_ceiling
+            .clone();
+        request.allowed_tool_contract_refs = scenario.allowed_tools.clone();
+        request.allowed_skill_refs = scenario.allowed_skills.clone();
+        let compiler = AgentBindingCompiler::new(Arc::clone(&self.definition_registry));
+        let compiled = match evaluation {
+            Some(evaluation) => compiler.compile_evaluation_resolved(request, resolved, evaluation),
+            None => compiler.compile_resolved(request, resolved, None),
+        }
+        .map_err(|error| RuntimeServicesError::AgentRuntime(error.to_string()))?;
+        compiled
+            .snapshot
+            .compile_task_packet(AgentTaskIntent {
+                selected_agent_id: None,
+                definition_ref: Some(revision_ref),
+                granted_capabilities: Vec::new(),
+                run_id: run_id.clone(),
+                task_id: task_id.clone(),
+                session_id,
+                mission_id: None,
+                team_id: None,
+                graph_id: format!("evolution-eval-graph:{}", candidate.candidate_id),
+                node_id: format!("{}:{}", scenario.scenario_ref, side),
+                attempt: 1,
+                expected_graph_revision: 0,
+                objective: scenario.objective.clone(),
+                acceptance: scenario.acceptance.clone(),
+                constraints: vec![
+                    "evolution_evaluation:isolation_required".to_string(),
+                    format!("evaluation_scenario:{}", scenario.scenario_ref),
+                ],
+                context_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                allowed_tools: scenario.allowed_tools.clone(),
+                allowed_skills: scenario.allowed_skills.clone(),
+                permission_lease: scenario.permission_lease.clone(),
+                model_lease: scenario.model_lease.clone(),
+                budget_lease: ContextBudgetLeaseRef::new(
+                    format!("evolution-eval-budget:{run_id}"),
+                    run_id.clone(),
+                    "evolution_evaluation",
+                    65_536,
+                    1,
+                ),
+                managed_invocation: None,
+                idempotency_key: format!("evolution-eval:{}", run_id),
+            })
+            .map_err(|error| RuntimeServicesError::AgentRuntime(error.to_string()))
+    }
+
+    /// Converge file-backed Definition release projections from the Runtime
+    /// authorization ledger. This is deliberately idempotent: a crash after
+    /// the authorized event commit can delay availability, but can never make
+    /// an unapproved revision runnable.
+    pub fn materialize_evolution_release_assignments(&self) -> Result<(), RuntimeServicesError> {
+        for assignment in self
+            .evolution_governance
+            .release_assignments()
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?
+        {
+            self.definition_registry
+                .materialize_evolution_release(&assignment)?;
+        }
+        self.refresh_definition_catalog()
+    }
+
+    pub fn decide_evolution_release_review(
+        &self,
+        principal: &crate::VerifiedPrincipal,
+        lease: &crate::VerifiedDecisionLease,
+        review_id: &str,
+        decision: crate::ReleaseChangeReviewDecision,
+        reason: String,
+    ) -> Result<Option<crate::EvolutionReleaseAssignment>, RuntimeServicesError> {
+        let assignment = self
+            .evolution_governance
+            .decide_review(principal, lease, review_id, decision, reason)
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+        self.materialize_evolution_release_assignments()?;
+        Ok(assignment)
     }
     pub fn mission_evidence(&self) -> &Arc<MissionEvidenceBus> {
         &self.mission_evidence
@@ -815,11 +2121,24 @@ impl RuntimeServices {
                 );
             match interpretation.command {
                 crate::MissionInterpretedCommand::SubmitExecutionGraph { graph, .. } => {
-                    match self.graph_runner.start(graph.clone()).await {
+                    let graph_id = graph.id.clone();
+                    let graph = match self.compile_graph_agent_intents(graph) {
+                        Ok(graph) => graph,
+                        Err(error) => {
+                            failed.push(self.mission_schedules.mark_failed(
+                                &fire.fire_id,
+                                format!(
+                                    "SessionDispatch Agent Binding compilation failed: {error}"
+                                ),
+                            )?);
+                            continue;
+                        }
+                    };
+                    match self.graph_runner.start(graph).await {
                         Ok(report) if report.failed == 0 => {
                             submitted.push(
                                 self.mission_schedules
-                                    .mark_submitted(&fire.fire_id, graph.id)?,
+                                    .mark_submitted(&fire.fire_id, graph_id)?,
                             );
                         }
                         Ok(report) => failed.push(self.mission_schedules.mark_failed(
@@ -854,6 +2173,423 @@ impl RuntimeServices {
     pub fn mission_schedules(&self) -> &Arc<MissionScheduleStore> {
         &self.mission_schedules
     }
+    /// Runtime-owned Managed Agent registry and dispatcher. Gateway and Edge
+    /// can submit trigger intents, but they cannot claim or mutate its
+    /// invocation fence directly.
+    pub fn managed_agents(&self) -> &Arc<crate::ManagedAgentDispatcher> {
+        &self.managed_agents
+    }
+
+    pub fn register_managed_agent(
+        &self,
+        definition: harness_contract::managed_agent::ManagedAgentDefinition,
+    ) -> Result<harness_contract::managed_agent::ManagedAgentDefinition, RuntimeServicesError> {
+        self.managed_agents
+            .register_definition(definition, now_ms())
+            .map_err(RuntimeServicesError::Mission)
+    }
+
+    pub fn trigger_managed_agent_manual(
+        &self,
+        managed_agent_id: &str,
+        request_id: &str,
+    ) -> Result<crate::ManagedAgentInvocation, RuntimeServicesError> {
+        self.managed_agents
+            .trigger_manual(managed_agent_id, request_id, now_ms())
+            .map_err(RuntimeServicesError::Mission)
+    }
+
+    pub fn accept_managed_agent_event(
+        &self,
+        event: harness_contract::managed_agent::ManagedAgentTriggerEvent,
+    ) -> Result<crate::ManagedAgentDispatchReport, RuntimeServicesError> {
+        self.managed_agents
+            .accept_event(event, now_ms())
+            .map_err(RuntimeServicesError::Mission)
+    }
+
+    pub fn reset_managed_agent_health(
+        &self,
+        managed_agent_id: &str,
+    ) -> Result<crate::ManagedAgentHealth, RuntimeServicesError> {
+        self.managed_agents
+            .reset_health(managed_agent_id)
+            .map_err(RuntimeServicesError::Mission)
+    }
+
+    /// Enter Runtime's durable fenced-effect boundary.  Gateway owns the
+    /// adapter invocation, but it cannot execute a Managed Agent side effect
+    /// until this Runtime-owned ledger has persisted and claimed the intent.
+    pub fn begin_managed_agent_effect(
+        &self,
+        fence: &harness_contract::managed_agent::ManagedAgentInvocationFence,
+        effect_id: &str,
+        effect_kind: String,
+        idempotency_key: String,
+        request_ref: String,
+    ) -> Result<crate::ManagedAgentEffectPermit, RuntimeServicesError> {
+        fence
+            .validate()
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+        let queued = self
+            .managed_agents
+            .enqueue_effect(
+                &fence.invocation_id,
+                &fence.dispatcher_id,
+                fence.fence_generation,
+                effect_id,
+                effect_kind,
+                idempotency_key,
+                request_ref,
+                now_ms(),
+            )
+            .map_err(RuntimeServicesError::Mission)?;
+        match queued.status {
+            crate::FencedEffectStatus::Pending => self
+                .managed_agents
+                .claim_effect(
+                    &fence.invocation_id,
+                    effect_id,
+                    fence.fence_generation,
+                    &fence.dispatcher_id,
+                )
+                .map(|record| crate::ManagedAgentEffectPermit::Execute { record })
+                .map_err(RuntimeServicesError::Mission),
+            crate::FencedEffectStatus::Completed => {
+                Ok(crate::ManagedAgentEffectPermit::AlreadyCompleted { record: queued })
+            }
+            crate::FencedEffectStatus::Claimed
+            | crate::FencedEffectStatus::ReconciliationRequired
+            | crate::FencedEffectStatus::Cancelled => {
+                Err(RuntimeServicesError::Invariant(format!(
+                    "managed effect `{effect_id}` is not safe to execute from state {:?}",
+                    queued.status
+                )))
+            }
+        }
+    }
+
+    pub fn complete_managed_agent_effect(
+        &self,
+        fence: &harness_contract::managed_agent::ManagedAgentInvocationFence,
+        effect_id: &str,
+        receipt_ref: String,
+    ) -> Result<crate::FencedEffectOutboxRecord, RuntimeServicesError> {
+        self.managed_agents
+            .complete_effect(
+                &fence.invocation_id,
+                effect_id,
+                fence.fence_generation,
+                &fence.dispatcher_id,
+                receipt_ref,
+            )
+            .map_err(RuntimeServicesError::Mission)
+    }
+
+    pub fn reconcile_managed_agent_effect(
+        &self,
+        fence: &harness_contract::managed_agent::ManagedAgentInvocationFence,
+        effect_id: &str,
+        error: String,
+    ) -> Result<crate::FencedEffectOutboxRecord, RuntimeServicesError> {
+        self.managed_agents
+            .mark_effect_reconciliation_required(
+                &fence.invocation_id,
+                effect_id,
+                fence.fence_generation,
+                &fence.dispatcher_id,
+                error,
+            )
+            .map_err(RuntimeServicesError::Mission)
+    }
+
+    /// Accept due schedule occurrences, then compile and run each claimed
+    /// Managed Agent invocation through the same Agent/Team Runtime paths
+    /// used by interactive work. The report contains durable invocation
+    /// records, not a second Gateway scheduler state.
+    pub async fn dispatch_managed_agents(
+        &self,
+        dispatcher_id: &str,
+        limit: usize,
+    ) -> Result<ManagedAgentRuntimeDispatchReport, RuntimeServicesError> {
+        let health_affected = self
+            .managed_agents
+            .enforce_run_health(now_ms())
+            .map_err(RuntimeServicesError::Mission)?;
+        let scheduled = self
+            .managed_agents
+            .accept_due_schedules(now_ms())
+            .map_err(RuntimeServicesError::Mission)?;
+        let claimed = self
+            .managed_agents
+            .claim_ready(dispatcher_id, now_ms(), limit)
+            .map_err(RuntimeServicesError::Mission)?;
+        let mut completed = Vec::new();
+        let mut failed = Vec::new();
+        for invocation in &claimed {
+            match self
+                .execute_managed_agent_invocation(dispatcher_id, invocation.clone())
+                .await
+            {
+                Ok(invocation)
+                    if invocation.status == crate::ManagedAgentInvocationStatus::Completed =>
+                {
+                    completed.push(invocation);
+                }
+                Ok(invocation) => failed.push(invocation),
+                Err(error) => {
+                    let completed_invocation = self
+                        .managed_agents
+                        .complete_invocation(
+                            &invocation.invocation_id,
+                            dispatcher_id,
+                            invocation.fence_generation,
+                            false,
+                            now_ms(),
+                            None,
+                            Vec::new(),
+                            Some(error.to_string()),
+                        )
+                        .map_err(RuntimeServicesError::Mission)?;
+                    failed.push(completed_invocation);
+                }
+            }
+        }
+        Ok(ManagedAgentRuntimeDispatchReport {
+            health_affected,
+            scheduled,
+            claimed,
+            completed,
+            failed,
+        })
+    }
+
+    async fn execute_managed_agent_invocation(
+        &self,
+        dispatcher_id: &str,
+        invocation: crate::ManagedAgentInvocation,
+    ) -> Result<crate::ManagedAgentInvocation, RuntimeServicesError> {
+        // Move the durable invocation to Running before resolving the target.
+        // Any later definition/binding/executor failure is then completed by
+        // `dispatch_managed_agents` through the one retry/failure transition,
+        // rather than stranding a claimed reservation after a bad revision.
+        self.managed_agents
+            .start_invocation(
+                &invocation.invocation_id,
+                dispatcher_id,
+                invocation.fence_generation,
+                format!(
+                    "managed-dispatch:{}:{}",
+                    invocation.invocation_id, invocation.attempt_no
+                ),
+                now_ms(),
+            )
+            .map_err(RuntimeServicesError::Mission)?;
+        let definition = self
+            .managed_agents
+            .definition(
+                &invocation.definition_id,
+                Some(invocation.definition_revision),
+            )
+            .map_err(RuntimeServicesError::Mission)?;
+        match &definition.target {
+            harness_contract::managed_agent::ManagedAgentTarget::Agent {
+                definition_id,
+                selector,
+            } => {
+                let resolved = self
+                    .definition_registry
+                    .resolve_agent(definition_id, selector.clone())
+                    .map_err(RuntimeServicesError::DefinitionRegistry)?;
+                if !matches!(
+                    resolved.revision.manifest.executor,
+                    harness_contract::agent::AgentExecutorPolicy::CowdNative
+                ) {
+                    return Err(RuntimeServicesError::Invariant(
+                        "Managed Agent execution requires the Runtime-fenced CowdNative executor; ProcessJsonl and MCP-backed definitions cannot bypass the effect outbox"
+                            .to_string(),
+                    ));
+                }
+                let run_id = format!(
+                    "managed-run:{}:{}",
+                    invocation.invocation_id, invocation.attempt_no
+                );
+                let task_id = format!("{run_id}:task");
+                let mut request = AgentBindingRequest::new(
+                    definition_id.clone(),
+                    selector.clone(),
+                    format!("managed-instance:{run_id}"),
+                    definition.session_id.clone(),
+                    task_id.clone(),
+                );
+                request.granted_capabilities = definition.granted_capabilities.clone();
+                request.allowed_tool_contract_refs = definition.allowed_tool_contract_refs.clone();
+                request.allowed_skill_refs = definition.allowed_skill_refs.clone();
+                let compiled = AgentBindingCompiler::new(Arc::clone(&self.definition_registry))
+                    .compile(request)
+                    .map_err(|error| RuntimeServicesError::AgentRuntime(error.to_string()))?;
+                let execution_ref = run_id.clone();
+                let packet = compiled
+                    .snapshot
+                    .compile_task_packet(AgentTaskIntent {
+                        selected_agent_id: None,
+                        definition_ref: Some(compiled.snapshot.definition_ref.clone()),
+                        granted_capabilities: Vec::new(),
+                        run_id: run_id.clone(),
+                        task_id,
+                        session_id: definition.session_id.clone(),
+                        mission_id: None,
+                        team_id: None,
+                        graph_id: format!("managed-agent:{}", invocation.invocation_id),
+                        node_id: format!(
+                            "managed-agent:{}:attempt:{}",
+                            invocation.invocation_id, invocation.attempt_no
+                        ),
+                        attempt: u32::from(invocation.attempt_no),
+                        expected_graph_revision: 0,
+                        objective: definition.objective.clone(),
+                        acceptance: definition.acceptance.clone(),
+                        constraints: vec![
+                            format!(
+                                "managed_agent:{}@{}",
+                                definition.managed_agent_id, definition.revision
+                            ),
+                            format!("managed_invocation:{}", invocation.invocation_id),
+                            format!("managed_fence:{}", invocation.fence_generation),
+                        ],
+                        context_refs: Vec::new(),
+                        evidence_refs: Vec::new(),
+                        allowed_tools: definition.allowed_tool_contract_refs.clone(),
+                        allowed_skills: definition.allowed_skill_refs.clone(),
+                        permission_lease: definition.permission_lease.clone(),
+                        model_lease: definition.model_lease.clone(),
+                        budget_lease: ContextBudgetLeaseRef::new(
+                            format!("managed-budget:{run_id}"),
+                            run_id.clone(),
+                            "managed_agent",
+                            65_536,
+                            1,
+                        ),
+                        managed_invocation: Some(
+                            harness_contract::managed_agent::ManagedAgentInvocationFence {
+                                managed_agent_id: definition.managed_agent_id.clone(),
+                                definition_revision: definition.revision,
+                                invocation_id: invocation.invocation_id.clone(),
+                                attempt_no: invocation.attempt_no,
+                                fence_generation: invocation.fence_generation,
+                                dispatcher_id: dispatcher_id.to_string(),
+                            },
+                        ),
+                        idempotency_key: format!(
+                            "managed-agent:{}:{}",
+                            invocation.invocation_id, invocation.attempt_no
+                        ),
+                    })
+                    .map_err(|error| RuntimeServicesError::AgentRuntime(error.to_string()))?;
+                let returned = self
+                    .agent_runtime
+                    .execute_task(packet)
+                    .await
+                    .map_err(RuntimeServicesError::AgentRuntime)?;
+                self.managed_agents
+                    .complete_invocation(
+                        &invocation.invocation_id,
+                        dispatcher_id,
+                        invocation.fence_generation,
+                        returned.status == AgentTerminalStatus::Completed
+                            && returned.failure.is_none(),
+                        now_ms(),
+                        Some(execution_ref),
+                        returned
+                            .evidence_refs
+                            .iter()
+                            .map(|reference| reference.evidence_ref.0.id.clone())
+                            .collect(),
+                        returned.failure,
+                    )
+                    .map_err(RuntimeServicesError::Mission)
+            }
+            harness_contract::managed_agent::ManagedAgentTarget::Team {
+                template_id,
+                selector,
+            } => {
+                let execution_ref = format!(
+                    "managed-team:{}:{}",
+                    invocation.invocation_id, invocation.attempt_no
+                );
+                let selector_template_id = match selector {
+                    harness_contract::team::TeamTemplateSelector::Exact { revision_ref } => {
+                        &revision_ref.template_id
+                    }
+                    harness_contract::team::TeamTemplateSelector::LatestStable { template_id }
+                    | harness_contract::team::TeamTemplateSelector::Default { template_id } => {
+                        template_id
+                    }
+                    harness_contract::team::TeamTemplateSelector::Automatic => {
+                        return Err(RuntimeServicesError::Invariant(
+                            "managed Team target cannot use automatic template selection"
+                                .to_string(),
+                        ));
+                    }
+                };
+                if selector_template_id != template_id {
+                    return Err(RuntimeServicesError::Invariant(
+                        "managed Team target template_id must match its selector".to_string(),
+                    ));
+                }
+                let projection = self
+                    .team_runtime
+                    .instantiate(TeamInstantiationRequest {
+                        request_id: format!(
+                            "managed-team-request:{}:{}",
+                            invocation.invocation_id, invocation.attempt_no
+                        ),
+                        team_id: execution_ref.clone(),
+                        session_id: definition.session_id.clone(),
+                        mission_id: None,
+                        parent_execution: None,
+                        selection_mode: TeamSelectionMode::Explicit,
+                        template_selector: selector.clone(),
+                        objective: definition.objective.clone(),
+                        acceptance: definition.acceptance.clone(),
+                        risk: None,
+                        role_binding_overrides: Vec::new(),
+                        cardinality_overrides: Vec::new(),
+                        focus_partition_plans: Vec::new(),
+                        permission_lease: definition.permission_lease.clone(),
+                        model_lease: definition.model_lease.clone(),
+                        budget_lease: None,
+                        managed_invocation: Some(
+                            harness_contract::managed_agent::ManagedAgentInvocationFence {
+                                managed_agent_id: definition.managed_agent_id.clone(),
+                                definition_revision: definition.revision,
+                                invocation_id: invocation.invocation_id.clone(),
+                                attempt_no: invocation.attempt_no,
+                                fence_generation: invocation.fence_generation,
+                                dispatcher_id: dispatcher_id.to_string(),
+                            },
+                        ),
+                        resource_scopes: definition.resource_scopes.clone(),
+                    })
+                    .await
+                    .map_err(RuntimeServicesError::Mission)?;
+                let succeeded = projection.status == "completed";
+                self.managed_agents
+                    .complete_invocation(
+                        &invocation.invocation_id,
+                        dispatcher_id,
+                        invocation.fence_generation,
+                        succeeded,
+                        now_ms(),
+                        Some(execution_ref),
+                        vec![format!("team-graph:{}", projection.graph_id)],
+                        (!succeeded)
+                            .then(|| format!("Team graph terminal status: {}", projection.status)),
+                    )
+                    .map_err(RuntimeServicesError::Mission)
+            }
+        }
+    }
     #[must_use]
     pub fn mission_schedule_policy(&self) -> crate::MissionSchedulePolicy {
         self.mission_schedule_policy
@@ -871,6 +2607,24 @@ impl RuntimeServices {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = policy;
         Ok(())
+    }
+
+    /// Validate the Runtime-only candidate/scenario provenance carried by an
+    /// isolated evaluation Binding immediately before execution.
+    pub(crate) fn validate_agent_evaluation_binding(
+        &self,
+        binding: &harness_contract::agent::AgentBindingSnapshot,
+    ) -> Result<(), RuntimeServicesError> {
+        let Some(evaluation) = &binding.evaluation else {
+            return Ok(());
+        };
+        self.evolution_governance
+            .validate_agent_evaluation_binding(
+                &binding.definition_ref,
+                &evaluation.candidate_id,
+                &evaluation.scenario_ref,
+            )
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
     }
     pub fn session_relations(&self) -> &Arc<SessionRelationGraph> {
         &self.session_relations
@@ -893,6 +2647,208 @@ impl RuntimeServices {
         self.session_input_router
             .get()
             .map(|router| router.session_store())
+    }
+}
+
+fn ensure_team_evaluation_contract_noninferior(
+    baseline: &harness_contract::team::TeamTemplateManifest,
+    candidate: &harness_contract::team::TeamTemplateManifest,
+) -> Result<(), RuntimeServicesError> {
+    let baseline_result = &baseline.result_contract;
+    let candidate_result = &candidate.result_contract;
+    if (baseline.topology.require_synthesis && !candidate.topology.require_synthesis)
+        || (baseline.topology.require_review && !candidate.topology.require_review)
+        || (baseline_result.evidence_required && !candidate_result.evidence_required)
+        || (baseline_result.synthesis_required && !candidate_result.synthesis_required)
+        || baseline_result
+            .required_fields
+            .iter()
+            .any(|field| !candidate_result.required_fields.contains(field))
+        || !candidate.evaluation.is_noninferior_to(&baseline.evaluation)
+    {
+        return Err(RuntimeServicesError::Invariant(
+            "candidate Team Template weakens the baseline evaluation/result contract; submit a separate policy review"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Evaluation evidence must never create an untracked external side effect.
+/// Runtime has a dedicated mutation-sandbox design for future code-change
+/// scenarios; until that executor exists, paired Definition evaluation is
+/// deliberately read-only.  Skills are excluded because a Skill may contain
+/// arbitrary multi-language executable assets and has no per-invocation
+/// effect receipt yet.
+fn validate_evolution_scenario_isolation(
+    scenario: &EvaluationScenarioSpec,
+) -> Result<(), RuntimeServicesError> {
+    if !scenario.allowed_skills.is_empty() {
+        return Err(RuntimeServicesError::Invariant(
+            "paired evolution evaluation cannot execute Skills until a fenced Skill executor is installed"
+                .to_string(),
+        ));
+    }
+    let unsafe_tools = scenario
+        .allowed_tools
+        .iter()
+        .filter(|tool| {
+            crate::ToolSafetyCategory::from_tool_name(tool) != crate::ToolSafetyCategory::ReadOnly
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unsafe_tools.is_empty() {
+        return Err(RuntimeServicesError::Invariant(format!(
+            "paired evolution evaluation permits only read-only tools; unsafe tools: {}",
+            unsafe_tools.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn scenario_observation(
+    packet: &AgentTaskPacket,
+    returned: &harness_contract::agent::AgentReturnPacket,
+    scenario: &EvaluationScenarioSpec,
+    elapsed_ms: u64,
+) -> EvaluationScenarioObservation {
+    let acceptance_satisfied = scenario
+        .acceptance
+        .iter()
+        .filter(|criterion| returned.acceptance.contains(*criterion))
+        .count()
+        .min(u32::MAX as usize) as u32;
+    let mut evidence_refs = returned
+        .evidence_refs
+        .iter()
+        .filter(|evidence| evidence.is_durable())
+        .map(|evidence| evidence.evidence_ref.id().to_string())
+        .collect::<Vec<_>>();
+    evidence_refs.sort();
+    evidence_refs.dedup();
+    EvaluationScenarioObservation {
+        scenario_ref: scenario.scenario_ref.clone(),
+        definition_revision: packet
+            .binding
+            .as_ref()
+            .map(|binding| binding.definition_ref.revision)
+            .unwrap_or_default(),
+        run_ref: format!("agent-run:{}", packet.run_id),
+        succeeded: returned.status == AgentTerminalStatus::Completed,
+        acceptance_total: scenario.acceptance.len().min(u32::MAX as usize) as u32,
+        acceptance_satisfied,
+        evidence_refs,
+        input_tokens: returned.input_tokens,
+        output_tokens: returned.output_tokens,
+        tool_calls: returned.tool_calls,
+        elapsed_ms,
+    }
+}
+
+fn evolution_team_request(
+    candidate: &crate::EvolutionGovernanceCandidate,
+    scenario: &EvaluationScenarioSpec,
+    revision_ref: &TeamTemplateRevisionRef,
+    side: &str,
+    sample_index: u32,
+) -> TeamInstantiationRequest {
+    let identity = format!(
+        "evolution-eval:{}:{}:{}:{}:{}",
+        candidate.candidate_id, scenario.scenario_ref, side, revision_ref.revision, sample_index
+    );
+    TeamInstantiationRequest {
+        request_id: format!("{identity}:request"),
+        team_id: format!("{identity}:team"),
+        session_id: format!("evolution-eval:{}", candidate.candidate_id),
+        mission_id: None,
+        parent_execution: None,
+        selection_mode: TeamSelectionMode::Explicit,
+        template_selector: TeamTemplateSelector::Exact {
+            revision_ref: revision_ref.clone(),
+        },
+        objective: scenario.objective.clone(),
+        acceptance: scenario.acceptance.clone(),
+        risk: None,
+        role_binding_overrides: Vec::new(),
+        cardinality_overrides: Vec::new(),
+        focus_partition_plans: Vec::new(),
+        permission_lease: scenario.permission_lease.clone(),
+        model_lease: scenario.model_lease.clone(),
+        budget_lease: Some(ContextBudgetLeaseRef::new(
+            format!("evolution-eval-budget:{identity}"),
+            identity.clone(),
+            "evolution_evaluation",
+            65_536,
+            1,
+        )),
+        managed_invocation: None,
+        resource_scopes: Vec::new(),
+    }
+}
+
+fn team_scenario_observation(
+    projection: &crate::TeamProjection,
+    evaluations: &[crate::AgentRunEvaluation],
+    scenario: &EvaluationScenarioSpec,
+    definition_revision: u64,
+    elapsed_ms: u64,
+) -> EvaluationScenarioObservation {
+    let run_ids = projection
+        .tasks
+        .iter()
+        .map(|task| task.run_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let matched = evaluations
+        .iter()
+        .filter(|evaluation| run_ids.contains(evaluation.run_id.as_str()))
+        .collect::<Vec<_>>();
+    let mut evidence_refs = projection
+        .terminal_result
+        .as_ref()
+        .map(|result| {
+            result
+                .evidence_refs
+                .iter()
+                .map(|evidence| evidence.evidence_ref.id().to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    evidence_refs.extend(
+        matched
+            .iter()
+            .flat_map(|evaluation| evaluation.evidence_refs.clone()),
+    );
+    evidence_refs.sort();
+    evidence_refs.dedup();
+    let succeeded = projection.status == "completed" && projection.terminal_result.is_some();
+    EvaluationScenarioObservation {
+        scenario_ref: scenario.scenario_ref.clone(),
+        definition_revision,
+        run_ref: format!("team-graph:{}", projection.graph_id),
+        succeeded,
+        acceptance_total: scenario.acceptance.len().min(u32::MAX as usize) as u32,
+        acceptance_satisfied: succeeded
+            .then_some(scenario.acceptance.len().min(u32::MAX as usize) as u32)
+            .unwrap_or_default(),
+        evidence_refs,
+        input_tokens: matched
+            .iter()
+            .map(|evaluation| evaluation.input_tokens)
+            .sum(),
+        output_tokens: matched
+            .iter()
+            .map(|evaluation| evaluation.output_tokens)
+            .sum(),
+        tool_calls: matched.iter().map(|evaluation| evaluation.tool_calls).sum(),
+        elapsed_ms,
     }
 }
 
@@ -1025,13 +2981,62 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use harness_contract::agent::{AgentReturnPacket, AgentTaskPacket, AgentTerminalStatus};
+    use harness_contract::agent::{
+        AgentCapability, AgentCapabilityContract, AgentCognitivePolicy, AgentDefinitionId,
+        AgentDefinitionManifest, AgentEvaluationContract, AgentExecutorPolicy, AgentModelPolicy,
+        AgentOutputContract, AgentReturnPacket, AgentTaskPacket, AgentTerminalStatus,
+        CognitiveReadScope, CognitiveWriteMode, DefinitionScope, ReleaseAssignment,
+        ReleaseAssignmentStatus, ReleaseAuthorization, ReleaseChannel, RevisionLifecycle,
+        RevisionSelector,
+    };
     use harness_contract::context::ContextBudgetLeaseRef;
     use harness_contract::execution_graph::{
         ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec, ExecutionNodeStatus,
     };
     use harness_contract::mission::ScheduleTrigger;
+    use harness_contract::skill::{
+        SkillAdapterKind, SkillCapabilityProfile, SkillKind, SkillLifecycleStatus, SkillRiskLevel,
+    };
+    use harness_contract::team::{
+        RoleCardinalityPolicy, TeamInstantiationRequest, TeamRoleCardinalityOverride,
+        TeamSelectionMode, TeamTemplateDefinitionId, TeamTemplateSelector,
+    };
     use memory::SessionRecord;
+
+    #[test]
+    fn runtime_skill_catalog_is_available_to_delegated_execution_services() {
+        let services = RuntimeServices::in_memory().expect("in-memory runtime services");
+        let profile = SkillCapabilityProfile {
+            skill_id: "delegated-review".to_string(),
+            name: "Delegated Review".to_string(),
+            version: Some("1.0.0".to_string()),
+            source_root: "skill://delegated-review".to_string(),
+            package_fingerprint: "sha256:delegated-review".to_string(),
+            kind: SkillKind::Workflow,
+            lifecycle_status: SkillLifecycleStatus::UsablePrompt,
+            adapters: vec![SkillAdapterKind::PromptOnly],
+            risk_level: SkillRiskLevel::Low,
+            entrypoints: Vec::new(),
+            inspection_summary: vec!["review source changes".to_string()],
+            structured_dependencies: Vec::new(),
+        };
+        services.replace_skill_catalog(crate::RuntimeSkillCatalog::new(
+            vec![profile],
+            vec![crate::RuntimeSkillPromptAsset {
+                skill_id: "delegated-review".to_string(),
+                version: Some("1.0.0".to_string()),
+                content: "Review evidence before returning.".to_string(),
+                source_ref: "skill://delegated-review/SKILL.md".to_string(),
+            }],
+        ));
+
+        let catalog = services.skill_catalog();
+        assert_eq!(catalog.profiles()[0].skill_id, "delegated-review");
+        assert_eq!(
+            catalog.prompt_assets()[0].source_ref,
+            "skill://delegated-review/SKILL.md"
+        );
+    }
 
     struct TestExecutionHost;
 
@@ -1232,6 +3237,357 @@ mod tests {
             left.worktree_leases(),
             right.worktree_leases()
         ));
+    }
+
+    #[test]
+    fn definition_catalog_refresh_only_exposes_active_stable_revisions() {
+        let temp = tempfile::tempdir().expect("temporary root");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let services = RuntimeServices::builder(temp.path().join("home"), &workspace)
+            .build()
+            .expect("runtime services");
+        let definition_id = AgentDefinitionId::new(DefinitionScope::Workspace, "cowd/reviewer")
+            .expect("definition id");
+        let instructions = "# Reviewer\n\nReview evidence.\n";
+        let digest = format!("{:x}", Sha256::digest(instructions.as_bytes()));
+        let stored = services
+            .definition_registry()
+            .agents()
+            .store_revision(
+                AgentDefinitionManifest {
+                    api_version: "cowd.agent/v1".to_string(),
+                    definition_id: definition_id.clone(),
+                    revision: 1,
+                    name: "Reviewer".to_string(),
+                    description: "Reviews implementation evidence".to_string(),
+                    lifecycle: RevisionLifecycle::Published,
+                    executor: AgentExecutorPolicy::CowdNative,
+                    model_policy: AgentModelPolicy {
+                        profile: "coding".to_string(),
+                        allowed_models: vec!["test-model".to_string()],
+                        fallback_allowed: true,
+                    },
+                    cognitive_policy: AgentCognitivePolicy {
+                        context_profile: "team".to_string(),
+                        read_scopes: vec![CognitiveReadScope::Session],
+                        write_mode: CognitiveWriteMode::CandidateOnly,
+                        team_working_state_visible: true,
+                    },
+                    capability_contract: AgentCapabilityContract {
+                        capability_ceiling: vec![AgentCapability::Read],
+                        skill_refs: Vec::new(),
+                        approval_required_for: Vec::new(),
+                    },
+                    output_contract: AgentOutputContract::reviewable(),
+                    evaluation: AgentEvaluationContract::single_release_gate("review", "evidence"),
+                    instructions_digest: digest,
+                },
+                instructions,
+            )
+            .expect("stored revision");
+        services
+            .definition_registry()
+            .agents()
+            .record_release_assignment(&ReleaseAssignment {
+                scope: DefinitionScope::Workspace,
+                revision_ref: stored.revision.revision_ref.clone(),
+                channel: ReleaseChannel::Stable,
+                status: ReleaseAssignmentStatus::Active,
+                authorization: ReleaseAuthorization::HumanApproval {
+                    approval_ref: "approval/reviewer-v1".to_string(),
+                },
+                content_digest: stored.revision.content_digest.clone(),
+            })
+            .expect("active stable");
+        services
+            .refresh_definition_catalog()
+            .expect("catalog refresh");
+        let entry = services
+            .agent_runtime()
+            .catalog()
+            .get(definition_id.as_str())
+            .expect("runnable entry");
+        assert_eq!(entry.definition_ref.revision, 1);
+        assert_eq!(entry.capabilities, vec!["read"]);
+
+        services
+            .definition_registry()
+            .agents()
+            .record_release_assignment(&ReleaseAssignment {
+                scope: DefinitionScope::Workspace,
+                revision_ref: stored.revision.revision_ref,
+                channel: ReleaseChannel::Stable,
+                status: ReleaseAssignmentStatus::Stopped,
+                authorization: ReleaseAuthorization::HumanApproval {
+                    approval_ref: "approval/reviewer-v1".to_string(),
+                },
+                content_digest: stored.revision.content_digest,
+            })
+            .expect("stopped stable");
+        services
+            .refresh_definition_catalog()
+            .expect("catalog refresh");
+        assert!(services
+            .agent_runtime()
+            .catalog()
+            .get(definition_id.as_str())
+            .is_none());
+    }
+
+    #[test]
+    fn active_canary_routes_new_bindings_and_stop_reverts_to_stable() {
+        let temp = tempfile::tempdir().expect("temporary root");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let services = RuntimeServices::builder(temp.path().join("home"), &workspace)
+            .build()
+            .expect("runtime services");
+        let definition_id = AgentDefinitionId::new(DefinitionScope::Workspace, "cowd/canary")
+            .expect("definition id");
+        let instructions = "# Canary\n\nReturn evidence-backed review output.\n";
+        let evaluation = AgentEvaluationContract {
+            scenario_refs: vec!["canary/review".to_string()],
+            metrics: vec![
+                harness_contract::agent::EvaluationMetricSpec::release_gate(
+                    "canary/review",
+                    "contract",
+                    true,
+                    true,
+                ),
+                harness_contract::agent::EvaluationMetricSpec::release_gate(
+                    "canary/review",
+                    "evidence",
+                    true,
+                    false,
+                ),
+            ],
+        };
+        let manifest = |revision| AgentDefinitionManifest {
+            api_version: "cowd.agent/v1".to_string(),
+            definition_id: definition_id.clone(),
+            revision,
+            name: format!("Canary {revision}"),
+            description: "Canary routing fixture".to_string(),
+            lifecycle: RevisionLifecycle::Published,
+            executor: AgentExecutorPolicy::CowdNative,
+            model_policy: AgentModelPolicy {
+                profile: "test".to_string(),
+                allowed_models: Vec::new(),
+                fallback_allowed: true,
+            },
+            cognitive_policy: AgentCognitivePolicy {
+                context_profile: "sub_agent".to_string(),
+                read_scopes: vec![CognitiveReadScope::Session],
+                write_mode: CognitiveWriteMode::CandidateOnly,
+                team_working_state_visible: false,
+            },
+            capability_contract: AgentCapabilityContract {
+                capability_ceiling: vec![AgentCapability::Read],
+                skill_refs: Vec::new(),
+                approval_required_for: Vec::new(),
+            },
+            output_contract: AgentOutputContract::reviewable(),
+            evaluation: evaluation.clone(),
+            instructions_digest: format!("{:x}", Sha256::digest(instructions.as_bytes())),
+        };
+        let baseline = services
+            .definition_registry()
+            .agents()
+            .store_revision(manifest(1), instructions)
+            .expect("baseline revision");
+        let candidate_revision = services
+            .definition_registry()
+            .agents()
+            .store_revision(manifest(2), instructions)
+            .expect("candidate revision");
+        services
+            .definition_registry()
+            .agents()
+            .record_release_assignment(&ReleaseAssignment {
+                scope: DefinitionScope::Workspace,
+                revision_ref: baseline.revision.revision_ref.clone(),
+                channel: ReleaseChannel::Stable,
+                status: ReleaseAssignmentStatus::Active,
+                authorization: ReleaseAuthorization::HumanApproval {
+                    approval_ref: "approval/canary-baseline".to_string(),
+                },
+                content_digest: baseline.revision.content_digest.clone(),
+            })
+            .expect("baseline stable");
+        let candidate = services
+            .register_evolution_candidate(crate::EvolutionCandidateIntent {
+                candidate_id: "candidate-canary-v2".to_string(),
+                subject: crate::EvolutionCandidateSubject::AgentDefinition {
+                    revision_ref: candidate_revision.revision.revision_ref.clone(),
+                },
+                baseline_revision: 1,
+                source_evidence_refs: vec!["agent-run:baseline".to_string()],
+                canary_policy: crate::CanaryRolloutPolicy {
+                    traffic_basis_points: 10_000,
+                    minimum_samples: 1,
+                    minimum_duration_ms: 1,
+                    maximum_duration_ms: 60_000,
+                },
+            })
+            .expect("candidate registered");
+        services
+            .evolution_governance
+            .record_comparison(crate::EvolutionComparisonReportV2 {
+                report_id: "canary-fixture-report".to_string(),
+                candidate_id: candidate.candidate_id.clone(),
+                evaluation_contract_digest: candidate.evaluation_contract_digest(),
+                dimensions: vec![
+                    crate::EvolutionComparisonDimension {
+                        metric_id: "evidence".to_string(),
+                        direction: crate::EvaluationDirection::HigherIsBetter,
+                        baseline: 1.0,
+                        candidate: 1.0,
+                        non_inferiority_margin: 0.0,
+                        sample_count: 10,
+                        minimum_samples: 10,
+                        confidence: 1.0,
+                        minimum_confidence: 0.9,
+                        hard_gate: true,
+                        protected: true,
+                        target_improvement: false,
+                    },
+                    crate::EvolutionComparisonDimension {
+                        metric_id: "contract".to_string(),
+                        direction: crate::EvaluationDirection::HigherIsBetter,
+                        baseline: 1.0,
+                        // The immutable contract marks this as a target-improvement
+                        // metric, so equality is intentionally not eligible for a
+                        // Canary review.
+                        candidate: 1.01,
+                        non_inferiority_margin: 0.0,
+                        sample_count: 10,
+                        minimum_samples: 10,
+                        confidence: 1.0,
+                        minimum_confidence: 0.9,
+                        hard_gate: true,
+                        protected: true,
+                        target_improvement: true,
+                    },
+                ],
+                source_run_refs: vec!["eval:paired".to_string()],
+                evidence_refs: vec!["evidence:paired".to_string()],
+                created_at_ms: 1,
+            })
+            .expect("eligible comparison");
+        let review = services
+            .request_evolution_canary_review(&candidate.candidate_id)
+            .expect("canary review");
+        let principal = crate::security::test_human_interactive_principal();
+        let lease = crate::security::test_verified_decision_lease(
+            &review.review_id,
+            review.action_key(),
+            review.subject.scope_ref(),
+            review.evidence_digest(),
+        );
+        services
+            .decide_evolution_release_review(
+                &principal,
+                &lease,
+                &review.review_id,
+                crate::ReleaseChangeReviewDecision::Approve,
+                "approve canary fixture".to_string(),
+            )
+            .expect("canary approved");
+
+        let mut request = AgentBindingRequest::new(
+            definition_id.clone(),
+            RevisionSelector::LatestApprovedStable,
+            "instance:canary-a",
+            "session:canary",
+            "task:canary",
+        );
+        request.granted_capabilities = vec![AgentCapability::Read];
+        let routed = services
+            .compile_agent_binding(request)
+            .expect("canary binding");
+        assert_eq!(routed.snapshot.definition_ref.revision, 2);
+        assert_eq!(
+            routed
+                .snapshot
+                .release
+                .as_ref()
+                .map(|release| release.channel),
+            Some(ReleaseChannel::Canary)
+        );
+
+        let stop = services
+            .request_evolution_release_change(crate::ReleaseChangeRequest {
+                request_id: "stop-canary-fixture".to_string(),
+                subject: candidate.subject.clone(),
+                action: crate::ReleaseChangeAction::StopCanary,
+                selector: None,
+                candidate_id: Some(candidate.candidate_id.clone()),
+                evidence_refs: vec!["incident:fixture".to_string()],
+            })
+            .expect("stop review");
+        let stop_lease = crate::security::test_verified_decision_lease(
+            &stop.review_id,
+            stop.action_key(),
+            stop.subject.scope_ref(),
+            stop.evidence_digest(),
+        );
+        services
+            .decide_evolution_release_review(
+                &principal,
+                &stop_lease,
+                &stop.review_id,
+                crate::ReleaseChangeReviewDecision::Approve,
+                "stop canary fixture".to_string(),
+            )
+            .expect("stopped canary");
+
+        let mut request = AgentBindingRequest::new(
+            definition_id,
+            RevisionSelector::LatestApprovedStable,
+            "instance:canary-b",
+            "session:canary",
+            "task:stable",
+        );
+        request.granted_capabilities = vec![AgentCapability::Read];
+        let stable = services
+            .compile_agent_binding(request)
+            .expect("stable binding");
+        assert_eq!(stable.snapshot.definition_ref.revision, 1);
+        assert!(stable.snapshot.release.is_none());
+    }
+
+    #[test]
+    fn explicit_toml_import_is_runtime_owned_and_never_enters_runnable_catalog() {
+        let temp = tempfile::tempdir().expect("temporary root");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let services = RuntimeServices::builder(temp.path().join("home"), &workspace)
+            .build()
+            .expect("runtime services");
+        let definition_id = AgentDefinitionId::new(DefinitionScope::Workspace, "external/reviewer")
+            .expect("definition id");
+
+        let receipt = services
+            .import_agent_toml_draft(crate::agent::definition::ExplicitTomlAgentImport {
+                definition_id: definition_id.clone(),
+                revision: 1,
+                source_label: "manual:/tmp/external-reviewer.toml".to_string(),
+                toml: "name = 'External reviewer'\nmodel = 'review-model'\n".to_string(),
+            })
+            .expect("runtime import");
+
+        assert_eq!(receipt.revision_ref.definition_id, definition_id);
+        assert_eq!(receipt.revision_ref.revision, 1);
+        assert!(!receipt.content_digest.is_empty());
+        services
+            .refresh_definition_catalog()
+            .expect("catalog refresh");
+        assert!(services
+            .agent_runtime()
+            .catalog()
+            .get("workspace/external/reviewer")
+            .is_none());
     }
 
     #[test]
@@ -1620,9 +3976,11 @@ mod tests {
 
         let mut graph = ExecutionGraph::new("agent graph integration");
         graph.id = "agent-runtime-graph".into();
-        let packet = AgentTaskPacket {
+        let intent = AgentTaskIntent {
+            selected_agent_id: None,
+            definition_ref: None,
+            granted_capabilities: Vec::new(),
             run_id: "agent-runtime-run".into(),
-            agent_id: "agent-runtime-agent".into(),
             task_id: "agent-runtime-task".into(),
             session_id: "agent-runtime-session".into(),
             mission_id: None,
@@ -1647,17 +4005,21 @@ mod tests {
                 1000,
                 1,
             ),
+            managed_invocation: None,
             idempotency_key: "agent-runtime-idempotency".into(),
         };
         let mut node = ExecutionNodeSpec::new(
             ExecutionNodeKind::AgentTask,
             crate::execution_core::graph::executors::AgentTaskExecutor::KIND,
-            serde_json::to_string(&packet).unwrap(),
+            serde_json::to_string(&intent).unwrap(),
         );
-        node.id = packet.node_id.clone();
-        node.idempotency_key = packet.idempotency_key.clone();
-        node.acceptance.criteria = packet.acceptance.clone();
+        node.id = intent.node_id.clone();
+        node.idempotency_key = intent.idempotency_key.clone();
+        node.acceptance.criteria = intent.acceptance.clone();
         graph.nodes.push(node);
+
+        let graph = services.compile_graph_agent_intents(graph).unwrap();
+        let packet: AgentTaskPacket = serde_json::from_str(&graph.nodes[0].payload_ref).unwrap();
 
         let report = services
             .graph_runner()
@@ -1678,7 +4040,128 @@ mod tests {
             agent.status,
             harness_contract::agent::AgentStatus::Completed
         );
+        let binding = agent.binding.expect("prepared Agent Binding is durable");
+        assert_eq!(
+            binding.definition_ref.definition_id.as_str(),
+            "builtin/cowd/direct"
+        );
+        assert_eq!(binding.data_lease.session_id, packet.session_id);
+        assert_eq!(binding.data_lease.task_id, packet.task_id);
         assert_eq!(services.agent_runtime().events(&packet.agent_id).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn one_definition_can_drive_eight_isolated_runtime_instances() {
+        let temp = tempfile::tempdir().expect("temporary root");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let providers = crate::config::ProvidersConfig {
+            providers: std::collections::HashMap::from([(
+                "test".into(),
+                crate::config::ProviderConfig {
+                    name: "test".into(),
+                    base_url: "https://example.test/v1".into(),
+                    api_key: "test".into(),
+                    models: vec!["fast".into()],
+                    protocol: Some("responses".into()),
+                },
+            )]),
+        };
+        let services = RuntimeServices::builder(temp.path(), &workspace)
+            .provider_registry(Arc::new(
+                crate::ProviderRegistry::new(providers).expect("provider"),
+            ))
+            .build()
+            .expect("runtime services");
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        services
+            .agent_runtime()
+            .register_backend(Arc::new(ParallelTrackingAgentBackend {
+                active: Arc::clone(&active),
+                max_active: Arc::clone(&max_active),
+            }));
+
+        let mut graph = ExecutionGraph::new("eight independent evidence reads");
+        graph.id = "binding-eight-instances".to_string();
+        for index in 0..8_u8 {
+            let agent_id = format!("researcher-slot-{index}");
+            let node_id = format!("binding-agent-node-{index}");
+            let intent = AgentTaskIntent {
+                selected_agent_id: None,
+                definition_ref: None,
+                granted_capabilities: Vec::new(),
+                run_id: format!("binding-run-{index}"),
+                task_id: format!("binding-task-{index}"),
+                session_id: "binding-session".to_string(),
+                mission_id: None,
+                team_id: Some("binding-team".to_string()),
+                graph_id: graph.id.clone(),
+                node_id: node_id.clone(),
+                attempt: 1,
+                expected_graph_revision: 0,
+                objective: format!("research isolated domain {index}"),
+                acceptance: vec!["evidence".to_string()],
+                constraints: vec![format!("role_slot:researcher-{index}")],
+                context_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                allowed_tools: Vec::new(),
+                allowed_skills: Vec::new(),
+                permission_lease: "read_only".to_string(),
+                model_lease: "fast".to_string(),
+                budget_lease: ContextBudgetLeaseRef::new(
+                    format!("binding-budget-{index}"),
+                    agent_id,
+                    "agent",
+                    2_000,
+                    1,
+                ),
+                managed_invocation: None,
+                idempotency_key: format!("binding-agent-{index}"),
+            };
+            let mut node = ExecutionNodeSpec::new(
+                ExecutionNodeKind::AgentTask,
+                crate::execution_core::graph::executors::AgentTaskExecutor::KIND,
+                serde_json::to_string(&intent).expect("intent"),
+            );
+            node.id = node_id;
+            node.idempotency_key = intent.idempotency_key;
+            node.acceptance.criteria = intent.acceptance;
+            graph.nodes.push(node);
+        }
+
+        let graph = services
+            .compile_graph_agent_intents(graph)
+            .expect("bind graph");
+
+        let report = services
+            .graph_runner()
+            .start(graph)
+            .await
+            .expect("run graph");
+        assert_eq!(report.completed, 8);
+        let snapshots = services
+            .agent_runtime()
+            .list()
+            .into_iter()
+            .filter(|snapshot| snapshot.session_id == "binding-session")
+            .collect::<Vec<_>>();
+        assert_eq!(snapshots.len(), 8);
+        let bindings = snapshots
+            .iter()
+            .map(|snapshot| snapshot.binding.as_ref().expect("durable binding"))
+            .collect::<Vec<_>>();
+        assert!(bindings.iter().all(|binding| {
+            binding.definition_ref.definition_id.as_str() == "builtin/cowd/direct"
+                && binding.definition_ref.revision == 1
+                && binding.data_lease.team_id.as_deref() == Some("binding-team")
+        }));
+        let instances = bindings
+            .iter()
+            .map(|binding| binding.instance.instance_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(instances.len(), 8);
+        assert!(max_active.load(Ordering::SeqCst) >= 2);
     }
 
     #[tokio::test]
@@ -1708,46 +4191,13 @@ mod tests {
 
         let projection = services
             .team_runtime()
-            .start(crate::StartTeamRequest {
-                team_id: "team-runtime-integration".into(),
-                session_id: "team-runtime-session".into(),
-                objective: "independently analyse and review the runtime boundary".into(),
-                template_id: harness_contract::team::TeamTemplateId::ExecuteReview,
-                roles: vec![
-                    harness_contract::team::TeamRoleSpec {
-                        role_id: "analysis".into(),
-                        responsibility: "analyse the boundary".into(),
-                        required_capabilities: vec!["analysis".into()],
-                        allowed_tools: vec!["read_file".into()],
-                        acceptance: vec!["evidence".into()],
-                        evidence_duties: vec!["source".into()],
-                    },
-                    harness_contract::team::TeamRoleSpec {
-                        role_id: "review".into(),
-                        responsibility: "review the conclusion".into(),
-                        required_capabilities: vec!["review".into()],
-                        allowed_tools: vec!["read_file".into()],
-                        acceptance: vec!["risks".into()],
-                        evidence_duties: vec!["review".into()],
-                    },
-                ],
-                role_dependencies: vec![crate::TeamRoleDependency {
-                    from_role_id: "analysis".into(),
-                    to_role_id: "review".into(),
-                }],
-                lift_input: crate::CollaborationLiftInput {
-                    independent_work_items: 2,
-                    domain_count: 2,
-                    shared_write_scope: false,
-                    review_required: true,
-                    provider_healthy: true,
-                    budget_allows_parallelism: true,
-                    requested_parallelism: 2,
-                },
-                permission_lease: "read_only".into(),
-                model_lease: "fast".into(),
-                backend_constraint: None,
-            })
+            .instantiate(team_request(
+                "team-runtime-integration",
+                "team-runtime-session",
+                "cowd/execute-review",
+                "independently analyse and review the runtime boundary",
+                "fast",
+            ))
             .await
             .expect("team execution");
 
@@ -1768,6 +4218,28 @@ mod tests {
             .node_statuses
             .values()
             .all(|status| *status == ExecutionNodeStatus::Completed));
+        let team_bindings = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == ExecutionNodeKind::AgentTask)
+            .map(|node| {
+                serde_json::from_str::<AgentTaskPacket>(&node.payload_ref)
+                    .expect("canonical AgentTaskPacket")
+                    .binding
+                    .expect("Team graph payload contains exact Binding")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(team_bindings.len(), 2);
+        assert_eq!(
+            team_bindings
+                .iter()
+                .map(|binding| binding.definition_ref.definition_id.as_str())
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from(["builtin/cowd/direct", "builtin/cowd/execute"])
+        );
+        assert!(team_bindings.iter().all(|binding| {
+            binding.data_lease.team_id.as_deref() == Some("team-runtime-integration")
+        }));
         assert!(services.team_runtime().projection_json()["teams"]
             .as_array()
             .is_some_and(|teams| teams.len() == 1));
@@ -1802,41 +4274,85 @@ mod tests {
                 active: Arc::clone(&active),
                 max_active: Arc::clone(&max_active),
             }));
-        let role = |role_id: &str| harness_contract::team::TeamRoleSpec {
-            role_id: role_id.into(),
-            responsibility: format!("independent {role_id} analysis"),
-            required_capabilities: vec!["analysis".into()],
-            allowed_tools: vec!["read_file".into()],
-            acceptance: vec!["evidence".into()],
-            evidence_duties: vec!["source".into()],
-        };
         let projection = services
             .team_runtime()
-            .start(crate::StartTeamRequest {
-                team_id: "team-runtime-fanout".into(),
-                session_id: "team-runtime-session".into(),
-                objective: "compare three independent architecture choices".into(),
-                template_id: harness_contract::team::TeamTemplateId::FanoutResearchSynthesis,
-                roles: vec![role("a"), role("b"), role("c")],
-                role_dependencies: Vec::new(),
-                lift_input: crate::CollaborationLiftInput {
-                    independent_work_items: 3,
-                    domain_count: 3,
-                    shared_write_scope: false,
-                    review_required: false,
-                    provider_healthy: true,
-                    budget_allows_parallelism: true,
-                    requested_parallelism: 2,
-                },
-                permission_lease: "read_only".into(),
-                model_lease: "fast".into(),
-                backend_constraint: None,
+            .instantiate(TeamInstantiationRequest {
+                cardinality_overrides: vec![TeamRoleCardinalityOverride {
+                    role_id: "researcher".to_string(),
+                    cardinality: RoleCardinalityPolicy::Fixed { count: 3 },
+                }],
+                focus_partition_plans: vec![harness_contract::team::FocusPartitionPlan {
+                    role_id: "researcher".to_string(),
+                    shared_baseline: vec!["compare the same architecture constraints".to_string()],
+                    slots: vec![
+                        harness_contract::team::FocusPartitionSlot {
+                            focus_id: "architecture-a".to_string(),
+                            boundary: "only architecture-a".to_string(),
+                            evidence_responsibility: "source evidence for architecture-a"
+                                .to_string(),
+                            output_contract: vec!["findings".to_string(), "evidence".to_string()],
+                        },
+                        harness_contract::team::FocusPartitionSlot {
+                            focus_id: "architecture-b".to_string(),
+                            boundary: "only architecture-b".to_string(),
+                            evidence_responsibility: "source evidence for architecture-b"
+                                .to_string(),
+                            output_contract: vec!["findings".to_string(), "evidence".to_string()],
+                        },
+                        harness_contract::team::FocusPartitionSlot {
+                            focus_id: "architecture-c".to_string(),
+                            boundary: "only architecture-c".to_string(),
+                            evidence_responsibility: "source evidence for architecture-c"
+                                .to_string(),
+                            output_contract: vec!["findings".to_string(), "evidence".to_string()],
+                        },
+                    ],
+                }],
+                ..team_request(
+                    "team-runtime-fanout",
+                    "team-runtime-session",
+                    "cowd/parallel-research-synthesis",
+                    "compare three independent architecture choices",
+                    "fast",
+                )
             })
             .await
             .expect("fanout team execution");
         assert_eq!(projection.status, "completed");
         assert!(max_active.load(Ordering::SeqCst) >= 2);
-        assert!(max_active.load(Ordering::SeqCst) <= 2);
+        assert!(max_active.load(Ordering::SeqCst) <= 3);
+    }
+
+    fn team_request(
+        team_id: &str,
+        session_id: &str,
+        template_id: &str,
+        objective: &str,
+        model_lease: &str,
+    ) -> TeamInstantiationRequest {
+        TeamInstantiationRequest {
+            request_id: format!("test-request-{team_id}"),
+            team_id: team_id.to_string(),
+            session_id: session_id.to_string(),
+            mission_id: None,
+            parent_execution: None,
+            selection_mode: TeamSelectionMode::Explicit,
+            template_selector: TeamTemplateSelector::LatestStable {
+                template_id: TeamTemplateDefinitionId::new(DefinitionScope::Builtin, template_id)
+                    .expect("builtin Team template id"),
+            },
+            objective: objective.to_string(),
+            acceptance: vec!["summary".to_string(), "evidence".to_string()],
+            risk: None,
+            role_binding_overrides: Vec::new(),
+            cardinality_overrides: Vec::new(),
+            focus_partition_plans: Vec::new(),
+            permission_lease: "read_only".to_string(),
+            model_lease: model_lease.to_string(),
+            budget_lease: None,
+            managed_invocation: None,
+            resource_scopes: Vec::new(),
+        }
     }
 
     #[test]

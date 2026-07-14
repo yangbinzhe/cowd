@@ -15,8 +15,6 @@ use crate::execution_core::{
     runtime_orchestration_action_guidance, runtime_orchestration_actions, tool_dag_from_rewoo,
     RuntimeExecutionDecision,
 };
-use crate::EvolutionAppliedCapabilityRecord;
-use crate::TeamTemplateRegistry;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeCapability {
@@ -88,97 +86,10 @@ pub struct RuntimeActionContract {
     pub expected_projection: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ActiveEvolutionCapabilityOverlay {
-    pub active_count: usize,
-    pub rolled_back_count: usize,
-    pub capabilities: Vec<ActiveEvolutionCapabilitySummary>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ActiveEvolutionCapabilitySummary {
-    pub version_id: String,
-    pub candidate_id: String,
-    pub kind: String,
-    pub adapter: String,
-    pub owner: String,
-    pub status: String,
-    pub goal_ids: Vec<String>,
-    pub policy_effects: Vec<String>,
-    pub evidence_refs: Vec<String>,
-}
-
-impl ActiveEvolutionCapabilityOverlay {
-    #[must_use]
-    pub fn from_records(records: &[EvolutionAppliedCapabilityRecord]) -> Self {
-        let capabilities = records
-            .iter()
-            .map(|record| ActiveEvolutionCapabilitySummary {
-                version_id: record.version_id.clone(),
-                candidate_id: record.candidate_id.clone(),
-                kind: record.kind.clone(),
-                adapter: record.adapter.clone(),
-                owner: record.owner.clone(),
-                status: record.status.clone(),
-                goal_ids: record.goal_ids.clone(),
-                policy_effects: record.policy_effects.clone(),
-                evidence_refs: record.artifact_refs.clone(),
-            })
-            .collect::<Vec<_>>();
-        Self {
-            active_count: capabilities
-                .iter()
-                .filter(|capability| capability.status == "active")
-                .count(),
-            rolled_back_count: capabilities
-                .iter()
-                .filter(|capability| capability.status == "rolled_back")
-                .count(),
-            capabilities,
-        }
-    }
-
-    #[must_use]
-    pub fn active_summaries(&self, limit: usize) -> Vec<String> {
-        self.capabilities
-            .iter()
-            .filter(|capability| capability.status == "active")
-            .take(limit)
-            .map(|capability| {
-                format!(
-                    "{}:{} via {} effects={}",
-                    capability.kind,
-                    capability.version_id,
-                    capability.adapter,
-                    if capability.policy_effects.is_empty() {
-                        "none".to_string()
-                    } else {
-                        capability.policy_effects.join("|")
-                    }
-                )
-            })
-            .collect()
-    }
-}
-
 impl RuntimeCapabilityCatalog {
     #[must_use]
     pub fn current() -> Self {
-        let templates = TeamTemplateRegistry::all()
-            .into_iter()
-            .map(|template| RuntimeTemplateSummary {
-                template_id: template.template_id.as_str().to_string(),
-                protocol_id: template.protocol_id.to_string(),
-                protocol_version: template.version,
-                availability: match template.availability {
-                    harness_contract::team::TeamTemplateAvailability::Available => "available",
-                    harness_contract::team::TeamTemplateAvailability::Unavailable => "unavailable",
-                }
-                .to_string(),
-                requires_review: template.requires_review,
-                best_for: template_best_for(template.template_id),
-            })
-            .collect();
+        let templates = builtin_team_template_summaries();
         let protocols = ProtocolRegistry::all()
             .into_iter()
             .map(|protocol| RuntimeProtocolSummary {
@@ -205,8 +116,8 @@ impl RuntimeCapabilityCatalog {
                     vec![
                         operation(
                             "build_execution_graph",
-                            "runtime.team_builder",
-                            "Convert a collaboration template into a validated ExecutionGraph with verify and synthesis nodes.",
+                            "runtime.team_instantiation",
+                            "Resolve a versioned Team template into a validated ExecutionGraph with exact Agent Bindings, verify, and synthesis nodes.",
                             "I need ordered or parallel team work with visible dependencies.",
                             "ExecutionGraph quality must be DAG-valid and policy-approved before dispatch.",
                             &["execution_graph_id", "team_id", "agent_task_bindings"],
@@ -314,8 +225,8 @@ impl RuntimeCapabilityCatalog {
                 action_contract(
                     "run_deliberation_protocol",
                     "request_deliberation",
-                    "Conflicting options, evidence quality, or material tradeoffs need proposer/critic/arbitration rather than a string consensus.",
-                    &["intent", "session_id", "protocol optional"],
+                    "Conflicting options, evidence quality, or material tradeoffs need the versioned debate Team template rather than a string consensus.",
+                    &["intent", "session_id", "template_hint optional"],
                     &["execution_graph", "graph_projection", "terminal_result_ref"],
                 ),
                 action_contract(
@@ -329,14 +240,14 @@ impl RuntimeCapabilityCatalog {
                     "use_team_template",
                     "request_team",
                     "Complex implementation, audit, research, debate, incident, or long-running work benefits from role split.",
-                    &["intent", "template_hint optional", "reason optional"],
+                    &["intent", "template_hint optional", "focus_partition_plans optional", "reason optional"],
                     &["team_projection", "agent_projection", "execution_graph"],
                 ),
                 action_contract(
                     "build_execution_graph",
                     "request_team",
                     "The model wants explicit dependencies, parallel lanes, review, and synthesis for a team.",
-                    &["intent", "template_hint optional"],
+                    &["intent", "template_hint optional", "focus_partition_plans optional"],
                     &["execution_graph", "execution_graph_quality", "ready_node_ids"],
                 ),
                 action_contract(
@@ -470,13 +381,6 @@ impl RuntimeCapabilityManifest {
 
 #[must_use]
 pub fn runtime_capability_primer() -> String {
-    runtime_capability_primer_with_overlay(&ActiveEvolutionCapabilityOverlay::default())
-}
-
-#[must_use]
-pub fn runtime_capability_primer_with_overlay(
-    active_evolution: &ActiveEvolutionCapabilityOverlay,
-) -> String {
     let manifest = RuntimeCapabilityManifest::current();
     let catalog = RuntimeCapabilityCatalog::current();
     let mut lines = vec![
@@ -484,6 +388,7 @@ pub fn runtime_capability_primer_with_overlay(
         "You run inside Cowd AI Harness. You are not limited to naive one-tool-at-a-time ReAct."
             .to_string(),
         "Actively choose the most efficient available runtime capability for the task.".to_string(),
+        "This section is a capability catalog, not a function-call contract. Only native function schemas explicitly supplied for the current provider request are callable. A deferred catalog name must be activated through the current request's discovery protocol; never simulate an unavailable tool call.".to_string(),
         String::new(),
         "Core capabilities:".to_string(),
     ];
@@ -491,18 +396,10 @@ pub fn runtime_capability_primer_with_overlay(
     for capability in &manifest.capabilities {
         lines.push(format!("- `{}`: {}", capability.id, capability.summary));
     }
-    if active_evolution.active_count > 0 {
-        lines.push(String::new());
-        lines.push("Active self-evolution overlays:".to_string());
-        for summary in active_evolution.active_summaries(5) {
-            lines.push(format!("- {summary}"));
-        }
-    }
-
     lines.extend([
         String::new(),
         "Runtime action contract:".to_string(),
-        "When higher-order execution is useful, inspect options through read-only `runtime_capabilities`; use `runtime_orchestrate` only for stateful runtime orchestration that may create teams, session commands, approvals, or evidence records.".to_string(),
+        "When higher-order execution is useful, inspect options through read-only `runtime_capabilities`; use `runtime_orchestrate` only when it is an active native schema and a stateful runtime operation may create teams, session commands, approvals, or evidence records.".to_string(),
     ]);
     for action in &catalog.action_contracts {
         lines.push(format!(
@@ -514,7 +411,8 @@ pub fn runtime_capability_primer_with_overlay(
     lines.extend([
         String::new(),
         "Operational guidance:".to_string(),
-        "- For README/docs/code review, prefer `workspace_snapshot`, `git diff` evidence, `read_many`, `grep_many`, or `tool_batch_readonly` before repeated `read_file`.".to_string(),
+        "- Catalog examples include `workspace_snapshot`, `read_many`, `grep_many`, and `tool_batch_readonly`; these names become callable only when the current function-call contract exposes them.".to_string(),
+        "- For README/docs/code review, prefer currently active batch/read tools; if they are merely listed in this catalog, activate them through the request's discovery protocol before calling them.".to_string(),
         "- For independent read-only facts, request them together so the runtime can batch or parallelize them.".to_string(),
         "- Distinguish model-callable tools from runtime-owned affordances: subagent/team/mission collaboration may be orchestrated by runtime even when it is not exposed as a direct tool.".to_string(),
         "- For complex architecture or validation work, shape the task so runtime-owned collaboration can be used when independent evidence domains exist.".to_string(),
@@ -525,7 +423,7 @@ pub fn runtime_capability_primer_with_overlay(
         "- Current user instructions override conflicting recalled memory or knowledge rules for this turn; if a recalled preference conflicts with the explicit current request, suppress that memory and follow the current request.".to_string(),
         "- Use `runtime_capabilities` when you need a compact, read-only recommendation for available runtime affordances.".to_string(),
         "- Use `runtime_capabilities` with detail=`execution_patterns`, `team_templates`, `agent_catalog`, `orchestration_options`, or `budget_controls` when deciding how to solve complex work.".to_string(),
-        "- Use `runtime_orchestrate` only when a runtime state change is intended; it is not a read-only query.".to_string(),
+        "- Use `runtime_orchestrate` only when it is an active native schema and a runtime state change is intended; it is not a read-only query.".to_string(),
         format!("- {}", runtime_orchestration_action_guidance()),
     ]);
 
@@ -548,31 +446,7 @@ pub fn runtime_capabilities_response_with_detail(
     profile: Option<&str>,
     detail: Option<&str>,
 ) -> Value {
-    runtime_capabilities_response_with_detail_and_overlay(
-        intent,
-        surface,
-        profile,
-        detail,
-        &ActiveEvolutionCapabilityOverlay::default(),
-    )
-}
-
-#[must_use]
-pub fn runtime_capabilities_response_with_detail_and_overlay(
-    intent: &str,
-    surface: Option<&str>,
-    profile: Option<&str>,
-    detail: Option<&str>,
-    active_evolution: &ActiveEvolutionCapabilityOverlay,
-) -> Value {
-    runtime_capabilities_response_with_leased_decision(
-        intent,
-        surface,
-        profile,
-        detail,
-        active_evolution,
-        None,
-    )
+    runtime_capabilities_response_with_leased_decision(intent, surface, profile, detail, None)
 }
 
 #[must_use]
@@ -581,7 +455,6 @@ pub fn runtime_capabilities_response_with_leased_decision(
     surface: Option<&str>,
     profile: Option<&str>,
     detail: Option<&str>,
-    active_evolution: &ActiveEvolutionCapabilityOverlay,
     leased_decision: Option<&RuntimeExecutionDecision>,
 ) -> Value {
     let available_tools = runtime_model_callable_tools()
@@ -593,7 +466,6 @@ pub fn runtime_capabilities_response_with_leased_decision(
         surface,
         profile,
         detail,
-        active_evolution,
         leased_decision,
         &available_tools,
     )
@@ -605,10 +477,26 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
     surface: Option<&str>,
     profile: Option<&str>,
     detail: Option<&str>,
-    active_evolution: &ActiveEvolutionCapabilityOverlay,
     leased_decision: Option<&RuntimeExecutionDecision>,
     available_tool_names: &[String],
 ) -> Value {
+    // The provider transport validates this enum for native function calls,
+    // but compatibility transports and persisted/replayed calls can still
+    // carry arbitrary strings.  Unknown detail must never accidentally turn a
+    // bounded model-facing query into a full diagnostic catalog.
+    const CAPABILITY_DETAILS: &[&str] = &[
+        "summary",
+        "execution_patterns",
+        "team_templates",
+        "agent_catalog",
+        "orchestration_options",
+        "budget_controls",
+        "policy_gates",
+        "model_router",
+        "runtime_action_contract",
+        "capability_catalog",
+        "action_selection",
+    ];
     let mut manifest = RuntimeCapabilityManifest::current();
     let catalog = RuntimeCapabilityCatalog::current();
     let context_profile = profile.and_then(parse_context_profile);
@@ -623,7 +511,13 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
         action_selection_report_for_decision(&execution_decision, context_profile);
     let rewoo_plan = rewoo_plan_for_intent_with_evidence_plan(intent, evidence_plan.clone());
     let tool_dag = tool_dag_from_rewoo(&rewoo_plan);
-    let detail_value = detail.unwrap_or("summary");
+    let requested_detail = detail.map(str::trim).filter(|value| !value.is_empty());
+    let detail_value = requested_detail
+        .filter(|value| CAPABILITY_DETAILS.contains(value))
+        .unwrap_or("summary");
+    let detail_normalized_from = requested_detail
+        .filter(|value| *value != detail_value)
+        .map(str::to_string);
     let backend_capabilities =
         backend_capabilities(detail_value, &execution_decision, &action_selection);
     let runtime_orchestrate_enabled = available_tool_names
@@ -655,32 +549,45 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
         runtime_orchestrate_available,
         &orchestration_blocked_reasons,
     );
-    json!({
+    let mut response = json!({
         "type": "runtime_capabilities",
-        "manifest": manifest,
-        "runtime_capability_catalog": catalog,
         "intent": intent,
         "surface": surface,
         "profile": profile,
         "detail": detail_value,
-        "active_evolution_capabilities": active_evolution,
+        "detail_normalized_from": detail_normalized_from,
+        "available_details": [
+            "summary",
+            "execution_patterns",
+            "team_templates",
+            "agent_catalog",
+            "orchestration_options",
+            "budget_controls",
+            "policy_gates",
+            "model_router",
+            "runtime_action_contract",
+            "capability_catalog"
+        ],
+        // Default capability queries are part of a model turn. Keep the
+        // response decision-oriented and bounded; the complete catalog stays
+        // available through an explicit diagnostic detail request.
+        "manifest": compact_manifest(&manifest),
         "available_tool_names": available_tool_names,
-        "evidence_plan": evidence_plan,
-        "execution_decision": execution_decision,
-        "action_selection": action_selection,
-        "backend_capabilities": backend_capabilities,
+        "execution_decision": compact_execution_decision(&execution_decision),
+        "action_selection": compact_action_selection(&action_selection),
+        "backend_capabilities": backend_capabilities_for_detail(
+            detail_value,
+            &backend_capabilities,
+        ),
         "runtime_orchestrate": {
             "available": runtime_orchestrate_available,
             "blocked_reasons": orchestration_blocked_reasons,
             "required_permission": "workspace-write",
-            "side_effects": ["mission_evidence", "team_runtime", "session_input", "approval_orchestration"],
-            "actions": runtime_orchestration_actions(),
-            "runtime_action_contract": RuntimeCapabilityCatalog::current().action_contracts,
-            "recommendation": execution_decision.recommended_actions,
-            "action_selection": action_selection
+            "recommended_actions": execution_decision.recommended_actions,
+            "expected_projection": action_selection.expected_projection,
+            "details": "request detail=orchestration_options or runtime_action_contract for the full stateful action contract"
         },
-        "action_plane": action_plane,
-        "runtime_action_contract": RuntimeCapabilityCatalog::current().action_contracts,
+        "action_plane": compact_action_plane(&action_plane),
         "model_router": runtime_model_router_capability(),
         "budget_controls": runtime_budget_controls(profile),
         "strategy": {
@@ -695,10 +602,115 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
             "fallback_when_stalled": "switch execution pattern by querying runtime_capabilities first, then use runtime_orchestrate(request_reflexion_retry/request_parallel_tools) only when stateful runtime orchestration is intended, or answer with checked evidence, current judgment, remaining risks, and next best step"
         },
         "advanced_execution": {
-            "rewoo_candidate": rewoo_plan,
-            "tool_dag_candidate": tool_dag,
+            "available_on_detail": "orchestration_options",
+            "rewoo_available": true,
+            "tool_dag_available": true,
         }
+    });
+
+    match detail_value {
+        "summary" => {
+            response["evidence_plan"] = compact_evidence_plan(&evidence_plan);
+        }
+        "orchestration_options" => {
+            response["evidence_plan"] =
+                serde_json::to_value(&evidence_plan).expect("evidence plan is serializable");
+            response["advanced_execution"] = json!({
+                "rewoo_candidate": rewoo_plan,
+                "tool_dag_candidate": tool_dag,
+                "action_plane": action_plane,
+                "runtime_action_contract": catalog.action_contracts,
+            });
+        }
+        "runtime_action_contract" => {
+            response["runtime_action_contract"] = json!({
+                "contracts": catalog.action_contracts,
+                "operation_groups": catalog.operation_groups,
+            });
+        }
+        "capability_catalog" => {
+            response["diagnostic_catalog"] = json!({
+                "manifest": manifest,
+                "runtime_capability_catalog": catalog,
+                "runtime_action_contract": runtime_orchestration_actions(),
+            });
+        }
+        _ => {}
+    }
+    response
+}
+
+fn compact_manifest(manifest: &RuntimeCapabilityManifest) -> Value {
+    json!({
+        "name": manifest.name,
+        "capabilities": manifest.capabilities.iter().map(|capability| json!({
+            "id": capability.id,
+            "summary": capability.summary,
+            "recommended_tools": capability.recommended_tools,
+        })).collect::<Vec<_>>(),
     })
+}
+
+fn compact_execution_decision(decision: &RuntimeExecutionDecision) -> Value {
+    json!({
+        "decision_id": decision.decision_id,
+        "pattern": decision.pattern().as_str(),
+        "complexity": decision.complexity(),
+        "risk": decision.risk(),
+        "evidence_mode": decision.evidence_mode,
+        "recommended_template": decision.recommended_template,
+        "recommended_actions": decision.recommended_actions,
+        "compile_target": decision.compile_target,
+        "lease": decision.lease,
+        "executable": decision.executable,
+        "blocked_reasons": decision.blocked_reasons,
+        "confidence": decision.confidence,
+    })
+}
+
+fn compact_action_selection(selection: &crate::RuntimeActionSelectionReport) -> Value {
+    json!({
+        "selected_action": selection.selected_action,
+        "fallback_action": selection.fallback_action,
+        "recommended_pattern": selection.recommended_pattern.as_str(),
+        "recommended_template": selection.recommended_template,
+        "stateful": selection.stateful,
+        "reason": selection.reason,
+        "confidence": selection.confidence,
+    })
+}
+
+fn compact_action_plane(action_plane: &Value) -> Value {
+    json!({
+        "recommended_next_tool": action_plane["recommended_next_tool"],
+        "can_execute_now": action_plane["can_execute_now"],
+        "blocked_reasons": action_plane["blocked_reasons"],
+        "session_id_bound": action_plane["session_id_bound"],
+        "permissions": action_plane["permissions"],
+        "details": "request detail=orchestration_options for recipes and complete action plane",
+    })
+}
+
+fn compact_evidence_plan(plan: &EvidencePlan) -> Value {
+    json!({
+        "mode": plan.mode,
+        "recommended_call_count": plan.recommended_calls.len(),
+        "guidance": "request detail=orchestration_options when the full ReWOO or Tool DAG plan is needed",
+    })
+}
+
+fn backend_capabilities_for_detail(detail: &str, capabilities: &Value) -> Value {
+    if detail == "summary" {
+        json!({
+            "summary": capabilities["summary"],
+            "execution_pattern_count": capabilities["execution_patterns"]
+                .as_array()
+                .map_or(0, Vec::len),
+            "collaboration_template_count": capabilities["collaboration_template_count"],
+        })
+    } else {
+        capabilities.clone()
+    }
 }
 
 fn runtime_action_plane<T: Serialize>(
@@ -961,30 +973,72 @@ fn capability(
     }
 }
 
-fn template_best_for(template_id: harness_contract::team::TeamTemplateId) -> Vec<String> {
-    match template_id {
-        harness_contract::team::TeamTemplateId::SingleExecutor => {
-            vec!["direct bounded work".into()]
-        }
-        harness_contract::team::TeamTemplateId::ExecuteReview => {
-            vec!["execution with independent review".into()]
-        }
-        harness_contract::team::TeamTemplateId::FanoutResearchSynthesis => {
-            vec!["independent evidence gathering".into(), "synthesis".into()]
-        }
-        harness_contract::team::TeamTemplateId::DebateConsensus => {
-            vec!["competing proposals".into()]
-        }
-        harness_contract::team::TeamTemplateId::ImplementationReviewFix => {
-            vec!["implementation, review, and repair".into()]
-        }
-        harness_contract::team::TeamTemplateId::IncidentResponse => {
-            vec!["incident triage and remediation".into()]
-        }
-        harness_contract::team::TeamTemplateId::LongRunningProject => {
-            vec!["durable mission execution".into()]
-        }
-    }
+fn builtin_team_template_summaries() -> Vec<RuntimeTemplateSummary> {
+    [
+        (
+            "builtin/cowd/direct-executor",
+            "direct@1",
+            false,
+            &["direct bounded work"][..],
+        ),
+        (
+            "builtin/cowd/planner-executor-verifier",
+            "review_fix@1",
+            true,
+            &["planning, execution, and independent verification"][..],
+        ),
+        (
+            "builtin/cowd/parallel-research-synthesis",
+            "jps@1",
+            false,
+            &["independent evidence gathering", "synthesis"][..],
+        ),
+        (
+            "builtin/cowd/implementation-review-fix",
+            "review_fix@1",
+            true,
+            &["implementation, review, and repair"][..],
+        ),
+        (
+            "builtin/cowd/debate-critic-arbiter",
+            "debate@1",
+            true,
+            &["competing proposals", "arbitration"][..],
+        ),
+        (
+            "builtin/cowd/incident-response",
+            "incident@1",
+            true,
+            &["incident triage and remediation"][..],
+        ),
+        (
+            "builtin/cowd/matrix-scenario-ensemble",
+            "matrix_scenario@1",
+            false,
+            &["counterfactual scenarios", "matrix comparison"][..],
+        ),
+        (
+            "builtin/cowd/long-running-workstreams",
+            "workstreams@1",
+            true,
+            &[
+                "durable parallel workstreams",
+                "checkpoint and coordination",
+            ][..],
+        ),
+    ]
+    .into_iter()
+    .map(
+        |(template_id, protocol_id, requires_review, best_for)| RuntimeTemplateSummary {
+            template_id: template_id.to_string(),
+            protocol_id: protocol_id.to_string(),
+            protocol_version: 1,
+            availability: "available".to_string(),
+            requires_review,
+            best_for: best_for.iter().map(|value| (*value).to_string()).collect(),
+        },
+    )
+    .collect()
 }
 
 fn operation_group(
@@ -1072,22 +1126,20 @@ mod tests {
 
         assert_eq!(response["type"], "runtime_capabilities");
         assert_eq!(response["surface"], "feishu");
-        assert!(response["evidence_plan"]["recommended_calls"].is_array());
+        assert_eq!(response["detail"], "summary");
+        assert!(response["evidence_plan"]["recommended_call_count"].is_u64());
         assert!(response["runtime_orchestrate"]["available"]
             .as_bool()
             .unwrap_or(false));
-        assert!(response["runtime_capability_catalog"]["operation_groups"].is_array());
-        assert!(response["runtime_action_contract"]
+        assert!(response["available_details"]
             .as_array()
-            .is_some_and(|items| items
-                .iter()
-                .any(|item| item["runtime_action"] == "use_team_template")));
+            .is_some_and(|items| items.iter().any(|item| item == "runtime_action_contract")));
         assert_eq!(
             response["action_plane"]["recommended_next_tool"],
             "runtime_capabilities_or_runtime_orchestrate"
         );
-        assert!(response["action_plane"]["recipes"].is_array());
-        assert!(response["execution_decision"]["strategy"]["pattern"].is_string());
+        assert!(response["action_plane"]["details"].is_string());
+        assert!(response["execution_decision"]["pattern"].is_string());
         assert!(response["execution_decision"]["lease"]["lease_id"].is_string());
         assert!(response["budget_controls"]["turn"]["safety_fuse"].is_object());
         assert_eq!(
@@ -1101,6 +1153,57 @@ mod tests {
             response["strategy"]["current_turn_overrides_conflicting_memory"]
                 .as_bool()
                 .unwrap_or(false)
+        );
+    }
+
+    #[test]
+    fn summary_capability_response_is_bounded_while_diagnostic_catalog_is_explicit() {
+        let summary = runtime_capabilities_response(
+            "复杂代码重构需要多 Agent 并行审查、跨 Session 跟踪、冲突仲裁和证据化回归",
+            None,
+            Some("DeepInvestigation"),
+        );
+        let summary_size = serde_json::to_vec(&summary)
+            .expect("capability summary serializes")
+            .len();
+        assert!(
+            summary_size < 16_384,
+            "default model-facing capability result must remain bounded, got {summary_size} bytes"
+        );
+        assert!(summary.get("diagnostic_catalog").is_none());
+        assert!(summary["advanced_execution"]["rewoo_candidate"].is_null());
+
+        let catalog = runtime_capabilities_response_with_detail(
+            "diagnose all runtime capability contracts",
+            None,
+            None,
+            Some("capability_catalog"),
+        );
+        assert!(
+            catalog["diagnostic_catalog"]["runtime_capability_catalog"]["operation_groups"]
+                .is_array()
+        );
+        assert!(catalog["diagnostic_catalog"]["runtime_action_contract"].is_array());
+    }
+
+    #[test]
+    fn unknown_capability_detail_falls_back_to_bounded_summary() {
+        let response = runtime_capabilities_response_with_detail(
+            "审查当前运行时能力合同",
+            None,
+            None,
+            Some("architecture_review"),
+        );
+        let size = serde_json::to_vec(&response)
+            .expect("capability response serializes")
+            .len();
+
+        assert_eq!(response["detail"], "summary");
+        assert_eq!(response["detail_normalized_from"], "architecture_review");
+        assert!(response.get("diagnostic_catalog").is_none());
+        assert!(
+            size < 16_384,
+            "unknown detail must remain bounded, got {size} bytes"
         );
     }
 
@@ -1120,7 +1223,6 @@ mod tests {
             None,
             None,
             None,
-            &ActiveEvolutionCapabilityOverlay::default(),
             Some(&decision),
         );
 
@@ -1142,16 +1244,16 @@ mod tests {
             None,
             None,
             None,
-            &ActiveEvolutionCapabilityOverlay::default(),
             None,
             &["runtime_capabilities".to_string(), "read_many".to_string()],
         );
 
         assert_eq!(response["runtime_orchestrate"]["available"], false);
         assert_eq!(response["action_plane"]["can_execute_now"], false);
-        assert!(response["action_plane"]["recipes"]
-            .as_array()
-            .is_some_and(Vec::is_empty));
+        assert!(response["action_plane"].get("recipes").is_none());
+        assert!(response["action_plane"]["details"]
+            .as_str()
+            .is_some_and(|value| value.contains("orchestration_options")));
         assert!(response["strategy"]["model_callable_tools"]
             .as_array()
             .is_some_and(|items| items.iter().all(|item| item != "runtime_orchestrate")));
@@ -1162,41 +1264,6 @@ mod tests {
                 .all(|capability| capability["recommended_tools"]
                     .as_array()
                     .is_some_and(|tools| tools.iter().all(|tool| tool != "runtime_orchestrate")))));
-    }
-
-    #[test]
-    fn capabilities_response_accepts_explicit_active_evolution_overlay() {
-        let overlay = ActiveEvolutionCapabilityOverlay {
-            active_count: 1,
-            rolled_back_count: 0,
-            capabilities: vec![ActiveEvolutionCapabilitySummary {
-                version_id: "version-runtime-policy".to_string(),
-                candidate_id: "candidate-runtime-policy".to_string(),
-                kind: "runtime_policy".to_string(),
-                adapter: "runtime_policy_overlay".to_string(),
-                owner: "runtime".to_string(),
-                status: "active".to_string(),
-                goal_ids: vec!["runtime_efficiency".to_string()],
-                policy_effects: vec!["prefer_parallel_tool_batch".to_string()],
-                evidence_refs: vec!["artifact-policy".to_string()],
-            }],
-        };
-        let response = runtime_capabilities_response_with_detail_and_overlay(
-            "需要自进化策略影响后续运行",
-            Some("webui"),
-            Some("DeepInvestigation"),
-            Some("summary"),
-            &overlay,
-        );
-
-        assert_eq!(response["active_evolution_capabilities"]["active_count"], 1);
-        assert_eq!(
-            response["active_evolution_capabilities"]["capabilities"][0]["policy_effects"][0],
-            "prefer_parallel_tool_batch"
-        );
-        let primer = runtime_capability_primer_with_overlay(&overlay);
-        assert!(primer.contains("Active self-evolution overlays"));
-        assert!(primer.contains("prefer_parallel_tool_batch"));
     }
 
     #[test]

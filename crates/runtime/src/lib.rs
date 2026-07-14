@@ -82,6 +82,8 @@ pub mod knowledge_compliance;
 mod lane_events;
 #[path = "infrastructure/lifecycle_hooks.rs"]
 pub mod lifecycle_hooks;
+#[path = "agent/managed_agent.rs"]
+pub mod managed_agent;
 #[path = "infrastructure/mcp.rs"]
 mod mcp;
 #[path = "infrastructure/mcp_client.rs"]
@@ -142,6 +144,8 @@ pub mod agent;
 pub mod agent_capability;
 #[path = "agent/catalog.rs"]
 pub mod agent_catalog;
+#[path = "agent/evaluation.rs"]
+pub mod agent_evaluation;
 #[path = "agent/in_process_worker.rs"]
 pub mod agent_in_process_worker;
 #[path = "agent/model_selector.rs"]
@@ -170,6 +174,9 @@ pub mod context_fanout;
 pub mod cowd_event;
 #[path = "policy/cross_plane_policy.rs"]
 pub mod cross_plane_policy;
+#[path = "agent/definition_registry.rs"]
+pub mod definition_registry;
+pub use definition_registry::AgentDefinitionDraftReceipt;
 #[path = "infrastructure/eval_gate.rs"]
 pub mod eval_gate;
 #[path = "context/evidence_planner.rs"]
@@ -212,14 +219,22 @@ pub mod provider_transport_policy;
 pub mod quality_gate;
 #[path = "context/reality_decision.rs"]
 pub mod reality_decision;
+#[path = "context/reality_recall_port.rs"]
+pub mod reality_recall_port;
 #[path = "infrastructure/release_gate.rs"]
 pub mod release_gate;
 #[path = "recovery/runtime_event_replay.rs"]
 pub mod runtime_event_replay;
+#[cfg(feature = "test-fixtures")]
 #[path = "recovery/runtime_event_store.rs"]
 pub mod runtime_event_store;
+#[cfg(not(feature = "test-fixtures"))]
+#[path = "recovery/runtime_event_store.rs"]
+pub(crate) mod runtime_event_store;
 #[path = "mission/runtime_harness.rs"]
 pub mod runtime_harness;
+#[path = "security/mod.rs"]
+pub mod security;
 #[path = "session/session_execution.rs"]
 pub mod session_execution;
 #[path = "session/session_input.rs"]
@@ -253,20 +268,24 @@ pub mod task_packet;
 pub mod team_agent_selector;
 #[path = "team/agent_task.rs"]
 pub mod team_agent_task;
-#[path = "team/builder.rs"]
-pub mod team_builder;
+#[path = "team/definition/mod.rs"]
+pub mod team_definition;
+#[path = "team/instantiation.rs"]
+pub mod team_instantiation;
+#[path = "team/l4_promotion.rs"]
+pub mod team_l4_promotion;
 #[path = "team/legacy_import.rs"]
 pub mod team_legacy_import;
-#[path = "team/lift_gate.rs"]
-pub mod team_lift_gate;
+#[path = "team/profile_migration.rs"]
+pub mod team_profile_migration;
 #[path = "team/projection.rs"]
 pub mod team_projection;
 #[path = "team/result_reducer.rs"]
 pub mod team_result_reducer;
 #[path = "team/team_runtime.rs"]
 pub mod team_runtime;
-#[path = "team/template_registry.rs"]
-pub mod team_template_registry;
+#[path = "team/working_state.rs"]
+pub mod team_working_state;
 #[path = "tooling/tool_dispatch.rs"]
 pub mod tool_dispatch;
 #[path = "tooling/tool_execution_plan.rs"]
@@ -290,6 +309,9 @@ pub mod upgrade;
 #[path = "provider/usage.rs"]
 mod usage;
 
+pub use agent::binding::{
+    AgentBindingCompiler, AgentBindingError, AgentBindingRequest, CompiledAgentBinding,
+};
 pub use agent::{
     SubAgentConfig, SubAgentError, SubAgentExecutor, SubAgentProgressCallback, SubAgentResult,
     SubAgentToolMode,
@@ -298,6 +320,7 @@ pub use agent_capability::{
     resolve_agent_capability, AgentCapabilityRequest, ResolvedAgentCapability,
 };
 pub use agent_catalog::{AgentCatalog, AgentCatalogEntry};
+pub use agent_evaluation::{project_self_models, AgentRunEvaluation, AgentSelfModel};
 pub use agent_in_process_worker::InProcessAgentWorker;
 pub use agent_model_selector::{AgentModelSelection, AgentModelSelectionError, AgentModelSelector};
 pub use agent_process_jsonl_adapter::{ProcessJsonlAdapter, ProcessJsonlSpec};
@@ -308,8 +331,8 @@ pub use agent_runtime::{
     LegacyAgentImportReport, LegacyAgentStateRecord,
 };
 pub use approval_queue::{
-    ApprovalQueue, ApprovalSource, ApprovalSourceKind, ApprovalTimeoutPolicy,
-    GlobalApprovalDecision, GlobalApprovalDecisionReceipt, GlobalApprovalRequest,
+    ApprovalDecisionCommand, ApprovalQueue, ApprovalSource, ApprovalSourceKind,
+    ApprovalTimeoutPolicy, GlobalApprovalDecisionReceipt, GlobalApprovalRequest,
     GlobalApprovalStatus, SubmitGlobalApprovalRequest,
 };
 pub use autonomy_profile::{
@@ -322,13 +345,10 @@ pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};
 pub use capability_manifest::{
     runtime_capabilities_response, runtime_capabilities_response_with_detail,
-    runtime_capabilities_response_with_detail_and_overlay,
     runtime_capabilities_response_with_leased_decision,
     runtime_capabilities_response_with_leased_decision_and_tools, runtime_capability_primer,
-    runtime_capability_primer_with_overlay, ActiveEvolutionCapabilityOverlay,
-    ActiveEvolutionCapabilitySummary, RuntimeActionContract, RuntimeCapability,
-    RuntimeCapabilityCatalog, RuntimeCapabilityManifest, RuntimeOperation, RuntimeOperationGroup,
-    RuntimeTemplateSummary,
+    RuntimeActionContract, RuntimeCapability, RuntimeCapabilityCatalog, RuntimeCapabilityManifest,
+    RuntimeOperation, RuntimeOperationGroup, RuntimeTemplateSummary,
 };
 pub use checkpoint::{
     checkpoint_create, checkpoint_diff, checkpoint_list, checkpoint_restore, CheckpointCreateInput,
@@ -336,8 +356,7 @@ pub use checkpoint::{
     CheckpointSummary,
 };
 pub use collaboration_template::{
-    protocol_id as collaboration_protocol_id, CollaborationDecision, CollaborationTemplateId,
-    CollaborationTemplateMatcher,
+    CollaborationDecision, CollaborationTemplateId, CollaborationTemplateMatcher,
 };
 pub use compact::{
     estimate_session_tokens, format_compact_summary, get_compact_continuation_message,
@@ -385,25 +404,30 @@ pub use cross_plane_policy::{
     CrossPlanePolicyDecision, CrossPlanePolicyEngine, CrossPlaneResolvedIdentity,
     CrossPlaneSummary, GrantType, IdentityTrust, PolicyDecisionKind,
 };
+pub use definition_registry::{
+    DefinitionRegistryError, RuntimeDefinitionRegistry, RuntimeTeamTemplateCatalogEntry,
+};
 pub use evidence_planner::{
     evidence_plan_prompt, plan_evidence, EvidenceAcquisitionMode, EvidencePlan,
 };
 pub use execution_core::{
     action_selection_report_for_decision, build_runtime_action_selection_report,
     build_runtime_execution_decision, execution_pattern_catalog_response, rewoo_plan_for_intent,
-    runtime_execution_guidance_prompt, runtime_orchestration_action_guidance,
-    runtime_orchestration_actions, tool_dag_from_rewoo, CrossPlaneRuntimeError,
-    CrossPlaneRuntimeService, DeliberationMode, DeliberationPlan, ExecutionCommitService,
-    ExecutionCompileRequest, ExecutionGraphCompiler, ExecutionGraphHost, ExecutionGraphHostReceipt,
-    ExecutionGraphRunner, ExecutionGraphStateStore, ExecutionPatternCatalog,
-    ExecutionStartupRecoveryError, ExecutionStartupRecoveryRecord, ExecutionStartupRecoveryReport,
-    ReflexionRecord, ReflexionTrigger, RewooEvidencePlan, RewooEvidenceResult, RewooEvidenceStep,
-    RewooObservation, RewooSolverContract, RuntimeActionSelectionReport, RuntimeCompileTarget,
-    RuntimeEvidenceSummary, RuntimeExecutionActionHint, RuntimeExecutionDecision,
-    RuntimeExecutionPatternCandidate, RuntimeExecutionPatternSpec, RuntimeExecutionReportSpec,
-    RuntimeServices, RuntimeServicesBuilder, RuntimeServicesError, StrategyDecisionEngine,
-    StrategyLease, StrategyResourceHealth, ToolDagEdge, ToolDagEdgeKind, ToolDagPlan,
-    ToolDagSafetySummary, ToolDagTask,
+    runtime_execution_guidance_prompt, runtime_execution_guidance_prompt_with_tool_exposure,
+    runtime_orchestration_action_guidance, runtime_orchestration_actions, tool_dag_from_rewoo,
+    CrossPlaneRuntimeError, CrossPlaneRuntimeService, DeliberationMode, DeliberationPlan,
+    ExecutionCommitService, ExecutionCompileRequest, ExecutionGraphCompiler, ExecutionGraphHost,
+    ExecutionGraphHostReceipt, ExecutionGraphRunner, ExecutionGraphStateStore,
+    ExecutionPatternCatalog, ExecutionStartupRecoveryError, ExecutionStartupRecoveryRecord,
+    ExecutionStartupRecoveryReport, ReflexionRecord, ReflexionTrigger, RewooEvidencePlan,
+    RewooEvidenceResult, RewooEvidenceStep, RewooObservation, RewooSolverContract,
+    RuntimeActionSelectionReport, RuntimeCompileTarget, RuntimeEventReader, RuntimeEvidenceSummary,
+    RuntimeExecutionActionHint, RuntimeExecutionDecision, RuntimeExecutionPatternCandidate,
+    RuntimeExecutionPatternSpec, RuntimeExecutionReportSpec, RuntimeServices,
+    RuntimeServicesBuilder, RuntimeServicesError, SessionTerminalDeliveryPort,
+    StrategyDecisionEngine, StrategyLease, StrategyResourceHealth, TaskLifecycleEvent,
+    TaskLifecycleKind, ToolDagEdge, ToolDagEdgeKind, ToolDagPlan, ToolDagSafetySummary,
+    ToolDagTask,
 };
 pub use file_ops::{
     edit_file, glob_search, grep_search, read_file, write_file, EditFileOutput, GlobSearchOutput,
@@ -436,28 +460,34 @@ pub use lane_events::{
     dedupe_superseded_commit_events, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
     LaneEventName, LaneEventStatus, LaneFailureClass,
 };
+pub use managed_agent::{
+    FencedEffectOutboxRecord, FencedEffectStatus, ManagedAgentDispatchReport,
+    ManagedAgentDispatcher, ManagedAgentEffectPermit, ManagedAgentHealth, ManagedAgentHealthStatus,
+    ManagedAgentInvocation, ManagedAgentInvocationStatus, ManagedAgentInvocationTrigger,
+    ManagedAgentRuntimeDispatchReport,
+};
 pub use runtime_harness::{RuntimeAiKernel, RuntimeAiKernelTrace};
 
+pub(crate) use evolution::EvolutionCandidateRegistration;
 pub use evolution::{
-    candidate_kind_from_proposal, candidate_kinds_from_root_cause, evolution_memory_context_items,
-    EvolutionAdoptionManager, EvolutionAdoptionReceipt, EvolutionAppliedCapabilityRecord,
-    EvolutionAppliedCapabilityRegistry, EvolutionArtifactBuilder, EvolutionCandidate,
-    EvolutionCandidateGenerator, EvolutionCandidateKind, EvolutionCandidatePlan,
-    EvolutionCandidateStatus, EvolutionCandidateStore, EvolutionCapabilityGoal,
-    EvolutionComparisonReport, EvolutionDiagnosis, EvolutionDiagnosisEngine,
-    EvolutionDiagnosisStore, EvolutionEvaluationRequest, EvolutionGeneratedArtifact,
-    EvolutionLifecycleDraft, EvolutionLifecycleService, EvolutionMemoryBridge,
-    EvolutionMemoryRecord, EvolutionMemoryScope, EvolutionMetric, EvolutionMission,
-    EvolutionMissionStatus, EvolutionMissionStore, EvolutionPlanDraft, EvolutionPromotionAdapter,
-    EvolutionPromotionManager, EvolutionPromotionReceipt, EvolutionProposal, EvolutionProposalKind,
-    EvolutionProposalRisk, EvolutionProposalStore, EvolutionRollbackManager,
-    EvolutionRollbackReceipt, EvolutionRootCauseKind, EvolutionRunnerPolicy, EvolutionRunnerResult,
-    EvolutionSandboxEval, EvolutionSandboxOrchestrator, EvolutionSandboxRecommendation,
-    EvolutionSandboxStore, EvolutionSignal, EvolutionSignalCollector, EvolutionSignalInput,
+    candidate_kind_from_proposal, candidate_kinds_from_root_cause, CanaryObservationReport,
+    CanaryRolloutPolicy, EvaluationDirection, EvaluationPolicyChangeIntent,
+    EvaluationPolicyChangeReview, EvolutionCandidateIntent, EvolutionCandidateKind,
+    EvolutionCandidateLifecycle, EvolutionCandidateSubject, EvolutionCapabilityGoal,
+    EvolutionComparisonDimension, EvolutionComparisonReportV2, EvolutionDiagnosis,
+    EvolutionDiagnosisEngine, EvolutionDiagnosisStore, EvolutionEvalRunner,
+    EvolutionGovernanceCandidate, EvolutionGovernanceError, EvolutionGovernanceService,
+    EvolutionLifecycleDraft, EvolutionLifecycleService, EvolutionMission, EvolutionMissionStatus,
+    EvolutionMissionStore, EvolutionPlanDraft, EvolutionProposal, EvolutionProposalKind,
+    EvolutionProposalRisk, EvolutionProposalStore, EvolutionReleaseAssignment,
+    EvolutionRootCauseKind, EvolutionSignal, EvolutionSignalCollector, EvolutionSignalInput,
     EvolutionSignalSeverity, EvolutionSignalSource, EvolutionSignalStore, EvolutionSignalType,
-    EvolutionSkillDraft, EvolutionTriageCluster, EvolutionTriageService,
-    EvolutionVerificationResult, EvolutionVersionRecord, IsolatedRunner, WorktreeRunner,
+    EvolutionSkillDraft, EvolutionTriageCluster, EvolutionTriageService, ReleaseChangeAction,
+    ReleaseChangeRequest, ReleaseChangeReview, ReleaseChangeReviewClass,
+    ReleaseChangeReviewDecision, ReleaseChangeReviewStatus,
 };
+#[cfg(feature = "test-fixtures")]
+pub use execution_core::RuntimeFixtureEventPort;
 pub use harness_contract::turn::{
     InputRelationKind, InputRelationProposal, SessionDispatchAction, SessionDispatchCommand,
     SessionDispatchReceipt, SessionHandoff, SessionResultPacket,
@@ -552,6 +582,10 @@ pub use reality_decision::{
     RealityContextBudgetPlan, RealityFactPlan, RealityFactPlanItem, RealityKnowledgeDecision,
     RealityMemoryDecision, RealityRecallQualityReport, RealityRuntimeDecision,
 };
+pub use reality_recall_port::{
+    MatrixScenarioPort, MatrixScenarioStartRequest, RealityRecallPort, RealityRecallReport,
+    RealityRecallSourceStatus,
+};
 pub use recovery::{
     RecoveryAppliedAction, RecoveryExecutionReport, RecoveryExecutor, RecoveryFailedAction,
     RecoveryPlan, RecoveryPlanner, RecoverySkippedAction,
@@ -574,16 +608,28 @@ pub use runtime_event_replay::{
     candidate_from_action, RuntimeEventReplayer, RuntimeRecoveryAction, RuntimeRecoveryActionKind,
     RuntimeRecoveryCandidate, RuntimeReplayReport,
 };
-pub use runtime_event_store::{
-    DurableRuntimeEvent, RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore,
-    RuntimeEventStoreError, RuntimeSessionOutboxFailureClass, RuntimeSessionOutboxHealth,
-    RuntimeSessionOutboxRecord, SessionTerminalInput,
+#[cfg(not(feature = "test-fixtures"))]
+#[allow(unused_imports)]
+pub(crate) use runtime_event_store::{
+    AppendTransactionRequest, ExpectedStreamRevision, RuntimeEventInput, RuntimeEventStore,
+    RuntimeTransactionEventInput,
 };
+pub use runtime_event_store::{
+    DurableRuntimeEvent, RuntimeEventRef, RuntimeEventScope, RuntimeEventStoreError,
+    RuntimeSessionOutboxFailureClass, RuntimeSessionOutboxHealth, RuntimeSessionOutboxRecord,
+    SessionTerminalInput,
+};
+#[cfg(feature = "test-fixtures")]
+pub use runtime_event_store::{RuntimeEventInput, RuntimeEventStore};
 pub use sandbox::{
     build_linux_sandbox_command, detect_container_environment, detect_container_environment_from,
     resolve_sandbox_status, resolve_sandbox_status_for_request, ContainerEnvironment,
     FilesystemIsolationMode, LinuxSandboxCommand, SandboxConfig, SandboxDetectionInputs,
     SandboxRequest, SandboxStatus,
+};
+pub use security::{
+    DecisionLeaseExpectation, PrincipalVerificationError, PrincipalVerifier, VerifiedDecisionLease,
+    VerifiedPrincipal,
 };
 pub use session::{
     ContentBlock, ConversationMessage, MessageEvent, MessageRole, Session, SessionCompaction,
@@ -601,7 +647,8 @@ pub use session_relation_graph::{
     SessionRouteReceipt,
 };
 pub use skill::{
-    memory_candidate_from_skill_activation, RuntimeSkillCandidate, SkillActivationRecord,
+    memory_candidate_from_skill_activation, skill_memory_candidate_session_event,
+    RuntimeSkillCandidate, RuntimeSkillCatalog, RuntimeSkillPromptAsset, SkillActivationRecord,
     SkillMemoryPolicy,
 };
 pub use source_self_audit::{
@@ -623,15 +670,16 @@ pub use task_packet::{
     validate_packet, TaskPacket, TaskPacketValidationError, TaskScope, ValidatedPacket,
 };
 pub use team_agent_selector::AgentSelector;
-pub use team_builder::{TeamBuild, TeamBuildRequest, TeamBuilder};
+pub use team_instantiation::{ResolvedRoleSlot, TeamInstantiation, TeamInstantiationService};
+pub use team_l4_promotion::{
+    L4CandidateLifecycle, L4PromotionCandidate, L4PromotionReceipt, L4PromotionService,
+};
 pub use team_legacy_import::LegacyTeamImportReport;
-pub use team_lift_gate::{CollaborationLiftGate, CollaborationLiftInput};
+pub use team_profile_migration::LegacyTeamProfileMigrationReport;
 pub use team_projection::{TeamProjection, TeamProjectionReader};
 pub use team_result_reducer::TeamResultReducer;
-pub use team_runtime::{StartTeamRequest, TeamRuntime};
-pub use team_template_registry::{
-    TeamRoleDependency, TeamTemplateRegistry, TeamTemplateSpec, TeamTemplateValidationError,
-};
+pub use team_runtime::TeamRuntime;
+pub use team_working_state::{TeamWorkingState, TeamWorkingStateEntry, TeamWorkingStateKind};
 pub use tool_execution_plan::{ToolExecutionMode, ToolExecutionPlan, ToolExecutionPlanTask};
 pub use tool_host::{
     RuntimeExecutionHost, RuntimeToolExecutionOutcome, RuntimeToolExecutionRequest,

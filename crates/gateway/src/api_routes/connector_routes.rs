@@ -1,4 +1,8 @@
-use std::sync::{Arc, OnceLock};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, OnceLock},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use axum::{
     extract::{Path, Query, State as AxumState},
@@ -18,6 +22,7 @@ use memory::types::{
 use memory::MemoryScope;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::services::GatewayMemoryManager;
 
@@ -254,13 +259,22 @@ async fn connector_source_poll_events_handler(
         .source_event_poll(&adapter_id, payload)
         .await
     {
-        Ok(batch) => Json(serde_json::json!({
-            "kind": "connector.source.event_batch",
-            "adapter_id": adapter_id,
-            "status": if batch.event_count == 0 { "degraded" } else { "ok" },
-            "degraded_reason": if batch.event_count == 0 { Some("requires_external_event_source") } else { None },
-            "event_batch": batch,
-        })),
+        Ok(batch) => {
+            let managed_agent = submit_source_batch_to_managed_agents(&state, &adapter_id, &batch);
+            let managed_status = managed_agent
+                .as_ref()
+                .map(|report| report.status.as_str())
+                .unwrap_or("unavailable");
+            Json(serde_json::json!({
+                "kind": "connector.source.event_batch",
+                "adapter_id": adapter_id,
+                "status": if batch.event_count == 0 { "degraded" } else { "ok" },
+                "degraded_reason": if batch.event_count == 0 { Some("requires_external_event_source") } else { None },
+                "event_batch": batch,
+                "managed_agent": managed_agent,
+                "managed_agent_status": managed_status,
+            }))
+        }
         Err(error) => Json(serde_json::json!({
             "kind": "connector.source.event_batch",
             "adapter_id": adapter_id,
@@ -268,6 +282,161 @@ async fn connector_source_poll_events_handler(
             "degraded_reason": error,
         })),
     }
+}
+
+#[derive(Debug, Serialize)]
+struct ManagedAgentSourceForwarding {
+    status: String,
+    accepted: usize,
+    suppressed: usize,
+    rejected: Vec<String>,
+    event_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    degraded_reason: Option<String>,
+}
+
+/// Connector sidecars only return source transport facts. Gateway normalizes
+/// them once and submits Runtime's canonical trigger event; Runtime remains
+/// the sole owner of matching, ordering, idempotency and overlap decisions.
+fn submit_source_batch_to_managed_agents(
+    state: &AppState,
+    adapter_id: &str,
+    batch: &connector::SourceEventBatch,
+) -> Option<ManagedAgentSourceForwarding> {
+    let runtime = state.services.runtime.as_ref()?;
+    let source_capabilities = source_event_capabilities(adapter_id);
+    let mut accepted = 0;
+    let mut suppressed = 0;
+    let mut rejected = Vec::new();
+    let mut event_ids = Vec::new();
+    for (index, event) in batch.events.iter().enumerate() {
+        let normalized = normalize_source_event(
+            adapter_id,
+            batch.resource_ref.as_deref(),
+            event,
+            index,
+            &source_capabilities,
+        );
+        let event_id = normalized.event_id.clone();
+        match runtime
+            .runtime_services()
+            .accept_managed_agent_event(normalized)
+        {
+            Ok(report) => {
+                accepted += report.accepted.len();
+                suppressed += report.suppressed.len();
+                rejected.extend(report.rejected);
+                event_ids.push(event_id);
+            }
+            Err(error) => rejected.push(format!("{event_id}: {error}")),
+        }
+    }
+    let status = if rejected.is_empty() {
+        "accepted".to_string()
+    } else if accepted + suppressed > 0 {
+        "partially_degraded".to_string()
+    } else {
+        "degraded".to_string()
+    };
+    Some(ManagedAgentSourceForwarding {
+        status,
+        accepted,
+        suppressed,
+        rejected: rejected.clone(),
+        event_ids,
+        degraded_reason: (!rejected.is_empty())
+            .then(|| "one or more normalized source events were rejected by Runtime".to_string()),
+    })
+}
+
+fn source_event_capabilities(adapter_id: &str) -> Vec<String> {
+    let mut capabilities = vec![
+        "connector.source.event.receive".to_string(),
+        format!("connector.source.adapter:{adapter_id}"),
+    ];
+    if let Some(manifest) = connector::source_adapter_manifest(adapter_id) {
+        capabilities.push(format!("connector.source.family:{}", manifest.family));
+        if manifest.supports_event_subscription {
+            capabilities.push("connector.source.event.subscription".to_string());
+        }
+    }
+    capabilities.sort();
+    capabilities.dedup();
+    capabilities
+}
+
+fn normalize_source_event(
+    adapter_id: &str,
+    resource_ref: Option<&str>,
+    event: &Value,
+    index: usize,
+    source_capabilities: &[String],
+) -> harness_contract::managed_agent::ManagedAgentTriggerEvent {
+    let canonical = serde_json::to_vec(event).unwrap_or_default();
+    let digest = format!("sha256:{:x}", Sha256::digest(&canonical));
+    let event_id = value_string(event, "event_id")
+        .or_else(|| value_string(event, "id"))
+        .unwrap_or_else(|| format!("{adapter_id}:{index}:{digest}"));
+    let event_type = value_string(event, "event_type")
+        .or_else(|| value_string(event, "type"))
+        .or_else(|| value_string(event, "kind"))
+        .unwrap_or_else(|| "source.record.changed".to_string());
+    let subject = value_string(event, "subject")
+        .or_else(|| value_string(event, "resource_ref"))
+        .or_else(|| resource_ref.map(str::to_string))
+        .unwrap_or_else(|| adapter_id.to_string());
+    let mut attributes = BTreeMap::new();
+    attributes.insert("adapter_id".to_string(), adapter_id.to_string());
+    if let Some(resource_ref) = resource_ref {
+        attributes.insert("resource_ref".to_string(), resource_ref.to_string());
+    }
+    if let Some(object) = event.as_object() {
+        for (key, value) in object {
+            if let Some(value) = value.as_str() {
+                attributes.insert(key.clone(), value.to_string());
+            } else if value.is_boolean() || value.is_number() {
+                attributes.insert(key.clone(), value.to_string());
+            }
+        }
+    }
+    let occurred_at_ms = event
+        .get("occurred_at_ms")
+        .and_then(Value::as_u64)
+        .or_else(|| event.get("timestamp_ms").and_then(Value::as_u64))
+        .unwrap_or_else(now_ms);
+    harness_contract::managed_agent::ManagedAgentTriggerEvent {
+        event_id: event_id.clone(),
+        source_id: adapter_id.to_string(),
+        source_kind: "connector_source".to_string(),
+        event_type,
+        subject,
+        payload_ref: format!(
+            "connector-source:{adapter_id}:{}:{event_id}",
+            resource_ref.unwrap_or("default")
+        ),
+        payload_digest: digest,
+        occurred_at_ms,
+        source_sequence: event
+            .get("source_sequence")
+            .and_then(Value::as_u64)
+            .or_else(|| event.get("sequence").and_then(Value::as_u64)),
+        idempotency_key: format!("connector-source:{adapter_id}:{event_id}"),
+        source_capabilities: source_capabilities.to_vec(),
+        attributes,
+        trace_refs: vec![format!("connector-source:{adapter_id}:{event_id}")],
+    }
+}
+
+fn value_string(value: &Value, key: &str) -> Option<String> {
+    value.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 async fn connector_source_commit_watermark_handler(
@@ -542,5 +711,60 @@ fn auth_mode_for_platform(platform_type: &str) -> &'static str {
         "wechat-ilink" | "wechat_ilink" | "wechat" => "qr_session",
         "email" => "smtp_imap",
         _ => "config",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connector_event_normalization_preserves_transport_facts_only() {
+        let event = serde_json::json!({
+            "id": "row-change-42",
+            "type": "record.updated",
+            "subject": "order-17",
+            "sequence": 8,
+            "priority": "high",
+            "deleted": false,
+            "attempt": 3,
+        });
+        let capabilities = source_event_capabilities("feishu-bitable");
+
+        let normalized = normalize_source_event(
+            "feishu-bitable",
+            Some("bitable://app/table"),
+            &event,
+            0,
+            &capabilities,
+        );
+
+        assert_eq!(normalized.event_id, "row-change-42");
+        assert_eq!(
+            normalized.idempotency_key,
+            "connector-source:feishu-bitable:row-change-42"
+        );
+        assert_eq!(normalized.source_id, "feishu-bitable");
+        assert_eq!(normalized.source_kind, "connector_source");
+        assert_eq!(normalized.event_type, "record.updated");
+        assert_eq!(normalized.subject, "order-17");
+        assert_eq!(normalized.source_sequence, Some(8));
+        assert_eq!(
+            normalized.attributes.get("priority"),
+            Some(&"high".to_string())
+        );
+        assert_eq!(
+            normalized.attributes.get("deleted"),
+            Some(&"false".to_string())
+        );
+        assert_eq!(normalized.attributes.get("attempt"), Some(&"3".to_string()));
+        assert_eq!(
+            normalized.attributes.get("resource_ref"),
+            Some(&"bitable://app/table".to_string())
+        );
+        assert!(normalized
+            .source_capabilities
+            .contains(&"connector.source.event.receive".to_string()));
+        assert!(normalized.payload_digest.starts_with("sha256:"));
     }
 }

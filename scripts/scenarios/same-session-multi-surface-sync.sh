@@ -11,12 +11,17 @@ TMP_DIR="$(mktemp -d /tmp/cowd-same-session-sync.XXXXXX)"
 WORKDIR="$TMP_DIR/workspace"
 CONFIG_HOME="$TMP_DIR/config"
 HOME_DIR="$TMP_DIR/home"
-SOCKET="$TMP_DIR/cowd.sock"
 LOG="$TMP_DIR/gateway.log"
+API_TOKEN="same-session-sync-$$_credential"
+AUTH_BROKER_BIN="${COWD_AUTH_BROKER_BIN:-$TARGET_ROOT/debug/cowd-auth-broker}"
 SESSION_ID="same-session-session-$$"
-OWNER="tui:same-session-$$"
+OWNER="principal:local-human"
 TASK_OBJECTIVE="same-session same-session sync task $$"
 SCENARIO_API_KEY="${ANTHROPIC_API_KEY:-test-dummy-key-for-same-session-scenario}"
+
+curl() {
+  command curl -H "Authorization: Bearer $API_TOKEN" "$@"
+}
 
 cleanup() {
   if command -v tmux >/dev/null 2>&1; then
@@ -52,6 +57,10 @@ if ss -ltnp | rg -q ":$PORT\\b"; then
   echo "port $PORT is already in use" >&2
   exit 1
 fi
+if [[ ! -x "$AUTH_BROKER_BIN" ]]; then
+  echo "cowd-auth-broker is required at $AUTH_BROKER_BIN" >&2
+  exit 1
+fi
 
 cd "$ROOT"
 if [[ "${COWD_SCENARIO_SKIP_BUILD:-0}" != "1" ]]; then
@@ -85,7 +94,8 @@ gateway:
       host: "127.0.0.1"
       port: $PORT
       auth:
-        enabled: false
+        enabled: true
+        token: "$API_TOKEN"
 EOF
 cp "$CONFIG_HOME/config.yaml" "$HOME_DIR/.cowd/config.yaml"
 cp "$CONFIG_HOME/config.yaml" "$WORKDIR/.cowd/config.yaml"
@@ -93,50 +103,41 @@ cp "$CONFIG_HOME/config.yaml" "$WORKDIR/.cowd/config.yaml"
 tmux new-session -d -s "$TMUX_SESSION" \
   "bash -lc \"cd '$WORKDIR' && \
     export COWD_CONFIG_HOME='$CONFIG_HOME' && \
-    export COWD_DAEMON_SOCKET='$SOCKET' && \
+    export COWD_AUTH_BROKER_BIN='$AUTH_BROKER_BIN' && \
     export HOME='$HOME_DIR' && \
     '$BIN' gateway run >'$LOG' 2>&1\""
 
 for _ in {1..100}; do
-  if [[ -S "$SOCKET" ]] && curl -fsS "$BASE_URL/health" >/dev/null 2>&1; then
+  if curl -fsS "$BASE_URL/health" >/dev/null 2>&1; then
     break
   fi
   sleep 0.2
 done
 
-[[ -S "$SOCKET" ]]
 curl -fsS "$BASE_URL/health" >/dev/null
 
-python3 - "$SOCKET" "$SESSION_ID" "$OWNER" "$TASK_OBJECTIVE" <<'PY'
-import json
-import socket
-import sys
-
-sock_path, session_id, owner, objective = sys.argv[1:5]
-
-def request(payload):
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-        client.connect(sock_path)
-        client.sendall(json.dumps(payload).encode("utf-8") + b"\n")
-        chunks = []
-        while not chunks or not chunks[-1].endswith(b"\n"):
-            chunk = client.recv(65536)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        data = json.loads(b"".join(chunks).decode("utf-8").strip())
-        if not data.get("ok"):
-            raise SystemExit(json.dumps(data, ensure_ascii=False))
-        return data
-
-request({"cmd": "ensure_session", "protocol_version": 1, "session_id": session_id, "model": "claude-sonnet-4-6"})
-request({"cmd": "acquire_session_lease", "protocol_version": 1, "session_id": session_id, "owner": owner, "mode": "collaborative"})
-snapshot = request({"cmd": "runtime_snapshot", "protocol_version": 1})
-assert session_id in snapshot.get("sessions", []), snapshot
-assert any(item.get("owner") == owner for item in snapshot.get("leases", {}).get("items", [])), snapshot
-task = request({"cmd": "task_start", "protocol_version": 1, "objective": objective, "yolo_mode": True})
-assert task.get("task", {}).get("objective") == objective, task
-PY
+curl -fsS -X POST "$BASE_URL/api/sessions/$SESSION_ID/ensure" \
+  -H 'content-type: application/json' \
+  -d '{"model":"claude-sonnet-4-6"}' \
+  | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("ok") is True and data.get("session_id") == sys.argv[1], data' "$SESSION_ID"
+for attachment in '{"surface":"tui","role":"writer"}' '{"surface":"webui","role":"reader"}'; do
+  curl -fsS -X POST "$BASE_URL/api/sessions/$SESSION_ID/attach" \
+    -H 'content-type: application/json' \
+    -d "$attachment" \
+    | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("ok") is True, data'
+done
+curl -fsS "$BASE_URL/api/sessions/$SESSION_ID/lifecycle" \
+  | python3 -c 'import json,sys; data=json.load(sys.stdin); items=data.get("snapshot",{}).get("attachments",[]); assert data.get("ok") is True and len(items) == 2 and {item["actor"]["surface"] for item in items} == {"tui","webui"}, data'
+curl -fsS -X POST "$BASE_URL/api/runtime/session-leases/acquire" \
+  -H 'content-type: application/json' \
+  -d "{\"session_id\":\"$SESSION_ID\",\"mode\":\"collaborative\"}" \
+  | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("ok") is True, data'
+curl -fsS "$BASE_URL/api/runtime/snapshot" \
+  | python3 -c 'import json,sys; data=json.load(sys.stdin); assert sys.argv[1] in (data.get("sessions") or []), data' "$SESSION_ID"
+curl -fsS -X POST "$BASE_URL/api/tasks/start" \
+  -H 'content-type: application/json' \
+  -d "{\"objective\":\"$TASK_OBJECTIVE\",\"yolo_mode\":true}" \
+  | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("objective") == sys.argv[1] and data.get("status") == "running", data' "$TASK_OBJECTIVE"
 
 LEASES_JSON="$TMP_DIR/session-leases.json"
 TASKS_JSON="$TMP_DIR/tasks.json"

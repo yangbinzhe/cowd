@@ -42,17 +42,17 @@ impl GatewayServices {
     ) -> Self {
         let command_host_runtime = Arc::clone(&runtime);
         let runtime_services = runtime.runtime_services();
-        let runtime_events =
-            RuntimeEventService::from_store(Arc::clone(runtime_services.event_store()));
+        let runtime_events = RuntimeEventService::from_runtime_services(runtime_services.as_ref());
         let session_kernel = runtime.session_kernel();
         let lifecycle_kernel = runtime.lifecycle_kernel();
+        let task = TaskService::with_kernel_and_runtime(task_kernel, Arc::clone(&runtime_services));
         Self {
             runtime: Some(runtime),
             runtime_events,
             surface: SurfaceService::with_host(surface_host),
-            slash: SlashController::new(Some(command_host_runtime)),
+            slash: SlashController::new(Some(command_host_runtime), task.clone()),
             session: SessionService::with_runtime_boundaries(session_kernel, lifecycle_kernel),
-            task: TaskService::with_kernel_and_runtime(task_kernel, Arc::clone(&runtime_services)),
+            task,
             memory: MemoryService::with_manager(memory_manager),
             approval: ApprovalService::with_gate_and_repository(approval_gate, approval_repository)
                 .with_runtime_services(Arc::clone(&runtime_services)),
@@ -73,20 +73,21 @@ impl GatewayServices {
     )]
     pub(crate) fn baseline_with_config_home(config_home: impl AsRef<std::path::Path>) -> Self {
         let config_home = config_home.as_ref();
+        let baseline_runtime =
+            runtime::RuntimeServices::in_memory().expect("baseline runtime event projection");
+        let task = TaskService::new();
         Self {
             runtime: None,
-            runtime_events: RuntimeEventService::open(config_home),
+            runtime_events: RuntimeEventService::from_runtime_services(baseline_runtime.as_ref()),
             surface: SurfaceService::new(),
-            slash: SlashController::new(None),
+            slash: SlashController::new(None, task.clone()),
             session: SessionService::new(),
-            task: TaskService::new(),
+            task,
             approval: ApprovalService::new(),
             memory: MemoryService::new(),
             context: ContextService::new(),
             connector: ConnectorService::new(),
-            cross_plane: CrossPlaneService::new(
-                runtime::RuntimeServices::in_memory().expect("baseline cross-plane runtime"),
-            ),
+            cross_plane: CrossPlaneService::new(baseline_runtime),
             tool: ToolService::new(),
             system: SystemService::new(),
             audit: AuditService::new(),
@@ -282,10 +283,16 @@ impl GatewayServices {
             ("harness_eval", "run_start"),
             ("evolution", "signals"),
             ("evolution", "proposals"),
-            ("evolution", "candidates"),
-            ("evolution", "candidate_create"),
-            ("evolution", "candidate_decision"),
-            ("evolution", "sandbox_evals"),
+            ("evolution", "signal_create"),
+            ("evolution", "diagnoses"),
+            ("evolution", "diagnosis_create"),
+            ("evolution", "missions_summary"),
+            ("evolution", "mission_detail"),
+            ("evolution", "proposal_create"),
+            ("evolution", "proposal_detail"),
+            ("evolution", "chain"),
+            ("evolution", "proposal_decision"),
+            ("evolution", "skill_draft"),
             ("provider", "config_projection"),
             ("provider", "model_routing"),
             ("reality", "status"),

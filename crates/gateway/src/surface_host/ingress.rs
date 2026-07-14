@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use harness_contract::turn::{InputSourceKind, SessionInputEnvelope};
 use memory::{SessionMissionOutboxOperation, SessionMissionOutboxRequest, SessionRecord};
@@ -20,37 +21,203 @@ pub(crate) fn spawn_surface_ingress_dispatcher(state: Arc<AppState>) {
     let mut rx = state.services.surface.subscribe_events();
     let session_locks = Arc::new(Mutex::new(HashMap::<String, Arc<Mutex<()>>>::new()));
     tokio::spawn(async move {
+        let mut retry_tick = tokio::time::interval(Duration::from_secs(5));
+        retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            let frame = match rx.recv().await {
-                Ok(frame) => frame,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    tracing::warn!(skipped, "surface ingress dispatcher lagged");
-                    continue;
+            tokio::select! {
+                _ = retry_tick.tick() => {
+                    retry_surface_trigger_events(&state).await;
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            };
-            let SurfaceFrame::Event {
-                surface,
-                event,
-                payload,
-            } = frame
-            else {
-                continue;
-            };
-            if event != "message.received" {
-                continue;
+                received = rx.recv() => {
+                    let frame = match received {
+                        Ok(frame) => frame,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(skipped, "surface ingress dispatcher lagged");
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    };
+                    let SurfaceFrame::Event {
+                        surface,
+                        event,
+                        payload,
+                    } = frame
+                    else {
+                        continue;
+                    };
+                    let state = state.clone();
+                    enqueue_surface_trigger_event(state.clone(), &surface, &event, &payload);
+                    if event != "message.received" {
+                        continue;
+                    }
+                    let session_locks = session_locks.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) =
+                            handle_surface_message(state, session_locks, surface, payload).await
+                        {
+                            tracing::warn!(error = %error, "surface ingress message handling failed");
+                        }
+                    });
+                }
             }
-            let state = state.clone();
-            let session_locks = session_locks.clone();
-            tokio::spawn(async move {
-                if let Err(error) =
-                    handle_surface_message(state, session_locks, surface, payload).await
-                {
-                    tracing::warn!(error = %error, "surface ingress message handling failed");
-                }
-            });
         }
     });
+}
+
+/// Persist a Surface transport event before attempting Runtime delivery.  The
+/// persisted record is the recoverable transport handoff; it is intentionally
+/// not a second scheduler or source-matching implementation.
+fn enqueue_surface_trigger_event(
+    state: Arc<AppState>,
+    surface: &str,
+    event_type: &str,
+    payload: &serde_json::Value,
+) {
+    let event = normalize_surface_event(surface, event_type, payload);
+    match state
+        .services
+        .surface
+        .record_trigger_event_received(surface, event_type, &event, payload)
+    {
+        Ok(receipt) if !receipt.duplicate => {
+            let idempotency_key = receipt.record.idempotency_key;
+            tokio::spawn(async move {
+                dispatch_surface_trigger_event(state, idempotency_key).await;
+            });
+        }
+        Ok(receipt) => {
+            tracing::debug!(
+                surface,
+                event = event_type,
+                status = %receipt.record.status,
+                "surface trigger event ignored as durable duplicate"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                surface,
+                event = event_type,
+                error = %error,
+                "surface trigger event could not be persisted"
+            );
+        }
+    }
+}
+
+async fn retry_surface_trigger_events(state: &Arc<AppState>) {
+    for record in state.services.surface.due_trigger_event_retries() {
+        dispatch_surface_trigger_event(state.clone(), record.idempotency_key).await;
+    }
+}
+
+async fn dispatch_surface_trigger_event(state: Arc<AppState>, idempotency_key: String) {
+    let record = match state
+        .services
+        .surface
+        .mark_trigger_event_dispatching(&idempotency_key)
+    {
+        Ok(Some(record)) => record,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%idempotency_key, error = %error, "surface trigger event claim failed");
+            return;
+        }
+    };
+    let result = state
+        .services
+        .runtime
+        .as_ref()
+        .ok_or_else(|| "runtime service unavailable".to_string())
+        .and_then(|runtime| {
+            runtime
+                .runtime_services()
+                .accept_managed_agent_event(record.trigger.clone())
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        });
+    match result {
+        Ok(()) => {
+            if let Err(error) = state
+                .services
+                .surface
+                .mark_trigger_event_accepted(&idempotency_key)
+            {
+                tracing::error!(%idempotency_key, error = %error, "Runtime accepted surface trigger but receipt persistence failed");
+            }
+        }
+        Err(error) => {
+            match state
+                .services
+                .surface
+                .mark_trigger_event_failed(&idempotency_key, &error)
+            {
+                Ok(updated) => tracing::warn!(
+                    surface = %updated.surface,
+                    event = %updated.event_type,
+                    attempts = updated.attempts,
+                    max_attempts = updated.max_attempts,
+                    status = %updated.status,
+                    error = %error,
+                    "surface trigger event Runtime handoff failed"
+                ),
+                Err(persistence_error) => tracing::error!(
+                    %idempotency_key,
+                    error = %persistence_error,
+                    runtime_error = %error,
+                    "surface trigger event failure could not be persisted"
+                ),
+            }
+        }
+    }
+}
+
+/// Normalize one Surface transport event into the Runtime-owned trigger
+/// contract. This deliberately performs no matching, authorization or
+/// scheduling: those decisions are durable Dispatcher responsibilities.
+fn normalize_surface_event(
+    surface: &str,
+    event_type: &str,
+    payload: &serde_json::Value,
+) -> harness_contract::managed_agent::ManagedAgentTriggerEvent {
+    let event_local_id = payload_string(payload, "event_id")
+        .or_else(|| payload_string(payload, "message_id"))
+        .or_else(|| payload_string(payload, "id"))
+        .unwrap_or_else(|| payload_fingerprint_id(surface, payload));
+    let session_id = surface_session_id(surface, payload);
+    let thread_id = payload_string(payload, "thread_id");
+    let user_id = payload_string(payload, "user_id");
+    let mut attributes = BTreeMap::new();
+    attributes.insert("surface".to_string(), surface.to_string());
+    attributes.insert("session_id".to_string(), session_id.clone());
+    if let Some(thread_id) = thread_id {
+        attributes.insert("thread_id".to_string(), thread_id);
+    }
+    if let Some(user_id) = user_id {
+        attributes.insert("user_id".to_string(), user_id);
+    }
+    let stable_key = format!("surface-event:{surface}:{event_type}:{event_local_id}");
+    harness_contract::managed_agent::ManagedAgentTriggerEvent {
+        event_id: stable_key.clone(),
+        source_id: surface.to_string(),
+        source_kind: "surface".to_string(),
+        event_type: event_type.to_string(),
+        subject: session_id,
+        payload_ref: format!("surface-event:{stable_key}"),
+        payload_digest: format!(
+            "sha256:{:x}",
+            Sha256::digest(payload.to_string().as_bytes())
+        ),
+        occurred_at_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64,
+        source_sequence: None,
+        idempotency_key: stable_key.clone(),
+        source_capabilities: vec!["surface.event.receive".to_string()],
+        attributes,
+        trace_refs: vec![format!("surface:{surface}:event:{event_local_id}")],
+    }
 }
 
 async fn handle_surface_message(
@@ -803,6 +970,7 @@ fn surface_system_prompt(surface: &str) -> Vec<String> {
 
 fn surface_session_id(surface: &str, payload: &serde_json::Value) -> String {
     payload_string(payload, "session")
+        .or_else(|| payload_string(payload, "session_id"))
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| {
             let metadata = payload.get("metadata").unwrap_or(&serde_json::Value::Null);
@@ -1171,6 +1339,17 @@ mod tests {
     }
 
     #[test]
+    fn surface_session_id_accepts_canonical_session_id() {
+        let payload = serde_json::json!({
+            "session_id": "session-canonical",
+            "user_id": "user-a",
+            "thread_id": "chat-a"
+        });
+
+        assert_eq!(surface_session_id("feishu", &payload), "session-canonical");
+    }
+
+    #[test]
     fn surface_session_id_uses_surface_user_and_chat() {
         let payload = serde_json::json!({
             "user_id": "user-a",
@@ -1421,5 +1600,38 @@ mod tests {
         assert!(text.contains("已经进入 Cowd"));
         assert!(text.contains("turn timed out after 240s"));
         assert!(text.contains("重放"));
+    }
+
+    #[test]
+    fn surface_events_normalize_to_stable_runtime_trigger_contracts() {
+        let payload = serde_json::json!({
+            "message_id": "om_123",
+            "thread_id": "chat_456",
+            "user_id": "user_789",
+            "session_id": "session_ops",
+            "text": "inspect the incident"
+        });
+
+        let event = normalize_surface_event("feishu", "message.received", &payload);
+
+        assert_eq!(
+            event.event_id,
+            "surface-event:feishu:message.received:om_123"
+        );
+        assert_eq!(event.idempotency_key, event.event_id);
+        assert_eq!(event.source_id, "feishu");
+        assert_eq!(event.source_kind, "surface");
+        assert_eq!(event.subject, "session_ops");
+        assert_eq!(event.source_capabilities, vec!["surface.event.receive"]);
+        assert_eq!(
+            event.attributes.get("thread_id"),
+            Some(&"chat_456".to_string())
+        );
+        assert_eq!(
+            event.attributes.get("user_id"),
+            Some(&"user_789".to_string())
+        );
+        assert!(event.payload_digest.starts_with("sha256:"));
+        assert_eq!(event.trace_refs, vec!["surface:feishu:event:om_123"]);
     }
 }

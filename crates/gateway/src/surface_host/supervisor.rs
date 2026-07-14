@@ -4,6 +4,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, RwLock};
 
 use chrono::Utc;
+use sandbox_launcher::{program_command, SandboxLaunchSpec};
 use surface::{
     normalize_surface_id, SurfaceDescriptor, SurfaceError, SurfaceFailureKind, SurfaceFrame,
     SurfaceLifecycle, SurfaceRuntimeError, SurfaceRuntimeSnapshot, SurfaceRuntimeStatus,
@@ -270,8 +271,23 @@ async fn start_managed_process(
         }
     }
 
-    let mut child = TokioCommand::new(&command_path)
-        .current_dir(working_dir.as_deref().unwrap_or_else(|| Path::new(".")))
+    let workspace_root = working_dir
+        .as_deref()
+        .ok_or_else(|| SurfaceError::Invocation {
+            surface: surface_id.clone(),
+            reason: "managed surface manifest has no parent directory".to_string(),
+        })?;
+    let mut sandbox = SandboxLaunchSpec::workspace(workspace_root);
+    sandbox.working_directory = Some(workspace_root.to_path_buf());
+    let prepared =
+        program_command(&command_path, &sandbox).map_err(|error| SurfaceError::Invocation {
+            surface: surface_id.clone(),
+            reason: format!("managed surface sandbox unavailable: {error}"),
+        })?;
+    let mut child = TokioCommand::new(prepared.program)
+        .args(prepared.args)
+        .env_clear()
+        .envs(prepared.environment)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

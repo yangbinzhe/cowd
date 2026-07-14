@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 harness-contract = { path = "../harness-contract" }
+auth-broker = { path = "../auth-broker" }
 harness-eval = { path = "../harness-eval" }
 fact-kernel = { path = "../fact-kernel" }
 model-protocol = { path = "../model-protocol" }
@@ -19,6 +20,7 @@ storage = { path = "../storage" }
 surface = { path = "../surface" }
 approval = { path = "../approval" }
 axum = { version = "0.7", features = ["multipart"] }
+base64 = "0.22"
 memory = { path = "../memory" }
 chrono = { version = "0.4", features = ["serde"] }
 connector = { path = "../connector" }
@@ -29,6 +31,7 @@ libc = "0.2"
 rusqlite = { version = "0.31", features = ["bundled"] }
 reqwest.workspace = true
 runtime = { path = "../runtime" }
+sandbox-launcher = { path = "../sandbox-launcher" }
 plugins = { path = "../plugins" }
 provider = { path = "../provider" }
 serde = { version = "1", features = ["derive"] }
@@ -54,11 +57,47 @@ async-trait = "0.1"
 [features]
 default = []
 code-index = ["memory/code-index"]
+# Explicit opt-in harness for black-box Gateway integration tests. It is never
+# enabled by the production default feature set.
+test-support = ["runtime/test-fixtures", "auth-broker/test-support"]
+
+# These routes are verified through a public, feature-gated black-box harness.
+# Keeping the targets opt-in ensures a normal production test build never
+# compiles test-only exports, while the dedicated gate always enables them.
+[[test]]
+name = "agent_definition_api"
+required-features = ["test-support"]
+
+[[test]]
+name = "agent_definition_routes"
+required-features = ["test-support"]
+
+[[test]]
+name = "auth_mutation_gate"
+required-features = ["test-support"]
+
+[[test]]
+name = "evolution_review_routes"
+required-features = ["test-support"]
+
+[[test]]
+name = "promotion_review_api"
+required-features = ["test-support"]
+
+[[test]]
+name = "surface_trigger_event_routes"
+required-features = ["test-support"]
+
+[[test]]
+name = "team_template_routes"
+required-features = ["test-support"]
 
 [lints.rust]
 unsafe_code = "allow"
 
 [dev-dependencies]
+auth-broker = { path = "../auth-broker", features = ["test-support"] }
+runtime = { path = "../runtime", features = ["test-fixtures"] }
 serde_json.workspace = true
 serial_test = "3"
 tempfile = "3"

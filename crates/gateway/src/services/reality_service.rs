@@ -551,7 +551,11 @@ impl RealityService {
                     augmentation.candidates.push(RecallCandidate::from_external(
                         format!("Matrix fact {} · {}", fact.fact_id, fact.fact_type),
                         content.clone(),
-                        MemoryLayer::L4,
+                        // Matrix is an external Reality source, not a Memory
+                        // L4 promotion.  Use the durable-reference display
+                        // tier while retaining the Matrix source/evidence
+                        // boundary in the recall candidate itself.
+                        MemoryLayer::L3,
                         RecallSourceKind::Matrix,
                         score,
                         fact.confidence,
@@ -588,7 +592,7 @@ impl RealityService {
                             augmentation.candidates.push(RecallCandidate::from_external(
                                 format!("Matrix evidence {}", packet.packet_id),
                                 content.clone(),
-                                MemoryLayer::L4,
+                                MemoryLayer::L3,
                                 RecallSourceKind::Matrix,
                                 score.max(0.35),
                                 packet.confidence,

@@ -1,3 +1,7 @@
+use axum::extract::Extension;
+
+use crate::api_routes::{principal_actor_id, AuthenticatedPrincipal};
+
 use super::*;
 
 pub(super) async fn mfg_incident_create_handler(
@@ -480,8 +484,10 @@ pub(super) async fn mfg_execution_get_handler(
 pub(super) async fn mfg_execution_cross_plane_bridge_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
-    Json(request): Json<MfgCrossPlaneBridgeRequest>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Json(intent): Json<MfgCrossPlaneBridgeIntent>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let request = intent.into_request(principal_actor_id(&principal));
     let execution = state
         .services
         .mfg

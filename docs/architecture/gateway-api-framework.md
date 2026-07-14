@@ -1,6 +1,6 @@
 # Gateway API 总框架与关系设计
 
-生成时间：2026-07-04
+生成时间：2026-07-13
 
 本文说明 Gateway API 的职责边界、接口关系和前后端使用逻辑。全量接口表见 [`docs/api/gateway-api-reference.md`](../api/gateway-api-reference.md)。
 
@@ -34,32 +34,31 @@ flowchart TB
 
 | 接口族 | 核心职责 | 上游消费者 | 下游能力 | 数量 |
 |---|---|---|---|---|
-| 公共入口与认证 | 健康检查、WebUI manifest 和认证入口；公共路由不经过统一 Bearer 中间件。 | 浏览器、探活、登录页 | `public` services / kernels | 7 |
-| Cowd 核心投影与发布门禁 | Gateway 对外暴露的全局能力图、结构化事实投影、发布门禁和路由清单。 | WebUI、TUI、Runtime 或运维工具 | `core` services / kernels | 14 |
-| Runtime 执行核心 | AI Harness 的运行状态、事件、控制平面、配置热加载、turn 提交和 session lease。 | WebUI、TUI、Mission、调试工具 | `runtime` services / kernels | 20 |
-| Session 生命周期 | 持久会话、分叉、压缩、统计、事件、运行投影和 session 级管理。 | WebUI、TUI、Surface 消息入口 | `session` services / kernels | 18 |
-| 对话消息与 SSE | 用户消息写入、历史消息读取和会话 SSE 流。 | WebUI、TUI、Surface 消息入口 | `message` services / kernels | 3 |
-| Mission Control / 多 Session 多 Agent 协同 | Mission Runtime 的全局控制、跨 session 命令、team runtime、steward、审批和代理关系。 | WebUI、Runtime、Agent 协同 | `mission` services / kernels | 50 |
-| Agent 目录、组队与运行 | Agent catalog、team profile、自动发现、组队、信誉和 runtime agent 视图。 | WebUI、TUI、Runtime 或运维工具 | `agent` services / kernels | 20 |
+| 公共入口与认证 | 健康检查、WebUI manifest 和认证入口；公共路由不经过统一 Bearer 中间件。 | 浏览器、探活、登录页 | `public` services / kernels | 11 |
+| Cowd 核心投影与发布门禁 | Gateway 对外暴露的全局能力图、结构化事实投影、发布门禁和路由清单。 | WebUI、TUI、Runtime 或运维工具 | `core` services / kernels | 10 |
+| Runtime 执行核心 | AI Harness 的运行状态、事件、控制平面、配置热加载、turn 提交和 session lease。 | WebUI、TUI、Mission、调试工具 | `runtime` services / kernels | 28 |
+| Session 生命周期 | 持久会话、分叉、压缩、统计、事件、运行投影和 session 级管理。 | WebUI、TUI、Surface 消息入口 | `session` services / kernels | 20 |
+| 对话消息与 SSE | 用户消息写入、历史消息读取和会话 SSE 流。 | WebUI、TUI、Surface 消息入口 | `message` services / kernels | 9 |
+| Mission Control / 多 Session 多 Agent 协同 | Mission Runtime 的全局控制、跨 session 命令、team runtime、steward、审批和代理关系。 | WebUI、Runtime、Agent 协同 | `mission` services / kernels | 34 |
+| Agent 目录、组队与运行 | Runtime-owned Agent Definition、Team Template、自动发现、组队、信誉和执行投影视图。 | WebUI、TUI、Runtime 或运维工具 | `agent` services / kernels | 18 |
 | Task 阶段化执行 | 任务启动、阶段、产物、审查、失败、完成和取消。 | WebUI、TUI、Runtime 或运维工具 | `task` services / kernels | 8 |
-| Context / Evidence | 当前上下文、上下文历史、推荐、压缩和证据引用解析。 | WebUI、TUI、Runtime 或运维工具 | `context` services / kernels | 6 |
-| Memory / Knowledge | 记忆层、检索、packet、维护候选、实体、三元组、知识与性能状态。 | WebUI、TUI、Runtime 或运维工具 | `memory` services / kernels | 25 |
+| Context / Evidence | 当前上下文、上下文历史、推荐、压缩和证据引用解析。 | WebUI、TUI、Runtime 或运维工具 | `context` services / kernels | 7 |
+| Memory / Knowledge | 记忆层、检索、packet、维护候选、实体、三元组、知识与性能状态。 | WebUI、TUI、Runtime 或运维工具 | `memory` services / kernels | 30 |
 | Reality Core | Reality Core 的静态地图、动态 fact flow、promotions、governance、boundaries 和 evidence。 | WebUI、TUI、Runtime 或运维工具 | `reality` services / kernels | 10 |
 | Matrix 结构化事实 | 结构化源包、实体、事实、指标、变化、证据包和连接器运行。 | WebUI、TUI、Runtime 或运维工具 | `matrix` services / kernels | 43 |
 | Growth / 自我演进 | 成长状态、成长事件与演进线索。 | WebUI、TUI、Runtime 或运维工具 | `growth` services / kernels | 2 |
-| Tools 工具执行 | 工具注册表、单工具调用、只读批量、mutation 预览/提交、幂等与意图规划。 | WebUI、TUI、Runtime 或运维工具 | `tool` services / kernels | 16 |
+| Tools 工具执行 | 工具注册表、单工具调用、只读批量、mutation 预览/提交、幂等与意图规划。 | WebUI、TUI、Runtime 或运维工具 | `tool` services / kernels | 17 |
 | Skills 技能体系 | 技能目录、投影、详情、文件、翻译、运行记录和 validate/plan/run 动作。 | WebUI、TUI、Runtime 或运维工具 | `skill` services / kernels | 12 |
 | Approval 审批 | 待审批、审批响应、风险收据、solo 策略、审批配置与历史。 | WebUI、TUI、Runtime 或运维工具 | `approval` services / kernels | 7 |
 | Cross Plane 权限与动作 | 跨 plane 能力授权、风险评估、动作执行、幂等与审计。 | WebUI、TUI、Runtime 或运维工具 | `cross_plane` services / kernels | 14 |
-| Surface 接入面 | Surface 注册表、健康、路由、资源、状态、事件、启动/停止/修复和消息投递。 | WebUI、运维、Gateway supervisor | `surface` services / kernels | 24 |
+| Surface 接入面 | Surface 注册表、健康、路由、资源、状态、事件、启动/停止/修复和消息投递。 | WebUI、运维、Gateway supervisor | `surface` services / kernels | 29 |
 | Edge 热加载与外部包 | Edge 包发现、健康、热加载、surface/connector/resource 投影。 | WebUI、Gateway hot reload | `edge` services / kernels | 7 |
-| Channel / Platform | 平台、消息 channel、Feishu/WeChat 等渠道状态与治理。 | WebUI、TUI、Runtime 或运维工具 | `channel` services / kernels | 8 |
-| Connector 数据与服务连接 | 外部资源连接、账号、capability、MCP、source/service/tool connector。 | WebUI、Matrix、Reality、MFG | `connector` services / kernels | 11 |
+| Connector 数据与服务连接 | 外部资源连接、账号、capability、MCP、source/service/tool connector。 | WebUI、Matrix、Reality、MFG | `connector` services / kernels | 15 |
 | Resource 附件资源 | 上传资源注册、资源详情和资源 evidence。 | WebUI、Surface 附件、Runtime 上下文 | `resource` services / kernels | 3 |
 | Workspace 文件工作区 | 工作区浏览、文件/目录增删改、上传、下载、raw 读取和 session attachment。 | WebUI、TUI、Runtime 工具 | `workspace` services / kernels | 14 |
 | Profile 配置画像 | 配置画像列表、切换和删除。 | WebUI、TUI、Runtime 或运维工具 | `profile` services / kernels | 4 |
 | MFG 上层应用 | 制造领域应用：Reality 数据、事件、incident、playbook、case、analysis、action、report。 | WebUI MFG 应用 | `mfg` services / kernels | 79 |
-| Harness Eval 评测 | AI Harness 场景评测、运行、报告和最新报告。 | WebUI、TUI、Runtime 或运维工具 | `harness_eval` services / kernels | 8 |
+| Harness Eval 评测 | AI Harness 场景评测、运行、报告和最新报告。 | WebUI、TUI、Runtime 或运维工具 | `harness_eval` services / kernels | 10 |
 | Audit 审计 | 跨模块审计导出。 | WebUI、TUI、Runtime 或运维工具 | `audit` services / kernels | 1 |
 | Slash 命令 | Slash 命令目录、详情、解析、分发和历史。 | WebUI、TUI、Runtime 或运维工具 | `slash` services / kernels | 5 |
 

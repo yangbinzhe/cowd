@@ -8,16 +8,17 @@
 use std::sync::Arc;
 
 use harness_contract::execution_graph::{ExecutionGraph, ExecutionGraphCommand};
+use harness_contract::team::TeamInstantiationRequest;
 use serde_json::{json, Value};
 
 use crate::{
-    CreateMissionScheduleRequest, ExecutionGraphHost, GlobalApprovalDecision,
+    ApprovalDecisionCommand, CreateMissionScheduleRequest, ExecutionGraphHost,
     MissionCommandInterpretation, MissionCommandInterpreter, MissionControlCommand,
     MissionControlCommandReceipt, MissionControlProjection, MissionControlRuntime,
     MissionProjection, MissionRuntime, MissionScheduleDispatchReport, MissionSchedulePolicy,
     MissionSessionSnapshot, RuntimeServices, SessionProxy, SessionRelation, SessionRelationGraph,
-    SessionRelationKind, StartMissionSessionRequest, StartTeamRequest, SubmitGlobalApprovalRequest,
-    TeamProjection, UpdateMissionScheduleRequest,
+    SessionRelationKind, StartMissionSessionRequest, SubmitGlobalApprovalRequest, TeamProjection,
+    UpdateMissionScheduleRequest,
 };
 
 /// Runtime's sole surface-facing Mission boundary.
@@ -255,8 +256,11 @@ impl MissionRuntimePort {
             .map(|schedule| serde_json::to_value(schedule).unwrap_or_default())
     }
 
-    pub async fn start_team(&self, request: StartTeamRequest) -> Result<TeamProjection, String> {
-        self.services.team_runtime().start(request).await
+    pub async fn instantiate_team(
+        &self,
+        request: TeamInstantiationRequest,
+    ) -> Result<TeamProjection, String> {
+        self.services.team_runtime().instantiate(request).await
     }
 
     pub fn submit_approval(&self, request: SubmitGlobalApprovalRequest) -> Result<Value, String> {
@@ -266,10 +270,14 @@ impl MissionRuntimePort {
             .map(|approval| serde_json::to_value(approval).unwrap_or_default())
     }
 
-    pub fn decide_approval(&self, decision: GlobalApprovalDecision) -> Result<Value, String> {
+    pub fn decide_approval(
+        &self,
+        principal: &crate::VerifiedPrincipal,
+        decision: ApprovalDecisionCommand,
+    ) -> Result<Value, String> {
         self.services
             .approval_queue()
-            .decide(decision)
+            .decide(principal, decision)
             .map(|receipt| serde_json::to_value(receipt).unwrap_or_default())
     }
 

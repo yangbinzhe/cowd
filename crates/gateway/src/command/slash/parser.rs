@@ -93,7 +93,6 @@ impl SlashCommand {
             Self::Pipeline { .. } => "/pipeline",
             Self::Solve { .. } => "/solve",
             Self::Agents { .. } => "/agent",
-            Self::AgentProfile { .. } => "/agent",
             #[allow(unreachable_patterns)]
             _ => "/unknown",
         }
@@ -619,14 +618,6 @@ fn parse_agent_command(args: Option<&str>) -> Result<SlashCommand, SlashCommandP
         None | Some("list" | "help" | "-h" | "--help") => Ok(SlashCommand::Agents {
             args: args.map(String::from),
         }),
-        Some(profile_args) if profile_args.starts_with("profile") => {
-            let agent_id = profile_args
-                .strip_prefix("profile")
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .map(String::from);
-            Ok(SlashCommand::AgentProfile { agent_id })
-        }
         Some(other) => {
             // Treat unknown subcommand as agents list/help.
             Ok(SlashCommand::Agents {

@@ -5,13 +5,14 @@ use crate::command::slash::{
     CommandDefinition, CommandProjection, CommandRegistry, CommandSurface,
 };
 
-use crate::runtime_service::RuntimeService;
+use crate::{runtime_service::RuntimeService, task_kernel::TaskStatus};
 
-use super::ServiceEnvelope;
+use super::{ServiceEnvelope, TaskService};
 
 #[derive(Clone)]
 pub(crate) struct SlashController {
     runtime: Option<Arc<RuntimeService>>,
+    task: TaskService,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -34,8 +35,8 @@ pub(crate) struct SlashDispatchReceipt {
 }
 
 impl SlashController {
-    pub(crate) fn new(runtime: Option<Arc<RuntimeService>>) -> Self {
-        Self { runtime }
+    pub(crate) fn new(runtime: Option<Arc<RuntimeService>>, task: TaskService) -> Self {
+        Self { runtime, task }
     }
 
     pub(crate) fn label(&self) -> &'static str {
@@ -152,6 +153,20 @@ impl SlashController {
                     ),
                 }
             }
+            CommandActionTarget::Runtime { operation } if operation == "task.manage" => {
+                match self.execute_task_command(&args) {
+                    Ok(data) => (true, "complete", data),
+                    Err(error) => (
+                        false,
+                        "rejected",
+                        serde_json::json!({
+                            "dispatch": "task_service",
+                            "operation": operation,
+                            "error": error,
+                        }),
+                    ),
+                }
+            }
             CommandActionTarget::Client { action } => (
                 true,
                 "dispatch_required",
@@ -207,4 +222,115 @@ impl SlashController {
             ),
         }
     }
+
+    fn execute_task_command(&self, args: &serde_json::Value) -> Result<serde_json::Value, String> {
+        let input = args
+            .get("input")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("/tasks");
+        match TaskCommand::parse(input)? {
+            TaskCommand::List => Ok(serde_json::json!({
+                "dispatch": "task_service",
+                "operation": "list",
+                "tasks": self.task.list_records()?,
+                "current": self.task.current()?,
+            })),
+            TaskCommand::Start {
+                objective,
+                yolo_mode,
+            } => {
+                let task = self.task.start_goal(objective, yolo_mode)?;
+                self.task.record_lifecycle_event(&task, "task.started")?;
+                Ok(serde_json::json!({
+                    "dispatch": "task_service",
+                    "operation": "start",
+                    "task": task,
+                }))
+            }
+            TaskCommand::Cancel { id } => {
+                let task = self.task.transition(
+                    &id,
+                    TaskStatus::Cancelled,
+                    None,
+                    "cancelled by slash command",
+                )?;
+                self.task.record_lifecycle_event(&task, "task.cancelled")?;
+                Ok(serde_json::json!({
+                    "dispatch": "task_service",
+                    "operation": "cancel",
+                    "task": task,
+                }))
+            }
+            TaskCommand::Complete { id } => {
+                let task = self.task.transition(
+                    &id,
+                    TaskStatus::Completed,
+                    None,
+                    "completed by slash command",
+                )?;
+                self.task.record_lifecycle_event(&task, "task.completed")?;
+                Ok(serde_json::json!({
+                    "dispatch": "task_service",
+                    "operation": "complete",
+                    "task": task,
+                }))
+            }
+        }
+    }
+}
+
+enum TaskCommand {
+    List,
+    Start { objective: String, yolo_mode: bool },
+    Cancel { id: String },
+    Complete { id: String },
+}
+
+impl TaskCommand {
+    fn parse(input: &str) -> Result<Self, String> {
+        let input = input.trim();
+        let remainder = input
+            .strip_prefix("/tasks")
+            .or_else(|| input.strip_prefix("tasks"))
+            .unwrap_or(input)
+            .trim();
+        if remainder.is_empty() || matches!(remainder, "list" | "ls") {
+            return Ok(Self::List);
+        }
+
+        let mut parts = remainder.split_whitespace();
+        match parts.next() {
+            Some("start") => {
+                let tail = parts.collect::<Vec<_>>().join(" ");
+                let (yolo_mode, objective) = match tail.strip_prefix("--yolo") {
+                    Some(objective) => (true, objective.trim()),
+                    None => (false, tail.trim()),
+                };
+                if objective.is_empty() {
+                    return Err("usage: /tasks start [--yolo] <objective>".to_string());
+                }
+                Ok(Self::Start {
+                    objective: objective.to_string(),
+                    yolo_mode,
+                })
+            }
+            Some("cancel") => {
+                required_task_id("cancel", parts.next()).map(|id| Self::Cancel { id })
+            }
+            Some("complete") => {
+                required_task_id("complete", parts.next()).map(|id| Self::Complete { id })
+            }
+            Some(other) => Err(format!(
+                "unknown /tasks action `{other}`; use list, start, cancel, or complete"
+            )),
+            None => Ok(Self::List),
+        }
+    }
+}
+
+fn required_task_id(action: &str, id: Option<&str>) -> Result<String, String> {
+    id.map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| format!("usage: /tasks {action} <task-id>"))
 }

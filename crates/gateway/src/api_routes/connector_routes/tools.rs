@@ -1,9 +1,10 @@
 use super::*;
-use axum::http::StatusCode;
+use crate::api_routes::{principal_actor_id, AuthenticatedPrincipal};
+use axum::{http::StatusCode, Extension};
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ServiceExecuteRequest {
-    actor_principal: String,
     #[serde(default)]
     actor_identity_ref: Option<String>,
     #[serde(default)]
@@ -52,6 +53,7 @@ pub(super) async fn connector_service_tools_handler(
 pub(super) async fn connector_service_execute_handler(
     Path(service_id): Path<String>,
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(request): Json<ServiceExecuteRequest>,
 ) -> impl IntoResponse {
     let registry = builtin_service_connector_registry();
@@ -102,7 +104,7 @@ pub(super) async fn connector_service_execute_handler(
         &service_request.title,
     );
     let action = state.services.connector.service_action(
-        request.actor_principal,
+        principal_actor_id(&principal),
         request.tool_id,
         request.actor_identity_ref,
         request.source_channel,

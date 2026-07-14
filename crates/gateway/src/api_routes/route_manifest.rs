@@ -112,6 +112,20 @@ mod tests {
         assert!(has("POST", "/api/skills/:id/actions/validate"));
         assert!(has("POST", "/api/skills/:id/actions/plan"));
         assert!(has("POST", "/api/skills/:id/actions/run"));
+        assert!(has("GET", "/api/evolution/evaluation-policy"));
+        assert!(has("GET", "/api/evolution/evaluation-policy/reviews"));
+        assert!(has(
+            "POST",
+            "/api/evolution/evaluation-policy/reviews/:id/decision"
+        ));
+        assert!(has("GET", "/api/runtime/managed-agents"));
+        assert!(has("POST", "/api/runtime/managed-agents/definitions"));
+        assert!(has("POST", "/api/runtime/managed-agents/:id/trigger"));
+        assert!(has("POST", "/api/runtime/managed-agents/dispatch"));
+        assert!(has("POST", "/api/runtime/managed-agents/events"));
+        assert!(has("GET", "/api/runtime/managed-agents/effects"));
+        assert!(has("GET", "/api/surfaces/:id/trigger-events"));
+        assert!(has("POST", "/api/surfaces/:id/trigger-events/retry"));
         assert!(has("GET", "/api/cowd/release-gate"));
         assert!(has("POST", "/api/resources"));
         assert!(manifest
@@ -134,7 +148,7 @@ mod tests {
         assert!(manifest.iter().any(|entry| {
             entry.path == "/api/gateway/route-manifest"
                 && entry.handler == "route_manifest_handler"
-                && entry.source == "core_routes.rs"
+                && entry.source == "public_routes.rs"
         }));
         assert!(generated_route_metadata().len() > 50);
     }

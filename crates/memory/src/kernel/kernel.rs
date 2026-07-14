@@ -271,8 +271,16 @@ pub struct MemoryTurnContext {
     pub session_id: String,
     pub project_id: Option<String>,
     pub agent_id: String,
+    /// Definition lineage is distinct from `agent_id`, which is always an
+    /// isolated runtime instance identity.
+    pub definition_lineage_id: Option<String>,
     pub team_id: Option<String>,
     pub task_id: Option<String>,
+    /// Explicit cognitive read lease supplied by the Runtime Binding. This is
+    /// checked again after every retrieval source returns candidates, so a
+    /// broad backend query cannot leak a memory into an Agent context.
+    #[serde(default = "default_cognitive_read_scopes")]
+    pub cognitive_read_scopes: Vec<harness_contract::agent::CognitiveReadScope>,
 }
 
 impl MemoryTurnContext {
@@ -282,14 +290,22 @@ impl MemoryTurnContext {
             session_id: session_id.into(),
             project_id: None,
             agent_id: agent_id.into(),
+            definition_lineage_id: None,
             team_id: None,
             task_id: None,
+            cognitive_read_scopes: default_cognitive_read_scopes(),
         }
     }
 
     #[must_use]
     pub fn with_project_id(mut self, project_id: Option<String>) -> Self {
         self.project_id = project_id;
+        self
+    }
+
+    #[must_use]
+    pub fn with_definition_lineage_id(mut self, definition_lineage_id: Option<String>) -> Self {
+        self.definition_lineage_id = definition_lineage_id;
         self
     }
 
@@ -304,6 +320,27 @@ impl MemoryTurnContext {
         self.team_id = team_id;
         self
     }
+
+    #[must_use]
+    pub fn with_cognitive_read_scopes(
+        mut self,
+        scopes: Vec<harness_contract::agent::CognitiveReadScope>,
+    ) -> Self {
+        self.cognitive_read_scopes = scopes;
+        self
+    }
+}
+
+fn default_cognitive_read_scopes() -> Vec<harness_contract::agent::CognitiveReadScope> {
+    use harness_contract::agent::CognitiveReadScope;
+
+    vec![
+        CognitiveReadScope::Session,
+        CognitiveReadScope::Team,
+        CognitiveReadScope::WorkspaceKnowledge,
+        CognitiveReadScope::Project,
+        CognitiveReadScope::DefinitionLineage,
+    ]
 }
 
 /// A degraded memory subsystem or fallback path.
@@ -378,17 +415,18 @@ impl MemoryKernel {
         query: &str,
         messages: &[Message],
     ) -> MemoryKernelResult<PreparedContext> {
-        self.manager.set_active_session(ctx.session_id.clone());
-        self.manager.set_active_agent(ctx.agent_id.clone());
-        self.manager.set_active_scope(default_scope_for_ctx(ctx));
-
         match self
             .manager
-            .prepare_context(query, messages, Some(&ctx.session_id))
+            .prepare_context_for_turn(ctx, query, messages)
             .await
         {
             Ok(mut prepared) => {
-                prepared.entries = self.filter_active_entries(prepared.entries).await;
+                prepared.entries = self
+                    .filter_active_entries(prepared.entries)
+                    .await
+                    .into_iter()
+                    .filter(|entry| memory_scope_visible_to_ctx(&entry.scope, ctx))
+                    .collect();
                 prepared.total_tokens = prepared
                     .entries
                     .iter()
@@ -414,11 +452,7 @@ impl MemoryKernel {
         ctx: &MemoryTurnContext,
         messages: &mut Vec<Message>,
     ) -> MemoryKernelResult<()> {
-        self.manager.set_active_session(ctx.session_id.clone());
-        self.manager.set_active_agent(ctx.agent_id.clone());
-        self.manager.set_active_scope(default_scope_for_ctx(ctx));
-
-        if let Err(error) = self.manager.on_turn_end(messages).await {
+        if let Err(error) = self.manager.on_turn_end_for_turn(ctx, messages).await {
             tracing::warn!(
                 session_id = %ctx.session_id,
                 agent_id = %ctx.agent_id,
@@ -438,10 +472,6 @@ impl MemoryKernel {
         ctx: &MemoryTurnContext,
         mut entry: MemoryEntry,
     ) -> MemoryKernelResult<()> {
-        self.manager.set_active_session(ctx.session_id.clone());
-        self.manager.set_active_agent(ctx.agent_id.clone());
-        self.manager.set_active_scope(default_scope_for_ctx(ctx));
-
         entry
             .session_id
             .get_or_insert_with(|| ctx.session_id.clone());
@@ -487,7 +517,7 @@ impl MemoryKernel {
             );
             return Ok(());
         }
-        if let Err(error) = self.manager.remember(entry).await {
+        if let Err(error) = self.manager.remember_for_turn(ctx, entry).await {
             tracing::warn!(
                 session_id = %ctx.session_id,
                 agent_id = %ctx.agent_id,
@@ -813,7 +843,10 @@ impl MemoryKernel {
         }
         let (deduplicated_entries, mut duplicate_omissions) =
             deduplicate_memory_entries_for_recall(prepared.entries);
-        prepared.entries = deduplicated_entries;
+        prepared.entries = deduplicated_entries
+            .into_iter()
+            .filter(|entry| memory_scope_visible_to_ctx(&entry.scope, ctx))
+            .collect();
         checkpoint_omissions.append(&mut duplicate_omissions);
         let usage_summary = self.usage_summary().await.unwrap_or_default();
         let mut packet = self
@@ -1455,7 +1488,7 @@ fn packet_role_and_reason(atom: &MemoryAtomView) -> (MemoryPacketRole, String) {
     }
 }
 
-fn scoped_entry_scope(ctx: &MemoryTurnContext, entry: &MemoryEntry) -> MemoryScope {
+pub(crate) fn scoped_entry_scope(ctx: &MemoryTurnContext, entry: &MemoryEntry) -> MemoryScope {
     match &entry.scope {
         // `MemoryScope::default()` is the historical Session("") sentinel.
         // Never persist it: it is neither visible to its source session nor a
@@ -1465,10 +1498,10 @@ fn scoped_entry_scope(ctx: &MemoryTurnContext, entry: &MemoryEntry) -> MemorySco
         }
         MemoryScope::Global => {
             if matches!(entry.visibility, AgentVisibility::Private) {
-                return MemoryScope::Agent(ctx.agent_id.clone());
+                return MemoryScope::AgentInstance(ctx.agent_id.clone());
             }
             if let Some(team_id) = &ctx.team_id {
-                return MemoryScope::Project(team_id.clone());
+                return MemoryScope::TeamRun(team_id.clone());
             }
             if let Some(project_id) = &ctx.project_id {
                 return MemoryScope::Project(project_id.clone());
@@ -1489,7 +1522,7 @@ fn scoped_entry_scope(ctx: &MemoryTurnContext, entry: &MemoryEntry) -> MemorySco
     }
 }
 
-fn default_scope_for_ctx(ctx: &MemoryTurnContext) -> MemoryScope {
+pub(crate) fn default_scope_for_ctx(ctx: &MemoryTurnContext) -> MemoryScope {
     if let Some(task_id) = ctx.task_id.as_deref().filter(|id| !id.trim().is_empty()) {
         return MemoryScope::Task(task_id.to_string());
     }
@@ -1499,15 +1532,45 @@ fn default_scope_for_ctx(ctx: &MemoryTurnContext) -> MemoryScope {
     MemoryScope::Session(ctx.session_id.clone())
 }
 
-fn memory_scope_visible_to_ctx(scope: &MemoryScope, ctx: &MemoryTurnContext) -> bool {
+pub(crate) fn memory_scope_visible_to_ctx(scope: &MemoryScope, ctx: &MemoryTurnContext) -> bool {
+    use harness_contract::agent::CognitiveReadScope;
+
     match scope {
-        MemoryScope::Global => true,
-        MemoryScope::Session(session_id) => session_id == &ctx.session_id,
-        MemoryScope::Project(project_id) => {
-            ctx.project_id.as_ref() == Some(project_id) || ctx.team_id.as_ref() == Some(project_id)
+        MemoryScope::Global => ctx
+            .cognitive_read_scopes
+            .contains(&CognitiveReadScope::WorkspaceKnowledge),
+        MemoryScope::Session(session_id) => {
+            session_id == &ctx.session_id
+                && ctx
+                    .cognitive_read_scopes
+                    .contains(&CognitiveReadScope::Session)
         }
-        MemoryScope::Task(task_id) => ctx.task_id.as_ref() == Some(task_id),
-        MemoryScope::Agent(agent_id) => agent_id == &ctx.agent_id,
+        MemoryScope::Project(project_id) => {
+            ctx.project_id.as_ref() == Some(project_id)
+                && ctx
+                    .cognitive_read_scopes
+                    .contains(&CognitiveReadScope::Project)
+        }
+        MemoryScope::Task(task_id) => {
+            ctx.task_id.as_ref() == Some(task_id)
+                && ctx
+                    .cognitive_read_scopes
+                    .contains(&CognitiveReadScope::Session)
+        }
+        MemoryScope::AgentDefinitionLineage(definition_id) => {
+            ctx.definition_lineage_id.as_ref() == Some(definition_id)
+                && ctx
+                    .cognitive_read_scopes
+                    .contains(&CognitiveReadScope::DefinitionLineage)
+        }
+        MemoryScope::AgentInstance(instance_id) => instance_id == &ctx.agent_id,
+        MemoryScope::TeamRun(team_id) => {
+            ctx.team_id.as_ref() == Some(team_id)
+                && ctx
+                    .cognitive_read_scopes
+                    .contains(&CognitiveReadScope::Team)
+        }
+        MemoryScope::LegacyUnresolvedAgent(_) => false,
     }
 }
 
@@ -1515,13 +1578,14 @@ fn checkpoint_recall_score(entry: &MemoryEntry, ctx: &MemoryTurnContext, query: 
     let scope_score = match &entry.scope {
         MemoryScope::Task(task_id) if ctx.task_id.as_ref() == Some(task_id) => 0.34,
         MemoryScope::Session(session_id) if session_id == &ctx.session_id => 0.30,
-        MemoryScope::Project(project_id)
-            if ctx.project_id.as_ref() == Some(project_id)
-                || ctx.team_id.as_ref() == Some(project_id) =>
+        MemoryScope::Project(project_id) if ctx.project_id.as_ref() == Some(project_id) => 0.20,
+        MemoryScope::TeamRun(team_id) if ctx.team_id.as_ref() == Some(team_id) => 0.22,
+        MemoryScope::AgentDefinitionLineage(definition_id)
+            if ctx.definition_lineage_id.as_ref() == Some(definition_id) =>
         {
-            0.20
+            0.18
         }
-        MemoryScope::Agent(agent_id) if agent_id == &ctx.agent_id => 0.18,
+        MemoryScope::AgentInstance(instance_id) if instance_id == &ctx.agent_id => 0.16,
         MemoryScope::Global => 0.08,
         _ => 0.0,
     };
@@ -1965,6 +2029,83 @@ mod tests {
             scoped_entry_scope(&context, &empty_scope_entry),
             MemoryScope::Session("session-a".to_string())
         );
+    }
+
+    #[test]
+    fn cognitive_read_lease_filters_team_project_and_global_memory() {
+        use harness_contract::agent::CognitiveReadScope;
+
+        let context = MemoryTurnContext::new("session-a", "agent-a")
+            .with_project_id(Some("project-a".to_string()))
+            .with_team_id(Some("team-a".to_string()))
+            .with_cognitive_read_scopes(vec![CognitiveReadScope::Session]);
+        assert!(memory_scope_visible_to_ctx(
+            &MemoryScope::Session("session-a".to_string()),
+            &context
+        ));
+        assert!(!memory_scope_visible_to_ctx(
+            &MemoryScope::Project("project-a".to_string()),
+            &context
+        ));
+        assert!(!memory_scope_visible_to_ctx(&MemoryScope::Global, &context));
+
+        let expanded = context.with_cognitive_read_scopes(vec![
+            CognitiveReadScope::Session,
+            CognitiveReadScope::Project,
+            CognitiveReadScope::Team,
+            CognitiveReadScope::WorkspaceKnowledge,
+        ]);
+        assert!(memory_scope_visible_to_ctx(
+            &MemoryScope::Project("project-a".to_string()),
+            &expanded
+        ));
+        assert!(memory_scope_visible_to_ctx(
+            &MemoryScope::TeamRun("team-a".to_string()),
+            &expanded
+        ));
+        assert!(memory_scope_visible_to_ctx(&MemoryScope::Global, &expanded));
+    }
+
+    #[test]
+    fn definition_instance_and_team_scopes_never_cross_a_binding_lease() {
+        use harness_contract::agent::CognitiveReadScope;
+
+        let context = MemoryTurnContext::new("session-a", "instance-a")
+            .with_definition_lineage_id(Some("builtin/cowd/researcher".to_string()))
+            .with_team_id(Some("team-a".to_string()))
+            .with_cognitive_read_scopes(vec![
+                CognitiveReadScope::Session,
+                CognitiveReadScope::DefinitionLineage,
+                CognitiveReadScope::Team,
+            ]);
+        assert!(memory_scope_visible_to_ctx(
+            &MemoryScope::AgentDefinitionLineage("builtin/cowd/researcher".to_string()),
+            &context
+        ));
+        assert!(!memory_scope_visible_to_ctx(
+            &MemoryScope::AgentDefinitionLineage("builtin/cowd/reviewer".to_string()),
+            &context
+        ));
+        assert!(memory_scope_visible_to_ctx(
+            &MemoryScope::AgentInstance("instance-a".to_string()),
+            &context
+        ));
+        assert!(!memory_scope_visible_to_ctx(
+            &MemoryScope::AgentInstance("instance-b".to_string()),
+            &context
+        ));
+        assert!(memory_scope_visible_to_ctx(
+            &MemoryScope::TeamRun("team-a".to_string()),
+            &context
+        ));
+        assert!(!memory_scope_visible_to_ctx(
+            &MemoryScope::TeamRun("team-b".to_string()),
+            &context
+        ));
+        assert!(!memory_scope_visible_to_ctx(
+            &MemoryScope::LegacyUnresolvedAgent("researcher".to_string()),
+            &context
+        ));
     }
 
     #[tokio::test]

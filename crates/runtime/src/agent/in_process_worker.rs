@@ -65,6 +65,26 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         packet: AgentTaskPacket,
         selection: AgentModelSelection,
     ) -> Result<AgentReturnPacket, String> {
+        let binding = packet.binding.as_ref().ok_or_else(|| {
+            "in-process Agent execution requires a Runtime-compiled Binding".to_string()
+        })?;
+        binding.validate().map_err(|error| error.to_string())?;
+        if packet
+            .allowed_tools
+            .iter()
+            .any(|tool| !binding.tool_contract_refs.contains(tool))
+        {
+            return Err("AgentTaskPacket tool allow-list exceeds its Binding contract".to_string());
+        }
+        if packet
+            .allowed_skills
+            .iter()
+            .any(|skill| !binding.skill_refs.contains(skill))
+        {
+            return Err(
+                "AgentTaskPacket Skill allow-list exceeds its Binding contract".to_string(),
+            );
+        }
         let services = self
             .services
             .upgrade()
@@ -72,13 +92,19 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         let host = services.tool_execution_host().cloned().ok_or_else(|| {
             "RuntimeServices has no ToolHost for the in-process agent".to_string()
         })?;
-        let allowed_tools = packet
+        let packet_allowed_tools = packet
             .allowed_tools
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
+        let requested_tool_names = packet_allowed_tools.iter().cloned().collect::<Vec<_>>();
+        let tool_definitions = host.delegated_tool_definitions(&requested_tool_names);
+        let allowed_tools = tool_definitions
+            .iter()
+            .map(|definition| definition.name.clone())
+            .filter(|tool| packet_allowed_tools.contains(tool))
+            .collect::<BTreeSet<_>>();
         let tool_names = allowed_tools.iter().cloned().collect::<Vec<_>>();
-        let tool_definitions = host.delegated_tool_definitions(&tool_names);
         let tool_executor = Arc::new(ScopedRuntimeToolExecutor {
             host,
             allowed_tools: allowed_tools.clone(),
@@ -86,6 +112,8 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             model_lease: selection.model.clone(),
             execution_id: packet.graph_id.clone(),
             node_id: packet.node_id.clone(),
+            evaluation_isolated: binding.evaluation.is_some(),
+            managed_invocation: packet.managed_invocation.clone(),
         });
         let policy = permission_policy(&packet.permission_lease, &allowed_tools);
         let cancellation = crate::CancellationToken::new();
@@ -113,6 +141,10 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         child_session.session_id = packet.session_id.clone();
         child_session.model = Some(selection.model.clone());
         let child_session_id = child_session.session_id.clone();
+        // RuntimeServices owns the inspected Skill snapshot. The Binding's
+        // refs below remain the capability ceiling; this worker never scans
+        // package directories or falls back to an empty production profile.
+        let skill_catalog = services.skill_catalog();
         let host = StandardRuntimeHost::new(StandardRuntimeHostConfig {
             runtime_services: Arc::clone(&services),
             session: child_session,
@@ -134,8 +166,24 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             session_store: services.session_store(),
             hook_progress_reporter: None,
             external_context_items: Vec::new(),
-            skill_profiles: Vec::new(),
-            agent_skill_profile: harness_contract::skill::AgentSkillProfile::default(),
+            skill_profiles: skill_catalog.profiles(),
+            agent_skill_profile: harness_contract::skill::AgentSkillProfile {
+                baseline_skill_refs: Vec::new(),
+                template_skill_refs: Vec::new(),
+                team_skill_refs: Vec::new(),
+                task_skill_refs: binding.skill_refs.clone(),
+                explicit_grants: binding.skill_refs.clone(),
+                hidden_skill_refs: Vec::new(),
+                adapter_ceiling: Vec::new(),
+            },
+            skill_prompt_assets: skill_catalog.prompt_assets(),
+            memory_agent_id: binding.instance.instance_id.clone(),
+            memory_definition_lineage_id: Some(
+                binding.definition_ref.definition_id.as_str().to_string(),
+            ),
+            memory_team_id: binding.data_lease.team_id.clone(),
+            memory_read_scopes: binding.data_lease.read_scopes.clone(),
+            reality_binding: Some(binding.clone()),
             execution_parent: Some(harness_contract::execution_graph::ExecutionParentBinding {
                 execution_id: packet.graph_id.clone(),
                 node_id: packet.node_id.clone(),
@@ -153,6 +201,10 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         // parent session authority but must not inherit MainTurn's broad,
         // open-ended exploration profile.
         runtime.set_context_profile(ContextProfile::SubAgent);
+        // Delegated Agents share the parent Session's evidence authority, but
+        // only the parent Turn may publish conversation messages. The child
+        // result returns through AgentReturnPacket and the Team reducer.
+        runtime.set_transcript_persistence(false);
         let input_stream = runtime.session_input_stream();
         self.active_runs
             .lock()
@@ -318,6 +370,8 @@ struct ScopedRuntimeToolExecutor {
     model_lease: String,
     execution_id: String,
     node_id: String,
+    evaluation_isolated: bool,
+    managed_invocation: Option<harness_contract::managed_agent::ManagedAgentInvocationFence>,
 }
 
 impl ToolExecutor for ScopedRuntimeToolExecutor {
@@ -343,36 +397,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
                 "tool `{tool_name}` is outside the AgentTaskPacket allow-list"
             )));
         }
-        let request = RuntimeToolExecutionRequest {
-            idempotency_key: format!(
-                "agent-tool:{tool_name}:{}",
-                crate::tool_invocation::now_ms()
-            ),
-            tool_use_id: format!("agent-tool:{}", uuid::Uuid::new_v4()),
-            tool_name: tool_name.to_string(),
-            input: input.to_string(),
-            category: crate::ToolSafetyCategory::from_tool_name(tool_name),
-            session_id: Some(self.session_id.clone()),
-            model_lease: Some(self.model_lease.clone()),
-            parent_execution: Some(harness_contract::execution_graph::ExecutionParentBinding {
-                execution_id: self.execution_id.clone(),
-                node_id: self.node_id.clone(),
-            }),
-        };
-        let outcome = self.host.execute_runtime_tool(&request);
-        match outcome.status {
-            RuntimeToolExecutionStatus::Executed => Ok(outcome.output.unwrap_or_default()),
-            RuntimeToolExecutionStatus::BlockedPermission => Err(ToolError::new(
-                outcome
-                    .error
-                    .unwrap_or_else(|| "tool blocked by policy".into()),
-            )),
-            RuntimeToolExecutionStatus::Failed => Err(ToolError::new(
-                outcome
-                    .error
-                    .unwrap_or_else(|| "tool execution failed".into()),
-            )),
-        }
+        self.execute_scoped(tool_name, input, None)
     }
 
     fn tool_discovery_receipt(&self) -> harness_contract::tool::ToolDiscoveryReceipt {
@@ -390,17 +415,19 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
             permission_source: "runtime bootstrap".to_string(),
             health: ToolDescriptorHealth::Healthy,
         });
-        descriptors.extend(self.allowed_tools.iter().map(|tool_name| {
-            let descriptor = scoped_tool_effect_descriptor(tool_name);
-            ToolDescriptorRef {
+        descriptors.extend(self.allowed_tools.iter().filter_map(|tool_name| {
+            let descriptor = self
+                .host
+                .delegated_tool_effect_descriptor(tool_name, &serde_json::json!({}))?;
+            Some(ToolDescriptorRef {
                 canonical_id: tool_name.clone(),
                 display_name: tool_name.clone(),
                 source: "delegated-agent".to_string(),
                 schema_hash: descriptor.descriptor_hash,
                 required_permission: descriptor.required_permission,
-                permission_source: "agent task packet allow-list".to_string(),
+                permission_source: "runtime binding plus host snapshot".to_string(),
                 health: ToolDescriptorHealth::Healthy,
-            }
+            })
         }));
         ToolDiscoveryReceipt {
             query: "delegated-agent".to_string(),
@@ -413,11 +440,12 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
     fn describe_tool_effect(
         &self,
         tool_name: &str,
-        _input: &serde_json::Value,
+        input: &serde_json::Value,
     ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
         self.allowed_tools
             .contains(tool_name)
-            .then(|| scoped_tool_effect_descriptor(tool_name))
+            .then(|| self.host.delegated_tool_effect_descriptor(tool_name, input))
+            .flatten()
     }
 
     fn execute_authorized(
@@ -431,7 +459,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
                 "agent tool authorization does not match the allowed tool request",
             ));
         }
-        self.execute(tool_name, input)
+        self.execute_scoped(tool_name, input, Some(authorization.clone()))
     }
 
     fn available_tool_names(&self) -> Vec<String> {
@@ -451,56 +479,52 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
     }
 }
 
-fn scoped_tool_effect_descriptor(tool_name: &str) -> harness_contract::tool::ToolEffectDescriptor {
-    use harness_contract::policy::{PermissionOperation, PermissionResource, PermissionScope};
-    use harness_contract::tool::{
-        ToolApprovalClass, ToolEffectDescriptor, ToolEffectKind, ToolIdempotency,
-        ToolPermissionMode,
-    };
-
-    let safety = crate::ToolSafetyCategory::from_tool_name(tool_name);
-    let (effect_kind, idempotency, required_permission, scope, approval_class) = match safety {
-        crate::ToolSafetyCategory::ReadOnly => (
-            ToolEffectKind::Read,
-            ToolIdempotency::Idempotent,
-            ToolPermissionMode::ReadOnly,
-            PermissionScope::new(PermissionResource::File, PermissionOperation::Read),
-            ToolApprovalClass::None,
-        ),
-        crate::ToolSafetyCategory::WriteLocal => (
-            ToolEffectKind::Write,
-            ToolIdempotency::IdempotentWithKey,
-            ToolPermissionMode::WorkspaceWrite,
-            PermissionScope::new(PermissionResource::File, PermissionOperation::Write),
-            ToolApprovalClass::Policy,
-        ),
-        crate::ToolSafetyCategory::Network => (
-            ToolEffectKind::Network,
-            ToolIdempotency::Unknown,
-            ToolPermissionMode::DangerFullAccess,
-            PermissionScope::new(PermissionResource::Network, PermissionOperation::Execute),
-            ToolApprovalClass::Policy,
-        ),
-        crate::ToolSafetyCategory::Destructive => (
-            ToolEffectKind::Destructive,
-            ToolIdempotency::Unknown,
-            ToolPermissionMode::DangerFullAccess,
-            PermissionScope::new(PermissionResource::Tool, PermissionOperation::Execute),
-            ToolApprovalClass::User,
-        ),
-    };
-    ToolEffectDescriptor {
-        tool_id: tool_name.to_string(),
-        descriptor_hash: format!("delegated-agent:{tool_name}:{effect_kind:?}"),
-        effect_kind,
-        idempotency,
-        scopes: vec![scope],
-        required_permission,
-        approval_class,
-        uses_network: matches!(safety, crate::ToolSafetyCategory::Network),
-        spawns_process: matches!(safety, crate::ToolSafetyCategory::Destructive),
-        mutates_packages: false,
-        mutates_system: matches!(safety, crate::ToolSafetyCategory::Destructive),
+impl ScopedRuntimeToolExecutor {
+    fn execute_scoped(
+        &self,
+        tool_name: &str,
+        input: &str,
+        authorization: Option<harness_contract::tool::ToolExecutionAuthorization>,
+    ) -> Result<String, ToolError> {
+        let idempotency_key = authorization
+            .as_ref()
+            .and_then(|value| value.idempotency_key.clone())
+            .unwrap_or_else(|| {
+                format!(
+                    "agent-tool:{tool_name}:{}",
+                    crate::tool_invocation::now_ms()
+                )
+            });
+        let request = RuntimeToolExecutionRequest {
+            idempotency_key,
+            tool_use_id: format!("agent-tool:{}", uuid::Uuid::new_v4()),
+            tool_name: tool_name.to_string(),
+            input: input.to_string(),
+            category: crate::ToolSafetyCategory::from_tool_name(tool_name),
+            authorization,
+            session_id: Some(self.session_id.clone()),
+            model_lease: Some(self.model_lease.clone()),
+            parent_execution: Some(harness_contract::execution_graph::ExecutionParentBinding {
+                execution_id: self.execution_id.clone(),
+                node_id: self.node_id.clone(),
+            }),
+            evaluation_isolated: self.evaluation_isolated,
+            managed_invocation: self.managed_invocation.clone(),
+        };
+        let outcome = self.host.execute_runtime_tool(&request);
+        match outcome.status {
+            RuntimeToolExecutionStatus::Executed => Ok(outcome.output.unwrap_or_default()),
+            RuntimeToolExecutionStatus::BlockedPermission => Err(ToolError::new(
+                outcome
+                    .error
+                    .unwrap_or_else(|| "tool blocked by policy".into()),
+            )),
+            RuntimeToolExecutionStatus::Failed => Err(ToolError::new(
+                outcome
+                    .error
+                    .unwrap_or_else(|| "tool execution failed".into()),
+            )),
+        }
     }
 }
 
@@ -514,7 +538,7 @@ fn permission_policy(lease: &str, tools: &BTreeSet<String>) -> PermissionPolicy 
     tools
         .iter()
         .fold(PermissionPolicy::new(mode), |policy, tool| {
-            policy.with_tool_requirement(tool, mode)
+            policy.with_tool_requirement(tool, crate::agent_capability::agent_tool_permission(tool))
         })
 }
 
@@ -530,6 +554,24 @@ fn system_prompt(
         format!("Objective: {}", packet.objective),
         format!("Workspace root: {}", workspace_root.display()),
     ];
+    if let Some(binding) = &packet.binding {
+        prompt.push(format!(
+            "Agent Definition: {}@{} (binding {}).",
+            binding.definition_ref.definition_id.as_str(),
+            binding.definition_ref.revision,
+            binding.binding_id,
+        ));
+        prompt.push(format!(
+            "Definition instructions:\n{}",
+            binding.instructions.trim()
+        ));
+        prompt.push(format!(
+            "Cognitive data lease: read={:?}; write={:?}; team_working_state_visible={}",
+            binding.data_lease.read_scopes,
+            binding.data_lease.write_mode,
+            binding.data_lease.team_working_state_visible,
+        ));
+    }
     if !packet.constraints.is_empty() {
         prompt.push(format!("Constraints: {}", packet.constraints.join("; ")));
     }
@@ -579,6 +621,14 @@ mod tests {
         ) -> crate::RuntimeToolExecutionOutcome {
             panic!("the capability advertisement test must not execute a tool")
         }
+
+        fn delegated_tool_effect_descriptor(
+            &self,
+            tool_name: &str,
+            _input: &serde_json::Value,
+        ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
+            test_tool_descriptor(tool_name)
+        }
     }
 
     struct EchoRuntimeExecutionHost;
@@ -588,6 +638,17 @@ mod tests {
             &self,
             request: &crate::RuntimeToolExecutionRequest,
         ) -> crate::RuntimeToolExecutionOutcome {
+            if request.authorization.is_none() {
+                return crate::RuntimeToolExecutionOutcome {
+                    tool_use_id: request.tool_use_id.clone(),
+                    tool_name: request.tool_name.clone(),
+                    status: crate::RuntimeToolExecutionStatus::BlockedPermission,
+                    category: request.category,
+                    output: None,
+                    error: Some("missing propagated authorization".to_string()),
+                    evidence_ref: format!("agent-tool:{}", request.tool_use_id),
+                };
+            }
             crate::RuntimeToolExecutionOutcome {
                 tool_use_id: request.tool_use_id.clone(),
                 tool_name: request.tool_name.clone(),
@@ -598,6 +659,41 @@ mod tests {
                 evidence_ref: format!("agent-tool:{}", request.tool_use_id),
             }
         }
+
+        fn delegated_tool_effect_descriptor(
+            &self,
+            tool_name: &str,
+            _input: &serde_json::Value,
+        ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
+            test_tool_descriptor(tool_name)
+        }
+    }
+
+    fn test_tool_descriptor(
+        tool_name: &str,
+    ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
+        use harness_contract::policy::{PermissionOperation, PermissionResource, PermissionScope};
+        use harness_contract::tool::{
+            ToolApprovalClass, ToolEffectDescriptor, ToolEffectKind, ToolIdempotency,
+            ToolPermissionMode,
+        };
+
+        matches!(tool_name, "read_file" | "grep_search").then(|| ToolEffectDescriptor {
+            tool_id: tool_name.to_string(),
+            descriptor_hash: format!("test-host:{tool_name}"),
+            effect_kind: ToolEffectKind::Read,
+            idempotency: ToolIdempotency::Idempotent,
+            scopes: vec![PermissionScope::new(
+                PermissionResource::File,
+                PermissionOperation::Read,
+            )],
+            required_permission: ToolPermissionMode::ReadOnly,
+            approval_class: ToolApprovalClass::None,
+            uses_network: false,
+            spawns_process: false,
+            mutates_packages: false,
+            mutates_system: false,
+        })
     }
 
     #[test]
@@ -605,6 +701,10 @@ mod tests {
         let tools = BTreeSet::from(["write_file".to_string()]);
         let policy = permission_policy("unknown-lease", &tools);
         assert_eq!(policy.active_mode(), PermissionMode::ReadOnly);
+        assert_eq!(
+            policy.required_mode_for("write_file"),
+            PermissionMode::WorkspaceWrite
+        );
     }
 
     #[test]
@@ -612,6 +712,10 @@ mod tests {
         let tools = BTreeSet::from(["write_file".to_string()]);
         let policy = permission_policy("workspace-write", &tools);
         assert_eq!(policy.active_mode(), PermissionMode::WorkspaceWrite);
+        assert_eq!(
+            policy.required_mode_for("write_file"),
+            PermissionMode::WorkspaceWrite
+        );
     }
 
     #[test]
@@ -623,6 +727,8 @@ mod tests {
             model_lease: "model".to_string(),
             execution_id: "graph".to_string(),
             node_id: "node".to_string(),
+            evaluation_isolated: false,
+            managed_invocation: None,
         };
 
         assert!(executor.has_registered_tools());
@@ -650,7 +756,7 @@ mod tests {
     }
 
     #[test]
-    fn scoped_executor_requires_runtime_authorization_for_normal_agent_tools() {
+    fn scoped_executor_propagates_runtime_authorization_for_normal_agent_tools() {
         let executor = ScopedRuntimeToolExecutor {
             host: Arc::new(EchoRuntimeExecutionHost),
             allowed_tools: BTreeSet::from(["read_file".to_string()]),
@@ -658,6 +764,8 @@ mod tests {
             model_lease: "model".to_string(),
             execution_id: "graph".to_string(),
             node_id: "node".to_string(),
+            evaluation_isolated: false,
+            managed_invocation: None,
         };
         let descriptor = executor
             .describe_tool_effect("read_file", &serde_json::json!({"path": "README.md"}))
@@ -672,6 +780,9 @@ mod tests {
                 .expect("authorized tool should execute"),
             "authorized:read_file"
         );
+        assert!(executor
+            .execute("read_file", r#"{"path":"README.md"}"#)
+            .is_err());
         assert!(executor
             .execute_authorized(&authorization, "write_file", r#"{"path":"README.md"}"#)
             .is_err());
@@ -709,6 +820,8 @@ mod tests {
             budget_lease: harness_contract::context::ContextBudgetLeaseRef::new(
                 "budget", "agent", "agent", 0, 1,
             ),
+            binding: None,
+            managed_invocation: None,
             idempotency_key: "key".into(),
         };
         let tool_access = harness_contract::context::EvidenceAccessRef::durable(
@@ -812,6 +925,8 @@ mod tests {
             budget_lease: harness_contract::context::ContextBudgetLeaseRef::new(
                 "budget", "agent", "agent", 0, 1,
             ),
+            binding: None,
+            managed_invocation: None,
             idempotency_key: "key".into(),
         };
         let prompt = system_prompt(&packet, std::path::Path::new("/workspace"), &[]).join("\n");

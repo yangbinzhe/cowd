@@ -852,7 +852,10 @@ fn memory_scope_key(scope: &MemoryScope) -> String {
         MemoryScope::Project(value) => format!("project:{value}"),
         MemoryScope::Session(value) => format!("session:{value}"),
         MemoryScope::Task(value) => format!("task:{value}"),
-        MemoryScope::Agent(value) => format!("agent:{value}"),
+        MemoryScope::AgentDefinitionLineage(value) => format!("agent_definition:{value}"),
+        MemoryScope::AgentInstance(value) => format!("agent_instance:{value}"),
+        MemoryScope::TeamRun(value) => format!("team_run:{value}"),
+        MemoryScope::LegacyUnresolvedAgent(value) => format!("legacy_agent:{value}"),
     }
 }
 

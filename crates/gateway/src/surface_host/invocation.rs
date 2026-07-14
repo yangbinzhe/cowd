@@ -1,9 +1,10 @@
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use sandbox_launcher::{program_command, SandboxLaunchSpec};
 use surface::{
     message::MessageActionKind, normalize_surface_id, SurfaceActionRequest, SurfaceDescriptor,
     SurfaceError, SurfaceFailureKind, SurfaceFrame, SurfaceLifecycle, SurfaceOperationResult,
@@ -404,8 +405,21 @@ fn invoke_sidecar(
         }
     }
 
-    let mut child = Command::new(&command_path)
-        .current_dir(working_dir.as_deref().unwrap_or_else(|| Path::new(".")))
+    let workspace_root = working_dir
+        .as_deref()
+        .ok_or_else(|| SurfaceError::Invocation {
+            surface: surface_id.clone(),
+            reason: "one-shot sidecar manifest has no parent directory".to_string(),
+        })?;
+    let mut sandbox = SandboxLaunchSpec::workspace(workspace_root);
+    sandbox.working_directory = Some(workspace_root.to_path_buf());
+    let prepared =
+        program_command(&command_path, &sandbox).map_err(|error| SurfaceError::Invocation {
+            surface: surface_id.clone(),
+            reason: format!("sidecar sandbox unavailable: {error}"),
+        })?;
+    let mut child = prepared
+        .into_command()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -61,7 +61,7 @@ impl ConnectorService {
         } else {
             "blocked"
         };
-        let (_, receipt) = cross_plane.record_action_execution(CrossPlaneExecutionRecord {
+        let record = CrossPlaneExecutionRecord {
             idempotency_key,
             mode: mode.to_string(),
             status: match status {
@@ -84,7 +84,12 @@ impl ConnectorService {
             audit_result: audit_result.to_string(),
             audit_summary,
             execution_graph_id,
-        })?;
+        };
+        let (_, receipt) = if mode == "commit" && status == "executed" {
+            cross_plane.record_completed_effect_execution(record)?
+        } else {
+            cross_plane.record_action_execution(record)?
+        };
         Ok(receipt)
     }
 

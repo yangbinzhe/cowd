@@ -1,19 +1,19 @@
-//! L4 – Shared / team knowledge backbone for multi-agent collaboration.
+//! L4 – governed durable Team knowledge.
 //!
 //! # Role in Multi-Agent Architecture
 //!
-//! L4 serves as the **cross-agent knowledge bus** in Cowd's multi-agent
-//! architecture. Unlike L0-L3 which are session/agent-scoped, L4 entries are
-//! visible to all agents within a team or organisation.
+//! L4 is not a live cross-agent message bus.  ExecutionGraph and
+//! TeamWorkingState carry current-run collaboration; L4 contains only
+//! evidence-backed, promoted long-term knowledge from completed governance.
 //!
 //! ## Key Use Cases
 //!
 //! - **Team conventions**: coding standards, review checklists, naming conventions
 //! - **Shared decisions**: architectural decisions, API contracts, design tradeoffs
-//! - **Task handoff**: agent-to-agent context transfer via persistent shared entries
+//! - **Handoffs/checkpoints**: governed durable context for later runs
 //! - **Runbooks**: operational knowledge, on-call procedures, troubleshooting guides
-//! - **Agent orchestration**: Worker assignments, task progress tracking, completion
-//!   signals visible to the orchestrator and peer agents
+//! - Never task progress, raw tool output, worker assignment, or live peer
+//!   messages; those belong to Runtime projections.
 //!
 //! ## Scope Isolation
 //!
@@ -35,92 +35,17 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use std::sync::Arc;
-use tokio::sync::broadcast;
-use uuid::Uuid;
 
 use crate::{
     config::DriftConfig,
     layers::{LayerManager, Result},
     store::MemoryStore,
-    types::{
-        MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, PreparedContext,
-        Priority, TokenBudget,
-    },
+    types::{MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, PreparedContext, TokenBudget},
     MemoryScope,
 };
 
 /// Default maximum token budget for the shared layer.
 const DEFAULT_MAX_TOKENS: u64 = 2000;
-
-// ---------------------------------------------------------------------------
-// L4 Event Bus – push notifications for cross-agent awareness
-// ---------------------------------------------------------------------------
-
-/// An event emitted when an agent modifies L4 shared memory.
-///
-/// Other agents can subscribe to receive real-time notifications so they
-/// become immediately aware of new shared entries without waiting for the
-/// next `prepare_context` pull cycle.
-#[derive(Debug, Clone)]
-pub struct L4Event {
-    /// Which agent performed the operation.
-    pub agent_id: String,
-    /// UUID string of the affected memory entry.
-    pub memory_id: String,
-    /// What kind of operation was performed.
-    pub operation: L4Operation,
-    /// Title of the memory entry.
-    pub title: String,
-    /// Unix timestamp in milliseconds when the event occurred.
-    pub timestamp_ms: u64,
-}
-
-/// Type of L4 modification that triggered an event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum L4Operation {
-    /// A new entry was created.
-    Insert,
-    /// An existing entry was modified.
-    Update,
-    /// An entry was removed.
-    Delete,
-}
-
-/// Lightweight publish-subscribe bus for L4 memory events.
-///
-/// Built on `tokio::sync::broadcast`, it allows any number of subscribers
-/// to receive push notifications whenever an agent writes to L4.
-pub struct L4EventBus {
-    tx: broadcast::Sender<L4Event>,
-}
-
-impl L4EventBus {
-    /// Create a new bus with the given channel capacity.
-    ///
-    /// `capacity` is the maximum number of buffered events before slow
-    /// receivers start lagging (lagged receivers are closed).
-    pub fn new(capacity: usize) -> Self {
-        let (tx, _) = broadcast::channel(capacity);
-        Self { tx }
-    }
-
-    /// Subscribe to receive all future L4 events.
-    ///
-    /// Returns a [`broadcast::Receiver`] that can be used to drain
-    /// pending events via [`broadcast::Receiver::try_recv`].
-    pub fn subscribe(&self) -> broadcast::Receiver<L4Event> {
-        self.tx.subscribe()
-    }
-
-    /// Publish an L4 event to all active subscribers.
-    ///
-    /// If no subscribers are listening the event is silently dropped.
-    /// Slow receivers that have lagged beyond the channel capacity are
-    /// closed automatically by the underlying broadcast channel.
-    pub fn publish(&self, event: L4Event) {
-        let _ = self.tx.send(event);
-    }
-}
 
 // ---------------------------------------------------------------------------
 // SharedLayer
@@ -134,8 +59,6 @@ pub struct SharedLayer {
     /// Scope key used to tag all entries written by this layer.
     shared_scope: Option<MemoryScope>,
     drift: DriftConfig,
-    /// Optional event bus for push-notifying other agents of L4 writes.
-    pub event_bus: Option<Arc<L4EventBus>>,
 }
 
 impl SharedLayer {
@@ -148,7 +71,6 @@ impl SharedLayer {
             max_tokens: DEFAULT_MAX_TOKENS,
             shared_scope: None,
             drift: DriftConfig::default(),
-            event_bus: None,
         }
     }
 
@@ -160,7 +82,6 @@ impl SharedLayer {
             max_tokens: DEFAULT_MAX_TOKENS,
             shared_scope: None,
             drift: DriftConfig::default(),
-            event_bus: None,
         }
     }
 
@@ -178,7 +99,6 @@ impl SharedLayer {
             max_tokens,
             shared_scope,
             drift,
-            event_bus: None,
         }
     }
 
@@ -195,56 +115,6 @@ impl SharedLayer {
         }
         let entries = self.store.search_by_layer(MemoryLayer::L4).await?;
         Ok(truncate_to_budget(entries, self.max_tokens))
-    }
-
-    /// Add a shared memory entry.
-    pub async fn add(
-        &self,
-        category: MemoryCategory,
-        title: &str,
-        content: &str,
-        priority: Priority,
-        source: MemorySource,
-        tags: Vec<String>,
-    ) -> Result<MemoryId> {
-        if !self.enabled {
-            return Ok(Uuid::nil());
-        }
-        let now = Utc::now();
-        let entry = MemoryEntry {
-            id: Uuid::new_v4(),
-            layer: MemoryLayer::L4,
-            category,
-            priority,
-            source,
-            title: title.to_string(),
-            content: content.to_string(),
-            embedding: None,
-            tags,
-            relations: vec![],
-            confidence: 1.0,
-            access_count: 0,
-            staleness: 0.0,
-            created_at: now,
-            updated_at: now,
-            last_accessed_at: None,
-            scope: self.shared_scope.clone().unwrap_or_default(),
-            session_id: None,
-            source_agent: None,
-            visibility: crate::types::AgentVisibility::default(),
-        };
-        let id = self.store.insert(&entry).await?;
-        // Publish push notification so other agents become immediately aware.
-        if let Some(ref bus) = self.event_bus {
-            bus.publish(L4Event {
-                agent_id: String::new(),
-                memory_id: id.to_string(),
-                operation: L4Operation::Insert,
-                title: title.to_string(),
-                timestamp_ms: now.timestamp_millis() as u64,
-            });
-        }
-        Ok(id)
     }
 
     /// Recall shared entries relevant to a query via FTS.
@@ -296,106 +166,6 @@ impl SharedLayer {
         Ok(filtered)
     }
 
-    /// Recall peer agent entries from L4 for cross-agent perception.
-    ///
-    /// Filters for entries with visibility==Shared from other agents,
-    /// within a 5-minute time window. Caps at `max_per_peer` entries
-    /// per agent and `max_peers` total peer agents.
-    pub async fn recall_peers(
-        &self,
-        query: &str,
-        current_agent: &str,
-        max_per_peer: usize,
-        max_peers: usize,
-    ) -> Result<Vec<MemoryEntry>> {
-        if !self.enabled {
-            return Ok(Vec::new());
-        }
-        let cutoff = Utc::now() - chrono::Duration::minutes(5);
-        let results = self
-            .store
-            .search_fts(query, max_peers * max_per_peer * 2)
-            .await?;
-        let peer_entries: Vec<MemoryEntry> = results
-            .into_iter()
-            .filter(|e| {
-                e.layer == MemoryLayer::L4
-                    && e.visibility == crate::types::AgentVisibility::Shared
-                    && e.source_agent.as_deref() != Some(current_agent)
-                    && e.created_at >= cutoff
-            })
-            .collect();
-
-        // Group by source_agent, cap per peer, then cap total peers.
-        let mut seen_peers: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        let mut capped = Vec::new();
-        for entry in peer_entries {
-            let agent_key = entry.source_agent.clone().unwrap_or_default();
-            let count = seen_peers.get(&agent_key).copied().unwrap_or(0);
-            if count >= max_per_peer {
-                continue;
-            }
-            if seen_peers.len() >= max_peers && !seen_peers.contains_key(&agent_key) {
-                continue;
-            }
-            seen_peers.insert(agent_key, count + 1);
-            capped.push(entry);
-        }
-        Ok(capped)
-    }
-
-    /// Recall peer agent entries from L4 for intra-turn real-time perception.
-    ///
-    /// Unlike [`recall_peers`], this does NOT apply a 5-minute time cutoff.
-    /// Instead it filters by `session_id` so entries written by Agent A in the
-    /// current turn are visible to Agent B in the same turn's prepare_context.
-    /// Caps at `max_per_peer` entries per agent and `max_peers` total peers.
-    pub async fn recall_peers_realtime(
-        &self,
-        query: &str,
-        current_agent: &str,
-        current_session_id: &str,
-        max_per_peer: usize,
-        max_peers: usize,
-    ) -> Result<Vec<MemoryEntry>> {
-        if !self.enabled {
-            return Ok(Vec::new());
-        }
-        let results = self
-            .store
-            .search_fts(query, max_peers * max_per_peer * 2)
-            .await?;
-        let peer_entries: Vec<MemoryEntry> = results
-            .into_iter()
-            .filter(|e| {
-                e.layer == MemoryLayer::L4
-                    && e.visibility == crate::types::AgentVisibility::Shared
-                    && e.source_agent.as_deref() != Some(current_agent)
-                    // Match entries from the same session (intra-turn)
-                    && e.session_id.as_deref() == Some(current_session_id)
-            })
-            .collect();
-
-        // Group by source_agent, cap per peer, then cap total peers.
-        let mut seen_peers: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        let mut capped = Vec::new();
-        for entry in peer_entries {
-            let agent_key = entry.source_agent.clone().unwrap_or_default();
-            let count = seen_peers.get(&agent_key).copied().unwrap_or(0);
-            if count >= max_per_peer {
-                continue;
-            }
-            if seen_peers.len() >= max_peers && !seen_peers.contains_key(&agent_key) {
-                continue;
-            }
-            seen_peers.insert(agent_key, count + 1);
-            capped.push(entry);
-        }
-        Ok(capped)
-    }
-
     /// Sync: re-read L4 entries from the store and update staleness.
     ///
     /// In a real multi-agent system this would pull from a remote shared store.
@@ -442,6 +212,23 @@ impl SharedLayer {
         sorted.sort_by(|a, b| b.1.cmp(&a.1));
         sorted.into_iter().map(|(tag, _)| tag).collect()
     }
+
+    /// Internal writer used only by `MemoryOrchestrator::promote_l4` after
+    /// Runtime has validated a typed promotion command.  This is deliberately
+    /// not exposed through the public `LayerManager::insert` contract.
+    pub(crate) async fn insert_promoted(&self, mut entry: MemoryEntry) -> Result<MemoryId> {
+        if !self.enabled {
+            return Err(crate::MemoryError::WriteDenied {
+                layer: "L4".to_string(),
+                write_source: "disabled_l4_promotion_target".to_string(),
+            });
+        }
+        entry.layer = MemoryLayer::L4;
+        if let Some(ref scope) = self.shared_scope {
+            entry.scope = scope.clone();
+        }
+        self.store.insert(&entry).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -454,26 +241,11 @@ impl LayerManager for SharedLayer {
         MemoryLayer::L4
     }
 
-    async fn insert(&self, mut entry: MemoryEntry) -> Result<MemoryId> {
-        if !self.enabled {
-            return Ok(Uuid::nil());
-        }
-        entry.layer = MemoryLayer::L4;
-        if let Some(ref s) = self.shared_scope {
-            entry.scope = s.clone();
-        }
-        let id = self.store.insert(&entry).await?;
-        // Publish push notification so other agents become immediately aware.
-        if let Some(ref bus) = self.event_bus {
-            bus.publish(L4Event {
-                agent_id: entry.source_agent.clone().unwrap_or_default(),
-                memory_id: id.to_string(),
-                operation: L4Operation::Insert,
-                title: entry.title.clone(),
-                timestamp_ms: Utc::now().timestamp_millis() as u64,
-            });
-        }
-        Ok(id)
+    async fn insert(&self, _entry: MemoryEntry) -> Result<MemoryId> {
+        Err(crate::MemoryError::WriteDenied {
+            layer: "L4".to_string(),
+            write_source: "layer_manager_insert_requires_runtime_l4_promotion_service".to_string(),
+        })
     }
 
     async fn remove(&self, id: &MemoryId) -> Result<()> {
@@ -678,10 +450,36 @@ mod tests {
     use super::*;
     use crate::config::DriftConfig;
     use crate::store::sqlite::SqliteStore;
+    use crate::types::{MemorySource, Priority};
 
     fn in_memory() -> Arc<dyn MemoryStore> {
         let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
         Arc::new(SqliteStore::open_path(&tmp.path().join("test.db")).unwrap())
+    }
+
+    fn shared_entry(staleness: f32) -> MemoryEntry {
+        MemoryEntry {
+            id: uuid::Uuid::new_v4(),
+            layer: MemoryLayer::L4,
+            category: MemoryCategory::Shared,
+            priority: Priority::Normal,
+            source: MemorySource::AutoExtracted,
+            title: "T".to_string(),
+            content: "C".to_string(),
+            embedding: None,
+            tags: Vec::new(),
+            relations: Vec::new(),
+            confidence: 1.0,
+            access_count: 0,
+            staleness,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_accessed_at: None,
+            scope: MemoryScope::default(),
+            session_id: None,
+            source_agent: None,
+            visibility: crate::types::AgentVisibility::Shared,
+        }
     }
 
     #[test]
@@ -697,46 +495,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_returns_nil_when_disabled() {
-        let layer = SharedLayer::disabled();
-        let id = layer
-            .add(
-                MemoryCategory::Shared,
-                "T",
-                "C",
-                Priority::Normal,
-                MemorySource::AutoExtracted,
-                vec![],
-            )
-            .await
-            .unwrap();
-        assert_eq!(id, uuid::Uuid::nil());
-    }
-
-    #[tokio::test]
-    async fn add_creates_entry_when_enabled() {
-        let layer = SharedLayer::new(in_memory());
-        let id = layer
-            .add(
-                MemoryCategory::Shared,
-                "Team decision",
-                "Use Rust",
-                Priority::High,
-                MemorySource::Import,
-                vec!["lang".into()],
-            )
-            .await
-            .unwrap();
-        assert_ne!(id, uuid::Uuid::nil());
-
-        let entries = layer.load().await.unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].id, id);
-        assert_eq!(entries[0].layer, MemoryLayer::L4);
-        assert_eq!(entries[0].tags, vec!["lang"]);
-    }
-
-    #[tokio::test]
     async fn load_returns_empty_when_disabled() {
         let layer = SharedLayer::disabled();
         assert!(layer.load().await.unwrap().is_empty());
@@ -749,7 +507,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn insert_noops_when_disabled() {
+    async fn ordinary_insert_is_rejected_even_when_disabled() {
         let layer = SharedLayer::disabled();
         let entry = MemoryEntry {
             id: uuid::Uuid::new_v4(),
@@ -773,12 +531,14 @@ mod tests {
             source_agent: None,
             visibility: crate::types::AgentVisibility::default(),
         };
-        let id = layer.insert(entry).await.unwrap();
-        assert_eq!(id, uuid::Uuid::nil());
+        assert!(matches!(
+            layer.insert(entry).await,
+            Err(crate::MemoryError::WriteDenied { .. })
+        ));
     }
 
     #[tokio::test]
-    async fn insert_overrides_layer_to_l4_when_enabled() {
+    async fn governed_insert_overrides_layer_to_l4_when_enabled() {
         let layer = SharedLayer::new(in_memory());
         let entry = MemoryEntry {
             id: uuid::Uuid::new_v4(),
@@ -802,8 +562,7 @@ mod tests {
             source_agent: None,
             visibility: crate::types::AgentVisibility::default(),
         };
-        let id = layer.insert(entry).await.unwrap();
-        assert_ne!(id, uuid::Uuid::nil());
+        let id = layer.insert_promoted(entry).await.unwrap();
         let entries = layer.load().await.unwrap();
         let got = entries.iter().find(|e| e.id == id).unwrap();
         assert_eq!(got.layer, MemoryLayer::L4);
@@ -845,17 +604,7 @@ mod tests {
     #[tokio::test]
     async fn sync_reduces_staleness() {
         let layer = SharedLayer::new(in_memory());
-        let id = layer
-            .add(
-                MemoryCategory::Shared,
-                "T",
-                "C",
-                Priority::Normal,
-                MemorySource::AutoExtracted,
-                vec![],
-            )
-            .await
-            .unwrap();
+        let id = layer.insert_promoted(shared_entry(0.0)).await.unwrap();
 
         layer.sync().await.unwrap();
         let entries = layer.load().await.unwrap();
@@ -871,17 +620,7 @@ mod tests {
             ..Default::default()
         };
         let layer = SharedLayer::with_config(in_memory(), true, None, 2000, drift);
-        layer
-            .add(
-                MemoryCategory::Shared,
-                "T",
-                "C",
-                Priority::Normal,
-                MemorySource::AutoExtracted,
-                vec![],
-            )
-            .await
-            .unwrap();
+        layer.insert_promoted(shared_entry(1.0)).await.unwrap();
         layer.tick().await.unwrap();
         assert!(layer.load().await.unwrap().is_empty());
     }

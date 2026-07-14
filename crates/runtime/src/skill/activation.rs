@@ -81,6 +81,7 @@ impl SkillActivationRecord {
     #[must_use]
     pub fn to_session_domain_event(&self, sequence: usize) -> SessionDomainEvent {
         let payload = serde_json::json!({
+            "source": "conversation_runtime.skill_activation",
             "turn_index": self.turn_index,
             "query": self.query,
             "selected": self.selected,

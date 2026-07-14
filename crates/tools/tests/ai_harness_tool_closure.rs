@@ -110,3 +110,46 @@ fn live_tool_batch_readonly_accepts_read_tools_and_rejects_write_tools() {
         .to_string()
         .contains("only accepts approved read-only tools"));
 }
+
+#[test]
+fn lease_blocks_external_and_control_plane_paths_for_workspace_file_tools() {
+    let unique = format!("cowd-tool-boundary-{}", std::process::id());
+    let root = std::env::temp_dir().join(&unique);
+    let outside = std::env::temp_dir().join(format!("{unique}-outside.txt"));
+    fs::create_dir_all(root.join(".cowd")).expect("workspace control plane");
+    fs::write(root.join("visible.txt"), "workspace evidence").expect("workspace file");
+    fs::write(root.join(".cowd").join("runtime.sqlite"), "control plane").expect("state");
+    fs::write(&outside, "outside").expect("outside file");
+
+    let host = ToolHost::builtin("boundary-test", &root);
+    let lease = host.pin_snapshot();
+    let denied = |name: &str, input: serde_json::Value| {
+        let authorization = authorize(&lease, name, &input);
+        let error = lease
+            .execute(&authorization, name, &input)
+            .expect_err("path should be denied");
+        assert!(
+            error.to_string().contains("workspace") || error.to_string().contains("control-plane"),
+            "unexpected error for {name}: {error}"
+        );
+    };
+
+    denied("read_file", json!({"path": "../outside.txt"}));
+    denied("write_file", json!({"path": outside, "content": "no"}));
+    denied(
+        "edit_file",
+        json!({"path": ".cowd/runtime.sqlite", "old_string": "control", "new_string": "no"}),
+    );
+    denied("glob_search", json!({"pattern": "*.txt", "path": ".cowd"}));
+    denied(
+        "grep_search",
+        json!({"pattern": "control", "path": ".cowd"}),
+    );
+    denied(
+        "workspace_snapshot",
+        json!({"roots": ["../"], "includeGit": false}),
+    );
+
+    let _ = fs::remove_file(outside);
+    let _ = fs::remove_dir_all(root);
+}

@@ -109,6 +109,26 @@ pub struct GatewayPanel {
     /// Latest evolution governance compact summary for terminal operators.
     pub evolution_status: Option<String>,
     pub evolution_summary: Option<String>,
+    /// Pending Runtime-owned release review ids from the latest projection.
+    /// These are only operator selection handles: the review state remains in
+    /// Runtime and every decision goes through Gateway's typed endpoint.
+    pending_release_review_ids: Vec<String>,
+    selected_release_review_index: usize,
+    /// Runtime-owned policy floor and pending policy-review summary.
+    pub evaluation_policy_status: Option<String>,
+    pub evaluation_policy_summary: Option<String>,
+    /// Pending Runtime-owned evaluation-policy review ids. Like release
+    /// reviews, these are not a local approval cache.
+    pending_policy_review_ids: Vec<String>,
+    selected_policy_review_index: usize,
+    /// Runtime-owned Managed Agent dispatcher projection. The TUI only
+    /// renders these facts and sends explicit Gateway commands.
+    pub managed_agent_status: Option<String>,
+    pub managed_agent_summary: Option<String>,
+    /// Recoverable Managed Agent ids from the latest Runtime projection.
+    /// A health reset is deliberately possible only for this explicit target.
+    managed_agent_health_action_ids: Vec<String>,
+    selected_managed_agent_health_index: usize,
     /// Scroll offset for content overflow.
     pub scroll_offset: usize,
 }
@@ -159,6 +179,16 @@ impl GatewayPanel {
             harness_eval_summary: None,
             evolution_status: None,
             evolution_summary: None,
+            pending_release_review_ids: Vec::new(),
+            selected_release_review_index: 0,
+            evaluation_policy_status: None,
+            evaluation_policy_summary: None,
+            pending_policy_review_ids: Vec::new(),
+            selected_policy_review_index: 0,
+            managed_agent_status: None,
+            managed_agent_summary: None,
+            managed_agent_health_action_ids: Vec::new(),
+            selected_managed_agent_health_index: 0,
             scroll_offset: 0,
         }
     }
@@ -268,6 +298,129 @@ impl GatewayPanel {
         }
     }
 
+    /// Return the selected pending typed release review. The returned id is a
+    /// projection handle only; callers must still use Gateway's typed review
+    /// decision endpoint, which validates the authenticated human lease.
+    pub fn selected_release_review_id(&self) -> Option<String> {
+        selected_id(
+            &self.pending_release_review_ids,
+            self.selected_release_review_index,
+        )
+    }
+
+    /// Return the selected pending evaluation-policy review handle.
+    pub fn selected_policy_review_id(&self) -> Option<String> {
+        selected_id(
+            &self.pending_policy_review_ids,
+            self.selected_policy_review_index,
+        )
+    }
+
+    /// Return the selected Runtime-managed Agent that currently needs a
+    /// health recovery action.
+    pub fn selected_managed_agent_health_id(&self) -> Option<String> {
+        selected_id(
+            &self.managed_agent_health_action_ids,
+            self.selected_managed_agent_health_index,
+        )
+    }
+
+    pub fn select_next_release_review(&mut self) {
+        self.select_release_review(true);
+    }
+
+    pub fn select_previous_release_review(&mut self) {
+        self.select_release_review(false);
+    }
+
+    pub fn select_next_policy_review(&mut self) {
+        self.select_policy_review(true);
+    }
+
+    pub fn select_previous_policy_review(&mut self) {
+        self.select_policy_review(false);
+    }
+
+    pub fn select_next_managed_agent_health(&mut self) {
+        self.select_managed_agent_health(true);
+    }
+
+    pub fn select_previous_managed_agent_health(&mut self) {
+        self.select_managed_agent_health(false);
+    }
+
+    /// Keep a human decision receipt distinct from the latest read
+    /// projection. This never mutates local review status or bypasses
+    /// Runtime's approval aggregate.
+    pub fn record_release_review_decision(
+        &mut self,
+        review_id: &str,
+        decision: &str,
+        result: Result<serde_json::Value, String>,
+    ) {
+        self.record_action_result(
+            &format!("evolution.release_review.{decision}:{review_id}"),
+            result,
+        );
+    }
+
+    /// Record a protected policy-floor decision receipt. Gateway validates
+    /// the human capability and one-time lease before Runtime changes policy.
+    pub fn record_policy_review_decision(
+        &mut self,
+        review_id: &str,
+        decision: &str,
+        result: Result<serde_json::Value, String>,
+    ) {
+        self.record_action_result(
+            &format!("evolution.evaluation_policy.{decision}:{review_id}"),
+            result,
+        );
+    }
+
+    fn select_release_review(&mut self, forward: bool) {
+        if let Some(review_id) = cycle_selection(
+            &self.pending_release_review_ids,
+            &mut self.selected_release_review_index,
+            forward,
+        ) {
+            self.action_status = Some(format!("selected release review {review_id}"));
+            self.action_receipt = None;
+        } else {
+            self.action_status = Some("no pending release review is loaded; press v".to_string());
+            self.action_receipt = None;
+        }
+    }
+
+    fn select_policy_review(&mut self, forward: bool) {
+        if let Some(review_id) = cycle_selection(
+            &self.pending_policy_review_ids,
+            &mut self.selected_policy_review_index,
+            forward,
+        ) {
+            self.action_status = Some(format!("selected policy review {review_id}"));
+            self.action_receipt = None;
+        } else {
+            self.action_status = Some("no pending policy review is loaded; press p".to_string());
+            self.action_receipt = None;
+        }
+    }
+
+    fn select_managed_agent_health(&mut self, forward: bool) {
+        if let Some(managed_agent_id) = cycle_selection(
+            &self.managed_agent_health_action_ids,
+            &mut self.selected_managed_agent_health_index,
+            forward,
+        ) {
+            self.action_status = Some(format!("selected managed Agent health {managed_agent_id}"));
+            self.action_receipt = None;
+        } else {
+            self.action_status =
+                Some("no degraded Managed Agent is loaded; press m to refresh".to_string());
+            self.action_receipt = None;
+        }
+    }
+
     pub fn record_harness_eval_latest(&mut self, result: Result<serde_json::Value, String>) {
         match result {
             Ok(payload) => {
@@ -331,26 +484,41 @@ impl GatewayPanel {
                     .unwrap_or_default();
                 let candidates = payload
                     .get("candidates")
-                    .and_then(|value| value.get("count"))
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or_default();
-                let evals = payload
-                    .get("sandbox_evals")
-                    .and_then(|value| value.get("count"))
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or_default();
-                let active = payload
+                    .and_then(|value| value.get("candidates"))
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, Vec::len);
+                let reviews = payload
+                    .get("reviews")
+                    .and_then(|value| value.get("reviews"))
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, Vec::len);
+                self.pending_release_review_ids = pending_review_ids(
+                    payload
+                        .get("reviews")
+                        .and_then(|value| value.get("reviews")),
+                );
+                clamp_selection(
+                    &mut self.selected_release_review_index,
+                    self.pending_release_review_ids.len(),
+                );
+                let active_capability_count = payload
                     .get("active_capabilities")
                     .and_then(|value| value.get("active_count"))
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or_default();
-                let installed = payload
+                let capability_count = payload
                     .get("active_capabilities")
                     .and_then(|value| value.get("count"))
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or_default();
                 self.evolution_status = Some(
-                    if signals + diagnoses + missions + proposals + candidates + evals + active > 0
+                    if signals
+                        + diagnoses
+                        + missions
+                        + proposals
+                        + candidates as u64
+                        + reviews as u64
+                        > 0
                     {
                         "active".to_string()
                     } else {
@@ -358,15 +526,152 @@ impl GatewayPanel {
                     },
                 );
                 self.evolution_summary = Some(format!(
-                    "signals={signals} diagnoses={diagnoses} missions={missions} proposals={proposals} candidates={candidates} sandbox={evals} active={active}/{installed}"
+                    "signals={signals} diagnoses={diagnoses} missions={missions} proposals={proposals} candidates={candidates} release_reviews={reviews} pending_release={} active={active_capability_count}/{capability_count}",
+                    self.pending_release_review_ids.len(),
                 ));
                 self.action_status = Some("evolution.overview succeeded".to_string());
                 self.action_receipt = Some(gateway_receipt_summary(&payload));
             }
             Err(error) => {
+                self.pending_release_review_ids.clear();
+                self.selected_release_review_index = 0;
                 self.evolution_status = Some("unavailable".to_string());
                 self.evolution_summary = Some(error.clone());
                 self.action_status = Some(format!("evolution.overview failed: {error}"));
+                self.action_receipt = None;
+            }
+        }
+    }
+
+    pub fn record_evaluation_policy_overview(&mut self, result: Result<serde_json::Value, String>) {
+        match result {
+            Ok(payload) => {
+                let policy = payload.get("policy").unwrap_or(&serde_json::Value::Null);
+                let policy_id = policy
+                    .get("policy_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unavailable");
+                let revision = policy
+                    .get("revision")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default();
+                let pending = payload
+                    .get("reviews")
+                    .and_then(|value| value.get("reviews"))
+                    .and_then(serde_json::Value::as_array)
+                    .map(|reviews| {
+                        reviews
+                            .iter()
+                            .filter(|review| {
+                                review.get("status").and_then(serde_json::Value::as_str)
+                                    == Some("pending")
+                            })
+                            .count()
+                    })
+                    .unwrap_or_default();
+                self.pending_policy_review_ids = pending_review_ids(
+                    payload
+                        .get("reviews")
+                        .and_then(|value| value.get("reviews")),
+                );
+                clamp_selection(
+                    &mut self.selected_policy_review_index,
+                    self.pending_policy_review_ids.len(),
+                );
+                self.evaluation_policy_status = Some(if pending > 0 {
+                    "review_required".to_string()
+                } else {
+                    "active".to_string()
+                });
+                self.evaluation_policy_summary =
+                    Some(format!("{policy_id}@{revision} pending_reviews={pending}"));
+                self.action_status = Some("evolution.evaluation_policy succeeded".to_string());
+                self.action_receipt = Some(gateway_receipt_summary(&payload));
+            }
+            Err(error) => {
+                self.pending_policy_review_ids.clear();
+                self.selected_policy_review_index = 0;
+                self.evaluation_policy_status = Some("unavailable".to_string());
+                self.evaluation_policy_summary = Some(error.clone());
+                self.action_status = Some(format!("evolution.evaluation_policy failed: {error}"));
+                self.action_receipt = None;
+            }
+        }
+    }
+
+    pub fn record_managed_agent_overview(&mut self, result: Result<serde_json::Value, String>) {
+        match result {
+            Ok(payload) => {
+                let definitions = payload
+                    .get("definitions")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, Vec::len);
+                let invocations = payload
+                    .get("invocations")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, Vec::len);
+                let health = payload
+                    .get("health")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let reconciliation = health
+                    .iter()
+                    .filter(|entry| {
+                        entry.get("status").and_then(serde_json::Value::as_str)
+                            == Some("reconciliation_required")
+                    })
+                    .count();
+                let degraded = health
+                    .iter()
+                    .filter(|entry| {
+                        matches!(
+                            entry.get("status").and_then(serde_json::Value::as_str),
+                            Some("degraded" | "circuit_open")
+                        )
+                    })
+                    .count();
+                self.managed_agent_health_action_ids = health
+                    .iter()
+                    .filter(|entry| {
+                        matches!(
+                            entry.get("status").and_then(serde_json::Value::as_str),
+                            Some("degraded" | "circuit_open" | "reconciliation_required")
+                        )
+                    })
+                    .filter_map(|entry| {
+                        entry
+                            .get("managed_agent_id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(ToOwned::to_owned)
+                    })
+                    .collect();
+                clamp_selection(
+                    &mut self.selected_managed_agent_health_index,
+                    self.managed_agent_health_action_ids.len(),
+                );
+                self.managed_agent_status = Some(if reconciliation > 0 {
+                    "reconciliation_required".to_string()
+                } else if degraded > 0 {
+                    "degraded".to_string()
+                } else if definitions > 0 {
+                    "healthy".to_string()
+                } else {
+                    "empty".to_string()
+                });
+                self.managed_agent_summary = Some(format!(
+                    "definitions={definitions} invocations={invocations} degraded={degraded} reconciliation={reconciliation} recoverable={}",
+                    self.managed_agent_health_action_ids.len(),
+                ));
+                self.action_status = Some("runtime.managed_agents succeeded".to_string());
+                self.action_receipt = Some(gateway_receipt_summary(&payload));
+            }
+            Err(error) => {
+                self.managed_agent_health_action_ids.clear();
+                self.selected_managed_agent_health_index = 0;
+                self.managed_agent_status = Some("unavailable".to_string());
+                self.managed_agent_summary = Some(error.clone());
+                self.action_status = Some(format!("runtime.managed_agents failed: {error}"));
                 self.action_receipt = None;
             }
         }
@@ -437,7 +742,7 @@ impl Component for GatewayPanel {
             status,
         ]));
         lines.push(Line::from(Span::styled(
-            "Keys: r refresh  h health  s start/stop  e eval  E smoke  v evolution",
+            "Keys: r refresh  h health  s start/stop  e eval  E smoke  v evolution  p policy  m managed  D dispatch",
             Style::default().fg(Color::DarkGray),
         )));
         if let Some(status) = &self.action_status {
@@ -476,6 +781,61 @@ impl Component for GatewayPanel {
             lines.push(Line::from(vec![
                 Span::styled("Evolution: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(summary.clone(), Style::default().fg(color)),
+            ]));
+        }
+        if let Some(review_id) = self.selected_release_review_id() {
+            lines.push(Line::from(vec![
+                Span::styled("Release review: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(review_id, Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    "  [/] select · a approve · x reject",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+        if let Some(summary) = &self.evaluation_policy_summary {
+            let color = match self.evaluation_policy_status.as_deref() {
+                Some("active") => Color::Green,
+                Some("review_required") => Color::Yellow,
+                Some("unavailable") => Color::Red,
+                _ => Color::Cyan,
+            };
+            lines.push(Line::from(vec![
+                Span::styled("EvalPolicy: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(summary.clone(), Style::default().fg(color)),
+            ]));
+        }
+        if let Some(review_id) = self.selected_policy_review_id() {
+            lines.push(Line::from(vec![
+                Span::styled("Policy review: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(review_id, Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    "  {/} select · A approve · X reject",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+        if let Some(summary) = &self.managed_agent_summary {
+            let color = match self.managed_agent_status.as_deref() {
+                Some("healthy") => Color::Green,
+                Some("empty") => Color::DarkGray,
+                Some("degraded" | "reconciliation_required") => Color::Yellow,
+                Some("unavailable") => Color::Red,
+                _ => Color::Cyan,
+            };
+            lines.push(Line::from(vec![
+                Span::styled("ManagedAgents: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(summary.clone(), Style::default().fg(color)),
+            ]));
+        }
+        if let Some(managed_agent_id) = self.selected_managed_agent_health_id() {
+            lines.push(Line::from(vec![
+                Span::styled("Managed health: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(managed_agent_id, Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    "  n/N select · R reset · D dispatch",
+                    Style::default().fg(Color::DarkGray),
+                ),
             ]));
         }
         lines.push(Line::from(""));
@@ -1393,7 +1753,11 @@ impl Component for GatewayPanel {
         // ── Keyboard hint bar ──────────────────────────────────
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "Keys: j/k scroll  PgUp/PgDn page  e eval  E smoke  c consume  C cancel  y retry  t schedule tick",
+            "Views: e eval · E smoke · v release reviews · p policy reviews · m managed Agents",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(Span::styled(
+            "Actions: [/] release select · a/x release approve/reject · {/} policy select · A/X policy approve/reject · n/N health select · R reset · D dispatch · t schedule tick",
             Style::default().fg(Color::DarkGray),
         )));
 
@@ -1464,6 +1828,57 @@ impl Component for GatewayPanel {
     fn id(&self) -> &str {
         "gateway_panel"
     }
+}
+
+fn pending_review_ids(reviews: Option<&serde_json::Value>) -> Vec<String> {
+    let mut ids = Vec::new();
+    for review in reviews
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if review.get("status").and_then(serde_json::Value::as_str) != Some("pending") {
+            continue;
+        }
+        let Some(review_id) = review
+            .get("review_id")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+        else {
+            continue;
+        };
+        if !ids.contains(&review_id) {
+            ids.push(review_id);
+        }
+    }
+    ids
+}
+
+fn clamp_selection(index: &mut usize, len: usize) {
+    if len == 0 {
+        *index = 0;
+    } else {
+        *index = (*index).min(len - 1);
+    }
+}
+
+fn selected_id(ids: &[String], index: usize) -> Option<String> {
+    ids.get(index).cloned()
+}
+
+fn cycle_selection(ids: &[String], index: &mut usize, forward: bool) -> Option<String> {
+    if ids.is_empty() {
+        *index = 0;
+        return None;
+    }
+    *index = if forward {
+        (*index + 1) % ids.len()
+    } else if *index == 0 {
+        ids.len() - 1
+    } else {
+        *index - 1
+    };
+    selected_id(ids, *index)
 }
 
 fn compact_text(value: &str, max_chars: usize) -> String {
@@ -1663,6 +2078,101 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("active=1/2"));
+    }
+
+    #[test]
+    fn management_projection_selects_typed_reviews_and_recoverable_agents() {
+        let mut panel = GatewayPanel::new();
+        panel.record_evolution_overview(Ok(serde_json::json!({
+            "kind": "evolution.overview",
+            "signals": {"count": 0},
+            "diagnoses": {"count": 0},
+            "missions": {"count": 0},
+            "proposals": {"count": 0},
+            "candidates": {"candidates": []},
+            "reviews": {"reviews": [
+                {"review_id": "release-b", "status": "pending"},
+                {"review_id": "release-a", "status": "pending"},
+                {"review_id": "release-old", "status": "approved"}
+            ]},
+            "active_capabilities": {"count": 0, "active_count": 0}
+        })));
+        assert_eq!(
+            panel.selected_release_review_id().as_deref(),
+            Some("release-b")
+        );
+        panel.select_next_release_review();
+        assert_eq!(
+            panel.selected_release_review_id().as_deref(),
+            Some("release-a")
+        );
+
+        panel.record_evaluation_policy_overview(Ok(serde_json::json!({
+            "kind": "evolution.evaluation_policy.overview",
+            "policy": {"policy_id": "policy-default", "revision": 3},
+            "reviews": {"reviews": [
+                {"review_id": "policy-1", "status": "pending"},
+                {"review_id": "policy-old", "status": "denied"}
+            ]}
+        })));
+        assert_eq!(
+            panel.selected_policy_review_id().as_deref(),
+            Some("policy-1")
+        );
+
+        panel.record_managed_agent_overview(Ok(serde_json::json!({
+            "definitions": [
+                {"managed_agent_id": "agent-healthy"},
+                {"managed_agent_id": "agent-recover"}
+            ],
+            "invocations": [],
+            "health": [
+                {"managed_agent_id": "agent-healthy", "status": "healthy"},
+                {"managed_agent_id": "agent-recover", "status": "circuit_open"}
+            ]
+        })));
+        assert_eq!(
+            panel.selected_managed_agent_health_id().as_deref(),
+            Some("agent-recover")
+        );
+        assert!(panel
+            .managed_agent_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("recoverable=1"));
+    }
+
+    #[test]
+    fn typed_management_actions_keep_gateway_receipts_and_errors_visible() {
+        let mut panel = GatewayPanel::new();
+        panel.record_release_review_decision(
+            "release-1",
+            "approve",
+            Ok(serde_json::json!({
+                "kind": "evolution.release_decision",
+                "status": "approved"
+            })),
+        );
+        assert_eq!(
+            panel.action_status.as_deref(),
+            Some("evolution.release_review.approve:release-1 succeeded")
+        );
+        assert!(panel
+            .action_receipt
+            .as_deref()
+            .unwrap_or_default()
+            .contains("evolution.release_decision"));
+
+        panel.record_policy_review_decision(
+            "policy-1",
+            "reject",
+            Err("human capability required".to_string()),
+        );
+        assert_eq!(
+            panel.action_status.as_deref(),
+            Some("evolution.evaluation_policy.reject:policy-1 failed: human capability required")
+        );
+        assert!(panel.action_receipt.is_none());
     }
 
     #[test]

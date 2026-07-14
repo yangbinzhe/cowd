@@ -175,7 +175,7 @@ mod tests {
                     summary: "read local evidence".to_string(),
                     risk: TaskRisk::Low,
                     requested_tool: Some("read_file".to_string()),
-                    template_id: Some(CollaborationTemplateId::ExecuteReview),
+                    template_id: Some(CollaborationTemplateId::PlannerExecutorVerifier),
                     requires_write: false,
                     is_critical_operation: false,
                     evidence_refs: vec!["trace:low".to_string()],

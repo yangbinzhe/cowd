@@ -1,14 +1,15 @@
 use super::*;
 
 pub(in crate::api_routes) fn execution_graph_summary(events: &[RuntimeEvent]) -> Value {
-    let graph_events: Vec<&RuntimeEvent> = events
-        .iter()
-        .filter(|event| {
-            event.kind == "agent.execution_graph.reviewed"
-                || event.kind == "agent.execution_graph.planned"
-        })
-        .collect();
-    let Some(latest) = graph_events.last() else {
+    let mut graph_events = std::collections::BTreeMap::<String, &RuntimeEvent>::new();
+    let mut latest = None;
+    for event in events.iter().filter(|event| agent_graph(event).is_some()) {
+        let graph = agent_graph(event).expect("filtered agent graph");
+        let graph_id = graph_identity(graph, event);
+        graph_events.insert(graph_id, event);
+        latest = Some(event);
+    }
+    let Some(latest) = latest else {
         return empty_execution_graph_summary();
     };
 
@@ -36,17 +37,7 @@ pub(in crate::api_routes) fn execution_graph_summary(events: &[RuntimeEvent]) ->
         .and_then(Value::as_array)
         .map(Vec::len)
         .unwrap_or(0);
-    let graph_id = graph
-        .get("graph_id")
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
-        .or_else(|| {
-            latest
-                .refs
-                .iter()
-                .find(|reference| reference.ref_type == "execution_graph")
-                .map(|reference| reference.id.clone())
-        });
+    let graph_id = Some(graph_identity(graph, latest));
     let board_id = payload
         .get("board_id")
         .and_then(Value::as_str)
@@ -73,11 +64,15 @@ pub(in crate::api_routes) fn execution_graph_summary(events: &[RuntimeEvent]) ->
             "status": graph
                 .get("status")
                 .and_then(Value::as_str)
+                .or_else(|| graph_runtime_status(graph))
                 .or(latest.status.as_deref())
                 .unwrap_or("n/a"),
             "graph_id": graph_id,
             "board_id": board_id,
-            "completion_rate": scorecard.get("completion_rate").and_then(Value::as_f64),
+            "completion_rate": scorecard
+                .get("completion_rate")
+                .and_then(Value::as_f64)
+                .or_else(|| graph_completion_rate(graph)),
             "synthesis_lift": scorecard.get("synthesis_lift").and_then(Value::as_f64),
             "complementarity_score": scorecard
                 .get("complementarity_score")
@@ -90,6 +85,89 @@ pub(in crate::api_routes) fn execution_graph_summary(events: &[RuntimeEvent]) ->
             .get("conflict_count")
             .and_then(Value::as_u64)
             .unwrap_or(0),
+    })
+}
+
+fn agent_graph(event: &RuntimeEvent) -> Option<&Value> {
+    let supported = matches!(
+        event.kind.as_str(),
+        "agent.execution_graph.reviewed"
+            | "agent.execution_graph.planned"
+            | "execution_graph.planned"
+            | "execution_graph.node_transitioned"
+            | "execution_graph.node_transitioned_and_replanned"
+            | "execution_graph.command_applied"
+            | "execution_graph.replanned"
+            | "execution_graph.recovered"
+    );
+    let graph = supported.then(|| event.payload.get("graph")).flatten()?;
+    graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .is_some_and(|nodes| {
+            nodes.iter().any(|node| {
+                matches!(
+                    node.get("kind").and_then(Value::as_str),
+                    Some("AgentTask") | Some("agent_task")
+                )
+            })
+        })
+        .then_some(graph)
+}
+
+fn graph_identity(graph: &Value, event: &RuntimeEvent) -> String {
+    graph
+        .get("graph_id")
+        .or_else(|| graph.get("id"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| {
+            event
+                .refs
+                .iter()
+                .find(|reference| reference.ref_type == "execution_graph")
+                .map(|reference| reference.id.clone())
+        })
+        .unwrap_or_else(|| format!("runtime-graph-event:{}", event.sequence))
+}
+
+fn graph_runtime_status(graph: &Value) -> Option<&str> {
+    let statuses = graph.get("node_statuses")?.as_object()?;
+    if statuses.is_empty() {
+        return None;
+    }
+    if statuses.values().any(|status| {
+        matches!(
+            status.as_str(),
+            Some("failed") | Some("blocked") | Some("cancelled")
+        )
+    }) {
+        return Some("degraded");
+    }
+    statuses
+        .values()
+        .all(|status| matches!(status.as_str(), Some("completed") | Some("skipped")))
+        .then_some("completed")
+        .or(Some("running"))
+}
+
+fn graph_completion_rate(graph: &Value) -> Option<f64> {
+    let statuses = graph.get("node_statuses")?.as_object()?;
+    (!statuses.is_empty()).then(|| {
+        let completed = statuses
+            .values()
+            .filter(|status| {
+                matches!(
+                    status.as_str(),
+                    Some("completed")
+                        | Some("failed")
+                        | Some("blocked")
+                        | Some("cancelled")
+                        | Some("skipped")
+                )
+            })
+            .count();
+        completed as f64 / statuses.len() as f64
     })
 }
 

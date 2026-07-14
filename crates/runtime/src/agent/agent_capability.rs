@@ -39,7 +39,7 @@ pub fn resolve_agent_capability(request: AgentCapabilityRequest) -> ResolvedAgen
     let mut permission_policy = PermissionPolicy::new(permission_mode);
     for tool in &allowed_tools {
         permission_policy =
-            permission_policy.with_tool_requirement(tool.clone(), tool_permission(tool));
+            permission_policy.with_tool_requirement(tool.clone(), agent_tool_permission(tool));
     }
     let capability_summary = format!(
         "role={} capabilities=[{}] tools=[{}] permission={}",
@@ -88,7 +88,7 @@ struct CapabilityMapping {
 fn capability_mapping(capability: &str) -> CapabilityMapping {
     match capability {
         "read" => CapabilityMapping {
-            tools: &["read_file", "glob_search"],
+            tools: &["read_file"],
             required_mode: PermissionMode::ReadOnly,
         },
         "search" => CapabilityMapping {
@@ -122,7 +122,7 @@ fn capability_mapping(capability: &str) -> CapabilityMapping {
     }
 }
 
-fn tool_permission(tool: &str) -> PermissionMode {
+pub(crate) fn agent_tool_permission(tool: &str) -> PermissionMode {
     match tool {
         "write_file" | "edit_file" => PermissionMode::WorkspaceWrite,
         "bash" => PermissionMode::DangerFullAccess,

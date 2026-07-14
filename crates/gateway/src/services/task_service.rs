@@ -5,7 +5,7 @@ use harness_contract::execution_graph::{
     ExecutionNodeSpec,
 };
 
-use super::{RuntimeEventService, ServiceEnvelope};
+use super::ServiceEnvelope;
 use crate::task_kernel::{TaskKernel, TaskRecord, TaskStatus};
 
 #[derive(Clone)]
@@ -220,10 +220,20 @@ impl TaskService {
 
     pub(crate) fn record_lifecycle_event(
         &self,
-        runtime_events: &RuntimeEventService,
         task: &TaskRecord,
         kind: &'static str,
     ) -> Result<(), String> {
+        let kind = match kind {
+            "task.started" => runtime::TaskLifecycleKind::Started,
+            "task.phase.started" => runtime::TaskLifecycleKind::PhaseStarted,
+            "task.phase.artifact.recorded" => runtime::TaskLifecycleKind::PhaseArtifactRecorded,
+            "task.phase.reviewed" => runtime::TaskLifecycleKind::PhaseReviewed,
+            "task.cancelled" => runtime::TaskLifecycleKind::Cancelled,
+            "task.completed" => runtime::TaskLifecycleKind::Completed,
+            "task.failure.recorded" => runtime::TaskLifecycleKind::FailureRecorded,
+            "task.blocked" => runtime::TaskLifecycleKind::Blocked,
+            _ => return Err(format!("unsupported task lifecycle event `{kind}`")),
+        };
         let latest_audit = task.audit.last();
         let payload = serde_json::json!({
             "task": task,
@@ -234,8 +244,12 @@ impl TaskService {
             "failure_count": task.failure_count,
             "latest_audit": latest_audit,
         });
-        runtime_events
-            .append(&task.id, runtime::RuntimeEventScope::Task, kind, payload)
+        self.runtime_services()?
+            .record_task_lifecycle(runtime::TaskLifecycleEvent {
+                task_id: task.id.clone(),
+                kind,
+                payload,
+            })
             .map(|_| ())
             .map_err(|error| format!("failed to append task runtime event: {error}"))
     }

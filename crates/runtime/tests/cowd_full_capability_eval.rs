@@ -9,10 +9,15 @@ use chrono::Utc;
 use memory::store::session::SessionRecord;
 use memory::{
     AgentVisibility, CognitiveContextManager, FactChecker, MemoryCategory, MemoryConfig,
-    MemoryEntry, MemoryLayer, MemoryScope, MemorySource, Priority, UnifiedSessionStore,
+    MemoryEntry, MemoryLayer, MemoryScope, MemorySource, MemoryTurnContext, Priority,
+    UnifiedSessionStore,
 };
 use memory::{DocumentCategory, DocumentContent, DocumentIngestor};
-use runtime::{RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore};
+use runtime::{
+    L4CandidateLifecycle, L4PromotionCandidate, L4PromotionService, RuntimeEventInput,
+    RuntimeEventRef, RuntimeEventScope, RuntimeEventStore,
+};
+use std::sync::Arc;
 
 fn memory_config(sqlite_path: &std::path::Path) -> MemoryConfig {
     MemoryConfig {
@@ -120,9 +125,11 @@ async fn cowd_full_capability_eval_covers_document_memory_fact_session_agents_an
 ) {
     let tmp = tempfile::TempDir::new().expect("temp dir creates");
     let session_id = "session-full-capability-eval";
-    let memory = CognitiveContextManager::new(memory_config(&tmp.path().join("memory.db")))
-        .await
-        .expect("memory manager opens");
+    let memory = Arc::new(
+        CognitiveContextManager::new(memory_config(&tmp.path().join("memory.db")))
+            .await
+            .expect("memory manager opens"),
+    );
     let sessions = UnifiedSessionStore::open_in_memory().expect("session store opens");
     sessions
         .create_session(&session_record(session_id))
@@ -221,7 +228,8 @@ async fn cowd_full_capability_eval_covers_document_memory_fact_session_agents_an
         "comment": "All evidence, memory, session, and structured checks are connected."
     });
 
-    let execution_events = RuntimeEventStore::open_in_memory().expect("runtime event store opens");
+    let execution_events =
+        Arc::new(RuntimeEventStore::open_in_memory().expect("runtime event store opens"));
     for evidence in &agent_evidence {
         execution_events
             .append(RuntimeEventInput {
@@ -272,34 +280,73 @@ async fn cowd_full_capability_eval_covers_document_memory_fact_session_agents_an
         .expect("session memories load");
     assert!(associated.contains(&document_memory_id.to_string()));
 
-    let reviewer_memory = memory_entry(
-        "Reviewer accepted full capability eval",
-        &format!(
+    let l4_promotion =
+        L4PromotionService::new(Arc::clone(&execution_events), Some(Arc::clone(&memory)));
+    let reviewer_candidate = L4PromotionCandidate {
+        candidate_id: "candidate-full-capability-review".to_string(),
+        team_id: "team-full-capability-eval".to_string(),
+        graph_id: "graph-full-capability-eval".to_string(),
+        lineage_ref: format!("session:{session_id}"),
+        title: "Reviewer accepted full capability eval".to_string(),
+        content: format!(
             "review={} fact_check_consistent={} structured_ref={}",
             review["id"].as_str().unwrap(),
             fact_result.is_consistent,
             "structured-evidence:shortage-risk-packet"
         ),
-        MemoryLayer::L4,
-        MemoryCategory::Decision,
-        Some(session_id.to_string()),
-        Some("agent-reviewer".to_string()),
-        vec!["review".to_string(), "full-capability".to_string()],
-    );
-    let reviewer_memory_id = reviewer_memory.id;
-    memory
-        .remember(reviewer_memory)
+        scope: MemoryScope::Project("cowd-full-capability-eval".to_string()),
+        source_evidence_refs: agent_evidence
+            .iter()
+            .map(|evidence| format!("evidence:{}", evidence["id"].as_str().unwrap()))
+            .collect(),
+        priority: Priority::High,
+        tags: vec!["review".to_string(), "full-capability".to_string()],
+    };
+    let reviewer_memory = l4_promotion
+        .validate_and_promote(reviewer_candidate.clone())
         .await
-        .expect("reviewer memory stores");
+        .expect("reviewer memory promotes through the governed L4 path");
+    assert_eq!(reviewer_memory.lifecycle, L4CandidateLifecycle::Promoted);
+    assert_eq!(
+        l4_promotion
+            .lifecycle(&reviewer_candidate)
+            .expect("L4 promotion lifecycle loads"),
+        vec![
+            L4CandidateLifecycle::Proposed,
+            L4CandidateLifecycle::Validated,
+            L4CandidateLifecycle::Promoted,
+        ]
+    );
 
+    let shared_l4 = memory
+        .orchestrator()
+        .team_query(
+            "full capability eval",
+            Some(&MemoryScope::Project(
+                "cowd-full-capability-eval".to_string(),
+            )),
+            5,
+        )
+        .await
+        .expect("governed shared memory query succeeds");
+    assert!(
+        shared_l4
+            .iter()
+            .any(|entry| entry.id.to_string() == reviewer_memory.memory_id),
+        "promoted L4 memory must be retrievable through the scoped Runtime-facing recall path"
+    );
+
+    let turn = MemoryTurnContext::new(session_id, "agent-reviewer")
+        .with_project_id(Some("cowd-full-capability-eval".to_string()))
+        .with_team_id(Some("team-full-capability-eval".to_string()));
     let prepared = memory
-        .prepare_context("full capability eval supplier_recovery", &[], None)
+        .prepare_context_for_turn(
+            &turn,
+            "material_shortage_risk supplier_recovery quality gate",
+            &[],
+        )
         .await
         .expect("context prepares");
-    assert!(prepared
-        .entries
-        .iter()
-        .any(|entry| entry.id == reviewer_memory_id));
     assert!(prepared.entries.iter().any(|entry| {
         entry.title.contains("full capability")
             || entry.title.contains("Full capability")

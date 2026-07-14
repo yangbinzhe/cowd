@@ -2,6 +2,7 @@
 members = [
     "crates/harness-contract",
     "crates/app-mfg",
+    "crates/auth-broker",
     "crates/approval",
     "crates/cli",
     "crates/fact-kernel",
@@ -16,6 +17,7 @@ members = [
     "crates/provider",
     "crates/connector",
     "crates/runtime",
+    "crates/sandbox-launcher",
     "crates/session",
     "crates/skill/service",
     "crates/storage",
@@ -27,6 +29,7 @@ resolver = "2"
 default-members = [
     "crates/harness-contract",
     "crates/app-mfg",
+    "crates/auth-broker",
     "crates/approval",
     "crates/cli",
     "crates/fact-kernel",
@@ -41,6 +44,7 @@ default-members = [
     "crates/provider",
     "crates/connector",
     "crates/runtime",
+    "crates/sandbox-launcher",
     "crates/session",
     "crates/skill/service",
     "crates/storage",

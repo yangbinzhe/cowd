@@ -431,6 +431,28 @@ pub(crate) fn discover_project_context_items(cwd: &Path) -> Vec<ContextItem> {
     project_context_items(&project)
 }
 
+/// Discover project context for one Runtime context profile.
+///
+/// Delegated Agents already receive their workspace root and immutable role
+/// instructions in the stable head. Repeating a large mutable Git status on
+/// every provider iteration adds no evidence for their bounded objective and
+/// grows quadratically with tool loops, so only the primary turn receives the
+/// mutable repository orientation snapshot.
+pub(crate) fn discover_project_context_items_for_profile(
+    cwd: &Path,
+    profile: crate::context_runtime::ContextProfile,
+) -> Vec<ContextItem> {
+    let items = discover_project_context_items(cwd);
+    if profile == crate::context_runtime::ContextProfile::SubAgent {
+        items
+            .into_iter()
+            .filter(|item| !item.id.starts_with("workspace:git-"))
+            .collect()
+    } else {
+        items
+    }
+}
+
 pub(crate) fn project_context_items(project: &ProjectContext) -> Vec<ContextItem> {
     let mut items = Vec::new();
     if let Some(status) = project
@@ -565,9 +587,9 @@ fn get_actions_section() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        collapse_blank_lines, display_context_path, normalize_instruction_content,
-        project_context_items, truncate_instruction_content, ContextFile, ProjectContext,
-        SystemPromptBuilder, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+        collapse_blank_lines, discover_project_context_items_for_profile, display_context_path,
+        normalize_instruction_content, project_context_items, truncate_instruction_content,
+        ContextFile, ProjectContext, SystemPromptBuilder, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
     use crate::config::ConfigLoader;
     use std::fs;
@@ -907,6 +929,35 @@ mod tests {
             .iter()
             .any(|item| item.content.contains("hello\nworld")));
 
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn sub_agent_profile_omits_repeated_mutable_git_orientation() {
+        let _guard = env_lock();
+        ensure_valid_cwd();
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&root)
+            .status()
+            .expect("git init should run");
+        fs::write(root.join("untracked.txt"), "evidence\n").expect("write untracked file");
+
+        let main = discover_project_context_items_for_profile(
+            &root,
+            crate::context_runtime::ContextProfile::MainTurn,
+        );
+        let child = discover_project_context_items_for_profile(
+            &root,
+            crate::context_runtime::ContextProfile::SubAgent,
+        );
+
+        assert!(main.iter().any(|item| item.id == "workspace:git-status"));
+        assert!(child
+            .iter()
+            .all(|item| !item.id.starts_with("workspace:git-")));
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 

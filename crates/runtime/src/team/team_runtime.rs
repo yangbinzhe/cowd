@@ -3,37 +3,21 @@
 //! TeamRuntime compiles collaboration semantics and reads projections. It owns
 //! no scheduler, worker, state file, or process-global registry.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use harness_contract::team::{TeamRoleSpec, TeamTemplateId};
+use harness_contract::team::{TeamInstantiationRequest, TeamTemplateRevisionRef};
 
-use crate::execution_core::{ProtocolCompileRequest, ProtocolId, ProtocolRef, ProtocolRegistry};
+use crate::execution_core::graph::ExecutionResourceManager;
+
 use crate::{
-    AgentRuntime, AgentSelector, CollaborationLiftGate, CollaborationLiftInput,
-    ExecutionGraphRunner, ExecutionGraphStateStore, LegacyTeamImportReport, RuntimeEventStore,
-    TeamBuildRequest, TeamBuilder, TeamProjection, TeamProjectionReader, TeamRoleDependency,
+    AgentRuntime, EvolutionGovernanceService, ExecutionGraphRunner, ExecutionGraphStateStore,
+    LegacyTeamImportReport, LegacyTeamProfileMigrationReport, RuntimeDefinitionRegistry,
+    RuntimeEventStore, TeamProjection, TeamProjectionReader,
 };
-
-#[derive(Debug, Clone)]
-pub struct StartTeamRequest {
-    pub team_id: String,
-    pub session_id: String,
-    pub objective: String,
-    pub template_id: TeamTemplateId,
-    pub roles: Vec<TeamRoleSpec>,
-    pub role_dependencies: Vec<TeamRoleDependency>,
-    pub lift_input: CollaborationLiftInput,
-    pub permission_lease: String,
-    pub model_lease: String,
-    pub backend_constraint: Option<String>,
-}
 
 pub struct TeamRuntime {
     runner: Arc<ExecutionGraphRunner>,
-    builder: TeamBuilder,
-    selector: AgentSelector,
-    lift_gate: CollaborationLiftGate,
+    instantiation: crate::TeamInstantiationService,
     projection: TeamProjectionReader,
     event_store: Arc<RuntimeEventStore>,
 }
@@ -45,83 +29,72 @@ impl TeamRuntime {
         graphs: ExecutionGraphStateStore,
         agents: Arc<AgentRuntime>,
         event_store: Arc<RuntimeEventStore>,
+        definition_registry: Arc<RuntimeDefinitionRegistry>,
+        resources: Arc<ExecutionResourceManager>,
+        evolution_governance: Arc<EvolutionGovernanceService>,
     ) -> Self {
         Self {
             runner,
-            builder: TeamBuilder,
-            selector: AgentSelector::new(Arc::clone(agents.catalog()), Arc::clone(&agents)),
-            lift_gate: CollaborationLiftGate,
+            instantiation: crate::TeamInstantiationService::new(
+                definition_registry,
+                resources,
+                evolution_governance,
+            ),
             projection: TeamProjectionReader::new(graphs, agents),
             event_store,
         }
     }
 
-    pub async fn start(&self, request: StartTeamRequest) -> Result<TeamProjection, String> {
-        let verdict = self.lift_gate.decide(&request.lift_input);
-        if !verdict.accepted {
-            return Err(format!(
-                "team lift rejected: {}",
-                verdict.reasons.join("; ")
-            ));
-        }
-        if let Some(protocol) = protocol_for_template(request.template_id) {
-            let mut protocol_request = ProtocolCompileRequest::new(
-                ProtocolRef::new(protocol, 1),
-                format!("protocol-team-graph:{}", request.team_id),
-                request.session_id.clone(),
-                request.objective.clone(),
-            );
-            protocol_request.team_id = Some(request.team_id.clone());
-            protocol_request.permission_lease = request.permission_lease.clone();
-            protocol_request.model_lease = request.model_lease.clone();
-            protocol_request.allowed_tools = request
-                .roles
-                .iter()
-                .flat_map(|role| role.allowed_tools.iter().cloned())
-                .collect();
-            protocol_request.allowed_tools.sort();
-            protocol_request.allowed_tools.dedup();
-            protocol_request.budget_lease_id = format!("team-protocol:{}", request.team_id);
-            protocol_request.budget_tokens = 0;
-            protocol_request.budget_revision = 1;
-            protocol_request.fanout = verdict.max_parallel_agents.clamp(2, 4);
-            protocol_request.backend_constraint = request.backend_constraint.clone();
-            ProtocolRegistry::resolve(&protocol_request.protocol)
-                .map_err(|error| error.to_string())?;
-            let graph =
-                ProtocolRegistry::compile(&protocol_request).map_err(|error| error.to_string())?;
-            let graph_id = graph.id.clone();
-            self.runner
-                .start(graph)
-                .await
-                .map_err(|error| error.to_string())?;
-            return self.projection.project(&graph_id);
-        }
-        let selected_agent_profiles = request
-            .roles
-            .iter()
-            .filter_map(|role| {
-                self.selector
-                    .select(&role.required_capabilities)
-                    .map(|agent| (role.role_id.clone(), agent.agent_id))
-            })
-            .collect::<BTreeMap<_, _>>();
-        let build = self.builder.build(TeamBuildRequest {
-            team_id: request.team_id,
-            session_id: request.session_id,
-            objective: request.objective,
-            template_id: request.template_id,
-            roles: request.roles,
-            role_dependencies: request.role_dependencies,
-            selected_agent_profiles,
-            verdict,
-            permission_lease: request.permission_lease,
-            model_lease: request.model_lease,
-            backend_constraint: request.backend_constraint,
-        })?;
-        let graph_id = build.graph.id.clone();
+    /// Resolve a durable Team request into its immutable graph without
+    /// scheduling it. Evaluation and dry-run callers use this same canonical
+    /// compiler; no second graph builder exists outside Runtime.
+    pub fn plan(
+        &self,
+        request: TeamInstantiationRequest,
+    ) -> Result<crate::TeamInstantiation, String> {
+        self.instantiation.instantiate(request)
+    }
+
+    /// Instantiate a durable Team Template through the canonical Runtime
+    /// request. The returned graph already contains exact Agent Bindings, so
+    /// Runner never selects a profile or template while executing.
+    pub async fn instantiate(
+        &self,
+        request: TeamInstantiationRequest,
+    ) -> Result<TeamProjection, String> {
+        let instantiated = self.plan(request)?;
+        self.instantiation.validate_release(&instantiated)?;
+        let graph_id = instantiated.graph.id.clone();
         self.runner
-            .start(build.graph)
+            .start(instantiated.graph)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.projection.project(&graph_id)
+    }
+
+    /// Run one evaluation-only Team graph. The candidate template is selected
+    /// by a crate-private Runtime path and is never materialized as a normal
+    /// release assignment; the baseline continues through normal exact
+    /// approved resolution. Both sides still use the canonical Team compiler
+    /// and graph runner.
+    pub(crate) async fn instantiate_evaluation(
+        &self,
+        request: TeamInstantiationRequest,
+        candidate_revision: Option<&TeamTemplateRevisionRef>,
+        allowed_tools: &[String],
+    ) -> Result<TeamProjection, String> {
+        let instantiated = match candidate_revision {
+            Some(revision) => {
+                self.instantiation
+                    .instantiate_evaluation(request, revision, allowed_tools)?
+            }
+            None => self
+                .instantiation
+                .instantiate_evaluation_baseline(request, allowed_tools)?,
+        };
+        let graph_id = instantiated.graph.id.clone();
+        self.runner
+            .start(instantiated.graph)
             .await
             .map_err(|error| error.to_string())?;
         self.projection.project(&graph_id)
@@ -129,6 +102,25 @@ impl TeamRuntime {
 
     pub fn project(&self, graph_id: &str) -> Result<TeamProjection, String> {
         self.projection.project(graph_id)
+    }
+
+    /// Rebuild the team-local collaboration projection from events committed
+    /// atomically with graph transitions. The graph itself still owns node
+    /// status and topology; this view contains only shareable semantics.
+    pub fn working_state(&self, team_id: &str) -> Result<crate::TeamWorkingState, String> {
+        let team = self
+            .list()?
+            .into_iter()
+            .find(|team| team.team_id == team_id)
+            .ok_or_else(|| format!("team not found: {team_id}"))?;
+        let events = self
+            .event_store
+            .list_stream(&format!("team-working-state:{team_id}"))?;
+        Ok(crate::TeamWorkingState::from_events(
+            team_id,
+            team.graph_id,
+            events,
+        ))
     }
 
     /// Import and retire the removed pre-V5 Team state file. Unbound active
@@ -140,6 +132,20 @@ impl TeamRuntime {
         crate::team_legacy_import::import_legacy_team_state_file(
             Arc::clone(&self.event_store),
             path,
+        )
+    }
+
+    /// Retire legacy browser-owned Team Profiles without pretending that their
+    /// mutable role names are valid TeamTemplate revisions.
+    pub fn archive_legacy_profile_file(
+        &self,
+        source_path: &std::path::Path,
+        archive_root: &std::path::Path,
+    ) -> Result<Option<LegacyTeamProfileMigrationReport>, String> {
+        crate::team_profile_migration::archive_legacy_team_profile_file(
+            Arc::clone(&self.event_store),
+            source_path,
+            archive_root,
         )
     }
 
@@ -163,19 +169,8 @@ impl TeamRuntime {
                 "status": team.status,
                 "agents": team.tasks,
                 "terminal_result": team.terminal_result,
+                "working_state": self.working_state(&team.team_id).ok(),
             })).collect::<Vec<_>>(),
         })
-    }
-}
-
-fn protocol_for_template(template_id: TeamTemplateId) -> Option<ProtocolId> {
-    match template_id {
-        TeamTemplateId::DebateConsensus => Some(ProtocolId::Debate),
-        TeamTemplateId::ImplementationReviewFix => Some(ProtocolId::ReviewFix),
-        TeamTemplateId::IncidentResponse => Some(ProtocolId::Incident),
-        TeamTemplateId::SingleExecutor
-        | TeamTemplateId::ExecuteReview
-        | TeamTemplateId::FanoutResearchSynthesis
-        | TeamTemplateId::LongRunningProject => None,
     }
 }

@@ -3,7 +3,10 @@
 use super::activation::RuntimeSkillCandidateSource;
 use super::SkillActivationRecord;
 use chrono::Utc;
-use memory::{MaintenanceCandidate, MaintenanceCandidateAction, MaintenanceCandidateStatus};
+use memory::{
+    MaintenanceCandidate, MaintenanceCandidateAction, MaintenanceCandidateStatus,
+    SessionDomainEvent, SessionDomainRef, SessionDomainScope,
+};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +85,51 @@ pub fn memory_candidate_from_skill_activation(
     None
 }
 
+/// Project a runtime-owned Skill memory candidate into the canonical session
+/// timeline. The candidate is derived from a durable activation decision; it
+/// is never accepted from a Surface payload.
+#[must_use]
+pub fn skill_memory_candidate_session_event(
+    activation: &SkillActivationRecord,
+    candidate: &MaintenanceCandidate,
+    sequence: usize,
+) -> Option<SessionDomainEvent> {
+    let selected = activation.selected.as_deref()?.trim();
+    if selected.is_empty() {
+        return None;
+    }
+    let mut event = SessionDomainEvent::new(
+        activation.session_id.clone(),
+        sequence,
+        SessionDomainScope::Context,
+        "skill_memory_candidate",
+        serde_json::json!({
+            "source": "conversation_runtime.skill_memory_candidate",
+            "turn_index": activation.turn_index,
+            "query": activation.query,
+            "selected": selected,
+            "source_event": "skill_candidates",
+            "candidate": {
+                "id": candidate.id,
+                "kind": format!("{:?}", candidate.kind),
+                "status": format!("{:?}", candidate.status),
+                "summary": candidate.summary,
+                "content": candidate.reason,
+                "confidence": candidate.confidence,
+                "source": candidate.source,
+                "source_ref": candidate.source_ref,
+            }
+        }),
+        now_ms(),
+    );
+    event.refs.push(SessionDomainRef {
+        ref_type: "skill".to_string(),
+        id: selected.to_string(),
+        label: Some("memory_candidate_source".to_string()),
+    });
+    Some(event)
+}
+
 fn maintenance_candidate(
     action: MaintenanceCandidateAction,
     summary: &str,
@@ -106,6 +154,13 @@ fn maintenance_candidate(
         created_at: now,
         updated_at: now,
     }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[cfg(test)]
@@ -184,5 +239,42 @@ mod tests {
             memory_candidate_from_skill_activation(&activation, &SkillMemoryPolicy::default());
 
         assert!(candidate.is_none());
+    }
+
+    #[test]
+    fn selected_runtime_skill_candidate_projects_to_session_evidence() {
+        let activation = SkillActivationRecord::new(
+            "s1",
+            4,
+            "prepare release",
+            vec![RuntimeSkillCandidate {
+                name: "release".to_string(),
+                score: 12,
+                reasons: vec!["name:release".to_string()],
+                path: None,
+                source: RuntimeSkillCandidateSource::Profile,
+            }],
+        );
+        let candidate =
+            memory_candidate_from_skill_activation(&activation, &SkillMemoryPolicy::default())
+                .expect("selected runtime skill produces a memory candidate");
+
+        let event = skill_memory_candidate_session_event(&activation, &candidate, 9)
+            .expect("selected skill has session evidence");
+
+        assert_eq!(event.kind, "skill_memory_candidate");
+        assert_eq!(
+            event.payload["source"],
+            "conversation_runtime.skill_memory_candidate"
+        );
+        assert_eq!(event.payload["selected"], "release");
+        assert!(event.payload["candidate"]["content"]
+            .as_str()
+            .expect("candidate content")
+            .contains("source=runtime_skill"));
+        assert!(event
+            .refs
+            .iter()
+            .any(|reference| reference.ref_type == "skill" && reference.id == "release"));
     }
 }

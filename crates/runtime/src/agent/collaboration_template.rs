@@ -6,17 +6,51 @@
 
 use harness_contract::core::{ExecutionModifier, ExecutionPattern, TaskComplexity, TaskRisk};
 use harness_contract::strategy::{StrategyDecision, TaskDomain};
-use harness_contract::team::TeamTemplateId;
 use serde::{Deserialize, Serialize};
 
-pub use harness_contract::team::TeamTemplateId as CollaborationTemplateId;
+/// Strategy-level reference to one durable Team Template family.
+///
+/// This is only a recommendation vocabulary. It never constructs a graph or
+/// carries role definitions; Runtime turns it into a versioned
+/// `TeamTemplateSelector` before execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaborationTemplateId {
+    DirectExecutor,
+    PlannerExecutorVerifier,
+    ParallelResearchSynthesis,
+    ImplementationReviewFix,
+    DebateCriticArbiter,
+    IncidentResponse,
+    MatrixScenarioEnsemble,
+    LongRunningWorkstreams,
+}
+
+impl CollaborationTemplateId {
+    /// Stable template identifier advertised to models and policy contracts.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        self.template_path()
+    }
+
+    #[must_use]
+    pub const fn template_path(self) -> &'static str {
+        match self {
+            Self::DirectExecutor => "cowd/direct-executor",
+            Self::PlannerExecutorVerifier => "cowd/planner-executor-verifier",
+            Self::ParallelResearchSynthesis => "cowd/parallel-research-synthesis",
+            Self::ImplementationReviewFix => "cowd/implementation-review-fix",
+            Self::DebateCriticArbiter => "cowd/debate-critic-arbiter",
+            Self::IncidentResponse => "cowd/incident-response",
+            Self::MatrixScenarioEnsemble => "cowd/matrix-scenario-ensemble",
+            Self::LongRunningWorkstreams => "cowd/long-running-workstreams",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollaborationDecision {
-    pub template_id: TeamTemplateId,
-    /// A versioned protocol is selected only for the templates V6 can compile.
-    /// V5 TeamRuntime templates remain graph-owned Team commands.
-    pub protocol_id: Option<String>,
+    pub template_id: CollaborationTemplateId,
     pub rationale: String,
 }
 
@@ -46,7 +80,7 @@ impl CollaborationTemplateMatcher {
             TaskRisk::Critical
         ) {
             (
-                TeamTemplateId::IncidentResponse,
+                CollaborationTemplateId::IncidentResponse,
                 "critical or incident-like task needs typed triage and mitigation evidence",
             )
         } else if contains_any(
@@ -61,40 +95,49 @@ impl CollaborationTemplateMatcher {
                 "里程碑",
                 "全盘",
             ],
-        ) || matches!(strategy.understanding.complexity, TaskComplexity::Strategic)
-        {
+        ) {
             (
-                TeamTemplateId::LongRunningProject,
-                "strategic work belongs to the Mission/Schedule protocol",
+                CollaborationTemplateId::LongRunningWorkstreams,
+                "explicitly long-running work belongs to the Mission/Schedule protocol",
             )
         } else if contains_any(
             &normalized,
-            &["tradeoff", "pros", "cons", "debate", "是否", "利弊", "权衡"],
-        ) || matches!(strategy.understanding.domain, TaskDomain::Architecture)
-            && !strategy.understanding.requires_write
-        {
+            &[
+                "tradeoff", "pros", "cons", "debate", "是否", "利弊", "权衡", "取舍",
+            ],
+        ) {
             (
-                TeamTemplateId::DebateConsensus,
+                CollaborationTemplateId::DebateCriticArbiter,
                 "material tradeoff needs evidence arbitration rather than string consensus",
             )
         } else if contains_any(
             &normalized,
             &[
                 "research",
+                "researcher",
                 "compare",
                 "investigate",
                 "survey",
                 "调研",
                 "研究",
+                "研究员",
                 "对比",
                 "分析",
+                "并行审查",
             ],
         ) || strategy.pattern == ExecutionPattern::Explore
             || strategy.uses_modifier(ExecutionModifier::WithExternalResearch)
         {
             (
-                TeamTemplateId::FanoutResearchSynthesis,
+                CollaborationTemplateId::ParallelResearchSynthesis,
                 "independent evidence work can use the V5 fanout Team graph",
+            )
+        } else if matches!(strategy.understanding.domain, TaskDomain::Architecture)
+            && !strategy.understanding.requires_write
+        {
+            (
+                CollaborationTemplateId::DebateCriticArbiter,
+                "material tradeoff needs evidence arbitration rather than string consensus",
             )
         } else if contains_any(
             &normalized,
@@ -118,8 +161,13 @@ impl CollaborationTemplateMatcher {
             )
         {
             (
-                TeamTemplateId::ImplementationReviewFix,
+                CollaborationTemplateId::ImplementationReviewFix,
                 "write-oriented work needs the review-fix graph protocol",
+            )
+        } else if matches!(strategy.understanding.complexity, TaskComplexity::Strategic) {
+            (
+                CollaborationTemplateId::LongRunningWorkstreams,
+                "strategic work without a more specific protocol uses supervised workstreams",
             )
         } else if matches!(
             strategy.pattern,
@@ -127,33 +175,19 @@ impl CollaborationTemplateMatcher {
         ) || strategy.uses_modifier(ExecutionModifier::WithVerifier)
         {
             (
-                TeamTemplateId::ExecuteReview,
+                CollaborationTemplateId::PlannerExecutorVerifier,
                 "bounded work can use the V5 execute-review Team graph",
             )
         } else {
             (
-                TeamTemplateId::SingleExecutor,
+                CollaborationTemplateId::DirectExecutor,
                 "simple low-risk work should avoid coordination overhead",
             )
         };
         CollaborationDecision {
             template_id,
-            protocol_id: protocol_id(template_id).map(str::to_string),
             rationale: rationale.to_string(),
         }
-    }
-}
-
-#[must_use]
-pub const fn protocol_id(template_id: TeamTemplateId) -> Option<&'static str> {
-    match template_id {
-        TeamTemplateId::DebateConsensus => Some("debate@1"),
-        TeamTemplateId::ImplementationReviewFix => Some("review_fix@1"),
-        TeamTemplateId::IncidentResponse => Some("incident@1"),
-        TeamTemplateId::SingleExecutor
-        | TeamTemplateId::ExecuteReview
-        | TeamTemplateId::FanoutResearchSynthesis
-        | TeamTemplateId::LongRunningProject => None,
     }
 }
 
@@ -166,7 +200,7 @@ mod tests {
     use super::*;
     use harness_contract::strategy::{decide_strategy, StrategyInput};
 
-    fn matches(prompt: &str, expected: TeamTemplateId) {
+    fn matches(prompt: &str, expected: CollaborationTemplateId) {
         let strategy = decide_strategy(&StrategyInput::from_prompt(prompt));
         assert_eq!(
             CollaborationTemplateMatcher
@@ -178,19 +212,27 @@ mod tests {
 
     #[test]
     fn selects_protocol_templates_without_embedded_role_loops() {
-        matches("分析架构取舍和利弊", TeamTemplateId::DebateConsensus);
+        matches(
+            "分析架构取舍和利弊",
+            CollaborationTemplateId::DebateCriticArbiter,
+        );
         matches(
             "重构并修复这个模块",
-            TeamTemplateId::ImplementationReviewFix,
+            CollaborationTemplateId::ImplementationReviewFix,
         );
-        matches("线上事故需要回滚", TeamTemplateId::IncidentResponse);
+        matches(
+            "线上事故需要回滚",
+            CollaborationTemplateId::IncidentResponse,
+        );
+        matches(
+            "请使用多 Agent 团队并行审查三个模块，每个研究员读取真实代码并由综合者对比证据",
+            CollaborationTemplateId::ParallelResearchSynthesis,
+        );
         let strategy = decide_strategy(&StrategyInput::from_prompt("分析架构取舍"));
-        assert_eq!(
-            CollaborationTemplateMatcher
-                .decide("分析架构取舍", &strategy)
-                .protocol_id
-                .as_deref(),
-            Some("debate@1")
-        );
+        assert!(CollaborationTemplateMatcher
+            .decide("分析架构取舍", &strategy)
+            .template_id
+            .as_str()
+            .contains("debate-critic-arbiter"));
     }
 }

@@ -130,7 +130,11 @@ impl ApprovalService {
         id: &str,
         approved: bool,
         reason: Option<String>,
+        principal: &runtime::VerifiedPrincipal,
     ) -> Result<serde_json::Value, String> {
+        if !principal.is_human_interactive() || !principal.has_capability("approval.respond") {
+            return Err("approval_human_interactive_capability_required".to_string());
+        }
         let services = self.runtime_services()?;
         let graph_target = canonical_graph_approval_target(id);
         let graph_before = if let Some((graph_id, node_id)) = &graph_target {
@@ -219,10 +223,10 @@ impl ApprovalService {
             .map_err(|error| error.to_string())?
         } else {
             serde_json::to_value(services.approval_queue().decide(
-                runtime::GlobalApprovalDecision {
+                principal,
+                runtime::ApprovalDecisionCommand {
                     approval_id: id.to_string(),
                     approved,
-                    decided_by: "human".to_string(),
                     reason: decision_reason,
                 },
             )?)
@@ -252,9 +256,7 @@ impl ApprovalService {
 }
 
 fn canonical_graph_approval_target(approval_id: &str) -> Option<(String, String)> {
-    let rest = approval_id.strip_prefix("approval:")?;
-    let (graph_id, node_id) = rest.split_once(':')?;
-    Some((graph_id.to_string(), node_id.to_string()))
+    runtime::execution_core::graph::executors::parse_graph_approval_id(approval_id)
 }
 
 #[cfg(test)]
@@ -298,7 +300,8 @@ mod tests {
                 .map(|node| node.status),
             Some(ExecutionNodeStatus::WaitingApproval)
         );
-        let approval_id = format!("approval:{graph_id}:{node_id}");
+        let approval_id =
+            runtime::execution_core::graph::executors::graph_approval_id(&graph_id, &node_id);
         services
             .graph_runner()
             .command(
@@ -314,7 +317,7 @@ mod tests {
             .unwrap();
         services.approval_queue().refresh();
         let approval_events = services
-            .event_store()
+            .event_reader()
             .list_scope(runtime::RuntimeEventScope::Approval, 20)
             .unwrap();
         assert!(approval_events

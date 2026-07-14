@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use harness_contract::agent::AgentTaskPacket;
+use harness_contract::agent::AgentTaskIntent;
 use harness_contract::execution_graph::{
     validate_execution_graph, ExecutionEdgeKind, ExecutionGraph, ExecutionGraphValidationError,
     ExecutionNodeKind,
@@ -254,17 +254,17 @@ pub fn validate_protocol_graph(
                         &format!("agent node `{}` does not use `agent_task`", node.id),
                     ));
                 }
-                let packet: AgentTaskPacket =
+                let intent: AgentTaskIntent =
                     serde_json::from_str(&node.payload_ref).map_err(|error| {
                         invalid_graph(
                             &protocol,
                             &format!(
-                                "agent node `{}` has an invalid AgentTaskPacket: {error}",
+                                "agent node `{}` has an invalid AgentTaskIntent: {error}",
                                 node.id
                             ),
                         )
                     })?;
-                let role = packet
+                let role = intent
                     .constraints
                     .iter()
                     .find_map(|constraint| constraint.strip_prefix("protocol_role:"))
@@ -274,7 +274,7 @@ pub fn validate_protocol_graph(
                             &format!("agent node `{}` has no protocol role", node.id),
                         )
                     })?;
-                let slot = packet
+                let slot = intent
                     .constraints
                     .iter()
                     .find_map(|constraint| constraint.strip_prefix("protocol_slot:"))
@@ -297,11 +297,11 @@ pub fn validate_protocol_graph(
                         &format!("agent node `{}` references unknown role `{role}`", node.id),
                     )
                 })?;
-                validate_packet_node(
+                validate_intent_node(
                     &protocol,
                     request,
                     node,
-                    &packet,
+                    &intent,
                     role_spec,
                     role,
                     slot,
@@ -456,11 +456,11 @@ struct PacketNode {
     slot: usize,
 }
 
-fn validate_packet_node(
+fn validate_intent_node(
     protocol: &str,
     request: &ProtocolCompileRequest,
     node: &harness_contract::execution_graph::ExecutionNodeSpec,
-    packet: &AgentTaskPacket,
+    intent: &AgentTaskIntent,
     role: &super::RoleSpec,
     role_id: &str,
     slot: usize,
@@ -473,7 +473,7 @@ fn validate_packet_node(
     let backend_constraint_is_bound = request
         .backend_constraint
         .as_ref()
-        .is_none_or(|constraint| packet.constraints.contains(constraint));
+        .is_none_or(|constraint| intent.constraints.contains(constraint));
     let expected_allowed_tools = if role.evidence_mode == super::RoleEvidenceMode::Acquire {
         request
             .allowed_tools
@@ -484,24 +484,24 @@ fn validate_packet_node(
     } else {
         Vec::new()
     };
-    if packet.graph_id != request.graph_id
-        || packet.node_id != node.id
-        || packet.session_id != request.session_id
-        || packet.mission_id != request.mission_id
-        || packet.team_id != request.team_id
-        || packet.expected_graph_revision != 0
-        || packet.attempt != 1
-        || packet.idempotency_key != node.idempotency_key
-        || packet.permission_lease != request.permission_lease
-        || packet.model_lease != request.model_lease
-        || packet.context_refs != request.context_refs
-        || packet.evidence_refs != request.evidence_refs
-        || packet.allowed_tools != expected_allowed_tools
-        || packet.allowed_skills != request.allowed_skills
-        || !packet.constraints.contains(&expected_protocol)
-        || !packet.constraints.contains(&expected_role)
-        || !packet.constraints.contains(&expected_slot)
-        || !packet.constraints.contains(&expected_evidence_mode)
+    if intent.graph_id != request.graph_id
+        || intent.node_id != node.id
+        || intent.session_id != request.session_id
+        || intent.mission_id != request.mission_id
+        || intent.team_id != request.team_id
+        || intent.expected_graph_revision != 0
+        || intent.attempt != 1
+        || intent.idempotency_key != node.idempotency_key
+        || intent.permission_lease != request.permission_lease
+        || intent.model_lease != request.model_lease
+        || intent.context_refs != request.context_refs
+        || intent.evidence_refs != request.evidence_refs
+        || intent.allowed_tools != expected_allowed_tools
+        || intent.allowed_skills != request.allowed_skills
+        || !intent.constraints.contains(&expected_protocol)
+        || !intent.constraints.contains(&expected_role)
+        || !intent.constraints.contains(&expected_slot)
+        || !intent.constraints.contains(&expected_evidence_mode)
         || !backend_constraint_is_bound
     {
         return Err(invalid_graph(
@@ -512,12 +512,11 @@ fn validate_packet_node(
             ),
         ));
     }
-    if packet.objective.trim().is_empty()
-        || packet.run_id.trim().is_empty()
-        || packet.agent_id.trim().is_empty()
-        || packet.task_id.trim().is_empty()
+    if intent.objective.trim().is_empty()
+        || intent.run_id.trim().is_empty()
+        || intent.task_id.trim().is_empty()
         || node.resource_scopes != request.resource_scopes
-        || node.acceptance.criteria != packet.acceptance
+        || node.acceptance.criteria != intent.acceptance
         || node.retry_policy.max_attempts != max_agent_attempts
     {
         return Err(invalid_graph(
@@ -529,11 +528,11 @@ fn validate_packet_node(
         ));
     }
     let expected_budget_id = format!("{}:{}", request.budget_lease_id, node.id);
-    if packet.budget_lease.lease_id != expected_budget_id
-        || packet.budget_lease.owner_id != packet.agent_id
-        || packet.budget_lease.scope != "protocol_agent"
-        || packet.budget_lease.max_tokens != request.budget_tokens
-        || packet.budget_lease.revision != request.budget_revision
+    if intent.budget_lease.lease_id != expected_budget_id
+        || intent.budget_lease.owner_id.trim().is_empty()
+        || intent.budget_lease.scope != "protocol_agent"
+        || intent.budget_lease.max_tokens != request.budget_tokens
+        || intent.budget_lease.revision != request.budget_revision
     {
         return Err(invalid_graph(
             protocol,
@@ -541,14 +540,14 @@ fn validate_packet_node(
         ));
     }
     for field in &role.output.required_fields {
-        if !packet.acceptance.contains(field) {
+        if !intent.acceptance.contains(field) {
             return Err(invalid_graph(
                 protocol,
                 &format!("agent node `{}` omits output field `{field}`", node.id),
             ));
         }
     }
-    if role.output.evidence_required && !packet.acceptance.contains(&"evidence_backed".to_string())
+    if role.output.evidence_required && !intent.acceptance.contains(&"evidence_backed".to_string())
     {
         return Err(invalid_graph(
             protocol,

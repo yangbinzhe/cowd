@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Instant};
 
 use axum::{
-    extract::{Path, Query, State as AxumState},
+    extract::{Extension, Path, Query, State as AxumState},
     http::{header, HeaderMap, StatusCode},
     response::{sse::Event, IntoResponse, Response, Sse},
     routing::{get, post},
@@ -12,7 +12,7 @@ use serde_json::Value;
 use std::convert::Infallible;
 
 mod control;
-use super::{connector_routes, AppState, ErrorResponse};
+use super::{connector_routes, AppState, AuthenticatedPrincipal, ErrorResponse};
 pub(super) use control::{
     agent_value_summary, execution_graph_summary, get_runtime_control_plane, health_summary,
     session_lease_projection, value_loop_summary,
@@ -33,6 +33,8 @@ pub(in crate::api_routes) struct RuntimeEvent {
     sequence: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     commit_cursor: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_id: Option<String>,
     scope: String,
     kind: String,
     status: Option<String>,
@@ -76,6 +78,7 @@ impl From<memory::SessionDomainEvent> for RuntimeEvent {
         Self {
             sequence: event.sequence as u64,
             commit_cursor: None,
+            stream_id: None,
             scope: session_domain_scope_label(event.scope).to_string(),
             kind,
             status,
@@ -130,6 +133,7 @@ impl From<runtime::DurableRuntimeEvent> for RuntimeEvent {
         Self {
             sequence: event.sequence,
             commit_cursor: Some(event.commit_cursor),
+            stream_id: Some(event.stream_id),
             scope: event.scope.as_str().to_string(),
             kind: event.kind,
             status: event.status,
@@ -380,8 +384,8 @@ struct RuntimeOutboxQuery {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RuntimeOutboxRetryRequest {
-    actor: String,
     reason: String,
     expected_revision: Option<u64>,
 }
@@ -408,11 +412,11 @@ async fn get_runtime_outbox_status(
             "runtime service unavailable",
         )
     })?;
-    let event_store = Arc::clone(runtime.runtime_services().event_store());
+    let delivery = runtime.runtime_services().session_terminal_delivery();
     let (terminal_health, terminal_poison) = tokio::task::spawn_blocking(move || {
-        Ok::<_, runtime::RuntimeEventStoreError>((
-            event_store.session_terminal_health()?,
-            event_store.blocked_session_terminals(limit)?,
+        Ok::<_, String>((
+            delivery.health().map_err(|error| error.to_string())?,
+            delivery.blocked(limit).map_err(|error| error.to_string())?,
         ))
     })
     .await
@@ -429,14 +433,22 @@ async fn get_runtime_outbox_status(
 async fn retry_runtime_outbox(
     AxumState(state): AxumState<Arc<AppState>>,
     Path((direction, id)): Path<(String, String)>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(request): Json<RuntimeOutboxRetryRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
-    if request.actor.trim().is_empty() || request.reason.trim().is_empty() {
+    if request.reason.trim().is_empty() {
         return Err(runtime_event_error(
             StatusCode::BAD_REQUEST,
-            "actor and reason are required",
+            "reason is required",
         ));
     }
+    if !principal.0.is_human_interactive() || !principal.0.has_capability("runtime.outbox.retry") {
+        return Err(runtime_event_error(
+            StatusCode::FORBIDDEN,
+            "runtime_outbox_retry_human_interactive_capability_required",
+        ));
+    }
+    let actor = principal.0.claims().principal_id.clone();
     let record = match direction.as_str() {
         "ingress" => {
             let store = state.services.session.unified_store().ok_or_else(|| {
@@ -455,7 +467,7 @@ async fn retry_runtime_outbox(
                     .retry_blocked_session_runtime_outbox(
                         &id,
                         expected_revision,
-                        request.actor.trim(),
+                        &actor,
                         request.reason.trim(),
                         now_ms(),
                     )
@@ -470,18 +482,13 @@ async fn retry_runtime_outbox(
                     "runtime service unavailable",
                 )
             })?;
-            let event_store = Arc::clone(runtime.runtime_services().event_store());
-            let actor = request.actor;
+            let delivery = runtime.runtime_services().session_terminal_delivery();
+            let actor = actor.clone();
             let reason = request.reason;
             let terminal_id = id.clone();
             serde_json::to_value(
                 tokio::task::spawn_blocking(move || {
-                    event_store.retry_session_terminal(
-                        &terminal_id,
-                        actor.trim(),
-                        reason.trim(),
-                        now_ms(),
-                    )
+                    delivery.retry_blocked(&terminal_id, actor.trim(), reason.trim(), now_ms())
                 })
                 .await
                 .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
@@ -538,20 +545,21 @@ pub(super) struct RuntimeTimelineParams {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RuntimeSessionLeaseAcquireRequest {
     session_id: String,
-    owner: String,
     #[serde(default)]
     mode: Option<String>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RuntimeSessionLeaseReleaseRequest {
     session_id: String,
-    owner: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RuntimeTurnSubmitRequest {
     prompt: String,
     #[serde(default)]
@@ -561,16 +569,11 @@ struct RuntimeTurnSubmitRequest {
 }
 
 #[derive(Deserialize)]
-struct UpgradeMaintenanceRequest {
-    actor: String,
-}
-
-#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpgradeDispositionRequest {
     carrier_kind: String,
     carrier_id: String,
     action: String,
-    actor: String,
     reason: String,
     #[serde(default)]
     result_refs: Vec<String>,
@@ -595,12 +598,14 @@ async fn get_upgrade_maintenance(
 
 async fn enter_upgrade_maintenance(
     AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<UpgradeMaintenanceRequest>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
-    if request.actor.trim().is_empty() {
+    if !principal.0.is_human_interactive()
+        || !principal.0.has_capability("runtime.maintenance.manage")
+    {
         return Err(runtime_event_error(
-            StatusCode::BAD_REQUEST,
-            "actor is required",
+            StatusCode::FORBIDDEN,
+            "runtime_maintenance_human_interactive_capability_required",
         ));
     }
     let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
@@ -612,7 +617,7 @@ async fn enter_upgrade_maintenance(
     let coordinator = runtime_service.upgrade_coordinator();
     register_gateway_upgrade_collectors(&state, runtime_service);
     coordinator
-        .enter_maintenance(request.actor)
+        .enter_maintenance(principal.0.claims().principal_id.clone())
         .map_err(|error| runtime_event_error(StatusCode::CONFLICT, error))?;
     Ok(Json(serde_json::json!({
         "ok": true,
@@ -623,18 +628,27 @@ async fn enter_upgrade_maintenance(
 
 async fn record_upgrade_disposition(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(request): Json<UpgradeDispositionRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
     if request.carrier_kind.trim().is_empty()
         || request.carrier_id.trim().is_empty()
-        || request.actor.trim().is_empty()
         || request.reason.trim().is_empty()
     {
         return Err(runtime_event_error(
             StatusCode::BAD_REQUEST,
-            "carrier_kind, carrier_id, actor and reason are required",
+            "carrier_kind, carrier_id and reason are required",
         ));
     }
+    if !principal.0.is_human_interactive()
+        || !principal.0.has_capability("runtime.maintenance.manage")
+    {
+        return Err(runtime_event_error(
+            StatusCode::FORBIDDEN,
+            "runtime_maintenance_human_interactive_capability_required",
+        ));
+    }
+    let actor = principal.0.claims().principal_id.clone();
     let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
         runtime_event_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -712,7 +726,7 @@ async fn record_upgrade_disposition(
                         target: harness_contract::mission::MissionCommandTarget::Session {
                             session_id: request.carrier_id.clone(),
                         },
-                        actor: request.actor.clone(),
+                        actor: actor.clone(),
                         expected_revision: None,
                         correlation_id: format!("upgrade:{}", request.carrier_id),
                         payload: Value::Null,
@@ -757,7 +771,7 @@ async fn record_upgrade_disposition(
         carrier_kind: request.carrier_kind,
         carrier_id: request.carrier_id,
         action: request.action,
-        actor: request.actor,
+        actor,
         reason: request.reason,
         result_refs: request.result_refs,
         created_at_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
@@ -952,16 +966,12 @@ async fn get_runtime_capabilities(Query(params): Query<RuntimeCapabilitiesParams
     let intent = params
         .intent
         .unwrap_or_else(|| "inspect active runtime capability map".to_string());
-    let active_evolution = crate::current_active_evolution_capability_overlay();
-    Json(
-        runtime::runtime_capabilities_response_with_detail_and_overlay(
-            &intent,
-            params.surface.as_deref(),
-            params.profile.as_deref(),
-            params.detail.as_deref(),
-            &active_evolution,
-        ),
-    )
+    Json(runtime::runtime_capabilities_response_with_detail(
+        &intent,
+        params.surface.as_deref(),
+        params.profile.as_deref(),
+        params.detail.as_deref(),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -975,25 +985,29 @@ async fn get_runtime_events(
     Query(params): Query<RuntimeEventsParams>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
     let limit = params.limit.unwrap_or(100).min(500);
-    let store = state.services.runtime_events.store();
     let events = if let Some(stream_id) = params.stream_id {
-        store
+        state
+            .services
+            .runtime_events
             .list_stream(&stream_id)
             .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
     } else if let Some(scope) = params.scope {
         let scope = parse_runtime_event_scope(&scope)
             .map_err(|error| runtime_event_error(StatusCode::BAD_REQUEST, error))?;
-        store
+        state
+            .services
+            .runtime_events
             .list_scope(scope, limit)
             .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
     } else {
-        store
+        state
+            .services
+            .runtime_events
             .all_events(limit)
             .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
     };
     Ok(Json(serde_json::json!({
         "kind": "runtime.events",
-        "store_path": store.path(),
         "count": events.len(),
         "events": events,
     })))
@@ -1036,12 +1050,13 @@ fn runtime_replay_report(
     state: &AppState,
     limit: usize,
 ) -> Result<Value, (StatusCode, Json<ErrorResponse>)> {
-    let store = state.services.runtime_events.store();
-    let report = runtime::RuntimeEventReplayer::report(store, limit)
+    let report = state
+        .services
+        .runtime_events
+        .replay_report(limit)
         .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(serde_json::json!({
         "kind": "runtime.events.replay_report",
-        "store_path": store.path(),
         "actions": &report.actions,
         "candidates": &report.candidates,
         "report": report,
@@ -1177,24 +1192,16 @@ pub(super) async fn get_runtime_timeline(
     let lifecycle_events = state
         .services
         .runtime_events
-        .store()
-        .list_stream(&params.session_id)
-        .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
-        .into_iter()
-        .filter(|event| event.sequence >= from_seq as u64)
-        .collect::<Vec<_>>();
-    let related_execution_events = state
-        .services
-        .runtime_events
-        .store()
-        .execution_events_for_session(&params.session_id, 0, limit)
+        .session_timeline_events(&params.session_id, from_seq as u64, limit)
         .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-    let lifecycle_total = lifecycle_events.len() + related_execution_events.len();
+    let lifecycle_total = lifecycle_events.len();
     events.extend(lifecycle_events.into_iter().map(RuntimeEvent::from));
-    events.extend(related_execution_events.into_iter().map(RuntimeEvent::from));
     events.sort_by_key(|event| (event.created_at_ms, event.sequence));
     events.dedup_by(|left, right| {
-        left.source == right.source && left.sequence == right.sequence && left.kind == right.kind
+        left.source == right.source
+            && left.stream_id == right.stream_id
+            && left.sequence == right.sequence
+            && left.kind == right.kind
     });
     let combined_total = domain_total + lifecycle_total;
     let combined_has_more = domain_has_more || events.len() > limit;
@@ -1315,6 +1322,7 @@ async fn get_runtime_session_leases(AxumState(state): AxumState<Arc<AppState>>) 
 
 async fn acquire_runtime_session_lease(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(request): Json<RuntimeSessionLeaseAcquireRequest>,
 ) -> Json<Value> {
     let Some(registry) = state.session_lease_registry.as_ref() else {
@@ -1324,15 +1332,13 @@ async fn acquire_runtime_session_lease(
         }));
     };
     let mode = request.mode.as_deref().unwrap_or("collaborative");
-    Json(
-        registry
-            .acquire(&request.session_id, &request.owner, mode)
-            .await,
-    )
+    let owner = format!("principal:{}", principal.0.claims().principal_id);
+    Json(registry.acquire(&request.session_id, &owner, mode).await)
 }
 
 async fn release_runtime_session_lease(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(request): Json<RuntimeSessionLeaseReleaseRequest>,
 ) -> Json<Value> {
     let Some(registry) = state.session_lease_registry.as_ref() else {
@@ -1341,5 +1347,6 @@ async fn release_runtime_session_lease(
             "error": "session lease registry is not attached",
         }));
     };
-    Json(registry.release(&request.session_id, &request.owner).await)
+    let owner = format!("principal:{}", principal.0.claims().principal_id);
+    Json(registry.release(&request.session_id, &owner).await)
 }

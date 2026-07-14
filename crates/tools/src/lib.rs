@@ -19,6 +19,14 @@ use serde_json::Value;
 
 use crate::permissions::PermissionMode;
 
+/// Serializes tests that temporarily mutate process-wide state such as `PATH`
+/// or the current working directory. Production code never takes this lock.
+#[cfg(test)]
+pub(crate) fn test_process_environment_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 // Re-exports from split modules
 pub(crate) use tool_specs::{
     deferred_tool_specs, normalize_tool_name, permission_mode_from_plugin,
@@ -463,6 +471,8 @@ pub mod lane_policy;
 pub mod lsp_client;
 #[path = "state/mutation_plan.rs"]
 pub mod mutation_plan;
+#[path = "filesystem/path_policy.rs"]
+pub mod path_policy;
 #[path = "filesystem/pdf_extract.rs"]
 pub mod pdf_extract;
 #[path = "policy/permissions.rs"]

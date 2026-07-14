@@ -1,0 +1,91 @@
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
+use harness_contract::agent::{
+    AgentCapability, AgentDefinitionId, AgentTaskIntent, DefinitionScope, RevisionSelector,
+};
+use harness_contract::context::ContextBudgetLeaseRef;
+use runtime::{AgentBindingRequest, RuntimeServices};
+
+#[test]
+fn binding_compiler_intersects_capabilities_and_freezes_data_leases_into_a_snapshot() {
+    let services = RuntimeServices::in_memory().expect("runtime");
+    let mut request = AgentBindingRequest::new(
+        AgentDefinitionId::new(DefinitionScope::Builtin, "cowd/explore").expect("builtin id"),
+        RevisionSelector::LatestApprovedStable,
+        "instance:binding-test",
+        "session:binding-test",
+        "task:binding-test",
+    );
+    request.role_slot_id = Some("researcher:1".to_string());
+    request.team_id = Some("team:binding-test".to_string());
+    request.granted_capabilities = vec![AgentCapability::Read, AgentCapability::Search];
+    request.fact_boundaries = vec!["observed".to_string()];
+    request.fact_refs = vec!["fact:shipment-delay".to_string()];
+    request.matrix_snapshot_refs = vec!["matrix:source_snapshot:orders-v7".to_string()];
+    request.team_working_state_visible = true;
+
+    let compiled = services
+        .compile_agent_binding(request)
+        .expect("compile immutable binding");
+    let snapshot = compiled.snapshot;
+    assert_eq!(
+        snapshot.definition_ref.definition_id.as_str(),
+        "builtin/cowd/explore"
+    );
+    assert_eq!(snapshot.instance.instance_id, "instance:binding-test");
+    assert_eq!(
+        snapshot.instance.role_slot_id.as_deref(),
+        Some("researcher:1")
+    );
+    assert_eq!(snapshot.data_lease.fact_refs, vec!["fact:shipment-delay"]);
+    assert_eq!(
+        snapshot.data_lease.matrix_snapshot_refs,
+        vec!["matrix:source_snapshot:orders-v7"]
+    );
+    assert!(snapshot
+        .effective_capabilities
+        .contains(&AgentCapability::Read));
+    assert!(snapshot
+        .effective_capabilities
+        .contains(&AgentCapability::Search));
+    snapshot.validate().expect("persistable binding snapshot");
+    let packet = snapshot
+        .compile_task_packet(AgentTaskIntent {
+            selected_agent_id: None,
+            definition_ref: Some(snapshot.definition_ref.clone()),
+            granted_capabilities: Vec::new(),
+            run_id: "run:binding-test".to_string(),
+            task_id: "task:binding-test".to_string(),
+            session_id: "session:binding-test".to_string(),
+            mission_id: None,
+            team_id: Some("team:binding-test".to_string()),
+            graph_id: "graph:binding-test".to_string(),
+            node_id: "node:binding-test".to_string(),
+            attempt: 1,
+            expected_graph_revision: 0,
+            objective: "Inspect only leased facts and Matrix snapshots.".to_string(),
+            acceptance: vec!["evidence".to_string()],
+            constraints: Vec::new(),
+            context_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            allowed_tools: Vec::new(),
+            allowed_skills: Vec::new(),
+            permission_lease: "read_only".to_string(),
+            model_lease: "default".to_string(),
+            budget_lease: ContextBudgetLeaseRef::new(
+                "lease:binding-test",
+                "run:binding-test",
+                "agent_task",
+                4096,
+                1,
+            ),
+            managed_invocation: None,
+            idempotency_key: "binding-test:1".to_string(),
+        })
+        .expect("only a compiled binding may produce an executable packet");
+    assert_eq!(packet.agent_id, "instance:binding-test");
+    assert_eq!(
+        packet.binding.expect("binding packet").binding_digest,
+        snapshot.binding_digest
+    );
+}

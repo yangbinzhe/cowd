@@ -39,6 +39,8 @@ mod ontology;
 mod quality;
 #[path = "entity/relation.rs"]
 mod relation;
+#[path = "source/scenario.rs"]
+mod scenario;
 #[path = "source/source.rs"]
 mod source;
 #[path = "source/source_pack.rs"]
@@ -77,6 +79,10 @@ pub use ontology::{
 };
 pub use quality::MatrixQualityGateDecision;
 pub use relation::{MatrixImpactHop, MatrixImpactTrace, MatrixRelation, MatrixRelationInput};
+pub use scenario::{
+    MatrixScenarioOutputContract, MatrixScenarioResult, MatrixScenarioRun, MatrixScenarioRunStatus,
+    MatrixScenarioSpec, MatrixSnapshotRef,
+};
 pub use source::{
     MatrixSourceKind, MatrixSourceSnapshot, MatrixSourceSnapshotApplyReport,
     MatrixSourceSnapshotInput, MatrixSourceSnapshotPlan,
@@ -86,7 +92,7 @@ pub use source_pack::{
     MatrixSourcePackValidation, MatrixSourceRelationMapping,
 };
 
-pub const MATRIX_SCHEMA_VERSION: i64 = 18;
+pub const MATRIX_SCHEMA_VERSION: i64 = 19;
 
 #[must_use]
 pub fn matrix_reference(kind: &str, id: &str) -> String {
@@ -104,6 +110,6 @@ mod tests {
 
     #[test]
     fn matrix_schema_version_is_owned_by_matrix_contract() {
-        assert_eq!(MATRIX_SCHEMA_VERSION, 18);
+        assert_eq!(MATRIX_SCHEMA_VERSION, 19);
     }
 }

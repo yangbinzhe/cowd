@@ -16,6 +16,13 @@ impl EvolutionCapabilityGoal {
     #[must_use]
     pub fn for_kind(kind: EvolutionCandidateKind) -> Self {
         let (goal_id, name, metrics, owner, criteria) = match kind {
+            EvolutionCandidateKind::AgentDefinition => (
+                "agent_definition_quality",
+                "Agent Definition quality",
+                vec!["task_success", "policy_compliance", "regression_safety"],
+                "runtime",
+                vec!["agent revision proves protected evaluation dimensions are non-inferior"],
+            ),
             EvolutionCandidateKind::RuntimePolicy => (
                 "execution_efficiency",
                 "Execution efficiency",

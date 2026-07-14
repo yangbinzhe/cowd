@@ -9,6 +9,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::path_policy::WorkspacePathPolicy;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MutationEdit {
     pub path: String,
@@ -74,13 +76,17 @@ pub struct FileMutationApplied {
     pub replacement_count: usize,
 }
 
-pub fn preview_mutations(input: MutationPreviewInput) -> io::Result<MutationPreview> {
+pub fn preview_mutations(
+    policy: &WorkspacePathPolicy,
+    input: MutationPreviewInput,
+) -> io::Result<MutationPreview> {
     let grouped = group_edits(input.edits);
     let mut files = Vec::new();
     let mut conflict_count = 0usize;
 
     for (path, edits) in grouped {
-        let original = fs::read_to_string(&path)?;
+        let resolved = policy.resolve(&path)?;
+        let original = fs::read_to_string(&resolved)?;
         let expected_hash = stable_hash(&original);
         let mut updated = original.clone();
         let mut replacement_count = 0usize;
@@ -133,10 +139,16 @@ pub fn preview_mutations(input: MutationPreviewInput) -> io::Result<MutationPrev
     })
 }
 
-pub fn apply_mutations(input: MutationApplyInput) -> io::Result<MutationApplyOutput> {
-    let preview = preview_mutations(MutationPreviewInput {
-        edits: input.edits.clone(),
-    })?;
+pub fn apply_mutations(
+    policy: &WorkspacePathPolicy,
+    input: MutationApplyInput,
+) -> io::Result<MutationApplyOutput> {
+    let preview = preview_mutations(
+        policy,
+        MutationPreviewInput {
+            edits: input.edits.clone(),
+        },
+    )?;
     let conflicts = preview
         .files
         .iter()
@@ -153,7 +165,8 @@ pub fn apply_mutations(input: MutationApplyInput) -> io::Result<MutationApplyOut
     let grouped = group_edits(input.edits);
     let mut planned = Vec::new();
     for (path, edits) in grouped {
-        let original = fs::read_to_string(&path)?;
+        let resolved = policy.resolve(&path)?;
+        let original = fs::read_to_string(&resolved)?;
         let previous_hash = stable_hash(&original);
         if let Some(expected) = input.expected_hashes.get(&path) {
             if expected != &previous_hash {
@@ -177,7 +190,7 @@ pub fn apply_mutations(input: MutationApplyInput) -> io::Result<MutationApplyOut
             }
         }
         planned.push(PlannedMutation {
-            path: PathBuf::from(&path),
+            path: resolved,
             display_path: path,
             original,
             updated,
@@ -285,6 +298,7 @@ fn preview_text(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::path_policy::WorkspacePathPolicy;
 
     fn temp_file(name: &str, content: &str) -> std::path::PathBuf {
         let root =
@@ -298,14 +312,18 @@ mod tests {
     #[test]
     fn preview_detects_multiple_match_conflict() {
         let path = temp_file("conflict", "alpha\nalpha\n");
-        let preview = preview_mutations(MutationPreviewInput {
-            edits: vec![MutationEdit {
-                path: path.to_string_lossy().into_owned(),
-                old_string: "alpha".to_string(),
-                new_string: "omega".to_string(),
-                replace_all: None,
-            }],
-        })
+        let policy = WorkspacePathPolicy::new(path.parent().expect("parent"));
+        let preview = preview_mutations(
+            &policy,
+            MutationPreviewInput {
+                edits: vec![MutationEdit {
+                    path: path.to_string_lossy().into_owned(),
+                    old_string: "alpha".to_string(),
+                    new_string: "omega".to_string(),
+                    replace_all: None,
+                }],
+            },
+        )
         .expect("preview");
 
         assert_eq!(preview.conflict_count, 1);
@@ -316,18 +334,22 @@ mod tests {
     #[test]
     fn apply_refuses_stale_expected_hash() {
         let path = temp_file("stale", "alpha\n");
-        let err = apply_mutations(MutationApplyInput {
-            edits: vec![MutationEdit {
-                path: path.to_string_lossy().into_owned(),
-                old_string: "alpha".to_string(),
-                new_string: "omega".to_string(),
-                replace_all: None,
-            }],
-            expected_hashes: BTreeMap::from([(
-                path.to_string_lossy().into_owned(),
-                "stale".to_string(),
-            )]),
-        })
+        let policy = WorkspacePathPolicy::new(path.parent().expect("parent"));
+        let err = apply_mutations(
+            &policy,
+            MutationApplyInput {
+                edits: vec![MutationEdit {
+                    path: path.to_string_lossy().into_owned(),
+                    old_string: "alpha".to_string(),
+                    new_string: "omega".to_string(),
+                    replace_all: None,
+                }],
+                expected_hashes: BTreeMap::from([(
+                    path.to_string_lossy().into_owned(),
+                    "stale".to_string(),
+                )]),
+            },
+        )
         .expect_err("stale hash should fail");
 
         assert!(err.to_string().contains("changed before apply"));
@@ -343,25 +365,29 @@ mod tests {
         let _ = fs::create_dir_all(&root);
         let first = root.join("first.txt");
         let second = root.join("missing.txt");
+        let policy = WorkspacePathPolicy::new(&root);
         fs::write(&first, "alpha\n").expect("write first");
 
-        let err = apply_mutations(MutationApplyInput {
-            edits: vec![
-                MutationEdit {
-                    path: first.to_string_lossy().into_owned(),
-                    old_string: "alpha".to_string(),
-                    new_string: "omega".to_string(),
-                    replace_all: None,
-                },
-                MutationEdit {
-                    path: second.to_string_lossy().into_owned(),
-                    old_string: "beta".to_string(),
-                    new_string: "theta".to_string(),
-                    replace_all: None,
-                },
-            ],
-            expected_hashes: BTreeMap::new(),
-        })
+        let err = apply_mutations(
+            &policy,
+            MutationApplyInput {
+                edits: vec![
+                    MutationEdit {
+                        path: first.to_string_lossy().into_owned(),
+                        old_string: "alpha".to_string(),
+                        new_string: "omega".to_string(),
+                        replace_all: None,
+                    },
+                    MutationEdit {
+                        path: second.to_string_lossy().into_owned(),
+                        old_string: "beta".to_string(),
+                        new_string: "theta".to_string(),
+                        replace_all: None,
+                    },
+                ],
+                expected_hashes: BTreeMap::new(),
+            },
+        )
         .expect_err("missing second file should fail before first write");
 
         assert!(err.kind() == io::ErrorKind::NotFound);

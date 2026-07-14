@@ -232,6 +232,8 @@ mod tests {
             permission_lease: "permission-1".into(),
             model_lease: "model-1".into(),
             budget_lease: ContextBudgetLeaseRef::new("budget-1", "agent-1", "agent", 1000, 1),
+            binding: None,
+            managed_invocation: None,
             idempotency_key: "idempotency-1".into(),
         }
     }

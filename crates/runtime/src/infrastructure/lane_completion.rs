@@ -138,6 +138,7 @@ mod tests {
             revision: 1,
             model: None,
             provider: None,
+            binding: None,
             started_at_ms: 1,
             updated_at_ms: 1,
             failure: None,

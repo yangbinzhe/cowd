@@ -2340,6 +2340,65 @@ impl TuiState {
         if key.kind != crossterm::event::KeyEventKind::Press {
             return false;
         }
+        if key.code == KeyCode::Char('n') {
+            self.agent_team_panel.select_next_team_template();
+            return true;
+        }
+        if key.code == KeyCode::Char('t') {
+            let Some(template) = self.agent_team_panel.selected_team_template().cloned() else {
+                self.agent_team_panel.record_action_result(
+                    "team.instantiate",
+                    Err("No runnable Team template is loaded".to_string()),
+                );
+                return true;
+            };
+            let objective = self.app.input.lines().join("\n").trim().to_string();
+            if objective.is_empty() {
+                self.agent_team_panel.record_action_result(
+                    "team.instantiate",
+                    Err("Enter the Team objective in the composer before pressing t".to_string()),
+                );
+                return true;
+            }
+            let session_id = self.app.session_id.clone();
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_millis())
+                .unwrap_or_default();
+            let team_id = format!("tui-team-{nonce}");
+            let body = serde_json::json!({
+                "request_id": format!("tui-team-request-{nonce}"),
+                "team_id": team_id,
+                "session_id": session_id,
+                "selection_mode": "explicit",
+                "template_selector": {
+                    "kind": "latest_stable",
+                    "template_id": template.template_id,
+                },
+                "objective": objective,
+                "acceptance": template.result_fields,
+                "role_binding_overrides": [],
+                "cardinality_overrides": [],
+                "focus_partition_plans": [],
+                "permission_lease": "read_only",
+                "model_lease": "default",
+                "resource_scopes": [format!("session:{}", self.app.session_id)],
+            });
+            let result = run_gateway_api_blocking(move |client| async move {
+                let mut receipt = client.instantiate_team_template(body).await?;
+                if let Some(team_id) = receipt
+                    .pointer("/team/team_id")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    let working_state = client.team_working_state(team_id).await?;
+                    receipt["working_state"] = working_state;
+                }
+                Ok(receipt)
+            });
+            self.agent_team_panel
+                .record_action_result("team.instantiate", result);
+            return true;
+        }
         let action = match key.code {
             KeyCode::Char('i') => "input",
             KeyCode::Char('!') => "interrupt",
@@ -2403,8 +2462,7 @@ impl TuiState {
                     let missions = client.evolution_missions_summary().await?;
                     let proposals = client.evolution_proposals().await?;
                     let candidates = client.evolution_candidates().await?;
-                    let sandbox_evals = client.evolution_sandbox_evals().await?;
-                    let active_capabilities = client.evolution_active_capabilities().await?;
+                    let reviews = client.evolution_reviews().await?;
                     Ok(serde_json::json!({
                         "kind": "evolution.overview",
                         "signals": signals,
@@ -2412,11 +2470,135 @@ impl TuiState {
                         "missions": missions,
                         "proposals": proposals,
                         "candidates": candidates,
-                        "sandbox_evals": sandbox_evals,
-                        "active_capabilities": active_capabilities,
+                        "reviews": reviews,
                     }))
                 });
                 self.gateway_panel.record_evolution_overview(result);
+                true
+            }
+            KeyCode::Char('p') => {
+                let result = run_gateway_api_blocking(move |client| async move {
+                    let policy = client.evolution_evaluation_policy().await?;
+                    let reviews = client.evolution_evaluation_policy_reviews().await?;
+                    Ok(serde_json::json!({
+                        "kind": "evolution.evaluation_policy.overview",
+                        "policy": policy.get("policy").cloned().unwrap_or(policy),
+                        "reviews": reviews,
+                    }))
+                });
+                self.gateway_panel.record_evaluation_policy_overview(result);
+                true
+            }
+            KeyCode::Char('m') => {
+                let result =
+                    run_gateway_api_blocking(
+                        move |client| async move { client.managed_agents().await },
+                    );
+                self.gateway_panel.record_managed_agent_overview(result);
+                true
+            }
+            KeyCode::Char('D') => {
+                let result = run_gateway_api_blocking(move |client| async move {
+                    client.dispatch_managed_agents("tui-operator", 16).await
+                });
+                self.gateway_panel
+                    .record_action_result("runtime.managed_agents.dispatch_due_and_retry", result);
+                true
+            }
+            KeyCode::Char('R') => {
+                let Some(managed_agent_id) = self.gateway_panel.selected_managed_agent_health_id()
+                else {
+                    self.gateway_panel.record_action_result(
+                        "runtime.managed_agents.health.reset",
+                        Err("no degraded Managed Agent selected; press m to refresh".to_string()),
+                    );
+                    return true;
+                };
+                let result = run_gateway_api_blocking(move |client| async move {
+                    client.reset_managed_agent_health(&managed_agent_id).await
+                });
+                self.gateway_panel
+                    .record_action_result("runtime.managed_agents.health.reset", result);
+                true
+            }
+            KeyCode::Char('n') => {
+                self.gateway_panel.select_next_managed_agent_health();
+                true
+            }
+            KeyCode::Char('N') => {
+                self.gateway_panel.select_previous_managed_agent_health();
+                true
+            }
+            KeyCode::Char('[') => {
+                self.gateway_panel.select_previous_release_review();
+                true
+            }
+            KeyCode::Char(']') => {
+                self.gateway_panel.select_next_release_review();
+                true
+            }
+            KeyCode::Char('{') => {
+                self.gateway_panel.select_previous_policy_review();
+                true
+            }
+            KeyCode::Char('}') => {
+                self.gateway_panel.select_next_policy_review();
+                true
+            }
+            KeyCode::Char('a') | KeyCode::Char('x') => {
+                let decision = if matches!(key.code, KeyCode::Char('a')) {
+                    "approve"
+                } else {
+                    "reject"
+                };
+                let Some(review_id) = self.gateway_panel.selected_release_review_id() else {
+                    self.gateway_panel.record_action_result(
+                        &format!("evolution.release_review.{decision}"),
+                        Err("no pending release review selected; press v to refresh".to_string()),
+                    );
+                    return true;
+                };
+                let review_id_for_request = review_id.clone();
+                let decision_for_request = decision.to_string();
+                let result = run_gateway_api_blocking(move |client| async move {
+                    client
+                        .evolution_review_decision(
+                            &review_id_for_request,
+                            &decision_for_request,
+                            "TUI human operator decision",
+                        )
+                        .await
+                });
+                self.gateway_panel
+                    .record_release_review_decision(&review_id, decision, result);
+                true
+            }
+            KeyCode::Char('A') | KeyCode::Char('X') => {
+                let decision = if matches!(key.code, KeyCode::Char('A')) {
+                    "approve"
+                } else {
+                    "reject"
+                };
+                let Some(review_id) = self.gateway_panel.selected_policy_review_id() else {
+                    self.gateway_panel.record_action_result(
+                        &format!("evolution.evaluation_policy.{decision}"),
+                        Err("no pending policy review selected; press p to refresh".to_string()),
+                    );
+                    return true;
+                };
+                let review_id_for_request = review_id.clone();
+                let decision_for_request = decision.to_string();
+                let result = run_gateway_api_blocking(move |client| async move {
+                    client
+                        .evolution_evaluation_policy_review_decision(
+                            &review_id_for_request,
+                            &decision_for_request,
+                            "TUI human operator decision",
+                        )
+                        .await
+                });
+                self.gateway_panel
+                    .record_policy_review_decision(&review_id, decision, result);
                 true
             }
             KeyCode::Char('t') => {
@@ -3458,6 +3640,17 @@ impl TuiState {
             }
             Action::ToggleAgentPanel => {
                 self.agent_team_panel.toggle();
+                if self.agent_team_panel.visible {
+                    let result = run_gateway_api_blocking(move |client| async move {
+                        client.team_templates().await
+                    });
+                    match result {
+                        Ok(payload) => self.agent_team_panel.set_team_templates(&payload),
+                        Err(error) => self
+                            .agent_team_panel
+                            .record_action_result("team.templates", Err(error)),
+                    }
+                }
             }
             Action::TogglePerformanceDashboard => {
                 self.performance_dashboard.toggle();
@@ -5181,6 +5374,22 @@ mod tests {
         assert_eq!(state.active_topic_panel, None);
         assert_eq!(state.sidebar_active_tab, TAB_GATEWAY);
         assert_eq!(state.focus_target, FocusTarget::Sidebar);
+    }
+
+    #[test]
+    fn gateway_review_keys_fail_closed_without_a_loaded_pending_review() {
+        let mut state = TuiState::new("m", "s");
+        let event =
+            crossterm::event::Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+
+        assert!(state.handle_gateway_panel_action(&event));
+        assert_eq!(
+            state.gateway_panel.action_status.as_deref(),
+            Some(
+                "evolution.release_review.approve failed: no pending release review selected; press v to refresh"
+            )
+        );
+        assert!(state.gateway_panel.action_receipt.is_none());
     }
 
     #[test]

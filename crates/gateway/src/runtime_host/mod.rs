@@ -5,10 +5,13 @@
 // Shared state: ActiveSessions, CognitiveContextManager, ToolCatalog, SessionEventBus
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use axum::{
     http::{header, HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Response},
@@ -36,6 +39,133 @@ use runtime::session_lifecycle::{
 };
 
 pub mod config_reload;
+
+/// Gateway composition adapter for paired Definition evaluation. It owns no
+/// scoring, candidate state, or release decision: `harness-eval` loads and
+/// scores frozen scenarios while Runtime performs both real Agent runs.
+#[derive(Clone)]
+struct GatewayEvolutionScenarioExecutor {
+    runtime: Arc<OnceLock<Weak<runtime::RuntimeServices>>>,
+}
+
+#[async_trait]
+impl harness_eval::DefinitionEvolutionScenarioExecutor for GatewayEvolutionScenarioExecutor {
+    async fn execute(
+        &self,
+        candidate_id: &str,
+        scenario: &harness_contract::evaluation::EvaluationScenarioSpec,
+        sample_index: u32,
+    ) -> Result<
+        (
+            harness_contract::evaluation::EvaluationScenarioObservation,
+            harness_contract::evaluation::EvaluationScenarioObservation,
+        ),
+        String,
+    > {
+        let runtime = self
+            .runtime
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| "runtime_evaluation_executor_not_bound".to_string())?;
+        runtime
+            .execute_evolution_scenario(candidate_id, scenario, sample_index)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// Gateway owns the broker process lifetime but never opens its authority
+/// directory or signing key.  The child receives enrollment material once on
+/// stdin, then serves only its protected Unix socket.
+struct AuthBrokerProcess {
+    child: Child,
+    socket_path: PathBuf,
+}
+
+impl AuthBrokerProcess {
+    fn start(config_home: &Path, credential: &str) -> Result<Self, String> {
+        let root = config_home.join("auth-broker");
+        std::fs::create_dir_all(&root)
+            .map_err(|error| format!("failed to create auth broker root: {error}"))?;
+        let socket_path = auth_broker::BrokerClient::default_socket(&root);
+        if socket_path.exists() {
+            std::fs::remove_file(&socket_path)
+                .map_err(|error| format!("failed to remove stale auth broker socket: {error}"))?;
+        }
+        let binary = auth_broker_binary()?;
+        let mut child = Command::new(binary)
+            .arg("--root")
+            .arg(&root)
+            .arg("--socket")
+            .arg(&socket_path)
+            .arg("--credential-stdin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|error| format!("failed to spawn auth broker: {error}"))?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "auth broker stdin is unavailable".to_string())?;
+        stdin
+            .write_all(credential.as_bytes())
+            .and_then(|_| stdin.write_all(b"\n"))
+            .and_then(|_| stdin.flush())
+            .map_err(|error| format!("failed to enroll auth broker: {error}"))?;
+        drop(stdin);
+
+        let client = auth_broker::BrokerClient::new(&socket_path);
+        for _ in 0..40 {
+            if client.trust_metadata().is_ok() {
+                return Ok(Self { child, socket_path });
+            }
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|error| format!("failed to inspect auth broker: {error}"))?
+            {
+                return Err(format!("auth broker exited during startup: {status}"));
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        Err("auth broker did not become ready within one second".to_string())
+    }
+
+    fn shutdown(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+fn auth_broker_binary() -> Result<PathBuf, String> {
+    if let Some(path) = std::env::var_os("COWD_AUTH_BROKER_BIN") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(format!(
+            "COWD_AUTH_BROKER_BIN does not point to a file: {}",
+            path.display()
+        ));
+    }
+    let current = std::env::current_exe()
+        .map_err(|error| format!("failed to locate current executable: {error}"))?;
+    let binary_name = if cfg!(windows) {
+        "cowd-auth-broker.exe"
+    } else {
+        "cowd-auth-broker"
+    };
+    let candidate = current.with_file_name(binary_name);
+    candidate.is_file().then_some(candidate.clone()).ok_or_else(|| {
+        format!(
+            "auth broker binary is missing; install it beside Gateway or set COWD_AUTH_BROKER_BIN ({})",
+            candidate.display()
+        )
+    })
+}
 
 #[derive(Clone, Default)]
 struct RuntimeMcpServiceAdapter {
@@ -605,6 +735,11 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                 .map(|home| home.join(".cowd"))
         })
         .unwrap_or_else(|| std::path::PathBuf::from(".cowd"));
+    let mut auth_broker = config
+        .auth_token
+        .as_deref()
+        .map(|credential| AuthBrokerProcess::start(&approval_dir, credential))
+        .transpose()?;
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let config_load =
         runtime::ConfigLoader::new(&workspace_root, &approval_dir).load_with_diagnostics();
@@ -746,10 +881,29 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     );
     let runtime_tool_host: Arc<dyn runtime::RuntimeExecutionHost> =
         gateway_runtime_tool_host.clone();
+    // The evaluator is assembled at the composition root. Its weak Runtime
+    // reference is bound only after RuntimeServices exists, avoiding a
+    // dependency cycle while keeping Gateway out of scoring and release
+    // authorization.
+    let evolution_runtime = Arc::new(OnceLock::<Weak<runtime::RuntimeServices>>::new());
+    let evolution_scenarios = Arc::new(harness_eval::FileDefinitionEvolutionScenarioCatalog::new(
+        approval_dir.join("runtime").join("evolution-scenarios"),
+    ));
+    let evolution_executor = Arc::new(GatewayEvolutionScenarioExecutor {
+        runtime: Arc::clone(&evolution_runtime),
+    });
+    let evolution_eval_runner: Arc<dyn runtime::EvolutionEvalRunner> =
+        Arc::new(harness_eval::DefinitionEvolutionEvalRunner::new(Arc::new(
+            harness_eval::RuntimeDefinitionEvolutionWorkload::new(
+                evolution_scenarios,
+                evolution_executor,
+            ),
+        )));
     let mut runtime_services_builder =
         runtime::RuntimeServices::builder(&approval_dir, &workspace_root)
             .provider_registry(Arc::clone(&provider_registry))
             .tool_execution_host(runtime_tool_host)
+            .evolution_eval_runner(evolution_eval_runner)
             .mission_schedule_policy(
                 runtime_config
                     .runtime_control()
@@ -757,12 +911,25 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                     .mission_schedule
                     .clone(),
             );
+    let startup_skill_assets = crate::services::runtime_skill_assets_for_workspace(&workspace_root);
+    runtime_services_builder =
+        runtime_services_builder.skill_catalog(runtime::RuntimeSkillCatalog::new(
+            startup_skill_assets.profiles,
+            startup_skill_assets.prompt_assets,
+        ));
+    if let Some(memory_manager) = cognitive.as_ref() {
+        runtime_services_builder =
+            runtime_services_builder.memory_manager(Arc::clone(memory_manager));
+    }
     if let Some(store) = unified_store.as_ref() {
         runtime_services_builder = runtime_services_builder.session_store(Arc::clone(store));
     }
     let runtime_services = runtime_services_builder
         .build()
         .map_err(|error| format!("failed to initialize runtime services: {error}"))?;
+    evolution_runtime
+        .set(Arc::downgrade(&runtime_services))
+        .map_err(|_| "failed to bind Runtime evolution evaluation executor".to_string())?;
     run_legacy_execution_startup_migration(&runtime_services, &approval_dir)?;
     gateway_runtime_tool_host
         .bind_runtime_services(Arc::clone(&runtime_services))
@@ -829,7 +996,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         services: services,
         session_lease_registry: Some(lease_registry.clone()),
     });
-    let mission_schedule_timer = spawn_mission_schedule_timer(runtime_service.runtime_services());
+    let mission_schedule_timer = spawn_runtime_schedule_timer(runtime_service.runtime_services());
     config_reload::initialize_config_reload_status(&config_reload, &app_state);
     let _config_reload_watcher = config_reload::spawn_config_reload_watcher(
         config_reload,
@@ -948,6 +1115,9 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     session_runtime_bridge.shutdown().await;
     mission_schedule_timer.abort();
     let _ = mission_schedule_timer.await;
+    if let Some(broker) = auth_broker.as_mut() {
+        broker.shutdown();
+    }
 
     tracing::info!("surface host shutdown complete");
 
@@ -956,10 +1126,11 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     Ok(())
 }
 
-/// The timer is an event source only. It claims due durable occurrences and
-/// submits their canonical graphs; GraphRunner remains the sole owner of node
-/// state, retry, and terminal transitions.
-fn spawn_mission_schedule_timer(
+/// The timer is an event source only. It claims due Mission schedules and
+/// Managed Agent triggers, then sends both through Runtime's canonical
+/// Binding/graph paths. GraphRunner and the Managed Agent dispatcher retain
+/// ownership of all execution state, retry and terminal transitions.
+fn spawn_runtime_schedule_timer(
     runtime_services: Arc<runtime::RuntimeServices>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -972,6 +1143,15 @@ fn spawn_mission_schedule_timer(
                 {
                     tracing::warn!(%error, "mission schedule timer dispatch failed");
                 }
+            }
+            // Managed Agents have independent trigger definitions. They do
+            // not become inert merely because Mission scheduling is disabled;
+            // the existing interval is only the shared wake-up cadence.
+            if let Err(error) = runtime_services
+                .dispatch_managed_agents("gateway-runtime-scheduler", 16)
+                .await
+            {
+                tracing::warn!(%error, "managed Agent timer dispatch failed");
             }
             tokio::time::sleep(Duration::from_millis(policy.tick_interval_ms)).await;
         }
@@ -995,15 +1175,9 @@ fn run_legacy_execution_startup_migration(
     if !legacy_inventory.exists() && !legacy_receipt.exists() {
         return Ok(());
     }
-    runtime::LegacyExecutionImporter::new(
-        Arc::clone(runtime_services.event_store()),
-        runtime_services.workspace_key(),
-        runtime_services.workspace_root(),
-        env!("CARGO_PKG_VERSION"),
-    )
-    .import_receipt_file(&legacy_receipt)
-    .map(|_| ())
-    .map_err(|error| format!("legacy execution migration failed; startup blocked: {error}"))
+    runtime_services
+        .import_legacy_execution_receipt(&legacy_receipt, env!("CARGO_PKG_VERSION"))
+        .map_err(|error| format!("legacy execution migration failed; startup blocked: {error}"))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────

@@ -12,6 +12,11 @@ pub struct RuntimeToolExecutionRequest {
     pub tool_name: String,
     pub input: String,
     pub category: ToolSafetyCategory,
+    /// Runtime-issued authorization for an ordinary tool effect. Gateway
+    /// control tools do not use this field; delegated Agent tools carry it so
+    /// the concrete ToolHost can verify the same descriptor before execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<harness_contract::tool::ToolExecutionAuthorization>,
     /// Logical parent session that owns this graph node. It is not inferred
     /// from a process-global tool host, because a single Gateway serves many
     /// concurrent sessions.
@@ -25,6 +30,16 @@ pub struct RuntimeToolExecutionRequest {
     /// by the Runner, never parsed from model-generated tool JSON.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_execution: Option<ExecutionParentBinding>,
+    /// Runtime-issued paired evaluation traffic. Tool adapters use this to
+    /// enforce the evaluation isolation policy rather than trusting a model
+    /// supplied session or tool parameter.
+    #[serde(default)]
+    pub evaluation_isolated: bool,
+    /// Runtime-issued Managed Agent invocation fence.  Gateway may execute a
+    /// side effect only after Runtime has recorded and claimed the matching
+    /// outbox entry; conversational calls always leave this empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_invocation: Option<harness_contract::managed_agent::ManagedAgentInvocationFence>,
 }
 
 impl RuntimeToolExecutionRequest {
@@ -36,9 +51,12 @@ impl RuntimeToolExecutionRequest {
             tool_name: request.tool_name.clone(),
             input: request.input.clone(),
             category: ToolSafetyCategory::from_tool_name(&request.tool_name),
+            authorization: None,
             session_id: None,
             model_lease: None,
             parent_execution: None,
+            evaluation_isolated: false,
+            managed_invocation: None,
         }
     }
 }
@@ -87,5 +105,15 @@ pub trait RuntimeExecutionHost: Send + Sync {
                 input_schema: serde_json::json!({"type": "object"}),
             })
             .collect()
+    }
+
+    /// Return the concrete host descriptor used to authorize a delegated
+    /// tool. `None` means that the current host snapshot cannot execute it.
+    fn delegated_tool_effect_descriptor(
+        &self,
+        _tool_name: &str,
+        _input: &serde_json::Value,
+    ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
+        None
     }
 }

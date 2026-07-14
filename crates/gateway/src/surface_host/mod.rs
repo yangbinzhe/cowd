@@ -19,7 +19,8 @@ mod types;
 pub(crate) use ingress::spawn_surface_ingress_dispatcher;
 pub(crate) use message_store::{
     SurfaceDeliveryEvent, SurfaceInboxReceipt, SurfaceInboxRecord, SurfaceMessageSnapshot,
-    SurfaceMessageStore, SurfaceOutboxRecord,
+    SurfaceMessageStore, SurfaceOutboxRecord, SurfaceTriggerEventReceipt,
+    SurfaceTriggerEventRecord,
 };
 pub(crate) use types::{
     SurfaceDiscoveryFailure, SurfaceDiscoveryReport, SurfaceHostHealth, SurfaceResourceSummary,

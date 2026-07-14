@@ -1,3 +1,7 @@
+use axum::extract::Extension;
+
+use crate::api_routes::{principal_actor_id, AuthenticatedPrincipal};
+
 use super::*;
 
 pub(super) async fn mfg_cockpit_profile_upsert_handler(
@@ -94,8 +98,10 @@ pub(super) async fn mfg_cockpit_report_get_handler(
 pub(super) async fn mfg_cockpit_report_deliver_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
-    Json(request): Json<MfgCockpitReportDeliveryRequest>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Json(intent): Json<MfgCockpitReportDeliveryIntent>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let request = intent.into_request(principal_actor_id(&principal));
     let report = state
         .services
         .mfg
@@ -136,6 +142,7 @@ pub(super) async fn mfg_cockpit_report_delivery_state_handler(
 pub(super) async fn mfg_cockpit_report_delivery_retry_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(request): Json<MfgCockpitReportDeliveryRetryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let report = state
@@ -154,7 +161,12 @@ pub(super) async fn mfg_cockpit_report_delivery_retry_handler(
             ),
         ));
     }
-    let delivery_request = mfg_retry_delivery_request(&report, &before_state, request);
+    let delivery_request = mfg_retry_delivery_request(
+        &report,
+        &before_state,
+        request,
+        principal_actor_id(&principal),
+    );
     let outcome = deliver_mfg_cockpit_report(&state, report, delivery_request).await?;
     let after_state = MfgCockpitReportDeliveryState::from_report(&outcome.report);
     Ok(Json(serde_json::json!({
@@ -167,6 +179,7 @@ pub(super) async fn mfg_cockpit_report_delivery_retry_handler(
 
 pub(super) async fn mfg_cockpit_report_schedule_run_handler(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(request): Json<MfgCockpitReportScheduleRunRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let limit = request.limit.unwrap_or(50).clamp(1, 100);
@@ -211,8 +224,12 @@ pub(super) async fn mfg_cockpit_report_schedule_run_handler(
             })?;
 
         if request.deliver {
-            let delivery_request =
-                mfg_schedule_delivery_request(&profile, &report, &request, delivery_count);
+            let delivery_request = mfg_schedule_delivery_request(
+                &report,
+                &request,
+                delivery_count,
+                principal_actor_id(&principal),
+            );
             let outcome = deliver_mfg_cockpit_report(&state, report, delivery_request).await?;
             delivery_count += 1;
             items.push(serde_json::json!({
@@ -379,10 +396,10 @@ fn default_mfg_schedule_delivery_ref(
 }
 
 fn mfg_schedule_delivery_request(
-    profile: &MfgCockpitProfile,
     report: &MfgCockpitReportSnapshot,
     request: &MfgCockpitReportScheduleRunRequest,
     delivery_index: usize,
+    actor_principal: String,
 ) -> MfgCockpitReportDeliveryRequest {
     MfgCockpitReportDeliveryRequest {
         mode: request.mode.clone(),
@@ -397,10 +414,7 @@ fn mfg_schedule_delivery_request(
             report.report_id,
             delivery_index
         )),
-        actor_principal: request
-            .actor_principal
-            .clone()
-            .or_else(|| Some(profile.owner_ref.clone())),
+        actor_principal,
         actor_identity_ref: request.actor_identity_ref.clone(),
         source_channel: request
             .source_channel
@@ -419,6 +433,7 @@ fn mfg_retry_delivery_request(
     report: &MfgCockpitReportSnapshot,
     state: &MfgCockpitReportDeliveryState,
     request: MfgCockpitReportDeliveryRetryRequest,
+    actor_principal: String,
 ) -> MfgCockpitReportDeliveryRequest {
     let latest_receipt_id = state
         .latest_receipt
@@ -435,9 +450,7 @@ fn mfg_retry_delivery_request(
                 state.attempt_count + 1
             ))
         }),
-        actor_principal: request
-            .actor_principal
-            .or_else(|| Some(report.owner_ref.clone())),
+        actor_principal,
         actor_identity_ref: request.actor_identity_ref,
         source_channel: request
             .source_channel

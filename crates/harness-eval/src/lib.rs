@@ -35,7 +35,11 @@ mod runner;
 mod terminal_gate;
 mod terminal_matrix;
 
-pub use evolution::{evaluate_evolution_closure, EvolutionClosureReport};
+pub use evolution::{
+    evaluate_evolution_closure, DefinitionEvolutionEvalRunner, DefinitionEvolutionScenarioCatalog,
+    DefinitionEvolutionScenarioExecutor, DefinitionEvolutionWorkload, EvolutionClosureReport,
+    FileDefinitionEvolutionScenarioCatalog, RuntimeDefinitionEvolutionWorkload,
+};
 pub use live_scenario_runner::run_live_gateway_scenarios;
 pub use paired_performance::{run_paired_performance, PairedPerformanceOptions};
 pub use report::{

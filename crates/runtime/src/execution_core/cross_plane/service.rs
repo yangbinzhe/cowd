@@ -155,6 +155,26 @@ impl CrossPlaneRuntimeService {
         audit: CrossPlaneAuditRecord,
         receipt: CrossPlaneExecutionReceipt,
     ) -> Result<(String, CrossPlaneExecutionReceipt), CrossPlaneRuntimeError> {
+        self.record_action_execution_with_grant_consumption(audit, receipt, false)
+    }
+
+    /// Atomically persist a terminal effect receipt and consume its matched
+    /// single-use grant.  The snapshot append rolls both changes back together
+    /// if durable persistence fails; idempotent replays return before consuming.
+    pub fn record_completed_effect_execution(
+        &self,
+        audit: CrossPlaneAuditRecord,
+        receipt: CrossPlaneExecutionReceipt,
+    ) -> Result<(String, CrossPlaneExecutionReceipt), CrossPlaneRuntimeError> {
+        self.record_action_execution_with_grant_consumption(audit, receipt, true)
+    }
+
+    fn record_action_execution_with_grant_consumption(
+        &self,
+        mut audit: CrossPlaneAuditRecord,
+        receipt: CrossPlaneExecutionReceipt,
+        consume_single_use_grant: bool,
+    ) -> Result<(String, CrossPlaneExecutionReceipt), CrossPlaneRuntimeError> {
         self.mutate("execution_recorded", move |control| {
             if let Some(existing) = receipt
                 .idempotency_key
@@ -165,6 +185,14 @@ impl CrossPlaneRuntimeService {
                     existing.audit_record_id.clone().unwrap_or_default(),
                     existing,
                 );
+            }
+            if consume_single_use_grant {
+                if let Some((grant_id, remaining_uses)) =
+                    control.consume_matched_grant_for_decision(&receipt.decision)
+                {
+                    audit.evidence.consumed_grant_id = Some(grant_id);
+                    audit.evidence.remaining_uses_after = Some(remaining_uses);
+                }
             }
             let audit_id = audit.id.clone();
             control.record_audit(audit);
@@ -495,6 +523,79 @@ mod tests {
         assert_eq!(first.1.id, second.1.id);
         assert_eq!(service.list_audit(10, 0).len(), 1);
         assert_eq!(service.list_executions(10, 0).len(), 1);
+    }
+
+    #[test]
+    fn completed_effect_consumes_single_use_grant_once_with_its_receipt() {
+        let service = CrossPlaneRuntimeService::open(Arc::new(
+            RuntimeEventStore::try_open_in_memory().unwrap(),
+        ))
+        .unwrap();
+        let mut grant = CrossPlaneGrant::persistent("alice", "channel.send");
+        grant.grant_type = crate::GrantType::SingleUse;
+        let grant_id = grant.id.clone();
+        service.upsert_grant(grant).unwrap();
+
+        let mut action = CrossPlaneAction::new("alice", "channel.send");
+        action.identity_trust = crate::IdentityTrust::Verified;
+        action.risk = harness_contract::policy::CrossPlaneRisk::High;
+        let (action, decision, evidence) =
+            service.decide_with_connector_context(action, None, Utc::now());
+        assert_eq!(decision.decision, crate::PolicyDecisionKind::Allow);
+        assert_eq!(
+            decision
+                .matched_grant
+                .as_ref()
+                .map(|matched| matched.id.as_str()),
+            Some(grant_id.as_str())
+        );
+
+        let build = || {
+            let audit = CrossPlaneAuditRecord::new(
+                action.clone(),
+                decision.clone(),
+                "executed",
+                "side effect completed",
+            )
+            .with_evidence(evidence.clone());
+            let receipt = CrossPlaneExecutionReceipt::new(
+                Some("completed-effect-key".to_string()),
+                "commit",
+                "executed",
+                "sent",
+                action.clone(),
+                decision.clone(),
+                Vec::new(),
+                Some(audit.id.clone()),
+            );
+            (audit, receipt)
+        };
+
+        let (audit, receipt) = build();
+        let first = service
+            .record_completed_effect_execution(audit, receipt)
+            .unwrap();
+        let (audit, receipt) = build();
+        let replay = service
+            .record_completed_effect_execution(audit, receipt)
+            .unwrap();
+
+        assert_eq!(first.1.id, replay.1.id);
+        assert_eq!(
+            service
+                .list_grants()
+                .into_iter()
+                .find(|entry| entry.id == grant_id)
+                .and_then(|entry| entry.remaining_uses),
+            Some(0)
+        );
+        assert_eq!(service.list_audit(10, 0).len(), 1);
+        let audit = service.list_audit(10, 0).pop().unwrap();
+        assert_eq!(
+            audit.evidence.consumed_grant_id.as_deref(),
+            Some(grant_id.as_str())
+        );
+        assert_eq!(audit.evidence.remaining_uses_after, Some(0));
     }
 
     #[test]

@@ -208,7 +208,10 @@ fn memory_scope_fact_key(scope: &MemoryScope) -> String {
         MemoryScope::Project(id) => format!("project:{id}"),
         MemoryScope::Session(id) => format!("session:{id}"),
         MemoryScope::Task(id) => format!("task:{id}"),
-        MemoryScope::Agent(id) => format!("agent:{id}"),
+        MemoryScope::AgentDefinitionLineage(id) => format!("agent_definition:{id}"),
+        MemoryScope::AgentInstance(id) => format!("agent_instance:{id}"),
+        MemoryScope::TeamRun(id) => format!("team_run:{id}"),
+        MemoryScope::LegacyUnresolvedAgent(id) => format!("legacy_agent:{id}"),
     }
 }
 

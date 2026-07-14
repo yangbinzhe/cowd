@@ -34,13 +34,11 @@ impl MfgService {
         execution: &MfgActionExecution,
         request: &MfgCrossPlaneBridgeRequest,
     ) -> CrossPlaneAction {
-        let actor_principal = request
-            .actor_principal
-            .as_deref()
-            .or(execution.operator_id.as_deref())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("mfg:operator");
+        let actor_principal = request.actor_principal.trim();
+        debug_assert!(
+            !actor_principal.is_empty(),
+            "Gateway must inject the verified principal before MFG dispatch"
+        );
         let requested_capability = request
             .requested_capability
             .as_deref()

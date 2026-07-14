@@ -94,6 +94,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
+name = "auth-broker"
+version = "0.9.483"
+dependencies = [
+ "base64",
+ "harness-contract",
+ "ring",
+ "serde",
+ "serde_json",
+ "subtle",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -715,7 +729,9 @@ dependencies = [
  "app-mfg",
  "approval",
  "async-trait",
+ "auth-broker",
  "axum",
+ "base64",
  "chrono",
  "connector",
  "fact-kernel",
@@ -733,6 +749,7 @@ dependencies = [
  "reqwest",
  "runtime",
  "rusqlite",
+ "sandbox-launcher",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -829,6 +846,7 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "uuid",
 ]
@@ -837,7 +855,9 @@ dependencies = [
 name = "harness-eval"
 version = "0.9.483"
 dependencies = [
+ "async-trait",
  "fact-kernel",
+ "futures",
  "harness-contract",
  "memory",
  "reqwest",
@@ -2073,6 +2093,7 @@ dependencies = [
  "harness-contract",
  "libc",
  "matrix-core",
+ "matrix-repository",
  "memory",
  "model-protocol",
  "plugins",
@@ -2082,6 +2103,7 @@ dependencies = [
  "rand 0.8.6",
  "regex",
  "reqwest",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2091,6 +2113,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "toml",
  "tracing",
  "uuid",
  "walkdir",
@@ -2202,6 +2225,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "sandbox-launcher"
+version = "0.9.483"
+dependencies = [
+ "thiserror",
 ]
 
 [[package]]
@@ -2821,6 +2851,7 @@ dependencies = [
  "plugins",
  "regex",
  "reqwest",
+ "sandbox-launcher",
  "serde",
  "serde_json",
  "serde_yaml",

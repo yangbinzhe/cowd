@@ -1,7 +1,7 @@
 use std::{collections::HashSet, path::Path as FsPath, sync::Arc};
 
 use axum::{
-    extract::{Path, State as AxumState},
+    extract::{Extension, Path, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, post},
@@ -13,7 +13,7 @@ use runtime::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::{message_connector_routes, AppState};
+use super::{message_connector_routes, principal_actor_id, AppState, AuthenticatedPrincipal};
 use crate::services::{CrossPlaneExecutionRecord, GatewayCrossPlaneExecutor};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
@@ -68,12 +68,56 @@ struct CrossPlaneIdentityResolveRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CrossPlaneActionExecuteRequest {
-    action: CrossPlaneAction,
+    action: CrossPlaneActionIntent,
     #[serde(default = "default_execute_mode")]
     mode: String,
     #[serde(default)]
     idempotency_key: Option<String>,
+}
+
+/// Untrusted action description supplied by a caller.  The authenticated
+/// Gateway principal is deliberately excluded and injected at the boundary.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CrossPlaneActionIntent {
+    #[serde(default)]
+    actor_identity_ref: Option<String>,
+    #[serde(default)]
+    source_channel: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    requested_capability: String,
+    #[serde(default)]
+    provider_account: Option<String>,
+    #[serde(default)]
+    target_ref: Option<String>,
+    #[serde(default)]
+    resource_ref: Option<String>,
+    #[serde(default = "default_cross_plane_risk")]
+    risk: harness_contract::policy::CrossPlaneRisk,
+    #[serde(default = "default_data_classification")]
+    data_classification: harness_contract::policy::DataClassification,
+    #[serde(default = "default_identity_trust")]
+    identity_trust: runtime::IdentityTrust,
+}
+
+impl CrossPlaneActionIntent {
+    fn into_action(self, principal: &AuthenticatedPrincipal) -> CrossPlaneAction {
+        let mut action =
+            CrossPlaneAction::new(principal_actor_id(principal), self.requested_capability);
+        action.actor_identity_ref = self.actor_identity_ref;
+        action.source_channel = self.source_channel;
+        action.session_id = self.session_id;
+        action.provider_account = self.provider_account;
+        action.target_ref = self.target_ref;
+        action.resource_ref = self.resource_ref;
+        action.risk = self.risk;
+        action.data_classification = self.data_classification;
+        action.identity_trust = self.identity_trust;
+        action
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -100,6 +144,18 @@ struct CrossPlaneAdapterCapability {
 
 fn default_execute_mode() -> String {
     "dry_run".to_string()
+}
+
+fn default_cross_plane_risk() -> harness_contract::policy::CrossPlaneRisk {
+    harness_contract::policy::CrossPlaneRisk::Low
+}
+
+fn default_data_classification() -> harness_contract::policy::DataClassification {
+    harness_contract::policy::DataClassification::Internal
+}
+
+fn default_identity_trust() -> runtime::IdentityTrust {
+    runtime::IdentityTrust::Unknown
 }
 
 async fn cross_plane_summary_handler(
@@ -299,10 +355,15 @@ async fn cross_plane_action_executions_handler(
 
 async fn cross_plane_policy_simulate_handler(
     AxumState(state): AxumState<Arc<AppState>>,
-    Json(action): Json<CrossPlaneAction>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Json(intent): Json<CrossPlaneActionIntent>,
 ) -> impl IntoResponse {
-    let (action, decision, evidence) =
-        decide_connector_action(&state, action, "dry_run", chrono::Utc::now());
+    let (action, decision, evidence) = decide_connector_action(
+        &state,
+        intent.into_action(&principal),
+        "dry_run",
+        chrono::Utc::now(),
+    );
     Json(serde_json::json!({
         "kind": "cross_plane_policy_simulation",
         "action": action,
@@ -313,9 +374,16 @@ async fn cross_plane_policy_simulate_handler(
 
 async fn cross_plane_action_preflight_handler(
     AxumState(state): AxumState<Arc<AppState>>,
-    Json(action): Json<CrossPlaneAction>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Json(intent): Json<CrossPlaneActionIntent>,
 ) -> impl IntoResponse {
-    let readiness = evaluate_action_readiness(&state, action, "dry_run", chrono::Utc::now()).await;
+    let readiness = evaluate_action_readiness(
+        &state,
+        intent.into_action(&principal),
+        "dry_run",
+        chrono::Utc::now(),
+    )
+    .await;
     Json(serde_json::json!({
         "kind": "cross_plane_action_preflight",
         "action": readiness.action,
@@ -332,6 +400,7 @@ async fn cross_plane_action_preflight_handler(
 
 async fn cross_plane_action_execute_handler(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(request): Json<CrossPlaneActionExecuteRequest>,
 ) -> impl IntoResponse {
     let now = chrono::Utc::now();
@@ -370,7 +439,8 @@ async fn cross_plane_action_execute_handler(
             }));
         }
     }
-    let mut readiness = evaluate_action_readiness(&state, request.action, &mode, now).await;
+    let mut readiness =
+        evaluate_action_readiness(&state, request.action.into_action(&principal), &mode, now).await;
     let evidence = readiness.evidence.clone();
     let mut status = "blocked";
     let mut dispatch_status = "not_started";
@@ -464,33 +534,37 @@ async fn cross_plane_action_execute_handler(
         audit_summary = "commit_requires_bound_surface_adapter".to_string();
     }
 
-    let (audit_record_id, receipt) =
-        match state
+    let record = CrossPlaneExecutionRecord {
+        idempotency_key: idempotency_key.clone(),
+        mode: mode.clone(),
+        status: status.to_string(),
+        dispatch_status: dispatch_status.to_string(),
+        action: readiness.action.clone(),
+        decision: readiness.decision.clone(),
+        blockers: readiness.blockers.clone(),
+        dispatch_target: readiness.dispatch_target.clone(),
+        dispatch_outcome: dispatch_outcome.clone(),
+        evidence,
+        audit_result: audit_result.to_string(),
+        audit_summary,
+        execution_graph_id: execution_graph.as_ref().map(|graph| graph.graph_id.clone()),
+    };
+    let (audit_record_id, receipt) = match if mode == "commit" && dispatched {
+        state
             .services
             .cross_plane
-            .record_action_execution(CrossPlaneExecutionRecord {
-                idempotency_key: idempotency_key.clone(),
-                mode: mode.clone(),
-                status: status.to_string(),
-                dispatch_status: dispatch_status.to_string(),
-                action: readiness.action.clone(),
-                decision: readiness.decision.clone(),
-                blockers: readiness.blockers.clone(),
-                dispatch_target: readiness.dispatch_target.clone(),
-                dispatch_outcome: dispatch_outcome.clone(),
-                evidence,
-                audit_result: audit_result.to_string(),
-                audit_summary,
-                execution_graph_id: execution_graph.as_ref().map(|graph| graph.graph_id.clone()),
-            }) {
-            Ok(committed) => committed,
-            Err(error) => {
-                return Json(serde_json::json!({
-                    "kind": "cross_plane_action_execution_failed",
-                    "error": error.to_string(),
-                }));
-            }
-        };
+            .record_completed_effect_execution(record)
+    } else {
+        state.services.cross_plane.record_action_execution(record)
+    } {
+        Ok(committed) => committed,
+        Err(error) => {
+            return Json(serde_json::json!({
+                "kind": "cross_plane_action_execution_failed",
+                "error": error.to_string(),
+            }));
+        }
+    };
 
     Json(serde_json::json!({
         "kind": "cross_plane_action_execution",
