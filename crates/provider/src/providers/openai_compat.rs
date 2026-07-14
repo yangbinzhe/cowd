@@ -747,6 +747,15 @@ impl StreamState {
             if let Some(calls) = parse_compat_tool_calls(&frame, &self.exposed_tool_names) {
                 self.emit_dsml_tool_calls(calls, &mut events);
             } else {
+                let preview = if frame.chars().count() > 100 {
+                    format!("{}…", frame.chars().take(100).collect::<String>())
+                } else {
+                    frame.clone()
+                };
+                tracing::warn!(
+                    dsml_frame_preview = %preview,
+                    "rejected malformed DSML tool-call frame; falling back to text emission"
+                );
                 self.emit_text_content(frame, &mut events);
             }
         }

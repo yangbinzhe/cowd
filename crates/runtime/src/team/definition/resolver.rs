@@ -153,23 +153,27 @@ mod tests {
         store: &TeamTemplateDefinitionStore<super::super::store::ScopedTeamTemplateLayout>,
         revision: u64,
     ) -> TeamTemplateDefinitionId {
+        publish_scoped(store, DefinitionScope::Workspace, revision)
+    }
+
+    fn publish_scoped(
+        store: &TeamTemplateDefinitionStore<super::super::store::ScopedTeamTemplateLayout>,
+        scope: DefinitionScope,
+        revision: u64,
+    ) -> TeamTemplateDefinitionId {
         let stored = store
             .store_revision(
-                manifest(
-                    DefinitionScope::Workspace,
-                    revision,
-                    RevisionLifecycle::Published,
-                ),
+                manifest(scope, revision, RevisionLifecycle::Published),
                 markdown(),
             )
             .unwrap();
         store
             .record_release_assignment(&TeamReleaseAssignment {
-                scope: DefinitionScope::Workspace,
+                scope,
                 revision_ref: stored.revision.revision_ref.clone(),
                 channel: ReleaseChannel::Stable,
                 status: ReleaseAssignmentStatus::Active,
-                authorization: release_authorization(DefinitionScope::Workspace),
+                authorization: release_authorization(scope),
                 content_digest: stored.revision.content_digest,
             })
             .unwrap();
@@ -179,6 +183,14 @@ mod tests {
     fn agents() -> EligibleAgents {
         let mut agents = EligibleAgents::default();
         agents.0.insert(("workspace/cowd/reviewer".to_string(), 1));
+        agents
+    }
+
+    fn builtin_agents() -> EligibleAgents {
+        let mut agents = EligibleAgents::default();
+        agents
+            .0
+            .insert(("builtin/cowd/reviewer".to_string(), 1));
         agents
     }
 
@@ -223,6 +235,77 @@ mod tests {
             )),
             Err(TeamDefinitionStoreError::ManualPinProtected)
         ));
+    }
+
+    #[test]
+    fn latest_approved_stable_default_pointer_resolves_to_latest_eligible_revision() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let id = publish(&store, 1);
+        publish(&store, 2);
+        let resolver = TeamTemplateDefinitionResolver::new(&store);
+        store
+            .set_default_pointer(&TeamDefaultPointer::latest(
+                DefinitionScope::Workspace,
+                id.clone(),
+                release_authorization(DefinitionScope::Workspace),
+            ))
+            .unwrap();
+        assert_eq!(
+            resolver
+                .resolve_default(&id, &agents())
+                .unwrap()
+                .revision
+                .revision_ref
+                .revision,
+            2,
+            "LatestApprovedStable default pointer must resolve to the latest eligible revision"
+        );
+    }
+
+    #[test]
+    fn bootstrapped_builtin_team_resolves_latest_approved_stable_through_default_pointer() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let id = publish_scoped(&store, DefinitionScope::Builtin, 1);
+        publish_scoped(&store, DefinitionScope::Builtin, 2);
+        let resolver = TeamTemplateDefinitionResolver::new(&store);
+        store
+            .set_default_pointer(&TeamDefaultPointer::latest(
+                DefinitionScope::Builtin,
+                id.clone(),
+                release_authorization(DefinitionScope::Builtin),
+            ))
+            .unwrap();
+        let pointer = store.default_pointer(&id).unwrap();
+        assert_eq!(
+            pointer.selector,
+            RevisionSelector::LatestApprovedStable,
+            "default pointer selector must be LatestApprovedStable"
+        );
+        assert_eq!(
+            resolver
+                .resolve(&id, RevisionSelector::LatestApprovedStable, &builtin_agents())
+                .unwrap()
+                .revision
+                .revision_ref
+                .revision,
+            2,
+            "direct LatestApprovedStable resolution must find the latest eligible revision"
+        );
+        let resolved = resolver
+            .resolve_default(&id, &builtin_agents())
+            .unwrap();
+        assert_eq!(
+            resolved.revision.revision_ref.revision,
+            2,
+            "LatestApprovedStable default pointer must resolve to the latest eligible revision"
+        );
+        assert_eq!(
+            resolved.selected_by,
+            RevisionSelector::DefaultPointer,
+            "selected_by reflects the top-level selector passed to resolve"
+        );
     }
 
     #[test]

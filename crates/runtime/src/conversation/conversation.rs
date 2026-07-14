@@ -4586,6 +4586,21 @@ where
     }
 
     #[must_use]
+    pub fn tool_executor(&self) -> &Arc<T> {
+        &self.tool_executor
+    }
+
+    #[must_use]
+    pub fn permission_policy(&self) -> &PermissionPolicy {
+        &self.permission_policy
+    }
+
+    #[must_use]
+    pub fn tool_timeout(&self) -> Option<std::time::Duration> {
+        self.tool_timeout
+    }
+
+    #[must_use]
     #[allow(
         clippy::panic,
         reason = "the synchronous compatibility API cannot return an error; an OS worker that cannot join would violate the session read contract"
