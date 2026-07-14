@@ -565,32 +565,6 @@ impl PidFileGuard {
     }
 }
 
-struct GatewayTokenFile;
-
-impl GatewayTokenFile {
-    fn write_if_configured(auth_token: Option<&str>) {
-        let Some(token) = auth_token.filter(|t| !t.is_empty()) else {
-            return;
-        };
-        let Ok(home) = std::env::var("HOME") else { return };
-        let token_path = std::path::PathBuf::from(home).join(".cowd").join("gateway.token");
-        if let Err(e) = std::fs::create_dir_all(token_path.parent().unwrap()) {
-            tracing::warn!("failed to create token dir: {e}");
-            return;
-        }
-        if let Err(e) = std::fs::write(&token_path, token) {
-            tracing::warn!("failed to write gateway token file: {e}");
-        } else {
-            tracing::info!(path = %token_path.display(), "gateway token file written for TUI auto-auth");
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600));
-        }
-    }
-}
-
 async fn webui_not_configured_handler() -> impl IntoResponse {
     (
         StatusCode::NOT_FOUND,
@@ -720,7 +694,6 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     let started_at = Instant::now();
     // 0. Write PID file (removed on drop via guard)
     let _pid_guard = PidFileGuard::new()?;
-    GatewayTokenFile::write_if_configured(config.auth_token.as_deref());
 
     // 1. Initialise shared state
     let sessions = Arc::new(ActiveSessions::default());

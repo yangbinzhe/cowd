@@ -2010,12 +2010,9 @@ fn gateway_listener_reachable(base_url: &str) -> bool {
 }
 
 pub fn default_auth_token() -> Option<String> {
-    // 1. CLI参数注入: --tui-token 或 COWD_API_TOKEN
     std::env::var("COWD_API_TOKEN")
         .ok()
-        // 2. 通用环境变量
         .or_else(|| std::env::var("COWD_AUTH_TOKEN").ok())
-        // 3. 从配置文件读取: ~/.cowd/config.yaml 中 gateway.platforms[api_server].auth.token
         .or_else(|| {
             let home = std::env::var("HOME").ok()?;
             let config_path = std::path::PathBuf::from(home).join(".cowd").join("config.yaml");
@@ -2030,12 +2027,6 @@ pub fn default_auth_token() -> Option<String> {
                 }
             }
             None
-        })
-        // 4. Gateway启动时自动写入的token文件
-        .or_else(|| {
-            let home = std::env::var("HOME").ok()?;
-            let token_path = std::path::PathBuf::from(home).join(".cowd").join("gateway.token");
-            std::fs::read_to_string(&token_path).ok()
         })
         .map(|token| token.trim().to_string())
         .filter(|token| !token.is_empty())
