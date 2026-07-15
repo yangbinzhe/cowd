@@ -196,6 +196,10 @@ pub struct SessionRuntimeOutboxRequest {
     pub turn_id: String,
     pub message_id: String,
     pub created_at_ms: u64,
+    /// Opaque, versioned Runtime-owned ingress options.  Memory persists this
+    /// value but never interprets it, preserving the Session→Runtime boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_options_json: Option<String>,
 }
 
 /// Persisted bridge work item. `revision` protects every status transition.
@@ -217,6 +221,8 @@ pub struct SessionRuntimeOutboxRecord {
     pub revision: u64,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_options_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -768,6 +774,7 @@ fn ensure_session_runtime_outbox_schema(conn: &Connection) -> Result<()> {
             revision INTEGER NOT NULL DEFAULT 0,
             created_at_ms INTEGER NOT NULL,
             updated_at_ms INTEGER NOT NULL,
+            runtime_options_json TEXT,
             FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
             FOREIGN KEY (message_id) REFERENCES messages(stable_message_id) ON DELETE CASCADE
         );
@@ -789,7 +796,16 @@ fn ensure_session_runtime_outbox_schema(conn: &Connection) -> Result<()> {
         );
         "#,
     )
-    .map_err(sql_err)
+    .map_err(sql_err)?;
+    let columns = table_columns(conn, "session_runtime_outbox")?;
+    if !columns.contains("runtime_options_json") {
+        conn.execute(
+            "ALTER TABLE session_runtime_outbox ADD COLUMN runtime_options_json TEXT",
+            [],
+        )
+        .map_err(sql_err)?;
+    }
+    Ok(())
 }
 
 fn ensure_session_mission_outbox_schema(conn: &Connection) -> Result<()> {
@@ -954,6 +970,7 @@ fn row_to_outbox(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRuntimeOutb
         revision: row.get::<_, i64>(13)? as u64,
         created_at_ms: row.get::<_, i64>(14)? as u64,
         updated_at_ms: row.get::<_, i64>(15)? as u64,
+        runtime_options_json: row.get(16)?,
     })
 }
 
@@ -962,7 +979,7 @@ fn query_outbox(conn: &Connection, request_id: &str) -> Result<Option<SessionRun
         r"SELECT request_id, turn_id, message_id, session_id, sequence, status,
                   runtime_commit_cursor, attempts, next_attempt_at_ms, claim_owner,
                   claim_expires_at_ms, failure_class, last_error, revision,
-                  created_at_ms, updated_at_ms
+                  created_at_ms, updated_at_ms, runtime_options_json
              FROM session_runtime_outbox WHERE request_id = ?1",
         params![request_id],
         row_to_outbox,
@@ -2119,8 +2136,9 @@ impl SqliteSessionStore {
         tx.execute(
             r"INSERT INTO session_runtime_outbox
                 (request_id, turn_id, message_id, session_id, sequence, status,
-                 attempts, next_attempt_at_ms, revision, created_at_ms, updated_at_ms)
-               VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, 0, ?6, ?6)",
+                 attempts, next_attempt_at_ms, revision, created_at_ms, updated_at_ms,
+                 runtime_options_json)
+               VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, 0, ?6, ?6, ?7)",
             params![
                 request.request_id,
                 request.turn_id,
@@ -2128,6 +2146,7 @@ impl SqliteSessionStore {
                 message.session_id,
                 message.sequence as i64,
                 request.created_at_ms as i64,
+                request.runtime_options_json,
             ],
         )
         .map_err(sql_err)?;
@@ -2194,8 +2213,9 @@ impl SqliteSessionStore {
         tx.execute(
             r"INSERT INTO session_runtime_outbox
                 (request_id, turn_id, message_id, session_id, sequence, status,
-                 attempts, next_attempt_at_ms, revision, created_at_ms, updated_at_ms)
-               VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, 0, ?6, ?6)",
+                 attempts, next_attempt_at_ms, revision, created_at_ms, updated_at_ms,
+                 runtime_options_json)
+               VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, 0, ?6, ?6, ?7)",
             params![
                 request.request_id,
                 request.turn_id,
@@ -2203,6 +2223,7 @@ impl SqliteSessionStore {
                 session_id,
                 sequence as i64,
                 request.created_at_ms as i64,
+                request.runtime_options_json,
             ],
         )
         .map_err(sql_err)?;
@@ -2533,6 +2554,62 @@ impl SqliteSessionStore {
         query_outbox(&conn, request_id)
     }
 
+    /// Bounded durable ingress history for one Session.  Runtime/Suface
+    /// observers use it only to recover execution identity and ingress state;
+    /// detailed execution facts remain owned by Runtime's graph projection.
+    pub fn session_runtime_outbox_for_session(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionRuntimeOutboxRecord>> {
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare(
+                r"SELECT request_id, turn_id, message_id, session_id, sequence, status,
+                         runtime_commit_cursor, attempts, next_attempt_at_ms, claim_owner,
+                         claim_expires_at_ms, failure_class, last_error, revision,
+                         created_at_ms, updated_at_ms, runtime_options_json
+                    FROM session_runtime_outbox
+                   WHERE session_id = ?1
+                   ORDER BY updated_at_ms DESC, sequence DESC, request_id DESC
+                   LIMIT ?2",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(
+                params![session_id, limit.clamp(1, 500) as i64],
+                row_to_outbox,
+            )
+            .map_err(sql_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)
+    }
+
+    /// Bounded durable work that may still need observer recovery after a
+    /// Gateway restart.  Materialized ingress is terminal for this carrier;
+    /// the terminal transcript/outbox remains the source for reply recovery.
+    pub fn active_session_runtime_outbox(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<SessionRuntimeOutboxRecord>> {
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare(
+                r"SELECT request_id, turn_id, message_id, session_id, sequence, status,
+                         runtime_commit_cursor, attempts, next_attempt_at_ms, claim_owner,
+                         claim_expires_at_ms, failure_class, last_error, revision,
+                         created_at_ms, updated_at_ms, runtime_options_json
+                    FROM session_runtime_outbox
+                   WHERE status != 'materialized'
+                   ORDER BY updated_at_ms DESC, sequence DESC, request_id DESC
+                   LIMIT ?1",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![limit.clamp(1, 500) as i64], row_to_outbox)
+            .map_err(sql_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)
+    }
+
     pub fn session_runtime_outbox_health(&self) -> Result<SessionRuntimeOutboxHealth> {
         let conn = self.conn()?;
         let mut health = SessionRuntimeOutboxHealth::default();
@@ -2571,7 +2648,7 @@ impl SqliteSessionStore {
                 r"SELECT request_id, turn_id, message_id, session_id, sequence, status,
                          runtime_commit_cursor, attempts, next_attempt_at_ms, claim_owner,
                          claim_expires_at_ms, failure_class, last_error, revision,
-                         created_at_ms, updated_at_ms
+                         created_at_ms, updated_at_ms, runtime_options_json
                     FROM session_runtime_outbox
                    WHERE status = 'blocked_materialization'
                    ORDER BY updated_at_ms ASC, sequence ASC, request_id ASC
@@ -4684,6 +4761,7 @@ mod tests {
             turn_id: "turn-1".to_string(),
             message_id: "message-1".to_string(),
             created_at_ms: 100,
+            runtime_options_json: None,
         }
     }
 
@@ -4713,6 +4791,31 @@ mod tests {
     }
 
     #[test]
+    fn runtime_options_remain_opaque_and_durable_with_session_ingress() {
+        let (store, _dir) = make_store();
+        store
+            .create_session(&make_record("s-runtime-options"))
+            .unwrap();
+        let message = outbox_message("s-runtime-options");
+        let mut request = outbox_request();
+        request.request_id = "request-runtime-options".to_string();
+        request.runtime_options_json = Some(
+            r#"{"profile":"surface_quick_reply","pre_messages":[{"role":"user","blocks":[]}]}"#
+                .to_string(),
+        );
+
+        let first = store
+            .append_message_with_runtime_outbox(&message, &request)
+            .unwrap();
+        assert_eq!(first.runtime_options_json, request.runtime_options_json);
+        let reloaded = store
+            .get_session_runtime_outbox(&request.request_id)
+            .unwrap()
+            .expect("outbox record must persist");
+        assert_eq!(reloaded.runtime_options_json, request.runtime_options_json);
+    }
+
+    #[test]
     fn source_transaction_rolls_back_when_outbox_identity_conflicts() {
         let (store, _dir) = make_store();
         store.create_session(&make_record("s-rollback")).unwrap();
@@ -4729,6 +4832,7 @@ mod tests {
             turn_id: "turn-2".to_string(),
             message_id: "message-1".to_string(),
             created_at_ms: 101,
+            runtime_options_json: None,
         };
         assert!(store
             .append_message_with_runtime_outbox(&second, &conflicting)
@@ -4821,6 +4925,7 @@ mod tests {
             turn_id: "turn-preserve".to_string(),
             message_id: "message-preserve".to_string(),
             created_at_ms: 101,
+            runtime_options_json: None,
         };
         store
             .append_ingress_with_runtime_outbox(

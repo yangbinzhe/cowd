@@ -150,6 +150,23 @@ impl SurfaceService {
             .mark_inbox_processed(idempotency_key, runtime_turn_id)
     }
 
+    pub(crate) fn mark_inbox_admitted(
+        &self,
+        idempotency_key: &str,
+        correlation: crate::surface_host::SurfaceTurnCorrelation,
+    ) -> Result<(), String> {
+        self.host.mark_inbox_admitted(idempotency_key, correlation)
+    }
+
+    pub(crate) fn record_inbox_terminal_delivery(
+        &self,
+        idempotency_key: &str,
+        terminal_id: &str,
+    ) -> Result<(), String> {
+        self.host
+            .record_inbox_terminal_delivery(idempotency_key, terminal_id)
+    }
+
     pub(crate) fn mark_inbox_replied(&self, idempotency_key: &str) -> Result<(), String> {
         self.host.mark_inbox_replied(idempotency_key)
     }

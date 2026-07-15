@@ -165,7 +165,16 @@ pub(crate) fn gateway_openapi_document() -> Value {
                 "ExecutionParentBinding": execution_parent_binding_schema(),
                 "ExecutionGraphProjection": execution_graph_projection_schema(),
                 "ChildExecutionProjection": child_execution_projection_schema(),
+                "ContextComponentUsage": context_component_usage_schema(),
+                "ContextUsageProjection": context_usage_projection_schema(),
+                "RunMetricsProjection": run_metrics_projection_schema(),
+                "ExecutionLiveState": execution_live_state_schema(),
                 "ExecutionProjection": execution_projection_schema(),
+                "SessionExecutionIndexProjection": session_execution_index_projection_schema(),
+                "SessionExecutionIndicesProjection": session_execution_indices_projection_schema(),
+                "EvidenceFreshness": evidence_freshness_schema(),
+                "TurnEvidenceProjection": turn_evidence_projection_schema(),
+                "SessionEvidenceProjection": session_evidence_projection_schema(),
                 "ProjectionEvent": projection_event_schema(),
                 "ProjectionDelta": projection_delta_schema(),
                 "ExecutionCommandRequest": execution_command_request_schema(),
@@ -923,6 +932,142 @@ fn child_execution_projection_schema() -> Value {
     })
 }
 
+fn context_component_usage_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["kind", "tokens", "occurrences"],
+        "properties": {
+            "kind": {"type": "string"},
+            "tokens": {"type": "integer", "minimum": 0},
+            "occurrences": {"type": "integer", "minimum": 0}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn context_usage_projection_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["components"],
+        "properties": {
+            "model": {"type": ["string", "null"]},
+            "window_tokens": {"type": ["integer", "null"], "minimum": 0},
+            "window_source": {"type": ["string", "null"]},
+            "input_tokens": {"type": ["integer", "null"], "minimum": 0},
+            "input_source": {"type": ["string", "null"]},
+            "remaining_tokens": {"type": ["integer", "null"], "minimum": 0},
+            "usage_percent_bp": {"type": ["integer", "null"], "minimum": 0, "maximum": 10000},
+            "request_sequence": {"type": ["integer", "null"], "minimum": 0},
+            "components": {"type": "array", "items": {"$ref": "#/components/schemas/ContextComponentUsage"}}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn run_metrics_projection_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["tool_calls", "memory_recalls", "memory_evidence", "approvals", "context_items", "files_touched", "input_tokens", "output_tokens", "total_tokens"],
+        "properties": {
+            "tool_calls": {"type": "integer", "minimum": 0},
+            "memory_recalls": {"type": "integer", "minimum": 0},
+            "memory_evidence": {"type": "integer", "minimum": 0},
+            "approvals": {"type": "integer", "minimum": 0},
+            "context_items": {"type": "integer", "minimum": 0},
+            "files_touched": {"type": "integer", "minimum": 0},
+            "input_tokens": {"type": "integer", "minimum": 0},
+            "output_tokens": {"type": "integer", "minimum": 0},
+            "total_tokens": {"type": "integer", "minimum": 0}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn execution_live_state_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["revision", "status", "started_at_ms", "updated_at_ms", "last_progress_at_ms", "metrics"],
+        "properties": {
+            "revision": {"type": "integer", "minimum": 0},
+            "status": {"type": "string", "enum": ["queued", "preparing_context", "calling_model", "thinking", "calling_tool", "waiting_approval", "finalizing", "complete", "cancelled", "error"]},
+            "status_detail": {"type": ["string", "null"]},
+            "turn_id": {"type": ["string", "null"]},
+            "started_at_ms": {"type": "integer", "minimum": 0},
+            "updated_at_ms": {"type": "integer", "minimum": 0},
+            "last_progress_at_ms": {"type": "integer", "minimum": 0},
+            "context_usage": {"oneOf": [{"$ref": "#/components/schemas/ContextUsageProjection"}, {"type": "null"}]},
+            "metrics": {"$ref": "#/components/schemas/RunMetricsProjection"},
+            "output_preview": {"type": ["string", "null"]},
+            "terminal_ref": {"type": ["string", "null"]},
+            "error": {"type": ["string", "null"]}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn session_execution_index_projection_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["session_id", "active_execution_ids"],
+        "properties": {
+            "session_id": {"type": "string"},
+            "active_execution_ids": {"type": "array", "items": {"type": "string"}},
+            "latest_execution_id": {"type": ["string", "null"]},
+            "latest_status": {"type": ["string", "null"], "enum": ["queued", "preparing_context", "calling_model", "thinking", "calling_tool", "waiting_approval", "finalizing", "complete", "cancelled", "error", null]},
+            "latest_live_revision": {"type": ["integer", "null"], "minimum": 0},
+            "last_progress_at_ms": {"type": ["integer", "null"], "minimum": 0},
+            "terminal_ref": {"type": ["string", "null"]}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn session_execution_indices_projection_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["items"],
+        "properties": {"items": {"type": "array", "items": {"$ref": "#/components/schemas/SessionExecutionIndexProjection"}}},
+        "additionalProperties": false
+    })
+}
+
+fn evidence_freshness_schema() -> Value {
+    json!({"type": "string", "enum": ["live", "durable", "unavailable"]})
+}
+
+fn turn_evidence_projection_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["session_id", "turn_id", "input_message_id", "execution_id", "evidence_refs", "freshness"],
+        "properties": {
+            "session_id": {"type": "string"},
+            "turn_id": {"type": "string"},
+            "input_message_id": {"type": "string"},
+            "execution_id": {"type": "string"},
+            "terminal_ref": {"type": ["string", "null"]},
+            "assistant_message_id": {"type": ["string", "null"]},
+            "context_report_id": {"type": ["string", "null"]},
+            "evidence_refs": {"type": "array", "items": {"type": "string"}},
+            "freshness": {"$ref": "#/components/schemas/EvidenceFreshness"}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn session_evidence_projection_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["session_id", "evidence_refs", "turns", "freshness"],
+        "properties": {
+            "session_id": {"type": "string"},
+            "evidence_refs": {"type": "array", "items": {"type": "string"}},
+            "turns": {"type": "array", "items": {"$ref": "#/components/schemas/TurnEvidenceProjection"}},
+            "freshness": {"$ref": "#/components/schemas/EvidenceFreshness"}
+        },
+        "additionalProperties": false
+    })
+}
+
 fn execution_projection_schema() -> Value {
     json!({
         "type": "object",
@@ -948,6 +1093,7 @@ fn execution_projection_schema() -> Value {
             "evidence": projection_entity_list_schema(),
             "health": projection_entity_list_schema(),
             "recovery": projection_entity_list_schema(),
+            "live": {"oneOf": [{"$ref": "#/components/schemas/ExecutionLiveState"}, {"type": "null"}]},
             "available_commands": {
                 "type": "array",
                 "items": {

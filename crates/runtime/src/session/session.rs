@@ -18,7 +18,7 @@ const MAX_ROTATED_FILES: usize = 3;
 static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Speaker role associated with a persisted conversation message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MessageRole {
     System,
     User,
@@ -39,7 +39,7 @@ impl MessageRole {
 }
 
 /// Structured message content stored inside a [`Session`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ContentBlock {
     Text {
         text: String,

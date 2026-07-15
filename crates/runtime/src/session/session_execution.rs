@@ -393,6 +393,7 @@ impl SessionInputRouter {
                 turn_id: format!("cross-session-turn:{stable}"),
                 message_id: format!("cross-session-message:{stable}"),
                 created_at_ms: now_ms(),
+                runtime_options_json: None,
             };
             let ingress_content = handoff_ingress_content(&handoff)?;
             let record = self
@@ -1015,6 +1016,7 @@ mod tests {
             turn_id: "t1".to_string(),
             message_id: "m1".to_string(),
             created_at_ms: 1,
+            runtime_options_json: None,
         };
         router.persist_input("s1", "hello", &request).await.unwrap();
         router.persist_input("s1", "hello", &request).await.unwrap();
@@ -1103,6 +1105,7 @@ mod tests {
             turn_id: "long-t1".into(),
             message_id: "long-m1".into(),
             created_at_ms: now_ms(),
+            runtime_options_json: None,
         };
         let router_a = Arc::new(SessionInputRouter {
             store: Arc::clone(&store),
@@ -1194,6 +1197,7 @@ mod tests {
             turn_id: "ack-loss-t1".into(),
             message_id: "ack-loss-m1".into(),
             created_at_ms: now_ms(),
+            runtime_options_json: None,
         };
         let router_a = SessionInputRouter {
             store: Arc::clone(&store),

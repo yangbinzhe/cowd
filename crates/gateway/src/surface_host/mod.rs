@@ -20,7 +20,7 @@ pub(crate) use ingress::spawn_surface_ingress_dispatcher;
 pub(crate) use message_store::{
     SurfaceDeliveryEvent, SurfaceInboxReceipt, SurfaceInboxRecord, SurfaceMessageSnapshot,
     SurfaceMessageStore, SurfaceOutboxRecord, SurfaceTriggerEventReceipt,
-    SurfaceTriggerEventRecord,
+    SurfaceTriggerEventRecord, SurfaceTurnCorrelation,
 };
 pub(crate) use types::{
     SurfaceDiscoveryFailure, SurfaceDiscoveryReport, SurfaceHostHealth, SurfaceResourceSummary,

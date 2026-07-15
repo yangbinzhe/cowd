@@ -13,6 +13,8 @@ use axum::{
 };
 use harness_contract::projection::{
     ExecutionCommandReceipt, ExecutionCommandRequest, ExecutionProjection, ProjectionDelta,
+    SessionEvidenceProjection, SessionExecutionIndexProjection, SessionExecutionIndicesProjection,
+    TurnEvidenceProjection,
 };
 
 use super::{runtime_routes, AppState};
@@ -112,8 +114,36 @@ fn execution_projection_command_spec(
     )
 }
 
-pub(crate) fn execution_projection_route_metadata() -> [StableRouteMetadata; 3] {
-    [
+fn session_execution_indices_spec() -> TypedRouteSpec<(), (), SessionExecutionIndicesProjection> {
+    TypedRouteSpec::new(
+        "GET",
+        "/api/sessions/executions",
+        "session_execution_indices_get",
+    )
+}
+
+fn session_execution_index_spec() -> TypedRouteSpec<(), (), SessionExecutionIndexProjection> {
+    TypedRouteSpec::new(
+        "GET",
+        "/api/sessions/:id/execution",
+        "session_execution_index_get",
+    )
+}
+
+fn session_evidence_spec() -> TypedRouteSpec<(), (), SessionEvidenceProjection> {
+    TypedRouteSpec::new("GET", "/api/sessions/:id/evidence", "session_evidence_get")
+}
+
+fn turn_evidence_spec() -> TypedRouteSpec<(), (), TurnEvidenceProjection> {
+    TypedRouteSpec::new(
+        "GET",
+        "/api/sessions/:id/turns/:turn_id/evidence",
+        "session_turn_evidence_get",
+    )
+}
+
+pub(crate) fn execution_projection_route_metadata() -> Vec<StableRouteMetadata> {
+    vec![
         execution_projection_snapshot_spec().metadata(None, "ExecutionProjection", false),
         execution_projection_events_spec().metadata(None, "ProjectionDelta", true),
         execution_projection_command_spec().metadata(
@@ -121,6 +151,10 @@ pub(crate) fn execution_projection_route_metadata() -> [StableRouteMetadata; 3] 
             "ExecutionCommandReceipt",
             false,
         ),
+        session_execution_indices_spec().metadata(None, "SessionExecutionIndicesProjection", false),
+        session_execution_index_spec().metadata(None, "SessionExecutionIndexProjection", false),
+        session_evidence_spec().metadata(None, "SessionEvidenceProjection", false),
+        turn_evidence_spec().metadata(None, "TurnEvidenceProjection", false),
     ]
 }
 
@@ -155,7 +189,7 @@ mod tests {
     #[test]
     fn execution_projection_specs_cover_snapshot_delta_and_command_contracts() {
         let specs = execution_projection_route_metadata();
-        assert_eq!(specs.len(), 3);
+        assert_eq!(specs.len(), 7);
         assert_eq!(specs[0].operation_id, "runtime_execution_projection_get");
         assert_eq!(specs[0].response_schema, "ExecutionProjection");
         assert_eq!(specs[1].path, "/api/runtime/executions/:id/events");
@@ -163,5 +197,12 @@ mod tests {
         assert_eq!(specs[1].response_schema, "ProjectionDelta");
         assert_eq!(specs[2].request_schema, Some("ExecutionCommandRequest"));
         assert_eq!(specs[2].response_schema, "ExecutionCommandReceipt");
+        assert_eq!(
+            specs[3].response_schema,
+            "SessionExecutionIndicesProjection"
+        );
+        assert_eq!(specs[4].operation_id, "session_execution_index_get");
+        assert_eq!(specs[5].response_schema, "SessionEvidenceProjection");
+        assert_eq!(specs[6].response_schema, "TurnEvidenceProjection");
     }
 }

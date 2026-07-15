@@ -1486,6 +1486,96 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn session_execution_and_evidence_routes_use_durable_turn_binding() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let session_id = "durable-execution-route-session";
+        let request_id = "durable-execution-route-request";
+        let turn_id = "durable-execution-route-turn";
+        store
+            .create_session(&new_api_session_record(
+                session_id,
+                Some("test-model".into()),
+            ))
+            .await
+            .unwrap();
+        store
+            .append_ingress_with_runtime_outbox(
+                session_id,
+                "user",
+                Some("[{\"type\":\"text\",\"text\":\"durable route check\"}]"),
+                42,
+                &memory::SessionRuntimeOutboxRequest {
+                    request_id: request_id.to_string(),
+                    turn_id: turn_id.to_string(),
+                    message_id: "durable-execution-route-message".to_string(),
+                    created_at_ms: 42,
+                    runtime_options_json: Some("{\"profile\":\"main_turn\"}".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        let execution_id = runtime::session_ingress_graph_id(session_id, request_id, turn_id);
+        let app = api_router(test_state_with_store(store));
+
+        let index = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{session_id}/execution"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(index.status(), StatusCode::OK);
+        let index_body = to_bytes(index.into_body(), usize::MAX).await.unwrap();
+        let index_json: serde_json::Value = serde_json::from_slice(&index_body).unwrap();
+        assert_eq!(index_json["latest_execution_id"], execution_id);
+        assert_eq!(index_json["latest_status"], "queued");
+        assert_eq!(
+            index_json["active_execution_ids"],
+            serde_json::json!([execution_id])
+        );
+
+        let evidence = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{session_id}/evidence"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(evidence.status(), StatusCode::OK);
+        let evidence_body = to_bytes(evidence.into_body(), usize::MAX).await.unwrap();
+        let evidence_json: serde_json::Value = serde_json::from_slice(&evidence_body).unwrap();
+        assert_eq!(evidence_json["freshness"], "unavailable");
+        assert_eq!(evidence_json["turns"][0]["turn_id"], turn_id);
+        assert_eq!(evidence_json["turns"][0]["execution_id"], execution_id);
+        assert_eq!(
+            evidence_json["turns"][0]["evidence_refs"],
+            serde_json::json!([])
+        );
+
+        let turn = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/sessions/{session_id}/turns/{turn_id}/evidence"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(turn.status(), StatusCode::OK);
+        let turn_body = to_bytes(turn.into_body(), usize::MAX).await.unwrap();
+        let turn_json: serde_json::Value = serde_json::from_slice(&turn_body).unwrap();
+        assert_eq!(turn_json["execution_id"], execution_id);
+    }
+
+    #[tokio::test]
     async fn runtime_outbox_management_reports_poison_and_retries_both_directions() {
         let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
         store
@@ -1498,6 +1588,7 @@ pub(crate) mod tests {
             turn_id: "turn-1".to_string(),
             message_id: "user-1".to_string(),
             created_at_ms: 1,
+            runtime_options_json: None,
         };
         store
             .append_ingress_with_runtime_outbox(
