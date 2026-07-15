@@ -250,12 +250,17 @@ async fn send_message(
         )
     })?;
     if !runtime_service.has_active_session(&id) {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("session {id} not found"),
-            }),
-        ));
+        runtime_service
+            .ensure_runtime_session(&id, None)
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse {
+                        error: format!("session {id} not found: {error}"),
+                    }),
+                )
+            })?;
     }
 
     let runtime_service = runtime_service.clone();
