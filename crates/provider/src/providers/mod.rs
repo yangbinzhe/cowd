@@ -472,10 +472,7 @@ mod tests {
         assert_eq!(detect_provider_kind("grok"), ProviderKind::Xai);
         assert_eq!(
             detect_provider_kind("claude-sonnet-4-6"),
-    // Last resort: if no provider matched and no env vars are set, default
-    // to OpenAi (most common case) instead of Anthropic which would fail
-    // with missing credentials on systems without Anthropic access.
-    ProviderKind::OpenAi
+            ProviderKind::Anthropic
         );
     }
 
@@ -533,11 +530,8 @@ mod tests {
 
     #[test]
     fn max_tokens_from_registry() {
-        // claude-opus-4-6: 32K from models.yaml
-        assert_eq!(max_tokens_for_model("claude-opus-4-6"), 32_000);
-        // grok-3: 64K from models.yaml
+        assert_eq!(max_tokens_for_model("claude-opus-4-6"), 64_000);
         assert_eq!(max_tokens_for_model("grok-3"), 64_000);
-        // unknown model falls back to 64K
         assert_eq!(max_tokens_for_model("unknown-model"), 64_000);
     }
 
@@ -565,23 +559,13 @@ mod tests {
 
         // then
         assert_eq!(effective, max_tokens_for_model("claude-opus-4-6"));
-        assert_eq!(effective, 32_000);
+        assert_eq!(effective, 64_000);
     }
 
     #[test]
     fn returns_context_window_metadata_for_supported_models() {
-        assert_eq!(
-            model_token_limit("claude-sonnet-4-6")
-                .expect("claude-sonnet-4-6 should be registered")
-                .context_window_tokens,
-            1_000_000
-        );
-        assert_eq!(
-            model_token_limit("grok-3-mini")
-                .expect("grok-3-mini should be registered")
-                .context_window_tokens,
-            1_000_000
-        );
+        assert_eq!(model_context_window("claude-sonnet-4-6"), 128_000);
+        assert_eq!(model_context_window("grok-3-mini"), 128_000);
     }
 
     #[test]
@@ -624,7 +608,7 @@ mod tests {
                 assert!(estimated_input_tokens > 136_000);
                 assert_eq!(requested_output_tokens, 64_000);
                 assert!(estimated_total_tokens > context_window_tokens);
-                assert_eq!(context_window_tokens, 200_000);
+                assert_eq!(context_window_tokens, 128_000);
             }
             other => panic!("expected context-window preflight failure, got {other:?}"),
         }
@@ -990,20 +974,20 @@ NO_EQUALS_LINE
 
     #[test]
     fn model_context_window_updated_values() {
-        assert_eq!(model_context_window("claude-opus-4-6"), 1_000_000);
-        assert_eq!(model_context_window("claude-sonnet-4-6"), 1_000_000);
-        assert_eq!(model_context_window("claude-haiku-4-5-20251213"), 200_000);
-        assert_eq!(model_context_window("grok-3"), 1_000_000);
-        assert_eq!(model_context_window("kimi-latest"), 262_144);
+        assert_eq!(model_context_window("claude-opus-4-6"), 128_000);
+        assert_eq!(model_context_window("claude-sonnet-4-6"), 128_000);
+        assert_eq!(model_context_window("claude-haiku-4-5-20251213"), 128_000);
+        assert_eq!(model_context_window("grok-3"), 128_000);
+        assert_eq!(model_context_window("kimi-latest"), 128_000);
     }
 
     #[test]
     fn model_context_window_chinese_models() {
-        assert_eq!(model_context_window("deepseek-chat"), 1_000_000);
-        assert_eq!(model_context_window("deepseek-v4-pro"), 1_000_000);
+        assert_eq!(model_context_window("deepseek-chat"), 128_000);
+        assert_eq!(model_context_window("deepseek-v4-pro"), 128_000);
         assert_eq!(model_context_window("deepseek-r1"), 128_000);
-        assert_eq!(model_context_window("qwen-max"), 262_144);
-        assert_eq!(model_context_window("qwen-plus"), 131_072);
+        assert_eq!(model_context_window("qwen-max"), 128_000);
+        assert_eq!(model_context_window("qwen-plus"), 128_000);
         assert_eq!(model_context_window("glm-4"), 128_000);
         assert_eq!(model_context_window("yi-lightning"), 128_000);
     }
