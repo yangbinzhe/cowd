@@ -287,7 +287,7 @@ pub const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "config",
         aliases: &[],
-        summary: "Inspect Claude config files or merged sections",
+        summary: "Inspect Cowd instruction files or merged sections",
         argument_hint: Some("[env|hooks|model|plugins]"),
         resume_supported: true,
     },
@@ -308,7 +308,7 @@ pub const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "memory",
         aliases: &[],
-        summary: "Inspect loaded Claude instruction memory files",
+        summary: "Inspect loaded Cowd instruction memory files",
         argument_hint: None,
         resume_supported: true,
     },
@@ -718,7 +718,7 @@ pub const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "api-key",
         aliases: &[],
-        summary: "Show or set the Anthropic API key",
+        summary: "Show or set the provider API key",
         argument_hint: Some("[key]"),
         resume_supported: false,
     },

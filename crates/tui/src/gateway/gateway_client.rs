@@ -2013,6 +2013,23 @@ pub fn default_auth_token() -> Option<String> {
     std::env::var("COWD_API_TOKEN")
         .ok()
         .or_else(|| std::env::var("COWD_AUTH_TOKEN").ok())
+        .or_else(|| {
+            let home = std::env::var("HOME").ok()?;
+            let config_path = std::path::PathBuf::from(home)
+                .join(".cowd")
+                .join("config.yaml");
+            let config = std::fs::read_to_string(&config_path).ok()?;
+            for line in config.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("token:") {
+                    let token = trimmed.strip_prefix("token:")?.trim().trim_matches('"');
+                    if !token.is_empty() {
+                        return Some(token.to_string());
+                    }
+                }
+            }
+            None
+        })
         .map(|token| token.trim().to_string())
         .filter(|token| !token.is_empty())
 }

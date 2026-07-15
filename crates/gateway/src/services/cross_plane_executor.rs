@@ -69,6 +69,9 @@ impl ScopedNodeBackend for GatewayConnectorServiceExecutor {
                     reason: error.to_string(),
                 }
             })?),
+            summary: Some(format!(
+                "Cross-plane operation completed with status {status:?}"
+            )),
             evidence_refs: Vec::new(),
             failure: None,
             usage: ExecutionUsage::default(),
@@ -236,6 +239,9 @@ fn node_result_from_dispatch(
                 reason: error.to_string(),
             }
         })?),
+        summary: Some(format!(
+            "Cross-plane connector completed with status {status:?}"
+        )),
         evidence_refs: Vec::new(),
         failure: None,
         usage: ExecutionUsage::default(),

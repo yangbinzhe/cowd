@@ -14,6 +14,9 @@ name = "cowd-sandbox-launcher"
 path = "src/main.rs"
 
 [dependencies]
+landlock = "0.4.5"
+libc = "0.2.186"
+seccompiler = "0.5.0"
 thiserror = "2"
 
 [lints]

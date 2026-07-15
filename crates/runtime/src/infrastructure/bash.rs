@@ -10,9 +10,10 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command as TokioCommand;
 use tokio::time::timeout;
 
+use sandbox_launcher::{shell_command, SandboxLaunchSpec};
+
 use crate::sandbox::{
-    build_linux_sandbox_command, resolve_sandbox_status_for_request, FilesystemIsolationMode,
-    SandboxConfig, SandboxStatus,
+    resolve_sandbox_status_for_request, FilesystemIsolationMode, SandboxConfig, SandboxStatus,
 };
 use crate::ConfigLoader;
 
@@ -75,7 +76,7 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
     let sandbox_status = sandbox_status_for_input(&input, &cwd);
 
     if input.run_in_background.unwrap_or(false) {
-        let mut child = prepare_command(&input.command, &cwd, &sandbox_status, false);
+        let mut child = prepare_command(&input.command, &cwd, &sandbox_status, false)?;
         let child = child
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -133,7 +134,7 @@ async fn execute_bash_async(
     sandbox_status: SandboxStatus,
     cwd: std::path::PathBuf,
 ) -> io::Result<BashCommandOutput> {
-    let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true);
+    let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true)?;
 
     let output_result = if let Some(timeout_ms) = input.timeout {
         match timeout(Duration::from_millis(timeout_ms), command.output()).await {
@@ -213,17 +214,13 @@ fn prepare_command(
     cwd: &std::path::Path,
     sandbox_status: &SandboxStatus,
     create_dirs: bool,
-) -> Command {
+) -> io::Result<Command> {
     if create_dirs {
         prepare_sandbox_dirs();
     }
 
-    if let Some(launcher) = build_linux_sandbox_command(command, cwd, sandbox_status) {
-        let mut prepared = Command::new(launcher.program);
-        prepared.args(launcher.args);
-        prepared.current_dir(cwd);
-        prepared.envs(launcher.env);
-        return prepared;
+    if sandbox_status.enabled {
+        return hardened_command(command, cwd, sandbox_status);
     }
 
     let mut prepared = Command::new(shell_program());
@@ -232,7 +229,7 @@ fn prepare_command(
         prepared.env("HOME", crate::cowd_dirs::sandbox_home_dir());
         prepared.env("TMPDIR", crate::cowd_dirs::sandbox_tmp_dir());
     }
-    prepared
+    Ok(prepared)
 }
 
 fn prepare_tokio_command(
@@ -240,17 +237,19 @@ fn prepare_tokio_command(
     cwd: &std::path::Path,
     sandbox_status: &SandboxStatus,
     create_dirs: bool,
-) -> TokioCommand {
+) -> io::Result<TokioCommand> {
     if create_dirs {
         prepare_sandbox_dirs();
     }
 
-    if let Some(launcher) = build_linux_sandbox_command(command, cwd, sandbox_status) {
-        let mut prepared = TokioCommand::new(launcher.program);
-        prepared.args(launcher.args);
-        prepared.current_dir(cwd);
-        prepared.envs(launcher.env);
-        return prepared;
+    if sandbox_status.enabled {
+        let prepared = hardened_launch(command, cwd, sandbox_status)?;
+        let mut command = TokioCommand::new(&prepared.program);
+        command.args(&prepared.args);
+        command.current_dir(cwd);
+        command.env_clear();
+        command.envs(prepared.environment);
+        return Ok(command);
     }
 
     let mut prepared = TokioCommand::new(shell_program());
@@ -259,7 +258,42 @@ fn prepare_tokio_command(
         prepared.env("HOME", crate::cowd_dirs::sandbox_home_dir());
         prepared.env("TMPDIR", crate::cowd_dirs::sandbox_tmp_dir());
     }
-    prepared
+    Ok(prepared)
+}
+
+fn hardened_command(
+    command: &str,
+    cwd: &std::path::Path,
+    sandbox_status: &SandboxStatus,
+) -> io::Result<Command> {
+    let prepared = hardened_launch(command, cwd, sandbox_status)?;
+    let mut command = prepared.into_command();
+    command.current_dir(cwd);
+    Ok(command)
+}
+
+fn hardened_launch(
+    command: &str,
+    cwd: &std::path::Path,
+    sandbox_status: &SandboxStatus,
+) -> io::Result<sandbox_launcher::PreparedSandboxCommand> {
+    let workspace = cwd.canonicalize()?;
+    let mut spec = SandboxLaunchSpec::workspace(&workspace);
+    spec.working_directory = Some(workspace);
+    spec.network_enabled = !sandbox_status.network_active;
+    if sandbox_status.filesystem_mode == FilesystemIsolationMode::AllowList {
+        spec.writable_roots = sandbox_status
+            .allowed_mounts
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+    }
+    shell_command(command, &spec).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("hardened sandbox unavailable: {error}"),
+        )
+    })
 }
 
 fn prepare_sandbox_dirs() {

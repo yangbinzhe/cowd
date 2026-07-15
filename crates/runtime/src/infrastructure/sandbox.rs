@@ -75,13 +75,6 @@ pub struct SandboxDetectionInputs<'a> {
     pub proc_1_cgroup: Option<&'a str>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LinuxSandboxCommand {
-    pub program: String,
-    pub args: Vec<String>,
-    pub env: Vec<(String, String)>,
-}
-
 impl SandboxConfig {
     #[must_use]
     pub fn resolve_request(
@@ -161,7 +154,7 @@ pub fn resolve_sandbox_status(config: &SandboxConfig, cwd: &Path) -> SandboxStat
 #[must_use]
 pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) -> SandboxStatus {
     let container = detect_container_environment();
-    let namespace_supported = cfg!(target_os = "linux") && unshare_user_namespace_works();
+    let namespace_supported = cfg!(target_os = "linux") && hardened_sandbox_works();
     let network_supported = namespace_supported;
     let filesystem_active =
         request.enabled && request.filesystem_mode != FilesystemIsolationMode::Off;
@@ -169,11 +162,12 @@ pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) 
 
     if request.enabled && request.namespace_restrictions && !namespace_supported {
         fallback_reasons
-            .push("namespace isolation unavailable (requires Linux with `unshare`)".to_string());
+            .push("kernel-hardened sandbox unavailable (requires bwrap, Landlock, seccomp, and the cowd sandbox helper)".to_string());
     }
     if request.enabled && request.network_isolation && !network_supported {
-        fallback_reasons
-            .push("network isolation unavailable (requires Linux with `unshare`)".to_string());
+        fallback_reasons.push(
+            "network isolation unavailable (requires the kernel-hardened sandbox)".to_string(),
+        );
     }
     if request.enabled
         && request.filesystem_mode == FilesystemIsolationMode::AllowList
@@ -205,60 +199,6 @@ pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) 
         container_markers: container.markers,
         fallback_reason: (!fallback_reasons.is_empty()).then(|| fallback_reasons.join("; ")),
     }
-}
-
-#[must_use]
-pub fn build_linux_sandbox_command(
-    command: &str,
-    _cwd: &Path,
-    status: &SandboxStatus,
-) -> Option<LinuxSandboxCommand> {
-    if !cfg!(target_os = "linux")
-        || !status.enabled
-        || (!status.namespace_active && !status.network_active)
-    {
-        return None;
-    }
-
-    let mut args = vec![
-        "--user".to_string(),
-        "--map-root-user".to_string(),
-        "--mount".to_string(),
-        "--ipc".to_string(),
-        "--pid".to_string(),
-        "--uts".to_string(),
-        "--fork".to_string(),
-    ];
-    if status.network_active {
-        args.push("--net".to_string());
-    }
-    args.push("sh".to_string());
-    args.push("-lc".to_string());
-    args.push(command.to_string());
-
-    let sandbox_home = crate::cowd_dirs::sandbox_home_dir();
-    let sandbox_tmp = crate::cowd_dirs::sandbox_tmp_dir();
-    let mut env = vec![
-        ("HOME".to_string(), sandbox_home.display().to_string()),
-        ("TMPDIR".to_string(), sandbox_tmp.display().to_string()),
-        (
-            "COWD_SANDBOX_FILESYSTEM_MODE".to_string(),
-            status.filesystem_mode.as_str().to_string(),
-        ),
-        (
-            "COWD_SANDBOX_ALLOWED_MOUNTS".to_string(),
-            status.allowed_mounts.join(":"),
-        ),
-    ];
-    if let Ok(path) = env::var("PATH") {
-        env.push(("PATH".to_string(), path));
-    }
-
-    Some(LinuxSandboxCommand {
-        program: "unshare".to_string(),
-        args,
-        env,
-    })
 }
 
 fn normalize_mounts(mounts: &[String], cwd: &Path) -> Vec<String> {
@@ -293,32 +233,18 @@ fn command_exists(command: &str) -> bool {
 /// Check whether `unshare --user` actually works on this system.
 /// On some CI environments (e.g. GitHub Actions), the binary exists but
 /// user namespaces are restricted, causing silent failures.
-fn unshare_user_namespace_works() -> bool {
+fn hardened_sandbox_works() -> bool {
     use std::sync::OnceLock;
     static RESULT: OnceLock<bool> = OnceLock::new();
-    *RESULT.get_or_init(|| {
-        if !command_exists("unshare") {
-            return false;
-        }
-        std::process::Command::new("unshare")
-            .args(["--user", "--map-root-user", "true"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    })
+    *RESULT.get_or_init(|| command_exists("bwrap") && sandbox_launcher::probe().is_ok())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_linux_sandbox_command, detect_container_environment_from, FilesystemIsolationMode,
-        SandboxConfig, SandboxDetectionInputs,
+        detect_container_environment_from, FilesystemIsolationMode, SandboxConfig,
+        SandboxDetectionInputs,
     };
-    use std::path::Path;
-
     #[test]
     fn detects_container_markers_from_multiple_sources() {
         let detected = detect_container_environment_from(SandboxDetectionInputs {
@@ -366,28 +292,5 @@ mod tests {
         assert!(request.network_isolation);
         assert_eq!(request.filesystem_mode, FilesystemIsolationMode::AllowList);
         assert_eq!(request.allowed_mounts, vec!["tmp"]);
-    }
-
-    #[test]
-    fn builds_linux_launcher_with_network_flag_when_requested() {
-        let config = SandboxConfig::default();
-        let status = super::resolve_sandbox_status_for_request(
-            &config.resolve_request(
-                Some(true),
-                Some(true),
-                Some(true),
-                Some(FilesystemIsolationMode::WorkspaceOnly),
-                None,
-            ),
-            Path::new("/workspace"),
-        );
-
-        if let Some(launcher) =
-            build_linux_sandbox_command("printf hi", Path::new("/workspace"), &status)
-        {
-            assert_eq!(launcher.program, "unshare");
-            assert!(launcher.args.iter().any(|arg| arg == "--mount"));
-            assert!(launcher.args.iter().any(|arg| arg == "--net") == status.network_active);
-        }
     }
 }

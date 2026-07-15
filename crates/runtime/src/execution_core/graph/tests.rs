@@ -462,6 +462,7 @@ impl NodeExecutor for EvidenceExecutor {
         Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
             status: ExecutionNodeStatus::Completed,
             result_ref: Some(format!("source-result:{}", ticket.node_id)),
+            summary: Some("source completed".to_string()),
             evidence_refs,
             failure: None,
             usage: Default::default(),
@@ -499,6 +500,7 @@ impl super::executors::SynthesizeBackend for TerminalBackend {
         Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
             status: ExecutionNodeStatus::Completed,
             result_ref: Some(format!("terminal:{}", ticket.graph_id)),
+            summary: Some("terminal completed".to_string()),
             evidence_refs: Vec::new(),
             failure: None,
             usage: Default::default(),
@@ -608,6 +610,7 @@ fn completed_result(id: &str) -> ExecutionNodeResult {
     ExecutionNodeResult {
         status: ExecutionNodeStatus::Completed,
         result_ref: Some(format!("result:{id}")),
+        summary: Some(format!("result {id}")),
         evidence_refs: Vec::new(),
         failure: None,
         usage: Default::default(),

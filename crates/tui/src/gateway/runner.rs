@@ -24,7 +24,7 @@ static SHARED_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct GatewayTuiConfig {
-    pub model: String,
+    pub model: Option<String>,
     pub session_id: String,
     pub yolo_mode: bool,
     pub startup_banner: String,
@@ -34,9 +34,8 @@ pub struct GatewayTuiConfig {
 impl GatewayTuiConfig {
     pub fn from_env_args() -> Self {
         let args: Vec<String> = std::env::args().skip(1).collect();
-        let model = arg_value(&args, &["--model", "-m"])
-            .or_else(|| std::env::var("COWD_MODEL").ok())
-            .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
+        let model =
+            arg_value(&args, &["--model", "-m"]).or_else(|| std::env::var("COWD_MODEL").ok());
         let session_id = arg_value(&args, &["--resume", "--session", "--session-id", "-s"])
             .unwrap_or_else(|| format!("tui-{}", uuid::Uuid::new_v4()));
         let yolo_mode = args.iter().any(|arg| {
@@ -45,9 +44,10 @@ impl GatewayTuiConfig {
                 "--yolo" | "--dangerously-skip-permissions" | "--danger-full-access"
             )
         });
+        let display_model = model.clone().unwrap_or_else(|| "default".to_string());
         Self {
-            startup_banner: format_startup_banner(&model, yolo_mode, &session_id),
-            connected_line: format_connected_line(&model),
+            startup_banner: format_startup_banner(&display_model, yolo_mode, &session_id),
+            connected_line: format_connected_line(&display_model),
             model,
             session_id,
             yolo_mode,
@@ -85,7 +85,11 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
 
     let (tui_tx, tui_rx) = cowd_event_channel();
     let session_id = config.session_id.clone();
-    let mut state = TuiState::new(&config.model, &session_id);
+    let display_model = config
+        .model
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
+    let mut state = TuiState::new(&display_model, &session_id);
     state.app.yolo_mode = config.yolo_mode;
     state.add_system_notice(SystemNoticeKind::Info, &config.startup_banner);
     state.add_system_notice(SystemNoticeKind::Info, &config.connected_line);
@@ -322,7 +326,10 @@ fn attach_gateway_session(
     );
 
     let ensured = runtime
-        .block_on(gateway_client.ensure_session(&config.session_id, &config.model))
+        .block_on(
+            gateway_client
+                .ensure_session(&config.session_id, config.model.as_deref().unwrap_or("")),
+        )
         .map_err(|err| format!("Gateway session attach failed: {err}"))?;
     state.app.active_api_sessions = ensured
         .get("active_sessions")

@@ -145,6 +145,11 @@ pub struct ExecutionUsage {
 pub struct ExecutionNodeResult {
     pub status: ExecutionNodeStatus,
     pub result_ref: Option<String>,
+    /// Bounded semantic outcome for downstream collaborators. Raw model traces
+    /// and complete tool payloads remain in evidence storage and are referenced
+    /// through `evidence_refs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
     pub evidence_refs: Vec<EvidenceAccessRef>,
     pub failure: Option<ExecutionFailure>,
     pub usage: ExecutionUsage,

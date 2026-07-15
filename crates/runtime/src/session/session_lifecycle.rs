@@ -228,11 +228,34 @@ impl SessionLifecycleManager {
             .collect()
     }
 
+    /// Select and remove one hot-runtime victim using the configured capacity
+    /// policy. Durable Session identity is outside this resource manager and
+    /// remains available for a later cold recovery.
+    pub async fn evict_one_for_capacity(&self) -> Option<String> {
+        let mut sessions = self.sessions.write().await;
+        let victim = match self.config.eviction_policy {
+            EvictionPolicy::Lru => sessions
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_active)
+                .map(|(id, _)| id.clone()),
+            EvictionPolicy::Oldest => sessions
+                .iter()
+                .min_by_key(|(_, entry)| entry.created_at_ms)
+                .map(|(id, _)| id.clone()),
+            EvictionPolicy::Largest => sessions
+                .iter()
+                .max_by_key(|(_, entry)| entry.message_count)
+                .map(|(id, _)| id.clone()),
+        }?;
+        sessions.remove(&victim);
+        Some(victim)
+    }
+
     /// Background cleanup: expire stale sessions and evict when over capacity.
     ///
     /// Call this periodically (e.g. from a tokio interval task) with the
     /// configured `cleanup_interval`.
-    pub async fn run_cleanup(&self) {
+    pub async fn run_cleanup(&self) -> Vec<String> {
         let now_instant = Instant::now();
         let now_ms = current_time_millis();
 
@@ -266,7 +289,7 @@ impl SessionLifecycleManager {
             .len()
             .saturating_sub(self.config.max_active_sessions);
         if excess == 0 {
-            return;
+            return Vec::new();
         }
 
         // Remove already-expired / closed entries first as they are
@@ -285,7 +308,7 @@ impl SessionLifecycleManager {
             .len()
             .saturating_sub(self.config.max_active_sessions);
         if remaining_excess == 0 {
-            return;
+            return dead_ids;
         }
 
         // Apply the configured eviction policy to the remaining sessions.
@@ -321,6 +344,7 @@ impl SessionLifecycleManager {
             }
             sessions.remove(id);
         }
+        dead_ids.into_iter().chain(candidate_ids).collect()
     }
 }
 

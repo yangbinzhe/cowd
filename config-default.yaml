@@ -49,7 +49,7 @@ runtime:
       review_budget_tokens: 0
       degrade_on_pressure_bp: 8500
     memory:
-      emit_pulses_from_workgraph: true
+      emit_pulses_from_execution_graph: true
       review_conflicts: true
       max_candidates_per_turn: 8
     permission:

@@ -250,12 +250,32 @@ async fn send_message(
         )
     })?;
     if !runtime_service.has_active_session(&id) {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("session {id} not found"),
-            }),
-        ));
+        state
+            .services
+            .session_manager
+            .as_ref()
+            .ok_or_else(|| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorResponse {
+                        error: "unified session manager unavailable".to_string(),
+                    }),
+                )
+            })?
+            .ensure_session(crate::unified_session_manager::EnsureSessionRequest::new(
+                &id,
+                None,
+                crate::unified_session_manager::SessionSource::WebUi,
+            ))
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse {
+                        error: format!("session {id} not found: {error}"),
+                    }),
+                )
+            })?;
     }
 
     let runtime_service = runtime_service.clone();

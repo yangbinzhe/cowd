@@ -155,6 +155,10 @@ impl NodeExecutor for VerifyNodeExecutor {
                     ticket.graph_id, ticket.node_id
                 )
             }),
+            summary: failure
+                .as_ref()
+                .map(|failure| failure.message.clone())
+                .or_else(|| Some("Required evidence was verified".to_string())),
             evidence_refs: evidence,
             failure,
             usage: ExecutionUsage::default(),
@@ -232,6 +236,7 @@ mod tests {
                 Some(ExecutionNodeResult {
                     status: ExecutionNodeStatus::Completed,
                     result_ref: None,
+                    summary: Some("Verification fixture completed".to_string()),
                     evidence_refs: vec![evidence("proof")],
                     failure: None,
                     usage: ExecutionUsage::default(),

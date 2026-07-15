@@ -2052,6 +2052,40 @@ where
                 reason: "tool batch has no model-requested calls".to_string(),
             });
         }
+        // Compute per-call tool effect authorizations from the conversation
+        // runtime. These are necessary for delegated agent tool calls that
+        // travel through the governed path, because the Gateway's ToolHost
+        // must verify the same descriptor before execution.
+        let tool_authorizations: std::collections::HashMap<
+            String,
+            harness_contract::tool::ToolExecutionAuthorization,
+        > = {
+            let runtime = self.runtime.lock().await;
+            let tool_exec = Arc::clone(runtime.tool_executor());
+            let active_mode = runtime.permission_policy().active_mode();
+            let default_timeout = runtime
+                .tool_timeout()
+                .unwrap_or_else(|| std::time::Duration::from_secs(60));
+            drop(runtime);
+            let mut auths = std::collections::HashMap::new();
+            for call in &calls {
+                let parsed_input: serde_json::Value =
+                    serde_json::from_str(&call.input).unwrap_or(serde_json::Value::Null);
+                if let Some(descriptor) = tool_exec.describe_tool_effect(&call.name, &parsed_input)
+                {
+                    let request_id = format!("{}:{}:{}", session_id, call.id, ticket.attempt);
+                    if let Ok(decision) = crate::ToolPolicy.authorize(
+                        &descriptor,
+                        request_id,
+                        active_mode,
+                        default_timeout.as_secs(),
+                    ) {
+                        auths.insert(call.id.clone(), decision.authorization);
+                    }
+                }
+            }
+            auths
+        };
         let result = if let Some(host) = self.services.tool_execution_host() {
             let raw_messages = execute_governed_runtime_tool_batch(
                 Arc::clone(host),
@@ -2059,6 +2093,7 @@ where
                 &session_id,
                 model_lease.as_deref(),
                 ticket,
+                &tool_authorizations,
             )
             .await;
             // Graph scheduling executes outside the legacy adapter. Before
@@ -2438,6 +2473,10 @@ async fn execute_governed_runtime_tool_batch(
     session_id: &str,
     model_lease: Option<&str>,
     ticket: &NodeExecutionTicket,
+    tool_authorizations: &std::collections::HashMap<
+        String,
+        harness_contract::tool::ToolExecutionAuthorization,
+    >,
 ) -> Vec<ConversationMessage> {
     let requests = calls
         .iter()
@@ -2464,8 +2503,14 @@ async fn execute_governed_runtime_tool_batch(
             let limit = batch.max_concurrency.min(batch.indices.len()).max(1);
             let completed = stream::iter(batch.indices.into_iter().map(|index| {
                 let host = Arc::clone(&host);
-                let request =
-                    bound_runtime_tool_request(&calls[index], session_id, model_lease, ticket);
+                let authorization = tool_authorizations.get(&calls[index].id).cloned();
+                let request = bound_runtime_tool_request(
+                    &calls[index],
+                    session_id,
+                    model_lease,
+                    ticket,
+                    authorization,
+                );
                 async move {
                     let joined =
                         tokio::task::spawn_blocking(move || host.execute_runtime_tool(&request))
@@ -2489,8 +2534,14 @@ async fn execute_governed_runtime_tool_batch(
             }
         } else {
             for index in batch.indices {
-                let request =
-                    bound_runtime_tool_request(&calls[index], session_id, model_lease, ticket);
+                let authorization = tool_authorizations.get(&calls[index].id).cloned();
+                let request = bound_runtime_tool_request(
+                    &calls[index],
+                    session_id,
+                    model_lease,
+                    ticket,
+                    authorization,
+                );
                 results[index] = Some(tool_outcome_message(host.execute_runtime_tool(&request)));
             }
         }
@@ -2517,6 +2568,7 @@ fn bound_runtime_tool_request(
     session_id: &str,
     model_lease: Option<&str>,
     ticket: &NodeExecutionTicket,
+    authorization: Option<harness_contract::tool::ToolExecutionAuthorization>,
 ) -> crate::RuntimeToolExecutionRequest {
     crate::RuntimeToolExecutionRequest {
         idempotency_key: format!("{}:{}", ticket.idempotency_key, call.id),
@@ -2524,7 +2576,7 @@ fn bound_runtime_tool_request(
         tool_name: call.name.clone(),
         input: call.input.clone(),
         category: crate::tool_orchestrator::ToolSafetyCategory::from_tool_name(&call.name),
-        authorization: None,
+        authorization,
         session_id: Some(session_id.to_string()),
         model_lease: model_lease.map(ToString::to_string),
         parent_execution: Some(harness_contract::execution_graph::ExecutionParentBinding {
@@ -3325,6 +3377,7 @@ fn completed_result(result_ref: Option<String>, usage: ExecutionUsage) -> Execut
     ExecutionNodeResult {
         status: ExecutionNodeStatus::Completed,
         result_ref,
+        summary: None,
         evidence_refs: Vec::new(),
         failure: None,
         usage,
@@ -3983,8 +4036,15 @@ mod tests {
             },
         ];
 
-        let messages =
-            execute_governed_runtime_tool_batch(host, &calls, "session", None, &ticket).await;
+        let messages = execute_governed_runtime_tool_batch(
+            host,
+            &calls,
+            "session",
+            None,
+            &ticket,
+            &std::collections::HashMap::new(),
+        )
+        .await;
 
         assert!(peak.load(Ordering::SeqCst) >= 2);
         assert_eq!(messages.len(), 2);

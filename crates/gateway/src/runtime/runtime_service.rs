@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Instant;
 use tokio::task::JoinHandle;
 
@@ -11,7 +11,7 @@ use crate::runtime_boundary::{
     RuntimeBoundaryClock, RuntimeBoundarySnapshot, RuntimeBoundaryStatus,
 };
 use crate::runtime_protocol::{RuntimeErrorKind, RuntimeRequest, RuntimeResponse};
-use crate::session_kernel::{RuntimeCommand, SessionKernel};
+use crate::session_kernel::SessionKernel;
 use crate::session_lifecycle_kernel::SessionLifecycleKernel;
 use harness_contract::{
     task::{TaskId, TaskTurnBinding},
@@ -22,6 +22,11 @@ use harness_contract::{
     },
 };
 use session::SessionLeaseRegistry;
+
+#[async_trait::async_trait]
+pub(crate) trait SessionActivationPort: Send + Sync {
+    async fn activate(&self, session_id: &str) -> Result<(), String>;
+}
 
 use crate::services::{
     ActiveMessagesPage, SessionCompactResult, SessionMessageCounts, SessionStatsSnapshot,
@@ -133,6 +138,7 @@ pub(crate) struct RuntimeService {
     resource_capabilities: runtime::ResourceCapabilityIndex,
     runtime_services: Arc<runtime::RuntimeServices>,
     session_input_router: Arc<runtime::SessionInputRouter>,
+    session_activator: Arc<OnceLock<Weak<dyn SessionActivationPort>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +189,7 @@ impl RuntimeService {
             resource_capabilities,
             runtime_services,
             session_input_router,
+            session_activator: Arc::new(OnceLock::new()),
         })
     }
 
@@ -197,6 +204,15 @@ impl RuntimeService {
 
     pub(crate) fn session_input_router(&self) -> Arc<runtime::SessionInputRouter> {
         Arc::clone(&self.session_input_router)
+    }
+
+    pub(crate) fn install_session_activator(
+        &self,
+        activator: Weak<dyn SessionActivationPort>,
+    ) -> Result<(), String> {
+        self.session_activator
+            .set(activator)
+            .map_err(|_| "session activation port is already installed".to_string())
     }
 
     pub(crate) fn resource_capability_index(&self) -> runtime::ResourceCapabilityIndex {
@@ -254,8 +270,19 @@ impl RuntimeService {
                 ));
             }
         }
-        self.ensure_runtime_session(&record.session_id, None)
-            .await?;
+        if !self.has_active_session(&record.session_id) {
+            let activator = self
+                .session_activator
+                .get()
+                .and_then(Weak::upgrade)
+                .ok_or_else(|| {
+                    format!(
+                        "session {} requires UnifiedSessionManager activation, but no activation port is installed",
+                        record.session_id
+                    )
+                })?;
+            activator.activate(&record.session_id).await?;
+        }
         let runtime_entry = self
             .sessions
             .get(&record.session_id)
@@ -743,10 +770,11 @@ impl RuntimeService {
     /// Lazily activate a persisted session for a new ingress turn. Persisted
     /// session identity remains owned by UnifiedSessionStore; this only adds
     /// the process-local runtime required to execute work.
-    pub(crate) async fn ensure_runtime_session(
+    pub(crate) async fn activate_persisted_session(
         &self,
         session_id: &str,
         model_hint: Option<&str>,
+        system_prompt: Vec<String>,
     ) -> Result<(), String> {
         if self.has_active_session(session_id) {
             return Ok(());
@@ -763,7 +791,7 @@ impl RuntimeService {
             .map(ToOwned::to_owned)
             .or(stored_model)
             .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string());
-        let runtime = self.build_session_runtime_entry(session_id, &model)?;
+        let runtime = self.build_session_runtime_entry(session_id, &model, system_prompt)?;
         self.register_runtime(session_id.to_string(), runtime)?;
         Ok(())
     }
@@ -1042,10 +1070,11 @@ impl RuntimeService {
         Ok(receipt)
     }
 
-    fn build_session_runtime_entry(
+    pub(crate) fn build_session_runtime_entry(
         &self,
         session_id: &str,
         model: &str,
+        system_prompt: Vec<String>,
     ) -> Result<crate::runtime_entry::GatewayRuntimeEntry, String> {
         let session = runtime::Session::new();
         if let Some(store) = self.session_kernel.unified_store() {
@@ -1057,7 +1086,7 @@ impl RuntimeService {
                 session,
                 session_id,
                 model.to_string(),
-                vec![],
+                system_prompt,
                 true,
                 true,
                 None,
@@ -1074,7 +1103,7 @@ impl RuntimeService {
                 session,
                 session_id,
                 model.to_string(),
-                vec![],
+                system_prompt,
                 true,
                 true,
                 None,
@@ -1084,33 +1113,6 @@ impl RuntimeService {
             )
             .map_err(|error| error.to_string())
         }
-    }
-
-    async fn model_for_session(&self, session_id: &str) -> Option<String> {
-        if let Some(model) = self
-            .session_models
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(session_id)
-            .cloned()
-            .filter(|model| !model.trim().is_empty())
-        {
-            return Some(model);
-        }
-        let runtime_entry = self.sessions.get(session_id)?;
-        let runtime_guard = runtime_entry.lock().await;
-        let model = runtime_guard
-            .session_async()
-            .await
-            .model
-            .filter(|model| !model.trim().is_empty());
-        if let Some(model) = model.as_ref() {
-            self.session_models
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(session_id.to_string(), model.clone());
-        }
-        model
     }
 
     fn emit_session_input_materialized(&self, session_id: &str, materialized: serde_json::Value) {
@@ -1255,55 +1257,11 @@ impl RuntimeService {
             .await?
             .is_some()
         {
-            self.ensure_mission_membership(session_id).await?;
             return Ok(());
         }
-        let model = self.model_for_session(session_id).await;
-        let command = RuntimeCommand::CreateSession {
-            session_id: session_id.to_string(),
-            model,
-        };
-        self.session_kernel.execute_runtime_command(command).await?;
-        self.ensure_mission_membership(session_id).await?;
-        Ok(())
-    }
-
-    async fn ensure_mission_membership(&self, session_id: &str) -> Result<(), memory::MemoryError> {
-        let Some(mut record) = self.session_kernel.stored_session(session_id).await? else {
-            return Ok(());
-        };
-        let mut metadata = record
-            .metadata_json
-            .as_deref()
-            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
-            .filter(serde_json::Value::is_object)
-            .unwrap_or_else(|| serde_json::json!({}));
-        metadata["workspace_root"] =
-            serde_json::Value::String(self.runtime_services.workspace_root().display().to_string());
-        let title = metadata
-            .get("title")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| format!("Session {}", &session_id[..session_id.len().min(8)]));
-        record.metadata_json = Some(metadata.to_string());
-        let workspace_key = self.runtime_services.workspace_key().to_string();
-        let request = memory::SessionMissionOutboxRequest {
-            request_id: format!(
-                "mission:{workspace_key}:register:{}:{}",
-                record.session_id, record.created_at
-            ),
-            session_id: record.session_id.clone(),
-            title,
-            workspace_key,
-            operation: memory::SessionMissionOutboxOperation::Register,
-            created_at_ms: current_time_ms(),
-        };
-        self.session_kernel
-            .upsert_stored_session_with_mission_outbox(&record, &request)
-            .await?;
-        Ok(())
+        Err(memory::MemoryError::NotFound(format!(
+            "session {session_id} must be created through UnifiedSessionManager before runtime events are persisted"
+        )))
     }
 
     pub(crate) async fn configure_turn_context(
@@ -1631,8 +1589,8 @@ impl RuntimeService {
     ) -> Result<(), memory::MemoryError> {
         self.session_kernel
             .sync_runtime_session_snapshot(session_id, session)
-            .await?;
-        self.ensure_mission_membership(session_id).await
+            .await
+            .map(|_| ())
     }
 
     pub(crate) async fn compact_active_session(

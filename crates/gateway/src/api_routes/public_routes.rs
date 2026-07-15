@@ -133,7 +133,7 @@ async fn login_handler(
                 )
             })?;
             let cookie = HeaderValue::from_str(&format!(
-                "{WEB_SESSION_COOKIE}={session}; HttpOnly; SameSite=Strict; Path=/api; Max-Age=300"
+                "{WEB_SESSION_COOKIE}={session}; HttpOnly; SameSite=Strict; Path=/api; Max-Age=28800"
             ))
             .map_err(|error| {
                 (

@@ -115,15 +115,28 @@ pub(crate) fn terminal_working_state_event(
     }
     let binding = packet.binding.as_ref()?;
     let (kind, summary, confidence_milli) = match status {
-        ExecutionNodeStatus::Completed => (
-            TeamWorkingStateKind::Finding,
-            format!(
-                "Role node `{}` completed; inspect its evidence references and terminal result through the graph projection.",
-                node_id
-            ),
-            1_000,
-        ),
-        ExecutionNodeStatus::Failed | ExecutionNodeStatus::Blocked | ExecutionNodeStatus::Cancelled => (
+        ExecutionNodeStatus::Completed => {
+            let summary = result
+                .and_then(|result| result.summary.as_deref())
+                .map(str::trim)
+                .filter(|summary| !summary.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| {
+                    format!("Role node `{node_id}` completed without a semantic summary.")
+                });
+            let kind = if result
+                .and_then(|result| result.result_ref.as_deref())
+                .is_some_and(|reference| reference.ends_with(":unresolved"))
+            {
+                TeamWorkingStateKind::Unresolved
+            } else {
+                TeamWorkingStateKind::Finding
+            };
+            (kind, summary, 1_000)
+        }
+        ExecutionNodeStatus::Failed
+        | ExecutionNodeStatus::Blocked
+        | ExecutionNodeStatus::Cancelled => (
             TeamWorkingStateKind::Blocker,
             result
                 .and_then(|result| result.failure.as_ref())

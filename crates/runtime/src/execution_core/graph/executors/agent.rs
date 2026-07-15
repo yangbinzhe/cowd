@@ -156,6 +156,8 @@ impl NodeExecutor for AgentTaskExecutor {
                     ""
                 }
             )),
+            summary: (!returned.outcome.trim().is_empty())
+                .then(|| bounded_semantic_summary(&returned.outcome)),
             evidence_refs: returned.evidence_refs,
             failure,
             usage: ExecutionUsage {
@@ -168,6 +170,17 @@ impl NodeExecutor for AgentTaskExecutor {
             finished_at_ms: crate::tool_invocation::now_ms(),
         }))
     }
+}
+
+fn bounded_semantic_summary(value: &str) -> String {
+    const MAX_CHARS: usize = 2_000;
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= MAX_CHARS {
+        return normalized;
+    }
+    let mut summary = normalized.chars().take(MAX_CHARS).collect::<String>();
+    summary.push_str(" ...");
+    summary
 }
 
 fn execution_status_for_agent_terminal(

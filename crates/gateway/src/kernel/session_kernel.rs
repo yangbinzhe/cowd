@@ -19,51 +19,6 @@ use crate::runtime_entry::GatewayRuntimeEntry;
 
 type RuntimeEntry = Arc<Mutex<GatewayRuntimeEntry>>;
 
-#[derive(Debug, Clone)]
-pub(crate) enum RuntimeCommand {
-    CreateSession {
-        session_id: String,
-        model: Option<String>,
-    },
-    ActivateSession {
-        session_id: String,
-    },
-    ArchiveSession {
-        session_id: String,
-    },
-    DeleteSession {
-        session_id: String,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RuntimeCommandResult {
-    pub session_id: String,
-    pub kind: &'static str,
-    pub persisted: bool,
-    pub session_domain_event_sequence: Option<usize>,
-}
-
-impl RuntimeCommand {
-    fn session_id(&self) -> &str {
-        match self {
-            Self::CreateSession { session_id, .. }
-            | Self::ActivateSession { session_id }
-            | Self::ArchiveSession { session_id }
-            | Self::DeleteSession { session_id } => session_id,
-        }
-    }
-
-    fn kind(&self) -> &'static str {
-        match self {
-            Self::CreateSession { .. } => "session.create",
-            Self::ActivateSession { .. } => "session.activate",
-            Self::ArchiveSession { .. } => "session.archive",
-            Self::DeleteSession { .. } => "session.delete",
-        }
-    }
-}
-
 /// Unified session capability boundary for hot runtimes, durable session data,
 /// and frontend event fan-out.
 ///
@@ -152,17 +107,6 @@ impl SessionKernel {
         store.get_session(session_id).await
     }
 
-    pub(crate) async fn upsert_stored_session(
-        &self,
-        record: &SessionRecord,
-    ) -> Result<bool, MemoryError> {
-        let Some(store) = self.unified_store.as_ref() else {
-            return Ok(false);
-        };
-        store.upsert_session(record).await?;
-        Ok(true)
-    }
-
     /// Persist the Session authority record and its one-way Mission lifecycle
     /// intent in the same SQLite transaction. Runtime bridge workers, not API
     /// routes, materialize that intent into the Mission event stream.
@@ -189,21 +133,6 @@ impl SessionKernel {
         };
         store.update_session(record).await?;
         Ok(true)
-    }
-
-    pub(crate) async fn delete_stored_session(
-        &self,
-        session_id: &str,
-    ) -> Result<bool, MemoryError> {
-        let Some(store) = self.unified_store.as_ref() else {
-            return Ok(false);
-        };
-        if store.get_session(session_id).await?.is_some() {
-            store.delete_session(session_id).await?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
     }
 
     pub(crate) async fn delete_stored_session_with_mission_outbox(
@@ -446,79 +375,6 @@ impl SessionKernel {
             .map(Some)
     }
 
-    pub(crate) async fn execute_runtime_command(
-        &self,
-        command: RuntimeCommand,
-    ) -> Result<RuntimeCommandResult, MemoryError> {
-        let session_id = command.session_id().to_string();
-        let kind = command.kind();
-        let Some(store) = self.unified_store.as_ref() else {
-            if matches!(command, RuntimeCommand::DeleteSession { .. }) {
-                self.remove_active_runtime(&session_id);
-            }
-            return Ok(RuntimeCommandResult {
-                session_id,
-                kind,
-                persisted: false,
-                session_domain_event_sequence: None,
-            });
-        };
-
-        match &command {
-            RuntimeCommand::CreateSession { model, .. } => {
-                let mut record = new_api_session_record(&session_id, model.clone());
-                record.status = "active".to_string();
-                store.create_session(&record).await?;
-            }
-            RuntimeCommand::ActivateSession { .. } => {
-                if let Some(mut record) = store.get_session(&session_id).await? {
-                    record.status = "active".to_string();
-                    record.last_activity = chrono::Utc::now().to_rfc3339();
-                    store.update_session(&record).await?;
-                }
-            }
-            RuntimeCommand::ArchiveSession { .. } => {
-                if let Some(mut record) = store.get_session(&session_id).await? {
-                    record.status = "archived".to_string();
-                    record.last_activity = chrono::Utc::now().to_rfc3339();
-                    store.update_session(&record).await?;
-                }
-            }
-            RuntimeCommand::DeleteSession { .. } => {
-                self.remove_active_runtime(&session_id);
-                if store.get_session(&session_id).await?.is_some() {
-                    store.delete_session(&session_id).await?;
-                }
-                return Ok(RuntimeCommandResult {
-                    session_id,
-                    kind,
-                    persisted: true,
-                    session_domain_event_sequence: None,
-                });
-            }
-        }
-
-        let session_domain_event_sequence = self
-            .append_session_domain_event(
-                &session_id,
-                SessionDomainScope::Session,
-                kind,
-                serde_json::json!({
-                    "command": kind,
-                    "session_id": session_id,
-                    "persisted": true,
-                }),
-            )
-            .await?;
-
-        Ok(RuntimeCommandResult {
-            session_id,
-            kind,
-            persisted: true,
-            session_domain_event_sequence,
-        })
-    }
-
     pub(crate) async fn sync_runtime_session_snapshot(
         &self,
         session_id: &str,
@@ -621,7 +477,7 @@ fn new_api_session_record(session_id: &str, model: Option<String>) -> SessionRec
 mod tests {
     use std::sync::Arc;
 
-    use super::{RuntimeCommand, SessionKernel};
+    use super::SessionKernel;
     use crate::event_bus::SessionEventBus;
     use crate::gateway::ActiveSessions;
     #[test]
@@ -658,7 +514,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kernel_queries_stored_session_records_and_deletes_existing_rows() {
+    async fn kernel_queries_stored_session_records() {
         let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
         let kernel = SessionKernel::new(
             Arc::new(ActiveSessions::new()),
@@ -688,152 +544,5 @@ mod tests {
             .await
             .unwrap()
             .is_some());
-        assert!(kernel
-            .delete_stored_session("stored-session")
-            .await
-            .unwrap());
-        assert!(kernel
-            .stored_session("stored-session")
-            .await
-            .unwrap()
-            .is_none());
-    }
-
-    #[tokio::test]
-    async fn kernel_upserts_and_updates_stored_session_records() {
-        let kernel = SessionKernel::new(
-            Arc::new(ActiveSessions::new()),
-            Some(Arc::new(
-                memory::UnifiedSessionStore::open_in_memory().unwrap(),
-            )),
-            SessionEventBus::new(),
-        );
-        let mut record = memory::SessionRecord {
-            session_id: "upsert-session".to_string(),
-            platform: "api".to_string(),
-            chat_id: "upsert-session".to_string(),
-            user_id: None,
-            model: Some("claude-sonnet-4-6".to_string()),
-            created_at: "2026-06-05T00:00:00Z".to_string(),
-            last_activity: "2026-06-05T00:00:00Z".to_string(),
-            message_count: 0,
-            reset_policy: "manual".to_string(),
-            metadata_json: None,
-            input_tokens: 0,
-            output_tokens: 0,
-            estimated_cost_usd: 0.0,
-            status: "active".to_string(),
-        };
-
-        assert!(kernel.upsert_stored_session(&record).await.unwrap());
-        record.model = Some("claude-opus-4-6".to_string());
-        assert!(kernel.update_stored_session(&record).await.unwrap());
-
-        let stored = kernel
-            .stored_session("upsert-session")
-            .await
-            .unwrap()
-            .expect("record should exist");
-        assert_eq!(stored.model.as_deref(), Some("claude-opus-4-6"));
-    }
-
-    #[tokio::test]
-    async fn session_lifecycle_create_activate_archive_emits_runtime_events() {
-        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
-        let kernel = SessionKernel::new(
-            Arc::new(ActiveSessions::new()),
-            Some(store.clone()),
-            SessionEventBus::new(),
-        );
-
-        let created = kernel
-            .execute_runtime_command(RuntimeCommand::CreateSession {
-                session_id: "lifecycle-session".to_string(),
-                model: Some("claude-sonnet-4-6".to_string()),
-            })
-            .await
-            .unwrap();
-        assert!(created.persisted);
-        assert_eq!(created.session_domain_event_sequence, Some(0));
-
-        let activated = kernel
-            .execute_runtime_command(RuntimeCommand::ActivateSession {
-                session_id: "lifecycle-session".to_string(),
-            })
-            .await
-            .unwrap();
-        assert_eq!(activated.session_domain_event_sequence, Some(1));
-
-        let archived = kernel
-            .execute_runtime_command(RuntimeCommand::ArchiveSession {
-                session_id: "lifecycle-session".to_string(),
-            })
-            .await
-            .unwrap();
-        assert_eq!(archived.session_domain_event_sequence, Some(2));
-
-        let record = store
-            .get_session("lifecycle-session")
-            .await
-            .unwrap()
-            .expect("session should exist");
-        assert_eq!(record.status, "archived");
-
-        let page = kernel
-            .stored_session_domain_events_page("lifecycle-session", 0, 10)
-            .await
-            .unwrap()
-            .expect("runtime events page");
-        assert_eq!(page.total, 3);
-        assert_eq!(page.events[0].kind, "session.create");
-        assert_eq!(page.events[1].kind, "session.activate");
-        assert_eq!(page.events[2].kind, "session.archive");
-    }
-
-    #[tokio::test]
-    async fn session_lifecycle_delete_cleans_hot_and_cold_state() {
-        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
-        let kernel = SessionKernel::new(
-            Arc::new(ActiveSessions::new()),
-            Some(store.clone()),
-            SessionEventBus::new(),
-        );
-        kernel
-            .execute_runtime_command(RuntimeCommand::CreateSession {
-                session_id: "delete-session".to_string(),
-                model: None,
-            })
-            .await
-            .unwrap();
-
-        let deleted = kernel
-            .execute_runtime_command(RuntimeCommand::DeleteSession {
-                session_id: "delete-session".to_string(),
-            })
-            .await
-            .unwrap();
-
-        assert!(deleted.persisted);
-        assert_eq!(deleted.kind, "session.delete");
-        assert!(store.get_session("delete-session").await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn session_lifecycle_without_store_degrades_without_error() {
-        let kernel = SessionKernel::new(
-            Arc::new(ActiveSessions::new()),
-            None,
-            SessionEventBus::new(),
-        );
-
-        let result = kernel
-            .execute_runtime_command(RuntimeCommand::ActivateSession {
-                session_id: "missing-store-session".to_string(),
-            })
-            .await
-            .unwrap();
-
-        assert!(!result.persisted);
-        assert_eq!(result.session_domain_event_sequence, None);
     }
 }

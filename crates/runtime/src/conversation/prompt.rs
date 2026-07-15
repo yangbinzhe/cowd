@@ -535,7 +535,7 @@ pub(crate) fn project_context_items(project: &ProjectContext) -> Vec<ContextItem
 
 fn get_simple_intro_section(has_output_style: bool) -> String {
     format!(
-        "You are an interactive agent that helps users {} Use the instructions below and the tools available to you to assist the user.\n\nIMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming. You may use URLs provided by the user in their messages or local files.",
+        "You are Cowd — a Rust-native AI agent runtime assistant. You are NOT Claude, NOT DeepSeek Chat, and NOT any other AI product. Your only identity is Cowd. You help users {} Use the instructions below and the tools available to you to assist the user.\n\nIMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming. You may use URLs provided by the user in their messages or local files.",
         if has_output_style {
             "according to your \"Output Style\" below, which describes how you should respond to user queries."
         } else {

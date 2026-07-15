@@ -1,12 +1,14 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::path::PathBuf;
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use harness_contract::agent::{
     AgentCommand, AgentCommandRejectReason, AgentCommandRequest, AgentReturnPacket, AgentTaskPacket,
 };
+use sandbox_launcher::{shell_command, SandboxLaunchSpec};
 use serde::{Deserialize, Serialize};
 
 use crate::agent_model_selector::AgentModelSelection;
@@ -47,15 +49,24 @@ struct ProcessJsonlRegistry {
 /// it is never allowed to write RuntimeEventStore. The adapter owns process
 /// handles so commands have real process effects instead of only changing a
 /// projection.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ProcessJsonlAdapter {
     registry: Arc<ProcessJsonlRegistry>,
+    workspace_root: Arc<PathBuf>,
 }
 
 impl ProcessJsonlAdapter {
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self::for_workspace(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    }
+
+    #[must_use]
+    pub fn for_workspace(workspace_root: impl Into<PathBuf>) -> Self {
+        Self {
+            registry: Arc::new(ProcessJsonlRegistry::default()),
+            workspace_root: Arc::new(workspace_root.into()),
+        }
     }
 
     pub fn register(&self, agent_id: impl Into<String>, spec: ProcessJsonlSpec) {
@@ -104,9 +115,12 @@ impl AgentRuntimeBackend for ProcessJsonlAdapter {
             .cloned()
             .ok_or_else(|| "no ProcessJsonl spec is registered for this agent".to_string())?;
         let registry = Arc::clone(&self.registry);
-        tokio::task::spawn_blocking(move || execute_child(&registry, &spec, &packet))
-            .await
-            .map_err(|error| format!("process-jsonl worker join failed: {error}"))?
+        let workspace_root = Arc::clone(&self.workspace_root);
+        tokio::task::spawn_blocking(move || {
+            execute_child(&registry, &workspace_root, &spec, &packet)
+        })
+        .await
+        .map_err(|error| format!("process-jsonl worker join failed: {error}"))?
     }
 
     async fn command(
@@ -147,14 +161,24 @@ impl AgentRuntimeBackend for ProcessJsonlAdapter {
 
 fn execute_child(
     registry: &ProcessJsonlRegistry,
+    workspace_root: &PathBuf,
     spec: &ProcessJsonlSpec,
     packet: &AgentTaskPacket,
 ) -> Result<AgentReturnPacket, String> {
     if spec.command.trim().is_empty() {
         return Err("ProcessJsonl command is empty".into());
     }
-    let mut child = Command::new(&spec.command)
-        .args(&spec.args)
+    let invocation = std::iter::once(spec.command.as_str())
+        .chain(spec.args.iter().map(String::as_str))
+        .map(shell_quote)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut launch_spec = SandboxLaunchSpec::workspace(workspace_root);
+    launch_spec.working_directory = Some(workspace_root.clone());
+    let prepared = shell_command(&format!("exec {invocation}"), &launch_spec)
+        .map_err(|error| format!("prepare hardened ProcessJsonl sandbox failed: {error}"))?;
+    let mut child = prepared
+        .into_command()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -215,6 +239,10 @@ fn execute_child(
         return Err(format!("ProcessJsonl worker exited with {status}"));
     }
     result
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn read_process_result(

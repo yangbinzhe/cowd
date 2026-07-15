@@ -29,14 +29,11 @@ use crate::session_kernel::SessionKernel;
 use crate::session_lifecycle_kernel::SessionLifecycleKernel;
 use memory::cognitive::CognitiveContextManager;
 use memory::MemoryConfig;
-use memory::UnifiedSessionStore;
 use runtime::mcp_tool_bridge::{McpConnectionStatus, McpToolInfo, McpToolRegistry};
 use runtime::{McpServerManager, RuntimeConfig};
 use surface::SurfaceManifest;
 
-use runtime::session_lifecycle::{
-    EvictionPolicy, SessionLifecycleConfig, SessionLifecycleManager, SessionStatus,
-};
+use runtime::session_lifecycle::{EvictionPolicy, SessionLifecycleConfig, SessionLifecycleManager};
 
 pub mod config_reload;
 
@@ -382,9 +379,7 @@ impl mcp::McpService for RuntimeMcpServiceAdapter {
 /// Uses `spawn_blocking` + `block_on` internally because the session
 /// entry's `MutexGuard` is `!Send` across `.await` points.
 fn spawn_session_cleanup_task(
-    active_sessions: Arc<ActiveSessions>,
-    lifecycle: Arc<SessionLifecycleManager>,
-    unified_store: Option<Arc<UnifiedSessionStore>>,
+    session_manager: Arc<crate::unified_session_manager::UnifiedSessionManager>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -392,43 +387,9 @@ fn spawn_session_cleanup_task(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-            // Run lifecycle's internal TTL/idle/eviction checks first
-            lifecycle.run_cleanup().await;
-            let ids = active_sessions.list();
-            for id in &ids {
-                if let Some(status) = lifecycle.check_session(id).await {
-                    if matches!(
-                        status,
-                        SessionStatus::Expired | SessionStatus::Idle | SessionStatus::Evicted
-                    ) {
-                        tracing::info!(session_id=%id, ?status, "cleanup: closing session");
-                        if let Some(entry) = active_sessions.get(id) {
-                            let entry = entry.clone();
-                            let store = unified_store.clone();
-                            let id = id.clone();
-                            tokio::task::spawn_blocking(move || {
-                                let handle = tokio::runtime::Handle::current();
-                                handle.block_on(async {
-                                    let mut runtime = entry.lock().await;
-                                    // Shutdown MCP and plugins before dropping
-                                    let _ = runtime.shutdown_mcp();
-                                    let _ = runtime.shutdown_plugins();
-                                    drop(runtime);
-                                    if let Some(ref store) = store {
-                                        let _ = store.delete_session(&id);
-                                    }
-                                });
-                            })
-                            .await
-                            .ok();
-                        }
-                        active_sessions.remove(id);
-                        lifecycle.unregister(id).await;
-                    }
-                } else {
-                    // Session tracked in active_sessions but not in lifecycle
-                    active_sessions.remove(id);
-                }
+            let unloaded = session_manager.run_resource_cleanup().await;
+            if unloaded > 0 {
+                tracing::info!(unloaded, "session resource cleanup completed");
             }
         }
     })
@@ -826,13 +787,6 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         cleanup_interval: Duration::from_secs(300),
     };
     let lifecycle = Arc::new(SessionLifecycleManager::new(lifecycle_config));
-    let _cleanup_handle = spawn_session_cleanup_task(
-        sessions.clone(),
-        lifecycle,
-        unified_store.clone(),
-        Duration::from_secs(300),
-    );
-
     let static_webui =
         crate::gateway_static::resolve_static_webui_source(config.webui_dir.as_deref());
     let startup_diagnostics = build_startup_diagnostics(
@@ -957,6 +911,14 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     let session_bridge_store = unified_store.clone().ok_or_else(|| {
         "durable UnifiedSessionStore is required for the Runtime session bridge".to_string()
     })?;
+    let session_manager = Arc::new(crate::unified_session_manager::UnifiedSessionManager::new(
+        Arc::clone(&runtime_service),
+        Arc::clone(&lifecycle),
+        100,
+    ));
+    let session_activation_port: Arc<dyn crate::runtime_service::SessionActivationPort> =
+        session_manager.clone();
+    runtime_service.install_session_activator(Arc::downgrade(&session_activation_port))?;
     let session_runtime_bridge = crate::session_runtime_bridge::SessionRuntimeBridge::start(
         Arc::clone(&runtime_service),
         session_bridge_store,
@@ -972,15 +934,31 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         }),
     ));
     let config_reload = runtime_service.config_reload();
-    let services = Arc::new(crate::services::GatewayServices::new_with_config_home(
+    let services = Arc::new(crate::services::GatewayServices::new_with_session_manager(
         Arc::clone(&runtime_service),
         task_kernel.clone(),
         surface_host.clone(),
         cognitive.clone(),
         approval_gate.clone(),
         approval_repository,
+        Arc::clone(&session_manager),
         &approval_dir,
     ));
+    let _cleanup_handle =
+        spawn_session_cleanup_task(Arc::clone(&session_manager), Duration::from_secs(300));
+    tokio::spawn(async move {
+        let summary = session_manager.recover_active_sessions().await;
+        tracing::info!(
+            discovered = summary.discovered,
+            recovered = summary.recovered,
+            already_active = summary.already_active,
+            failed = summary.failed,
+            "session startup recovery completed"
+        );
+        for failure in summary.failures {
+            tracing::warn!(error = %failure, "session startup recovery item failed");
+        }
+    });
 
     let app_state = Arc::new(api_routes::AppState {
         tool_registry: tools.clone(),

@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -11,15 +10,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use memory::store::session::{
-    SessionEvent, SessionListOptions, SessionMissionOutboxOperation, SessionMissionOutboxRequest,
-    SessionRecord,
-};
+use memory::store::session::{SessionEvent, SessionListOptions, SessionRecord};
 use serde::{Deserialize, Serialize};
 
-use super::{
-    new_api_session_record, surface_actor_id, AppState, AuthenticatedPrincipal, ErrorResponse,
-};
+use super::{surface_actor_id, AppState, AuthenticatedPrincipal, ErrorResponse};
 use crate::services::{
     SessionMessageCounts, SessionStatsSnapshot, SessionTokenCounts, SessionUpdateRequest,
 };
@@ -117,58 +111,29 @@ fn default_session_model(state: &AppState) -> String {
         .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string())
 }
 
-fn session_provider_registry(
+fn required_session_manager(
     state: &AppState,
-) -> Result<Arc<runtime::ProviderRegistry>, (StatusCode, Json<ErrorResponse>)> {
-    state
-        .services
-        .runtime
-        .as_ref()
-        .map(|service| service.provider_registry())
-        .ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse {
-                    error: "runtime provider registry unavailable".to_string(),
-                }),
-            )
-        })
+) -> Result<
+    &Arc<crate::unified_session_manager::UnifiedSessionManager>,
+    (StatusCode, Json<ErrorResponse>),
+> {
+    state.services.session_manager.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "unified session manager unavailable".to_string(),
+            }),
+        )
+    })
 }
 
-fn session_tool_host(
-    state: &AppState,
-) -> Result<Arc<tools::ToolHost>, (StatusCode, Json<ErrorResponse>)> {
-    state
-        .services
-        .runtime
-        .as_ref()
-        .map(|service| service.tool_host())
-        .ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse {
-                    error: "runtime tool host unavailable".to_string(),
-                }),
-            )
-        })
-}
-
-fn session_runtime_services(
-    state: &AppState,
-) -> Result<Arc<runtime::RuntimeServices>, (StatusCode, Json<ErrorResponse>)> {
-    state
-        .services
-        .runtime
-        .as_ref()
-        .map(|service| service.runtime_services())
-        .ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse {
-                    error: "runtime services unavailable".to_string(),
-                }),
-            )
-        })
+fn session_manager_error(error: String) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse {
+            error: format!("session operation failed: {error}"),
+        }),
+    )
 }
 
 #[derive(Deserialize)]
@@ -438,187 +403,30 @@ async fn create_session(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(body): Json<CreateSessionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let provider_registry = session_provider_registry(&state)?;
-    let tool_host = session_tool_host(&state)?;
     let session_id = uuid::Uuid::new_v4().to_string();
     tracing::info!(%session_id, "API session create requested");
-
-    let session = runtime::Session::new();
     let model = body
         .model
         .filter(|model| !model.trim().is_empty())
         .unwrap_or_else(|| default_session_model(&state));
-    let runtime = if let Some(store) = state.services.session.unified_store() {
-        crate::runtime_factory::create_runtime_entry_with_session_store(
-            store.clone(),
-            session_runtime_services(&state)?,
-            Arc::clone(&provider_registry),
-            Arc::clone(&tool_host),
-            session,
+    let manager = required_session_manager(&state)?;
+    let outcome = manager
+        .ensure_session(crate::unified_session_manager::EnsureSessionRequest::new(
             &session_id,
-            model.clone(),
-            vec![],
-            true,
-            true,
-            None,
-            runtime::PermissionMode::WorkspaceWrite,
-            None,
-            None,
-        )
-    } else {
-        crate::runtime_factory::create_runtime_entry(
-            session_runtime_services(&state)?,
-            Arc::clone(&provider_registry),
-            Arc::clone(&tool_host),
-            session,
-            &session_id,
-            model.clone(),
-            vec![],
-            true,
-            true,
-            None,
-            runtime::PermissionMode::WorkspaceWrite,
-            None,
-            None,
-        )
-    }
-    .map_err(|error| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("failed to build runtime: {error}"),
-            }),
-        )
-    })?;
-
-    let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "runtime service not configured".to_string(),
-            }),
-        )
-    })?;
-    if let Err(error) = runtime_service.register_runtime(session_id.clone(), runtime) {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: format!("failed to register session: {error}"),
-            }),
-        ));
-    }
-
-    let mut info = active_session_info(session_id.clone());
-    if state.services.session.has_unified_store() {
-        let mut record = new_api_session_record(&session_id, Some(model));
-        persist_session_with_mission_registration(&state, &mut record, "API session").await?;
-        info = session_info_from_record(record);
-    }
+            Some(model),
+            crate::unified_session_manager::SessionSource::WebUi,
+        ))
+        .await
+        .map_err(session_manager_error)?;
+    let info = session_info_from_record(outcome.record);
 
     Ok((StatusCode::CREATED, Json(info)))
-}
-
-fn mission_outbox_request(
-    state: &AppState,
-    record: &SessionRecord,
-    title: &str,
-    operation: SessionMissionOutboxOperation,
-) -> Result<SessionMissionOutboxRequest, (StatusCode, Json<ErrorResponse>)> {
-    let services = session_runtime_services(state)?;
-    let operation_name = match operation {
-        SessionMissionOutboxOperation::Register => "register",
-        SessionMissionOutboxOperation::Start => "start",
-        SessionMissionOutboxOperation::Close => "close",
-    };
-    Ok(SessionMissionOutboxRequest {
-        request_id: format!(
-            "mission:{}:{operation_name}:{}:{}",
-            services.workspace_key(),
-            record.session_id,
-            record.created_at,
-        ),
-        session_id: record.session_id.clone(),
-        title: title.to_string(),
-        workspace_key: services.workspace_key().to_string(),
-        operation,
-        created_at_ms: current_time_ms(),
-    })
-}
-
-fn bind_session_workspace(record: &mut SessionRecord, state: &AppState) {
-    let mut metadata = record
-        .metadata_json
-        .as_deref()
-        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
-        .filter(serde_json::Value::is_object)
-        .unwrap_or_else(|| serde_json::json!({}));
-    metadata["workspace_root"] =
-        serde_json::Value::String(state.workspace_root.display().to_string());
-    record.metadata_json = Some(metadata.to_string());
-}
-
-fn session_title(record: &SessionRecord) -> String {
-    record
-        .metadata_json
-        .as_deref()
-        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
-        .and_then(|value| {
-            value
-                .get("title")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-        })
-        .unwrap_or_else(|| {
-            format!(
-                "Session {}",
-                &record.session_id[..record.session_id.len().min(8)]
-            )
-        })
-}
-
-fn current_time_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-async fn persist_session_with_mission_registration(
-    state: &AppState,
-    record: &mut SessionRecord,
-    title: &str,
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    bind_session_workspace(record, state);
-    let request = mission_outbox_request(
-        state,
-        record,
-        title,
-        SessionMissionOutboxOperation::Register,
-    )?;
-    state
-        .services
-        .session
-        .upsert_stored_session_with_mission_outbox(record, &request)
-        .await
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("failed to persist session and Mission registration: {error}"),
-                }),
-            )
-        })?;
-    Ok(())
 }
 
 async fn branch_session_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let provider_registry = session_provider_registry(&state)?;
-    let tool_host = session_tool_host(&state)?;
     if id.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -671,85 +479,24 @@ async fn branch_session_handler(
         .and_then(|record| record.model.clone())
         .unwrap_or_else(|| default_session_model(&state));
     let branch_id = uuid::Uuid::new_v4().to_string();
-    let session = runtime::Session::new();
-    let runtime = if let Some(store) = state.services.session.unified_store() {
-        crate::runtime_factory::create_runtime_entry_with_session_store(
-            store.clone(),
-            session_runtime_services(&state)?,
-            Arc::clone(&provider_registry),
-            Arc::clone(&tool_host),
-            session,
-            &branch_id,
-            model.clone(),
-            vec![],
-            true,
-            true,
-            None,
-            runtime::PermissionMode::WorkspaceWrite,
-            None,
-            None,
-        )
-    } else {
-        crate::runtime_factory::create_runtime_entry(
-            session_runtime_services(&state)?,
-            Arc::clone(&provider_registry),
-            Arc::clone(&tool_host),
-            session,
-            &branch_id,
-            model.clone(),
-            vec![],
-            true,
-            true,
-            None,
-            runtime::PermissionMode::WorkspaceWrite,
-            None,
-            None,
-        )
-    }
-    .map_err(|error| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("failed to build runtime: {error}"),
-            }),
-        )
-    })?;
-
-    let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "runtime service not configured".to_string(),
-            }),
-        )
-    })?;
-    if let Err(error) = runtime_service.register_runtime(branch_id.clone(), runtime) {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: format!("failed to register branch session: {error}"),
-            }),
-        ));
-    }
-
-    let mut info = active_session_info(branch_id.clone());
+    let mut request = crate::unified_session_manager::EnsureSessionRequest::new(
+        &branch_id,
+        Some(model),
+        crate::unified_session_manager::SessionSource::WebUi,
+    );
+    request.title = Some(format!("{} / branch", source_title));
+    request.metadata = serde_json::json!({
+        "branched_from": id,
+        "branch_source_title": source_title,
+    });
+    let outcome = required_session_manager(&state)?
+        .ensure_session(request)
+        .await
+        .map_err(session_manager_error)?;
+    let mut info = session_info_from_record(outcome.record.clone());
     let mut copied_messages = 0usize;
     if state.services.session.has_unified_store() {
-        let mut record = new_api_session_record(&branch_id, Some(model));
-        record.metadata_json = Some(
-            serde_json::json!({
-                "title": format!("{} / branch", source_title),
-                "branched_from": id,
-                "branch_source_title": source_title,
-            })
-            .to_string(),
-        );
-        persist_session_with_mission_registration(
-            &state,
-            &mut record,
-            &format!("{} / branch", source_title),
-        )
-        .await?;
+        let mut record = outcome.record;
         copied_messages = state
             .services
             .session
@@ -818,8 +565,6 @@ async fn ensure_session_handler(
     Path(id): Path<String>,
     Json(body): Json<CreateSessionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let provider_registry = session_provider_registry(&state)?;
-    let tool_host = session_tool_host(&state)?;
     if id.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -829,118 +574,21 @@ async fn ensure_session_handler(
         ));
     }
 
-    let mut created = false;
-    if !state
-        .services
-        .runtime
-        .as_ref()
-        .is_some_and(|runtime_service| runtime_service.has_active_session(&id))
-    {
-        let session = runtime::Session::new();
-        let model = body
-            .model
-            .filter(|model| !model.trim().is_empty())
-            .unwrap_or_else(|| default_session_model(&state));
-        let runtime = if let Some(store) = state.services.session.unified_store() {
-            crate::runtime_factory::create_runtime_entry_with_session_store(
-                store.clone(),
-                session_runtime_services(&state)?,
-                Arc::clone(&provider_registry),
-                Arc::clone(&tool_host),
-                session,
-                &id,
-                model.clone(),
-                vec![],
-                true,
-                true,
-                None,
-                runtime::PermissionMode::WorkspaceWrite,
-                None,
-                None,
-            )
-        } else {
-            crate::runtime_factory::create_runtime_entry(
-                session_runtime_services(&state)?,
-                Arc::clone(&provider_registry),
-                Arc::clone(&tool_host),
-                session,
-                &id,
-                model.clone(),
-                vec![],
-                true,
-                true,
-                None,
-                runtime::PermissionMode::WorkspaceWrite,
-                None,
-                None,
-            )
-        }
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("failed to build runtime: {error}"),
-                }),
-            )
-        })?;
-
-        let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse {
-                    error: "runtime service not configured".to_string(),
-                }),
-            )
-        })?;
-        if let Err(error) = runtime_service.register_runtime(id.clone(), runtime) {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse {
-                    error: format!("failed to register session: {error}"),
-                }),
-            ));
-        }
-        if state.services.session.has_unified_store()
-            && state
-                .services
-                .session
-                .stored_session(&id)
-                .await
-                .ok()
-                .flatten()
-                .is_none()
-        {
-            let mut record = new_api_session_record(&id, Some(model));
-            persist_session_with_mission_registration(&state, &mut record, "Ensured API session")
-                .await?;
-        }
-        created = true;
-    }
-    if state.services.session.has_unified_store() {
-        if let Some(mut record) =
-            state
-                .services
-                .session
-                .stored_session(&id)
-                .await
-                .map_err(|error| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ErrorResponse {
-                            error: format!("failed to load ensured session: {error}"),
-                        }),
-                    )
-                })?
-        {
-            persist_session_with_mission_registration(&state, &mut record, "Ensured API session")
-                .await?;
-        }
-    }
+    let outcome = required_session_manager(&state)?
+        .ensure_session(crate::unified_session_manager::EnsureSessionRequest::new(
+            &id,
+            body.model.filter(|model| !model.trim().is_empty()),
+            crate::unified_session_manager::SessionSource::Tui,
+        ))
+        .await
+        .map_err(session_manager_error)?;
 
     Ok(Json(serde_json::json!({
         "ok": true,
         "session_id": id,
-        "created": created,
+        "created": outcome.created,
+        "restored": outcome.restored,
+        "source": outcome.record.platform,
         "active_sessions": state.services.session.list_active_session_ids().len(),
     })))
 }
@@ -1052,49 +700,11 @@ async fn delete_session(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let removed_active = state
-        .services
-        .runtime
-        .as_ref()
-        .is_some_and(|runtime_service| runtime_service.remove_active_runtime_if_present(&id));
-    let removed_stored = if let Some(record) = state
-        .services
-        .session
-        .stored_session(&id)
+    let removed = required_session_manager(&state)?
+        .delete_session(&id)
         .await
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("failed to load session before deletion: {error}"),
-                }),
-            )
-        })? {
-        let title = session_title(&record);
-        let request = mission_outbox_request(
-            &state,
-            &record,
-            &title,
-            SessionMissionOutboxOperation::Close,
-        )?;
-        state
-            .services
-            .session
-            .delete_stored_session_with_mission_outbox(&request)
-            .await
-            .map_err(|error| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("failed to delete session and queue Mission close: {error}"),
-                    }),
-                )
-            })?
-    } else {
-        false
-    };
-
-    if removed_active || removed_stored {
+        .map_err(session_manager_error)?;
+    if removed {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err((

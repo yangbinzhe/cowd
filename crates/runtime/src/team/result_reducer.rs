@@ -149,9 +149,19 @@ impl SynthesizeBackend for TeamResultReducer {
                 None,
             )
         };
+        let summary = failure
+            .as_ref()
+            .map(|failure| failure.message.clone())
+            .or_else(|| {
+                result_ref
+                    .as_deref()
+                    .and_then(|value| value.strip_prefix("assistant_json:"))
+                    .and_then(|value| serde_json::from_str::<String>(value).ok())
+            });
         Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
             status,
             result_ref,
+            summary,
             evidence_refs: evidence,
             failure,
             usage,
