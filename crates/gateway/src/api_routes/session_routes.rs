@@ -818,8 +818,6 @@ async fn ensure_session_handler(
     Path(id): Path<String>,
     Json(body): Json<CreateSessionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let provider_registry = session_provider_registry(&state)?;
-    let tool_host = session_tool_host(&state)?;
     if id.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -836,54 +834,6 @@ async fn ensure_session_handler(
         .as_ref()
         .is_some_and(|runtime_service| runtime_service.has_active_session(&id))
     {
-        let session = runtime::Session::new();
-        let model = body
-            .model
-            .filter(|model| !model.trim().is_empty())
-            .unwrap_or_else(|| default_session_model(&state));
-        let runtime = if let Some(store) = state.services.session.unified_store() {
-            crate::runtime_factory::create_runtime_entry_with_session_store(
-                store.clone(),
-                session_runtime_services(&state)?,
-                Arc::clone(&provider_registry),
-                Arc::clone(&tool_host),
-                session,
-                &id,
-                model.clone(),
-                vec![],
-                true,
-                true,
-                None,
-                runtime::PermissionMode::WorkspaceWrite,
-                None,
-                None,
-            )
-        } else {
-            crate::runtime_factory::create_runtime_entry(
-                session_runtime_services(&state)?,
-                Arc::clone(&provider_registry),
-                Arc::clone(&tool_host),
-                session,
-                &id,
-                model.clone(),
-                vec![],
-                true,
-                true,
-                None,
-                runtime::PermissionMode::WorkspaceWrite,
-                None,
-                None,
-            )
-        }
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("failed to build runtime: {error}"),
-                }),
-            )
-        })?;
-
         let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -892,14 +842,24 @@ async fn ensure_session_handler(
                 }),
             )
         })?;
-        if let Err(error) = runtime_service.register_runtime(id.clone(), runtime) {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse {
-                    error: format!("failed to register session: {error}"),
-                }),
-            ));
-        }
+        let model_hint = body
+            .model
+            .as_deref()
+            .filter(|model| !model.trim().is_empty());
+        runtime_service
+            .ensure_runtime_session(&id, model_hint)
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("failed to build runtime: {error}"),
+                    }),
+                )
+            })?;
+        let model = model_hint
+            .map(str::to_string)
+            .unwrap_or_else(|| default_session_model(&state));
         if state.services.session.has_unified_store()
             && state
                 .services
