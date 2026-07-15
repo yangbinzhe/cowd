@@ -956,6 +956,34 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         .with_tool_host(tool_host)
         .with_approval_gate(approval_gate.clone()),
     );
+    if unified_store.is_some() {
+        let recovery_opts = memory::store::session::SessionListOptions {
+            query: None,
+            model: None,
+            status: Some("active"),
+            sort: "updated_at",
+            order: "desc",
+            limit: 100,
+            offset: 0,
+        };
+        match session_kernel.list_stored_sessions_page(&recovery_opts).await {
+            Ok(Some(page)) => {
+                let total = page.records.len();
+                let mut recovered = 0usize;
+                for record in &page.records {
+                    let sid = &record.session_id;
+                    let model = record.model.as_deref();
+                    match runtime_service.ensure_runtime_session(sid, model).await {
+                        Ok(()) => recovered += 1,
+                        Err(e) => tracing::warn!(session_id = %sid, error = %e, "startup session recovery failed"),
+                    }
+                }
+                tracing::info!(total, recovered, "session startup recovery completed");
+            }
+            Ok(None) => tracing::info!("no unified store, skipping session recovery"),
+            Err(e) => tracing::warn!(error = %e, "failed to query sessions for startup recovery"),
+        }
+    }
     let session_bridge_store = unified_store.clone().ok_or_else(|| {
         "durable UnifiedSessionStore is required for the Runtime session bridge".to_string()
     })?;
