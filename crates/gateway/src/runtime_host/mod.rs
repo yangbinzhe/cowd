@@ -426,8 +426,10 @@ fn spawn_session_cleanup_task(
                         lifecycle.unregister(id).await;
                     }
                 } else {
-                    // Session tracked in active_sessions but not in lifecycle
-                    active_sessions.remove(id);
+                    // Session tracked in active_sessions but not yet registered
+                    // with the lifecycle manager. Register it instead of killing it.
+                    lifecycle.register(id).await;
+                    lifecycle.mark_active(id).await;
                 }
             }
         }
