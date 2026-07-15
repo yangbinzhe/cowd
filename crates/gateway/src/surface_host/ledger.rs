@@ -12,6 +12,7 @@ use super::{managed_actions, SurfaceHost};
 use super::{
     SurfaceDeliveryEvent, SurfaceInboxReceipt, SurfaceInboxRecord, SurfaceMessageSnapshot,
     SurfaceOutboxRecord, SurfaceTriggerEventReceipt, SurfaceTriggerEventRecord,
+    SurfaceTurnCorrelation,
 };
 use harness_contract::managed_agent::ManagedAgentTriggerEvent;
 
@@ -65,6 +66,24 @@ impl SurfaceHost {
     ) -> Result<(), String> {
         self.messages
             .mark_inbox_processed(idempotency_key, runtime_turn_id)
+    }
+
+    pub(crate) fn mark_inbox_admitted(
+        &self,
+        idempotency_key: &str,
+        correlation: SurfaceTurnCorrelation,
+    ) -> Result<(), String> {
+        self.messages
+            .mark_inbox_admitted(idempotency_key, correlation)
+    }
+
+    pub(crate) fn record_inbox_terminal_delivery(
+        &self,
+        idempotency_key: &str,
+        terminal_id: &str,
+    ) -> Result<(), String> {
+        self.messages
+            .record_inbox_terminal_delivery(idempotency_key, terminal_id)
     }
 
     pub(crate) fn mark_inbox_replied(&self, idempotency_key: &str) -> Result<(), String> {

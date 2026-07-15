@@ -85,6 +85,13 @@ pub enum CowdEvent {
         name: String,
         duration_ms: u64,
     },
+    /// Authoritative phase transitions emitted by Runtime's graph/conversation
+    /// owner. Gateway and Surface transports may project this event but must
+    /// not infer a phase from stream text or tool prose.
+    ExecutionPhase {
+        status: harness_contract::projection::ExecutionLiveStatus,
+        detail: Option<String>,
+    },
     // Turn lifecycle
     TurnStarted,
     TurnComplete {

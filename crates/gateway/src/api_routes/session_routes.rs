@@ -21,7 +21,12 @@ use crate::services::{
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/sessions", get(list_sessions).post(create_session))
+        .route(
+            "/api/sessions/executions",
+            get(list_running_session_execution_indices),
+        )
         .route("/api/sessions/search", get(search_messages_handler))
+        .route("/api/sessions/:id/evidence", get(get_session_evidence))
         .route("/api/sessions/:id/ensure", post(ensure_session_handler))
         .route("/api/sessions/:id/branch", post(branch_session_handler))
         .route("/api/sessions/:id/attach", post(attach_session_handler))
@@ -43,11 +48,229 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         )
         .route("/api/sessions/:id/events", get(get_session_events))
         .route("/api/sessions/:id/runs", get(get_session_runs))
+        .route(
+            "/api/sessions/:id/execution",
+            get(get_session_execution_index),
+        )
         .route("/api/sessions/:id/turns", get(get_session_turns))
         .route("/api/sessions/:id/turns/:turn_id", get(get_session_turn))
+        .route(
+            "/api/sessions/:id/turns/:turn_id/evidence",
+            get(get_turn_evidence),
+        )
         .route("/api/sessions/:id/projection", get(get_session_projection))
         .route("/api/sessions/:id/compact", post(compact_session_handler))
         .route("/api/sessions/:id/stats", get(get_session_stats_handler))
+}
+
+pub(super) async fn get_session_evidence(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<
+    Json<harness_contract::projection::SessionEvidenceProjection>,
+    (StatusCode, Json<ErrorResponse>),
+> {
+    let projection = session_evidence_projection(&state, &id, None).await?;
+    Ok(Json(projection))
+}
+
+pub(super) async fn get_turn_evidence(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path((id, turn_id)): Path<(String, String)>,
+) -> Result<
+    Json<harness_contract::projection::TurnEvidenceProjection>,
+    (StatusCode, Json<ErrorResponse>),
+> {
+    let projection = session_evidence_projection(&state, &id, Some(turn_id.as_str())).await?;
+    projection
+        .turns
+        .into_iter()
+        .next()
+        .map(Json)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!(
+                        "turn {turn_id} has no durable execution binding in session {id}"
+                    ),
+                }),
+            )
+        })
+}
+
+async fn session_evidence_projection(
+    state: &AppState,
+    session_id: &str,
+    turn_id: Option<&str>,
+) -> Result<
+    harness_contract::projection::SessionEvidenceProjection,
+    (StatusCode, Json<ErrorResponse>),
+> {
+    use harness_contract::projection::{
+        EvidenceFreshness, ProjectionDetailScope, ProjectionQueryContext,
+        SessionEvidenceProjection, TurnEvidenceProjection,
+    };
+
+    let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "runtime service unavailable".to_string(),
+            }),
+        )
+    })?;
+    let store = runtime_service
+        .session_kernel()
+        .unified_store()
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "unified session store unavailable".to_string(),
+                }),
+            )
+        })?;
+    let mut records = store
+        .session_runtime_outbox_for_session(session_id, 100)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to load durable turn bindings: {error}"),
+                }),
+            )
+        })?;
+    if let Some(turn_id) = turn_id {
+        records.retain(|record| record.turn_id == turn_id);
+    }
+    records.sort_by_key(|record| (record.sequence, record.request_id.clone()));
+
+    let context = ProjectionQueryContext {
+        principal: "gateway-local".to_string(),
+        workspace_id: runtime_service
+            .runtime_services()
+            .workspace_key()
+            .to_string(),
+        // This query is scoped by the durable record selected above, and the
+        // Runtime projection performs the same session-scope verification.
+        session_scopes: vec![session_id.to_string()],
+        mission_scopes: Vec::new(),
+        visibility_grants: vec!["gateway-local".to_string()],
+        detail_scope: ProjectionDetailScope::Summary,
+        authorization_revision: 1,
+    };
+    let mut all_refs = BTreeSet::new();
+    let mut turns = Vec::with_capacity(records.len());
+    for record in records {
+        // The relation is deterministic from the durable ingress identity;
+        // never approximate it from message text, sequence, or timestamps.
+        let execution_id =
+            runtime::session_ingress_graph_id(session_id, &record.request_id, &record.turn_id);
+        let projection = runtime::execution_projection::snapshot(
+            runtime_service.runtime_services().as_ref(),
+            &execution_id,
+            &context,
+        )
+        .await
+        .ok();
+        let mut evidence_refs = projection
+            .as_ref()
+            .map(|projection| {
+                projection
+                    .evidence
+                    .iter()
+                    .flat_map(|entity| entity.evidence_refs.iter().cloned())
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        all_refs.extend(evidence_refs.iter().cloned());
+        let live = runtime_service.execution_live(&execution_id);
+        let freshness = if live.is_some() {
+            EvidenceFreshness::Live
+        } else if projection.is_some() {
+            EvidenceFreshness::Durable
+        } else {
+            EvidenceFreshness::Unavailable
+        };
+        let terminal_ref = (record.status == memory::OutboxStatus::Materialized)
+            .then(|| format!("turn-terminal:{}", record.request_id));
+        let assistant_message_id = terminal_ref
+            .as_ref()
+            .map(|_| format!("assistant:{}", record.message_id));
+        turns.push(TurnEvidenceProjection {
+            session_id: session_id.to_string(),
+            turn_id: record.turn_id,
+            input_message_id: record.message_id,
+            execution_id,
+            terminal_ref,
+            assistant_message_id,
+            context_report_id: None,
+            evidence_refs: std::mem::take(&mut evidence_refs).into_iter().collect(),
+            freshness,
+        });
+    }
+    let freshness = if turns
+        .iter()
+        .any(|turn| turn.freshness == EvidenceFreshness::Live)
+    {
+        EvidenceFreshness::Live
+    } else if turns
+        .iter()
+        .any(|turn| turn.freshness == EvidenceFreshness::Durable)
+    {
+        EvidenceFreshness::Durable
+    } else {
+        EvidenceFreshness::Unavailable
+    };
+    Ok(SessionEvidenceProjection {
+        session_id: session_id.to_string(),
+        evidence_refs: all_refs.into_iter().collect(),
+        turns,
+        freshness,
+    })
+}
+
+pub(super) async fn list_running_session_execution_indices(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<
+    Json<harness_contract::projection::SessionExecutionIndicesProjection>,
+    (StatusCode, Json<ErrorResponse>),
+> {
+    let runtime = state.services.runtime.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "runtime service unavailable".to_string(),
+            }),
+        )
+    })?;
+    Ok(Json(
+        harness_contract::projection::SessionExecutionIndicesProjection {
+            items: runtime
+                .recoverable_running_session_execution_indices()
+                .await,
+        },
+    ))
+}
+
+pub(super) async fn get_session_execution_index(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<
+    Json<harness_contract::projection::SessionExecutionIndexProjection>,
+    (StatusCode, Json<ErrorResponse>),
+> {
+    let runtime = state.services.runtime.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "runtime service unavailable".to_string(),
+            }),
+        )
+    })?;
+    Ok(Json(runtime.recoverable_session_execution_index(&id).await))
 }
 
 #[derive(Serialize)]

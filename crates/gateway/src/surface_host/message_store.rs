@@ -17,6 +17,28 @@ const TRIGGER_EVENT_FILE: &str = "surface_trigger_event.jsonl";
 const DEFAULT_MAX_ATTEMPTS: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SurfaceTurnCorrelation {
+    /// Stable transport identity retained with the original inbox record.
+    pub surface: String,
+    pub message_id: String,
+    pub inbox_idempotency_key: String,
+    /// Canonical SessionIngress and Runtime identities.  These are never
+    /// inferred from message text or timestamps during recovery.
+    pub session_id: String,
+    pub turn_id: String,
+    pub execution_id: String,
+    pub reply_to_message_id: String,
+    pub reply_idempotency_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+    /// Monotonic terminal-delivery observation revision.  It protects
+    /// restart/replay reconciliation while the unchanged outbox key provides
+    /// the side-effect idempotency boundary.
+    #[serde(default)]
+    pub terminal_delivery_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SurfaceInboxRecord {
     pub id: String,
     pub surface: String,
@@ -32,6 +54,10 @@ pub(crate) struct SurfaceInboxRecord {
     pub updated_at_ms: i64,
     pub runtime_session_id: Option<String>,
     pub runtime_turn_id: Option<String>,
+    /// Additive migration carrier for canonical ingress/terminal recovery.
+    /// Older JSONL records deserialize without it and remain readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation: Option<SurfaceTurnCorrelation>,
     pub last_error: Option<String>,
 }
 
@@ -190,6 +216,7 @@ impl SurfaceMessageStore {
             updated_at_ms: now,
             runtime_session_id: Some(runtime_session_id.to_string()),
             runtime_turn_id: None,
+            correlation: None,
             last_error: None,
         };
         state.inbox.insert(idempotency_key, record.clone());
@@ -224,6 +251,79 @@ impl SurfaceMessageStore {
         runtime_turn_id: Option<String>,
     ) -> Result<(), String> {
         self.update_inbox_status(idempotency_key, "processed", runtime_turn_id, None)
+    }
+
+    pub(crate) fn mark_inbox_admitted(
+        &self,
+        idempotency_key: &str,
+        correlation: SurfaceTurnCorrelation,
+    ) -> Result<(), String> {
+        let mut state = self.lock_state()?;
+        let record = state
+            .inbox
+            .get_mut(idempotency_key)
+            .ok_or_else(|| format!("surface inbox `{idempotency_key}` not found"))?;
+        record.status = "processed".to_string();
+        record.updated_at_ms = now_ms();
+        record.runtime_session_id = Some(correlation.session_id.clone());
+        record.runtime_turn_id = Some(correlation.turn_id.clone());
+        record.correlation = Some(correlation);
+        record.last_error = None;
+        let record = record.clone();
+        self.append_record(INBOX_FILE, &record)?;
+        drop(state);
+        self.push_event(SurfaceDeliveryEvent {
+            event_id: new_event_id(),
+            surface: record.surface.clone(),
+            delivery_id: None,
+            message_id: Some(record.message_id.clone()),
+            kind: "inbox.processed".to_string(),
+            status: "processed".to_string(),
+            detail_json: serde_json::json!({
+                "runtime_turn_id": record.runtime_turn_id,
+                "execution_id": record.correlation.as_ref().map(|item| item.execution_id.clone()),
+                "reply_idempotency_key": record.correlation.as_ref().map(|item| item.reply_idempotency_key.clone()),
+            }),
+            created_at_ms: now_ms(),
+        })
+    }
+
+    pub(crate) fn record_inbox_terminal_delivery(
+        &self,
+        idempotency_key: &str,
+        terminal_id: &str,
+    ) -> Result<(), String> {
+        let mut state = self.lock_state()?;
+        let record = state
+            .inbox
+            .get_mut(idempotency_key)
+            .ok_or_else(|| format!("surface inbox `{idempotency_key}` not found"))?;
+        let correlation = record
+            .correlation
+            .as_mut()
+            .ok_or_else(|| format!("surface inbox `{idempotency_key}` has no turn correlation"))?;
+        if correlation.terminal_id.as_deref() != Some(terminal_id) {
+            correlation.terminal_id = Some(terminal_id.to_string());
+            correlation.terminal_delivery_revision =
+                correlation.terminal_delivery_revision.saturating_add(1);
+        }
+        record.updated_at_ms = now_ms();
+        let record = record.clone();
+        self.append_record(INBOX_FILE, &record)?;
+        drop(state);
+        self.push_event(SurfaceDeliveryEvent {
+            event_id: new_event_id(),
+            surface: record.surface.clone(),
+            delivery_id: None,
+            message_id: Some(record.message_id.clone()),
+            kind: "inbox.terminal_delivery_observed".to_string(),
+            status: record.status.clone(),
+            detail_json: serde_json::json!({
+                "terminal_id": terminal_id,
+                "terminal_delivery_revision": record.correlation.as_ref().map(|item| item.terminal_delivery_revision),
+            }),
+            created_at_ms: now_ms(),
+        })
     }
 
     pub(crate) fn mark_inbox_replied(&self, idempotency_key: &str) -> Result<(), String> {
@@ -1238,7 +1338,7 @@ fn reconcile_inbox_with_outbox(state: &mut SurfaceMessageState) {
                 .last_error
                 .clone()
                 .or_else(|| outbox_failure_reason(outbox));
-        } else if is_active_inbox_status(&inbox.status) {
+        } else if is_active_inbox_status(&inbox.status) && inbox.correlation.is_none() {
             inbox.status = "failed".to_string();
             inbox.updated_at_ms = now_ms();
             inbox.last_error = Some(
@@ -1252,7 +1352,12 @@ fn reconcile_inbox_with_outbox(state: &mut SurfaceMessageState) {
 fn is_active_inbox_status(status: &str) -> bool {
     matches!(
         status,
-        "received" | "processing" | "replying" | "failure_notifying" | "reply_retry_scheduled"
+        "received"
+            | "processing"
+            | "processed"
+            | "replying"
+            | "failure_notifying"
+            | "reply_retry_scheduled"
     )
 }
 
@@ -1699,6 +1804,72 @@ mod tests {
 
         let reloaded = SurfaceMessageStore::new(&root);
         assert_eq!(reloaded.snapshot("feishu").inbox[0].status, "replied");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn admitted_surface_turn_correlation_survives_reload_and_terminal_replay() {
+        let root = std::env::temp_dir().join(format!(
+            "cowd-edge-surface-correlation-store-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = SurfaceMessageStore::new(&root);
+        let inbox = store
+            .record_inbox_received(
+                "wecom",
+                "message-1",
+                &serde_json::json!({"text": "investigate"}),
+                "surface:wecom:chat-1",
+                Some("thread-1".to_string()),
+                Some("user-1".to_string()),
+            )
+            .unwrap();
+        let correlation = SurfaceTurnCorrelation {
+            surface: "wecom".to_string(),
+            message_id: "message-1".to_string(),
+            inbox_idempotency_key: inbox.record.idempotency_key.clone(),
+            session_id: "surface:wecom:chat-1".to_string(),
+            turn_id: "surface-turn:abc".to_string(),
+            execution_id: "session-ingress:abc".to_string(),
+            reply_to_message_id: "message-1".to_string(),
+            reply_idempotency_key: "surface-reply:wecom:message-1".to_string(),
+            terminal_id: None,
+            terminal_delivery_revision: 0,
+        };
+        store
+            .mark_inbox_admitted(&inbox.record.idempotency_key, correlation)
+            .unwrap();
+        store
+            .record_inbox_terminal_delivery(&inbox.record.idempotency_key, "turn-terminal:req-1")
+            .unwrap();
+        // Re-observing the same terminal must not create a second recovery
+        // revision or a second delivery identity.
+        store
+            .record_inbox_terminal_delivery(&inbox.record.idempotency_key, "turn-terminal:req-1")
+            .unwrap();
+
+        let reloaded = SurfaceMessageStore::new(&root);
+        let record = reloaded
+            .get_inbox_message("wecom", "message-1")
+            .expect("correlation must be durable");
+        let correlation = record.correlation.expect("canonical correlation");
+        assert_eq!(record.status, "processed");
+        assert_eq!(correlation.execution_id, "session-ingress:abc");
+        assert_eq!(
+            correlation.terminal_id.as_deref(),
+            Some("turn-terminal:req-1")
+        );
+        assert_eq!(correlation.terminal_delivery_revision, 1);
+        assert_eq!(
+            correlation.reply_idempotency_key,
+            "surface-reply:wecom:message-1"
+        );
+        assert!(reloaded
+            .snapshot("wecom")
+            .active_inbox
+            .iter()
+            .any(|item| item.message_id == "message-1"));
 
         let _ = std::fs::remove_dir_all(root);
     }

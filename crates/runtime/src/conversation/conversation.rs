@@ -3199,6 +3199,10 @@ where
                     Ok(AssistantEvent::ThinkingDelta(delta)) => {
                         thinking.push_str(&delta);
                         if let Some(ref cowd) = self.cowd_bus {
+                            cowd.emit(crate::cowd_event::CowdEvent::ExecutionPhase {
+                                status: harness_contract::projection::ExecutionLiveStatus::Thinking,
+                                detail: Some("reasoning".to_string()),
+                            });
                             cowd.emit(crate::cowd_event::CowdEvent::ThinkingDelta {
                                 thinking: delta.clone(),
                             });
@@ -3635,6 +3639,15 @@ where
                 "operations": operations,
             })
             .to_string();
+            if let Some(cowd) = self.cowd_bus() {
+                cowd.emit(crate::cowd_event::CowdEvent::ExecutionPhase {
+                    status: harness_contract::projection::ExecutionLiveStatus::WaitingApproval,
+                    detail: Some("runtime_strategy_tool_batch".to_string()),
+                });
+                cowd.emit(crate::cowd_event::CowdEvent::ApprovalRequested {
+                    tool: "runtime_strategy_tool_batch".to_string(),
+                });
+            }
             match gate
                 .require_explicit_approval("runtime_strategy_tool_batch", &approval_input)
                 .await
@@ -5021,6 +5034,10 @@ where
         let Some(ref cowd) = self.cowd_bus else {
             return;
         };
+        cowd.emit(crate::cowd_event::CowdEvent::ExecutionPhase {
+            status: harness_contract::projection::ExecutionLiveStatus::CallingTool,
+            detail: Some(tool_name.to_string()),
+        });
         cowd.emit(crate::cowd_event::CowdEvent::ToolStart {
             id: tool_use_id.to_string(),
             name: tool_name.to_string(),

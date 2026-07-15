@@ -52,7 +52,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "app-mfg"
-version = "0.9.494"
+version = "0.9.498"
 dependencies = [
  "chrono",
  "matrix-core",
@@ -67,7 +67,7 @@ dependencies = [
 
 [[package]]
 name = "approval"
-version = "0.9.494"
+version = "0.9.498"
 dependencies = [
  "serde",
  "serde_json",
@@ -95,7 +95,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "auth-broker"
-version = "0.9.494"
+version = "0.9.498"
 dependencies = [
  "base64",
  "harness-contract",
@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "cli"
-version = "0.9.494"
+version = "0.9.498"
 dependencies = [
  "gateway",
  "serde",
@@ -316,7 +316,7 @@ dependencies = [
 
 [[package]]
 name = "connector"
-version = "0.9.494"
+version = "0.9.498"
 dependencies = [
  "chrono",
  "harness-contract",
@@ -562,7 +562,7 @@ dependencies = [
 
 [[package]]
 name = "fact-kernel"
-version = "0.9.494"
+version = "0.9.498"
 dependencies = [
  "chrono",
  "serde",
@@ -744,7 +744,7 @@ dependencies = [
 
 [[package]]
 name = "gateway"
-version = "0.9.494"
+version = "0.9.498"
 dependencies = [
  "app-mfg",
  "approval",
@@ -861,7 +861,7 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "harness-contract"
-version = "0.9.494"
+version = "0.9.498"
 dependencies = [
  "chrono",
  "serde",
@@ -873,7 +873,7 @@ dependencies = [
 
 [[package]]
 name = "harness-eval"
-version = "0.9.494"
+version = "0.9.498"
 dependencies = [
  "async-trait",
  "fact-kernel",
@@ -1406,7 +1406,7 @@ checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
 name = "matrix-core"
-version = "0.9.494"
+version = "0.9.498"
 dependencies = [
  "chrono",
  "fact-kernel",
@@ -1418,7 +1418,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-repository"
-version = "0.9.494"
+version = "0.9.498"
 dependencies = [
  "chrono",
  "matrix-core",
@@ -1434,7 +1434,7 @@ dependencies = [
 
 [[package]]
 name = "mcp"
-version = "0.9.494"
+version = "0.9.498"
 dependencies = [
  "serde",
  "serde_json",
@@ -1449,7 +1449,7 @@ checksum = "6b947ae49db0d222b1dbc6b113ce7248a3fc3a6ca21b696717bfc000ba4484d8"
 
 [[package]]
 name = "memory"
-version = "0.9.494"
+version = "0.9.498"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1539,7 +1539,7 @@ dependencies = [
 
 [[package]]
 name = "model-protocol"
-version = "0.9.494"
+version = "0.9.498"
 dependencies = [
  "lru",
  "serde",
@@ -1726,7 +1726,7 @@ dependencies = [
 
 [[package]]
 name = "plugins"
-version = "0.9.494"
+version = "0.9.498"
 dependencies = [
  "serde",
  "serde_json",
@@ -1777,7 +1777,7 @@ dependencies = [
 
 [[package]]
 name = "provider"
-version = "0.9.494"
+version = "0.9.498"
 dependencies = [
  "model-protocol",
  "reqwest",
@@ -2109,7 +2109,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.9.494"
+version = "0.9.498"
 dependencies = [
  "approval",
  "async-trait",
@@ -2261,7 +2261,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-launcher"
-version = "0.9.494"
+version = "0.9.498"
 dependencies = [
  "landlock",
  "libc",
@@ -2414,7 +2414,7 @@ dependencies = [
 
 [[package]]
 name = "session"
-version = "0.9.494"
+version = "0.9.498"
 dependencies = [
  "memory",
  "serde",
@@ -2500,7 +2500,7 @@ checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "skill"
-version = "0.9.494"
+version = "0.9.498"
 dependencies = [
  "harness-contract",
  "regex",
@@ -2552,7 +2552,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "storage"
-version = "0.9.494"
+version = "0.9.498"
 dependencies = [
  "rusqlite",
  "serde",
@@ -2603,7 +2603,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "surface"
-version = "0.9.494"
+version = "0.9.498"
 dependencies = [
  "chrono",
  "serde",
@@ -2884,7 +2884,7 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "tools"
-version = "0.9.494"
+version = "0.9.498"
 dependencies = [
  "base64",
  "flate2",
@@ -3126,7 +3126,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tui"
-version = "0.9.494"
+version = "0.9.498"
 dependencies = [
  "chrono",
  "crossterm",

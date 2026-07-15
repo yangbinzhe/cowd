@@ -35,7 +35,15 @@ pub(crate) fn gateway_route_manifest() -> Vec<GatewayRouteManifestEntry> {
             source: "route_registry.rs",
             handler: route.operation_id,
         };
-        entries.insert(manifest_entry(&generated));
+        // Session execution/evidence routes have literal Axum registrations,
+        // so the build-generated inventory already owns their manifest row.
+        // The typed metadata enriches OpenAPI response schemas, but must not
+        // produce a second public method/path entry with a different source.
+        if !entries.iter().any(|entry: &GatewayRouteManifestEntry| {
+            entry.method == generated.method && entry.path == generated.path
+        }) {
+            entries.insert(manifest_entry(&generated));
+        }
     }
     entries.into_iter().collect()
 }

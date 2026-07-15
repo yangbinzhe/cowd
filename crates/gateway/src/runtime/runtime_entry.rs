@@ -104,6 +104,32 @@ impl GatewayRuntimeEntry {
         self.resume_context_loaded = loaded;
     }
 
+    /// The conversation host is moved out only while a provider-backed turn
+    /// owns it.  RuntimeService keeps the observable/cancellation carrier
+    /// outside this mutex so read paths never wait for that turn.
+    pub(crate) fn turn_is_owned(&self) -> bool {
+        self.runtime.is_none()
+    }
+
+    pub(crate) fn take_runtime_for_turn(
+        &mut self,
+    ) -> Result<runtime::StandardRuntimeHost<GatewayToolExecutor>, runtime::RuntimeError> {
+        self.runtime.take().ok_or_else(|| {
+            runtime::RuntimeError::new("session runtime is already executing a turn")
+        })
+    }
+
+    pub(crate) fn restore_runtime_after_turn(
+        &mut self,
+        runtime: runtime::StandardRuntimeHost<GatewayToolExecutor>,
+    ) {
+        debug_assert!(
+            self.runtime.is_none(),
+            "runtime must be empty while turn owner returns it"
+        );
+        self.runtime = Some(runtime);
+    }
+
     pub(crate) fn cowd_bus(&self) -> Option<&runtime::CowdEventBus> {
         self.runtime_ref().cowd_bus()
     }

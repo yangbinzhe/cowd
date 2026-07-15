@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Mutex;
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Instant;
@@ -14,6 +14,11 @@ use crate::runtime_protocol::{RuntimeErrorKind, RuntimeRequest, RuntimeResponse}
 use crate::session_kernel::SessionKernel;
 use crate::session_lifecycle_kernel::SessionLifecycleKernel;
 use harness_contract::{
+    context::ContextTurnReport,
+    projection::{
+        ContextUsageProjection, ExecutionLiveState, ExecutionLiveStatus, RunMetricsProjection,
+        SessionExecutionIndexProjection,
+    },
     task::{TaskId, TaskTurnBinding},
     turn::{
         InputRoutingDecision, SessionInputEnvelope, SessionInputId, SessionInputProjection,
@@ -90,6 +95,50 @@ pub(crate) struct RuntimeTurnOptions {
     pub(crate) pre_messages: Vec<runtime::ConversationMessage>,
 }
 
+/// Persisted verbatim in the Session ingress row.  The Session store treats it
+/// as opaque JSON; only Runtime decodes the typed context/profile payload when
+/// it becomes the exclusive execution owner.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct IngressRuntimeOptions {
+    pub(crate) profile: runtime::ContextProfile,
+    #[serde(default)]
+    pub(crate) pre_messages: Vec<IngressPreMessage>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct IngressPreMessage {
+    pub(crate) role: runtime::MessageRole,
+    pub(crate) blocks: Vec<runtime::ContentBlock>,
+}
+
+impl From<runtime::ConversationMessage> for IngressPreMessage {
+    fn from(message: runtime::ConversationMessage) -> Self {
+        Self {
+            role: message.role,
+            blocks: message.blocks,
+        }
+    }
+}
+
+impl IngressPreMessage {
+    fn into_conversation_message(self) -> runtime::ConversationMessage {
+        runtime::ConversationMessage {
+            role: self.role,
+            blocks: self.blocks,
+            usage: None,
+        }
+    }
+}
+
+impl Default for IngressRuntimeOptions {
+    fn default() -> Self {
+        Self {
+            profile: runtime::ContextProfile::MainTurn,
+            pre_messages: Vec::new(),
+        }
+    }
+}
+
 impl Default for RuntimeTurnOptions {
     fn default() -> Self {
         Self {
@@ -117,6 +166,328 @@ fn current_time_ms() -> u64 {
         .unwrap_or(0)
 }
 
+const LIVE_OUTPUT_PREVIEW_LIMIT: usize = 1_024;
+
+/// RuntimeService owns this carrier while a GatewayRuntimeEntry is busy.  It
+/// contains only facts emitted by Runtime or the canonical SessionIngress;
+/// Gateway HTTP/SSE handlers may read it without taking the long-held
+/// conversation mutex.
+#[derive(Debug, Clone)]
+struct LiveExecutionRecord {
+    session_id: String,
+    execution_id: String,
+    live: ExecutionLiveState,
+    tool_ids: BTreeSet<String>,
+    approval_keys: BTreeSet<String>,
+}
+
+impl LiveExecutionRecord {
+    fn new(session_id: String, execution_id: String, turn_id: String) -> Self {
+        let now = current_time_ms();
+        Self {
+            session_id,
+            execution_id,
+            live: ExecutionLiveState {
+                revision: 1,
+                status: ExecutionLiveStatus::Queued,
+                status_detail: Some("session input accepted".to_string()),
+                turn_id: Some(turn_id),
+                started_at_ms: now,
+                updated_at_ms: now,
+                last_progress_at_ms: now,
+                context_usage: None,
+                metrics: RunMetricsProjection::default(),
+                output_preview: None,
+                terminal_ref: None,
+                error: None,
+            },
+            tool_ids: BTreeSet::new(),
+            approval_keys: BTreeSet::new(),
+        }
+    }
+
+    fn transition(&mut self, status: ExecutionLiveStatus, detail: Option<String>) {
+        if self.live.status == status && self.live.status_detail == detail {
+            return;
+        }
+        if !Self::allows_transition(self.live.status, status) {
+            tracing::warn!(
+                execution_id = %self.execution_id,
+                from = ?self.live.status,
+                to = ?status,
+                "ignored invalid live execution status transition"
+            );
+            return;
+        }
+        let now = current_time_ms();
+        self.live.status = status;
+        self.live.status_detail = detail;
+        self.live.updated_at_ms = now;
+        self.live.last_progress_at_ms = now;
+        self.live.revision = self.live.revision.saturating_add(1);
+    }
+
+    fn touch(&mut self) {
+        let now = current_time_ms();
+        self.live.updated_at_ms = now;
+        self.live.last_progress_at_ms = now;
+        self.live.revision = self.live.revision.saturating_add(1);
+    }
+
+    fn allows_transition(from: ExecutionLiveStatus, to: ExecutionLiveStatus) -> bool {
+        use ExecutionLiveStatus::{
+            CallingModel, CallingTool, Cancelled, Complete, Error, Finalizing, PreparingContext,
+            Queued, Thinking, WaitingApproval,
+        };
+        if from == to {
+            return true;
+        }
+        matches!(
+            (from, to),
+            (Queued, PreparingContext | CallingModel | Error | Cancelled)
+                | (
+                    PreparingContext,
+                    CallingModel
+                        | Thinking
+                        | CallingTool
+                        | WaitingApproval
+                        | Finalizing
+                        | Error
+                        | Cancelled
+                )
+                | (
+                    CallingModel,
+                    Thinking
+                        | CallingTool
+                        | WaitingApproval
+                        | Finalizing
+                        | Complete
+                        | Error
+                        | Cancelled
+                )
+                | (
+                    Thinking,
+                    CallingModel
+                        | CallingTool
+                        | WaitingApproval
+                        | Finalizing
+                        | Complete
+                        | Error
+                        | Cancelled
+                )
+                | (
+                    CallingTool,
+                    CallingModel
+                        | Thinking
+                        | WaitingApproval
+                        | Finalizing
+                        | Complete
+                        | Error
+                        | Cancelled
+                )
+                | (
+                    WaitingApproval,
+                    CallingModel | CallingTool | Thinking | Finalizing | Error | Cancelled
+                )
+                | (Finalizing, Complete | Error | Cancelled)
+        )
+    }
+
+    fn append_preview(&mut self, text: &str) {
+        let mut preview = self.live.output_preview.take().unwrap_or_default();
+        preview.push_str(text);
+        if preview.len() > LIVE_OUTPUT_PREVIEW_LIMIT {
+            let split = preview.len().saturating_sub(LIVE_OUTPUT_PREVIEW_LIMIT);
+            let boundary = preview
+                .char_indices()
+                .find_map(|(index, _)| (index >= split).then_some(index))
+                .unwrap_or(0);
+            preview = preview[boundary..].to_string();
+        }
+        self.live.output_preview = (!preview.is_empty()).then_some(preview);
+        self.touch();
+    }
+
+    fn complete(&mut self, report: &ContextTurnReport, terminal_ref: String) {
+        self.live.context_usage = context_usage_from_report(report);
+        self.live.metrics.tool_calls = self
+            .live
+            .metrics
+            .tool_calls
+            .max(report.observations.len() as u64);
+        self.live.metrics.memory_evidence = self
+            .live
+            .metrics
+            .memory_evidence
+            .max(report.audit_projections.len() as u64);
+        self.live.metrics.context_items = self.live.context_usage.as_ref().map_or(0, |usage| {
+            usage
+                .components
+                .iter()
+                .map(|component| component.occurrences)
+                .sum()
+        });
+        self.live.terminal_ref = Some(terminal_ref);
+        self.live.error = None;
+        self.transition(
+            ExecutionLiveStatus::Complete,
+            Some("terminal committed".to_string()),
+        );
+    }
+
+    fn fail(&mut self, error: String) {
+        self.live.error = Some(error.clone());
+        self.transition(ExecutionLiveStatus::Error, Some(error));
+    }
+}
+
+fn context_usage_from_report(report: &ContextTurnReport) -> Option<ContextUsageProjection> {
+    let ledger = report.ledger.as_ref()?;
+    let input_tokens = ledger
+        .calibrated_input_tokens
+        .unwrap_or(ledger.consumed_tokens);
+    let input_source = if ledger.calibrated_input_tokens.is_some() {
+        "provider_actual"
+    } else {
+        "ledger_estimate"
+    };
+    let usage_percent_bp = (ledger.max_tokens > 0).then(|| {
+        ((u128::from(input_tokens) * 10_000) / u128::from(ledger.max_tokens))
+            .min(u128::from(u16::MAX)) as u16
+    });
+    Some(ContextUsageProjection {
+        model: None,
+        window_tokens: Some(ledger.max_tokens),
+        window_source: Some("runtime_ledger".to_string()),
+        input_tokens: Some(input_tokens),
+        input_source: Some(input_source.to_string()),
+        remaining_tokens: Some(ledger.max_tokens.saturating_sub(input_tokens)),
+        usage_percent_bp,
+        request_sequence: Some(ledger.request_sequence),
+        components: ledger.components.clone(),
+    })
+}
+
+fn observe_live_event(
+    live_executions: &Arc<Mutex<BTreeMap<String, LiveExecutionRecord>>>,
+    session_id: &str,
+    event: &runtime::CowdEvent,
+) {
+    let mut records = live_executions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(record) = records
+        .values_mut()
+        .filter(|record| record.session_id == session_id && !is_live_terminal(record.live.status))
+        .max_by_key(|record| record.live.updated_at_ms)
+    else {
+        return;
+    };
+    match event {
+        runtime::CowdEvent::ExecutionPhase { status, detail } => {
+            record.transition(*status, detail.clone());
+        }
+        runtime::CowdEvent::TextDelta { text } => record.append_preview(text),
+        runtime::CowdEvent::ThinkingDelta { .. } => {}
+        runtime::CowdEvent::ToolStart { id, .. } => {
+            if record.tool_ids.insert(id.clone()) {
+                record.live.metrics.tool_calls = record.live.metrics.tool_calls.saturating_add(1);
+                record.touch();
+            }
+        }
+        runtime::CowdEvent::ToolProgress { .. } | runtime::CowdEvent::ToolComplete { .. } => {
+            record.touch();
+        }
+        runtime::CowdEvent::ApprovalRequested { tool } => {
+            if record.approval_keys.insert(tool.clone()) {
+                record.live.metrics.approvals = record.live.metrics.approvals.saturating_add(1);
+                record.touch();
+            }
+        }
+        runtime::CowdEvent::ContextWindow(window_tokens) => {
+            let mut usage = record.live.context_usage.clone().unwrap_or_default();
+            usage.window_tokens = Some(*window_tokens);
+            usage.window_source = Some("runtime_event".to_string());
+            if let (Some(input), Some(window)) = (usage.input_tokens, usage.window_tokens) {
+                usage.remaining_tokens = Some(window.saturating_sub(input));
+                usage.usage_percent_bp = (window > 0).then(|| {
+                    ((u128::from(input) * 10_000) / u128::from(window)).min(u128::from(u16::MAX))
+                        as u16
+                });
+            }
+            record.live.context_usage = Some(usage);
+            record.touch();
+        }
+        runtime::CowdEvent::RunModelTelemetry { telemetry } => {
+            record.live.metrics.input_tokens = telemetry.input_tokens;
+            record.live.metrics.output_tokens = telemetry.output_tokens;
+            record.live.metrics.total_tokens = telemetry.total_tokens;
+            let mut usage = record.live.context_usage.clone().unwrap_or_default();
+            usage.model = telemetry.model.clone();
+            usage.input_tokens = Some(telemetry.input_tokens);
+            usage.input_source = Some(telemetry.usage_source.clone());
+            if let Some(window) = usage.window_tokens {
+                usage.remaining_tokens = Some(window.saturating_sub(telemetry.input_tokens));
+                usage.usage_percent_bp = (window > 0).then(|| {
+                    ((u128::from(telemetry.input_tokens) * 10_000) / u128::from(window))
+                        .min(u128::from(u16::MAX)) as u16
+                });
+            }
+            record.live.context_usage = Some(usage);
+            record.touch();
+        }
+        runtime::CowdEvent::TurnError { error } => record.fail(error.clone()),
+        runtime::CowdEvent::TurnComplete { .. } => {}
+        _ => {}
+    }
+}
+
+fn is_live_terminal(status: ExecutionLiveStatus) -> bool {
+    status.is_terminal()
+}
+
+fn session_execution_index_from_outbox(
+    session_id: &str,
+    records: &[memory::SessionRuntimeOutboxRecord],
+) -> SessionExecutionIndexProjection {
+    let mut ordered = records.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|record| {
+        (
+            record.updated_at_ms,
+            record.sequence,
+            record.request_id.as_str(),
+        )
+    });
+    let latest = ordered.last().copied();
+    let execution_for = |record: &memory::SessionRuntimeOutboxRecord| {
+        runtime::session_ingress_graph_id(session_id, &record.request_id, &record.turn_id)
+    };
+    let status_for = |record: &memory::SessionRuntimeOutboxRecord| match record.status {
+        memory::OutboxStatus::Pending | memory::OutboxStatus::RetryScheduled => {
+            ExecutionLiveStatus::Queued
+        }
+        memory::OutboxStatus::Claimed => ExecutionLiveStatus::PreparingContext,
+        memory::OutboxStatus::Materialized => ExecutionLiveStatus::Complete,
+        memory::OutboxStatus::BlockedMaterialization => ExecutionLiveStatus::Error,
+    };
+    let latest_status = latest.map(status_for);
+    SessionExecutionIndexProjection {
+        session_id: session_id.to_string(),
+        active_execution_ids: ordered
+            .iter()
+            .filter(|record| !is_live_terminal(status_for(record)))
+            .map(|record| execution_for(record))
+            .collect(),
+        latest_execution_id: latest.map(execution_for),
+        latest_status,
+        latest_live_revision: None,
+        last_progress_at_ms: latest.map(|record| record.updated_at_ms),
+        terminal_ref: latest
+            .filter(|record| record.status == memory::OutboxStatus::Materialized)
+            .map(|record| format!("turn-terminal:{}", record.request_id)),
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct RuntimeService {
     sessions: Arc<ActiveSessions>,
@@ -129,6 +500,7 @@ pub(crate) struct RuntimeService {
     session_inputs: Arc<Mutex<BTreeMap<String, runtime::SessionInputStream>>>,
     session_event_buses: Arc<Mutex<BTreeMap<String, runtime::CowdEventBus>>>,
     session_event_relays: Arc<Mutex<BTreeMap<String, JoinHandle<()>>>>,
+    live_executions: Arc<Mutex<BTreeMap<String, LiveExecutionRecord>>>,
     session_models: Arc<Mutex<BTreeMap<String, String>>>,
     approval_gate: Option<Arc<runtime::approval_gate::SmartApprovalGate>>,
     provider_registry: Arc<runtime::ProviderRegistry>,
@@ -180,6 +552,7 @@ impl RuntimeService {
             session_inputs: Arc::new(Mutex::new(BTreeMap::new())),
             session_event_buses: Arc::new(Mutex::new(BTreeMap::new())),
             session_event_relays: Arc::new(Mutex::new(BTreeMap::new())),
+            live_executions: Arc::new(Mutex::new(BTreeMap::new())),
             session_models: Arc::new(Mutex::new(BTreeMap::new())),
             approval_gate: None,
             provider_registry,
@@ -217,6 +590,164 @@ impl RuntimeService {
 
     pub(crate) fn resource_capability_index(&self) -> runtime::ResourceCapabilityIndex {
         self.resource_capabilities.clone()
+    }
+
+    pub(crate) fn execution_live(&self, execution_id: &str) -> Option<ExecutionLiveState> {
+        self.live_executions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(execution_id)
+            .map(|record| record.live.clone())
+    }
+
+    pub(crate) fn session_execution_index(
+        &self,
+        session_id: &str,
+    ) -> SessionExecutionIndexProjection {
+        let records = self
+            .live_executions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut matching = records
+            .values()
+            .filter(|record| record.session_id == session_id)
+            .collect::<Vec<_>>();
+        matching.sort_by_key(|record| record.live.updated_at_ms);
+        let latest = matching.last().copied();
+        SessionExecutionIndexProjection {
+            session_id: session_id.to_string(),
+            active_execution_ids: matching
+                .iter()
+                .filter(|record| !is_live_terminal(record.live.status))
+                .map(|record| record.execution_id.clone())
+                .collect(),
+            latest_execution_id: latest.map(|record| record.execution_id.clone()),
+            latest_status: latest.map(|record| record.live.status),
+            latest_live_revision: latest.map(|record| record.live.revision),
+            last_progress_at_ms: latest.map(|record| record.live.last_progress_at_ms),
+            terminal_ref: latest.and_then(|record| record.live.terminal_ref.clone()),
+        }
+    }
+
+    pub(crate) fn running_session_execution_indices(&self) -> Vec<SessionExecutionIndexProjection> {
+        let records = self
+            .live_executions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let session_ids = records
+            .values()
+            .filter(|record| !is_live_terminal(record.live.status))
+            .map(|record| record.session_id.clone())
+            .collect::<BTreeSet<_>>();
+        let mut indices = Vec::new();
+        for session_id in &session_ids {
+            let mut matching = records
+                .values()
+                .filter(|record| record.session_id == *session_id)
+                .collect::<Vec<_>>();
+            matching.sort_by_key(|record| record.live.updated_at_ms);
+            let latest = matching.last().copied();
+            indices.push(SessionExecutionIndexProjection {
+                session_id: session_id.clone(),
+                active_execution_ids: matching
+                    .iter()
+                    .filter(|record| !is_live_terminal(record.live.status))
+                    .map(|record| record.execution_id.clone())
+                    .collect(),
+                latest_execution_id: latest.map(|record| record.execution_id.clone()),
+                latest_status: latest.map(|record| record.live.status),
+                latest_live_revision: latest.map(|record| record.live.revision),
+                last_progress_at_ms: latest.map(|record| record.live.last_progress_at_ms),
+                terminal_ref: latest.and_then(|record| record.live.terminal_ref.clone()),
+            });
+        }
+        indices
+    }
+
+    /// Recover the discovery index after a Gateway restart from the durable
+    /// Session ingress carrier.  It deliberately restores only identity and
+    /// ingress lifecycle; detailed context/metrics/evidence are still read
+    /// from the existing execution projection and terminal stores.
+    pub(crate) async fn recoverable_session_execution_index(
+        &self,
+        session_id: &str,
+    ) -> SessionExecutionIndexProjection {
+        let volatile = self.session_execution_index(session_id);
+        let Some(store) = self.session_kernel.unified_store() else {
+            return volatile;
+        };
+        let Ok(records) = store
+            .session_runtime_outbox_for_session(session_id, 100)
+            .await
+        else {
+            return volatile;
+        };
+        let durable = session_execution_index_from_outbox(session_id, &records);
+        match (volatile.last_progress_at_ms, durable.last_progress_at_ms) {
+            (Some(live), Some(persisted)) if live >= persisted => volatile,
+            (Some(_), None) => volatile,
+            _ => durable,
+        }
+    }
+
+    pub(crate) async fn recoverable_running_session_execution_indices(
+        &self,
+    ) -> Vec<SessionExecutionIndexProjection> {
+        let mut session_ids = self
+            .running_session_execution_indices()
+            .into_iter()
+            .map(|index| index.session_id)
+            .collect::<BTreeSet<_>>();
+        if let Some(store) = self.session_kernel.unified_store() {
+            if let Ok(records) = store.active_session_runtime_outbox(500).await {
+                session_ids.extend(records.into_iter().map(|record| record.session_id));
+            }
+        }
+        let mut indices = Vec::with_capacity(session_ids.len());
+        for session_id in session_ids {
+            let index = self.recoverable_session_execution_index(&session_id).await;
+            if !index.active_execution_ids.is_empty() {
+                indices.push(index);
+            }
+        }
+        indices
+    }
+
+    fn record_live_execution(&self, session_id: &str, execution_id: String, turn_id: String) {
+        self.live_executions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(execution_id.clone())
+            .or_insert_with(|| {
+                LiveExecutionRecord::new(session_id.to_string(), execution_id, turn_id)
+            });
+    }
+
+    fn complete_live_execution(
+        &self,
+        execution_id: &str,
+        report: &ContextTurnReport,
+        terminal_ref: String,
+    ) {
+        if let Some(record) = self
+            .live_executions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(execution_id)
+        {
+            record.complete(report, terminal_ref);
+        }
+    }
+
+    fn fail_live_execution(&self, execution_id: &str, error: String) {
+        if let Some(record) = self
+            .live_executions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(execution_id)
+        {
+            record.fail(error);
+        }
     }
 
     pub(crate) fn refresh_resource_capabilities(&self) -> runtime::ResourceCapabilitySnapshot {
@@ -293,23 +824,63 @@ impl RuntimeService {
             message_id: record.message_id.clone(),
             session_id: record.session_id.clone(),
         };
+        self.record_live_execution(&record.session_id, graph_id.clone(), record.turn_id.clone());
+        let ingress_options = match record
+            .runtime_options_json
+            .as_deref()
+            .map(serde_json::from_str::<IngressRuntimeOptions>)
+            .transpose()
+        {
+            Ok(options) => options.unwrap_or_default(),
+            Err(error) => {
+                let error = format!("invalid persisted ingress runtime options: {error}");
+                self.fail_live_execution(&graph_id, error.clone());
+                return Err(error);
+            }
+        };
+        let mut owned_runtime = match async {
+            let mut runtime = runtime_entry.lock().await;
+            runtime.set_context_profile(ingress_options.profile);
+            for message in ingress_options.pre_messages {
+                runtime
+                    .append_external_message(message.into_conversation_message())
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            runtime
+                .take_runtime_for_turn()
+                .map_err(|error| error.to_string())
+        }
+        .await
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                self.fail_live_execution(&graph_id, error.clone());
+                return Err(error);
+            }
+        };
+        let summary_result = owned_runtime
+            .submit_ingress_turn(
+                content,
+                &runtime::permissions::SharedPrompter::none(),
+                ingress,
+            )
+            .await;
         {
             let mut runtime = runtime_entry.lock().await;
-            runtime
-                .submit_ingress_turn(
-                    content,
-                    &runtime::permissions::SharedPrompter::none(),
-                    ingress,
-                )
-                .await
-                .map_err(|error| error.to_string())?;
+            runtime.restore_runtime_after_turn(owned_runtime);
         }
+        let summary = summary_result.map_err(|error| {
+            self.fail_live_execution(&graph_id, error.to_string());
+            error.to_string()
+        })?;
         let terminal = self
             .runtime_services
             .session_terminal_delivery()
             .get(&terminal_id)
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("runtime committed no terminal for {}", record.request_id))?;
+        self.complete_live_execution(&graph_id, &summary.context_turn_report, terminal_id.clone());
         if let Some(resolution) = self.session_input_router.record_target_terminal(
             record,
             &graph_id,
@@ -893,11 +1464,13 @@ impl RuntimeService {
         let session_id = session_id.to_string();
         let relay_session_id = session_id.clone();
         let gateway_bus = self.session_kernel.event_bus();
+        let live_executions = Arc::clone(&self.live_executions);
         let mut receiver = bus.subscribe();
         let handle = runtime.spawn(async move {
             loop {
                 match receiver.recv().await {
                     Ok(event) => {
+                        observe_live_event(&live_executions, &relay_session_id, &event);
                         gateway_bus
                             .broadcast(
                                 &relay_session_id,
@@ -937,6 +1510,9 @@ impl RuntimeService {
     ) -> Option<tokio::sync::broadcast::Receiver<runtime::CowdEvent>> {
         let runtime_entry = self.sessions.get(session_id)?;
         let runtime_guard = runtime_entry.lock().await;
+        if runtime_guard.turn_is_owned() {
+            return None;
+        }
         runtime_guard.cowd_bus().map(|bus| bus.subscribe())
     }
 
@@ -978,6 +1554,12 @@ impl RuntimeService {
                 .clone()
                 .unwrap_or_else(|| envelope.input_id.to_string()),
             created_at_ms: envelope.created_at.timestamp_millis().max(0) as u64,
+            runtime_options_json: envelope
+                .metadata
+                .get("runtime_options")
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|error| RuntimeTurnExecutionError::Runtime(error.to_string()))?,
         };
         self.session_input_router
             .persist_input(&session_id, &content, &request)
@@ -996,12 +1578,15 @@ impl RuntimeService {
             None,
         )
         .await;
+        let execution_graph_id =
+            runtime::session_ingress_graph_id(&session_id, &request.request_id, &request.turn_id);
+        self.record_live_execution(
+            &session_id,
+            execution_graph_id.clone(),
+            request.turn_id.clone(),
+        );
         Ok(SessionInputAdmission {
-            execution_graph_id: runtime::session_ingress_graph_id(
-                &session_id,
-                &request.request_id,
-                &request.turn_id,
-            ),
+            execution_graph_id,
             receipt,
             materialized: None,
         })
@@ -1164,6 +1749,11 @@ impl RuntimeService {
             RuntimeTurnExecutionError::NotFound(format!("session {session_id} not found"))
         })?;
         let runtime_guard = runtime_entry.lock().await;
+        if runtime_guard.turn_is_owned() {
+            return Err(RuntimeTurnExecutionError::Runtime(format!(
+                "session {session_id} is executing before its input stream was initialized"
+            )));
+        }
         let stream = runtime_guard.session_input_stream();
         self.session_inputs
             .lock()
@@ -1375,23 +1965,29 @@ impl RuntimeService {
             RuntimeTurnExecutionError::NotFound(format!("session {session_id} not found"))
         })?;
         let queued_next_options = options.clone();
-        let turn_result = tokio::task::spawn_blocking(move || {
-            let handle = tokio::runtime::Handle::current();
-            handle.block_on(async move {
-                let mut runtime_guard = runtime_entry.lock().await;
-                runtime_guard.set_context_profile(options.profile);
-                for message in options.pre_messages {
-                    if let Err(error) = runtime_guard.append_external_message(message).await {
-                        return Err(error);
-                    }
-                }
+        let mut owned_runtime = {
+            let mut runtime_guard = runtime_entry.lock().await;
+            runtime_guard.set_context_profile(options.profile);
+            for message in options.pre_messages {
                 runtime_guard
-                    .submit_turn(&content, &runtime::permissions::SharedPrompter::none())
+                    .append_external_message(message)
                     .await
-            })
-        })
-        .await
-        .map_err(|error| RuntimeTurnExecutionError::Join(format!("task join error: {error}")))?;
+                    .map_err(|error| RuntimeTurnExecutionError::Runtime(error.to_string()))?;
+            }
+            runtime_guard
+                .take_runtime_for_turn()
+                .map_err(|error| RuntimeTurnExecutionError::Runtime(error.to_string()))?
+        };
+        // Do not hold `GatewayRuntimeEntry`'s mutex while a provider/tool turn
+        // awaits.  The host returns to the entry before this method settles
+        // the receipt, so the next turn still observes a single owner.
+        let turn_result = owned_runtime
+            .submit_turn(&content, &runtime::permissions::SharedPrompter::none())
+            .await;
+        {
+            let mut runtime_guard = runtime_entry.lock().await;
+            runtime_guard.restore_runtime_after_turn(owned_runtime);
+        }
 
         match turn_result {
             Ok(summary) => {
@@ -1579,6 +2175,9 @@ impl RuntimeService {
     pub(crate) async fn session_snapshot(&self, session_id: &str) -> Option<runtime::Session> {
         let runtime_entry = self.sessions.get(session_id)?;
         let runtime_guard = runtime_entry.lock().await;
+        if runtime_guard.turn_is_owned() {
+            return None;
+        }
         Some(runtime_guard.session_async().await)
     }
 
@@ -1633,7 +2232,13 @@ impl RuntimeService {
         session_id: &str,
     ) -> Option<SessionStatsSnapshot> {
         let runtime_entry = self.sessions.get(session_id)?;
-        let runtime_guard = runtime_entry.lock().await;
+        // A long provider/tool turn owns this mutex.  Stats are cumulative
+        // history, so callers can fall back to the durable session snapshot
+        // instead of queueing behind a running turn.
+        let runtime_guard = runtime_entry.try_lock().ok()?;
+        if runtime_guard.turn_is_owned() {
+            return None;
+        }
         let session = runtime_guard.active_session_stats_session();
         let messages = &session.messages;
 
@@ -1696,7 +2301,7 @@ impl RuntimeService {
     ) -> Option<runtime::ContextEnvelope> {
         let runtime_entry = self.sessions.get(session_id)?;
         let envelope = match runtime_entry.try_lock() {
-            Ok(runtime) => runtime.last_context_envelope(),
+            Ok(runtime) if !runtime.turn_is_owned() => runtime.last_context_envelope(),
             Err(_) => {
                 tracing::debug!(
                     %session_id,
@@ -1704,6 +2309,7 @@ impl RuntimeService {
                 );
                 None
             }
+            Ok(_) => None,
         };
         envelope
     }
@@ -1717,6 +2323,9 @@ impl RuntimeService {
     ) -> Option<ActiveMessagesPage> {
         let runtime_entry = self.sessions.get(session_id)?;
         let runtime_guard = runtime_entry.lock().await;
+        if runtime_guard.turn_is_owned() {
+            return None;
+        }
         let session = runtime_guard.session_async().await;
 
         let all_messages: Vec<serde_json::Value> = session
@@ -2040,6 +2649,7 @@ mod tests {
             revision: 1,
             created_at_ms: 1,
             updated_at_ms: 1,
+            runtime_options_json: None,
         };
         let services = runtime::RuntimeServices::builder(&home, &workspace)
             .session_store(Arc::clone(&store))
@@ -2341,5 +2951,174 @@ mod tests {
         assert_eq!(payload["type"], "TextDelta");
         assert_eq!(payload["text"], "streamed through gateway");
         service.remove_active_runtime("relay-session");
+    }
+
+    #[test]
+    fn live_context_usage_keeps_ledger_provenance_and_component_counts() {
+        let report = ContextTurnReport::new(
+            "turn-context",
+            harness_contract::context::ContextPressureState::new("default", 32_000, 8_000),
+        )
+        .with_ledger(harness_contract::context::ContextLedgerProjection {
+            max_tokens: 32_000,
+            consumed_tokens: 8_000,
+            remaining_tokens: 24_000,
+            tool_result_limit: 4_000,
+            tool_result_consumed: 750,
+            components: vec![harness_contract::context::ContextComponentUsage {
+                kind: "conversation".to_string(),
+                tokens: 5_000,
+                occurrences: 3,
+            }],
+            request_sequence: 7,
+            calibrated_input_tokens: Some(7_500),
+        });
+
+        let usage = context_usage_from_report(&report).expect("ledger becomes live usage");
+        assert_eq!(usage.window_tokens, Some(32_000));
+        assert_eq!(usage.window_source.as_deref(), Some("runtime_ledger"));
+        assert_eq!(usage.input_tokens, Some(7_500));
+        assert_eq!(usage.input_source.as_deref(), Some("provider_actual"));
+        assert_eq!(usage.remaining_tokens, Some(24_500));
+        assert_eq!(usage.usage_percent_bp, Some(2_343));
+        assert_eq!(usage.request_sequence, Some(7));
+        assert_eq!(usage.components[0].occurrences, 3);
+    }
+
+    #[test]
+    fn session_execution_index_exposes_running_only_and_retains_terminal_reference() {
+        let service = test_runtime_service(Arc::new(ActiveSessions::default()), None);
+        service.record_live_execution(
+            "session-index",
+            "execution-running".to_string(),
+            "turn-running".to_string(),
+        );
+        service.record_live_execution(
+            "session-index",
+            "execution-finished".to_string(),
+            "turn-finished".to_string(),
+        );
+
+        {
+            let mut records = service
+                .live_executions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let finished = records
+                .get_mut("execution-finished")
+                .expect("finished live execution exists");
+            finished.live.status = ExecutionLiveStatus::Complete;
+            finished.live.terminal_ref = Some("terminal-finished".to_string());
+            finished.live.updated_at_ms = finished.live.updated_at_ms.saturating_add(1);
+            finished.live.last_progress_at_ms = finished.live.updated_at_ms;
+        }
+
+        let index = service.session_execution_index("session-index");
+        assert_eq!(index.active_execution_ids, vec!["execution-running"]);
+        assert_eq!(
+            index.latest_execution_id.as_deref(),
+            Some("execution-finished")
+        );
+        assert_eq!(index.latest_status, Some(ExecutionLiveStatus::Complete));
+        assert_eq!(index.terminal_ref.as_deref(), Some("terminal-finished"));
+        assert!(service
+            .running_session_execution_indices()
+            .iter()
+            .any(|entry| entry.session_id == "session-index"));
+    }
+
+    #[test]
+    fn live_execution_rejects_illegal_terminal_transition_and_keeps_revision_monotonic() {
+        let mut record = LiveExecutionRecord::new(
+            "session-transition".to_string(),
+            "execution-transition".to_string(),
+            "turn-transition".to_string(),
+        );
+        let initial_revision = record.live.revision;
+        record.transition(
+            ExecutionLiveStatus::PreparingContext,
+            Some("assembling context".to_string()),
+        );
+        let preparing_revision = record.live.revision;
+        record.transition(
+            ExecutionLiveStatus::CallingModel,
+            Some("requesting model".to_string()),
+        );
+        record.transition(
+            ExecutionLiveStatus::Finalizing,
+            Some("synthesizing terminal".to_string()),
+        );
+        record.transition(
+            ExecutionLiveStatus::Complete,
+            Some("terminal committed".to_string()),
+        );
+        let terminal_revision = record.live.revision;
+        record.transition(
+            ExecutionLiveStatus::CallingTool,
+            Some("must be ignored".to_string()),
+        );
+
+        assert!(preparing_revision > initial_revision);
+        assert!(terminal_revision > preparing_revision);
+        assert_eq!(record.live.revision, terminal_revision);
+        assert_eq!(record.live.status, ExecutionLiveStatus::Complete);
+    }
+
+    #[test]
+    fn durable_ingress_index_recovers_execution_identity_without_mixing_cursors() {
+        let records = vec![
+            memory::SessionRuntimeOutboxRecord {
+                request_id: "request-complete".to_string(),
+                turn_id: "turn-complete".to_string(),
+                message_id: "message-complete".to_string(),
+                session_id: "session-recovery".to_string(),
+                sequence: 1,
+                status: memory::OutboxStatus::Materialized,
+                runtime_commit_cursor: Some(44),
+                attempts: 1,
+                next_attempt_at_ms: 0,
+                claim_owner: None,
+                claim_expires_at_ms: None,
+                failure_class: None,
+                last_error: None,
+                revision: 9,
+                created_at_ms: 10,
+                updated_at_ms: 20,
+                runtime_options_json: None,
+            },
+            memory::SessionRuntimeOutboxRecord {
+                request_id: "request-pending".to_string(),
+                turn_id: "turn-pending".to_string(),
+                message_id: "message-pending".to_string(),
+                session_id: "session-recovery".to_string(),
+                sequence: 2,
+                status: memory::OutboxStatus::Pending,
+                runtime_commit_cursor: None,
+                attempts: 0,
+                next_attempt_at_ms: 0,
+                claim_owner: None,
+                claim_expires_at_ms: None,
+                failure_class: None,
+                last_error: None,
+                revision: 3,
+                created_at_ms: 21,
+                updated_at_ms: 30,
+                runtime_options_json: None,
+            },
+        ];
+        let index = session_execution_index_from_outbox("session-recovery", &records);
+        assert_eq!(index.active_execution_ids.len(), 1);
+        assert_eq!(index.latest_status, Some(ExecutionLiveStatus::Queued));
+        assert_eq!(index.latest_live_revision, None);
+        assert_eq!(index.last_progress_at_ms, Some(30));
+        assert!(index.terminal_ref.is_none());
+        assert_eq!(
+            index.latest_execution_id,
+            Some(runtime::session_ingress_graph_id(
+                "session-recovery",
+                "request-pending",
+                "turn-pending"
+            ))
+        );
     }
 }

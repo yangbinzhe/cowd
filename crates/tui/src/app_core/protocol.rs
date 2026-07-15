@@ -213,6 +213,7 @@ mod tests {
             evidence: Vec::new(),
             health: Vec::new(),
             recovery: Vec::new(),
+            live: None,
             available_commands: Vec::<ProjectionCommandAvailability>::new(),
         }
     }

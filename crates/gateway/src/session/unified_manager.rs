@@ -1003,6 +1003,7 @@ mod tests {
             revision: 1,
             created_at_ms: 1,
             updated_at_ms: 1,
+            runtime_options_json: None,
         };
 
         let _ = manager

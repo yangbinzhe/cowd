@@ -9,7 +9,8 @@ use surface::{message::MessageActionKind, SurfaceActionRequest, SurfaceFrame, Su
 use tokio::sync::Mutex;
 
 use crate::api_routes::AppState;
-use crate::runtime_service::RuntimeTurnOptions;
+use crate::runtime_service::IngressRuntimeOptions;
+use crate::surface_host::SurfaceTurnCorrelation;
 
 #[derive(Debug, Clone, Copy)]
 struct SurfaceTurnPolicy {
@@ -26,6 +27,7 @@ pub(crate) fn spawn_surface_ingress_dispatcher(state: Arc<AppState>) {
             tokio::select! {
                 _ = retry_tick.tick() => {
                     retry_surface_trigger_events(&state).await;
+                    reconcile_surface_terminal_deliveries(&state).await;
                 }
                 received = rx.recv() => {
                     let frame = match received {
@@ -61,6 +63,231 @@ pub(crate) fn spawn_surface_ingress_dispatcher(state: Arc<AppState>) {
             }
         }
     });
+}
+
+/// Terminal replies remain a Surface delivery concern.  The bridge recovers
+/// correlations from the durable inbox plus Session ingress identity, then
+/// sends through the unchanged Surface outbox with a stable idempotency key.
+/// It never treats transient TextDelta as a channel reply.
+async fn reconcile_surface_terminal_deliveries(state: &Arc<AppState>) {
+    let Some(runtime_service) = state.services.runtime.as_ref() else {
+        return;
+    };
+    let Some(store) = runtime_service.session_kernel().unified_store() else {
+        return;
+    };
+    for inbox in state.services.surface.all_inbox() {
+        if !matches!(inbox.status.as_str(), "processing" | "processed") {
+            continue;
+        }
+        let correlation = inbox.correlation.as_ref();
+        let (Some(session_id), Some(turn_id)) = (
+            correlation
+                .map(|item| item.session_id.as_str())
+                .or(inbox.runtime_session_id.as_deref()),
+            correlation
+                .map(|item| item.turn_id.as_str())
+                .or(inbox.runtime_turn_id.as_deref()),
+        ) else {
+            continue;
+        };
+        let records = match store
+            .session_runtime_outbox_for_session(session_id, 100)
+            .await
+        {
+            Ok(records) => records,
+            Err(error) => {
+                tracing::warn!(
+                    session_id,
+                    turn_id,
+                    error = %error,
+                    "surface terminal bridge could not read ingress correlation"
+                );
+                continue;
+            }
+        };
+        let Some(record) = records.into_iter().find(|record| record.turn_id == turn_id) else {
+            continue;
+        };
+        if record.status == memory::OutboxStatus::BlockedMaterialization {
+            let error = record
+                .last_error
+                .unwrap_or_else(|| "Runtime could not materialize the surface turn".to_string());
+            if let Err(mark_error) = state
+                .services
+                .surface
+                .mark_inbox_failed(&inbox.idempotency_key, error.clone())
+            {
+                tracing::warn!(
+                    surface = %inbox.surface,
+                    message_id = %inbox.message_id,
+                    error = %mark_error,
+                    "surface terminal bridge could not record Runtime failure"
+                );
+            }
+            send_surface_failure_notice(
+                state,
+                &inbox.surface,
+                &inbox.payload_json,
+                session_id,
+                &inbox.message_id,
+                &error,
+            )
+            .await;
+            continue;
+        }
+        if record.status != memory::OutboxStatus::Materialized {
+            continue;
+        }
+        let execution_id =
+            runtime::session_ingress_graph_id(session_id, &record.request_id, &record.turn_id);
+        if correlation.is_some_and(|item| item.execution_id != execution_id) {
+            tracing::error!(
+                surface = %inbox.surface,
+                message_id = %inbox.message_id,
+                correlated = ?correlation.map(|item| &item.execution_id),
+                derived = %execution_id,
+                "surface turn correlation does not match durable ingress identity"
+            );
+            continue;
+        }
+        let terminal_id = format!("turn-terminal:{}", record.request_id);
+        let terminal = match runtime_service
+            .runtime_services()
+            .session_terminal_delivery()
+            .get(&terminal_id)
+        {
+            Ok(Some(terminal)) => terminal,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(%terminal_id, error = %error, "surface terminal bridge lookup failed");
+                continue;
+            }
+        };
+        let text = match crate::session_runtime_bridge::decode_terminal_payload(
+            &terminal.payload_ref,
+        ) {
+            Ok(text) => text,
+            Err((_, error)) => {
+                let _ = state
+                    .services
+                    .surface
+                    .mark_inbox_failed(&inbox.idempotency_key, error.clone());
+                tracing::warn!(surface = %inbox.surface, message_id = %inbox.message_id, error, "surface terminal payload is invalid");
+                continue;
+            }
+        };
+        if let Err(error) = deliver_surface_terminal(state, &inbox, &text, &terminal_id).await {
+            tracing::warn!(
+                surface = %inbox.surface,
+                message_id = %inbox.message_id,
+                %terminal_id,
+                error = %error,
+                "surface terminal bridge delivery did not settle"
+            );
+        }
+    }
+}
+
+async fn deliver_surface_terminal(
+    state: &AppState,
+    inbox: &crate::surface_host::SurfaceInboxRecord,
+    text: &str,
+    terminal_id: &str,
+) -> Result<(), String> {
+    let correlation = inbox.correlation.as_ref();
+    let session_id = correlation
+        .map(|item| item.session_id.as_str())
+        .or(inbox.runtime_session_id.as_deref())
+        .unwrap_or_default();
+    if correlation.is_some() {
+        state
+            .services
+            .surface
+            .record_inbox_terminal_delivery(&inbox.idempotency_key, terminal_id)?;
+    }
+    if text.trim().is_empty() {
+        state
+            .services
+            .surface
+            .mark_inbox_replied(&inbox.idempotency_key)?;
+        notify_surface_processing_lifecycle(
+            state,
+            &inbox.surface,
+            MessageActionKind::ProcessingComplete.as_str(),
+            &inbox.message_id,
+            None,
+        )
+        .await;
+        return Ok(());
+    }
+    let recipient = surface_reply_recipient(&inbox.payload_json)
+        .or_else(|| inbox.thread_id.clone())
+        .or_else(|| inbox.sender_id.clone())
+        .unwrap_or_else(|| session_id.to_string());
+    let reply_to = surface_platform_reply_to(&inbox.payload_json, &inbox.message_id);
+    let outbound = state
+        .services
+        .surface
+        .send(SurfaceSendRequest {
+            surface: inbox.surface.clone(),
+            recipient,
+            thread: inbox.thread_id.clone(),
+            text: text.to_string(),
+            idempotency_key: Some(correlation.map_or_else(
+                || format!("surface-reply:{}:{}", inbox.surface, inbox.message_id),
+                |item| item.reply_idempotency_key.clone(),
+            )),
+            metadata: serde_json::json!({
+                "reply_to": reply_to,
+                "local_reply_to": inbox.message_id,
+                "source_session_id": session_id,
+                "terminal_id": terminal_id,
+                "source": "surface_terminal_bridge",
+            }),
+        })
+        .await?;
+    if let Some(error) = outbound.error.as_ref() {
+        state
+            .services
+            .surface
+            .mark_inbox_reply_failed(&inbox.idempotency_key, error.message.clone())?;
+        notify_surface_processing_lifecycle(
+            state,
+            &inbox.surface,
+            MessageActionKind::ProcessingFailed.as_str(),
+            &inbox.message_id,
+            Some(error.message.clone()),
+        )
+        .await;
+        return Err(error.message.clone());
+    }
+    state
+        .services
+        .surface
+        .mark_inbox_replied(&inbox.idempotency_key)?;
+    notify_surface_processing_lifecycle(
+        state,
+        &inbox.surface,
+        MessageActionKind::ProcessingComplete.as_str(),
+        &inbox.message_id,
+        None,
+    )
+    .await;
+    append_surface_timeline_event(
+        state,
+        session_id,
+        "SurfaceMessageReplied",
+        serde_json::json!({
+            "type": "SurfaceMessageReplied",
+            "surface": inbox.surface,
+            "message_id": inbox.message_id,
+            "terminal_id": terminal_id,
+            "outbound": outbound,
+        }),
+    )
+    .await?;
+    Ok(())
 }
 
 /// Persist a Surface transport event before attempting Runtime delivery.  The
@@ -315,258 +542,70 @@ async fn handle_surface_message(
     let pre_messages = surface_runtime_pre_messages(&content, &current_media, &recent_media);
     let runtime_content = surface_runtime_content(&content, &current_resources, &recent_resources);
     let turn_policy = surface_turn_policy(&runtime_content);
-    if runtime_service
-        .session_input_projection(&session_id)
-        .await
-        .map_err(|error| error.message())?
-        .active_turn_id
-        .is_some()
-    {
-        let receipt = runtime_service
-            .admit_session_input(
-                SessionInputEnvelope::text(
-                    session_id.clone(),
-                    InputSourceKind::Surface,
-                    runtime_content,
-                )
-                .with_source_ref(format!("surface:{surface}"))
-                .with_source_message_id(message_id.clone())
-                .with_idempotency_key(inbox.record.idempotency_key.clone())
-                .with_metadata(serde_json::json!({
-                    "surface": surface.clone(),
-                    "thread_id": thread_id.clone(),
-                    "user_id": user_id.clone(),
-                    "payload_metadata": metadata,
-                })),
+    // Surface metadata enters the same durable SessionIngress as WebUI/TUI.
+    // Runtime reads the opaque options only after it owns the per-session
+    // executor, preserving image blocks and context policy without a direct
+    // SurfaceHost turn path.
+    let surface_turn_id = format!(
+        "surface-turn:{}",
+        stable_surface_turn_digest(&session_id, &inbox.record.idempotency_key)
+    );
+    let runtime_options = serde_json::to_value(IngressRuntimeOptions {
+        profile: turn_policy.profile,
+        pre_messages: pre_messages.into_iter().map(Into::into).collect(),
+    })
+    .map_err(|error| error.to_string())?;
+    let admission = runtime_service
+        .admit_session_input_with_materialized(
+            SessionInputEnvelope::text(
+                session_id.clone(),
+                InputSourceKind::Surface,
+                runtime_content,
             )
-            .await
-            .map_err(|error| error.message())?;
-        state.services.surface.mark_inbox_processed(
-            &inbox.record.idempotency_key,
-            receipt.active_turn_id.as_ref().map(ToString::to_string),
-        )?;
-        append_surface_timeline_event(
-            &state,
-            &session_id,
-            "SurfaceMessageAttachedToActiveTurn",
-            serde_json::json!({
-                "type": "SurfaceMessageAttachedToActiveTurn",
+            .with_source_ref(format!("surface:{surface}"))
+            .with_source_message_id(message_id.clone())
+            .with_idempotency_key(inbox.record.idempotency_key.clone())
+            .with_metadata(serde_json::json!({
                 "surface": surface.clone(),
-                "message_id": message_id.clone(),
-                "input_receipt": receipt,
-            }),
+                "thread_id": thread_id.clone(),
+                "user_id": user_id.clone(),
+                "payload_metadata": metadata,
+                "turn_id": surface_turn_id.clone(),
+                "runtime_options": runtime_options,
+            })),
         )
-        .await?;
-        notify_surface_processing_lifecycle(
-            &state,
-            &surface,
-            MessageActionKind::ProcessingComplete.as_str(),
-            &message_id,
-            None,
-        )
-        .await;
-        return Ok(());
-    }
-    drop(session_guard);
-    let accepted_turn = runtime_service
-        .accept_turn_with_options(&session_id, None, runtime_content.clone())
         .await
         .map_err(|error| error.message())?;
-    let execution = match runtime_service
-        .run_accepted_turn_with_options(
-            &session_id,
-            accepted_turn.turn_id.clone(),
-            runtime_content,
-            RuntimeTurnOptions {
-                profile: turn_policy.profile,
-                pre_messages,
-            },
-        )
-        .await
-    {
-        Ok(execution) => execution,
-        Err(error) => {
-            let message = error.message();
-            append_surface_timeline_event(
-                &state,
-                &session_id,
-                "SurfaceMessageProcessingFailed",
-                serde_json::json!({
-                    "type": "SurfaceMessageProcessingFailed",
-                    "surface": surface.clone(),
-                    "message_id": message_id.clone(),
-                    "error": message,
-                }),
-            )
-            .await?;
-            state
-                .services
-                .surface
-                .mark_inbox_failed(&inbox.record.idempotency_key, message.clone())?;
-            send_surface_failure_notice(
-                &state,
-                &surface,
-                &payload,
-                &session_id,
-                &message_id,
-                &message,
-            )
-            .await;
-            notify_surface_processing_lifecycle(
-                &state,
-                &surface,
-                MessageActionKind::ProcessingFailed.as_str(),
-                &message_id,
-                Some(message.clone()),
-            )
-            .await;
-            return Err(message);
-        }
-    };
-    if let Some(snapshot) = runtime_service.session_snapshot(&session_id).await {
-        runtime_service
-            .sync_session_snapshot(&session_id, &snapshot)
-            .await
-            .map_err(|error| error.to_string())?;
-    }
-    let response_text = final_text(&execution.summary);
-    state
-        .services
-        .session
-        .append_timeline_event(
-            &session_id,
-            "SurfaceMessageProcessed",
-            serde_json::json!({
-                "type": "SurfaceMessageProcessed",
-                "surface": surface.clone(),
-                "message_id": message_id.clone(),
-                "turn_id": execution.receipt.turn_id,
-                "context_turn_report": execution.summary.context_turn_report,
-                "response_preview": response_text.chars().take(240).collect::<String>(),
-            }),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    state.services.surface.mark_inbox_processed(
+    state.services.surface.mark_inbox_admitted(
         &inbox.record.idempotency_key,
-        Some(execution.receipt.turn_id.to_string()),
+        SurfaceTurnCorrelation {
+            surface: surface.clone(),
+            message_id: message_id.clone(),
+            inbox_idempotency_key: inbox.record.idempotency_key.clone(),
+            session_id: session_id.clone(),
+            turn_id: surface_turn_id.clone(),
+            execution_id: admission.execution_graph_id.clone(),
+            reply_to_message_id: surface_platform_reply_to(&payload, &message_id),
+            reply_idempotency_key: format!("surface-reply:{surface}:{message_id}"),
+            terminal_id: None,
+            terminal_delivery_revision: 0,
+        },
     )?;
-
-    if response_text.trim().is_empty() {
-        notify_surface_processing_lifecycle(
-            &state,
-            &surface,
-            MessageActionKind::ProcessingComplete.as_str(),
-            &message_id,
-            None,
-        )
-        .await;
-        return Ok(());
-    }
-    let recipient = surface_reply_recipient(&payload)
-        .or(thread_id.clone())
-        .or(user_id.clone())
-        .unwrap_or_else(|| session_id.clone());
-    let platform_reply_to = surface_platform_reply_to(&payload, &message_id);
-    let outbound_request = SurfaceSendRequest {
-        surface: surface.clone(),
-        recipient,
-        thread: thread_id,
-        text: response_text,
-        idempotency_key: Some(format!("surface-reply:{surface}:{message_id}")),
-        metadata: serde_json::json!({
-            "reply_to": platform_reply_to,
-            "local_reply_to": message_id,
-            "source_session_id": session_id,
-            "source": "surface_ingress_dispatcher",
-        }),
-    };
-    let outbound = match state.services.surface.send(outbound_request).await {
-        Ok(outbound) => outbound,
-        Err(error) => {
-            append_surface_timeline_event(
-                &state,
-                &session_id,
-                "SurfaceMessageReplyFailed",
-                serde_json::json!({
-                    "type": "SurfaceMessageReplyFailed",
-                    "surface": surface.clone(),
-                    "message_id": message_id.clone(),
-                    "error": error,
-                }),
-            )
-            .await?;
-            state
-                .services
-                .surface
-                .mark_inbox_reply_failed(&inbox.record.idempotency_key, error.clone())?;
-            notify_surface_processing_lifecycle(
-                &state,
-                &surface,
-                MessageActionKind::ProcessingFailed.as_str(),
-                &message_id,
-                Some(error.clone()),
-            )
-            .await;
-            return Err(error);
-        }
-    };
-    if let Some(error) = outbound.error.clone() {
-        append_surface_timeline_event(
-            &state,
-            &session_id,
-            "SurfaceMessageReplyFailed",
-            serde_json::json!({
-                "type": "SurfaceMessageReplyFailed",
-                "surface": surface.clone(),
-                "message_id": message_id.clone(),
-                "error": error.message.clone(),
-                "code": error.code.clone(),
-                "outbound": outbound,
-            }),
-        )
-        .await?;
-        state
-            .services
-            .surface
-            .mark_inbox_reply_failed(&inbox.record.idempotency_key, error.message.clone())?;
-        notify_surface_processing_lifecycle(
-            &state,
-            &surface,
-            MessageActionKind::ProcessingFailed.as_str(),
-            &message_id,
-            Some(error.message.clone()),
-        )
-        .await;
-        return Err(error.message.clone());
-    }
-    state
-        .services
-        .surface
-        .mark_inbox_replied(&inbox.record.idempotency_key)?;
-    notify_surface_processing_lifecycle(
+    append_surface_timeline_event(
         &state,
-        &surface,
-        MessageActionKind::ProcessingComplete.as_str(),
-        &message_id,
-        None,
+        &session_id,
+        "SurfaceMessageAccepted",
+        serde_json::json!({
+            "type": "SurfaceMessageAccepted",
+            "surface": surface,
+            "message_id": message_id,
+            "turn_id": surface_turn_id,
+            "execution_id": admission.execution_graph_id,
+            "input_receipt": admission.receipt,
+        }),
     )
-    .await;
-    state
-        .services
-        .session
-        .append_timeline_event(
-            &session_id,
-            "SurfaceMessageReplied",
-            serde_json::json!({
-                "type": "SurfaceMessageReplied",
-                "surface": surface.clone(),
-                "message_id": message_id,
-                "outbound": outbound,
-            }),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
+    .await?;
+    drop(session_guard);
     Ok(())
 }
 
@@ -667,6 +706,14 @@ fn surface_platform_reply_to(payload: &serde_json::Value, message_id: &str) -> S
         .get("metadata")
         .and_then(|metadata| payload_string(metadata, "replayed_from_message_id"))
         .unwrap_or_else(|| message_id.to_string())
+}
+
+fn stable_surface_turn_digest(session_id: &str, idempotency_key: &str) -> String {
+    let digest = Sha256::digest(format!("{session_id}:{idempotency_key}").as_bytes());
+    digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 async fn send_surface_failure_notice(

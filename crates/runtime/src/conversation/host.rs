@@ -448,6 +448,12 @@ where
 {
     let session_id = runtime.session().session_id;
     let runtime = Arc::new(tokio::sync::Mutex::new(runtime));
+    if let Some(bus) = runtime.lock().await.cowd_bus().cloned() {
+        bus.emit(CowdEvent::ExecutionPhase {
+            status: harness_contract::projection::ExecutionLiveStatus::PreparingContext,
+            detail: Some("assembling context".to_string()),
+        });
+    }
     let result = async {
         let state = Arc::new(tokio::sync::Mutex::new(TurnGraphState {
             content: content.to_string(),
@@ -1058,6 +1064,12 @@ where
             return Ok(outcome);
         }
         let mut runtime = self.runtime.lock().await;
+        if let Some(bus) = runtime.cowd_bus().cloned() {
+            bus.emit(CowdEvent::ExecutionPhase {
+                status: harness_contract::projection::ExecutionLiveStatus::CallingModel,
+                detail: Some("requesting model".to_string()),
+            });
+        }
         if force_text_only_response {
             runtime.require_next_model_final_response();
         }
@@ -2032,6 +2044,12 @@ where
         &self,
         ticket: &NodeExecutionTicket,
     ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+        if let Some(bus) = self.runtime.lock().await.cowd_bus().cloned() {
+            bus.emit(CowdEvent::ExecutionPhase {
+                status: harness_contract::projection::ExecutionLiveStatus::CallingTool,
+                detail: Some("executing tool batch".to_string()),
+            });
+        }
         let (prompter, iteration, session_id, model_lease) = {
             let state = self.state.lock().await;
             (
@@ -2614,6 +2632,12 @@ where
         &self,
         ticket: &NodeExecutionTicket,
     ) -> Result<NodeExecutionOutcome, String> {
+        if let Some(bus) = self.runtime.lock().await.cowd_bus().cloned() {
+            bus.emit(CowdEvent::ExecutionPhase {
+                status: harness_contract::projection::ExecutionLiveStatus::Finalizing,
+                detail: Some("synthesizing terminal".to_string()),
+            });
+        }
         let projection = self
             .services
             .graph_runner()

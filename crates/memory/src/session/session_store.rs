@@ -713,6 +713,24 @@ impl UnifiedSessionStore {
             .get_session_runtime_outbox(request_id)
     }
 
+    pub async fn session_runtime_outbox_for_session(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionRuntimeOutboxRecord>> {
+        self.inner
+            .lock()
+            .await
+            .session_runtime_outbox_for_session(session_id, limit)
+    }
+
+    pub async fn active_session_runtime_outbox(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<SessionRuntimeOutboxRecord>> {
+        self.inner.lock().await.active_session_runtime_outbox(limit)
+    }
+
     pub async fn session_runtime_outbox_health(&self) -> Result<SessionRuntimeOutboxHealth> {
         self.inner.lock().await.session_runtime_outbox_health()
     }
