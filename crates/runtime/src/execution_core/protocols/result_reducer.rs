@@ -118,6 +118,7 @@ impl SynthesizeBackend for ProtocolResultReducer {
             return Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
                 status: ExecutionNodeStatus::Blocked,
                 result_ref: None,
+                summary: Some(blockers.join("; ")),
                 evidence_refs: evidence.clone(),
                 failure: Some(harness_contract::execution_graph::ExecutionFailure {
                     kind: "protocol_agent_terminal_failure".to_string(),
@@ -154,6 +155,7 @@ impl SynthesizeBackend for ProtocolResultReducer {
         Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
             status,
             result_ref,
+            summary: Some(answer),
             evidence_refs: evidence,
             failure,
             usage,

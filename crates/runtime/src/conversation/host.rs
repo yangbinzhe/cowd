@@ -2063,9 +2063,9 @@ where
             let runtime = self.runtime.lock().await;
             let tool_exec = Arc::clone(runtime.tool_executor());
             let active_mode = runtime.permission_policy().active_mode();
-            let default_timeout = runtime.tool_timeout().unwrap_or_else(|| {
-                std::time::Duration::from_secs(60)
-            });
+            let default_timeout = runtime
+                .tool_timeout()
+                .unwrap_or_else(|| std::time::Duration::from_secs(60));
             drop(runtime);
             let mut auths = std::collections::HashMap::new();
             for call in &calls {
@@ -2073,8 +2073,7 @@ where
                     serde_json::from_str(&call.input).unwrap_or(serde_json::Value::Null);
                 if let Some(descriptor) = tool_exec.describe_tool_effect(&call.name, &parsed_input)
                 {
-                    let request_id =
-                        format!("{}:{}:{}", session_id, call.id, ticket.attempt);
+                    let request_id = format!("{}:{}:{}", session_id, call.id, ticket.attempt);
                     if let Ok(decision) = crate::ToolPolicy.authorize(
                         &descriptor,
                         request_id,
@@ -2474,7 +2473,10 @@ async fn execute_governed_runtime_tool_batch(
     session_id: &str,
     model_lease: Option<&str>,
     ticket: &NodeExecutionTicket,
-    tool_authorizations: &std::collections::HashMap<String, harness_contract::tool::ToolExecutionAuthorization>,
+    tool_authorizations: &std::collections::HashMap<
+        String,
+        harness_contract::tool::ToolExecutionAuthorization,
+    >,
 ) -> Vec<ConversationMessage> {
     let requests = calls
         .iter()
@@ -2502,8 +2504,13 @@ async fn execute_governed_runtime_tool_batch(
             let completed = stream::iter(batch.indices.into_iter().map(|index| {
                 let host = Arc::clone(&host);
                 let authorization = tool_authorizations.get(&calls[index].id).cloned();
-                let request =
-                    bound_runtime_tool_request(&calls[index], session_id, model_lease, ticket, authorization);
+                let request = bound_runtime_tool_request(
+                    &calls[index],
+                    session_id,
+                    model_lease,
+                    ticket,
+                    authorization,
+                );
                 async move {
                     let joined =
                         tokio::task::spawn_blocking(move || host.execute_runtime_tool(&request))
@@ -2528,8 +2535,13 @@ async fn execute_governed_runtime_tool_batch(
         } else {
             for index in batch.indices {
                 let authorization = tool_authorizations.get(&calls[index].id).cloned();
-                let request =
-                    bound_runtime_tool_request(&calls[index], session_id, model_lease, ticket, authorization);
+                let request = bound_runtime_tool_request(
+                    &calls[index],
+                    session_id,
+                    model_lease,
+                    ticket,
+                    authorization,
+                );
                 results[index] = Some(tool_outcome_message(host.execute_runtime_tool(&request)));
             }
         }
@@ -3365,6 +3377,7 @@ fn completed_result(result_ref: Option<String>, usage: ExecutionUsage) -> Execut
     ExecutionNodeResult {
         status: ExecutionNodeStatus::Completed,
         result_ref,
+        summary: None,
         evidence_refs: Vec::new(),
         failure: None,
         usage,

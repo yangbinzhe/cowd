@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use harness_contract::turn::{InputSourceKind, SessionInputEnvelope};
-use memory::{SessionMissionOutboxOperation, SessionMissionOutboxRequest, SessionRecord};
 use sha2::{Digest, Sha256};
 use surface::{message::MessageActionKind, SurfaceActionRequest, SurfaceFrame, SurfaceSendRequest};
 use tokio::sync::Mutex;
@@ -817,58 +816,30 @@ async fn ensure_surface_runtime_session(
     user_id: Option<&str>,
     metadata: &serde_json::Value,
 ) -> Result<(), String> {
-    let runtime_service = state
+    let manager = state
         .services
-        .runtime
+        .session_manager
         .as_ref()
-        .ok_or_else(|| "runtime service unavailable".to_string())?;
-    if runtime_service.has_active_session(session_id) {
-        ensure_surface_mission_registration(state, surface, session_id, user_id, metadata).await?;
-        return Ok(());
-    }
+        .ok_or_else(|| "unified session manager unavailable".to_string())?;
     let model = default_surface_session_model(state);
-    let mut session = runtime::Session::new();
-    session.session_id = session_id.to_string();
-    session.model = Some(model.clone());
-    let runtime = if let Some(store) = state.services.session.unified_store() {
-        crate::runtime_factory::create_runtime_entry_with_session_store(
-            store,
-            runtime_service.runtime_services(),
-            runtime_service.provider_registry(),
-            runtime_service.tool_host(),
-            session,
-            session_id,
-            model.clone(),
-            surface_system_prompt(surface),
-            true,
-            true,
-            None,
-            runtime::PermissionMode::WorkspaceWrite,
-            None,
-            None,
-        )
-    } else {
-        crate::runtime_factory::create_runtime_entry(
-            runtime_service.runtime_services(),
-            runtime_service.provider_registry(),
-            runtime_service.tool_host(),
-            session,
-            session_id,
-            model.clone(),
-            surface_system_prompt(surface),
-            true,
-            true,
-            None,
-            runtime::PermissionMode::WorkspaceWrite,
-            None,
-            None,
-        )
-    }
-    .map_err(|error| error.to_string())?;
-    runtime_service
-        .register_runtime(session_id.to_string(), runtime)
-        .map_err(|error| error.to_string())?;
-    ensure_surface_mission_registration(state, surface, session_id, user_id, metadata).await?;
+    let mut request = crate::unified_session_manager::EnsureSessionRequest::new(
+        session_id,
+        Some(model),
+        crate::unified_session_manager::SessionSource::Surface(surface.to_string()),
+    );
+    request.user_id = user_id.map(ToOwned::to_owned);
+    request.chat_id = payload_string(metadata, "chat_id");
+    request.title = Some(format!(
+        "{} {}",
+        surface,
+        session_id.chars().take(8).collect::<String>()
+    ));
+    request.metadata = serde_json::json!({
+        "surface": surface,
+        "source": "surface_ingress_dispatcher",
+        "metadata": metadata,
+    });
+    manager.ensure_session(request).await?;
     state
         .services
         .session
@@ -884,88 +855,6 @@ async fn ensure_surface_runtime_session(
         .await
         .map_err(|error| error.to_string())?;
     Ok(())
-}
-
-async fn ensure_surface_mission_registration(
-    state: &AppState,
-    surface: &str,
-    session_id: &str,
-    user_id: Option<&str>,
-    metadata: &serde_json::Value,
-) -> Result<(), String> {
-    if !state.services.session.has_unified_store() {
-        return Ok(());
-    }
-    let mut record = state
-        .services
-        .session
-        .stored_session(session_id)
-        .await
-        .map_err(|error| error.to_string())?
-        .unwrap_or_else(|| {
-            surface_session_record(
-                surface,
-                session_id,
-                user_id,
-                Some(default_surface_session_model(state)),
-                metadata,
-            )
-        });
-    let mut record_metadata = record
-        .metadata_json
-        .as_deref()
-        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
-        .filter(serde_json::Value::is_object)
-        .unwrap_or_else(|| serde_json::json!({}));
-    record_metadata["workspace_root"] =
-        serde_json::Value::String(state.workspace_root.display().to_string());
-    record.metadata_json = Some(record_metadata.to_string());
-    let runtime = state
-        .services
-        .runtime
-        .as_ref()
-        .ok_or_else(|| "runtime service unavailable".to_string())?;
-    let workspace_key = runtime.runtime_services().workspace_key().to_string();
-    let title = record_metadata
-        .get("title")
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| format!("{} {}", surface, &session_id[..session_id.len().min(8)]));
-    let request = SessionMissionOutboxRequest {
-        request_id: format!(
-            "mission:{workspace_key}:register:{}:{}",
-            record.session_id, record.created_at
-        ),
-        session_id: record.session_id.clone(),
-        title,
-        workspace_key,
-        operation: SessionMissionOutboxOperation::Register,
-        created_at_ms: current_time_ms(),
-    };
-    state
-        .services
-        .session
-        .upsert_stored_session_with_mission_outbox(&record, &request)
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(())
-}
-
-fn current_time_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-fn surface_system_prompt(surface: &str) -> Vec<String> {
-    vec![format!(
-        "你正在通过 `{surface}` 外部 surface 回复用户。必须优先给出可见、简洁、可执行的阶段性结果。\
-        如果任务需要读代码、检查 README、调研或测试，只检查足以支撑结论的关键证据；不要进行无边界穷举。\
-        如果当前 turn 的信息或时间不足，直接说明已检查内容、当前判断、剩余风险和建议下一步，而不是持续调用工具直到超时。\
-        外部 surface 的用户体验要求：宁可给出有证据的阶段性结论，也不能让用户长时间没有任何回复。"
-    )]
 }
 
 fn surface_session_id(surface: &str, payload: &serde_json::Value) -> String {
@@ -1247,41 +1136,6 @@ fn default_surface_session_model(state: &AppState) -> String {
         .and_then(|config| config.model().map(str::to_string))
         .filter(|model| !model.trim().is_empty())
         .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string())
-}
-
-fn surface_session_record(
-    surface: &str,
-    session_id: &str,
-    user_id: Option<&str>,
-    model: Option<String>,
-    metadata: &serde_json::Value,
-) -> SessionRecord {
-    let now = chrono::Utc::now().to_rfc3339();
-    let chat_id = payload_string(metadata, "chat_id").unwrap_or_else(|| session_id.to_string());
-    SessionRecord {
-        session_id: session_id.to_string(),
-        platform: surface.to_string(),
-        chat_id,
-        user_id: user_id.map(ToOwned::to_owned),
-        model,
-        created_at: now.clone(),
-        last_activity: now,
-        message_count: 0,
-        reset_policy: "none".to_string(),
-        metadata_json: Some(
-            serde_json::json!({
-                "title": format!("{} {}", surface, session_id.chars().take(8).collect::<String>()),
-                "surface": surface,
-                "source": "surface_ingress_dispatcher",
-                "metadata": metadata,
-            })
-            .to_string(),
-        ),
-        input_tokens: 0,
-        output_tokens: 0,
-        estimated_cost_usd: 0.0,
-        status: "active".to_string(),
-    }
 }
 
 fn payload_string(payload: &serde_json::Value, key: &str) -> Option<String> {

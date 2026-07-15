@@ -14,7 +14,7 @@ use crate::services::{
     StartMissionSessionHttpRequest, SubmitMissionApprovalHttpRequest,
     UpdateMissionScheduleHttpRequest, UpsertMissionProxyHttpRequest,
 };
-use memory::{SessionMissionOutboxOperation, SessionMissionOutboxRequest, SessionRecord};
+use memory::SessionMissionOutboxOperation;
 
 use super::{api_error, AppState, AuthenticatedPrincipal, ErrorResponse};
 
@@ -448,64 +448,30 @@ async fn start_mission_session_handler(
         .and_then(|config| config.model().map(str::to_string))
         .filter(|model| !model.trim().is_empty())
         .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string());
-    let now = chrono::Utc::now().to_rfc3339();
-    let mut record = SessionRecord {
-        session_id: session_id.clone(),
-        platform: "mission_control".to_string(),
-        chat_id: session_id.clone(),
-        user_id: None,
-        model: Some(model),
-        created_at: now.clone(),
-        last_activity: now,
-        message_count: 0,
-        reset_policy: "none".to_string(),
-        metadata_json: Some(
-            serde_json::json!({
-                "title": body.title.clone(),
-                "source": "mission_control",
-            })
-            .to_string(),
-        ),
-        input_tokens: 0,
-        output_tokens: 0,
-        estimated_cost_usd: 0.0,
-        status: "active".to_string(),
-    };
-    let mut metadata = record
-        .metadata_json
-        .as_deref()
-        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    metadata["workspace_root"] =
-        serde_json::Value::String(state.workspace_root.display().to_string());
-    record.metadata_json = Some(metadata.to_string());
-    let runtime = state.services.runtime.as_ref().ok_or_else(|| {
-        api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "runtime service is not configured".to_string(),
-        )
-    })?;
-    let workspace_key = runtime.runtime_services().workspace_key().to_string();
-    let request = SessionMissionOutboxRequest {
-        request_id: format!(
-            "mission:{workspace_key}:start:{}:{}",
-            record.session_id, record.created_at
-        ),
-        session_id: record.session_id.clone(),
-        title: body.title.clone(),
-        workspace_key,
-        operation: SessionMissionOutboxOperation::Start,
-        created_at_ms: current_time_ms(),
-    };
+    let mut request = crate::unified_session_manager::EnsureSessionRequest::new(
+        &session_id,
+        Some(model),
+        crate::unified_session_manager::SessionSource::MissionControl,
+    );
+    request.title = Some(body.title.clone());
+    request.metadata = serde_json::json!({"source": "mission_control"});
+    request.mission_operation = SessionMissionOutboxOperation::Start;
     state
         .services
-        .session
-        .upsert_stored_session_with_mission_outbox(&record, &request)
+        .session_manager
+        .as_ref()
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unified session manager is not configured".to_string(),
+            )
+        })?
+        .ensure_session(request)
         .await
         .map_err(|error| {
             api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to persist Mission session intent: {error}"),
+                format!("failed to ensure Mission session: {error}"),
             )
         })?;
     body.session_id = Some(session_id);
@@ -515,13 +481,6 @@ async fn start_mission_session_handler(
         .start_session(body)
         .map(|value| (StatusCode::CREATED, Json(value)))
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))
-}
-
-fn current_time_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 async fn switch_mission_session_handler(

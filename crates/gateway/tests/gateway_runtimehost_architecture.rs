@@ -1661,7 +1661,8 @@ fn surface_is_gateway_owned_and_runtime_host_uses_runtime_service_turns() {
     );
     assert!(
         (runtime_host.contains("GatewayServices::new(")
-            || runtime_host.contains("GatewayServices::new_with_config_home("))
+            || runtime_host.contains("GatewayServices::new_with_config_home(")
+            || runtime_host.contains("GatewayServices::new_with_session_manager("))
             && runtime_host.contains("RuntimeService::new(")
             && runtime_host.contains(".with_approval_gate("),
         "runtime host must register an approval-wired RuntimeService through GatewayServices"
@@ -1784,12 +1785,29 @@ fn gateway_runtime_factory_owns_runtime_assembly_without_legacy_direct_ai_shell(
 
     let session_routes = read_repo("crates/gateway/src/api_routes/session_routes.rs");
     assert!(
-        session_routes.contains("crate::runtime_factory::create_runtime_entry(")
-            && session_routes
+        session_routes.contains("required_session_manager(")
+            && session_routes.contains(".ensure_session(")
+            && !session_routes.contains("crate::runtime_factory::create_runtime_entry(")
+            && !session_routes
                 .contains("crate::runtime_factory::create_runtime_entry_with_session_store(")
             && !session_routes.contains("crate::create_runtime_entry(")
             && !session_routes.contains("crate::create_runtime_entry_with_session_store("),
-        "session routes must call runtime_factory instead of gateway root factories"
+        "session routes must use the unified Session owner instead of any Runtime factory"
+    );
+    let session_service =
+        production_part(&read_repo("crates/gateway/src/services/session_service.rs")).to_string();
+    let session_kernel =
+        production_part(&read_repo("crates/gateway/src/kernel/session_kernel.rs")).to_string();
+    assert!(
+        !session_service.contains("fn upsert_stored_session(")
+            && !session_service.contains("fn upsert_stored_session_with_mission_outbox(")
+            && !session_service.contains("fn delete_stored_session(")
+            && !session_service.contains("fn delete_stored_session_with_mission_outbox(")
+            && !session_kernel.contains("fn upsert_stored_session(")
+            && !session_kernel.contains("fn delete_stored_session(")
+            && !session_kernel.contains("enum RuntimeCommand")
+            && !session_kernel.contains("fn execute_runtime_command("),
+        "durable Session creation and deletion must not regain a service or raw-kernel bypass around UnifiedSessionManager"
     );
 }
 

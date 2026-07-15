@@ -172,6 +172,10 @@ impl NodeExecutor for ApprovalNodeExecutor {
         Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
             status,
             result_ref: Some(approval_id),
+            summary: failure
+                .as_ref()
+                .map(|failure| failure.message.clone())
+                .or_else(|| Some("Approval decision committed".to_string())),
             evidence_refs: Vec::new(),
             failure,
             usage: ExecutionUsage::default(),

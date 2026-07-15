@@ -106,7 +106,10 @@ impl ExecutionPatternCatalog {
                         "negative collaboration lift",
                         "no agent backend",
                     ],
-                    &["cowd/parallel-research-synthesis", "implementation_review_fix"],
+                    &[
+                        "cowd/parallel-research-synthesis",
+                        "implementation_review_fix",
+                    ],
                     &["team_runtime", "agent_runtime", "evidence_ledger"],
                     RuntimeCompileTarget::EvidenceGraph,
                 ),

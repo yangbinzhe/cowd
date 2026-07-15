@@ -78,7 +78,7 @@ EVAL_TOKEN="${COWD_EVAL_GATEWAY_TOKEN:-$(sed -n '/auth:/,/platform_type:/ { s/^[
 [[ -n "$EVAL_TOKEN" ]] || { echo "missing Gateway API token; set COWD_EVAL_GATEWAY_TOKEN or configure api_server.auth.token" >&2; exit 1; }
 
 cd "$ROOT"
-cargo build -p cli --features tui-surface
+cargo build -p cli -p sandbox-launcher --features tui-surface
 cargo build -p harness-eval
 start_gateway
 
@@ -108,7 +108,7 @@ curl --fail --silent --show-error "$BASE_URL/index.html" | grep -q '<!doctype ht
 curl --fail --silent --show-error "$BASE_URL/chat" | grep -q '<!doctype html'
 (
   cd "$WEBUI_ROOT"
-  COWD_E2E_GATEWAY_URL="$BASE_URL" npm run test:e2e
+  COWD_E2E_GATEWAY_URL="$BASE_URL" COWD_E2E_GATEWAY_TOKEN="$EVAL_TOKEN" npm run test:e2e
 )
 
 # This is a real terminal surface gate, not a mocked client test. The TUI must

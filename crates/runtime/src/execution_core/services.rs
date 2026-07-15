@@ -6,7 +6,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use harness_contract::agent::{
     AgentEvaluationBinding, AgentReleaseBinding, AgentTaskIntent, AgentTaskPacket,
-    AgentTerminalStatus, ReleaseChannel, RevisionSelector,
+    AgentTerminalStatus, DefinitionScope, ReleaseChannel, RevisionLifecycle, RevisionSelector,
 };
 use harness_contract::context::ContextBudgetLeaseRef;
 use harness_contract::evaluation::{EvaluationScenarioObservation, EvaluationScenarioSpec};
@@ -493,7 +493,9 @@ impl RuntimeServicesBuilder {
             ))));
         services
             .agent_runtime
-            .register_backend(Arc::new(ProcessJsonlAdapter::new()));
+            .register_backend(Arc::new(ProcessJsonlAdapter::for_workspace(
+                services.workspace_root(),
+            )));
         services
             .agent_runtime
             .block_unrecoverable_replayed_runs()
@@ -1164,6 +1166,149 @@ impl RuntimeServices {
     #[must_use]
     pub fn agent_self_models(&self) -> Vec<crate::AgentSelfModel> {
         self.agent_runtime.self_models()
+    }
+
+    /// Convert repeated, attributable Agent failures into an immutable
+    /// Definition revision and governed Draft candidate. This never changes a
+    /// release pointer and never grants its own review approval.
+    pub fn consider_agent_evolution(
+        &self,
+        trigger: &crate::AgentRunEvaluation,
+    ) -> Result<Option<crate::EvolutionGovernanceCandidate>, RuntimeServicesError> {
+        if trigger.is_success() {
+            return Ok(None);
+        }
+        let definition_id =
+            harness_contract::agent::AgentDefinitionId::try_from(trigger.definition_id.as_str())
+                .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+        if definition_id.scope() == DefinitionScope::Builtin {
+            return Ok(None);
+        }
+        let relevant = self
+            .agent_runtime
+            .evaluations()
+            .into_iter()
+            .filter(|evaluation| {
+                evaluation.definition_id == trigger.definition_id
+                    && evaluation.definition_revision == trigger.definition_revision
+                    && evaluation.environment_fingerprint == trigger.environment_fingerprint
+            })
+            .collect::<Vec<_>>();
+        let failures = relevant
+            .iter()
+            .filter(|evaluation| !evaluation.is_success())
+            .collect::<Vec<_>>();
+        if relevant.len() < 3 || failures.len() < 2 {
+            return Ok(None);
+        }
+        let success_count = relevant.len().saturating_sub(failures.len());
+        if success_count.saturating_mul(1_000) / relevant.len() >= 700 {
+            return Ok(None);
+        }
+        if self
+            .evolution_governance
+            .list_candidates()
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?
+            .into_iter()
+            .any(|candidate| {
+                candidate.baseline_revision == trigger.definition_revision
+                    && matches!(
+                        &candidate.subject,
+                        crate::EvolutionCandidateSubject::AgentDefinition { revision_ref }
+                            if revision_ref.definition_id == definition_id
+                    )
+                    && !matches!(
+                        candidate.lifecycle,
+                        crate::EvolutionCandidateLifecycle::Withdrawn
+                            | crate::EvolutionCandidateLifecycle::Superseded
+                            | crate::EvolutionCandidateLifecycle::Archived
+                    )
+            })
+        {
+            return Ok(None);
+        }
+
+        let baseline_ref = harness_contract::agent::AgentDefinitionRevisionRef::new(
+            definition_id.clone(),
+            trigger.definition_revision,
+        )
+        .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+        let baseline = self
+            .definition_registry
+            .agents()
+            .read_revision(&baseline_ref)
+            .map_err(DefinitionRegistryError::Agent)?;
+        let next_revision = self
+            .definition_registry
+            .agents()
+            .list_revisions(&definition_id)
+            .map_err(DefinitionRegistryError::Agent)?
+            .into_iter()
+            .map(|stored| stored.revision.revision_ref.revision)
+            .max()
+            .unwrap_or(trigger.definition_revision)
+            .saturating_add(1);
+        let mut failure_patterns = failures
+            .iter()
+            .filter_map(|evaluation| evaluation.failure.as_deref())
+            .map(|failure| failure.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|failure| !failure.is_empty())
+            .collect::<Vec<_>>();
+        failure_patterns.sort();
+        failure_patterns.dedup();
+        failure_patterns.truncate(8);
+        let mut instructions = baseline.agent_markdown.trim_end().to_string();
+        instructions.push_str("\n\n## Runtime-generated improvement candidate\n\n");
+        instructions.push_str(
+            "This revision is an unelevated candidate. Preserve the established role and contracts, while explicitly preventing the recurring failures below. Require evidence before claiming completion and surface unresolved constraints instead of fabricating success.\n",
+        );
+        for pattern in &failure_patterns {
+            instructions.push_str("- ");
+            instructions.push_str(&pattern.chars().take(500).collect::<String>());
+            instructions.push('\n');
+        }
+        if failure_patterns.is_empty() {
+            instructions.push_str("- Repeated terminal failures lacked a structured failure message; preserve diagnostic evidence and report the unresolved cause.\n");
+        }
+        let mut manifest = baseline.revision.manifest;
+        manifest.revision = next_revision;
+        manifest.lifecycle = RevisionLifecycle::Published;
+        manifest.instructions_digest = format!("{:x}", Sha256::digest(instructions.as_bytes()));
+        let stored = self
+            .definition_registry
+            .agents()
+            .store_revision(manifest, &instructions)
+            .map_err(DefinitionRegistryError::Agent)?;
+        let evidence_refs = failures
+            .iter()
+            .rev()
+            .take(10)
+            .map(|evaluation| evaluation.evaluation_id.clone())
+            .collect::<Vec<_>>();
+        let candidate_seed = format!(
+            "{}:{}:{}:{}",
+            definition_id.as_str(),
+            trigger.definition_revision,
+            next_revision,
+            trigger.environment_fingerprint
+        );
+        let candidate_id = format!(
+            "auto-agent-{}",
+            format!("{:x}", Sha256::digest(candidate_seed.as_bytes()))
+                .chars()
+                .take(20)
+                .collect::<String>()
+        );
+        self.register_evolution_candidate(crate::EvolutionCandidateIntent {
+            candidate_id,
+            subject: crate::EvolutionCandidateSubject::AgentDefinition {
+                revision_ref: stored.revision.revision_ref,
+            },
+            baseline_revision: trigger.definition_revision,
+            source_evidence_refs: evidence_refs,
+            canary_policy: crate::CanaryRolloutPolicy::default(),
+        })
+        .map(Some)
     }
 
     /// Recompute all active Canary observations from the canonical terminal
@@ -3170,6 +3315,7 @@ mod tests {
                 harness_contract::execution_graph::ExecutionNodeResult {
                     status: harness_contract::execution_graph::ExecutionNodeStatus::Completed,
                     result_ref: Some(format!("service-result:{}", ticket.node_id)),
+                    summary: Some("service backend completed".to_string()),
                     evidence_refs: Vec::new(),
                     failure: None,
                     usage: Default::default(),
@@ -3332,6 +3478,132 @@ mod tests {
             .agent_runtime()
             .catalog()
             .get(definition_id.as_str())
+            .is_none());
+    }
+
+    #[test]
+    fn repeated_agent_failures_generate_one_governed_candidate_without_self_promotion() {
+        let temp = tempfile::tempdir().expect("temporary root");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let services = RuntimeServices::builder(temp.path().join("home"), &workspace)
+            .build()
+            .expect("runtime services");
+        let definition_id = AgentDefinitionId::new(DefinitionScope::Workspace, "cowd/learner")
+            .expect("definition id");
+        let instructions = "# Learner\n\nSolve the task and preserve evidence.\n";
+        services
+            .definition_registry()
+            .agents()
+            .store_revision(
+                AgentDefinitionManifest {
+                    api_version: "cowd.agent/v1".to_string(),
+                    definition_id: definition_id.clone(),
+                    revision: 1,
+                    name: "Learner".to_string(),
+                    description: "Learns from attributable failures".to_string(),
+                    lifecycle: RevisionLifecycle::Published,
+                    executor: AgentExecutorPolicy::CowdNative,
+                    model_policy: AgentModelPolicy {
+                        profile: "coding".to_string(),
+                        allowed_models: vec!["test-model".to_string()],
+                        fallback_allowed: true,
+                    },
+                    cognitive_policy: AgentCognitivePolicy {
+                        context_profile: "sub_agent".to_string(),
+                        read_scopes: vec![CognitiveReadScope::Session],
+                        write_mode: CognitiveWriteMode::CandidateOnly,
+                        team_working_state_visible: true,
+                    },
+                    capability_contract: AgentCapabilityContract {
+                        capability_ceiling: vec![AgentCapability::Read],
+                        skill_refs: Vec::new(),
+                        approval_required_for: Vec::new(),
+                    },
+                    output_contract: AgentOutputContract::reviewable(),
+                    evaluation: AgentEvaluationContract::single_release_gate(
+                        "learner",
+                        "task_success",
+                    ),
+                    instructions_digest: format!("{:x}", Sha256::digest(instructions.as_bytes())),
+                },
+                instructions,
+            )
+            .expect("baseline revision");
+
+        let evaluation = |index: u64| crate::AgentRunEvaluation {
+            evaluation_id: format!("evaluation-{index}"),
+            run_id: format!("run-{index}"),
+            agent_instance_id: format!("agent-{index}"),
+            definition_id: definition_id.as_str().to_string(),
+            definition_revision: 1,
+            binding_digest: "binding-digest".to_string(),
+            release_assignment_id: None,
+            release_generation: None,
+            release_channel: Some(ReleaseChannel::Stable),
+            task_id: format!("coding-task-{index}"),
+            task_domain: "coding".to_string(),
+            complexity: "medium".to_string(),
+            role_slot_id: "worker".to_string(),
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            granted_capabilities: vec!["read".to_string()],
+            allowed_tools: Vec::new(),
+            allowed_skills: Vec::new(),
+            memory_reality_fingerprint: "memory-fingerprint".to_string(),
+            team_id: None,
+            environment_fingerprint: "environment-fingerprint".to_string(),
+            terminal_status: AgentTerminalStatus::Failed,
+            acceptance: vec!["task_success".to_string()],
+            outcome: String::new(),
+            failure: Some("repeated evidence validation failure".to_string()),
+            input_tokens: 10,
+            output_tokens: 2,
+            tool_calls: 1,
+            evidence_refs: vec![format!("evidence-{index}")],
+            created_at_ms: index,
+        };
+        for index in 1..=3 {
+            let evaluation = evaluation(index);
+            services
+                .event_store
+                .append(RuntimeEventInput {
+                    stream_id: format!("agent-evaluation:run-{index}"),
+                    scope: RuntimeEventScope::Evolution,
+                    kind: "agent.run_evaluated".to_string(),
+                    status: Some("failed".to_string()),
+                    actor: Some("test".to_string()),
+                    refs: Vec::new(),
+                    payload: serde_json::json!({"evaluation": evaluation}),
+                })
+                .expect("evaluation event");
+        }
+        let trigger = evaluation(3);
+        let candidate = services
+            .consider_agent_evolution(&trigger)
+            .expect("planner")
+            .expect("candidate");
+        assert_eq!(
+            candidate.lifecycle,
+            crate::EvolutionCandidateLifecycle::Draft
+        );
+        let crate::EvolutionCandidateSubject::AgentDefinition { revision_ref } = candidate.subject
+        else {
+            panic!("expected Agent Definition candidate");
+        };
+        assert_eq!(revision_ref.revision, 2);
+        let revision = services
+            .definition_registry()
+            .agents()
+            .read_revision(&revision_ref)
+            .expect("candidate revision");
+        assert!(revision
+            .agent_markdown
+            .contains("repeated evidence validation failure"));
+        assert!(services.evolution_release_reviews().unwrap().is_empty());
+        assert!(services
+            .consider_agent_evolution(&trigger)
+            .expect("idempotent planner")
             .is_none());
     }
 

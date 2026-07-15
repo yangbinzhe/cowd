@@ -80,6 +80,8 @@ mod suggestions;
 mod surface_host;
 #[path = "kernel/task_kernel.rs"]
 mod task_kernel;
+#[path = "session/unified_manager.rs"]
+mod unified_session_manager;
 
 pub use boundary_policy::{GatewayBoundaryPolicy, GatewayResponsibility};
 

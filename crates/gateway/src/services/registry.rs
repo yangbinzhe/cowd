@@ -20,6 +20,10 @@ impl GatewayServices {
         approval_gate: Arc<SmartApprovalGate>,
         approval_repository: FileApprovalRepository,
     ) -> Self {
+        let resource_lifecycle =
+            Arc::new(runtime::session_lifecycle::SessionLifecycleManager::new(
+                runtime::session_lifecycle::SessionLifecycleConfig::default(),
+            ));
         Self::new_with_config_home(
             runtime,
             task_kernel,
@@ -27,6 +31,7 @@ impl GatewayServices {
             memory_manager,
             approval_gate,
             approval_repository,
+            resource_lifecycle,
             ::runtime::cowd_dirs::config_home_dir(),
         )
     }
@@ -38,6 +43,35 @@ impl GatewayServices {
         memory_manager: Option<Arc<GatewayMemoryManager>>,
         approval_gate: Arc<SmartApprovalGate>,
         approval_repository: FileApprovalRepository,
+        resource_lifecycle: Arc<runtime::session_lifecycle::SessionLifecycleManager>,
+        config_home: impl AsRef<std::path::Path>,
+    ) -> Self {
+        let session_manager = Arc::new(crate::unified_session_manager::UnifiedSessionManager::new(
+            Arc::clone(&runtime),
+            resource_lifecycle,
+            100,
+        ));
+        Self::new_with_session_manager(
+            runtime,
+            task_kernel,
+            surface_host,
+            memory_manager,
+            approval_gate,
+            approval_repository,
+            session_manager,
+            config_home,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_session_manager(
+        runtime: Arc<RuntimeService>,
+        task_kernel: Arc<TaskKernel>,
+        surface_host: Arc<crate::surface_host::SurfaceHost>,
+        memory_manager: Option<Arc<GatewayMemoryManager>>,
+        approval_gate: Arc<SmartApprovalGate>,
+        approval_repository: FileApprovalRepository,
+        session_manager: Arc<crate::unified_session_manager::UnifiedSessionManager>,
         config_home: impl AsRef<std::path::Path>,
     ) -> Self {
         let command_host_runtime = Arc::clone(&runtime);
@@ -48,6 +82,7 @@ impl GatewayServices {
         let task = TaskService::with_kernel_and_runtime(task_kernel, Arc::clone(&runtime_services));
         Self {
             runtime: Some(runtime),
+            session_manager: Some(session_manager),
             runtime_events,
             surface: SurfaceService::with_host(surface_host),
             slash: SlashController::new(Some(command_host_runtime), task.clone()),
@@ -78,6 +113,7 @@ impl GatewayServices {
         let task = TaskService::new();
         Self {
             runtime: None,
+            session_manager: None,
             runtime_events: RuntimeEventService::from_runtime_services(baseline_runtime.as_ref()),
             surface: SurfaceService::new(),
             slash: SlashController::new(None, task.clone()),

@@ -82,7 +82,7 @@ pub fn execute_bash_in_workspace(
             interrupted: false,
             is_image: None,
             background_task_id: Some(child.id().to_string()),
-            backgrounded_by_user: Some(false),
+            backgrounded_by_user: Some(true),
             assistant_auto_backgrounded: Some(false),
             dangerously_disable_sandbox: input.dangerously_disable_sandbox,
             return_code_interpretation: None,
@@ -127,6 +127,7 @@ fn execute_bash_sync(
 ) -> io::Result<BashCommandOutput> {
     let mut command = prepare_command(&input.command, &workspace_root, &cwd, false)?;
     let output = if let Some(timeout_ms) = input.timeout {
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = command.spawn()?;
         let started = std::time::Instant::now();
         loop {

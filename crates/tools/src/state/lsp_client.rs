@@ -3,10 +3,12 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Command, Stdio};
+use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use sandbox_launcher::{shell_command, SandboxLaunchSpec};
 use serde::{Deserialize, Serialize};
 
 /// Supported LSP actions.
@@ -433,8 +435,24 @@ fn call_lsp_stdio_inner(
     character: Option<u32>,
     query: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let mut child = Command::new(&command[0])
-        .args(&command[1..])
+    let workspace = server
+        .root_path
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or(std::env::current_dir().map_err(|error| error.to_string())?)
+        .canonicalize()
+        .map_err(|error| format!("resolve LSP workspace failed: {error}"))?;
+    let invocation = std::iter::once(command[0].as_str())
+        .chain(command[1..].iter().map(String::as_str))
+        .map(shell_quote)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut spec = SandboxLaunchSpec::workspace(&workspace);
+    spec.working_directory = Some(workspace);
+    let prepared = shell_command(&format!("exec {invocation}"), &spec)
+        .map_err(|error| format!("prepare hardened LSP sandbox failed: {error}"))?;
+    let mut child = prepared
+        .into_command()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -481,6 +499,10 @@ fn call_lsp_stdio_inner(
             .map(|value| value.to_string())
             .unwrap_or_else(|| "none".to_string())
     ))
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn initialize_request(id: u64, server: &LspServerState) -> serde_json::Value {
@@ -936,11 +958,13 @@ mod tests {
                 }
             }]
         }));
-        let script_path = std::env::temp_dir().join(format!(
-            "cowd-fake-lsp-{}-{}.sh",
+        let workspace = std::env::temp_dir().join(format!(
+            "cowd-fake-lsp-{}-{}",
             std::process::id(),
             chrono_like_test_nonce()
         ));
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        let script_path = workspace.join("fake-lsp.sh");
         std::fs::write(
             &script_path,
             format!(
@@ -957,7 +981,7 @@ mod tests {
         let registry = LspRegistry::new();
         registry.register_command(
             "rust",
-            None,
+            Some(workspace.to_str().unwrap()),
             vec!["textDocument/documentSymbol".into()],
             vec![script_path.to_string_lossy().to_string()],
         );
@@ -970,7 +994,7 @@ mod tests {
         assert_eq!(result["result"][0]["name"], "main");
         assert_eq!(result["evidence"]["transport"], "lsp_stdio_json_rpc");
 
-        let _ = std::fs::remove_file(script_path);
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[test]

@@ -584,6 +584,9 @@ pub mod test_support {
                 None,
                 approval_gate,
                 approval_repository,
+                Arc::new(runtime::session_lifecycle::SessionLifecycleManager::new(
+                    runtime::session_lifecycle::SessionLifecycleConfig::default(),
+                )),
                 &config_home,
             ));
             let profiles = Arc::new(ProfileManager::new_with_profiles_dir(
@@ -894,6 +897,7 @@ pub(crate) mod tests {
                 harness_contract::execution_graph::ExecutionNodeResult {
                     status: harness_contract::execution_graph::ExecutionNodeStatus::Completed,
                     result_ref: Some(format!("cross-plane-sent:{}", ticket.node_id)),
+                    summary: Some("Cross-plane fixture completed".to_string()),
                     evidence_refs: Vec::new(),
                     failure: None,
                     usage: Default::default(),
@@ -944,6 +948,7 @@ pub(crate) mod tests {
                 harness_contract::execution_graph::ExecutionNodeResult {
                     status: harness_contract::execution_graph::ExecutionNodeStatus::Completed,
                     result_ref: Some(format!("tool-result:{}", ticket.node_id)),
+                    summary: Some("Tool fixture completed".to_string()),
                     evidence_refs: Vec::new(),
                     failure: None,
                     usage: Default::default(),
@@ -1106,6 +1111,9 @@ pub(crate) mod tests {
             None,
             test_approval_gate(),
             approval_repository,
+            Arc::new(runtime::session_lifecycle::SessionLifecycleManager::new(
+                runtime::session_lifecycle::SessionLifecycleConfig::default(),
+            )),
             isolated_test_config_home(),
         ))
     }
@@ -1114,7 +1122,11 @@ pub(crate) mod tests {
         let sessions = Arc::new(ActiveSessions::new());
         let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionEventBus::new(); // returns Arc<Self>
-        let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
+        let session_store = Arc::new(
+            UnifiedSessionStore::open_in_memory().expect("test session store should open"),
+        );
+        let session_kernel =
+            test_session_kernel(sessions.clone(), Some(session_store), event_bus.clone());
         let task_kernel = test_task_kernel();
         Arc::new(AppState {
             tool_registry: tools,
@@ -7006,7 +7018,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn runtime_projection_degrades_missing_sources() {
-        let app = api_router(test_state());
+        let app = api_router(test_state_with_config(serde_json::json!({})));
         let response = app
             .oneshot(
                 Request::builder()

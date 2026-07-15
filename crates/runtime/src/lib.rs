@@ -622,10 +622,9 @@ pub use runtime_event_store::{
 #[cfg(feature = "test-fixtures")]
 pub use runtime_event_store::{RuntimeEventInput, RuntimeEventStore};
 pub use sandbox::{
-    build_linux_sandbox_command, detect_container_environment, detect_container_environment_from,
-    resolve_sandbox_status, resolve_sandbox_status_for_request, ContainerEnvironment,
-    FilesystemIsolationMode, LinuxSandboxCommand, SandboxConfig, SandboxDetectionInputs,
-    SandboxRequest, SandboxStatus,
+    detect_container_environment, detect_container_environment_from, resolve_sandbox_status,
+    resolve_sandbox_status_for_request, ContainerEnvironment, FilesystemIsolationMode,
+    SandboxConfig, SandboxDetectionInputs, SandboxRequest, SandboxStatus,
 };
 pub use security::{
     DecisionLeaseExpectation, PrincipalVerificationError, PrincipalVerifier, VerifiedDecisionLease,

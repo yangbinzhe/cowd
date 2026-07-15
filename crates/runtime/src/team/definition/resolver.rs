@@ -188,9 +188,7 @@ mod tests {
 
     fn builtin_agents() -> EligibleAgents {
         let mut agents = EligibleAgents::default();
-        agents
-            .0
-            .insert(("builtin/cowd/reviewer".to_string(), 1));
+        agents.0.insert(("builtin/cowd/reviewer".to_string(), 1));
         agents
     }
 
@@ -285,7 +283,11 @@ mod tests {
         );
         assert_eq!(
             resolver
-                .resolve(&id, RevisionSelector::LatestApprovedStable, &builtin_agents())
+                .resolve(
+                    &id,
+                    RevisionSelector::LatestApprovedStable,
+                    &builtin_agents()
+                )
                 .unwrap()
                 .revision
                 .revision_ref
@@ -293,12 +295,9 @@ mod tests {
             2,
             "direct LatestApprovedStable resolution must find the latest eligible revision"
         );
-        let resolved = resolver
-            .resolve_default(&id, &builtin_agents())
-            .unwrap();
+        let resolved = resolver.resolve_default(&id, &builtin_agents()).unwrap();
         assert_eq!(
-            resolved.revision.revision_ref.revision,
-            2,
+            resolved.revision.revision_ref.revision, 2,
             "LatestApprovedStable default pointer must resolve to the latest eligible revision"
         );
         assert_eq!(

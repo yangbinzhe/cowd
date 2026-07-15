@@ -3300,87 +3300,40 @@ fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
     if input.code.trim().is_empty() {
         return Err(String::from("code must not be empty"));
     }
-    let runtime = resolve_repl_runtime(&input.language)?;
+    let language = input.language.trim().to_ascii_lowercase();
+    if !matches!(
+        language.as_str(),
+        "python" | "py" | "javascript" | "js" | "node" | "bash" | "sh" | "shell"
+    ) {
+        return Err(format!("unsupported REPL language: {}", input.language));
+    }
     let started = Instant::now();
-    let mut process = Command::new(runtime.program);
-    process
-        .args(runtime.args)
-        .arg(&input.code)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-
-    let output = if let Some(timeout_ms) = input.timeout_ms {
-        let mut child = process.spawn().map_err(|error| error.to_string())?;
-        loop {
-            if child
-                .try_wait()
-                .map_err(|error| error.to_string())?
-                .is_some()
-            {
-                break child
-                    .wait_with_output()
-                    .map_err(|error| error.to_string())?;
-            }
-            if started.elapsed() >= Duration::from_millis(timeout_ms) {
-                child.kill().map_err(|error| error.to_string())?;
-                child
-                    .wait_with_output()
-                    .map_err(|error| error.to_string())?;
-                return Err(format!(
-                    "REPL execution exceeded timeout of {timeout_ms} ms"
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    } else {
-        process
-            .spawn()
-            .map_err(|error| error.to_string())?
-            .wait_with_output()
-            .map_err(|error| error.to_string())?
-    };
+    let output = crate::sandbox_exec::execute_code_with_timeout(
+        &input.language,
+        &input.code,
+        input.timeout_ms,
+    );
+    if output.exit_code == 124 {
+        return Err(format!(
+            "REPL execution exceeded timeout of {} ms",
+            input.timeout_ms.unwrap_or_default()
+        ));
+    }
+    if output.exit_code != 0 {
+        return Err(format!(
+            "REPL execution failed with exit code {}: {}",
+            output.exit_code,
+            output.stderr.trim()
+        ));
+    }
 
     Ok(ReplOutput {
         language: input.language,
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        exit_code: output.status.code().unwrap_or(1),
+        stdout: output.stdout,
+        stderr: output.stderr,
+        exit_code: output.exit_code,
         duration_ms: started.elapsed().as_millis(),
     })
-}
-
-struct ReplRuntime {
-    program: &'static str,
-    args: &'static [&'static str],
-}
-
-fn resolve_repl_runtime(language: &str) -> Result<ReplRuntime, String> {
-    match language.trim().to_ascii_lowercase().as_str() {
-        "python" | "py" => Ok(ReplRuntime {
-            program: detect_first_command(&["python3", "python"])
-                .ok_or_else(|| String::from("python runtime not found"))?,
-            args: &["-c"],
-        }),
-        "javascript" | "js" | "node" => Ok(ReplRuntime {
-            program: detect_first_command(&["node"])
-                .ok_or_else(|| String::from("node runtime not found"))?,
-            args: &["-e"],
-        }),
-        "sh" | "shell" | "bash" => Ok(ReplRuntime {
-            program: detect_first_command(&["bash", "sh"])
-                .ok_or_else(|| String::from("shell runtime not found"))?,
-            args: &["-lc"],
-        }),
-        other => Err(format!("unsupported REPL language: {other}")),
-    }
-}
-
-fn detect_first_command(commands: &[&'static str]) -> Option<&'static str> {
-    commands
-        .iter()
-        .copied()
-        .find(|command| command_exists(command))
 }
 
 #[derive(Clone, Copy)]
@@ -3707,24 +3660,33 @@ fn iso8601_timestamp() -> String {
 
 #[allow(clippy::needless_pass_by_value)]
 fn execute_powershell(input: PowerShellInput) -> std::io::Result<BashCommandOutput> {
-    let _ = &input.description;
     if let Some(output) = workspace_test_branch_preflight(&input.command, None) {
         return Ok(output);
     }
     let shell = detect_powershell_shell()?;
-    execute_shell_command(
-        shell,
-        &input.command,
-        input.timeout,
-        input.run_in_background,
-    )
+    crate::bash::execute_bash(BashCommandInput {
+        command: format!(
+            "exec {} -NoProfile -NonInteractive -Command {}",
+            shell_quote(&shell.display().to_string()),
+            shell_quote(&input.command)
+        ),
+        cwd: None,
+        timeout: input.timeout,
+        description: input.description,
+        run_in_background: input.run_in_background,
+        dangerously_disable_sandbox: Some(false),
+        namespace_restrictions: Some(true),
+        isolate_network: None,
+        filesystem_mode: None,
+        allowed_mounts: None,
+    })
 }
 
-fn detect_powershell_shell() -> std::io::Result<&'static str> {
-    if command_exists("pwsh") {
-        Ok("pwsh")
-    } else if command_exists("powershell") {
-        Ok("powershell")
+fn detect_powershell_shell() -> std::io::Result<PathBuf> {
+    if let Some(path) = find_command("pwsh") {
+        Ok(path)
+    } else if let Some(path) = find_command("powershell") {
+        Ok(path)
     } else {
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -3733,167 +3695,40 @@ fn detect_powershell_shell() -> std::io::Result<&'static str> {
     }
 }
 
-fn command_exists(name: &str) -> bool {
+fn find_command(name: &str) -> Option<PathBuf> {
     // Safety: validate input to prevent path traversal and injection
     if name.is_empty()
         || !name
             .chars()
             .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
     {
-        return false;
+        return None;
     }
     // Search PATH directories for the executable
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|dir| {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths).find_map(|dir| {
             let full_path = dir.join(name);
             if !full_path.is_file() {
-                return false;
+                return None;
             }
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                std::fs::metadata(&full_path)
+                return std::fs::metadata(&full_path)
                     .map(|m| m.permissions().mode() & 0o111 != 0)
                     .unwrap_or(false)
+                    .then(|| full_path.canonicalize().unwrap_or(full_path));
             }
             #[cfg(not(unix))]
             {
-                true
+                Some(full_path.canonicalize().unwrap_or(full_path))
             }
         })
     })
 }
 
-#[allow(clippy::too_many_lines)]
-fn execute_shell_command(
-    shell: &str,
-    command: &str,
-    timeout: Option<u64>,
-    run_in_background: Option<bool>,
-) -> std::io::Result<BashCommandOutput> {
-    if run_in_background.unwrap_or(false) {
-        let child = std::process::Command::new(shell)
-            .arg("-NoProfile")
-            .arg("-NonInteractive")
-            .arg("-Command")
-            .arg(command)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
-        return Ok(BashCommandOutput {
-            stdout: String::new(),
-            stderr: String::new(),
-            raw_output_path: None,
-            interrupted: false,
-            is_image: None,
-            background_task_id: Some(child.id().to_string()),
-            backgrounded_by_user: Some(true),
-            assistant_auto_backgrounded: Some(false),
-            dangerously_disable_sandbox: None,
-            return_code_interpretation: None,
-            no_output_expected: Some(true),
-            structured_content: None,
-            persisted_output_path: None,
-            persisted_output_size: None,
-            sandbox_status: None,
-        });
-    }
-
-    let mut process = std::process::Command::new(shell);
-    process
-        .arg("-NoProfile")
-        .arg("-NonInteractive")
-        .arg("-Command")
-        .arg(command);
-    process
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-
-    if let Some(timeout_ms) = timeout {
-        let mut child = process.spawn()?;
-        let started = Instant::now();
-        loop {
-            if let Some(status) = child.try_wait()? {
-                let output = child.wait_with_output()?;
-                return Ok(BashCommandOutput {
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                    raw_output_path: None,
-                    interrupted: false,
-                    is_image: None,
-                    background_task_id: None,
-                    backgrounded_by_user: None,
-                    assistant_auto_backgrounded: None,
-                    dangerously_disable_sandbox: None,
-                    return_code_interpretation: status
-                        .code()
-                        .filter(|code| *code != 0)
-                        .map(|code| format!("exit_code:{code}")),
-                    no_output_expected: Some(output.stdout.is_empty() && output.stderr.is_empty()),
-                    structured_content: None,
-                    persisted_output_path: None,
-                    persisted_output_size: None,
-                    sandbox_status: None,
-                });
-            }
-            if started.elapsed() >= Duration::from_millis(timeout_ms) {
-                let _ = child.kill();
-                let output = child.wait_with_output()?;
-                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-                let stderr = if stderr.trim().is_empty() {
-                    format!("Command exceeded timeout of {timeout_ms} ms")
-                } else {
-                    format!(
-                        "{}
-Command exceeded timeout of {timeout_ms} ms",
-                        stderr.trim_end()
-                    )
-                };
-                return Ok(BashCommandOutput {
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                    stderr,
-                    raw_output_path: None,
-                    interrupted: true,
-                    is_image: None,
-                    background_task_id: None,
-                    backgrounded_by_user: None,
-                    assistant_auto_backgrounded: None,
-                    dangerously_disable_sandbox: None,
-                    return_code_interpretation: Some(String::from("timeout")),
-                    no_output_expected: Some(false),
-                    structured_content: None,
-                    persisted_output_path: None,
-                    persisted_output_size: None,
-                    sandbox_status: None,
-                });
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    let output = process.output()?;
-    Ok(BashCommandOutput {
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        raw_output_path: None,
-        interrupted: false,
-        is_image: None,
-        background_task_id: None,
-        backgrounded_by_user: None,
-        assistant_auto_backgrounded: None,
-        dangerously_disable_sandbox: None,
-        return_code_interpretation: output
-            .status
-            .code()
-            .filter(|code| *code != 0)
-            .map(|code| format!("exit_code:{code}")),
-        no_output_expected: Some(output.stdout.is_empty() && output.stderr.is_empty()),
-        structured_content: None,
-        persisted_output_path: None,
-        persisted_output_size: None,
-        sandbox_status: None,
-    })
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn resolve_cell_index(
@@ -5928,13 +5763,16 @@ mod tests {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let dir = std::env::temp_dir().join(format!(
-            "cowd-pwsh-bin-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "cowd-pwsh-bin-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("time")
+                    .as_nanos()
+            ));
         std::fs::create_dir_all(&dir).expect("create dir");
         let script = dir.join("pwsh");
         std::fs::write(

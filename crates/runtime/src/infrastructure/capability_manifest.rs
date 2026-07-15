@@ -899,14 +899,26 @@ fn backend_capabilities(
             ]
         }),
         "orchestration_options" => {
-            let compact_templates: Vec<Value> = catalog.templates.iter().map(|t| json!({
-                "template_id": t.template_id,
-                "best_for": t.best_for,
-            })).collect();
-            let compact_protocols: Vec<Value> = catalog.protocols.iter().map(|p| json!({
-                "protocol_id": p.protocol_id,
-                "summary": p.summary,
-            })).collect();
+            let compact_templates: Vec<Value> = catalog
+                .templates
+                .iter()
+                .map(|t| {
+                    json!({
+                        "template_id": t.template_id,
+                        "best_for": t.best_for,
+                    })
+                })
+                .collect();
+            let compact_protocols: Vec<Value> = catalog
+                .protocols
+                .iter()
+                .map(|p| {
+                    json!({
+                        "protocol_id": p.protocol_id,
+                        "summary": p.summary,
+                    })
+                })
+                .collect();
             json!({
                 "decision": execution_decision,
                 "action_selection": action_selection,
@@ -916,24 +928,36 @@ fn backend_capabilities(
                 "action_contract_count": catalog.action_contracts.len(),
                 "guidance": "Use detail=team_templates or detail=runtime_action_contract for specific details",
             })
-        },
+        }
         "action_selection" => json!(action_selection),
         "capability_catalog" => json!(catalog),
         "runtime_action_contract" => {
-            let compact_contracts: Vec<Value> = catalog.action_contracts.iter().map(|c| json!({
-                "runtime_action": c.runtime_action,
-                "tool_action": c.tool_action,
-                "when_to_use": c.when_to_use,
-            })).collect();
-            let compact_groups: Vec<Value> = catalog.operation_groups.iter().map(|g| json!({
-                "id": g.id,
-                "summary": g.summary,
-            })).collect();
+            let compact_contracts: Vec<Value> = catalog
+                .action_contracts
+                .iter()
+                .map(|c| {
+                    json!({
+                        "runtime_action": c.runtime_action,
+                        "tool_action": c.tool_action,
+                        "when_to_use": c.when_to_use,
+                    })
+                })
+                .collect();
+            let compact_groups: Vec<Value> = catalog
+                .operation_groups
+                .iter()
+                .map(|g| {
+                    json!({
+                        "id": g.id,
+                        "summary": g.summary,
+                    })
+                })
+                .collect();
             json!({
                 "contracts": compact_contracts,
                 "operation_groups": compact_groups,
             })
-        },
+        }
         "model_router" => runtime_model_router_capability(),
         "budget_controls" => runtime_budget_controls(None),
         "policy_gates" => json!({

@@ -8360,7 +8360,9 @@ mod tests {
         assert_eq!(projections[0].catalog_revision, 0);
         assert_eq!(projections[0].active_ids, vec!["ToolSearch"]);
         assert_eq!(projections[0].deferred_ids, vec!["custom_reader"]);
-        assert!(projections[1].active_ids.contains(&"custom_reader".to_string()));
+        assert!(projections[1]
+            .active_ids
+            .contains(&"custom_reader".to_string()));
         assert!(projections[1].exposure_revision > projections[0].exposure_revision);
     }
 

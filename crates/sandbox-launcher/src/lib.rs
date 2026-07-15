@@ -6,11 +6,8 @@
 //! inherited descriptors before `bwrap` executes, and performs a real Linux
 //! deny probe before every launch.
 //!
-//! `bwrap` provides the namespace and mount boundary.  Landlock and a custom
-//! seccomp BPF profile are *not* installed by this implementation: doing so
-//! safely would require passing verified kernel policy FDs through the bwrap
-//! bootstrap.  The returned [`SandboxPreflight`] therefore reports a
-//! restricted posture instead of claiming the V0 kernel-hardening target.
+//! `bwrap` provides the namespace and mount boundary. The trusted inner
+//! launcher then installs Landlock and seccomp before executing untrusted code.
 
 use std::{
     collections::{BTreeSet, HashSet},
@@ -25,6 +22,9 @@ use thiserror::Error;
 const SYSTEM_READ_ONLY_ROOTS: &[&str] = &["/usr", "/bin", "/lib", "/lib64", "/etc"];
 const SANDBOX_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const BOOTSTRAP_SHELL: &str = "/bin/bash";
+const INNER_LAUNCHER_PATH: &str = "/run/cowd-sandbox-inner";
+const LAUNCHER_PROTOCOL: &str =
+    concat!("sandbox-launcher/", env!("CARGO_PKG_VERSION"), "/kernel-v1");
 
 /// The hardening features which have actually been installed in a child.
 ///
@@ -109,9 +109,8 @@ pub struct SandboxLaunchSpec {
     /// config paths, dynamic-loader values, and `COWD_*` control variables are
     /// rejected.
     pub environment: Vec<(String, String)>,
-    /// Opt-in gate for a future Landlock+seccomp backend. It deliberately
-    /// fails closed today instead of representing the current bwrap-only
-    /// posture as a terminal V0 sandbox.
+    /// Require the verified Landlock+seccomp inner launcher. Untrusted callers
+    /// use this terminal posture and fail closed when it cannot be established.
     pub require_kernel_hardening: bool,
 }
 
@@ -126,7 +125,7 @@ impl SandboxLaunchSpec {
             protected_roots: default_protected_roots(),
             network_enabled: true,
             environment: Vec::new(),
-            require_kernel_hardening: false,
+            require_kernel_hardening: true,
         }
     }
 
@@ -238,6 +237,7 @@ pub fn preflight(spec: &SandboxLaunchSpec) -> Result<SandboxPreflight, SandboxEr
     spec.validate()?;
     let bwrap_path = bwrap_path().ok_or(SandboxError::LauncherUnavailable)?;
     ensure_bootstrap_shell()?;
+    ensure_launcher_protocol(&launcher_binary_path()?)?;
     let fixture = ProbeFixture::new()?;
     let mut probe_spec = SandboxLaunchSpec::workspace(&spec.workspace_root);
     probe_spec.working_directory = spec.working_directory.clone();
@@ -247,7 +247,7 @@ pub fn preflight(spec: &SandboxLaunchSpec) -> Result<SandboxPreflight, SandboxEr
     probe_spec.protect_root(&fixture.control);
     probe_spec.network_enabled = spec.network_enabled;
     probe_spec.environment = spec.environment.clone();
-    probe_spec.require_kernel_hardening = false;
+    probe_spec.require_kernel_hardening = spec.require_kernel_hardening;
     probe_spec.validate()?;
 
     let args = bwrap_args(
@@ -267,11 +267,8 @@ pub fn preflight(spec: &SandboxLaunchSpec) -> Result<SandboxPreflight, SandboxEr
         inherited_fds_closed: true,
         environment_allowlist_enforced: true,
         protected_roots_denied: true,
-        posture: SandboxSecurityPosture::Restricted,
-        unavailable_hardening: vec![
-            "Landlock rules are not installed by the bwrap launcher".to_string(),
-            "custom seccomp BPF is not installed by the bwrap launcher".to_string(),
-        ],
+        posture: SandboxSecurityPosture::KernelHardened,
+        unavailable_hardening: Vec::new(),
     };
     if spec.require_kernel_hardening {
         preflight.require_kernel_hardening()?;
@@ -328,6 +325,7 @@ fn bwrap_args(
         .map(canonical)
         .transpose()?
         .unwrap_or_else(|| workspace.clone());
+    let inner_launcher = launcher_binary_path()?;
 
     let mut args = vec![
         "--die-with-parent".to_string(),
@@ -368,6 +366,11 @@ fn bwrap_args(
         "/tmp".to_string(),
         "--dir".to_string(),
         "/home".to_string(),
+        "--dir".to_string(),
+        "/run".to_string(),
+        "--ro-bind".to_string(),
+        inner_launcher.display().to_string(),
+        INNER_LAUNCHER_PATH.to_string(),
     ]);
 
     let writable = spec
@@ -396,11 +399,62 @@ fn bwrap_args(
         "--chdir".to_string(),
         working_directory.display().to_string(),
         "--".to_string(),
-        "/bin/sh".to_string(),
-        "-c".to_string(),
-        command,
+        INNER_LAUNCHER_PATH.to_string(),
+        "--inner".to_string(),
+        "--workspace".to_string(),
+        workspace.display().to_string(),
     ]);
+    for root in &spec.writable_roots {
+        args.push("--writable".to_string());
+        args.push(canonical(root)?.display().to_string());
+    }
+    args.extend(["--".to_string(), command]);
     Ok(args)
+}
+
+fn launcher_binary_path() -> Result<PathBuf, SandboxError> {
+    if let Some(path) = env::var_os("COWD_SANDBOX_LAUNCHER").map(PathBuf::from) {
+        if path.is_file() {
+            return canonical(&path);
+        }
+    }
+    let current = env::current_exe().map_err(|error| {
+        SandboxError::ProbeFailed(format!("resolve current executable: {error}"))
+    })?;
+    let parent = current.parent().ok_or_else(|| {
+        SandboxError::ProbeFailed("current executable has no parent directory".to_string())
+    })?;
+    for candidate in [
+        parent.join("cowd-sandbox-launcher"),
+        parent
+            .parent()
+            .unwrap_or(parent)
+            .join("cowd-sandbox-launcher"),
+    ] {
+        if candidate.is_file() {
+            return canonical(&candidate);
+        }
+    }
+    Err(SandboxError::KernelHardeningUnavailable(
+        "cowd-sandbox-launcher inner hardener is not installed beside the host binary".to_string(),
+    ))
+}
+
+fn ensure_launcher_protocol(path: &Path) -> Result<(), SandboxError> {
+    let output = Command::new(path)
+        .arg("--protocol-version")
+        .env_clear()
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| SandboxError::ProbeFailed(error.to_string()))?;
+    let actual = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if output.status.success() && actual == LAUNCHER_PROTOCOL {
+        Ok(())
+    } else {
+        Err(SandboxError::KernelHardeningUnavailable(format!(
+            "sandbox helper protocol mismatch: expected `{LAUNCHER_PROTOCOL}`, got `{actual}`"
+        )))
+    }
 }
 
 fn append_environment(
@@ -412,7 +466,7 @@ fn append_environment(
         ("HOME", "/home/cowd"),
         ("TMPDIR", "/tmp"),
         ("PATH", SANDBOX_PATH),
-        ("COWD_SANDBOX", "rootless-bwrap-restricted"),
+        ("COWD_SANDBOX", "rootless-kernel-hardened"),
     ] {
         args.extend(["--setenv".to_string(), key.to_string(), value.to_string()]);
     }
@@ -458,7 +512,7 @@ fn probe_command(control_path: &Path, environment: &[(String, String)]) -> Strin
         .collect::<Vec<_>>()
         .join(" ");
     format!(
-        "set -eu; test ! -e {control}; test ! -r {control}; test \"${{HOME}}\" = /home/cowd; test \"${{COWD_SANDBOX}}\" = rootless-bwrap-restricted; test -z \"${{COWD_CONFIG_HOME+x}}\"; allowed=' HOME TMPDIR PATH COWD_SANDBOX PWD {custom_keys} '; /usr/bin/env | while IFS= read -r entry; do key=${{entry%%=*}}; case \"$allowed\" in *\" $key \"*) ;; *) exit 126 ;; esac; done; found=0; while IFS=: read -r key value; do if [ \"$key\" = NoNewPrivs ]; then test \"$value\" -eq 1; found=1; fi; done < /proc/self/status; test \"$found\" -eq 1"
+        "set -eu; test ! -e {control}; test ! -r {control}; test \"${{HOME}}\" = /home/cowd; test \"${{COWD_SANDBOX}}\" = rootless-kernel-hardened; test -z \"${{COWD_CONFIG_HOME+x}}\"; allowed=' HOME TMPDIR PATH COWD_SANDBOX PWD {custom_keys} '; /usr/bin/env | while IFS= read -r entry; do key=${{entry%%=*}}; case \"$allowed\" in *\" $key \"*) ;; *) exit 126 ;; esac; done; found=0; while IFS=: read -r key value; do if [ \"$key\" = NoNewPrivs ]; then test \"$value\" -eq 1; found=1; fi; done < /proc/self/status; test \"$found\" -eq 1"
     )
 }
 
@@ -754,12 +808,9 @@ mod tests {
         assert!(report.deny_probe_passed);
         assert!(report.no_new_privs_verified);
         assert!(report.protected_roots_denied);
-        assert_eq!(report.posture, SandboxSecurityPosture::Restricted);
-        assert!(!report.is_kernel_hardened());
-        assert!(matches!(
-            report.require_kernel_hardening(),
-            Err(SandboxError::KernelHardeningUnavailable(_))
-        ));
+        assert_eq!(report.posture, SandboxSecurityPosture::KernelHardened);
+        assert!(report.is_kernel_hardened());
+        report.require_kernel_hardening().unwrap();
     }
 
     #[test]
@@ -813,16 +864,32 @@ mod tests {
     }
 
     #[test]
-    fn strict_kernel_mode_fails_closed_until_real_backend_exists() {
+    fn strict_kernel_mode_executes_only_with_verified_backend() {
         if !bwrap_available() {
             return;
         }
         let root = ProbeFixture::new().expect("fixture");
         let mut spec = SandboxLaunchSpec::workspace(root.workspace.clone());
         spec.require_kernel_hardening = true;
-        assert!(matches!(
-            shell_command("true", &spec),
-            Err(SandboxError::KernelHardeningUnavailable(_))
-        ));
+        let prepared = shell_command("true", &spec).expect("kernel hardened command");
+        assert_eq!(
+            prepared.security_posture(),
+            SandboxSecurityPosture::KernelHardened
+        );
+        assert!(prepared.into_command().status().unwrap().success());
+    }
+
+    #[test]
+    fn kernel_hardened_child_cannot_write_system_root_or_mount() {
+        if !bwrap_available() {
+            return;
+        }
+        let root = ProbeFixture::new().expect("fixture");
+        let prepared = shell_command(
+            "test ! -w /etc && ! mount -t tmpfs tmpfs /tmp 2>/dev/null",
+            &SandboxLaunchSpec::workspace(&root.workspace),
+        )
+        .expect("prepare hardened sandbox");
+        assert!(prepared.into_command().status().unwrap().success());
     }
 }

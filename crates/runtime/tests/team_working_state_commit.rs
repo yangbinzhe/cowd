@@ -130,6 +130,7 @@ async fn terminal_graph_transition_commits_exactly_one_replayable_team_working_s
         .expect("working state");
     assert_eq!(state.graph_id, projection.graph_id);
     assert_eq!(state.entries.len(), 1);
+    assert_eq!(state.entries[0].summary, "completed with evidence");
     assert!(!state.entries[0].producer_instance_id.is_empty());
     assert!(state.entries[0]
         .boundary

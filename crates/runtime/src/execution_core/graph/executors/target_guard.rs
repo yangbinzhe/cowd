@@ -52,6 +52,7 @@ impl NodeExecutor for CompileTargetGuardExecutor {
         Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
             status: ExecutionNodeStatus::Completed,
             result_ref: Some(format!("compile-target-guard:{}", ticket.node_id)),
+            summary: Some("Target guard accepted the execution target".to_string()),
             evidence_refs: Vec::new(),
             failure: None,
             usage: ExecutionUsage::default(),

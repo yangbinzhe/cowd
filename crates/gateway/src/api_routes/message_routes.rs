@@ -250,8 +250,23 @@ async fn send_message(
         )
     })?;
     if !runtime_service.has_active_session(&id) {
-        runtime_service
-            .ensure_runtime_session(&id, None)
+        state
+            .services
+            .session_manager
+            .as_ref()
+            .ok_or_else(|| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorResponse {
+                        error: "unified session manager unavailable".to_string(),
+                    }),
+                )
+            })?
+            .ensure_session(crate::unified_session_manager::EnsureSessionRequest::new(
+                &id,
+                None,
+                crate::unified_session_manager::SessionSource::WebUi,
+            ))
             .await
             .map_err(|error| {
                 (

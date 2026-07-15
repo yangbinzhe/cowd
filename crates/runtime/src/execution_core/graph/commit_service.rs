@@ -571,6 +571,7 @@ impl ExecutionCommitService {
                     ExecutionNodeResult {
                         status: ExecutionNodeStatus::Completed,
                         result_ref: Some(result_ref.clone()),
+                        summary: None,
                         evidence_refs: Vec::new(),
                         failure: None,
                         usage: Default::default(),

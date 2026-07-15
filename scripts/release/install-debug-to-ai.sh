@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT/target}"
 BIN="${COWD_BIN:-$TARGET_ROOT/debug/cowd}"
+SANDBOX_BIN="${COWD_SANDBOX_BIN:-$TARGET_ROOT/debug/cowd-sandbox-launcher}"
 AI_ROOT="${COWD_AI_ROOT:-$HOME/AI}"
 VERSION="$(awk -F '"' '/^version = / {print $2; exit}' "$ROOT/Cargo.toml")"
 STAMP="${COWD_INSTALL_STAMP:-$(date +%Y%m%d-%H%M%S)}"
@@ -46,17 +47,24 @@ if [[ ! -x "$BIN" ]]; then
   echo "missing executable cowd binary at $BIN" >&2
   exit 1
 fi
+if [[ ! -x "$SANDBOX_BIN" ]]; then
+  echo "missing sandbox helper at $SANDBOX_BIN; build package sandbox-launcher first" >&2
+  exit 1
+fi
 
 mkdir -p "$INSTALL_DIR" "$INSTALL_DIR/docs" "$AI_ROOT"
 cp "$BIN" "$INSTALL_DIR/cowd"
 chmod +x "$INSTALL_DIR/cowd"
+cp "$SANDBOX_BIN" "$INSTALL_DIR/cowd-sandbox-launcher"
+chmod +x "$INSTALL_DIR/cowd-sandbox-launcher"
 
 cat >"$INSTALL_DIR/install.json" <<EOF
 {
   "version": "$VERSION",
   "installed_at": "$(date -Iseconds)",
   "source_root": "$ROOT",
-  "binary": "$INSTALL_DIR/cowd"
+  "binary": "$INSTALL_DIR/cowd",
+  "sandbox_helper": "$INSTALL_DIR/cowd-sandbox-launcher"
 }
 EOF
 

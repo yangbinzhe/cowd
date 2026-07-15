@@ -392,6 +392,7 @@ impl ExecutionGraphRunner {
                         // caller discards this result because the node is no longer running.
                         status: ExecutionNodeStatus::Cancelled,
                         result_ref: None,
+                        summary: None,
                         evidence_refs: Vec::new(),
                         failure: None,
                         usage: Default::default(),
@@ -560,6 +561,7 @@ impl ExecutionGraphRunner {
                 Some(ExecutionNodeResult {
                     status: ExecutionNodeStatus::Blocked,
                     result_ref: None,
+                    summary: None,
                     evidence_refs: Vec::new(),
                     failure: Some(harness_contract::execution_graph::ExecutionFailure {
                         kind: "resource_acquisition_failed".to_string(),
@@ -768,6 +770,7 @@ fn failed_result(error: &NodeExecutorError) -> ExecutionNodeResult {
             ExecutionNodeStatus::Failed
         },
         result_ref: None,
+        summary: None,
         evidence_refs: Vec::new(),
         failure: Some(harness_contract::execution_graph::ExecutionFailure {
             kind: if matches!(error, NodeExecutorError::Uncertain { .. }) {

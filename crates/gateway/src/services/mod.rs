@@ -544,6 +544,7 @@ impl AgentService {
 #[derive(Clone)]
 pub(crate) struct GatewayServices {
     pub(crate) runtime: Option<Arc<RuntimeService>>,
+    pub(crate) session_manager: Option<Arc<crate::unified_session_manager::UnifiedSessionManager>>,
     pub(crate) runtime_events: RuntimeEventService,
     pub(crate) surface: SurfaceService,
     pub(crate) slash: SlashController,

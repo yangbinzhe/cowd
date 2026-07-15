@@ -463,7 +463,7 @@ mod tests {
     use super::{
         anthropic_missing_credentials, anthropic_missing_credentials_hint, detect_provider_kind,
         load_dotenv_file, max_tokens_for_model, max_tokens_for_model_with_override,
-        model_context_window, model_context_window_resolution, model_token_limit, parse_dotenv,
+        model_context_window, model_context_window_resolution, parse_dotenv,
         preflight_message_request, ModelContextWindowSource, ProviderKind,
     };
 
