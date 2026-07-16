@@ -4,12 +4,25 @@ use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 use fact_kernel::FactExtractionTokenUsage;
 use tokio::sync::{RwLock, Semaphore};
+
+/// Process-wide admission budget. Per-turn/category semaphores protect one
+/// conversation; this guard prevents many sessions from multiplying a 16-way
+/// read batch into unbounded process load.
+const PROCESS_TOOL_CONCURRENCY_LIMIT: usize = 32;
+static PROCESS_TOOL_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn process_tool_semaphore() -> Arc<Semaphore> {
+    Arc::clone(
+        PROCESS_TOOL_SEMAPHORE
+            .get_or_init(|| Arc::new(Semaphore::new(PROCESS_TOOL_CONCURRENCY_LIMIT))),
+    )
+}
 
 /// T35: Lightweight cancellation token (tokio-util not available in dep tree).
 #[derive(Clone, Default, Debug)]
@@ -1135,7 +1148,8 @@ pub struct ConversationRuntime<C, T> {
     network_semaphore: Arc<Semaphore>,
     /// T4: Semaphore for Destructive tool concurrency (permits: 1).
     destructive_semaphore: Arc<Semaphore>,
-    /// T4: Semaphore for default/ReadOnly tool concurrency (permits: 8).
+    /// Per-turn ReadOnly admission. The process-wide permit is acquired in
+    /// addition to this one for every category.
     default_semaphore: Arc<Semaphore>,
     /// Maximum duration for a single tool execution. `None` means no timeout.
     tool_timeout: Option<Duration>,
@@ -1373,7 +1387,9 @@ where
             destructive_semaphore: Arc::new(Semaphore::new(
                 crate::tool_orchestrator::ToolSafetyCategory::Destructive.max_concurrency(),
             )),
-            default_semaphore: Arc::new(Semaphore::new(8)),
+            default_semaphore: Arc::new(Semaphore::new(
+                crate::execution_scheduler::DEFAULT_PARALLEL_READ_CONCURRENCY,
+            )),
             tool_timeout: Some(Duration::from_secs(120)),
             explicit_team_escalation: true,
         }
@@ -4260,7 +4276,7 @@ where
                     prompter,
                     iterations,
                     batch.max_concurrency,
-                    false,
+                    true,
                     strategy_approval_satisfied,
                     result_map,
                 )
@@ -4454,6 +4470,10 @@ where
             )));
         };
 
+        let process_semaphore = process_tool_semaphore();
+        let _process_permit = process_semaphore.acquire_owned().await.map_err(|error| {
+            RuntimeError::new(format!("process tool semaphore closed: {error}"))
+        })?;
         let result_msg = if acquire_category_permit {
             let sem = self.tool_category_semaphore(tool_name, input);
             let _permit = sem.acquire().await.map_err(|error| {

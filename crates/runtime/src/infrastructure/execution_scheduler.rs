@@ -310,6 +310,10 @@ fn request_scope(request: &ToolRequest) -> String {
 mod tests {
     use super::*;
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use harness_contract::core::ExecutionModifier;
 
     use crate::execution_core::build_runtime_execution_decision;
@@ -536,5 +540,46 @@ mod tests {
         );
         assert_eq!(schedule.batches[1].indices, vec![2]);
         assert_eq!(schedule.batches[2].indices, vec![0]);
+    }
+
+    #[tokio::test]
+    async fn thirty_two_ordinary_reads_run_in_two_bounded_waves_and_keep_model_order() {
+        let requests = (0..32)
+            .map(|index| request(&format!("read-{index}"), "read_file", "{}"))
+            .collect::<Vec<_>>();
+        let decision = decision_with_modifiers(&[]);
+        let schedule = schedule_tool_requests_for_decision(&requests, &decision);
+        let batch = schedule.batches.first().expect("parallel read batch");
+        assert_eq!(batch.mode, ExecutionBatchMode::ParallelRead);
+        assert_eq!(batch.max_concurrency, DEFAULT_PARALLEL_READ_CONCURRENCY);
+
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(batch.max_concurrency));
+        let running = Arc::new(AtomicUsize::new(0));
+        let max_running = Arc::new(AtomicUsize::new(0));
+        let started = std::time::Instant::now();
+        let mut tasks = futures::stream::FuturesUnordered::new();
+        for index in &batch.indices {
+            let semaphore = Arc::clone(&semaphore);
+            let running = Arc::clone(&running);
+            let max_running = Arc::clone(&max_running);
+            let index = *index;
+            tasks.push(async move {
+                let _permit = semaphore.acquire_owned().await.expect("open semaphore");
+                let current = running.fetch_add(1, Ordering::SeqCst) + 1;
+                max_running.fetch_max(current, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                running.fetch_sub(1, Ordering::SeqCst);
+                index
+            });
+        }
+        let mut completed = Vec::new();
+        use futures::StreamExt;
+        while let Some(index) = tasks.next().await {
+            completed.push(index);
+        }
+        completed.sort_unstable();
+        assert_eq!(completed, (0..32).collect::<Vec<_>>());
+        assert_eq!(max_running.load(Ordering::SeqCst), 16);
+        assert!(started.elapsed() < Duration::from_millis(80));
     }
 }

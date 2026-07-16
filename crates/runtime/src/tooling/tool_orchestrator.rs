@@ -164,7 +164,10 @@ impl ToolSafetyCategory {
     /// Maximum concurrent executions for this category.
     pub fn max_concurrency(&self) -> usize {
         match self {
-            Self::ReadOnly => usize::MAX,
+            // This profile is consumed by native calls as well as batch/many
+            // tools.  It must agree with the scheduler's normal per-turn
+            // cap; an unbounded profile here bypassed the plan budget.
+            Self::ReadOnly => crate::execution_scheduler::DEFAULT_PARALLEL_READ_CONCURRENCY,
             Self::WriteLocal => 4,
             Self::Network => 3,
             Self::Destructive => 1,
