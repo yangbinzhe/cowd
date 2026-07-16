@@ -156,6 +156,16 @@ impl TaskService {
         self.kernel()?.start_goal(objective, yolo_mode)
     }
 
+    pub(crate) fn start_goal_idempotent(
+        &self,
+        task_id: &str,
+        objective: impl Into<String>,
+        yolo_mode: bool,
+    ) -> Result<TaskRecord, String> {
+        self.kernel()?
+            .start_goal_idempotent(task_id, objective, yolo_mode)
+    }
+
     pub(crate) fn start_phase(
         &self,
         id: &str,
@@ -223,6 +233,39 @@ impl TaskService {
         task: &TaskRecord,
         kind: &'static str,
     ) -> Result<(), String> {
+        self.record_lifecycle_event_with_correlation(task, kind, None)
+            .map(|_| ())
+    }
+
+    pub(crate) fn latest_terminal_runtime_receipt(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<runtime::DurableRuntimeEvent>, String> {
+        self.runtime_services()?
+            .latest_task_terminal_receipt(task_id)
+    }
+
+    pub(crate) fn record_assignment_terminal_observation(
+        &self,
+        task_id: &str,
+        terminal_status: &str,
+        source_receipt_ref: &str,
+        correlation_id: &str,
+    ) -> Result<runtime::DurableRuntimeEvent, String> {
+        self.runtime_services()?.record_task_terminal_observation(
+            task_id,
+            terminal_status,
+            source_receipt_ref,
+            correlation_id,
+        )
+    }
+
+    fn record_lifecycle_event_with_correlation(
+        &self,
+        task: &TaskRecord,
+        kind: &'static str,
+        correlation_id: Option<&str>,
+    ) -> Result<runtime::DurableRuntimeEvent, String> {
         let kind = match kind {
             "task.started" => runtime::TaskLifecycleKind::Started,
             "task.phase.started" => runtime::TaskLifecycleKind::PhaseStarted,
@@ -243,14 +286,23 @@ impl TaskService {
             "current_phase": task.current_phase,
             "failure_count": task.failure_count,
             "latest_audit": latest_audit,
+            "correlation_id": correlation_id,
         });
-        self.runtime_services()?
-            .record_task_lifecycle(runtime::TaskLifecycleEvent {
-                task_id: task.id.clone(),
-                kind,
-                payload,
-            })
-            .map(|_| ())
-            .map_err(|error| format!("failed to append task runtime event: {error}"))
+        let event = runtime::TaskLifecycleEvent {
+            task_id: task.id.clone(),
+            kind,
+            payload,
+        };
+        let result = if kind == runtime::TaskLifecycleKind::Completed {
+            if let Some(correlation_id) = correlation_id.filter(|value| !value.trim().is_empty()) {
+                self.runtime_services()?
+                    .record_task_lifecycle_once(event, &format!("task-completed:{correlation_id}"))
+            } else {
+                self.runtime_services()?.record_task_lifecycle(event)
+            }
+        } else {
+            self.runtime_services()?.record_task_lifecycle(event)
+        };
+        result.map_err(|error| format!("failed to append task runtime event: {error}"))
     }
 }

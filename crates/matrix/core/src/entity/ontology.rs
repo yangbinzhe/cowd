@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use super::MatrixEntity;
 
@@ -112,8 +113,14 @@ pub fn match_candidate(
     if confidence < 0.5 {
         return None;
     }
+    let mut entity_ids = [left.entity_id.as_str(), right.entity_id.as_str()];
+    entity_ids.sort_unstable();
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(format!("{}:{}", entity_ids[0], entity_ids[1]).as_bytes())
+    );
     Some(MatrixEntityMatchCandidate {
-        candidate_id: format!("entity-match-{}", uuid::Uuid::new_v4()),
+        candidate_id: format!("entity-match-{}", &digest[..20]),
         left_entity_id: left.entity_id.clone(),
         right_entity_id: right.entity_id.clone(),
         match_type: "possible_duplicate".to_string(),

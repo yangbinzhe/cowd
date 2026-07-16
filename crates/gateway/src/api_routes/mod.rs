@@ -3695,6 +3695,7 @@ pub(crate) mod tests {
                     .method("POST")
                     .uri("/api/apps/mfg/cockpit/profiles/upsert")
                     .header("content-type", "application/json")
+                    .header("idempotency-key", "cockpit-contract-create")
                     .body(Body::from(
                         serde_json::json!({
                             "profile": {
@@ -3754,6 +3755,7 @@ pub(crate) mod tests {
                     .method("POST")
                     .uri("/api/apps/mfg/cockpit/profiles/upsert")
                     .header("content-type", "application/json")
+                    .header("idempotency-key", "cockpit-contract-conflict")
                     .body(Body::from(
                         serde_json::json!({
                             "profile": {
@@ -3784,6 +3786,163 @@ pub(crate) mod tests {
             .iter()
             .any(|action| action == "save_as"));
 
+        let delete_key = "webui-mfg:mfg.cockpit.profile.delete:contract-profile";
+        let deleted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/apps/mfg/cockpit/profiles/contract-profile?expected_revision=1&idempotency_key=webui-mfg%3Amfg.cockpit.profile.delete%3Acontract-profile")
+                    .header("idempotency-key", delete_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::OK);
+        let deleted: serde_json::Value =
+            serde_json::from_slice(&to_bytes(deleted.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            deleted["receipt"]["receipt_id"],
+            deleted["_mfg_receipt"]["receipt_id"]
+        );
+        assert_eq!(deleted["receipt"]["idempotency_key"], delete_key);
+        assert_eq!(deleted["receipt"]["expected_revision"], 1);
+
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[tokio::test]
+    async fn mfg_report_delivery_previews_do_not_mutate_report_or_cross_plane_ledger() {
+        let workspace = test_temp_dir("mfg-report-preview");
+        let config_home = test_temp_dir("mfg-report-preview-config");
+        let app = api_router(test_state_with_workspace(
+            workspace.clone(),
+            config_home.clone(),
+        ));
+
+        let profile = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apps/mfg/cockpit/profiles/upsert")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "report-preview-profile")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "profile": {
+                                "profile_id": "report-preview-profile",
+                                "owner_ref": "ignored-at-boundary",
+                                "display_name": "Report Preview Profile",
+                                "focus_refs": [],
+                                "focus_metric_ids": [],
+                                "thresholds": null
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(profile.status(), StatusCode::OK);
+
+        let generated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apps/mfg/cockpit/profiles/report-preview-profile/reports/generate")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "report-preview-generate")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "report": {
+                                "cadence": "daily",
+                                "delivery_ref": "channel://feishu/user/preview-target"
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(generated.status(), StatusCode::OK);
+        let generated_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(generated.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let baseline = generated_json["report"].clone();
+        let report_id = baseline["report_id"].as_str().unwrap();
+        assert_eq!(baseline["revision"], 1);
+        assert!(baseline["delivery_receipts"].as_array().unwrap().is_empty());
+
+        for uri in [
+            format!("/api/apps/mfg/cockpit/reports/{report_id}/deliver"),
+            format!("/api/apps/mfg/cockpit/reports/{report_id}/delivery/retry"),
+        ] {
+            let preview = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "mode": "dry_run",
+                                "expected_revision": 999,
+                                "target_ref": "channel://feishu/user/preview-target"
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(preview.status(), StatusCode::OK);
+            let preview_json: serde_json::Value =
+                serde_json::from_slice(&to_bytes(preview.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            let delivery = preview_json.get("delivery").unwrap_or(&preview_json);
+            assert_eq!(delivery["report"], baseline);
+            assert_eq!(delivery["idempotent_replay"], false);
+            assert!(delivery["cross_plane_execution_receipt"]["audit_record_id"].is_null());
+        }
+
+        let fetched = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/apps/mfg/cockpit/reports/{report_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fetched.status(), StatusCode::OK);
+        let fetched_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(fetched.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(fetched_json["report"], baseline);
+
+        let executions = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cross-plane/action/executions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let executions_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(executions.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(executions_json["total"], 0);
+
         let _ = std::fs::remove_dir_all(workspace);
         let _ = std::fs::remove_dir_all(config_home);
     }
@@ -3801,6 +3960,7 @@ pub(crate) mod tests {
                     .method("POST")
                     .uri("/api/apps/mfg/cockpit/profiles/upsert")
                     .header("content-type", "application/json")
+                    .header("idempotency-key", "decision-trace-profile")
                     .body(Body::from(
                         serde_json::json!({
                             "profile": {
@@ -3828,6 +3988,8 @@ pub(crate) mod tests {
             String::from_utf8_lossy(&profile_body)
         );
 
+        let report_key = "decision-trace-report";
+        let report_id = mfg_routes::stable_mfg_resource_id("cockpit-report", report_key);
         let report = app
             .clone()
             .oneshot(
@@ -3835,10 +3997,11 @@ pub(crate) mod tests {
                     .method("POST")
                     .uri("/api/apps/mfg/cockpit/profiles/trace-profile/reports/generate")
                     .header("content-type", "application/json")
+                    .header("idempotency-key", report_key)
                     .body(Body::from(
                         serde_json::json!({
                             "report": {
-                                "report_id": "trace-report",
+                                "report_id": "client-supplied-id-is-not-authoritative",
                                 "cadence": "daily",
                                 "delivery_ref": "channel://test/operator",
                                 "note": "decision trace test"
@@ -3870,12 +4033,14 @@ pub(crate) mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|report| report["report_id"] == "trace-report"));
+            .any(|report| report["report_id"] == report_id));
 
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/apps/mfg/decision-trace?report_id=trace-report")
+                    .uri(format!(
+                        "/api/apps/mfg/decision-trace?report_id={report_id}"
+                    ))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3899,10 +4064,10 @@ pub(crate) mod tests {
         );
         assert!(json["rows"].as_array().unwrap().iter().any(|row| {
             row["stage"] == "report"
-                && row["ref"] == "trace-report"
+                && row["ref"] == report_id
                 && row["endpoint"] == "/api/apps/mfg/cockpit/reports/:id/delivery-state"
         }));
-        assert_eq!(json["objects"]["report"]["report_id"], "trace-report");
+        assert_eq!(json["objects"]["report"]["report_id"], report_id);
     }
 
     #[tokio::test]
@@ -4316,7 +4481,7 @@ pub(crate) mod tests {
         assert_eq!(json["webui_tui_full_parity"], true);
         assert_eq!(json["cli_is_minimal_control"], true);
         assert_eq!(json["webui"]["role"], "enhanced_management");
-        assert_eq!(json["tui"]["role"], "console_read_only");
+        assert_eq!(json["tui"]["role"], "console_full_capability");
         assert_eq!(json["cli"]["role"], "minimal_core_control");
     }
 
@@ -5139,6 +5304,79 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn mfg_data_plane_ingest_preview_preserves_watermarks_and_session_timeline() {
+        let workspace = test_temp_dir("mfg-ingest-preview");
+        let config_home = test_temp_dir("mfg-ingest-preview-config");
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let app = api_router(test_state_with_store_and_workspace(
+            Arc::clone(&store),
+            workspace.clone(),
+            config_home.clone(),
+        ));
+        let session_id = "mfg-ingest-preview-session";
+
+        let before = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/mfg/reality/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let before_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(before.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+
+        let preview = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apps/mfg/reality/data-plane/ingest-plan")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "request_id": "mfg-ingest-preview-request",
+                            "session_id": session_id,
+                            "ingest": {
+                                "source_ref": "source-pack://preview-only",
+                                "fact_type": "manufacturing.preview_only",
+                                "partition_ref": "line:preview",
+                                "high_watermark": "2026-07-16T00:00:00Z",
+                                "estimated_rows": 8,
+                                "raw_checksum": "sha256:preview",
+                                "metric_ids": ["preview_metric"]
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preview.status(), StatusCode::OK);
+
+        let repository = matrix_repository::MatrixSqliteRepository::open(
+            config_home.join("storage").join("matrix.sqlite"),
+        )
+        .unwrap();
+        assert_eq!(
+            repository.health().unwrap().data_plane_watermark_count,
+            before_json["data_plane_watermark_count"].as_u64().unwrap()
+        );
+        let timeline = store
+            .session_domain_events_page(session_id, 0, 20)
+            .await
+            .unwrap();
+        assert_eq!(timeline.total, 0);
+        assert!(timeline.events.is_empty());
+
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[tokio::test]
     async fn matrix_metric_recompute_projects_changes_and_attention() {
         let workspace = test_temp_dir("matrix-metric");
         let config_home = test_temp_dir("matrix-metric-config");
@@ -5357,6 +5595,7 @@ pub(crate) mod tests {
                     .method("POST")
                     .uri("/api/apps/mfg/incidents")
                     .header("content-type", "application/json")
+                    .header("idempotency-key", "mfg-domain-incident")
                     .body(Body::from(
                         serde_json::json!({
                             "title": "GPU material shortage incident",
@@ -5429,6 +5668,27 @@ pub(crate) mod tests {
             .iter()
             .any(|node| node["node_id"] == skill_node_id));
         assert!(skill_plan_json.get("agent_graph").is_none());
+        let room_after_preview = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/apps/mfg/incidents/{incident_id}/room"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let room_after_preview_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(room_after_preview.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!room_after_preview_json["workflow_graph"]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["node_id"] == skill_node_id));
 
         let skill_run = app
             .clone()
@@ -5439,7 +5699,8 @@ pub(crate) mod tests {
                         "/api/apps/mfg/incidents/{incident_id}/skills/{skill_id}/run"
                     ))
                     .header("content-type", "application/json")
-                    .body(Body::from("{}"))
+                    .header("idempotency-key", "mfg-domain-skill-run")
+                    .body(Body::from(r#"{"expected_revision":1}"#))
                     .unwrap(),
             )
             .await
@@ -5454,6 +5715,49 @@ pub(crate) mod tests {
         );
         let skill_run_json: serde_json::Value = serde_json::from_slice(&skill_run_body).unwrap();
         assert_eq!(skill_run_json["skill_run"]["status"], "completed");
+        assert_eq!(
+            skill_run_json["skill_run"]["tool_results"]
+                .as_array()
+                .unwrap()
+                .len(),
+            skill_run_json["skill_run"]["tool_plan"]
+                .as_array()
+                .unwrap()
+                .len()
+        );
+        assert!(skill_run_json["skill_run"]["tool_results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|result| result["status"] == "completed"));
+        let skill_graph_id = skill_run_json["skill_run"]["runtime_execution_ref"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("runtime-execution://")
+            .unwrap();
+        let skill_graph = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/runtime/executions/{skill_graph_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(skill_graph.status(), StatusCode::OK);
+        let skill_graph_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(skill_graph.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(skill_graph_json["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| {
+                node["kind"] == "tool_batch"
+                    && node["status"] == "completed"
+                    && node["result_ref"].as_str().is_some()
+            }));
         assert!(skill_run_json["workflow_graph"]["nodes"]
             .as_array()
             .unwrap()
@@ -5467,6 +5771,7 @@ pub(crate) mod tests {
                 Request::builder()
                     .method("POST")
                     .uri(format!("/api/apps/mfg/incidents/{incident_id}/analyze"))
+                    .header("idempotency-key", "mfg-domain-analyze")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -5502,6 +5807,61 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(fetched_analysis.status(), StatusCode::OK);
 
+        let preview_execution = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/apps/mfg/analyses/{analysis_id}/actions/{action_id}/execute"
+                    ))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"mode":" PlAn ","note":"preview only"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preview_execution.status(), StatusCode::OK);
+        let preview_execution_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(preview_execution.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            preview_execution_json["execution"]["status"],
+            "dry_run_ready"
+        );
+        let preview_execution_id = preview_execution_json["execution"]["execution_id"]
+            .as_str()
+            .unwrap();
+        let preview_lookup = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/apps/mfg/executions/{preview_execution_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preview_lookup.status(), StatusCode::NOT_FOUND);
+        let invalid_mode = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/apps/mfg/analyses/{analysis_id}/actions/{action_id}/execute"
+                    ))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"mode":"unknown"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_mode.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
         let execution = app
             .clone()
             .oneshot(
@@ -5511,9 +5871,11 @@ pub(crate) mod tests {
                         "/api/apps/mfg/analyses/{analysis_id}/actions/{action_id}/execute"
                     ))
                     .header("content-type", "application/json")
+                    .header("idempotency-key", "mfg-domain-analysis-action")
                     .body(Body::from(
                         serde_json::json!({
                             "mode": "commit",
+                            "expected_revision": 1,
                             "note": "queue reviewed recovery action"
                         })
                         .to_string(),
@@ -5538,6 +5900,109 @@ pub(crate) mod tests {
             .as_str()
             .unwrap();
 
+        let bridge_preview = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/apps/mfg/executions/{execution_id}/cross-plane/execute"
+                    ))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"mode":"dry_run"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bridge_preview.status(), StatusCode::OK);
+        let bridge_preview_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(bridge_preview.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            bridge_preview_json["execution"],
+            execution_json["execution"]
+        );
+        assert!(bridge_preview_json["cross_plane_execution_receipt"]["audit_record_id"].is_null());
+        let bridge_preview_receipt = bridge_preview_json["cross_plane_execution_receipt"]["id"]
+            .as_str()
+            .unwrap();
+        let bridge_preview_lookup = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/cross-plane/action/executions/{bridge_preview_receipt}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bridge_preview_lookup.status(), StatusCode::NOT_FOUND);
+
+        let bridge_key = "mfg-domain-execution-cross-plane";
+        let bridge_commit = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/apps/mfg/executions/{execution_id}/cross-plane/execute"
+                    ))
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", bridge_key)
+                    .body(Body::from(r#"{"mode":"commit"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bridge_commit.status(), StatusCode::OK);
+        let bridge_commit_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(bridge_commit.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let bridge_receipt_id = bridge_commit_json["cross_plane_execution_receipt"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let bridge_execution_after_first = bridge_commit_json["execution"].clone();
+        let bridge_replay = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/apps/mfg/executions/{execution_id}/cross-plane/execute"
+                    ))
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", bridge_key)
+                    .body(Body::from(r#"{"mode":"commit"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bridge_replay.status(), StatusCode::OK);
+        let bridge_replay_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(bridge_replay.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            bridge_replay_json["cross_plane_execution_receipt"]["id"],
+            bridge_receipt_id
+        );
+        assert_eq!(
+            bridge_replay_json["execution"],
+            bridge_execution_after_first
+        );
+        assert_eq!(bridge_replay_json["idempotent_replay"], true);
+
         let feedback = app
             .clone()
             .oneshot(
@@ -5545,6 +6010,7 @@ pub(crate) mod tests {
                     .method("POST")
                     .uri(format!("/api/apps/mfg/executions/{execution_id}/feedback"))
                     .header("content-type", "application/json")
+                    .header("idempotency-key", "mfg-domain-feedback")
                     .body(Body::from(
                         serde_json::json!({
                             "outcome": "resolved",
@@ -9502,13 +9968,15 @@ providers:
             degrade_to: None,
         };
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let graph_key = format!("cross-plane-approval-{}", uuid::Uuid::new_v4());
         let projection = state
             .services
             .cross_plane
             .execute_commit_graph(
                 &action,
                 &decision,
-                &format!("cross-plane-approval-{}", uuid::Uuid::new_v4()),
+                &graph_key,
+                None,
                 Arc::new(CrossPlaneApprovalTestBackend {
                     calls: Arc::clone(&calls),
                 }),
@@ -9527,6 +9995,27 @@ providers:
             harness_contract::execution_graph::ExecutionNodeStatus::WaitingApproval
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let conflicting_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let conflicting_action =
+            runtime::CrossPlaneAction::new("different-operator", "service.execute");
+        let conflict = state
+            .services
+            .cross_plane
+            .execute_commit_graph(
+                &conflicting_action,
+                &decision,
+                &graph_key,
+                None,
+                Arc::new(CrossPlaneApprovalTestBackend {
+                    calls: Arc::clone(&conflicting_calls),
+                }),
+            )
+            .await;
+        assert!(conflict.is_err());
+        assert_eq!(
+            conflicting_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
 
         let approval_id = runtime::execution_core::graph::executors::graph_approval_id(
             &projection.graph_id,
@@ -9562,6 +10051,60 @@ providers:
             tool.status,
             harness_contract::execution_graph::ExecutionNodeStatus::Completed
         );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cross_plane_terminal_graph_recovers_before_owner_receipt_without_reexecution() {
+        let state = test_state();
+        let action = runtime::CrossPlaneAction::new("operator", "channel.send");
+        let decision = runtime::CrossPlanePolicyDecision {
+            decision: runtime::PolicyDecisionKind::Allow,
+            reason: "test grant".to_string(),
+            matched_grant: None,
+            required_approval: None,
+            degrade_to: None,
+        };
+        let graph_key = format!("cross-plane-terminal-window-{}", uuid::Uuid::new_v4());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first = state
+            .services
+            .cross_plane
+            .execute_commit_graph(
+                &action,
+                &decision,
+                &graph_key,
+                None,
+                Arc::new(CrossPlaneApprovalTestBackend {
+                    calls: Arc::clone(&calls),
+                }),
+            )
+            .await
+            .expect("first graph execution");
+        assert!(first.nodes.iter().all(|node| node.status.is_terminal()));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(state
+            .services
+            .cross_plane
+            .find_execution_by_idempotency_key(&graph_key)
+            .is_none());
+
+        let recovered = state
+            .services
+            .cross_plane
+            .execute_commit_graph(
+                &action,
+                &decision,
+                &graph_key,
+                None,
+                Arc::new(CrossPlaneApprovalTestBackend {
+                    calls: Arc::clone(&calls),
+                }),
+            )
+            .await
+            .expect("terminal graph recovery");
+        assert_eq!(recovered.graph_id, first.graph_id);
+        assert_eq!(recovered.commit_cursor, first.commit_cursor);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 

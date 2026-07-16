@@ -65,4 +65,12 @@ impl MfgService {
         action.identity_trust = IdentityTrust::Unknown;
         action
     }
+
+    pub(crate) fn execution_bridge_receipt_matches(
+        &self,
+        receipt: &CrossPlaneExecutionReceipt,
+        requested_action: &CrossPlaneAction,
+    ) -> bool {
+        receipt.action == *requested_action
+    }
 }

@@ -846,6 +846,11 @@ impl GatewayApiClient {
         self.get_json("/api/approval/pending").await
     }
 
+    pub async fn approval_history(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/approval/history?limit=200&offset=0")
+            .await
+    }
+
     pub async fn mission_projection(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/mission/projection").await
     }
@@ -1055,6 +1060,21 @@ impl GatewayApiClient {
 
     pub async fn cross_plane_summary(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/cross-plane/summary").await
+    }
+
+    pub async fn cross_plane_execution_receipt(
+        &self,
+        receipt_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        let path = format!(
+            "/api/cross-plane/action/executions/{}",
+            url_encode(receipt_id)
+        );
+        let response: serde_json::Value = self.get_json(&path).await?;
+        Ok(response
+            .get("execution_receipt")
+            .cloned()
+            .unwrap_or(response))
     }
 
     pub async fn connector_accounts(&self) -> Result<serde_json::Value, GatewayApiError> {
@@ -1894,7 +1914,7 @@ impl GatewayApiClient {
     pub async fn mfg_contract(
         &self,
     ) -> Result<app_mfg_contract::MfgFrontendContractV1, GatewayApiError> {
-        let path = mfg_tui_read_path(app_mfg_contract::MfgRouteId::ContractGet, &[])?;
+        let path = mfg_tui_route_path(app_mfg_contract::MfgRouteId::ContractGet, &[])?;
         self.get_typed(&path).await
     }
 
@@ -1913,7 +1933,16 @@ impl GatewayApiClient {
         replacements: &[(&str, &str)],
         query: &[(&str, String)],
     ) -> Result<app_mfg_contract::MfgReadResponseV1, GatewayApiError> {
-        let path = mfg_tui_read_path(route_id, replacements)?;
+        let contract = app_mfg_contract::mfg_route_contract(route_id).ok_or_else(|| {
+            GatewayApiError::Url(format!("{} route contract is missing", route_id.as_str()))
+        })?;
+        if contract.class != app_mfg_contract::MfgMutationClass::Read {
+            return Err(GatewayApiError::Url(format!(
+                "{} is not a read route",
+                route_id.as_str()
+            )));
+        }
+        let path = mfg_tui_route_path(route_id, replacements)?;
         let path = append_query(path, query);
         self.get_typed(&path).await
     }
@@ -1923,7 +1952,7 @@ impl GatewayApiClient {
         limit: usize,
     ) -> Result<app_mfg_contract::MfgReportDeliveryReviewCollection, GatewayApiError> {
         let path = append_query(
-            mfg_tui_read_path(app_mfg_contract::MfgRouteId::ReportReviewList, &[])?,
+            mfg_tui_route_path(app_mfg_contract::MfgRouteId::ReportReviewList, &[])?,
             &[("limit", limit.to_string())],
         );
         self.get_typed(&path).await
@@ -1933,11 +1962,53 @@ impl GatewayApiClient {
         &self,
         review_id: &str,
     ) -> Result<app_mfg_contract::MfgReportDeliveryReview, GatewayApiError> {
-        let path = mfg_tui_read_path(
+        let path = mfg_tui_route_path(
             app_mfg_contract::MfgRouteId::ReportReviewGet,
             &[("id", review_id)],
         )?;
         self.get_typed(&path).await
+    }
+
+    pub async fn mfg_action(
+        &self,
+        action_id: app_mfg_contract::MfgActionId,
+        route_id: app_mfg_contract::MfgRouteId,
+        replacements: &[(&str, &str)],
+        idempotency_key: &str,
+        correlation_id: &str,
+        body: &serde_json::Value,
+    ) -> Result<app_mfg_contract::MfgMutationResponseV1, GatewayApiError> {
+        let action = app_mfg_contract::mfg_tui_action_contracts()
+            .into_iter()
+            .find(|action| action.action_id == action_id && action.route_id == route_id)
+            .ok_or_else(|| {
+                GatewayApiError::Url(format!(
+                    "{} is not an active TUI action for {}",
+                    action_id.as_str(),
+                    route_id.as_str()
+                ))
+            })?;
+        let route = app_mfg_contract::mfg_route_contract(route_id).ok_or_else(|| {
+            GatewayApiError::Url(format!("{} route contract is missing", route_id.as_str()))
+        })?;
+        if route.method != "POST"
+            || action.availability != app_mfg_contract::MfgActionAvailability::Active
+        {
+            return Err(GatewayApiError::Url(format!(
+                "{} does not have an active POST transport",
+                action_id.as_str()
+            )));
+        }
+        let path = mfg_tui_route_path(route_id, replacements)?;
+        self.post_typed(
+            &path,
+            body,
+            &[
+                ("idempotency-key", idempotency_key),
+                ("x-cowd-correlation-id", correlation_id),
+            ],
+        )
+        .await
     }
 
     async fn get_json(&self, path: &str) -> Result<serde_json::Value, GatewayApiError> {
@@ -1947,6 +2018,27 @@ impl GatewayApiClient {
     async fn get_typed<T: DeserializeOwned>(&self, path: &str) -> Result<T, GatewayApiError> {
         let url = format!("{}{}", self.base_url, path);
         let request = self.authorize(self.client.get(url));
+        let response = request.send().await.map_err(GatewayApiError::Http)?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(gateway_status_error(status, body));
+        }
+        let bytes = response.bytes().await.map_err(GatewayApiError::Http)?;
+        decode_gateway_json(&bytes)
+    }
+
+    async fn post_typed<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+        headers: &[(&str, &str)],
+    ) -> Result<T, GatewayApiError> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut request = self.authorize(self.client.post(url).json(body));
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
         let response = request.send().await.map_err(GatewayApiError::Http)?;
         let status = response.status();
         if !status.is_success() {
@@ -2018,18 +2110,15 @@ impl GatewayApiClient {
     }
 }
 
-fn mfg_tui_read_path(
+pub(crate) fn mfg_tui_route_path(
     route_id: app_mfg_contract::MfgRouteId,
     replacements: &[(&str, &str)],
 ) -> Result<String, GatewayApiError> {
-    let contract = app_mfg_contract::mfg_tui_p0_read_route_contracts()
+    let contract = app_mfg_contract::mfg_tui_route_contracts()
         .into_iter()
         .find(|route| route.route_id == route_id)
         .ok_or_else(|| {
-            GatewayApiError::Url(format!(
-                "{} is not an active TUI P0 read route",
-                route_id.as_str()
-            ))
+            GatewayApiError::Url(format!("{} is not an active TUI route", route_id.as_str()))
         })?;
     let mut path = contract.path;
     for (name, value) in replacements {
@@ -2051,7 +2140,7 @@ fn tui_requested_capabilities() -> Vec<String> {
     .iter()
     .map(|capability| (*capability).to_string())
     .collect::<Vec<_>>();
-    for route in app_mfg_contract::mfg_tui_p0_read_route_contracts() {
+    for route in app_mfg_contract::mfg_tui_read_route_contracts() {
         match route.capability {
             app_mfg_contract::MfgCapabilityRequirement::One { capability } => {
                 capabilities.push(capability.as_str().to_string());
@@ -2065,6 +2154,9 @@ fn tui_requested_capabilities() -> Vec<String> {
             ),
             app_mfg_contract::MfgCapabilityRequirement::PerAction => {}
         }
+    }
+    for action in app_mfg_contract::mfg_tui_action_contracts() {
+        capabilities.extend(action.required_capabilities);
     }
     capabilities.sort();
     capabilities.dedup();
@@ -2475,6 +2567,51 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let count = socket.read(&mut buffer).await.expect("read request");
+            if count == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+            let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end + 4]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':')
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or_default();
+            if bytes.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+        String::from_utf8(bytes).expect("UTF-8 HTTP request")
+    }
+
+    async fn write_json_response(
+        socket: &mut tokio::net::TcpStream,
+        status: &str,
+        value: &serde_json::Value,
+    ) {
+        let body = serde_json::to_vec(value).expect("response JSON");
+        let response = format!(
+            "HTTP/1.1 {status}\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+            body.len()
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("write response headers");
+        socket.write_all(&body).await.expect("write response body");
+    }
+
     #[test]
     fn normalize_base_url_trims_trailing_slashes() {
         assert_eq!(
@@ -2524,6 +2661,234 @@ mod tests {
                     ..
             }) if request_id == "request-1" && !recovery_actions.is_empty()
         ));
+    }
+
+    #[tokio::test]
+    async fn every_tui_action_crosses_the_http_boundary_with_identity_and_typed_outcomes() {
+        for submission in crate::runtime_control_store::tests::operational_mfg_action_submissions()
+        {
+            let action = app_mfg_contract::mfg_tui_action_contracts()
+                .into_iter()
+                .find(|action| action.action_id == submission.action_id)
+                .expect("action contract");
+            let replacements = submission
+                .path_replacements
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect::<Vec<_>>();
+            let expected_path = mfg_tui_route_path(submission.route_id, &replacements)
+                .unwrap_or_else(|error| panic!("{}: {error}", action.action_id.as_str()));
+            let body = submission.request_body.clone();
+            let idempotency_key = submission.idempotency_key.clone();
+            let correlation_id = submission.correlation_id.clone();
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let server_action = action.clone();
+            let server_path = expected_path.clone();
+            let server_body = body.clone();
+            let server_key = idempotency_key.clone();
+            let server_correlation = correlation_id.clone();
+            let server = tokio::spawn(async move {
+                for outcome in 0..5 {
+                    let (mut socket, _) = listener.accept().await.expect("accept action request");
+                    let request = read_http_request(&mut socket).await;
+                    let (headers, request_body) =
+                        request.split_once("\r\n\r\n").expect("HTTP request body");
+                    assert!(
+                        headers.starts_with(&format!("POST {server_path} HTTP/1.1")),
+                        "{} used an unexpected path: {headers}",
+                        server_action.action_id.as_str()
+                    );
+                    let lower = headers.to_ascii_lowercase();
+                    assert!(lower.contains(&format!(
+                        "idempotency-key: {}",
+                        server_key.to_ascii_lowercase()
+                    )));
+                    assert!(lower.contains(&format!(
+                        "x-cowd-correlation-id: {}",
+                        server_correlation.to_ascii_lowercase()
+                    )));
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(request_body)
+                            .expect("request JSON"),
+                        server_body
+                    );
+                    if outcome == 4 {
+                        tokio::time::sleep(Duration::from_millis(80)).await;
+                        continue;
+                    }
+                    if outcome == 2 {
+                        let error = app_mfg_contract::MfgApiErrorV1::capability_denied(
+                            "mfg.transport.probe",
+                        );
+                        write_json_response(
+                            &mut socket,
+                            "403 Forbidden",
+                            &serde_json::to_value(error).expect("error JSON"),
+                        )
+                        .await;
+                        continue;
+                    }
+                    if outcome == 3 {
+                        let mut error = app_mfg_contract::MfgApiErrorV1::capability_denied(
+                            "mfg.transport.probe",
+                        );
+                        error.code = app_mfg_contract::MfgErrorCode::RevisionConflict;
+                        error.message = "revision conflict".to_string();
+                        error.http_status = 409;
+                        write_json_response(
+                            &mut socket,
+                            "409 Conflict",
+                            &serde_json::to_value(error).expect("error JSON"),
+                        )
+                        .await;
+                        continue;
+                    }
+                    let now = chrono::Utc::now();
+                    let receipt = app_mfg_contract::MfgReceiptV1 {
+                        receipt_id: format!(
+                            "receipt:{}:{outcome}",
+                            server_action.action_id.as_str()
+                        ),
+                        idempotency_key: server_key.clone(),
+                        actor_principal: "principal:tui".to_string(),
+                        action_id: server_action.action_id,
+                        resource_ref: "mfg:transport-probe".to_string(),
+                        expected_revision: None,
+                        result_revision: None,
+                        payload_digest: "sha256:transport-probe".to_string(),
+                        correlation_id: Some(server_correlation.clone()),
+                        status: if matches!(
+                            server_action.class,
+                            app_mfg_contract::MfgMutationClass::Preview
+                        ) {
+                            app_mfg_contract::MfgReceiptStatus::Preview
+                        } else if outcome == 0 {
+                            app_mfg_contract::MfgReceiptStatus::Completed
+                        } else {
+                            app_mfg_contract::MfgReceiptStatus::Replayed
+                        },
+                        response: serde_json::json!({"transport_probe": true}),
+                        contract_version: app_mfg_contract::MfgContractVersion::default(),
+                        created_at: now,
+                        updated_at: now,
+                    };
+                    write_json_response(
+                        &mut socket,
+                        "200 OK",
+                        &serde_json::json!({
+                            "receipt": receipt.clone(),
+                            "_mfg_receipt": receipt,
+                        }),
+                    )
+                    .await;
+                }
+            });
+
+            let client = GatewayApiClient::new(format!("http://{addr}"), None).expect("client");
+            let completed = client
+                .mfg_action(
+                    action.action_id,
+                    action.route_id,
+                    &replacements,
+                    &idempotency_key,
+                    &correlation_id,
+                    &body,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{} completed: {error}", action.action_id.as_str()));
+            let expected_first =
+                if matches!(action.class, app_mfg_contract::MfgMutationClass::Preview) {
+                    app_mfg_contract::MfgReceiptStatus::Preview
+                } else {
+                    app_mfg_contract::MfgReceiptStatus::Completed
+                };
+            assert_eq!(
+                completed
+                    .middleware_receipt
+                    .as_ref()
+                    .map(|receipt| receipt.status),
+                Some(expected_first)
+            );
+            let replayed = client
+                .mfg_action(
+                    action.action_id,
+                    action.route_id,
+                    &replacements,
+                    &idempotency_key,
+                    &correlation_id,
+                    &body,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{} replayed: {error}", action.action_id.as_str()));
+            let expected_second =
+                if matches!(action.class, app_mfg_contract::MfgMutationClass::Preview) {
+                    app_mfg_contract::MfgReceiptStatus::Preview
+                } else {
+                    app_mfg_contract::MfgReceiptStatus::Replayed
+                };
+            assert_eq!(
+                replayed
+                    .middleware_receipt
+                    .as_ref()
+                    .map(|receipt| receipt.status),
+                Some(expected_second)
+            );
+            assert!(matches!(
+                client
+                    .mfg_action(
+                        action.action_id,
+                        action.route_id,
+                        &replacements,
+                        &idempotency_key,
+                        &correlation_id,
+                        &body,
+                    )
+                    .await,
+                Err(GatewayApiError::Api(app_mfg_contract::MfgApiErrorV1 {
+                    code: app_mfg_contract::MfgErrorCode::CapabilityDenied,
+                    ..
+                }))
+            ));
+            assert!(matches!(
+                client
+                    .mfg_action(
+                        action.action_id,
+                        action.route_id,
+                        &replacements,
+                        &idempotency_key,
+                        &correlation_id,
+                        &body,
+                    )
+                    .await,
+                Err(GatewayApiError::Api(app_mfg_contract::MfgApiErrorV1 {
+                    code: app_mfg_contract::MfgErrorCode::RevisionConflict,
+                    ..
+                }))
+            ));
+            let timeout_client = GatewayApiClient {
+                base_url: format!("http://{addr}"),
+                auth_token: None,
+                client: reqwest::Client::builder()
+                    .timeout(Duration::from_millis(20))
+                    .build()
+                    .expect("timeout client"),
+            };
+            assert!(matches!(
+                timeout_client
+                    .mfg_action(
+                        action.action_id,
+                        action.route_id,
+                        &replacements,
+                        &idempotency_key,
+                        &correlation_id,
+                        &body,
+                    )
+                    .await,
+                Err(GatewayApiError::Http(error)) if error.is_timeout()
+            ));
+            server.await.expect("server task");
+        }
     }
 
     #[test]
@@ -2582,26 +2947,94 @@ mod tests {
         .expect("review detail");
         assert_eq!(detail.review_id, "review-1");
         assert_eq!(detail.approval_id.as_deref(), Some("approval-1"));
+
+        let now = chrono::Utc::now();
+        let canonical_receipt = app_mfg_contract::MfgReceiptV1 {
+            receipt_id: "mfg-receipt-1".to_string(),
+            idempotency_key: "idem-1".to_string(),
+            actor_principal: "principal:tui".to_string(),
+            action_id: app_mfg_contract::MfgActionId::Multi(
+                app_mfg_contract::MfgMultiActionId::ReportDeliverCommit,
+            ),
+            resource_ref: "mfg:cockpit-report:report-1".to_string(),
+            expected_revision: None,
+            result_revision: Some(3),
+            payload_digest: "sha256:test".to_string(),
+            correlation_id: Some("correlation-1".to_string()),
+            status: app_mfg_contract::MfgReceiptStatus::Completed,
+            response: serde_json::Value::Null,
+            contract_version: app_mfg_contract::MfgContractVersion::default(),
+            created_at: now,
+            updated_at: now,
+        };
+        let mutation: app_mfg_contract::MfgMutationResponseV1 = decode_gateway_json(
+            &serde_json::to_vec(&serde_json::json!({
+                "kind": "mfg.report.delivery",
+                "business_receipt": {
+                    "delivery_id": "surface-delivery-1",
+                    "cross_plane_status": "sent"
+                },
+                "receipt": canonical_receipt.clone(),
+                "_mfg_receipt": canonical_receipt,
+            }))
+            .expect("mutation JSON"),
+        )
+        .expect("single governance receipt decodes on both compatibility fields");
+        assert_eq!(
+            mutation
+                .receipt
+                .as_ref()
+                .and_then(|receipt| receipt.get("receipt_id"))
+                .and_then(serde_json::Value::as_str),
+            Some("mfg-receipt-1")
+        );
+        assert_eq!(
+            mutation
+                .middleware_receipt
+                .as_ref()
+                .map(|receipt| receipt.receipt_id.as_str()),
+            Some("mfg-receipt-1")
+        );
+        assert_eq!(
+            mutation
+                .payload
+                .get("business_receipt")
+                .and_then(|receipt| receipt.get("delivery_id"))
+                .and_then(serde_json::Value::as_str),
+            Some("surface-delivery-1")
+        );
     }
 
     #[test]
-    fn mfg_tui_paths_are_derived_from_the_19_route_read_contract() {
-        let routes = app_mfg_contract::mfg_tui_p0_read_route_contracts();
-        assert_eq!(routes.len(), 19);
+    fn mfg_tui_paths_are_derived_from_the_full_operational_route_contract() {
+        let routes = app_mfg_contract::mfg_tui_route_contracts();
+        assert!(routes.len() > 19);
         for route in routes {
-            if route.path.contains(":id") {
-                let path = mfg_tui_read_path(route.route_id, &[("id", "object/a")])
-                    .expect("parameterized path");
-                assert!(!path.contains(":id"));
-                assert!(path.contains("object%2Fa"));
+            if route.path.contains(':') {
+                let mut replacements = Vec::new();
+                if route.path.contains(":id") {
+                    replacements.push(("id", "object/a"));
+                }
+                if route.path.contains(":analysis_id") {
+                    replacements.push(("analysis_id", "analysis/a"));
+                }
+                if route.path.contains(":action_id") {
+                    replacements.push(("action_id", "action/a"));
+                }
+                if route.path.contains(":skill_id") {
+                    replacements.push(("skill_id", "skill/a"));
+                }
+                let path =
+                    mfg_tui_route_path(route.route_id, &replacements).expect("parameterized path");
+                assert!(!path.split('/').any(|segment| segment.starts_with(':')));
             } else {
                 assert_eq!(
-                    mfg_tui_read_path(route.route_id, &[]).expect("static path"),
+                    mfg_tui_route_path(route.route_id, &[]).expect("static path"),
                     route.path
                 );
             }
         }
-        assert!(mfg_tui_read_path(app_mfg_contract::MfgRouteId::LiveSnapshot, &[]).is_err());
+        assert!(mfg_tui_route_path(app_mfg_contract::MfgRouteId::LiveSnapshot, &[]).is_err());
         assert_eq!(
             append_query(
                 "/api/example".to_string(),
@@ -2620,23 +3053,18 @@ mod tests {
         assert!(source.contains("x-cowd-surface-id"));
         assert!(source.contains("x-cowd-requested-capabilities"));
         assert_eq!(source.matches("bearer_auth").count(), 1);
-        assert_eq!(
-            tui_requested_capabilities(),
-            vec![
-                "approval.respond",
-                "definition.default.set",
-                "definition.manage",
-                "definition.rollback",
-                "evolution.release.manage",
-                "mfg.read",
-                "mfg.report.review",
-                "runtime.maintenance.manage",
-                "runtime.outbox.retry",
-            ]
-            .into_iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>()
-        );
+        let capabilities = tui_requested_capabilities();
+        assert!(capabilities.windows(2).all(|pair| pair[0] < pair[1]));
+        for required in app_mfg_contract::core_profile_capabilities(
+            app_mfg_contract::MfgCoreProfileId::CoreManager,
+        ) {
+            assert!(capabilities.iter().any(|granted| granted == required));
+        }
+        for action in app_mfg_contract::mfg_tui_action_contracts() {
+            for required in action.required_capabilities {
+                assert!(capabilities.iter().any(|granted| granted == &required));
+            }
+        }
     }
 
     #[test]

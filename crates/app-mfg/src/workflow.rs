@@ -35,6 +35,8 @@ pub enum MfgWorkflowGraphError {
         from: MfgWorkflowNodeStatus,
         to: MfgWorkflowNodeStatus,
     },
+    #[error("MFG skill {0} has no completed Runtime execution receipt")]
+    InvalidSkillReceipt(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -404,6 +406,21 @@ impl MfgWorkflowGraph {
     }
 
     pub fn complete_skill(&mut self, run: &MfgSkillRun) -> Result<(), MfgWorkflowGraphError> {
+        if run.status != "completed"
+            || run
+                .runtime_execution_ref
+                .as_deref()
+                .is_none_or(str::is_empty)
+            || run.tool_results.len() != run.tool_plan.len()
+            || run
+                .tool_results
+                .iter()
+                .any(|result| result.status != "completed")
+        {
+            return Err(MfgWorkflowGraphError::InvalidSkillReceipt(
+                run.skill_id.clone(),
+            ));
+        }
         let node_id = run
             .agent_node_id
             .clone()
@@ -710,6 +727,24 @@ mod tests {
     use super::*;
     use crate::{run_server_manufacturing_skill, server_manufacturing_skill_pack};
 
+    fn runtime_completed(mut run: MfgSkillRun) -> MfgSkillRun {
+        run.status = "completed".to_string();
+        run.runtime_execution_ref = Some("runtime-execution://test-skill-graph".to_string());
+        run.runtime_commit_cursor = Some(1);
+        run.tool_results = run
+            .tool_plan
+            .iter()
+            .map(|call| crate::MfgSkillToolResult {
+                tool_name: call.tool_name.clone(),
+                status: "completed".to_string(),
+                summary: "test Runtime tool receipt".to_string(),
+                result: serde_json::json!({"test": true}),
+                evidence_refs: Vec::new(),
+            })
+            .collect();
+        run
+    }
+
     #[test]
     fn graph_uses_mfg_domain_types_and_rejects_cross_incident_identity() {
         let first = MfgIncident::new("GPU shortage");
@@ -789,7 +824,9 @@ mod tests {
         let mut graph = MfgWorkflowGraph::for_incident(&incident).unwrap();
         let before = graph.clone();
         let skill = server_manufacturing_skill_pack().remove(0);
-        let run = run_server_manufacturing_skill(&incident, &skill, None, None);
+        let run = runtime_completed(run_server_manufacturing_skill(
+            &incident, &skill, None, None,
+        ));
         assert!(matches!(
             graph.complete_skill(&run).unwrap_err(),
             MfgWorkflowGraphError::DependenciesIncomplete { .. }
@@ -821,7 +858,12 @@ mod tests {
         graph
             .set_node_terminal_result("mfg_reviewer", "reviewed")
             .unwrap();
-        let run = run_server_manufacturing_skill(&incident, &skill, None, Some(&packet));
+        let run = runtime_completed(run_server_manufacturing_skill(
+            &incident,
+            &skill,
+            None,
+            Some(&packet),
+        ));
         graph.complete_skill(&run).unwrap();
 
         let skill_node_id = skill_agent_node_id(&skill.skill_id);

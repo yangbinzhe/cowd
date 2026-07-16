@@ -1624,6 +1624,18 @@ impl App {
                 self.mfg_operations.apply_error(generation, section, error);
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
+            CowdEvent::MfgActionAccepted {
+                intent_id,
+                response,
+            } => {
+                self.mfg_operations
+                    .apply_action_success(&intent_id, response);
+                self.msg_version = self.msg_version.wrapping_add(1);
+            }
+            CowdEvent::MfgActionFailed { intent_id, error } => {
+                self.mfg_operations.apply_action_error(&intent_id, error);
+                self.msg_version = self.msg_version.wrapping_add(1);
+            }
 
             // New CowdEvent variants not yet consumed by TUI
             _ => {}

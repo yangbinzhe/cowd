@@ -202,6 +202,10 @@ pub struct MfgAssignment {
     #[serde(default)]
     pub notification_targets: Vec<MfgSurfaceNotificationTarget>,
     pub status: String,
+    #[serde(default)]
+    pub completion_ref: Option<String>,
+    #[serde(default)]
+    pub lifecycle_correlation_id: Option<String>,
     pub visibility: String,
     pub revision: u64,
     pub created_by: String,
@@ -230,6 +234,8 @@ impl MfgAssignment {
             sla_minutes: input.sla_minutes,
             notification_targets: input.notification_targets,
             status: "assigned".to_string(),
+            completion_ref: None,
+            lifecycle_correlation_id: None,
             visibility: input.visibility,
             revision: 1,
             created_by: actor_ref,
@@ -273,6 +279,9 @@ pub struct MfgAssignmentCommandInput {
     pub target_ref: Option<String>,
     #[serde(default)]
     pub reason: Option<String>,
+    pub correlation_id: String,
+    #[serde(default)]
+    pub completion_evidence: Option<app_mfg_contract::MfgAssignmentCompletionEvidenceV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -287,6 +296,8 @@ pub struct MfgCommandReceipt {
     pub idempotency_key: String,
     #[serde(default)]
     pub payload_digest: String,
+    #[serde(default)]
+    pub correlation_id: Option<String>,
     #[serde(default = "default_mfg_contract_version")]
     pub contract_version: String,
     pub idempotent_replay: bool,
@@ -335,6 +346,7 @@ impl MfgCommandReceipt {
             expected_revision: (!is_create).then_some(self.previous_revision),
             result_revision: Some(self.current_revision),
             payload_digest: self.payload_digest.clone(),
+            correlation_id: self.correlation_id.clone(),
             status: if self.idempotent_replay {
                 app_mfg_contract::MfgReceiptStatus::Replayed
             } else {

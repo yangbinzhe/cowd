@@ -763,6 +763,16 @@ impl MatrixService {
             .evaluate_evidence_quality(packet_id)
     }
 
+    pub(crate) fn evaluate_evidence_quality_with_gate_id(
+        &self,
+        config_home: impl AsRef<Path>,
+        packet_id: &str,
+        gate_id: &str,
+    ) -> Result<MatrixQualityGateDecision, GatewayMatrixRepositoryError> {
+        self.sqlite_repository(config_home)?
+            .evaluate_evidence_quality_with_gate_id(packet_id, gate_id)
+    }
+
     pub(crate) fn get_quality_gate(
         &self,
         config_home: impl AsRef<Path>,

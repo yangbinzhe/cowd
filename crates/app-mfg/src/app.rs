@@ -115,12 +115,15 @@ pub fn manufacturing_app_descriptor() -> MfgApplicationDescriptor {
             },
             MfgApplicationSurface {
                 surface: MfgApplicationSurfaceKind::Tui,
-                role: "console_read_only".to_string(),
+                role: "console_operational_control".to_string(),
                 entrypoints: vec![
                     "/api/apps/mfg/contract".to_string(),
                     "/mfg".to_string(),
                 ],
-                actions: Vec::new(),
+                actions: app_mfg_contract::mfg_tui_action_contracts()
+                    .into_iter()
+                    .map(|action| action.action_id.as_str().to_string())
+                    .collect(),
             },
             MfgApplicationSurface {
                 surface: MfgApplicationSurfaceKind::Cli,
@@ -180,15 +183,21 @@ mod tests {
     }
 
     #[test]
-    fn manufacturing_app_descriptor_exposes_tui_as_read_only_without_operations() {
+    fn manufacturing_app_descriptor_exposes_tui_as_contract_derived_operational_control() {
         let descriptor = manufacturing_app_descriptor();
         let tui = descriptor
             .surfaces
             .iter()
             .find(|surface| surface.surface == MfgApplicationSurfaceKind::Tui)
             .expect("TUI surface should be described");
-        assert_eq!(tui.role, "console_read_only");
+        assert_eq!(tui.role, "console_operational_control");
         assert!(tui.entrypoints.contains(&"/mfg".to_string()));
-        assert!(tui.actions.is_empty());
+        assert_eq!(
+            tui.actions,
+            app_mfg_contract::mfg_tui_action_contracts()
+                .into_iter()
+                .map(|action| action.action_id.as_str().to_string())
+                .collect::<Vec<_>>()
+        );
     }
 }

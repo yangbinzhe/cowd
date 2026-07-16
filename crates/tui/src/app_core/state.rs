@@ -69,7 +69,7 @@ use crate::keybind::which_key::WhichKey;
 use crate::keybind::{default_bindings, KeybindEngine};
 use crate::layout::{LayoutState, LayoutTree};
 use crate::profiler::{FrameTimer, RenderProfiler};
-use crate::runtime_control_store::{MfgBacklinkKind, MfgViewFocus};
+use crate::runtime_control_store::{MfgBacklinkKind, MfgIntentStatus, MfgViewFocus};
 use crate::theme::ThemeEngine;
 use crate::workbench::panel_registry;
 use crate::CowdEvent;
@@ -645,12 +645,44 @@ impl TuiState {
     /// internal state-change notification. It is intentionally not encoded
     /// as a fake terminal event.
     pub fn apply_event(&mut self, event: CowdEvent) {
+        let updates_mfg_actions = matches!(
+            &event,
+            CowdEvent::MfgContract { .. }
+                | CowdEvent::MfgSnapshot { .. }
+                | CowdEvent::MfgReadFailed { .. }
+                | CowdEvent::MfgActionAccepted { .. }
+                | CowdEvent::MfgActionFailed { .. }
+        );
         match &event {
             CowdEvent::TurnStarted => self.app.turn_interaction.submit_started(),
             CowdEvent::ExecutionGraphSummary { summary } => {
                 if let Some(execution_id) = summary.graph_id.as_deref() {
                     self.app.turn_interaction.ingress_accepted(execution_id);
                 }
+            }
+            CowdEvent::RuntimeBacklinkResolved { target, object } => {
+                self.runtime_activity_panel
+                    .record_backlink_object(target.clone(), object);
+            }
+            CowdEvent::RuntimeBacklinkFailed { target, message } => {
+                self.runtime_activity_panel
+                    .record_backlink_failure(target.clone(), message.clone());
+            }
+            CowdEvent::ApprovalBacklinkResolved { target, object } => {
+                self.approval_cockpit_panel
+                    .record_backlink_object(target.clone(), object);
+            }
+            CowdEvent::ApprovalBacklinkFailed { target, message } => {
+                self.approval_cockpit_panel
+                    .record_backlink_failure(target.clone(), message.clone());
+            }
+            CowdEvent::SurfaceBacklinkResolved { target, receipt } => {
+                self.surface_panel
+                    .record_backlink_receipt(target.clone(), receipt.clone());
+            }
+            CowdEvent::SurfaceBacklinkFailed { target, message } => {
+                self.surface_panel
+                    .record_backlink_failure(target.clone(), message.clone());
             }
             // Stream terminal events update the timeline only. Runtime
             // projection terminal_ref remains the lifecycle authority.
@@ -673,6 +705,10 @@ impl TuiState {
 
         // Preserve ALL existing App behavior
         self.app.apply_event(event);
+        if updates_mfg_actions {
+            self.command_palette
+                .sync_mfg_actions(&self.app.mfg_operations);
+        }
 
         // Bridge: notify new components that state has changed without
         // overloading an operating-system input event.
@@ -2328,16 +2364,18 @@ impl TuiState {
                     MfgViewFocus::Tabs => MfgViewFocus::List,
                     MfgViewFocus::List => MfgViewFocus::Detail,
                     MfgViewFocus::Detail => MfgViewFocus::Backlinks,
-                    MfgViewFocus::Backlinks => MfgViewFocus::Tabs,
+                    MfgViewFocus::Backlinks => MfgViewFocus::Actions,
+                    MfgViewFocus::Actions => MfgViewFocus::Tabs,
                 };
                 true
             }
             KeyCode::BackTab => {
                 self.app.mfg_operations.focus = match self.app.mfg_operations.focus {
-                    MfgViewFocus::Tabs => MfgViewFocus::Backlinks,
+                    MfgViewFocus::Tabs => MfgViewFocus::Actions,
                     MfgViewFocus::List => MfgViewFocus::Tabs,
                     MfgViewFocus::Detail => MfgViewFocus::List,
                     MfgViewFocus::Backlinks => MfgViewFocus::Detail,
+                    MfgViewFocus::Actions => MfgViewFocus::Backlinks,
                 };
                 true
             }
@@ -2353,6 +2391,8 @@ impl TuiState {
                 if self.app.mfg_operations.focus == MfgViewFocus::Detail {
                     self.app.mfg_operations.detail_scroll =
                         self.app.mfg_operations.detail_scroll.saturating_add(1);
+                } else if self.app.mfg_operations.focus == MfgViewFocus::Actions {
+                    self.app.mfg_operations.move_action_selection(true);
                 } else {
                     self.app.mfg_operations.move_selection(true);
                 }
@@ -2362,16 +2402,83 @@ impl TuiState {
                 if self.app.mfg_operations.focus == MfgViewFocus::Detail {
                     self.app.mfg_operations.detail_scroll =
                         self.app.mfg_operations.detail_scroll.saturating_sub(1);
+                } else if self.app.mfg_operations.focus == MfgViewFocus::Actions {
+                    self.app.mfg_operations.move_action_selection(false);
                 } else {
                     self.app.mfg_operations.move_selection(false);
                 }
                 true
             }
             KeyCode::Enter => {
-                self.app.mfg_operations.focus = match self.app.mfg_operations.focus {
-                    MfgViewFocus::Detail | MfgViewFocus::Backlinks => MfgViewFocus::List,
-                    MfgViewFocus::Tabs | MfgViewFocus::List => MfgViewFocus::Detail,
-                };
+                if self.app.mfg_operations.focus == MfgViewFocus::Actions {
+                    let should_confirm = self
+                        .app
+                        .mfg_operations
+                        .latest_action_intent()
+                        .is_some_and(|intent| {
+                            intent.status == MfgIntentStatus::AwaitingConfirmation
+                                && self
+                                    .app
+                                    .mfg_operations
+                                    .selected_action_contract()
+                                    .is_some_and(|action| action.action_id == intent.action_id)
+                        });
+                    if !should_confirm
+                        && self
+                            .app
+                            .mfg_operations
+                            .selected_action_contract()
+                            .is_some_and(|action| {
+                                crate::runtime_control_store::mfg_action_requires_explicit_input(
+                                    action.action_id,
+                                )
+                            })
+                    {
+                        let result = self
+                            .app
+                            .mfg_operations
+                            .selected_action_contract()
+                            .ok_or_else(|| "No MFG action is selected.".to_string())
+                            .and_then(|action| {
+                                self.app
+                                    .mfg_operations
+                                    .action_input_command(action.action_id)
+                            });
+                        self.prepare_mfg_action_composer(result);
+                        return true;
+                    }
+                    let result = if should_confirm {
+                        self.app.mfg_operations.confirm_pending_action()
+                    } else {
+                        self.app.mfg_operations.prepare_selected_action(None)
+                    };
+                    self.notify_mfg_intent_result(result);
+                } else {
+                    self.app.mfg_operations.focus = match self.app.mfg_operations.focus {
+                        MfgViewFocus::Detail | MfgViewFocus::Backlinks => MfgViewFocus::List,
+                        MfgViewFocus::Tabs | MfgViewFocus::List => MfgViewFocus::Detail,
+                        MfgViewFocus::Actions => MfgViewFocus::Actions,
+                    };
+                }
+                true
+            }
+            KeyCode::Char('a') => {
+                self.app.mfg_operations.focus = MfgViewFocus::Actions;
+                true
+            }
+            KeyCode::Char('y') => {
+                let result = self.app.mfg_operations.confirm_pending_action();
+                self.notify_mfg_intent_result(result);
+                true
+            }
+            KeyCode::Char('c') => {
+                let result = self.app.mfg_operations.cancel_pending_action();
+                self.notify_mfg_intent_result(result);
+                true
+            }
+            KeyCode::Char('R') => {
+                let result = self.app.mfg_operations.retry_failed_action();
+                self.notify_mfg_intent_result(result);
                 true
             }
             KeyCode::Char('r') => {
@@ -2411,11 +2518,49 @@ impl TuiState {
             KeyCode::Char('s') => self.activate_mfg_backlink(MfgBacklinkKind::Surface),
             KeyCode::Char('x') => self.activate_mfg_backlink(MfgBacklinkKind::Runtime),
             KeyCode::Esc => {
-                self.layout_state.toggle_sidebar(&mut self.layout_tree);
-                self.set_focus_target(FocusTarget::Chat);
+                if let Ok(intent_id) = self.app.mfg_operations.cancel_pending_action() {
+                    self.notify_mfg_intent_result(Ok(intent_id));
+                } else {
+                    self.layout_state.toggle_sidebar(&mut self.layout_tree);
+                    self.set_focus_target(FocusTarget::Chat);
+                }
                 true
             }
             _ => false,
+        }
+    }
+
+    fn notify_mfg_intent_result(&mut self, result: Result<String, String>) {
+        match result {
+            Ok(intent_id) => self.toast_manager.push(
+                ToastVariant::Info,
+                Some("MFG governed action".into()),
+                format!("Intent {intent_id} updated"),
+                1800,
+            ),
+            Err(error) => self.toast_manager.push(
+                ToastVariant::Warning,
+                Some("MFG governed action".into()),
+                error,
+                3200,
+            ),
+        }
+    }
+
+    fn prepare_mfg_action_composer(&mut self, result: Result<String, String>) {
+        match result {
+            Ok(command) => {
+                self.app.input.set_text(&command);
+                self.set_focus_target(FocusTarget::Chat);
+                self.toast_manager.push(
+                    ToastVariant::Info,
+                    Some("MFG governed input".into()),
+                    "Required fields are in the composer. Replace every <required:...> value, then submit."
+                        .into(),
+                    3600,
+                );
+            }
+            Err(error) => self.notify_mfg_intent_result(Err(error)),
         }
     }
 
@@ -2429,6 +2574,38 @@ impl TuiState {
             );
             return true;
         };
+        match kind {
+            MfgBacklinkKind::Evidence => {
+                self.open_sidebar_tab(TAB_MFG, "MFG evidence");
+                self.app
+                    .mfg_operations
+                    .focus_evidence_backlink(&backlink.target);
+            }
+            MfgBacklinkKind::Approval => {
+                self.open_sidebar_tab(TAB_APPROVALS, "Approvals");
+                self.approval_cockpit_panel
+                    .focus_backlink_target(backlink.target.clone());
+                self.app
+                    .mfg_operations
+                    .request_approval_backlink(&backlink.target);
+            }
+            MfgBacklinkKind::Surface => {
+                self.open_sidebar_tab(TAB_SURFACES, "Surfaces");
+                self.surface_panel
+                    .focus_backlink_target(backlink.target.clone());
+                self.app
+                    .mfg_operations
+                    .request_surface_receipt(&backlink.target);
+            }
+            MfgBacklinkKind::Runtime => {
+                self.open_sidebar_tab(TAB_RUNTIME, "Runtime");
+                self.runtime_activity_panel
+                    .focus_backlink_target(backlink.target.clone());
+                self.app
+                    .mfg_operations
+                    .request_runtime_backlink(&backlink.target);
+            }
+        }
         self.toast_manager.push(
             ToastVariant::Info,
             Some(format!("{} backlink", kind.label())),
@@ -3338,6 +3515,12 @@ impl TuiState {
             self.layout_state.toggle_sidebar(&mut self.layout_tree);
         }
         self.sidebar_active_tab = tab.min(SIDEBAR_TAB_COUNT.saturating_sub(1));
+        match self.sidebar_active_tab {
+            TAB_RUNTIME => self.runtime_activity_panel.clear_backlink_target(),
+            TAB_APPROVALS => self.approval_cockpit_panel.clear_backlink_target(),
+            TAB_SURFACES => self.surface_panel.clear_backlink_target(),
+            _ => {}
+        }
         self.set_focus_target(FocusTarget::Sidebar);
         if self.sidebar_active_tab == TAB_TOOLS {
             self.refresh_tool_ops_panel_overview();
@@ -3427,6 +3610,81 @@ impl TuiState {
         }
 
         if self.try_focus_command(command) {
+            return true;
+        }
+
+        if let Some(rest) = command.strip_prefix("/mfg ") {
+            self.open_sidebar_tab(TAB_MFG, "MFG Operations");
+            let rest = rest.trim();
+            let result = match rest {
+                "confirm" => {
+                    self.app.mfg_operations.focus = MfgViewFocus::Actions;
+                    self.app.mfg_operations.confirm_pending_action()
+                }
+                "cancel" => {
+                    self.app.mfg_operations.focus = MfgViewFocus::Actions;
+                    self.app.mfg_operations.cancel_pending_action()
+                }
+                "retry" => {
+                    self.app.mfg_operations.focus = MfgViewFocus::Actions;
+                    self.app.mfg_operations.retry_failed_action()
+                }
+                _ if rest.starts_with("review ") => {
+                    let review_id = rest["review ".len()..].trim();
+                    if review_id.is_empty() {
+                        Err("MFG review id is required.".to_string())
+                    } else {
+                        self.app
+                            .mfg_operations
+                            .select_tab(crate::runtime_control_store::MfgViewTab::Reviews);
+                        self.app.mfg_operations.selected_review_id = Some(review_id.to_string());
+                        self.app.mfg_operations.focus = MfgViewFocus::Detail;
+                        Ok(format!("mfg-review:{review_id}"))
+                    }
+                }
+                _ if rest.starts_with("draft ") => {
+                    let action_id = rest["draft ".len()..].trim();
+                    let Some(action_id) = app_mfg_contract::MfgActionId::parse(action_id) else {
+                        self.notify_mfg_intent_result(Err(format!(
+                            "Unknown MFG action id: {action_id}"
+                        )));
+                        return true;
+                    };
+                    let result = self.app.mfg_operations.action_input_command(action_id);
+                    self.prepare_mfg_action_composer(result);
+                    return true;
+                }
+                _ if rest.starts_with("action ") => {
+                    self.app.mfg_operations.focus = MfgViewFocus::Actions;
+                    let action = rest["action ".len()..].trim();
+                    let (action_id, payload) = action
+                        .split_once(char::is_whitespace)
+                        .map_or((action, None), |(id, payload)| (id, Some(payload.trim())));
+                    let Some(action_id) = app_mfg_contract::MfgActionId::parse(action_id) else {
+                        self.notify_mfg_intent_result(Err(format!(
+                            "Unknown MFG action id: {action_id}"
+                        )));
+                        return true;
+                    };
+                    let payload = match payload.filter(|payload| !payload.is_empty()) {
+                        Some(payload) => match serde_json::from_str::<serde_json::Value>(payload) {
+                            Ok(payload) => Some(payload),
+                            Err(error) => {
+                                self.notify_mfg_intent_result(Err(format!(
+                                    "MFG action JSON is invalid: {error}"
+                                )));
+                                return true;
+                            }
+                        },
+                        None => None,
+                    };
+                    self.app.mfg_operations.prepare_action(action_id, payload)
+                }
+                _ => Err(
+                    "Use /mfg review <review_id>, /mfg draft <action_id>, /mfg action <action_id> [JSON], /mfg confirm, /mfg cancel, or /mfg retry".to_string(),
+                ),
+            };
+            self.notify_mfg_intent_result(result);
             return true;
         }
 
@@ -3591,6 +3849,8 @@ impl TuiState {
         self.refresh_command_projection_from_gateway();
         let snapshot = crate::runtime_control_store::RuntimeControlSnapshot::from_app(&self.app);
         self.command_palette.sync_runtime_actions(&snapshot);
+        self.command_palette
+            .sync_mfg_actions(&self.app.mfg_operations);
         self.command_palette.open();
         self.set_focus_target(FocusTarget::CommandPalette);
     }
@@ -3599,6 +3859,8 @@ impl TuiState {
         self.refresh_command_projection_from_gateway();
         let snapshot = crate::runtime_control_store::RuntimeControlSnapshot::from_app(&self.app);
         self.command_palette.sync_runtime_actions(&snapshot);
+        self.command_palette
+            .sync_mfg_actions(&self.app.mfg_operations);
         self.command_palette.open_with_query(query);
         self.set_focus_target(FocusTarget::CommandPalette);
     }
@@ -3608,6 +3870,8 @@ impl TuiState {
             run_gateway_api_blocking(|client| async move { client.slash_projection("tui").await })
         {
             self.command_palette.sync_command_projection(&payload);
+            self.command_palette
+                .sync_mfg_actions(&self.app.mfg_operations);
             self.prompt
                 .sync_command_suggestions_from_projection(&payload);
         }
@@ -3919,6 +4183,40 @@ impl TuiState {
                     .show_notification("Command prepared. Press Enter to run.");
             }
             Action::RespondGatewayApproval { id, approved } => {
+                if let Some(mfg_approval) = self
+                    .app
+                    .gateway_approval_items
+                    .iter()
+                    .find(|approval| approval.id == *id && approval.is_mfg_source())
+                {
+                    let Some(review_ref) = mfg_approval
+                        .review_ref
+                        .clone()
+                        .filter(|review| !review.trim().is_empty())
+                    else {
+                        self.toast_manager.push(
+                            ToastVariant::Error,
+                            Some("MFG approval contract".into()),
+                            "Typed MFG review reference is missing; generic approve/reject is fail-closed."
+                                .into(),
+                            4200,
+                        );
+                        return;
+                    };
+                    self.open_sidebar_tab(TAB_MFG, "Typed MFG Review");
+                    self.app
+                        .mfg_operations
+                        .select_tab(crate::runtime_control_store::MfgViewTab::Reviews);
+                    self.app.mfg_operations.selected_review_id = Some(review_ref.clone());
+                    self.app.mfg_operations.focus = MfgViewFocus::Detail;
+                    self.toast_manager.push(
+                        ToastVariant::Info,
+                        Some("MFG Review".into()),
+                        format!("{review_ref} requires force_retry/reroute/abandon/resolve/reject"),
+                        3000,
+                    );
+                    return;
+                }
                 let approval_id = id.clone();
                 let projection_id = id.clone();
                 let result = run_gateway_api_blocking(move |client| async move {
@@ -6012,7 +6310,7 @@ mod tests {
     fn mfg_uses_the_full_workbench_for_real_80_96_120_frame_layouts() {
         for (width, height, expect_detail, expect_backlinks) in [
             (80, 24, false, false),
-            (96, 30, true, false),
+            (96, 28, true, false),
             (120, 40, true, true),
         ] {
             let mut state = TuiState::new("m", "mfg-layout");
@@ -6039,6 +6337,76 @@ mod tests {
             assert_eq!(joined.contains("Detail"), expect_detail);
             assert_eq!(joined.contains("Backlinks"), expect_backlinks);
         }
+    }
+
+    #[test]
+    fn mfg_backlinks_navigate_to_real_surface_panels() {
+        let mut state = TuiState::new("m", "mfg-backlinks");
+        state.layout_state.toggle_sidebar(&mut state.layout_tree);
+        state.sidebar_active_tab = TAB_MFG;
+        state.focus_target = FocusTarget::Sidebar;
+        state.app.mfg_operations.active_tab = crate::runtime_control_store::MfgViewTab::Incidents;
+        state.app.mfg_operations.incidents = vec![crate::runtime_control_store::MfgItemSummary {
+            id: "incident-1".to_string(),
+            backlinks: vec![
+                crate::runtime_control_store::MfgBacklink {
+                    kind: MfgBacklinkKind::Evidence,
+                    target: "evidence://packet-1".to_string(),
+                    label: "Evidence".to_string(),
+                },
+                crate::runtime_control_store::MfgBacklink {
+                    kind: MfgBacklinkKind::Approval,
+                    target: "approval://review-1".to_string(),
+                    label: "Approval".to_string(),
+                },
+                crate::runtime_control_store::MfgBacklink {
+                    kind: MfgBacklinkKind::Surface,
+                    target: "surface://webui/report-1".to_string(),
+                    label: "Surface".to_string(),
+                },
+                crate::runtime_control_store::MfgBacklink {
+                    kind: MfgBacklinkKind::Runtime,
+                    target: "runtime-execution://mfg-skill-graph-1".to_string(),
+                    label: "Runtime".to_string(),
+                },
+            ],
+            ..crate::runtime_control_store::MfgItemSummary::default()
+        }];
+        state.app.mfg_operations.selected_incident_id = Some("incident-1".to_string());
+
+        assert!(state.activate_mfg_backlink(MfgBacklinkKind::Approval));
+        assert_eq!(state.sidebar_active_tab, TAB_APPROVALS);
+        state.sidebar_active_tab = TAB_MFG;
+        assert!(state.activate_mfg_backlink(MfgBacklinkKind::Surface));
+        assert_eq!(state.sidebar_active_tab, TAB_SURFACES);
+        state.sidebar_active_tab = TAB_MFG;
+        assert!(state.activate_mfg_backlink(MfgBacklinkKind::Runtime));
+        assert_eq!(state.sidebar_active_tab, TAB_RUNTIME);
+        assert_eq!(
+            state
+                .app
+                .mfg_operations
+                .last_backlink_intent
+                .as_ref()
+                .map(|link| link.target.as_str()),
+            Some("runtime-execution://mfg-skill-graph-1")
+        );
+        state.sidebar_active_tab = TAB_MFG;
+        assert!(state.activate_mfg_backlink(MfgBacklinkKind::Evidence));
+        assert_eq!(state.sidebar_active_tab, TAB_MFG);
+        assert_eq!(
+            state.app.mfg_operations.focused_evidence_ref.as_deref(),
+            Some("packet-1")
+        );
+        assert_eq!(
+            state
+                .app
+                .mfg_operations
+                .last_backlink_intent
+                .as_ref()
+                .map(|link| link.target.as_str()),
+            Some("evidence://packet-1")
+        );
     }
 
     #[test]

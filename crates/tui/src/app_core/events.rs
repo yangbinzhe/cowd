@@ -80,6 +80,8 @@ fn is_reliable_event(event: &CowdEvent) -> bool {
             | CowdEvent::MfgContract { .. }
             | CowdEvent::MfgSnapshot { .. }
             | CowdEvent::MfgReadFailed { .. }
+            | CowdEvent::MfgActionAccepted { .. }
+            | CowdEvent::MfgActionFailed { .. }
     )
 }
 
@@ -107,7 +109,9 @@ fn retain_reliable_event(queue: &mut VecDeque<CowdEvent>, event: CowdEvent) {
         }
         CowdEvent::MfgContract { .. }
         | CowdEvent::MfgSnapshot { .. }
-        | CowdEvent::MfgReadFailed { .. } => {
+        | CowdEvent::MfgReadFailed { .. }
+        | CowdEvent::MfgActionAccepted { .. }
+        | CowdEvent::MfgActionFailed { .. } => {
             if let Some(index) = queue.iter().position(|queued| match (&event, queued) {
                 (
                     CowdEvent::MfgContract {
@@ -141,6 +145,24 @@ fn retain_reliable_event(queue: &mut VecDeque<CowdEvent>, event: CowdEvent) {
                         ..
                     },
                 ) => queued_generation == event_generation && queued_section == event_section,
+                (
+                    CowdEvent::MfgActionAccepted {
+                        intent_id: event_intent,
+                        ..
+                    }
+                    | CowdEvent::MfgActionFailed {
+                        intent_id: event_intent,
+                        ..
+                    },
+                    CowdEvent::MfgActionAccepted {
+                        intent_id: queued_intent,
+                        ..
+                    }
+                    | CowdEvent::MfgActionFailed {
+                        intent_id: queued_intent,
+                        ..
+                    },
+                ) => queued_intent == event_intent,
                 _ => false,
             }) {
                 queue[index] = event;
@@ -162,6 +184,8 @@ fn retain_reliable_event(queue: &mut VecDeque<CowdEvent>, event: CowdEvent) {
                     | CowdEvent::MfgContract { .. }
                     | CowdEvent::MfgSnapshot { .. }
                     | CowdEvent::MfgReadFailed { .. }
+                    | CowdEvent::MfgActionAccepted { .. }
+                    | CowdEvent::MfgActionFailed { .. }
             )
         }) {
             queue.remove(index);

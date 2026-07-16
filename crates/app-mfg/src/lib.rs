@@ -63,7 +63,7 @@ pub use operations::{
 pub use skill::{
     plan_server_manufacturing_skills, run_server_manufacturing_skill,
     server_manufacturing_skill_pack, skill_agent_node_id, MfgSkillManifest, MfgSkillPlan,
-    MfgSkillRun,
+    MfgSkillRun, MfgSkillTelemetry, MfgSkillToolCall, MfgSkillToolResult,
 };
 pub use store::MfgStore;
 pub use workflow::{
@@ -72,7 +72,7 @@ pub use workflow::{
     MfgWorkflowStatus,
 };
 
-pub use repository::{MfgHealth, MfgMetricRecomputeResult, MfgRepositoryError};
+pub use repository::{MfgHealth, MfgMetricRecomputeResult, MfgMutationClaim, MfgRepositoryError};
 
 #[must_use]
 pub fn mfg_seed_plan() -> MfgDomainSeedPlan {

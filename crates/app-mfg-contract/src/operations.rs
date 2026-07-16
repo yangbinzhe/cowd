@@ -22,6 +22,17 @@ pub struct MfgIncidentListQuery {
     pub limit: Option<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct MfgAssignmentCompletionEvidenceV1 {
+    pub correlation_id: String,
+    pub owner_kind: String,
+    pub task_ref: String,
+    #[serde(default)]
+    pub workflow_node_id: Option<String>,
+    pub terminal_status: String,
+    pub receipt_ref: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct MfgReadResponseV1 {
     #[serde(default)]
@@ -33,7 +44,7 @@ pub struct MfgReadResponseV1 {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct MfgMutationResponseV1 {
     #[serde(default)]
-    pub receipt: Option<MfgReceiptV1>,
+    pub receipt: Option<serde_json::Value>,
     #[serde(default, rename = "_mfg_receipt")]
     pub middleware_receipt: Option<MfgReceiptV1>,
     #[serde(flatten)]

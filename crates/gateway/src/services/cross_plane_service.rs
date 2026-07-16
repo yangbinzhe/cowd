@@ -25,6 +25,28 @@ impl runtime::execution_core::graph::executors::ScopedNodeBackendResolver
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CrossPlaneCommitGraphError {
+    #[error("{0}")]
+    CanonicalActionConflict(String),
+    #[error(transparent)]
+    Runtime(#[from] runtime::CrossPlaneRuntimeError),
+    #[error("cross-plane graph state failed: {0}")]
+    State(String),
+    #[error("cross-plane graph execution failed: {0}")]
+    Execution(String),
+}
+
+impl CrossPlaneCommitGraphError {
+    pub(crate) fn is_idempotency_conflict(&self) -> bool {
+        matches!(
+            self,
+            Self::CanonicalActionConflict(_)
+                | Self::Runtime(runtime::CrossPlaneRuntimeError::IdempotencyConflict(_))
+        )
+    }
+}
+
 pub(crate) struct CrossPlaneExecutionRecord {
     pub(crate) idempotency_key: Option<String>,
     pub(crate) mode: String,
@@ -42,6 +64,30 @@ pub(crate) struct CrossPlaneExecutionRecord {
 }
 
 impl CrossPlaneService {
+    pub(crate) fn preview_action(
+        &self,
+        idempotency_key: Option<String>,
+        mode: String,
+        action: CrossPlaneAction,
+        decision: CrossPlanePolicyDecision,
+    ) -> CrossPlaneExecutionReceipt {
+        let allowed = decision.decision == runtime::PolicyDecisionKind::Allow;
+        CrossPlaneExecutionReceipt::new(
+            idempotency_key,
+            mode,
+            if allowed { "planned" } else { "blocked" },
+            if allowed { "dry_run" } else { "policy_blocked" },
+            action,
+            decision.clone(),
+            if allowed {
+                Vec::new()
+            } else {
+                vec![format!("policy:{}", decision.reason)]
+            },
+            None,
+        )
+    }
+
     pub(crate) fn record_non_commit_action(
         &self,
         idempotency_key: Option<String>,
@@ -103,6 +149,12 @@ impl CrossPlaneService {
         self.runtime_services
             .cross_plane()
             .find_execution_by_idempotency_key(idempotency_key)
+    }
+
+    pub(crate) fn find_execution(&self, receipt_id: &str) -> Option<CrossPlaneExecutionReceipt> {
+        self.runtime_services
+            .cross_plane()
+            .find_execution(receipt_id)
     }
 
     pub(crate) fn consume_matched_grant_for_decision(
@@ -189,8 +241,12 @@ impl CrossPlaneService {
         action: &CrossPlaneAction,
         decision: &CrossPlanePolicyDecision,
         idempotency_key: &str,
+        dispatch_target: Option<&CrossPlaneDispatchTarget>,
         backend: std::sync::Arc<dyn runtime::execution_core::ScopedNodeBackend>,
-    ) -> Result<harness_contract::execution_graph::ExecutionGraphProjection, String> {
+    ) -> Result<
+        harness_contract::execution_graph::ExecutionGraphProjection,
+        CrossPlaneCommitGraphError,
+    > {
         let mut graph = self.runtime_services.cross_plane().compile_commit_graph(
             action,
             decision,
@@ -203,6 +259,63 @@ impl CrossPlaneService {
             }
         }
         let graph_id = graph.id.clone();
+        match self.runtime_services.graph_state_store().load(&graph_id) {
+            Ok(existing) => {
+                if existing.objective != graph.objective
+                    || existing.nodes != graph.nodes
+                    || existing.edges != graph.edges
+                {
+                    return Err(CrossPlaneCommitGraphError::CanonicalActionConflict(
+                        format!(
+                            "cross-plane graph {graph_id} is bound to another canonical action"
+                        ),
+                    ));
+                }
+                if let Some(dispatch_target) = dispatch_target {
+                    self.runtime_services
+                        .cross_plane()
+                        .begin_dispatch(idempotency_key, dispatch_target)?;
+                }
+                self.runtime_services
+                    .cross_plane_connector_executor()
+                    .install_resolver(std::sync::Arc::new(CrossPlaneGraphResolver {
+                        graph_id: graph_id.clone(),
+                        backend: std::sync::Arc::clone(&backend),
+                    }));
+                let projection = self
+                    .runtime_services
+                    .graph_runner()
+                    .graph_projection(&graph_id)
+                    .await
+                    .map_err(|error| CrossPlaneCommitGraphError::Execution(error.to_string()))?;
+                if projection
+                    .nodes
+                    .iter()
+                    .all(|node| node.status.is_terminal())
+                {
+                    return Ok(projection);
+                }
+                return self
+                    .runtime_services
+                    .graph_runner()
+                    .command_graph(
+                        &graph_id,
+                        ExecutionGraphCommand::Advance {
+                            expected_revision: projection.revision,
+                        },
+                    )
+                    .await
+                    .map(|receipt| receipt.graph)
+                    .map_err(|error| CrossPlaneCommitGraphError::Execution(error.to_string()));
+            }
+            Err(runtime::execution_core::ExecutionStateStoreError::NotFound(_)) => {}
+            Err(error) => return Err(CrossPlaneCommitGraphError::State(error.to_string())),
+        }
+        if let Some(dispatch_target) = dispatch_target {
+            self.runtime_services
+                .cross_plane()
+                .begin_dispatch(idempotency_key, dispatch_target)?;
+        }
         self.runtime_services
             .cross_plane_connector_executor()
             .install_resolver(std::sync::Arc::new(CrossPlaneGraphResolver {
@@ -219,7 +332,7 @@ impl CrossPlaneService {
             )
             .await
             .map(|receipt| receipt.graph)
-            .map_err(|error| error.to_string())
+            .map_err(|error| CrossPlaneCommitGraphError::Execution(error.to_string()))
     }
 
     /// Persist a message-delivery receipt after a caller has both executed a

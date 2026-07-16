@@ -27,6 +27,7 @@ mod harness_eval_service;
 mod matrix_service;
 mod memory_service;
 mod mfg_service;
+mod mfg_skill_executor;
 mod mission_service;
 mod policy;
 pub(crate) mod reality_service;
@@ -44,7 +45,7 @@ mod workspace_service;
 pub(crate) use approval_service::ApprovalService;
 pub(crate) use context_service::ContextServiceError;
 pub(crate) use cross_plane_executor::{GatewayConnectorServiceExecutor, GatewayCrossPlaneExecutor};
-pub(crate) use cross_plane_service::CrossPlaneExecutionRecord;
+pub(crate) use cross_plane_service::{CrossPlaneCommitGraphError, CrossPlaneExecutionRecord};
 pub(crate) use evolution_service::{
     EvolutionProposalCreateRequest, EvolutionProposalDecisionRequest, EvolutionServiceError,
     EvolutionSignalCreateRequest,
@@ -57,6 +58,7 @@ pub(crate) use mfg_service::{
     MfgCockpitReportDeliveryOutcome, MfgCockpitReportDeliveryRequest, MfgCrossPlaneBridgeRequest,
     MfgReviewReconcilerLifecycle, MfgService,
 };
+pub(crate) use mfg_skill_executor::{GatewayMfgSkillExecutor, MfgSkillExecutionPayload};
 pub(crate) use mission_service::{
     AddMissionRelationHttpRequest, CreateMissionScheduleHttpRequest,
     DecideMissionApprovalHttpRequest, InterpretMissionCommandHttpRequest,

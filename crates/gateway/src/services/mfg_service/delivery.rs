@@ -65,9 +65,9 @@ impl MfgService {
     pub(crate) fn report_delivery_receipt_matches(
         &self,
         receipt: &CrossPlaneExecutionReceipt,
-        report: &MfgCockpitReportSnapshot,
+        requested_action: &CrossPlaneAction,
     ) -> bool {
-        receipt.action.session_id.as_deref() == Some(report.report_id.as_str())
+        receipt.action == *requested_action
     }
 
     pub(crate) fn attach_report_delivery_receipt(

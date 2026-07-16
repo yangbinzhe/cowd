@@ -330,6 +330,7 @@ pub enum TaskLifecycleKind {
     Completed,
     FailureRecorded,
     Blocked,
+    AssignmentTerminalObserved,
 }
 
 impl TaskLifecycleKind {
@@ -344,6 +345,7 @@ impl TaskLifecycleKind {
             Self::Completed => "task.completed",
             Self::FailureRecorded => "task.failure.recorded",
             Self::Blocked => "task.blocked",
+            Self::AssignmentTerminalObserved => "task.assignment_terminal_observed",
         }
     }
 }
@@ -1179,6 +1181,147 @@ impl RuntimeServices {
             refs: Vec::new(),
             payload: event.payload,
         })
+    }
+
+    pub fn record_task_lifecycle_once(
+        &self,
+        event: TaskLifecycleEvent,
+        idempotency_key: &str,
+    ) -> Result<DurableRuntimeEvent, String> {
+        use crate::{
+            AppendTransactionRequest, ExpectedStreamRevision, RuntimeTransactionEventInput,
+        };
+
+        let idempotency_key = idempotency_key.trim();
+        if event.task_id.trim().is_empty() || idempotency_key.is_empty() {
+            return Err(
+                "idempotent task lifecycle event requires task_id and idempotency_key".to_string(),
+            );
+        }
+        if let Some(receipt) = self
+            .event_store
+            .event_by_idempotency_key(&event.task_id, idempotency_key)
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(receipt);
+        }
+        let expected_revision = self
+            .event_store
+            .stream_revision(&event.task_id)
+            .map_err(|error| error.to_string())?;
+        let transaction_id = format!(
+            "runtime-task-lifecycle-{:x}",
+            Sha256::digest(format!("{}:{idempotency_key}", event.task_id).as_bytes())
+        );
+        self.event_store
+            .append_transaction(AppendTransactionRequest {
+                transaction_id,
+                expected_streams: vec![ExpectedStreamRevision {
+                    stream_id: event.task_id.clone(),
+                    expected_revision,
+                }],
+                events: vec![RuntimeTransactionEventInput {
+                    event: RuntimeEventInput {
+                        stream_id: event.task_id.clone(),
+                        scope: RuntimeEventScope::Task,
+                        kind: event.kind.event_kind().to_string(),
+                        status: None,
+                        actor: Some("gateway-task-command".to_string()),
+                        refs: Vec::new(),
+                        payload: event.payload,
+                    },
+                    idempotency_key: Some(idempotency_key.to_string()),
+                    schema_version: 1,
+                }],
+            })
+            .map_err(|error| error.to_string())?;
+        self.event_store
+            .event_by_idempotency_key(&event.task_id, idempotency_key)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                "task lifecycle transaction committed without a readable event".to_string()
+            })
+    }
+
+    pub fn task_lifecycle_receipt(
+        &self,
+        task_id: &str,
+        correlation_id: &str,
+    ) -> Result<Option<DurableRuntimeEvent>, String> {
+        let correlation_id = correlation_id.trim();
+        if task_id.trim().is_empty() || correlation_id.is_empty() {
+            return Ok(None);
+        }
+        let receipt = self
+            .event_store
+            .list_stream(task_id)?
+            .into_iter()
+            .rev()
+            .find(|event| {
+                event.kind == TaskLifecycleKind::Completed.event_kind()
+                    && event
+                        .payload
+                        .get("correlation_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(correlation_id)
+            });
+        Ok(receipt)
+    }
+
+    pub fn latest_task_terminal_receipt(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<DurableRuntimeEvent>, String> {
+        if task_id.trim().is_empty() {
+            return Ok(None);
+        }
+        self.event_store
+            .list_stream(task_id)
+            .map(|events| {
+                events.into_iter().rev().find(|event| {
+                    event.kind != TaskLifecycleKind::AssignmentTerminalObserved.event_kind()
+                        && event
+                            .payload
+                            .get("status")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|status| {
+                                matches!(status, "completed" | "cancelled" | "failed" | "blocked")
+                            })
+                })
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn record_task_terminal_observation(
+        &self,
+        task_id: &str,
+        terminal_status: &str,
+        source_receipt_ref: &str,
+        correlation_id: &str,
+    ) -> Result<DurableRuntimeEvent, String> {
+        if !matches!(
+            terminal_status,
+            "completed" | "cancelled" | "failed" | "blocked"
+        ) {
+            return Err(format!(
+                "task terminal observation rejected non-terminal status {terminal_status}"
+            ));
+        }
+        let event = TaskLifecycleEvent {
+            task_id: task_id.to_string(),
+            kind: TaskLifecycleKind::AssignmentTerminalObserved,
+            payload: serde_json::json!({
+                "task_id": task_id,
+                "status": terminal_status,
+                "source_receipt_ref": source_receipt_ref,
+                "correlation_id": correlation_id,
+                "observed_for": "mfg.assignment.complete",
+            }),
+        };
+        self.record_task_lifecycle_once(
+            event,
+            &format!("task-assignment-terminal-observed:{correlation_id}"),
+        )
     }
 
     /// Runtime-owned startup migration command.  Gateway may trigger the
@@ -3208,6 +3351,36 @@ mod tests {
         TeamSelectionMode, TeamTemplateDefinitionId, TeamTemplateSelector,
     };
     use memory::SessionRecord;
+
+    #[test]
+    fn task_completion_lifecycle_receipt_is_idempotent_by_correlation_key() {
+        let services = RuntimeServices::in_memory().expect("in-memory runtime services");
+        let event = TaskLifecycleEvent {
+            task_id: "task-completion-1".to_string(),
+            kind: TaskLifecycleKind::Completed,
+            payload: serde_json::json!({
+                "task_id": "task-completion-1",
+                "status": "completed",
+                "correlation_id": "correlation-1"
+            }),
+        };
+        let first = services
+            .record_task_lifecycle_once(event.clone(), "task-completed:correlation-1")
+            .expect("first completion event");
+        let replay = services
+            .record_task_lifecycle_once(event, "task-completed:correlation-1")
+            .expect("idempotent completion replay");
+        assert_eq!(first.event_id, replay.event_id);
+        assert_eq!(first.commit_cursor, replay.commit_cursor);
+        assert_eq!(
+            services
+                .event_store
+                .list_stream("task-completion-1")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 
     #[test]
     fn runtime_skill_catalog_is_available_to_delegated_execution_services() {

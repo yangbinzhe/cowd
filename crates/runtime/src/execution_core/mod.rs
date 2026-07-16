@@ -29,9 +29,9 @@ pub use goal::{policy::InterventionPolicy, GoalProjection, GoalStore};
 pub use graph::{
     ExecutionCommitService, ExecutionCompileError, ExecutionCompileRequest, ExecutionGraphCompiler,
     ExecutionGraphHost, ExecutionGraphHostReceipt, ExecutionGraphReplan, ExecutionGraphRunner,
-    ExecutionGraphStateStore, ExecutionRunnerError, NodeExecutionContext, NodeExecutionOutcome,
-    NodeExecutionTicket, NodeExecutor, NodeExecutorError, NodeExecutorRegistry, ScopedNodeBackend,
-    ScopedNodeExecutor,
+    ExecutionGraphStateStore, ExecutionRunnerError, ExecutionStateStoreError, NodeExecutionContext,
+    NodeExecutionOutcome, NodeExecutionTicket, NodeExecutor, NodeExecutorError,
+    NodeExecutorRegistry, ScopedNodeBackend, ScopedNodeExecutor,
 };
 pub use model_affordance::{
     runtime_execution_guidance_prompt, runtime_execution_guidance_prompt_with_tool_exposure,

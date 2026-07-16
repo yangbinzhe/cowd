@@ -153,7 +153,7 @@ mfg_route_contracts! {
     RealityEntityUpsert, "mfg.reality.entity.upsert", "POST", "/api/apps/mfg/reality/entities/upsert", MatrixCore, CreateOrUpdate, MfgCapabilityRequirement::One { capability: C::DataManage }, Medium, Target, true, [Webui], Active;
     RealityEntityResolveSourceKey, "mfg.reality.entity.resolve_source_key", "POST", "/api/apps/mfg/reality/entities/resolve-source-key", MatrixCore, Preview, MfgCapabilityRequirement::One { capability: C::Read }, Low, None, false, [Webui], Active;
     RealityEntityMatchCandidate, "mfg.reality.entity.match_candidate", "POST", "/api/apps/mfg/reality/entities/match-candidate", MatrixCore, Preview, MfgCapabilityRequirement::One { capability: C::Read }, Low, None, false, [Webui], Active;
-    RealityEntityConflictDecision, "mfg.reality.entity.conflict_decision", "POST", "/api/apps/mfg/reality/entities/conflict-decision", MatrixCore, Update, MfgCapabilityRequirement::One { capability: C::DataManage }, High, TargetAndConfirm, true, [Webui], Active;
+    RealityEntityConflictDecision, "mfg.reality.entity.conflict_decision", "POST", "/api/apps/mfg/reality/entities/conflict-decision", MatrixCore, Effect, MfgCapabilityRequirement::One { capability: C::DataManage }, High, TargetAndConfirm, true, [Webui], Active;
     RealityEntityGet, "mfg.reality.entity.get", "GET", "/api/apps/mfg/reality/entities/:id", MatrixCore, Read, MfgCapabilityRequirement::One { capability: C::Read }, Low, None, false, [Webui], Active;
     RealityEntityRelations, "mfg.reality.entity.relations", "GET", "/api/apps/mfg/reality/entities/:id/relations", MatrixCore, Read, MfgCapabilityRequirement::One { capability: C::Read }, Low, None, false, [Webui], Active;
     RealityEntityImpactPath, "mfg.reality.entity.impact_path", "GET", "/api/apps/mfg/reality/entities/:id/impact-path", MatrixCore, Read, MfgCapabilityRequirement::One { capability: C::Read }, Low, None, false, [Webui], Active;
@@ -255,5 +255,25 @@ pub fn mfg_tui_p0_read_route_contracts() -> Vec<MfgRouteContract> {
                 && route.consumers.contains(&MfgConsumer::TuiP0)
                 && route.class == MfgMutationClass::Read
         })
+        .collect()
+}
+
+#[must_use]
+pub fn mfg_tui_route_contracts() -> Vec<MfgRouteContract> {
+    mfg_route_contracts()
+        .into_iter()
+        .filter(|route| route.availability == MfgActionAvailability::Active)
+        .filter(|route| {
+            route.consumers.contains(&MfgConsumer::TuiP0)
+                || route.consumers.contains(&MfgConsumer::TuiP1)
+        })
+        .collect()
+}
+
+#[must_use]
+pub fn mfg_tui_read_route_contracts() -> Vec<MfgRouteContract> {
+    mfg_tui_route_contracts()
+        .into_iter()
+        .filter(|route| route.class == MfgMutationClass::Read)
         .collect()
 }

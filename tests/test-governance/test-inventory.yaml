@@ -208,7 +208,7 @@ scenario_scripts:
     classification: manual
     default_gate: false
     capability: mfg.multi_surface_acceptance
-    keep_reason: V543 defines isolated PTY and evidence interfaces without claiming execution.
+    keep_reason: V544 defines isolated governed-action PTY evidence without claiming multi-Surface execution.
     planned_change: V545 completes multi-Surface orchestration; V548 records the final command evidence.
 
 manual_scripts:
@@ -268,7 +268,7 @@ interactive_modules:
   - path: tests/interactive/src/scenarios/tui_mfg_operations.rs
     classification: manual
     capability: tui.mfg_operations
-    rationale: V543 defines read-only responsive PTY evidence; V545 activates the isolated multi-Surface lane.
+    rationale: V544 defines responsive governed-action PTY evidence; V545 activates the isolated multi-Surface lane.
   - path: tests/interactive/src/scenarios/server_core.rs
     classification: manual
     capability: server.core

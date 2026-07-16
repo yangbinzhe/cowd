@@ -84,6 +84,8 @@ pub struct RuntimeActivityPanel {
     provider_names: String,
     control_plane_status: String,
     control_plane_reason: String,
+    focused_backlink_target: Option<String>,
+    focused_backlink_resolution: Option<String>,
     yolo_mode: bool,
 
     // ── Runtime counters ─────────────────────────────────────────
@@ -113,6 +115,13 @@ impl RuntimeActivityPanel {
         self.yolo_mode = app.yolo_mode;
         self.session_id = app.session_id.clone();
         self.model = app.model.clone();
+        if let Some(resolution) = self
+            .focused_backlink_target
+            .as_deref()
+            .and_then(|target| resolve_runtime_backlink(app, target))
+        {
+            self.focused_backlink_resolution = Some(resolution);
+        }
 
         let mut provider_names = app
             .gateway_connector_accounts
@@ -450,11 +459,76 @@ impl RuntimeActivityPanel {
             };
         }
     }
+
+    pub fn focus_backlink_target(&mut self, target: impl Into<String>) {
+        self.focused_backlink_target = Some(target.into());
+        self.scroll.top();
+    }
+
+    pub fn clear_backlink_target(&mut self) {
+        self.focused_backlink_target = None;
+        self.focused_backlink_resolution = None;
+    }
+
+    pub fn record_backlink_object(
+        &mut self,
+        target: impl Into<String>,
+        object: &serde_json::Value,
+    ) {
+        let target = target.into();
+        self.focused_backlink_target = Some(target.clone());
+        self.focused_backlink_resolution = Some(format!(
+            "{} status {}",
+            object
+                .get("id")
+                .or_else(|| object.get("task_id"))
+                .or_else(|| object.get("execution_id"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(target.as_str()),
+            object
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("loaded")
+        ));
+        self.scroll.top();
+    }
+
+    pub fn record_backlink_failure(
+        &mut self,
+        target: impl Into<String>,
+        message: impl Into<String>,
+    ) {
+        self.focused_backlink_target = Some(target.into());
+        self.focused_backlink_resolution = Some(format!("Resolution failed: {}", message.into()));
+        self.scroll.top();
+    }
 }
 
 impl Component for RuntimeActivityPanel {
     fn render(&mut self, ctx: &mut RenderContext, area: Rect) {
         let mut lines: Vec<Line> = Vec::new();
+        if let Some(target) = self.focused_backlink_target.as_deref() {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "Backlink target: ",
+                    Style::default().fg(Color::LightMagenta),
+                ),
+                Span::styled(preview(target, 72), Style::default().fg(Color::White)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "Resolved object: ",
+                    Style::default().fg(Color::LightMagenta),
+                ),
+                Span::styled(
+                    self.focused_backlink_resolution
+                        .as_deref()
+                        .unwrap_or("loading canonical Runtime projection")
+                        .to_string(),
+                    Style::default().fg(Color::White),
+                ),
+            ]));
+        }
 
         if !self.policy_action.is_empty() && self.policy_action != "None" {
             lines.push(Line::from(vec![
@@ -712,6 +786,46 @@ fn short_id(id: &str) -> String {
     } else {
         id.chars().take(12).collect()
     }
+}
+
+fn resolve_runtime_backlink(app: &App, target: &str) -> Option<String> {
+    let target_id = target
+        .trim()
+        .trim_start_matches("execution://")
+        .trim_start_matches("mfg:execution:")
+        .trim_start_matches("execution:")
+        .trim_start_matches("task://")
+        .trim_start_matches("task:")
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    if target_id.is_empty() {
+        return None;
+    }
+    if let Some(projection) = app
+        .latest_execution_projection
+        .as_ref()
+        .filter(|projection| projection.execution_id == target_id)
+    {
+        return Some(format!(
+            "execution {} revision {} cursor {} nodes {}",
+            projection.execution_id,
+            projection.revision,
+            projection.cursor,
+            projection.graph.nodes.len()
+        ));
+    }
+    app.gateway_tasks
+        .iter()
+        .find(|task| task.id == target_id)
+        .map(|task| {
+            format!(
+                "task {} status {} phase {}",
+                task.id,
+                task.status,
+                task.current_phase.as_deref().unwrap_or("none")
+            )
+        })
 }
 
 // ── Tests ────────────────────────────────────────────────────────────

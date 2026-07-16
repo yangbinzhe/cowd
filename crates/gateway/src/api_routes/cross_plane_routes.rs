@@ -45,6 +45,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             get(cross_plane_action_executions_handler),
         )
         .route(
+            "/api/cross-plane/action/executions/:id",
+            get(cross_plane_action_execution_get_handler),
+        )
+        .route(
             "/api/cross-plane/policy/simulate",
             post(cross_plane_policy_simulate_handler),
         )
@@ -332,6 +336,23 @@ async fn cross_plane_action_executions_handler(
     }))
 }
 
+async fn cross_plane_action_execution_get_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, StatusCode> {
+    state
+        .services
+        .cross_plane
+        .find_execution(&id)
+        .map(|receipt| {
+            Json(serde_json::json!({
+                "kind": "cross_plane_action_execution",
+                "execution_receipt": receipt,
+            }))
+        })
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
 async fn cross_plane_policy_simulate_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
@@ -381,9 +402,11 @@ async fn cross_plane_action_execute_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(request): Json<CrossPlaneActionExecuteRequest>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     let now = chrono::Utc::now();
     let mode = normalize_execute_mode(&request.mode);
+    let mut readiness =
+        evaluate_action_readiness(&state, request.action.into_action(&principal), &mode, now).await;
     let idempotency_key = request
         .idempotency_key
         .as_deref()
@@ -396,6 +419,19 @@ async fn cross_plane_action_execute_handler(
             .cross_plane
             .find_execution_by_idempotency_key(key)
         {
+            if receipt.mode != mode
+                || receipt.action != readiness.action
+                || receipt.dispatch_target != readiness.dispatch_target
+            {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "kind": "cross_plane_action_execution_failed",
+                        "error": "idempotency key is bound to another canonical cross-plane action",
+                    })),
+                )
+                    .into_response();
+            }
             let target_platform = target_platform_from_action(&receipt.action);
             return Json(serde_json::json!({
                 "kind": "cross_plane_action_execution",
@@ -415,11 +451,10 @@ async fn cross_plane_action_execute_handler(
                 "audit_record_id": receipt.audit_record_id.clone(),
                 "execution_receipt": receipt,
                 "idempotent_replay": true,
-            }));
+            }))
+            .into_response();
         }
     }
-    let mut readiness =
-        evaluate_action_readiness(&state, request.action.into_action(&principal), &mode, now).await;
     let evidence = readiness.evidence.clone();
     let mut status = "blocked";
     let mut dispatch_status = "not_started";
@@ -447,13 +482,19 @@ async fn cross_plane_action_execute_handler(
         let target = readiness.dispatch_target.clone().unwrap_or_default();
         let executor = Arc::new(GatewayCrossPlaneExecutor::new(
             state.services.surface.clone(),
-            target,
+            target.clone(),
             state.services.cross_plane.runtime_control(),
         ));
         match state
             .services
             .cross_plane
-            .execute_commit_graph(&readiness.action, &readiness.decision, &graph_key, executor)
+            .execute_commit_graph(
+                &readiness.action,
+                &readiness.decision,
+                &graph_key,
+                Some(&target),
+                executor,
+            )
             .await
         {
             Ok(graph) => {
@@ -488,11 +529,26 @@ async fn cross_plane_action_execute_handler(
                 execution_graph = Some(graph);
             }
             Err(error) => {
-                readiness.blockers.push(format!("execution_graph:{error}"));
-                readiness.executable = false;
-                dispatch_status = "execution_graph_rejected";
-                audit_result = "blocked_execution_graph";
-                audit_summary = "commit_graph_registration_failed".to_string();
+                let status = if error.is_idempotency_conflict() {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
+                let code = if error.is_idempotency_conflict() {
+                    "cross_plane_idempotency_conflict"
+                } else {
+                    "cross_plane_execution_graph_failed"
+                };
+                return (
+                    status,
+                    Json(serde_json::json!({
+                        "kind": "cross_plane_execution_error",
+                        "code": code,
+                        "error": error.to_string(),
+                        "idempotency_key": graph_key,
+                    })),
+                )
+                    .into_response();
             }
         }
     } else if readiness
@@ -538,10 +594,22 @@ async fn cross_plane_action_execute_handler(
     } {
         Ok(committed) => committed,
         Err(error) => {
-            return Json(serde_json::json!({
-                "kind": "cross_plane_action_execution_failed",
-                "error": error.to_string(),
-            }));
+            let status = if matches!(
+                error,
+                runtime::CrossPlaneRuntimeError::IdempotencyConflict(_)
+            ) {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            return (
+                status,
+                Json(serde_json::json!({
+                    "kind": "cross_plane_action_execution_failed",
+                    "error": error.to_string(),
+                })),
+            )
+                .into_response();
         }
     };
 
@@ -566,6 +634,7 @@ async fn cross_plane_action_execute_handler(
         "execution_graph": execution_graph,
         "idempotent_replay": false,
     }))
+    .into_response()
 }
 
 async fn cross_plane_identity_resolve_handler(

@@ -141,6 +141,33 @@ pub enum CowdEvent {
     ExecutionProjectionDelta {
         delta: ProjectionDelta,
     },
+    ExecutionProjectionLoaded {
+        projection: ExecutionProjection,
+    },
+    RuntimeBacklinkResolved {
+        target: String,
+        object: Value,
+    },
+    RuntimeBacklinkFailed {
+        target: String,
+        message: String,
+    },
+    ApprovalBacklinkResolved {
+        target: String,
+        object: Value,
+    },
+    ApprovalBacklinkFailed {
+        target: String,
+        message: String,
+    },
+    SurfaceBacklinkResolved {
+        target: String,
+        receipt: Value,
+    },
+    SurfaceBacklinkFailed {
+        target: String,
+        message: String,
+    },
     Warning {
         message: String,
     },
@@ -198,6 +225,14 @@ pub enum CowdEvent {
     MfgReadFailed {
         generation: u64,
         section: String,
+        error: app_mfg_contract::MfgApiErrorV1,
+    },
+    MfgActionAccepted {
+        intent_id: String,
+        response: app_mfg_contract::MfgMutationResponseV1,
+    },
+    MfgActionFailed {
+        intent_id: String,
         error: app_mfg_contract::MfgApiErrorV1,
     },
 }

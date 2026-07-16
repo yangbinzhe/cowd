@@ -16,6 +16,7 @@ pub enum MfgRecoveryActionKind {
     Resync,
     ChangeTarget,
     Abandon,
+    OpenRuntime,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -42,6 +43,9 @@ pub enum MfgErrorCode {
     ContractMismatch,
     ResyncRequired,
     ReviewRequired,
+    #[serde(rename = "mfg_assignment_task_transition_required")]
+    #[schemars(rename = "mfg_assignment_task_transition_required")]
+    AssignmentTaskTransitionRequired,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -96,6 +100,41 @@ impl MfgApiErrorV1 {
                 kind: MfgRecoveryActionKind::RequestAccess,
                 label: "Request access".to_string(),
                 target: None,
+                enabled: true,
+            }],
+            request_id: None,
+            receipt_ref: None,
+        }
+    }
+
+    #[must_use]
+    pub fn assignment_task_transition_required(
+        task_ref: impl Into<String>,
+        workflow_node_id: Option<String>,
+    ) -> Self {
+        let task_ref = task_ref.into();
+        let task_id = task_ref
+            .trim()
+            .strip_prefix("task://")
+            .or_else(|| task_ref.trim().strip_prefix("task:"))
+            .unwrap_or(task_ref.trim())
+            .to_string();
+        Self {
+            code: MfgErrorCode::AssignmentTaskTransitionRequired,
+            message:
+                "canonical task or workflow transition is required before assignment completion"
+                    .to_string(),
+            http_status: 409,
+            details: serde_json::json!({
+                "task_ref": task_ref,
+                "workflow_node_id": workflow_node_id,
+            }),
+            retryable: false,
+            contract_version: MfgContractVersion::default(),
+            recovery_actions: vec![MfgRecoveryAction {
+                kind: MfgRecoveryActionKind::OpenRuntime,
+                label: "Open canonical task or workflow".to_string(),
+                target: Some(format!("/tasks/{task_id}")),
                 enabled: true,
             }],
             request_id: None,

@@ -11,7 +11,7 @@ use std::{
 };
 
 use harness_contract::{execution_graph::ExecutionGraphProjection, strategy::StrategyDecision};
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use storage::{SqliteConnectionFactory, StorageHandle};
 
@@ -215,6 +215,102 @@ impl TaskKernel {
             .tasks
             .push(task.clone());
         self.persist()?;
+        Ok(task)
+    }
+
+    pub fn start_goal_idempotent(
+        &self,
+        task_id: &str,
+        objective: impl Into<String>,
+        yolo_mode: bool,
+    ) -> Result<TaskRecord, String> {
+        let task_id = task_id.trim();
+        let objective = objective.into();
+        if task_id.is_empty() || objective.trim().is_empty() {
+            return Err("task id and objective are required".to_string());
+        }
+        let mut conn = if let Some(handle) = &self.storage_handle {
+            SqliteConnectionFactory::default()
+                .open_handle(handle)
+                .map_err(|error| error.to_string())?
+        } else {
+            open_task_connection_path(&self.path)?
+        };
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        if let Some(json) = transaction
+            .query_row(
+                "SELECT record_json FROM tasks WHERE id = ?1",
+                params![task_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+        {
+            let existing =
+                serde_json::from_str::<TaskRecord>(&json).map_err(|error| error.to_string())?;
+            if existing.objective != objective || existing.yolo_mode != yolo_mode {
+                return Err(format!(
+                    "task id {task_id} is already bound to another governed objective"
+                ));
+            }
+            transaction.commit().map_err(|error| error.to_string())?;
+            return Ok(existing);
+        }
+        let now = now_ms();
+        let task = TaskRecord {
+            id: task_id.to_string(),
+            objective: objective.clone(),
+            status: TaskStatus::Running,
+            current_phase: Some("implementation".to_string()),
+            phases: vec![TaskPhaseRecord {
+                id: format!("phase-{task_id}-implementation"),
+                name: "implementation".to_string(),
+                objective,
+                plan: Vec::new(),
+                acceptance: Vec::new(),
+                test_commands: Vec::new(),
+                artifacts: Vec::new(),
+                review_result: None,
+                status: TaskPhaseStatus::Running,
+                created_at_ms: now,
+                updated_at_ms: now,
+            }],
+            yolo_mode,
+            failure_count: 0,
+            blocker_reason: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+            audit: vec![TaskAuditEvent {
+                event_type: "started".to_string(),
+                message: "task started".to_string(),
+                created_at_ms: now,
+            }],
+            execution_graph: None,
+            strategy: None,
+        };
+        transaction
+            .execute(
+                "INSERT INTO tasks (id, status, created_at_ms, updated_at_ms, record_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    task.id,
+                    task.status.as_str(),
+                    task.created_at_ms as i64,
+                    task.updated_at_ms as i64,
+                    serde_json::to_string(&task).map_err(|error| error.to_string())?,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        let mut store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !store.tasks.iter().any(|existing| existing.id == task.id) {
+            store.tasks.push(task.clone());
+        }
         Ok(task)
     }
 

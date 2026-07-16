@@ -200,11 +200,6 @@ impl MatrixSqliteRepository {
                 .collect();
             plan.affected_metric_ids = affected;
         }
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        upsert_data_plane_watermark(&connection, &plan.watermark)?;
         Ok(plan)
     }
 
@@ -343,7 +338,6 @@ impl MatrixSqliteRepository {
                 "entity match candidate below confidence threshold".to_string(),
             )
         })?;
-        insert_entity_match_candidate(&connection, &candidate)?;
         Ok(candidate)
     }
 
@@ -355,16 +349,43 @@ impl MatrixSqliteRepository {
         survivorship_rule: &str,
         notes: Option<String>,
     ) -> Result<matrix_core::MatrixEntityConflictDecision, MatrixSqliteRepositoryError> {
-        let connection = self
+        let mut connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        find_entity_match_candidate(&connection, candidate_id)?
-            .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(candidate_id.to_string()))?;
-        let survivor = find_entity(&connection, survivor_entity_id)?
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let survivor = find_entity(&transaction, survivor_entity_id)?
             .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(survivor_entity_id.to_string()))?;
-        let retired = find_entity(&connection, retired_entity_id)?
+        let retired = find_entity(&transaction, retired_entity_id)?
             .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(retired_entity_id.to_string()))?;
+        let candidate = match find_entity_match_candidate(&transaction, candidate_id)? {
+            Some(candidate) => candidate,
+            None => {
+                let candidate =
+                    matrix_core::match_candidate(&survivor, &retired).ok_or_else(|| {
+                        MatrixSqliteRepositoryError::NotFound(
+                            "entity match candidate below confidence threshold".to_string(),
+                        )
+                    })?;
+                if candidate.candidate_id != candidate_id {
+                    return Err(MatrixSqliteRepositoryError::NotFound(
+                        candidate_id.to_string(),
+                    ));
+                }
+                insert_entity_match_candidate(&transaction, &candidate)?;
+                candidate
+            }
+        };
+        let candidate_pair_matches = (candidate.left_entity_id == survivor_entity_id
+            && candidate.right_entity_id == retired_entity_id)
+            || (candidate.left_entity_id == retired_entity_id
+                && candidate.right_entity_id == survivor_entity_id);
+        if !candidate_pair_matches {
+            return Err(MatrixSqliteRepositoryError::InvalidScenario(
+                "entity conflict decision does not match the candidate pair".to_string(),
+            ));
+        }
         let decision = matrix_core::MatrixEntityConflictDecision {
             decision_id: format!("entity-conflict-decision-{}", uuid::Uuid::new_v4()),
             candidate_id: candidate_id.to_string(),
@@ -379,7 +400,8 @@ impl MatrixSqliteRepository {
             }),
             decided_at: Utc::now(),
         };
-        insert_entity_conflict_decision(&connection, &decision)?;
+        insert_entity_conflict_decision(&transaction, &decision)?;
+        transaction.commit()?;
         Ok(decision)
     }
 
@@ -1551,6 +1573,35 @@ impl MatrixSqliteRepository {
             .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(packet_id.to_string()))?;
         let decision = MatrixQualityGateDecision::for_evidence_packet(&packet);
         insert_quality_gate(&connection, &decision)?;
+        Ok(decision)
+    }
+
+    pub fn evaluate_evidence_quality_with_gate_id(
+        &self,
+        packet_id: &str,
+        gate_id: &str,
+    ) -> Result<MatrixQualityGateDecision, MatrixSqliteRepositoryError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(existing) = find_quality_gate(&transaction, gate_id)? {
+            if existing.target_ref == format!("matrix:evidence:{packet_id}") {
+                transaction.commit()?;
+                return Ok(existing);
+            }
+            return Err(MatrixSqliteRepositoryError::InvalidScenario(format!(
+                "quality gate id {gate_id} is bound to another evidence packet"
+            )));
+        }
+        let packet = find_evidence_packet(&transaction, packet_id)?
+            .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(packet_id.to_string()))?;
+        let mut decision = MatrixQualityGateDecision::for_evidence_packet(&packet);
+        decision.gate_id = gate_id.to_string();
+        insert_quality_gate(&transaction, &decision)?;
+        transaction.commit()?;
         Ok(decision)
     }
 
@@ -3974,6 +4025,49 @@ mod tests {
                 .revision,
             2
         );
+    }
+
+    #[test]
+    fn entity_match_preview_is_pure_and_decision_materializes_the_stable_candidate() {
+        let repository = MatrixSqliteRepository::in_memory().unwrap();
+        for entity_id in ["entity-preview-left", "entity-preview-right"] {
+            repository
+                .upsert_entity(&MatrixEntity::from_input(MatrixEntityInput {
+                    entity_id: Some(entity_id.to_string()),
+                    entity_type: "part".to_string(),
+                    canonical_key: entity_id.to_string(),
+                    display_name: Some("Shared preview identity".to_string()),
+                    source_keys: Vec::new(),
+                    attributes: Value::Null,
+                    confidence: None,
+                }))
+                .unwrap();
+        }
+
+        let first = repository
+            .propose_entity_match("entity-preview-left", "entity-preview-right")
+            .unwrap();
+        let second = repository
+            .propose_entity_match("entity-preview-left", "entity-preview-right")
+            .unwrap();
+        assert_eq!(first.candidate_id, second.candidate_id);
+        let preview_health = repository.health().unwrap();
+        assert_eq!(preview_health.entity_match_candidate_count, 0);
+        assert_eq!(preview_health.entity_conflict_decision_count, 0);
+
+        let decision = repository
+            .decide_entity_conflict(
+                &first.candidate_id,
+                "entity-preview-left",
+                "entity-preview-right",
+                "prefer_verified_source",
+                Some("governed commit".to_string()),
+            )
+            .unwrap();
+        assert_eq!(decision.candidate_id, first.candidate_id);
+        let committed_health = repository.health().unwrap();
+        assert_eq!(committed_health.entity_match_candidate_count, 1);
+        assert_eq!(committed_health.entity_conflict_decision_count, 1);
     }
 
     #[test]

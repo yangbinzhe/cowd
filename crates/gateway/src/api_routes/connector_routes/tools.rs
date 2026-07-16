@@ -1,6 +1,7 @@
 use super::*;
 use crate::api_routes::{principal_actor_id, AuthenticatedPrincipal};
 use axum::{http::StatusCode, Extension};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -68,29 +69,32 @@ pub(super) async fn connector_service_execute_handler(
             .into_response();
     };
     let service_metadata = connector.metadata();
-    let mode = request.mode.as_deref().unwrap_or("dry_run");
+    let mode = match request
+        .mode
+        .as_deref()
+        .unwrap_or("dry_run")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "dry_run" | "plan" => "dry_run",
+        "commit" | "live" | "execute" => "commit",
+        _ => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "mode must be one of dry_run, plan, commit, live, or execute",
+                })),
+            )
+                .into_response();
+        }
+    };
     let idempotency_key = request
         .idempotency_key
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    if let Some(key) = &idempotency_key {
-        if let Some(receipt) = state
-            .services
-            .cross_plane
-            .find_execution_by_idempotency_key(key)
-        {
-            return Json(serde_json::json!({
-                "kind": "connector_service_execution",
-                "service": service_metadata.id,
-                "replayed": true,
-                "receipt": receipt,
-            }))
-            .into_response();
-        }
-    }
-
     let service_request = ServiceToolRequest {
         tool_id: request.tool_id.clone(),
         resource_id: request.resource_id,
@@ -103,7 +107,15 @@ pub(super) async fn connector_service_execute_handler(
         &service_request.resource_id,
         &service_request.title,
     );
-    let action = state.services.connector.service_action(
+    let request_digest = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&service_request)
+                .unwrap_or_default()
+                .as_slice()
+        )
+    );
+    let mut action = state.services.connector.service_action(
         principal_actor_id(&principal),
         request.tool_id,
         request.actor_identity_ref,
@@ -112,6 +124,7 @@ pub(super) async fn connector_service_execute_handler(
         &service_metadata.id,
         Some(preview_resource.reference.clone()),
     );
+    action.target_ref = Some(format!("connector-request://sha256/{request_digest}"));
 
     let snapshot = connector_snapshot(&state);
     let (action, decision, evidence) = state.services.cross_plane.decide_connector_action(
@@ -120,6 +133,30 @@ pub(super) async fn connector_service_execute_handler(
         mode,
         chrono::Utc::now(),
     );
+    if let Some(key) = &idempotency_key {
+        if let Some(receipt) = state
+            .services
+            .cross_plane
+            .find_execution_by_idempotency_key(key)
+        {
+            if receipt.mode != mode || receipt.action != action {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "idempotency key is bound to another connector service request",
+                    })),
+                )
+                    .into_response();
+            }
+            return Json(serde_json::json!({
+                "kind": "connector_service_execution",
+                "service": service_metadata.id,
+                "replayed": true,
+                "receipt": receipt,
+            }))
+            .into_response();
+        }
+    }
 
     let policy_allowed = state.services.connector.policy_allows(&decision);
     let allowed = policy_allowed;
@@ -131,12 +168,36 @@ pub(super) async fn connector_service_execute_handler(
             service_metadata.id.clone(),
             service_request.clone(),
         ));
-        state
+        match state
             .services
             .cross_plane
-            .execute_commit_graph(&action, &decision, &graph_key, executor)
+            .execute_commit_graph(&action, &decision, &graph_key, None, executor)
             .await
-            .ok()
+        {
+            Ok(graph) => Some(graph),
+            Err(error) => {
+                let status = if error.is_idempotency_conflict() {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
+                let code = if error.is_idempotency_conflict() {
+                    "connector_idempotency_conflict"
+                } else {
+                    "connector_execution_graph_failed"
+                };
+                return (
+                    status,
+                    Json(serde_json::json!({
+                        "kind": "connector_service_execution_error",
+                        "code": code,
+                        "error": error.to_string(),
+                        "idempotency_key": graph_key,
+                    })),
+                )
+                    .into_response();
+            }
+        }
     } else {
         None
     };

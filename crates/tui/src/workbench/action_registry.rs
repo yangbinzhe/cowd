@@ -19,6 +19,58 @@ pub struct WorkbenchAction {
     pub action: Action,
 }
 
+#[derive(Debug, Clone)]
+pub struct MfgWorkbenchAction {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+    pub risk: ActionRisk,
+    pub requires_confirmation: bool,
+    pub receipt_target: &'static str,
+    pub action: Action,
+}
+
+pub fn registered_mfg_actions() -> Vec<MfgWorkbenchAction> {
+    app_mfg_contract::mfg_tui_action_contracts()
+        .into_iter()
+        .map(|contract| {
+            let command = if crate::runtime_control_store::mfg_action_requires_explicit_input(
+                contract.action_id,
+            ) {
+                format!("/mfg draft {}", contract.action_id.as_str())
+            } else {
+                format!("/mfg action {}", contract.action_id.as_str())
+            };
+            MfgWorkbenchAction {
+                id: contract.action_id.as_str().to_string(),
+                label: contract.action_id.as_str().to_string(),
+                description: format!(
+                    "{} via {} · capabilities:{}{}",
+                    contract.action_id.as_str(),
+                    contract.route_id.as_str(),
+                    contract.required_capabilities.join(","),
+                    if crate::runtime_control_store::mfg_action_requires_explicit_input(
+                        contract.action_id,
+                    ) {
+                        " · opens governed input template"
+                    } else {
+                        ""
+                    }
+                ),
+                risk: match contract.risk {
+                    app_mfg_contract::MfgActionRisk::Low => ActionRisk::Low,
+                    app_mfg_contract::MfgActionRisk::Medium => ActionRisk::Medium,
+                    app_mfg_contract::MfgActionRisk::High => ActionRisk::High,
+                },
+                requires_confirmation: contract.confirmation
+                    != app_mfg_contract::MfgConfirmationKind::None,
+                receipt_target: "mfg_operations_panel",
+                action: Action::Execute(command),
+            }
+        })
+        .collect()
+}
+
 pub fn registered_actions() -> Vec<WorkbenchAction> {
     vec![
         WorkbenchAction {
@@ -136,5 +188,19 @@ mod tests {
         assert_eq!(mfg.len(), 1);
         assert_eq!(mfg[0].id, "workbench.open_mfg");
         assert!(!mfg[0].requires_confirmation);
+        let operational = registered_mfg_actions();
+        assert_eq!(
+            operational
+                .iter()
+                .map(|action| action.id.as_str())
+                .collect::<std::collections::BTreeSet<_>>(),
+            app_mfg_contract::mfg_tui_action_contracts()
+                .iter()
+                .map(|action| action.action_id.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        assert!(operational
+            .iter()
+            .all(|action| action.receipt_target == "mfg_operations_panel"));
     }
 }

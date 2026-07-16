@@ -28,6 +28,8 @@ pub struct MfgReceiptV1 {
     #[serde(default)]
     pub result_revision: Option<u64>,
     pub payload_digest: String,
+    #[serde(default)]
+    pub correlation_id: Option<String>,
     pub status: MfgReceiptStatus,
     #[serde(default)]
     pub response: serde_json::Value,

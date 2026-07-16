@@ -49,4 +49,9 @@ pub struct MfgFrontendContractV1 {
     pub actions: Vec<MfgActionContract>,
     #[serde(default)]
     pub surfaces: Vec<MfgSurfaceContract>,
+    /// Effective capability grant for the authenticated principal on the
+    /// requesting surface. It is descriptive and never authorizes a request;
+    /// Gateway middleware remains the enforcement owner.
+    #[serde(default)]
+    pub granted_capabilities: Vec<String>,
 }

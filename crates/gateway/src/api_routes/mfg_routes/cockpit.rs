@@ -261,7 +261,7 @@ pub(super) async fn mfg_cockpit_profile_upsert_handler(
             "request_id": request.request_id,
             "session_id": request.session_id,
             "profile": profile,
-            "receipt": receipt,
+            "business_receipt": receipt,
         }),
         revision,
     ))
@@ -336,7 +336,7 @@ pub(super) async fn mfg_cockpit_profile_delete_handler(
         .canonical_receipt()
         .map_err(cockpit_internal_error)?;
     Ok(cockpit_profile_response(
-        serde_json::json!({ "kind": "mfg.cockpit.profile_deleted", "profile": profile, "receipt": receipt }),
+        serde_json::json!({ "kind": "mfg.cockpit.profile_deleted", "profile": profile, "business_receipt": receipt }),
         revision,
     ))
 }
@@ -413,7 +413,7 @@ pub(super) async fn mfg_cockpit_profile_clone_handler(
         .map_err(cockpit_internal_error)?;
     let clone = cockpit_profile_cropped_for(clone, &principal);
     Ok(cockpit_profile_response(
-        serde_json::json!({ "kind": "mfg.cockpit.profile_cloned", "source_profile_id": id, "profile": clone, "receipt": receipt }),
+        serde_json::json!({ "kind": "mfg.cockpit.profile_cloned", "source_profile_id": id, "profile": clone, "business_receipt": receipt }),
         revision,
     ))
 }
@@ -468,7 +468,7 @@ pub(super) async fn mfg_cockpit_profile_share_handler(
         .map_err(cockpit_internal_error)?;
     let profile = cockpit_profile_cropped_for(profile, &principal);
     Ok(cockpit_profile_response(
-        serde_json::json!({ "kind": "mfg.cockpit.profile_shared", "profile": profile, "receipt": receipt }),
+        serde_json::json!({ "kind": "mfg.cockpit.profile_shared", "profile": profile, "business_receipt": receipt }),
         revision,
     ))
 }
@@ -757,6 +757,7 @@ pub(super) async fn mfg_cockpit_report_generate_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
+    headers: HeaderMap,
     Json(request): Json<MfgCockpitReportGenerateRequest>,
 ) -> Result<impl IntoResponse, MfgCockpitApiError> {
     let profile = state
@@ -774,10 +775,20 @@ pub(super) async fn mfg_cockpit_report_generate_handler(
             "owner_or_editor_and_all_widget_capabilities",
         ));
     }
+    let idempotency_key = mfg_idempotency_key(&headers, None).map_err(|error| {
+        cockpit_mfg_api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            error.message,
+            serde_json::json!({"field": "idempotency_key"}),
+            &["provide_idempotency_key"],
+        )
+    })?;
+    let report_id = stable_mfg_resource_id("cockpit-report", &idempotency_key);
     let report = state
         .services
         .mfg
-        .generate_cockpit_report(&state.config_home, &id, request.report)
+        .generate_cockpit_report_idempotent(&state.config_home, &id, &report_id, request.report)
         .map_err(|error| match error {
             MfgRepositoryError::NotFound(message) => cockpit_not_found("cockpit_profile", &message),
             other => cockpit_internal_error(other),
@@ -844,21 +855,53 @@ pub(super) async fn mfg_cockpit_report_deliver_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
+    headers: HeaderMap,
     Json(intent): Json<MfgCockpitReportDeliveryIntent>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let capability = if intent.mode.trim().eq_ignore_ascii_case("dry_run") {
+    let mode = normalize_mfg_action_mode(&intent.mode)
+        .map_err(|error| mfg_api_error(StatusCode::UNPROCESSABLE_ENTITY, error))?;
+    let dry_run = mode == "dry_run";
+    let expected_revision = intent.expected_revision;
+    let body_idempotency_key = intent.idempotency_key.clone();
+    let capability = if dry_run {
         "mfg.read"
     } else {
         "mfg.report.deliver"
     };
     require_mfg_capability(&principal, capability)?;
-    let request = intent.into_request(principal_actor_id(&principal));
+    let mut request = intent.into_request(principal_actor_id(&principal));
+    request.mode = mode.to_string();
+    request.idempotency_key =
+        if dry_run && body_idempotency_key.is_none() && headers.get("idempotency-key").is_none() {
+            None
+        } else {
+            Some(
+                mfg_idempotency_key(&headers, body_idempotency_key)
+                    .map_err(|error| mfg_api_error(StatusCode::BAD_REQUEST, error.message))?,
+            )
+        };
     let report = state
         .services
         .mfg
         .get_cockpit_report(&state.config_home, &id)
         .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .ok_or_else(|| mfg_api_error(StatusCode::NOT_FOUND, "MFG cockpit report not found"))?;
+    let owner_replay = request.idempotency_key.as_deref().is_some_and(|key| {
+        state
+            .services
+            .cross_plane
+            .find_execution_by_idempotency_key(key)
+            .is_some()
+    });
+    if !dry_run && !owner_replay && expected_revision != Some(report.revision) {
+        return Err(mfg_api_error(
+            StatusCode::CONFLICT,
+            format!(
+                "report revision conflict: expected {expected_revision:?}, actual {}",
+                report.revision
+            ),
+        ));
+    }
     if !cockpit_report_accessible_to(&state, &report, &principal)
         .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
     {
@@ -1046,6 +1089,71 @@ pub(super) async fn mfg_cockpit_report_review_decision_handler(
             StatusCode::NOT_FOUND,
             "MFG report review was not found in the verified principal scope",
         ));
+    }
+    if let Some(existing) = state
+        .services
+        .mfg
+        .report_delivery_review_by_transition_key(&state.config_home, &id, &key)
+        .map_err(mfg_mutation_error)?
+    {
+        if existing.decision != Some(request.decision) {
+            return Err(mfg_api_error(
+                StatusCode::CONFLICT,
+                "idempotency key is bound to another report review decision",
+            ));
+        }
+        let approval_id = existing.approval_id.clone().ok_or_else(|| {
+            mfg_api_error(
+                StatusCode::CONFLICT,
+                "MFG report review has no correlated approval",
+            )
+        })?;
+        let decision_lease_ref = existing.decision_lease_ref.clone().ok_or_else(|| {
+            mfg_api_error(
+                StatusCode::CONFLICT,
+                "MFG report review has no bound decision lease",
+            )
+        })?;
+        if existing.status == app_mfg_contract::MfgReportDeliveryReviewStatus::DecisionPendingEffect
+        {
+            let runtime = mfg_review_runtime_services(&state)?;
+            runtime
+                .approval_queue()
+                .record_mfg_decision_fact(
+                    &approval_id,
+                    &existing.review_id,
+                    &actor,
+                    request.decision != app_mfg_contract::MfgReportDeliveryReviewDecision::Reject,
+                    &review_decision_string(request.decision),
+                    &existing.reason,
+                    &decision_lease_ref,
+                )
+                .map_err(|error| mfg_api_error(StatusCode::CONFLICT, error))?;
+            state
+                .services
+                .mfg
+                .activate_report_delivery_review_decision(
+                    &state.config_home,
+                    &existing.review_id,
+                    existing.revision,
+                    &actor,
+                    &format!("{key}:activate"),
+                )
+                .map_err(mfg_mutation_error)?;
+        }
+        reconcile_mfg_report_review_effects(&state, 8).await?;
+        let review = state
+            .services
+            .mfg
+            .get_report_delivery_review(&state.config_home, &id)
+            .map_err(mfg_mutation_error)?
+            .unwrap_or(existing);
+        return Ok(Json(serde_json::json!({
+            "kind": "mfg.report_delivery_review.decision",
+            "review": review,
+            "decision_lease_ref": decision_lease_ref,
+            "approval_id": approval_id,
+        })));
     }
     let action_id = review_decision_action_id(request.decision);
     let evidence_digest = review_decision_evidence_digest(&review, &request)?;
@@ -1580,9 +1688,24 @@ pub(super) async fn mfg_cockpit_report_delivery_retry_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
+    headers: HeaderMap,
     Json(request): Json<MfgCockpitReportDeliveryRetryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let normalized_mode = state.services.mfg.normalize_bridge_mode(&request.mode);
+    let normalized_mode = normalize_mfg_action_mode(&request.mode)
+        .map_err(|error| mfg_api_error(StatusCode::UNPROCESSABLE_ENTITY, error))?;
+    let expected_revision = request.expected_revision;
+    let body_idempotency_key = request.idempotency_key.clone();
+    let canonical_idempotency_key = if normalized_mode == "dry_run"
+        && body_idempotency_key.is_none()
+        && headers.get("idempotency-key").is_none()
+    {
+        None
+    } else {
+        Some(
+            mfg_idempotency_key(&headers, body_idempotency_key)
+                .map_err(|error| mfg_api_error(StatusCode::BAD_REQUEST, error.message))?,
+        )
+    };
     let capability = if normalized_mode == "dry_run" {
         "mfg.read"
     } else {
@@ -1595,6 +1718,22 @@ pub(super) async fn mfg_cockpit_report_delivery_retry_handler(
         .get_cockpit_report(&state.config_home, &id)
         .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .ok_or_else(|| mfg_api_error(StatusCode::NOT_FOUND, "MFG cockpit report not found"))?;
+    let owner_replay = canonical_idempotency_key.as_deref().is_some_and(|key| {
+        state
+            .services
+            .cross_plane
+            .find_execution_by_idempotency_key(key)
+            .is_some()
+    });
+    if normalized_mode != "dry_run" && !owner_replay && expected_revision != Some(report.revision) {
+        return Err(mfg_api_error(
+            StatusCode::CONFLICT,
+            format!(
+                "report revision conflict: expected {expected_revision:?}, actual {}",
+                report.revision
+            ),
+        ));
+    }
     if !cockpit_report_accessible_to(&state, &report, &principal)
         .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
     {
@@ -1612,7 +1751,7 @@ pub(super) async fn mfg_cockpit_report_delivery_retry_handler(
         ));
     }
     let before_state = MfgCockpitReportDeliveryState::from_report(&report);
-    if !before_state.retryable {
+    if normalized_mode != "dry_run" && !owner_replay && !before_state.retryable {
         return Err(mfg_api_error(
             StatusCode::CONFLICT,
             format!(
@@ -1621,12 +1760,13 @@ pub(super) async fn mfg_cockpit_report_delivery_retry_handler(
             ),
         ));
     }
-    let delivery_request = mfg_retry_delivery_request(
+    let mut delivery_request = mfg_retry_delivery_request(
         &report,
         &before_state,
         request,
         principal_actor_id(&principal),
     );
+    delivery_request.idempotency_key = canonical_idempotency_key;
     let outcome = deliver_mfg_cockpit_report(&state, report, delivery_request).await?;
     let after_state = MfgCockpitReportDeliveryState::from_report(&outcome.report);
     Ok(Json(serde_json::json!({
@@ -1871,7 +2011,8 @@ pub(super) async fn deliver_mfg_cockpit_report(
     report: MfgCockpitReportSnapshot,
     request: MfgCockpitReportDeliveryRequest,
 ) -> Result<MfgCockpitReportDeliveryOutcome, (StatusCode, Json<ErrorResponse>)> {
-    let mode = state.services.mfg.normalize_bridge_mode(&request.mode);
+    let mode = normalize_mfg_action_mode(&request.mode)
+        .map_err(|error| mfg_api_error(StatusCode::UNPROCESSABLE_ENTITY, error))?;
     let idempotency_key = request
         .idempotency_key
         .as_deref()
@@ -1882,6 +2023,36 @@ pub(super) async fn deliver_mfg_cockpit_report(
         .services
         .mfg
         .report_delivery_payload(&report, &request);
+    let requested_action =
+        state
+            .services
+            .mfg
+            .report_delivery_action(&report, &request, &delivery_payload);
+    let now = chrono::Utc::now();
+    let snapshot = crate::api_routes::connector_routes::connector_snapshot(state);
+    let (action, decision, evidence) =
+        state
+            .services
+            .cross_plane
+            .decide_connector_action(&snapshot, requested_action, mode, now);
+
+    if mode == "dry_run" {
+        let receipt = state.services.cross_plane.preview_action(
+            idempotency_key,
+            mode.to_string(),
+            action,
+            decision,
+        );
+        return Ok(MfgCockpitReportDeliveryOutcome {
+            mode: receipt.mode.clone(),
+            status: receipt.status.clone(),
+            dispatch_status: receipt.dispatch_status.clone(),
+            report,
+            delivery_payload,
+            cross_plane_execution_receipt: receipt,
+            idempotent_replay: false,
+        });
+    }
 
     if let Some(key) = &idempotency_key {
         if let Some(receipt) = state
@@ -1892,7 +2063,7 @@ pub(super) async fn deliver_mfg_cockpit_report(
             if !state
                 .services
                 .mfg
-                .report_delivery_receipt_matches(&receipt, &report)
+                .report_delivery_receipt_matches(&receipt, &action)
             {
                 return Err(mfg_api_error(
                     StatusCode::CONFLICT,
@@ -1918,16 +2089,6 @@ pub(super) async fn deliver_mfg_cockpit_report(
         }
     }
 
-    let action = state
-        .services
-        .mfg
-        .report_delivery_action(&report, &request, &delivery_payload);
-    let now = chrono::Utc::now();
-    let snapshot = crate::api_routes::connector_routes::connector_snapshot(state);
-    let (action, decision, evidence) = state
-        .services
-        .cross_plane
-        .decide_connector_action(&snapshot, action, &mode, now);
     let receipt = if mode == "commit" && decision.decision == runtime::PolicyDecisionKind::Allow {
         let graph_key = idempotency_key
             .clone()
@@ -1946,9 +2107,9 @@ pub(super) async fn deliver_mfg_cockpit_report(
         let projection = state
             .services
             .cross_plane
-            .execute_commit_graph(&action, &decision, &graph_key, executor)
+            .execute_commit_graph(&action, &decision, &graph_key, Some(&target), executor)
             .await
-            .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+            .map_err(mfg_cross_plane_graph_error)?;
         state
             .services
             .cross_plane
@@ -1960,13 +2121,19 @@ pub(super) async fn deliver_mfg_cockpit_report(
                 target,
                 &projection,
             )
-            .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+            .map_err(mfg_cross_plane_error)?
     } else {
         state
             .services
             .cross_plane
-            .record_non_commit_action(idempotency_key, mode.clone(), action, decision, evidence)
-            .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+            .record_non_commit_action(
+                idempotency_key,
+                mode.to_string(),
+                action,
+                decision,
+                evidence,
+            )
+            .map_err(mfg_cross_plane_error)?
     };
     let report = state
         .services

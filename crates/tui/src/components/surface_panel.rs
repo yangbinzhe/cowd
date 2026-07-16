@@ -24,6 +24,8 @@ pub struct SurfacePanel {
     message_routes: Vec<MessageRouteSummary>,
     message_bindings: Vec<MessageBindingSummary>,
     selected: usize,
+    focused_backlink_target: Option<String>,
+    focused_backlink_resolution: Option<String>,
     last_status: Option<String>,
     last_receipt: Option<serde_json::Value>,
     pending_confirm: Option<&'static str>,
@@ -40,6 +42,8 @@ impl SurfacePanel {
             message_routes: Vec::new(),
             message_bindings: Vec::new(),
             selected: 0,
+            focused_backlink_target: None,
+            focused_backlink_resolution: None,
             last_status: None,
             last_receipt: None,
             pending_confirm: None,
@@ -97,6 +101,75 @@ impl SurfacePanel {
         self.last_status = Some(status.into());
     }
 
+    pub fn focus_backlink_target(&mut self, target: impl Into<String>) {
+        let target = target.into();
+        let surface_id = target
+            .strip_prefix("surface://")
+            .and_then(|suffix| suffix.split('/').next());
+        if let Some(index) = self.surfaces.iter().position(|surface| {
+            surface_id == Some(surface.id.as_str()) || target.contains(&surface.id)
+        }) {
+            self.selected = index;
+            let surface = &self.surfaces[index];
+            let event = self.events.iter().find(|event| {
+                event.surface == surface.id
+                    && target
+                        .split('/')
+                        .next_back()
+                        .is_some_and(|object| event.detail.contains(object))
+            });
+            self.focused_backlink_resolution = Some(match event {
+                Some(event) => format!(
+                    "surface {} event {} {}",
+                    surface.id, event.event_type, event.detail
+                ),
+                None => format!(
+                    "surface {} status {} transport {}",
+                    surface.id, surface.status, surface.transport
+                ),
+            });
+        } else if target.starts_with("receipt://cross-plane/") {
+            self.focused_backlink_resolution =
+                Some("loading exact cross-plane execution receipt".to_string());
+        } else {
+            self.focused_backlink_resolution = None;
+        }
+        self.focused_backlink_target = Some(target);
+    }
+
+    pub fn clear_backlink_target(&mut self) {
+        self.focused_backlink_target = None;
+        self.focused_backlink_resolution = None;
+    }
+
+    pub fn record_backlink_receipt(
+        &mut self,
+        target: impl Into<String>,
+        receipt: serde_json::Value,
+    ) {
+        let target = target.into();
+        self.focus_backlink_target(target.clone());
+        self.last_status = Some(format!("Resolved exact Surface receipt {target}"));
+        let status = receipt
+            .get("cross_plane_dispatch_status")
+            .or_else(|| receipt.get("cross_plane_status"))
+            .or_else(|| receipt.get("dispatch_status"))
+            .or_else(|| receipt.get("status"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        self.focused_backlink_resolution = Some(format!("{target} status {status}"));
+        self.last_receipt = Some(receipt);
+    }
+
+    pub fn record_backlink_failure(
+        &mut self,
+        target: impl Into<String>,
+        message: impl Into<String>,
+    ) {
+        self.focused_backlink_target = Some(target.into());
+        self.focused_backlink_resolution = Some(format!("Resolution failed: {}", message.into()));
+    }
+
     pub fn render(&mut self, ctx: &mut RenderContext, area: Rect) {
         <Self as Component>::render(self, ctx, area);
     }
@@ -116,6 +189,28 @@ impl Component for SurfacePanel {
     fn render(&mut self, ctx: &mut RenderContext, area: Rect) {
         let mut lines = Vec::new();
         let health = self.health.as_ref();
+        if let Some(target) = self.focused_backlink_target.as_deref() {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "Backlink target: ",
+                    Style::default().fg(Color::LightMagenta),
+                ),
+                Span::styled(target.to_string(), Style::default().fg(Color::White)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "Resolved object: ",
+                    Style::default().fg(Color::LightMagenta),
+                ),
+                Span::styled(
+                    self.focused_backlink_resolution
+                        .as_deref()
+                        .unwrap_or("canonical Surface object is unavailable")
+                        .to_string(),
+                    Style::default().fg(Color::White),
+                ),
+            ]));
+        }
         lines.push(Line::from(vec![
             Span::styled("Host: ", Style::default().fg(Color::DarkGray)),
             Span::styled(

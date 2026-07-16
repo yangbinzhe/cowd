@@ -228,13 +228,6 @@ impl MfgService {
         run_server_manufacturing_skill(incident, skill, analysis, packet)
     }
 
-    pub(crate) fn normalize_bridge_mode(&self, mode: &str) -> String {
-        match mode.trim().to_ascii_lowercase().as_str() {
-            "commit" | "live" | "execute" => "commit".to_string(),
-            _ => "dry_run".to_string(),
-        }
-    }
-
     pub(crate) fn open_store(
         &self,
         config_home: impl AsRef<Path>,
@@ -359,6 +352,17 @@ impl MfgService {
             .build_evidence_packet(attention_id, title)
     }
 
+    pub(crate) fn build_evidence_packet_idempotent(
+        &self,
+        config_home: impl AsRef<Path>,
+        packet_id: &str,
+        attention_id: Option<&str>,
+        title: Option<&str>,
+    ) -> Result<MatrixEvidencePacket, MfgRepositoryError> {
+        self.open_store(config_home)?
+            .build_evidence_packet_idempotent(packet_id, attention_id, title)
+    }
+
     pub(crate) fn evaluate_evidence_quality(
         &self,
         config_home: impl AsRef<Path>,
@@ -421,6 +425,16 @@ impl MfgService {
         self.open_store(config_home)?.analyze_incident(incident_id)
     }
 
+    pub(crate) fn analyze_incident_idempotent(
+        &self,
+        config_home: impl AsRef<Path>,
+        incident_id: &str,
+        analysis_id: &str,
+    ) -> Result<MfgOperationalAnalysis, MfgRepositoryError> {
+        self.open_store(config_home)?
+            .analyze_incident_idempotent(incident_id, analysis_id)
+    }
+
     pub(crate) fn latest_analysis_for_incident(
         &self,
         config_home: impl AsRef<Path>,
@@ -447,6 +461,29 @@ impl MfgService {
     ) -> Result<MfgActionExecution, MfgRepositoryError> {
         self.open_store(config_home)?
             .execute_recommended_action(analysis_id, action_id, request)
+    }
+
+    pub(crate) fn preview_recommended_action(
+        &self,
+        config_home: impl AsRef<Path>,
+        analysis_id: &str,
+        action_id: &str,
+        request: &MfgActionExecutionRequest,
+    ) -> Result<MfgActionExecution, MfgRepositoryError> {
+        self.open_store(config_home)?
+            .preview_recommended_action(analysis_id, action_id, request)
+    }
+
+    pub(crate) fn execute_recommended_action_idempotent(
+        &self,
+        config_home: impl AsRef<Path>,
+        analysis_id: &str,
+        action_id: &str,
+        execution_id: &str,
+        request: &MfgActionExecutionRequest,
+    ) -> Result<MfgActionExecution, MfgRepositoryError> {
+        self.open_store(config_home)?
+            .execute_recommended_action_idempotent(analysis_id, action_id, execution_id, request)
     }
 
     pub(crate) fn get_execution(
@@ -701,6 +738,17 @@ impl MfgService {
             .generate_cockpit_report(profile_id, request)
     }
 
+    pub(crate) fn generate_cockpit_report_idempotent(
+        &self,
+        config_home: impl AsRef<Path>,
+        profile_id: &str,
+        report_id: &str,
+        request: MfgCockpitReportRequest,
+    ) -> Result<MfgCockpitReportSnapshot, MfgRepositoryError> {
+        self.open_store(config_home)?
+            .generate_cockpit_report_idempotent(profile_id, report_id, request)
+    }
+
     pub(crate) fn get_cockpit_report(
         &self,
         config_home: impl AsRef<Path>,
@@ -775,6 +823,16 @@ impl MfgService {
     ) -> Result<Option<MfgReportDeliveryReview>, MfgRepositoryError> {
         self.open_store(config_home)?
             .get_report_delivery_review(review_id)
+    }
+
+    pub(crate) fn report_delivery_review_by_transition_key(
+        &self,
+        config_home: impl AsRef<Path>,
+        review_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<MfgReportDeliveryReview>, MfgRepositoryError> {
+        self.open_store(config_home)?
+            .report_delivery_review_by_transition_key(review_id, idempotency_key)
     }
 
     pub(crate) fn list_report_delivery_reviews(
@@ -1049,6 +1107,22 @@ impl MfgService {
             .command_assignment(assignment_id, command)
     }
 
+    pub(crate) fn reserve_assignment_completion(
+        &self,
+        config_home: impl AsRef<Path>,
+        assignment_id: &str,
+        expected_revision: u64,
+        actor_ref: &str,
+        correlation_id: &str,
+    ) -> Result<MfgAssignment, MfgRepositoryError> {
+        self.open_store(config_home)?.reserve_assignment_completion(
+            assignment_id,
+            expected_revision,
+            actor_ref,
+            correlation_id,
+        )
+    }
+
     pub(crate) fn live_projection(
         &self,
         config_home: impl AsRef<Path>,
@@ -1066,6 +1140,71 @@ impl MfgService {
     ) -> Result<MfgCommandReceipt, MfgRepositoryError> {
         self.open_store(config_home)?
             .record_command_notifications(idempotency_key, notification_refs)
+    }
+
+    pub(crate) fn command_notification_refs_for_resource(
+        &self,
+        config_home: impl AsRef<Path>,
+        resource_ref: &str,
+    ) -> Result<Vec<String>, MfgRepositoryError> {
+        self.open_store(config_home)?
+            .command_notification_refs_for_resource(resource_ref)
+    }
+
+    pub(crate) fn native_command_receipt_by_identity(
+        &self,
+        config_home: impl AsRef<Path>,
+        idempotency_key: &str,
+        actor_principal: &str,
+        action_id: &str,
+        resource_ref: &str,
+    ) -> Result<Option<app_mfg::MfgCommandReceipt>, MfgRepositoryError> {
+        self.open_store(config_home)?
+            .native_command_receipt_by_identity(
+                idempotency_key,
+                actor_principal,
+                action_id,
+                resource_ref,
+            )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn claim_mutation_receipt(
+        &self,
+        config_home: impl AsRef<Path>,
+        idempotency_key: &str,
+        actor_principal: &str,
+        action_id: &str,
+        resource_ref: &str,
+        expected_revision: Option<u64>,
+        payload_digest: &str,
+        correlation_id: &str,
+    ) -> Result<app_mfg::MfgMutationClaim, MfgRepositoryError> {
+        self.open_store(config_home)?.claim_mutation_receipt(
+            idempotency_key,
+            actor_principal,
+            action_id,
+            resource_ref,
+            expected_revision,
+            payload_digest,
+            correlation_id,
+        )
+    }
+
+    pub(crate) fn release_mutation_claim(
+        &self,
+        config_home: impl AsRef<Path>,
+        idempotency_key: &str,
+        actor_principal: &str,
+        action_id: &str,
+        payload_digest: &str,
+    ) -> Result<bool, MfgRepositoryError> {
+        self.open_store(config_home)?.release_mutation_claim(
+            idempotency_key,
+            actor_principal,
+            action_id,
+            payload_digest,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]

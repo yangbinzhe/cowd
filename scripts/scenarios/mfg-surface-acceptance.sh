@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# V543 establishes the evidence producer contract only. V545 activates the
+# V544 establishes the governed-action evidence producer contract. V545 activates the
 # multi-surface orchestration lane; until then this script must never return a
 # successful status that could be mistaken for acceptance evidence.
 
@@ -40,7 +40,7 @@ export COWD_INTERACTIVE_ARTIFACT_DIR="${artifact_dir}"
 export COWD_INTERACTIVE_TMUX_LABEL="${tmux_prefix}"
 
 if [[ "${COWD_MFG_SURFACE_ACCEPTANCE_ACTIVATED:-0}" != "1" ]]; then
-  echo "MFG surface acceptance is intentionally not activated in V543." >&2
+  echo "MFG multi-Surface acceptance is intentionally not activated until V545." >&2
   echo "V545 must add isolated Gateway startup, fixture seeding, WebUI/TUI observers, live cursor checks, and artifact export." >&2
   exit 64
 fi

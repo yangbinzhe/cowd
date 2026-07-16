@@ -45,31 +45,37 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
     tui.enter()?;
     tui.wait_for("MFG Operations", 20)?;
     tui.wait_for("mfg.frontend.v1", 20)?;
-    tui.wait_for("ReadOnly", 20)?;
-    println!("\n── TUI MFG Operations (V543 read-only producer) ──");
+    tui.wait_for("Operational", 20)?;
+    println!("\n── TUI MFG Operations (V544 governed actions producer) ──");
 
-    runner.run("V543 MFG contract and read-only shell visible", || {
-        let capture = tui.capture_step("mfg-open-80x24", &[])?;
-        if !capture.contains("MFG Operations")
-            || !capture.contains("ReadOnly")
-            || capture.contains("contract pending")
-            || capture.contains("refreshed=never")
-        {
-            return Err(anyhow!("MFG read-only contract status is not visible"));
-        }
-        if !capture.contains("actions=0") || !capture.contains("mutations=0") {
-            return Err(anyhow!(
-                "V543 read-only shell did not prove zero actions and zero mutations"
+    runner.run(
+        "V544 MFG operational contract and action inventory visible",
+        || {
+            let capture = tui.capture_step("mfg-open-80x24", &[])?;
+            if !capture.contains("MFG Operations")
+                || !capture.contains("Operational")
+                || capture.contains("contract pending")
+                || capture.contains("refreshed=never")
+            {
+                return Err(anyhow!("MFG operational contract status is not visible"));
+            }
+            let action_count = mfg_any_fact(&capture, "actions")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or_default();
+            if action_count == 0 || !capture.contains("mutations=0") {
+                return Err(anyhow!(
+                "V544 operational shell did not expose governed actions with an idle mutation queue"
             ));
-        }
-        Ok(())
-    });
+            }
+            Ok(())
+        },
+    );
 
     tui.send_key("Right")?;
     tui.wait_for("tab=Incidents", 20)?;
     tui.wait_for("id=", 20)?;
 
-    runner.run("V543 responsive 80-96-120 read layout", || {
+    runner.run("V544 responsive 80-96-120 operational layout", || {
         let compact = tui.capture_step("responsive-80x24-list", &[])?;
         if compact.contains("Backlinks") {
             return Err(anyhow!("80x24 must use the single-column MFG layout"));
@@ -80,10 +86,10 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
             return Err(anyhow!("80x24 Enter did not switch to detail"));
         }
 
-        tui.resize(96, 30)?;
-        let medium = tui.capture_step("responsive-96x30", &[])?;
+        tui.resize(96, 28)?;
+        let medium = tui.capture_step("responsive-96x28", &[])?;
         if !medium.contains("Detail") {
-            return Err(anyhow!("96x30 did not expose the two-column detail"));
+            return Err(anyhow!("96x28 did not expose the two-column detail"));
         }
 
         tui.resize(120, 40)?;
@@ -94,7 +100,7 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
         Ok(())
     });
 
-    runner.run("V543 responsive selection and focus survive resize", || {
+    runner.run("V544 responsive selection and focus survive resize", || {
         tui.send_key("Enter")?;
         tui.send_key("j")?;
         let before = tui.capture_step("selection-before-resize", &[])?;
@@ -105,7 +111,7 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
         let list_scroll = mfg_header_fact(&before, "list-scroll")
             .ok_or_else(|| anyhow!("MFG list scroll was not exposed in the evidence header"))?;
         tui.resize(80, 24)?;
-        tui.resize(96, 30)?;
+        tui.resize(96, 28)?;
         let after = tui.capture_step("selection-after-resize", &[])?;
         if !after.contains(&format!("id={selected}")) {
             return Err(anyhow!(
@@ -124,12 +130,9 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
         tui.resize(120, 40)?;
         let incident_context = tui.capture_step("backlink-incident-context", &[])?;
         assert_backlink(&tui, "e", "Evidence", &incident_context)?;
-        assert_backlink(&tui, "s", "Surface", &incident_context)?;
         assert_backlink(&tui, "x", "Runtime", &incident_context)?;
 
-        for _ in 0..3 {
-            tui.send_key("Tab")?;
-        }
+        tui.send_key("BTab")?;
         for _ in 0..4 {
             tui.send_key("Right")?;
         }
@@ -137,22 +140,115 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
         tui.wait_for("id=review", 20)?;
         let review_context = tui.capture_step("backlink-review-context", &[])?;
         assert_backlink(&tui, "p", "Approval", &review_context)?;
+        tui.send_key("Left")?;
+        tui.wait_for("tab=Reports", 20)?;
+        tui.wait_for("id=report", 20)?;
+        let report_context = tui.capture_step("backlink-report-context", &[])?;
+        assert_backlink(&tui, "s", "Surface", &report_context)?;
+        Ok(())
+    });
+
+    runner.run("V544 high-risk cancel, receipt, and conflict sequence", || {
+        tui.resize(120, 40)?;
+        tui.send("/mfg action mfg.alert.escalate")?;
+        tui.enter()?;
+        tui.wait_for("AwaitingConfirmation", 20)?;
+        let prepared = tui.capture_step("action-escalate-prepared", &[])?;
+        let cancelled_key = mfg_any_fact(&prepared, "key")
+            .ok_or_else(|| anyhow!("prepared action did not expose its idempotency key"))?;
+        if !prepared.contains("target=mfg:alert-occurrence:")
+            || !prepared.contains("revision=")
+            || !prepared.contains("CONFIRM High")
+        {
+            return Err(anyhow!(
+                "high-risk confirmation omitted target, revision, or impact"
+            ));
+        }
+        tui.send("/mfg cancel")?;
+        tui.enter()?;
+        tui.wait_for("Cancelled", 20)?;
+        let cancelled = tui.capture_step("action-escalate-cancelled", &[])?;
+        if mfg_any_fact(&cancelled, "key").as_deref() != Some(cancelled_key.as_str())
+            || !cancelled.contains("mutations=0")
+            || cancelled.contains("receipt=")
+        {
+            return Err(anyhow!(
+                "cancelled action sent a request, consumed its key, or created a receipt"
+            ));
+        }
+
+        tui.send("/mfg action mfg.alert.escalate")?;
+        tui.enter()?;
+        tui.wait_for("AwaitingConfirmation", 20)?;
+        let commit_prepared = tui.capture_step("action-escalate-confirmation", &[])?;
+        let stale_revision = mfg_action_fact(&commit_prepared, "revision")
+            .ok_or_else(|| anyhow!("confirmed action did not expose expected revision"))?;
+        tui.send("/mfg confirm")?;
+        tui.enter()?;
+        tui.wait_for("Accepted", 20)?;
+        tui.wait_for("receipt=", 20)?;
+        let accepted = tui.capture_step("action-escalate-accepted", &[])?;
+        if !accepted.contains("receipt=")
+            || !accepted.contains("correlation=")
+            || !accepted.contains("result-revision=")
+        {
+            return Err(anyhow!(
+                "accepted action did not expose canonical receipt evidence"
+            ));
+        }
+        tui.resize(80, 24)?;
+        let accepted_compact = tui.capture_step("action-accepted-80x24", &[])?;
+        if !accepted_compact.contains("receipt=") || !accepted_compact.contains("Recovery") {
+            return Err(anyhow!(
+                "80x24 action view hid the canonical receipt or recovery section"
+            ));
+        }
+        tui.resize(96, 28)?;
+        let accepted_medium = tui.capture_step("action-accepted-96x28", &[])?;
+        if !accepted_medium.contains("receipt=") || !accepted_medium.contains("Recovery") {
+            return Err(anyhow!(
+                "96x28 action view hid the canonical receipt or recovery section"
+            ));
+        }
+        tui.resize(120, 40)?;
+
+        tui.send(&format!(
+            "/mfg action mfg.alert.resolve {{\"body\":{{\"command\":\"resolve\",\"expected_revision\":{stale_revision},\"reason\":\"PTY conflict proof\"}}}}"
+        ))?;
+        tui.enter()?;
+        tui.wait_for("AwaitingConfirmation", 20)?;
+        tui.send("/mfg confirm")?;
+        tui.enter()?;
+        tui.wait_for("Conflict", 20)?;
+        let conflict = tui.capture_step("action-stale-revision-conflict", &[])?;
+        if !conflict.contains("RevisionConflict")
+            || !conflict.contains("retryable=false")
+            || conflict.contains("result-revision=")
+        {
+            return Err(anyhow!(
+                "stale revision did not stop at a non-overwriting typed conflict"
+            ));
+        }
+
         tui.write_sidecar(
-            "v543-read-only-boundary",
+            "v544-governed-action-boundary",
             &[],
             json!({
                 "assertions": [
-                    "contract_read_only",
+                    "contract_operational",
                     "responsive_80_96_120",
                     "selection_preserved",
-                    "backlink_intents"
+                    "backlink_navigation",
+                    "high_risk_cancel_no_request",
+                    "accepted_receipt_visible",
+                    "stale_revision_conflict_no_overwrite"
                 ],
-                "status": "v543_read_only_producer_observed",
-                "target_acceptance_ids": ["TUI-01", "TUI-02", "TUI-03", "TUI-04"],
+                "status": "v544_governed_action_producer_observed",
+                "target_acceptance_ids": ["TUI-01", "TUI-02", "TUI-03", "TUI-04", "TUI-05"],
                 "deferred_acceptance_ids": ["TUI-01", "TUI-02", "TUI-03", "TUI-04", "TUI-05", "TUI-06", "TUI-07", "TUI-08"],
-                "receipt": null,
+                "receipt": mfg_any_fact(&accepted, "receipt"),
                 "cursor": null,
-                "pending_mutation": null
+                "pending_mutation": mfg_any_fact(&conflict, "mutations")
             }),
         )?;
         Ok(())
@@ -165,16 +261,54 @@ fn assert_backlink(tui: &TuiSession, key: &str, label: &str, context: &str) -> a
     let target = backlink_target(context, label)
         .ok_or_else(|| anyhow!("fixture has no canonical {label} backlink target"))?;
     tui.send_key(key)?;
-    std::thread::sleep(std::time::Duration::from_millis(150));
-    let capture = tui.capture_step(&format!("backlink-{}", label.to_ascii_lowercase()), &[])?;
+    let identity = target
+        .split(['/', ':'])
+        .next_back()
+        .unwrap_or(target.as_str())
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default();
+    let mut capture = String::new();
+    for _ in 0..200 {
+        capture = tui.capture_step(&format!("backlink-{}", label.to_ascii_lowercase()), &[])?;
+        let resolved = if label == "Evidence" {
+            capture.contains("focused_evidence_ref")
+                && capture.contains("evidence_context")
+                && !capture.contains("section error")
+        } else {
+            capture
+                .lines()
+                .find(|line| line.contains("Resolved object:"))
+                .is_some_and(|line| {
+                    line.contains(identity)
+                        && !line.to_ascii_lowercase().contains("loading")
+                        && !line.to_ascii_lowercase().contains("unavailable")
+                        && !line.to_ascii_lowercase().contains("failed")
+                })
+        };
+        if resolved {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     if capture.contains(&format!("No {label} backlink"))
         || !capture.contains(&format!("{label} backlink"))
         || !capture.contains(&target)
+        || (label != "Evidence"
+            && !capture.lines().any(|line| {
+                line.contains("Resolved object:")
+                    && line.contains(identity)
+                    && !line.to_ascii_lowercase().contains("loading")
+                    && !line.to_ascii_lowercase().contains("failed")
+            }))
     {
         return Err(anyhow!(
-            "{label} backlink intent did not preserve canonical target {target}"
+            "{label} backlink did not focus its destination panel on canonical target {target}"
         ));
     }
+    tui.send("/mfg")?;
+    tui.enter()?;
+    tui.wait_for("MFG Operations", 20)?;
     Ok(())
 }
 
@@ -198,6 +332,30 @@ fn mfg_header_fact(capture: &str, key: &str) -> Option<String> {
     capture
         .lines()
         .find(|line| line.contains("selection-revision="))
+        .and_then(|line| line.split(&marker).nth(1))
+        .and_then(|value| value.split_whitespace().next())
+        .map(|value| value.trim_end_matches('·').to_string())
+}
+
+fn mfg_any_fact(capture: &str, key: &str) -> Option<String> {
+    let marker = format!("{key}=");
+    capture
+        .lines()
+        .find_map(|line| line.split(&marker).nth(1))
+        .and_then(|value| value.split_whitespace().next())
+        .map(|value| {
+            value
+                .trim_end_matches('·')
+                .trim_end_matches(',')
+                .to_string()
+        })
+}
+
+fn mfg_action_fact(capture: &str, key: &str) -> Option<String> {
+    let marker = format!("{key}=");
+    capture
+        .lines()
+        .find(|line| line.contains("target=") && line.contains(&marker))
         .and_then(|line| line.split(&marker).nth(1))
         .and_then(|value| value.split_whitespace().next())
         .map(|value| value.trim_end_matches('·').to_string())

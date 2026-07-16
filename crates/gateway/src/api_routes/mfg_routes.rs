@@ -34,7 +34,6 @@ use crate::services::{
 
 use super::matrix_outcomes::{
     append_matrix_execution_outcome, matrix_evidence_packet_outcome, matrix_fact_outcome,
-    matrix_ingest_plan_outcome,
 };
 use super::mfg_outcomes::{
     append_mfg_execution_outcome, mfg_action_execution_outcome, mfg_skill_run_execution_outcome,
@@ -132,6 +131,8 @@ pub(super) struct MfgCockpitReportDeliveryIntent {
     #[serde(default = "default_mfg_bridge_mode")]
     mode: String,
     #[serde(default)]
+    expected_revision: Option<u64>,
+    #[serde(default)]
     idempotency_key: Option<String>,
     #[serde(default)]
     actor_identity_ref: Option<String>,
@@ -158,6 +159,8 @@ pub(super) struct MfgCockpitReportDeliveryIntent {
 pub(super) struct MfgActionExecutionIntent {
     #[serde(default = "default_mfg_bridge_mode")]
     mode: String,
+    #[serde(default)]
+    expected_revision: Option<u64>,
     #[serde(default)]
     note: Option<String>,
 }
@@ -784,9 +787,7 @@ async fn mfg_capability_middleware(
         )
             .into_response();
     }
-    if contract.class != app_mfg_contract::MfgMutationClass::Read
-        && !route_has_native_receipt(contract.route_id)
-    {
+    if contract.class != app_mfg_contract::MfgMutationClass::Read {
         return mfg_mutation_ledger_middleware(state, request, next, contract, principal).await;
     }
     let response = next.run(request).await;
@@ -816,22 +817,6 @@ async fn mfg_capability_middleware(
     response
 }
 
-fn route_has_native_receipt(route_id: app_mfg_contract::MfgRouteId) -> bool {
-    use app_mfg_contract::MfgRouteId as R;
-    matches!(
-        route_id,
-        R::CockpitProfileUpsert
-            | R::CockpitProfileDelete
-            | R::CockpitProfileClone
-            | R::CockpitProfileShare
-            | R::AlertRuleUpsert
-            | R::AlertSubscriptionUpsert
-            | R::AlertCommand
-            | R::AssignmentUpsert
-            | R::AssignmentCommand
-    )
-}
-
 async fn mfg_mutation_ledger_middleware(
     state: Arc<AppState>,
     request: Request<Body>,
@@ -848,6 +833,13 @@ async fn mfg_mutation_ledger_middleware(
     let header_key = request
         .headers()
         .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let header_correlation = request
+        .headers()
+        .get("x-cowd-correlation-id")
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -884,12 +876,29 @@ async fn mfg_mutation_ledger_middleware(
             }
         }
     };
+    if matches!(
+        contract.route_id,
+        app_mfg_contract::MfgRouteId::AnalysisActionExecute
+            | app_mfg_contract::MfgRouteId::ExecutionCrossPlaneExecute
+            | app_mfg_contract::MfgRouteId::ReportDeliver
+            | app_mfg_contract::MfgRouteId::ReportDeliveryRetry
+    ) {
+        let mode = find_json_string(&body_json, "mode").unwrap_or_default();
+        if let Err(message) = normalize_mfg_action_mode(&mode) {
+            return mfg_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                app_mfg_contract::MfgErrorCode::ValidationFailed,
+                message.to_string(),
+                false,
+            );
+        }
+    }
     let body_key = find_json_string(&body_json, "idempotency_key");
-    let query_key = query.split('&').find_map(|pair| {
-        pair.split_once('=')
-            .filter(|(name, _)| *name == "idempotency_key")
-            .map(|(_, value)| value.to_string())
-    });
+    let query_pairs = parse_mfg_query_pairs(&query);
+    let query_key = query_pairs
+        .iter()
+        .find(|(name, _)| name == "idempotency_key")
+        .map(|(_, value)| value.clone());
     let legacy_key = body_key.or(query_key);
     let idempotency_key = match (header_key, legacy_key) {
         (Some(header), Some(legacy)) if header != legacy => {
@@ -915,7 +924,12 @@ async fn mfg_mutation_ledger_middleware(
             false,
         );
     };
-    let resource_ref = resolve_mfg_resource_ref(contract.route_id, &request_path, &body_json);
+    let resource_ref = resolve_mfg_resource_ref(
+        contract.route_id,
+        &request_path,
+        &body_json,
+        idempotency_key.as_deref(),
+    );
     if let Some(missing) = action_contract
         .required_capabilities
         .iter()
@@ -936,7 +950,12 @@ async fn mfg_mutation_ledger_middleware(
         )
             .into_response();
     }
-    let expected_revision = find_json_u64(&body_json, "expected_revision");
+    let expected_revision = find_json_u64(&body_json, "expected_revision").or_else(|| {
+        query_pairs
+            .iter()
+            .find(|(name, _)| name == "expected_revision")
+            .and_then(|(_, value)| value.parse::<u64>().ok())
+    });
     if let app_mfg_contract::MfgMutationSemantics::DurableReceipt { revision, .. } =
         action_contract.mutation
     {
@@ -966,13 +985,28 @@ async fn mfg_mutation_ledger_middleware(
             _ => {}
         }
     }
-    let digest_payload = if is_json_body {
+    let digest_body = if is_json_body {
         let mut digest_body = body_json.clone();
         remove_json_field(&mut digest_body, "idempotency_key");
-        serde_json::to_vec(&digest_body).unwrap_or_else(|_| bytes.to_vec())
+        canonicalize_mfg_json(&digest_body)
     } else {
-        bytes.to_vec()
+        serde_json::Value::String(String::from_utf8_lossy(&bytes).to_string())
     };
+    let digest_query = query_pairs
+        .iter()
+        .filter(|(name, _)| name != "idempotency_key")
+        .cloned()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let digest_value = if digest_query.is_empty() {
+        digest_body
+    } else {
+        serde_json::json!({
+            "body": digest_body,
+            "query": digest_query,
+        })
+    };
+    let digest_payload = serde_json::to_vec(&canonicalize_mfg_json(&digest_value))
+        .unwrap_or_else(|_| bytes.to_vec());
     let payload_digest = format!("sha256:{:x}", Sha256::digest(&digest_payload));
     let actor_principal = principal_actor_id(&principal);
     let durable = !matches!(contract.class, MfgMutationClass::Preview)
@@ -992,21 +1026,61 @@ async fn mfg_mutation_ledger_middleware(
     } else {
         idempotency_key.unwrap_or_else(|| format!("preview-{}", uuid::Uuid::new_v4()))
     };
+    let correlation_id =
+        header_correlation.unwrap_or_else(|| format!("mfg-correlation:{idempotency_key}"));
+    let mut generic_claim_acquired = false;
     if durable {
-        match state.services.mfg.find_mutation_receipt(
+        match state.services.mfg.claim_mutation_receipt(
             &state.config_home,
             &idempotency_key,
             &actor_principal,
             &action_id,
             &resource_ref,
+            expected_revision,
             &payload_digest,
+            &correlation_id,
         ) {
-            Ok(Some((mut receipt, mut response))) => {
+            Ok(app_mfg::MfgMutationClaim::Acquired(_)) => {
+                generic_claim_acquired = true;
+            }
+            Ok(app_mfg::MfgMutationClaim::NativeRecovery(_))
+                if mfg_route_uses_native_business_receipt(contract.route_id) =>
+            {
+                // The native repository will replay its committed business
+                // receipt before any write; Gateway can then finalize the
+                // canonical outer receipt without repeating the effect.
+            }
+            Ok(app_mfg::MfgMutationClaim::NativeRecovery(_)) => {
+                return mfg_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    app_mfg_contract::MfgErrorCode::ContractMismatch,
+                    "native business recovery is not valid for this MFG route".to_string(),
+                    false,
+                );
+            }
+            Ok(app_mfg::MfgMutationClaim::Replayed(mut receipt, mut response)) => {
                 receipt.status = MfgReceiptStatus::Replayed;
                 attach_mfg_receipt(&mut response, &receipt);
                 return json_response_with_receipt(StatusCode::OK, response, &receipt);
             }
-            Ok(None) => {}
+            Ok(app_mfg::MfgMutationClaim::Pending(_))
+                if contract.route_id == app_mfg_contract::MfgRouteId::AssignmentCommand
+                    && action_id == "mfg.assignment.complete" =>
+            {
+                // Completion uses a durable assignment reservation and reads
+                // an already-terminal Runtime owner. Re-entry reconciles that
+                // saga; the repository CAS prevents a second reservation.
+            }
+            Ok(app_mfg::MfgMutationClaim::Pending(_))
+                if mfg_route_supports_owner_recovery(contract.route_id, &action_id) =>
+            {
+                // These handlers bind this exact canonical key to a stable
+                // owner identity, transition journal, durable outbox, or
+                // idempotent owner CAS before applying their effect.
+            }
+            Ok(app_mfg::MfgMutationClaim::Pending(receipt)) => {
+                return mfg_pending_claim_response(&receipt);
+            }
             Err(error) => {
                 return mfg_error_response(
                     StatusCode::CONFLICT,
@@ -1021,11 +1095,34 @@ async fn mfg_mutation_ledger_middleware(
     let request = Request::from_parts(parts, Body::from(bytes));
     let response = next.run(request).await;
     if response.status() == StatusCode::UNPROCESSABLE_ENTITY {
+        if generic_claim_acquired {
+            let _ = state.services.mfg.release_mutation_claim(
+                &state.config_home,
+                &idempotency_key,
+                &actor_principal,
+                &action_id,
+                &payload_digest,
+            );
+        }
         return mfg_error_response(
             StatusCode::UNPROCESSABLE_ENTITY,
             app_mfg_contract::MfgErrorCode::ValidationFailed,
             "MFG request payload could not be decoded by the canonical contract".to_string(),
             false,
+        );
+    }
+    if response.status().is_client_error()
+        && mfg_route_uses_native_business_receipt(contract.route_id)
+    {
+        // Native 4xx responses are produced by validation/CAS before their
+        // domain commit. Assignment completion may have a durable reservation,
+        // but re-claiming the same key resumes that explicit saga.
+        let _ = state.services.mfg.release_mutation_claim(
+            &state.config_home,
+            &idempotency_key,
+            &actor_principal,
+            &action_id,
+            &payload_digest,
         );
     }
     if !response.status().is_success() {
@@ -1046,6 +1143,12 @@ async fn mfg_mutation_ledger_middleware(
     };
     let mut response_json = serde_json::from_slice::<serde_json::Value>(&response_bytes)
         .unwrap_or_else(|_| serde_json::json!({"data": String::from_utf8_lossy(&response_bytes)}));
+    if let Some(object) = response_json.as_object_mut() {
+        object.insert(
+            "correlation_id".to_string(),
+            serde_json::Value::String(correlation_id.clone()),
+        );
+    }
     let result_revision = find_json_u64(&response_json, "revision")
         .or_else(|| find_json_u64(&response_json, "current_revision"));
     let receipt = if durable {
@@ -1081,6 +1184,7 @@ async fn mfg_mutation_ledger_middleware(
             expected_revision,
             result_revision,
             payload_digest,
+            correlation_id: Some(correlation_id),
             status: MfgReceiptStatus::Preview,
             response: response_json.clone(),
             contract_version: app_mfg_contract::MfgContractVersion::default(),
@@ -1105,14 +1209,93 @@ async fn mfg_mutation_ledger_middleware(
     Response::from_parts(response_parts, Body::from(body))
 }
 
+fn mfg_route_uses_native_business_receipt(route_id: app_mfg_contract::MfgRouteId) -> bool {
+    use app_mfg_contract::MfgRouteId as R;
+
+    matches!(
+        route_id,
+        R::CockpitProfileUpsert
+            | R::CockpitProfileDelete
+            | R::CockpitProfileClone
+            | R::CockpitProfileShare
+            | R::AlertRuleUpsert
+            | R::AlertSubscriptionUpsert
+            | R::AlertCommand
+            | R::AssignmentUpsert
+            | R::AssignmentCommand
+    )
+}
+
+fn mfg_route_supports_owner_recovery(
+    route_id: app_mfg_contract::MfgRouteId,
+    action_id: &str,
+) -> bool {
+    use app_mfg_contract::MfgRouteId as R;
+
+    mfg_route_uses_native_business_receipt(route_id)
+        || matches!(
+            route_id,
+            R::RealityEvidenceQualityGate
+                | R::IncidentCreate
+                | R::IncidentAnalyze
+                | R::IncidentSkillRun
+                | R::ExecutionCrossPlaneExecute
+                | R::ExecutionFeedbackCreate
+                | R::ReportGenerate
+                | R::ReportDeliver
+                | R::ReportDeliveryRetry
+                | R::ReportReviewRequest
+                | R::ReportReviewDecide
+        )
+        || (route_id == R::AnalysisActionExecute && action_id == "mfg.analysis.action.commit")
+}
+
+fn mfg_pending_claim_response(receipt: &app_mfg_contract::MfgReceiptV1) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(app_mfg_contract::MfgApiErrorV1 {
+            code: app_mfg_contract::MfgErrorCode::IdempotencyConflict,
+            message:
+                "the original mutation is still pending or its outcome requires reconciliation"
+                    .to_string(),
+            http_status: StatusCode::CONFLICT.as_u16(),
+            details: serde_json::json!({
+                "status": "pending",
+                "resource_ref": receipt.resource_ref,
+                "correlation_id": receipt.correlation_id,
+            }),
+            retryable: false,
+            contract_version: app_mfg_contract::MfgContractVersion::default(),
+            recovery_actions: vec![
+                app_mfg_contract::MfgRecoveryAction {
+                    kind: app_mfg_contract::MfgRecoveryActionKind::Reload,
+                    label: "Reload the canonical resource before deciding the outcome".to_string(),
+                    target: Some(receipt.resource_ref.clone()),
+                    enabled: true,
+                },
+                app_mfg_contract::MfgRecoveryAction {
+                    kind: app_mfg_contract::MfgRecoveryActionKind::Resync,
+                    label: "Reconcile the pending mutation with its domain owner".to_string(),
+                    target: receipt.correlation_id.clone(),
+                    enabled: true,
+                },
+            ],
+            request_id: receipt.correlation_id.clone(),
+            receipt_ref: Some(receipt.receipt_id.clone()),
+        }),
+    )
+        .into_response()
+}
+
 fn resolve_mfg_action_id(
     route_id: app_mfg_contract::MfgRouteId,
     body: &serde_json::Value,
 ) -> String {
     use app_mfg_contract::MfgRouteId as R;
-    let mode = find_json_string(body, "mode")
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    let raw_mode = find_json_string(body, "mode").unwrap_or_default();
+    let mode = normalize_mfg_action_mode(&raw_mode)
+        .unwrap_or("commit")
+        .to_string();
     match route_id {
         R::RealitySourcePackUpsert => {
             if find_json_u64(body, "expected_revision").is_some() {
@@ -1149,6 +1332,59 @@ fn resolve_mfg_action_id(
                 "mfg.playbook.create"
             }
         }
+        R::CockpitProfileUpsert => {
+            if find_json_u64(body, "expected_revision").is_some() {
+                "mfg.cockpit.profile.update"
+            } else {
+                "mfg.cockpit.profile.create"
+            }
+        }
+        R::AlertRuleUpsert => {
+            if find_json_u64(body, "expected_revision").is_some() {
+                "mfg.alert_rule.update"
+            } else {
+                "mfg.alert_rule.create"
+            }
+        }
+        R::AlertSubscriptionUpsert => {
+            if find_json_u64(body, "expected_revision").is_some() {
+                "mfg.alert_subscription.update"
+            } else {
+                "mfg.alert_subscription.create"
+            }
+        }
+        R::AssignmentUpsert => {
+            if find_json_u64(body, "expected_revision").is_some() {
+                "mfg.assignment.update"
+            } else {
+                "mfg.assignment.create"
+            }
+        }
+        R::AlertCommand => match find_json_string(body, "command")
+            .unwrap_or_default()
+            .as_str()
+        {
+            "acknowledge" => "mfg.alert.acknowledge",
+            "snooze" => "mfg.alert.snooze",
+            "resolve" => "mfg.alert.resolve",
+            "escalate" => "mfg.alert.escalate",
+            _ => route_id.as_str(),
+        },
+        R::AssignmentCommand => match find_json_string(body, "command")
+            .unwrap_or_default()
+            .as_str()
+        {
+            "assign" => "mfg.assignment.assign",
+            "claim" => "mfg.assignment.claim",
+            "transfer" => "mfg.assignment.transfer",
+            "unassign" => "mfg.assignment.unassign",
+            "watch" => "mfg.assignment.watch",
+            "request_update" => "mfg.assignment.request_update",
+            "escalate" => "mfg.assignment.escalate",
+            "start" => "mfg.assignment.start",
+            "complete" => "mfg.assignment.complete",
+            _ => route_id.as_str(),
+        },
         R::AnalysisActionExecute => {
             if mode.is_empty() || matches!(mode.as_str(), "dry_run" | "plan") {
                 "mfg.analysis.action.dry_run"
@@ -1203,16 +1439,142 @@ fn resolve_mfg_action_id(
     .to_string()
 }
 
+fn normalize_mfg_action_mode(mode: &str) -> Result<&'static str, &'static str> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "" | "dry_run" | "plan" => Ok("dry_run"),
+        "commit" | "live" | "execute" => Ok("commit"),
+        _ => Err("mode must be one of dry_run, plan, commit, live, or execute"),
+    }
+}
+
 fn resolve_mfg_resource_ref(
     route_id: app_mfg_contract::MfgRouteId,
     request_path: &str,
     body: &serde_json::Value,
+    idempotency_key: Option<&str>,
 ) -> String {
     use app_mfg_contract::MfgRouteId as R;
+    let path_id = |prefix: &str| {
+        request_path
+            .split(prefix)
+            .nth(1)
+            .and_then(|suffix| suffix.split('/').next())
+            .filter(|id| !id.trim().is_empty())
+            .map(str::to_string)
+    };
     let identified = match route_id {
+        R::IncidentCreate => idempotency_key
+            .map(|key| format!("mfg:incident:{}", stable_mfg_resource_id("incident", key))),
+        R::IncidentAnalyze | R::IncidentPlaybookRecommend | R::IncidentSkillPlan => {
+            path_id("/incidents/").map(|id| format!("mfg:incident:{id}"))
+        }
+        R::IncidentCasePromote => path_id("/incidents/").map(|id| format!("mfg:incident:{id}")),
+        R::AnalysisActionExecute => path_id("/analyses/").and_then(|analysis_id| {
+            request_path
+                .split("/actions/")
+                .nth(1)
+                .and_then(|suffix| suffix.split('/').next())
+                .filter(|id| !id.trim().is_empty())
+                .map(|action_id| format!("mfg:analysis:{analysis_id}:action:{action_id}"))
+        }),
+        R::AlertCommand => path_id("/alerts/").map(|id| format!("mfg:alert-occurrence:{id}")),
+        R::AlertRuleUpsert => find_json_string(body, "rule_id")
+            .filter(|id| !id.trim().is_empty())
+            .map(|id| format!("mfg:alert-rule:{id}"))
+            .or_else(|| {
+                idempotency_key.map(|key| {
+                    format!(
+                        "mfg:alert-rule:{}",
+                        stable_mfg_resource_id("alert-rule", key)
+                    )
+                })
+            }),
+        R::AlertSubscriptionUpsert => find_json_string(body, "subscription_id")
+            .filter(|id| !id.trim().is_empty())
+            .map(|id| format!("mfg:alert-subscription:{id}"))
+            .or_else(|| {
+                idempotency_key.map(|key| {
+                    format!(
+                        "mfg:alert-subscription:{}",
+                        stable_mfg_resource_id("alert-subscription", key)
+                    )
+                })
+            }),
+        R::AssignmentUpsert => find_json_string(body, "assignment_id")
+            .filter(|id| !id.trim().is_empty())
+            .map(|id| format!("mfg:assignment:{id}"))
+            .or_else(|| {
+                idempotency_key.map(|key| {
+                    format!(
+                        "mfg:assignment:{}",
+                        stable_mfg_resource_id("assignment", key)
+                    )
+                })
+            }),
+        R::AssignmentCommand => path_id("/assignments/").map(|id| format!("mfg:assignment:{id}")),
+        R::ExecutionFeedbackCreate => {
+            path_id("/executions/").map(|id| format!("mfg:execution:{id}"))
+        }
+        R::ExecutionCrossPlaneExecute => {
+            path_id("/executions/").map(|id| format!("mfg:execution:{id}"))
+        }
+        R::CockpitProfileUpsert => find_json_string(body, "profile_id")
+            .filter(|id| !id.trim().is_empty())
+            .map(|id| format!("mfg:cockpit-profile:{id}"))
+            .or_else(|| {
+                idempotency_key.map(|key| {
+                    format!(
+                        "mfg:cockpit-profile:{}",
+                        stable_mfg_resource_id("cockpit-profile", key)
+                    )
+                })
+            }),
+        R::CockpitProfileDelete | R::CockpitProfileShare => {
+            path_id("/profiles/").map(|id| format!("mfg:cockpit-profile:{id}"))
+        }
+        R::CockpitProfileClone => find_json_string(body, "profile_id")
+            .filter(|id| !id.trim().is_empty())
+            .map(|id| format!("mfg:cockpit-profile:{id}"))
+            .or_else(|| {
+                idempotency_key.map(|key| {
+                    format!(
+                        "mfg:cockpit-profile:{}",
+                        stable_mfg_resource_id("cockpit-profile", key)
+                    )
+                })
+            }),
+        R::ReportGenerate => path_id("/profiles/").map(|id| format!("mfg:cockpit-profile:{id}")),
+        R::ReportScheduleRun => Some("mfg:cockpit-report-schedule:due".to_string()),
+        R::ReportDeliver | R::ReportDeliveryRetry | R::ReportReviewRequest => {
+            path_id("/reports/").map(|id| format!("mfg:cockpit-report:{id}"))
+        }
+        R::RealityEvidenceQualityGate => {
+            path_id("/evidence/").map(|id| format!("mfg:evidence:{id}"))
+        }
+        R::IncidentSkillRun => path_id("/incidents/").and_then(|incident_id| {
+            request_path
+                .split("/skills/")
+                .nth(1)
+                .and_then(|suffix| suffix.split('/').next())
+                .filter(|id| !id.trim().is_empty())
+                .map(|skill_id| format!("mfg:incident:{incident_id}:skill:{skill_id}"))
+        }),
         R::RealitySourcePackUpsert => {
             find_json_string(body, "source_pack_id").map(|id| format!("matrix:source_pack:{id}"))
         }
+        R::RealitySourcePackValidate
+        | R::RealitySourcePackIngestFile
+        | R::RealitySourcePackDeltaPlan
+        | R::RealityConnectorRunPlan
+        | R::RealityConnectorRunExecute => {
+            path_id("/source-packs/").map(|id| format!("matrix:source_pack:{id}"))
+        }
+        R::RealityDataPlaneIngestPlan => Some("matrix:data-plane:ingest-plan".to_string()),
+        R::RealityMetricAttentionPlan => Some("matrix:metrics:attention-plan".to_string()),
+        R::RealityMetricSnapshotMaterialize => {
+            Some("matrix:metric-snapshot:materialize".to_string())
+        }
+        R::RealityMetricRecompute => Some("matrix:metrics".to_string()),
         R::RealityMetricDependencyUpsert => find_json_string(body, "dependency_id")
             .map(|id| format!("matrix:metric_dependency:{id}"))
             .or_else(|| {
@@ -1245,12 +1607,26 @@ fn resolve_mfg_resource_ref(
         R::PlaybookUpsert => {
             find_json_string(body, "playbook_id").map(|id| format!("mfg:playbook:{id}"))
         }
-        R::ReportReviewRequest => request_path
-            .split("/reports/")
-            .nth(1)
-            .and_then(|suffix| suffix.split('/').next())
-            .filter(|id| !id.trim().is_empty())
-            .map(|id| format!("mfg:cockpit-report:{id}")),
+        R::RealityMetricDependencyAffectedPlan => find_json_string(body, "fact_type")
+            .map(|fact_type| format!("matrix:fact-type:{fact_type}:metric-impact")),
+        R::RealityComputeJobPlan => find_json_string(body, "job_id")
+            .map(|id| format!("matrix:compute-job:{id}"))
+            .or_else(|| Some("matrix:compute-job:new".to_string())),
+        R::RealityComputeJobExecute => {
+            path_id("/compute/jobs/").map(|id| format!("matrix:compute-job:{id}"))
+        }
+        R::RealityEntityResolveSourceKey => find_json_string(body, "source_system")
+            .zip(find_json_string(body, "source_key"))
+            .map(|(source_system, source_key)| {
+                format!("matrix:source-key:{source_system}:{source_key}")
+            }),
+        R::RealityEntityMatchCandidate => Some("matrix:entity-match-candidate:preview".to_string()),
+        R::RealityEntityConflictDecision => find_json_string(body, "candidate_id")
+            .map(|id| format!("matrix:entity-match-candidate:{id}")),
+        R::RealityFactIngest => Some("matrix:facts:ingest".to_string()),
+        R::RealityEvidenceBuild => Some("matrix:evidence:new".to_string()),
+        R::DomainServerManufacturingSeed => Some("mfg:domain:server-manufacturing".to_string()),
+        R::OntologyServerManufacturingSeed => Some("mfg:ontology:server-manufacturing".to_string()),
         R::ReportReviewDecide => request_path
             .split("/report-reviews/")
             .nth(1)
@@ -1260,6 +1636,50 @@ fn resolve_mfg_resource_ref(
         _ => None,
     };
     identified.unwrap_or_else(|| format!("mfg:http:{request_path}"))
+}
+
+fn parse_mfg_query_pairs(query: &str) -> Vec<(String, String)> {
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (
+                decode_mfg_query_component(name),
+                decode_mfg_query_component(value),
+            )
+        })
+        .collect()
+}
+
+fn decode_mfg_query_component(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let high = (bytes[index + 1] as char).to_digit(16);
+                let low = (bytes[index + 2] as char).to_digit(16);
+                if let (Some(high), Some(low)) = (high, low) {
+                    decoded.push(((high << 4) | low) as u8);
+                    index += 3;
+                } else {
+                    decoded.push(bytes[index]);
+                    index += 1;
+                }
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
 }
 
 fn find_json_string(value: &serde_json::Value, key: &str) -> Option<String> {
@@ -1304,6 +1724,22 @@ fn find_json_bool(value: &serde_json::Value, key: &str) -> Option<bool> {
     }
 }
 
+fn canonicalize_mfg_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(object) => {
+            let sorted = object
+                .iter()
+                .map(|(key, value)| (key.clone(), canonicalize_mfg_json(value)))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            serde_json::to_value(sorted).unwrap_or(serde_json::Value::Null)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(canonicalize_mfg_json).collect())
+        }
+        _ => value.clone(),
+    }
+}
+
 fn remove_json_field(value: &mut serde_json::Value, key: &str) {
     match value {
         serde_json::Value::Object(object) => {
@@ -1323,10 +1759,9 @@ fn remove_json_field(value: &mut serde_json::Value, key: &str) {
 
 fn attach_mfg_receipt(response: &mut serde_json::Value, receipt: &app_mfg_contract::MfgReceiptV1) {
     if let Some(object) = response.as_object_mut() {
-        object.insert(
-            "_mfg_receipt".to_string(),
-            serde_json::to_value(receipt).unwrap_or(serde_json::Value::Null),
-        );
+        let canonical = serde_json::to_value(receipt).unwrap_or(serde_json::Value::Null);
+        object.insert("_mfg_receipt".to_string(), canonical.clone());
+        object.insert("receipt".to_string(), canonical);
     }
 }
 
@@ -1487,9 +1922,78 @@ pub(super) fn mfg_api_error(
     )
 }
 
+pub(super) fn mfg_cross_plane_error(
+    error: runtime::CrossPlaneRuntimeError,
+) -> (StatusCode, Json<ErrorResponse>) {
+    let status = if matches!(
+        error,
+        runtime::CrossPlaneRuntimeError::IdempotencyConflict(_)
+    ) {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    mfg_api_error(status, error.to_string())
+}
+
+pub(super) fn mfg_cross_plane_graph_error(
+    error: crate::services::CrossPlaneCommitGraphError,
+) -> (StatusCode, Json<ErrorResponse>) {
+    let status = match &error {
+        crate::services::CrossPlaneCommitGraphError::CanonicalActionConflict(_) => {
+            StatusCode::CONFLICT
+        }
+        crate::services::CrossPlaneCommitGraphError::Runtime(
+            runtime::CrossPlaneRuntimeError::IdempotencyConflict(_),
+        ) => StatusCode::CONFLICT,
+        crate::services::CrossPlaneCommitGraphError::Runtime(_)
+        | crate::services::CrossPlaneCommitGraphError::State(_)
+        | crate::services::CrossPlaneCommitGraphError::Execution(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    };
+    mfg_api_error(status, error.to_string())
+}
+
+pub(super) fn mfg_typed_api_error(
+    error: app_mfg_contract::MfgApiErrorV1,
+) -> (StatusCode, Json<ErrorResponse>) {
+    let status =
+        StatusCode::from_u16(error.http_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let encoded = serde_json::to_string(&error).unwrap_or_else(|_| {
+        "{\"code\":\"internal\",\"message\":\"failed to serialize typed MFG error\"}".to_string()
+    });
+    (
+        status,
+        Json(ErrorResponse {
+            error: format!("__mfg_api_error_v1__:{encoded}"),
+        }),
+    )
+}
+
 fn mfg_mutation_error(error: MfgRepositoryError) -> (StatusCode, Json<ErrorResponse>) {
     match error {
         MfgRepositoryError::NotFound(message) => mfg_api_error(StatusCode::NOT_FOUND, message),
+        MfgRepositoryError::CommandRejected(message)
+            if message.to_ascii_lowercase().contains("idempotency") =>
+        {
+            mfg_typed_api_error(app_mfg_contract::MfgApiErrorV1 {
+                code: app_mfg_contract::MfgErrorCode::IdempotencyConflict,
+                message,
+                http_status: StatusCode::CONFLICT.as_u16(),
+                details: serde_json::Value::Null,
+                retryable: false,
+                contract_version: app_mfg_contract::MfgContractVersion::default(),
+                recovery_actions: vec![app_mfg_contract::MfgRecoveryAction {
+                    kind: app_mfg_contract::MfgRecoveryActionKind::Compare,
+                    label: "Use the original intent or create a new governed intent".to_string(),
+                    target: None,
+                    enabled: true,
+                }],
+                request_id: None,
+                receipt_ref: None,
+            })
+        }
         conflict @ (MfgRepositoryError::RevisionConflict { .. }
         | MfgRepositoryError::CommandRejected(_)) => {
             mfg_api_error(StatusCode::CONFLICT, conflict.to_string())
@@ -1502,7 +2006,9 @@ async fn mfg_app_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl Int
     Json(state.services.mfg.app_descriptor())
 }
 
-async fn mfg_contract_handler() -> Json<app_mfg_contract::MfgFrontendContractV1> {
+async fn mfg_contract_handler(
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+) -> Json<app_mfg_contract::MfgFrontendContractV1> {
     use app_mfg_contract::{
         MfgActionAvailability, MfgConsumer, MfgFrontendContractV1, MfgSurfaceContract,
         MfgSurfaceKind, MfgSurfaceRole,
@@ -1531,9 +2037,13 @@ async fn mfg_contract_handler() -> Json<app_mfg_contract::MfgFrontendContractV1>
         app_mfg_contract::MfgRouteId::ContractGet,
         app_mfg_contract::MfgRouteId::AppGet,
     ];
-    let tui_routes = app_mfg_contract::mfg_tui_p0_read_route_contracts()
+    let tui_routes = app_mfg_contract::mfg_tui_route_contracts()
         .into_iter()
         .map(|route| route.route_id)
+        .collect::<Vec<_>>();
+    let tui_actions = app_mfg_contract::mfg_tui_action_contracts()
+        .into_iter()
+        .map(|action| action.action_id)
         .collect::<Vec<_>>();
     let webui_actions = actions
         .iter()
@@ -1563,10 +2073,10 @@ async fn mfg_contract_handler() -> Json<app_mfg_contract::MfgFrontendContractV1>
             },
             MfgSurfaceContract {
                 surface: MfgSurfaceKind::Tui,
-                role: MfgSurfaceRole::ConsoleReadOnly,
+                role: MfgSurfaceRole::ConsoleOperationalControl,
                 entrypoints: vec!["/api/apps/mfg/contract".to_string(), "/mfg".to_string()],
                 routes: tui_routes,
-                actions: Vec::new(),
+                actions: tui_actions,
             },
             MfgSurfaceContract {
                 surface: MfgSurfaceKind::Cli,
@@ -1576,6 +2086,7 @@ async fn mfg_contract_handler() -> Json<app_mfg_contract::MfgFrontendContractV1>
                 actions: Vec::new(),
             },
         ],
+        granted_capabilities: principal.0.claims().capabilities.clone(),
     })
 }
 
@@ -1796,12 +2307,16 @@ struct MfgSkillRunRequest {
     request_id: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
+    #[serde(default)]
+    expected_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 struct MfgCockpitReportDeliveryRetryRequest {
     #[serde(default)]
     mode: String,
+    #[serde(default)]
+    expected_revision: Option<u64>,
     #[serde(default)]
     idempotency_key: Option<String>,
     #[serde(default)]
@@ -2163,13 +2678,6 @@ async fn mfg_reality_data_plane_ingest_plan_handler(
         .matrix
         .plan_data_plane_ingest(&state.config_home, request.ingest)
         .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    append_matrix_execution_outcome(
-        &state,
-        session_id.as_deref(),
-        matrix_ingest_plan_outcome(&plan),
-    )
-    .await
-    .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.data_plane.ingest_plan",
         "request_id": request.request_id,
@@ -2956,11 +3464,15 @@ async fn mfg_reality_evidence_get_handler(
 async fn mfg_reality_evidence_quality_gate_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let idempotency_key = mfg_idempotency_key(&headers, None)
+        .map_err(|error| mfg_api_error(StatusCode::BAD_REQUEST, error.message))?;
+    let gate_id = stable_mfg_resource_id("quality-gate", &idempotency_key);
     let gate = state
         .services
         .matrix
-        .evaluate_evidence_quality(&state.config_home, &id)
+        .evaluate_evidence_quality_with_gate_id(&state.config_home, &id, &gate_id)
         .map_err(matrix_error)?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.quality_gate",
@@ -3180,10 +3692,7 @@ async fn mfg_execution_feedback_handler(
                 actor,
             ),
         )
-        .map_err(|error| match error {
-            MfgRepositoryError::NotFound(message) => mfg_api_error(StatusCode::NOT_FOUND, message),
-            other => mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-        })?;
+        .map_err(mfg_mutation_error)?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.action_execution",
         "execution": execution,
@@ -3193,38 +3702,54 @@ async fn mfg_execution_feedback_handler(
 #[cfg(test)]
 mod tests {
     use super::{
-        mfg_api_error, mfg_contract_handler, mfg_idempotency_key, resolve_mfg_action_id,
-        resolve_mfg_resource_ref, MfgActionExecutionIntent, MfgCockpitReportDeliveryIntent,
-        MfgCrossPlaneBridgeIntent, MfgExecutionFeedbackRequest,
+        mfg_api_error, mfg_contract_handler, mfg_idempotency_key, parse_mfg_query_pairs,
+        resolve_mfg_action_id, resolve_mfg_resource_ref, MfgActionExecutionIntent,
+        MfgCockpitReportDeliveryIntent, MfgCrossPlaneBridgeIntent, MfgExecutionFeedbackRequest,
     };
-    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use axum::{
+        extract::Extension,
+        http::{HeaderMap, HeaderValue, StatusCode},
+    };
 
     #[tokio::test]
-    async fn tui_contract_is_read_only_with_the_derived_19_route_inventory() {
-        let contract = mfg_contract_handler().await.0;
+    async fn tui_contract_is_operational_with_exact_derived_route_and_action_inventories() {
+        let principal = super::super::AuthenticatedPrincipal(super::super::test_human_principal());
+        let expected_capabilities = principal.0.claims().capabilities.clone();
+        let contract = mfg_contract_handler(Extension(principal)).await.0;
         let surface = contract
             .surfaces
             .iter()
             .find(|surface| surface.surface == app_mfg_contract::MfgSurfaceKind::Tui)
             .expect("TUI surface");
-        let expected = app_mfg_contract::mfg_tui_p0_read_route_contracts()
+        let expected_routes = app_mfg_contract::mfg_tui_route_contracts()
             .into_iter()
             .map(|route| route.route_id)
             .collect::<std::collections::BTreeSet<_>>();
+        let expected_actions = app_mfg_contract::mfg_tui_action_contracts()
+            .into_iter()
+            .map(|action| action.action_id)
+            .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
             surface.role,
-            app_mfg_contract::MfgSurfaceRole::ConsoleReadOnly
+            app_mfg_contract::MfgSurfaceRole::ConsoleOperationalControl
         );
-        assert_eq!(surface.routes.len(), 19);
         assert_eq!(
             surface
                 .routes
                 .iter()
                 .copied()
                 .collect::<std::collections::BTreeSet<_>>(),
-            expected
+            expected_routes
         );
-        assert!(surface.actions.is_empty());
+        assert_eq!(
+            surface
+                .actions
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected_actions
+        );
+        assert_eq!(contract.granted_capabilities, expected_capabilities);
         assert_eq!(
             super::mfg_request_schema_component(app_mfg_contract::MfgRouteId::IncidentList),
             "MfgIncidentListQuery"
@@ -3317,6 +3842,67 @@ mod tests {
     }
 
     #[test]
+    fn mutation_query_context_is_percent_decoded_before_identity_and_revision_checks() {
+        let pairs = parse_mfg_query_pairs(
+            "expected_revision=7&idempotency_key=webui-mfg%3Amfg.cockpit.profile.delete%3Aabc",
+        );
+        assert_eq!(
+            pairs,
+            vec![
+                ("expected_revision".to_string(), "7".to_string()),
+                (
+                    "idempotency_key".to_string(),
+                    "webui-mfg:mfg.cockpit.profile.delete:abc".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_active_mutation_route_resolves_a_domain_resource_not_an_http_fallback() {
+        let fixture = serde_json::json!({
+            "source_pack_id": "source-1",
+            "dependency_id": "dependency-1",
+            "entity_id": "entity-1",
+            "relation_id": "relation-1",
+            "playbook_id": "playbook-1",
+            "profile_id": "profile-1",
+            "rule_id": "rule-1",
+            "subscription_id": "subscription-1",
+            "assignment_id": "assignment-1",
+            "fact_type": "fact-1",
+            "job_id": "job-1",
+            "candidate_id": "candidate-1",
+            "source_system": "erp",
+            "source_key": "part-1",
+            "command": "complete",
+            "decision": "resolve",
+            "mode": "commit",
+            "deliver": true
+        });
+        for route in app_mfg_contract::mfg_route_contracts()
+            .into_iter()
+            .filter(|route| route.availability == app_mfg_contract::MfgActionAvailability::Active)
+            .filter(|route| route.class != app_mfg_contract::MfgMutationClass::Read)
+        {
+            let path = route
+                .path
+                .replace(":analysis_id", "analysis-1")
+                .replace(":action_id", "action-1")
+                .replace(":skill_id", "skill-1")
+                .replace(":instance_id", "instance-1")
+                .replace(":id", "object-1");
+            let resource =
+                resolve_mfg_resource_ref(route.route_id, &path, &fixture, Some("intent-1"));
+            assert!(
+                !resource.starts_with("mfg:http:"),
+                "{} fell back to transport identity: {resource}",
+                route.route_id.as_str()
+            );
+        }
+    }
+
+    #[test]
     fn multi_action_and_resource_resolution_is_derived_from_canonical_request_fields() {
         let create = serde_json::json!({
             "entity": {
@@ -3345,6 +3931,7 @@ mod tests {
                 app_mfg_contract::MfgRouteId::RealityEntityUpsert,
                 "/api/apps/mfg/reality/entities/upsert",
                 &create,
+                None,
             ),
             "matrix:entity:part:gpu"
         );
@@ -3353,6 +3940,7 @@ mod tests {
                 app_mfg_contract::MfgRouteId::RealityEntityUpsert,
                 "/api/apps/mfg/reality/entities/upsert",
                 &update,
+                None,
             ),
             "matrix:entity:entity-gpu"
         );
@@ -3393,7 +3981,16 @@ mod tests {
                 resolve_mfg_action_id(route, &serde_json::json!({"mode": "commit"})),
                 commit
             );
+            assert_eq!(
+                resolve_mfg_action_id(route, &serde_json::json!({"mode": " PlAn "})),
+                dry_run
+            );
+            assert_eq!(
+                resolve_mfg_action_id(route, &serde_json::json!({"mode": " ExEcUtE "})),
+                commit
+            );
         }
+        assert!(normalize_mfg_action_mode("unknown").is_err());
         assert_eq!(
             resolve_mfg_action_id(
                 app_mfg_contract::MfgRouteId::ReportScheduleRun,
@@ -3407,6 +4004,48 @@ mod tests {
                 &serde_json::json!({}),
             ),
             "mfg.skill.run"
+        );
+        assert_eq!(
+            resolve_mfg_resource_ref(
+                app_mfg_contract::MfgRouteId::AnalysisActionExecute,
+                "/api/apps/mfg/analyses/analysis-1/actions/action-1/execute",
+                &serde_json::json!({"mode": "commit", "expected_revision": 4}),
+                None,
+            ),
+            "mfg:analysis:analysis-1:action:action-1"
+        );
+        for (command, expected) in [
+            ("acknowledge", "mfg.alert.acknowledge"),
+            ("snooze", "mfg.alert.snooze"),
+            ("resolve", "mfg.alert.resolve"),
+            ("escalate", "mfg.alert.escalate"),
+        ] {
+            assert_eq!(
+                resolve_mfg_action_id(
+                    app_mfg_contract::MfgRouteId::AlertCommand,
+                    &serde_json::json!({"command": command, "expected_revision": 2}),
+                ),
+                expected
+            );
+        }
+        assert_eq!(
+            resolve_mfg_action_id(
+                app_mfg_contract::MfgRouteId::AssignmentUpsert,
+                &serde_json::json!({"assignment": {"assignment_id": "assignment-1"}}),
+            ),
+            "mfg.assignment.create"
+        );
+        assert_eq!(
+            resolve_mfg_action_id(
+                app_mfg_contract::MfgRouteId::AssignmentUpsert,
+                &serde_json::json!({
+                    "assignment": {
+                        "assignment_id": "assignment-1",
+                        "expected_revision": 3
+                    }
+                }),
+            ),
+            "mfg.assignment.update"
         );
         for (decision, expected) in [
             ("force_retry", "mfg.report.review.force_retry"),

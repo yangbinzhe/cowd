@@ -83,7 +83,9 @@ pub struct MfgMutationContextV1 {
     pub contract_version: MfgContractVersion,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum MfgMultiActionId {
     #[serde(rename = "mfg.reality.source_pack.create")]
@@ -342,7 +344,9 @@ impl MfgMultiActionId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(untagged)]
 pub enum MfgActionId {
     Route(MfgRouteId),
@@ -385,7 +389,10 @@ pub fn mfg_action_contracts() -> Vec<MfgActionContract> {
     let mut actions = crate::route::mfg_route_contracts()
         .into_iter()
         .filter_map(|route| {
-            if route.route_id == MfgRouteId::IncidentSkillRun {
+            if matches!(
+                route.route_id,
+                MfgRouteId::AlertCommand | MfgRouteId::IncidentSkillRun
+            ) {
                 return None;
             }
             if matches!(
@@ -406,6 +413,10 @@ pub fn mfg_action_contracts() -> Vec<MfgActionContract> {
                     idempotency: MfgIdempotencySemantics::Required,
                 },
                 MfgMutationClass::Effect => MfgMutationSemantics::DurableReceipt {
+                    // Route-owned effects such as ingest, recompute, execute,
+                    // and seed have durable idempotency but no canonical CAS
+                    // owner. Revision-owned effects are declared explicitly in
+                    // the closed multi-action matrix below.
                     revision: MfgRevisionSemantics::NotApplicable,
                     idempotency: MfgIdempotencySemantics::Required,
                 },
@@ -442,6 +453,19 @@ pub fn mfg_action_contracts() -> Vec<MfgActionContract> {
     actions
 }
 
+#[must_use]
+pub fn mfg_tui_action_contracts() -> Vec<MfgActionContract> {
+    let routes = crate::route::mfg_tui_route_contracts()
+        .into_iter()
+        .map(|route| route.route_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    mfg_action_contracts()
+        .into_iter()
+        .filter(|action| action.availability == MfgActionAvailability::Active)
+        .filter(|action| routes.contains(&action.route_id))
+        .collect()
+}
+
 fn multi_action_contracts() -> Vec<MfgActionContract> {
     use MfgActionRisk::{High as H, Low as L, Medium as M};
     use MfgConfirmationKind::{None as N, Target as T, TargetAndConfirm as TC};
@@ -451,21 +475,17 @@ fn multi_action_contracts() -> Vec<MfgActionContract> {
 
     let durable =
         |action_id, route_id, class, risk, confirmation, capabilities: &[&str], availability| {
-            let revision = if matches!(
-                action_id,
-                A::ReportReviewForceRetry
-                    | A::ReportReviewReroute
-                    | A::ReportReviewAbandon
-                    | A::ReportReviewResolve
-                    | A::ReportReviewReject
-            ) {
-                MfgRevisionSemantics::Required
-            } else {
-                match class {
-                    C => MfgRevisionSemantics::CreateOnly,
-                    U => MfgRevisionSemantics::Required,
-                    _ => MfgRevisionSemantics::NotApplicable,
-                }
+            let revision = match (class, action_id) {
+                (C, _) => MfgRevisionSemantics::CreateOnly,
+                (U, _) => MfgRevisionSemantics::Required,
+                (
+                    E,
+                    A::ExecutionCrossPlaneCommit
+                    | A::ReportScheduleGenerateOnly
+                    | A::ReportScheduleGenerateAndDeliver,
+                ) => MfgRevisionSemantics::NotApplicable,
+                (E, _) => MfgRevisionSemantics::Required,
+                _ => MfgRevisionSemantics::NotApplicable,
             };
             MfgActionContract {
                 action_id: MfgActionId::Multi(action_id),
@@ -771,7 +791,7 @@ fn multi_action_contracts() -> Vec<MfgActionContract> {
         durable(
             A::AssignmentComplete,
             R::AssignmentCommand,
-            U,
+            E,
             H,
             TC,
             &["mfg.assignment.lifecycle"],

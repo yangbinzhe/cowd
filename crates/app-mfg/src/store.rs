@@ -127,6 +127,16 @@ impl MfgStore {
         self.repository.build_evidence_packet(attention_id, title)
     }
 
+    pub fn build_evidence_packet_idempotent(
+        &self,
+        packet_id: &str,
+        attention_id: Option<&str>,
+        title: Option<&str>,
+    ) -> Result<MatrixEvidencePacket, MfgRepositoryError> {
+        self.repository
+            .build_evidence_packet_idempotent(packet_id, attention_id, title)
+    }
+
     pub fn evaluate_evidence_quality(
         &self,
         packet_id: &str,
@@ -159,6 +169,15 @@ impl MfgStore {
         self.repository.analyze_incident(incident_id)
     }
 
+    pub fn analyze_incident_idempotent(
+        &self,
+        incident_id: &str,
+        analysis_id: &str,
+    ) -> Result<MfgOperationalAnalysis, MfgRepositoryError> {
+        self.repository
+            .analyze_incident_idempotent(incident_id, analysis_id)
+    }
+
     pub fn latest_analysis_for_incident(
         &self,
         incident_id: &str,
@@ -181,6 +200,31 @@ impl MfgStore {
     ) -> Result<MfgActionExecution, MfgRepositoryError> {
         self.repository
             .execute_recommended_action(analysis_id, action_id, request)
+    }
+
+    pub fn preview_recommended_action(
+        &self,
+        analysis_id: &str,
+        action_id: &str,
+        request: &MfgActionExecutionRequest,
+    ) -> Result<MfgActionExecution, MfgRepositoryError> {
+        self.repository
+            .preview_recommended_action(analysis_id, action_id, request)
+    }
+
+    pub fn execute_recommended_action_idempotent(
+        &self,
+        analysis_id: &str,
+        action_id: &str,
+        execution_id: &str,
+        request: &MfgActionExecutionRequest,
+    ) -> Result<MfgActionExecution, MfgRepositoryError> {
+        self.repository.execute_recommended_action_idempotent(
+            analysis_id,
+            action_id,
+            execution_id,
+            request,
+        )
     }
 
     pub fn get_execution(
@@ -381,6 +425,16 @@ impl MfgStore {
         self.repository.generate_cockpit_report(profile_id, request)
     }
 
+    pub fn generate_cockpit_report_idempotent(
+        &self,
+        profile_id: &str,
+        report_id: &str,
+        request: MfgCockpitReportRequest,
+    ) -> Result<MfgCockpitReportSnapshot, MfgRepositoryError> {
+        self.repository
+            .generate_cockpit_report_idempotent(profile_id, report_id, request)
+    }
+
     pub fn get_cockpit_report(
         &self,
         report_id: &str,
@@ -446,6 +500,15 @@ impl MfgStore {
         review_id: &str,
     ) -> Result<Option<MfgReportDeliveryReview>, MfgRepositoryError> {
         self.repository.get_report_delivery_review(review_id)
+    }
+
+    pub fn report_delivery_review_by_transition_key(
+        &self,
+        review_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<MfgReportDeliveryReview>, MfgRepositoryError> {
+        self.repository
+            .report_delivery_review_by_transition_key(review_id, idempotency_key)
     }
 
     pub fn list_report_delivery_reviews(
@@ -690,6 +753,21 @@ impl MfgStore {
         self.repository.command_assignment(assignment_id, command)
     }
 
+    pub fn reserve_assignment_completion(
+        &self,
+        assignment_id: &str,
+        expected_revision: u64,
+        actor_ref: &str,
+        correlation_id: &str,
+    ) -> Result<MfgAssignment, MfgRepositoryError> {
+        self.repository.reserve_assignment_completion(
+            assignment_id,
+            expected_revision,
+            actor_ref,
+            correlation_id,
+        )
+    }
+
     pub fn live_projection(
         &self,
         cursor: Option<u64>,
@@ -705,6 +783,66 @@ impl MfgStore {
     ) -> Result<MfgCommandReceipt, MfgRepositoryError> {
         self.repository
             .record_command_notifications(idempotency_key, notification_refs)
+    }
+
+    pub fn command_notification_refs_for_resource(
+        &self,
+        resource_ref: &str,
+    ) -> Result<Vec<String>, MfgRepositoryError> {
+        self.repository
+            .command_notification_refs_for_resource(resource_ref)
+    }
+
+    pub fn native_command_receipt_by_identity(
+        &self,
+        idempotency_key: &str,
+        actor_principal: &str,
+        action_id: &str,
+        resource_ref: &str,
+    ) -> Result<Option<MfgCommandReceipt>, MfgRepositoryError> {
+        self.repository.native_command_receipt_by_identity(
+            idempotency_key,
+            actor_principal,
+            action_id,
+            resource_ref,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_mutation_receipt(
+        &self,
+        idempotency_key: &str,
+        actor_principal: &str,
+        action_id: &str,
+        resource_ref: &str,
+        expected_revision: Option<u64>,
+        payload_digest: &str,
+        correlation_id: &str,
+    ) -> Result<crate::MfgMutationClaim, MfgRepositoryError> {
+        self.repository.claim_mutation_receipt(
+            idempotency_key,
+            actor_principal,
+            action_id,
+            resource_ref,
+            expected_revision,
+            payload_digest,
+            correlation_id,
+        )
+    }
+
+    pub fn release_mutation_claim(
+        &self,
+        idempotency_key: &str,
+        actor_principal: &str,
+        action_id: &str,
+        payload_digest: &str,
+    ) -> Result<bool, MfgRepositoryError> {
+        self.repository.release_mutation_claim(
+            idempotency_key,
+            actor_principal,
+            action_id,
+            payload_digest,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -767,6 +905,16 @@ impl MfgStore {
         self.repository.create_incident_workflow(incident, packet)
     }
 
+    pub fn create_incident_workflow_idempotent(
+        &self,
+        incident: &MfgIncident,
+        packet: &MatrixEvidencePacket,
+        workflow_id: &str,
+    ) -> Result<(MfgIncident, MfgWorkflowGraph), MfgRepositoryError> {
+        self.repository
+            .create_incident_workflow_idempotent(incident, packet, workflow_id)
+    }
+
     pub fn plan_incident_workflow_skills(
         &self,
         incident_id: &str,
@@ -825,6 +973,24 @@ impl MfgStore {
 mod workflow_tests {
     use super::*;
     use crate::{run_server_manufacturing_skill, server_manufacturing_skill_pack, MfgSkillPlan};
+
+    fn runtime_completed(mut run: MfgSkillRun) -> MfgSkillRun {
+        run.status = "completed".to_string();
+        run.runtime_execution_ref = Some("runtime-execution://test-skill-graph".to_string());
+        run.runtime_commit_cursor = Some(1);
+        run.tool_results = run
+            .tool_plan
+            .iter()
+            .map(|call| crate::MfgSkillToolResult {
+                tool_name: call.tool_name.clone(),
+                status: "completed".to_string(),
+                summary: "test Runtime tool receipt".to_string(),
+                result: serde_json::json!({"test": true}),
+                evidence_refs: Vec::new(),
+            })
+            .collect();
+        run
+    }
 
     #[test]
     fn workflow_store_isolates_incidents_and_task_lookup() {
@@ -917,7 +1083,12 @@ mod workflow_tests {
         let planned = store
             .save_workflow_graph(&planned, Some(expected_revision))
             .unwrap();
-        let run = run_server_manufacturing_skill(&incident, &skill, None, Some(&packet));
+        let run = runtime_completed(run_server_manufacturing_skill(
+            &incident,
+            &skill,
+            None,
+            Some(&packet),
+        ));
         let (recorded_run, completed) = store.record_skill_run_and_complete_workflow(&run).unwrap();
 
         assert!(completed.revision > planned.revision);

@@ -73,7 +73,7 @@ impl MfgOperationsPanel {
             .map(|contract| contract.contract_version.0.as_str())
             .unwrap_or("contract pending");
         let connection_color = match state.connection {
-            MfgConnectionStatus::ReadOnly => Color::Green,
+            MfgConnectionStatus::ReadOnly | MfgConnectionStatus::Operational => Color::Green,
             MfgConnectionStatus::Loading => Color::Yellow,
             MfgConnectionStatus::Degraded => Color::LightYellow,
             MfgConnectionStatus::Failed => Color::Red,
@@ -120,7 +120,7 @@ impl MfgOperationsPanel {
             format!(
                 " actions={} · mutations={} · generation={}",
                 action_count,
-                state.pending_mutations.len(),
+                state.pending_mutation_count(),
                 state.applied_generation,
             ),
             Style::default().fg(Color::DarkGray),
@@ -184,6 +184,9 @@ impl MfgOperationsPanel {
                 MfgViewFocus::Detail | MfgViewFocus::Backlinks => {
                     self.render_detail(ctx, area, state);
                 }
+                MfgViewFocus::Actions => {
+                    self.render_links_and_recovery(ctx, area, state);
+                }
                 MfgViewFocus::Tabs | MfgViewFocus::List => {
                     self.render_list(ctx, area, state);
                 }
@@ -204,7 +207,11 @@ impl MfgOperationsPanel {
             .constraints(constraints)
             .split(area);
         self.render_list(ctx, columns[0], state);
-        self.render_detail(ctx, columns[1], state);
+        if columns.len() == 2 && state.focus == MfgViewFocus::Actions {
+            self.render_links_and_recovery(ctx, columns[1], state);
+        } else {
+            self.render_detail(ctx, columns[1], state);
+        }
         if columns.len() == 3 {
             self.render_links_and_recovery(ctx, columns[2], state);
         }
@@ -229,6 +236,7 @@ impl MfgOperationsPanel {
                 metric_line("Assignments", state.assignments.len()),
                 metric_line("Reports", state.reports.len()),
                 metric_line("Reviews", state.reviews.len()),
+                metric_line("Insights", state.insights.len()),
             ]);
             if state.command_center.is_none() {
                 lines.push(Line::from(Span::styled(
@@ -328,6 +336,7 @@ impl MfgOperationsPanel {
             MfgViewTab::Assignments => Some("assignments"),
             MfgViewTab::Reports => Some("reports"),
             MfgViewTab::Reviews => Some("reviews"),
+            MfgViewTab::Insights => None,
         };
         if let Some(pagination) = pagination_key.and_then(|key| state.pagination.get(key)) {
             lines.push(Line::from(""));
@@ -404,19 +413,156 @@ impl MfgOperationsPanel {
             .iter()
             .filter(|route| state.route_projection_status(**route) == Some("visible"))
             .count();
-        let mut lines = vec![
+        let p0_attempted = MFG_PANEL_READ_ROUTE_IDS
+            .iter()
+            .filter(|route| state.attempted_routes.contains(route))
+            .count();
+        let p1_attempted = state.attempted_routes.len().saturating_sub(p0_attempted);
+        let mut lines = vec![Line::from(Span::styled(
+            "Governed action status",
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        ))];
+        if let Some(intent) = state.latest_action_intent() {
+            lines.push(Line::from(format!(
+                "intent={} · {:?} · key={}",
+                intent.action_id.as_str(),
+                intent.status,
+                intent.idempotency_key
+            )));
+            if let Some(error) = intent.last_error.as_ref() {
+                lines.push(Line::from(format!(
+                    "{:?} · retryable={} · request={}",
+                    error.code,
+                    error.retryable,
+                    error.request_id.as_deref().unwrap_or("none")
+                )));
+            }
+            if let Some(receipt) = intent.receipt.as_ref() {
+                lines.push(Line::from(format!(
+                    "receipt={} · {:?} · correlation={} · result-revision={}",
+                    receipt.receipt_id,
+                    receipt.status,
+                    receipt.correlation_id.as_deref().unwrap_or("none"),
+                    receipt
+                        .result_revision
+                        .map(|revision| revision.to_string())
+                        .unwrap_or_else(|| "n/a".to_string())
+                )));
+                if receipt.status == app_mfg_contract::MfgReceiptStatus::Preview {
+                    let preview = serde_json::to_string(&receipt.response)
+                        .unwrap_or_else(|_| "<invalid preview payload>".to_string());
+                    let preview = if preview.chars().count() > 180 {
+                        format!("{}…", preview.chars().take(179).collect::<String>())
+                    } else {
+                        preview
+                    };
+                    lines.push(Line::from(format!("preview={preview}")));
+                }
+            }
+            lines.push(Line::from(format!(
+                "target={} · revision={}",
+                intent.resource_ref,
+                intent
+                    .expected_revision
+                    .map(|revision| revision.to_string())
+                    .unwrap_or_else(|| "n/a".to_string())
+            )));
+            if intent.status == crate::runtime_control_store::MfgIntentStatus::AwaitingConfirmation
+            {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "CONFIRM {:?}: this governed action can change canonical state{}",
+                        intent.risk,
+                        if intent.risk == app_mfg_contract::MfgActionRisk::High {
+                            " and may trigger irreversible external effects"
+                        } else {
+                            ""
+                        }
+                    ),
+                    Style::default()
+                        .fg(Color::LightRed)
+                        .add_modifier(Modifier::BOLD),
+                )));
+            }
+        }
+        lines.push(Line::from(Span::styled(
+            "Recovery",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for action in state
+            .recovery_actions
+            .iter()
+            .filter(|action| action.enabled)
+        {
+            lines.push(Line::from(format!(
+                "• {}{}",
+                action.label,
+                action
+                    .target
+                    .as_deref()
+                    .map(|target| format!(" → {target}"))
+                    .unwrap_or_default()
+            )));
+        }
+        if state.recovery_actions.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "No recovery action pending.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        lines.extend([
+            Line::from("a actions · Enter prepare/confirm"),
+            Line::from("c cancel · y confirm · R retry same key"),
+            Line::from(""),
             Line::from(Span::styled(
-                "P0 route projection",
+                "Governed actions",
+                Style::default()
+                    .fg(Color::LightMagenta)
+                    .add_modifier(Modifier::BOLD),
+            )),
+        ]);
+        let action_contracts = state.visible_action_contracts();
+        if action_contracts.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "No operational actions in contract.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            let start = state.selected_action_index.saturating_sub(2);
+            for (index, action) in action_contracts.iter().enumerate().skip(start).take(5) {
+                let marker = if index == state.selected_action_index {
+                    "›"
+                } else {
+                    " "
+                };
+                lines.push(Line::from(format!(
+                    "{marker} {} · {:?} · {}",
+                    action.action_id.as_str(),
+                    action.risk,
+                    state.action_usability_label(action),
+                )));
+            }
+        }
+        lines.extend([
+            Line::from(""),
+            Line::from(Span::styled(
+                "Route projection",
                 Style::default()
                     .fg(Color::LightGreen)
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(format!(
-                "this refresh: requests={}/{} · visible={}/{}",
-                state.attempted_routes.len(),
-                request_route_count,
-                visible_route_count,
-                request_route_count,
+                "P0 requests={}/{} · visible={}/{}",
+                p0_attempted, request_route_count, visible_route_count, request_route_count,
+            )),
+            Line::from(format!(
+                "P1 attempted={} · documents={}",
+                p1_attempted,
+                state.p1_documents.len()
             )),
             Line::from(if state.live_stream_available {
                 "live stream: route declared · not connected"
@@ -433,7 +579,7 @@ impl MfgOperationsPanel {
             Line::from("e Evidence · p Approval"),
             Line::from("s Surface · x Runtime"),
             Line::from(""),
-        ];
+        ]);
         if let Some(item) = state.selected_item() {
             for link in &item.backlinks {
                 lines.push(Line::from(format!(
@@ -460,33 +606,16 @@ impl MfgOperationsPanel {
                 state.route_projection_status(*route).unwrap_or("unmapped")
             )));
         }
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "Recovery",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )));
-        for action in state
-            .recovery_actions
-            .iter()
-            .filter(|action| action.enabled)
-        {
-            lines.push(Line::from(format!("• {}", action.label)));
-        }
-        if state.recovery_actions.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "No recovery action pending.",
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
         ctx.frame_mut().render_widget(
             Paragraph::new(lines)
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title(" Context ")
-                        .border_style(focus_style(state.focus == MfgViewFocus::Backlinks)),
+                        .title(" Context & Actions ")
+                        .border_style(focus_style(matches!(
+                            state.focus,
+                            MfgViewFocus::Backlinks | MfgViewFocus::Actions
+                        ))),
                 )
                 .wrap(Wrap { trim: true }),
             area,
@@ -513,7 +642,7 @@ impl MfgOperationsPanel {
                     "{:?} · receipts={} · pending-mutations={} · live-cursor={}",
                     state.connection,
                     state.receipts.len(),
-                    state.pending_mutations.len(),
+                    state.pending_mutation_count(),
                     state.live_cursor.as_deref().unwrap_or("not-started")
                 )
             });
@@ -529,7 +658,7 @@ impl MfgOperationsPanel {
                 }),
             )),
             Line::from(Span::styled(
-                "j/k select · Tab/ShiftTab focus · Enter list/detail · [/] page · r refresh · Esc leave",
+                "j/k select · a actions · Enter prepare/confirm · y confirm · c cancel · R retry · r refresh",
                 Style::default().fg(Color::DarkGray),
             )),
         ];
@@ -642,7 +771,7 @@ mod tests {
         assert!(compact.contains("Line stop"));
         assert!(!compact.contains("Backlinks"));
 
-        let medium = render(96, 30, &state);
+        let medium = render(96, 28, &state);
         assert!(medium.contains("Line stop"));
         assert!(medium.contains("Detail"));
         assert!(!medium.contains("Backlinks"));

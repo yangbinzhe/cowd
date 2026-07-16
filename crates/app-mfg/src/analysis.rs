@@ -59,7 +59,13 @@ pub struct MfgOperationalAnalysis {
     pub recommended_actions: Vec<MfgRecommendedAction>,
     pub confidence: f32,
     pub status: String,
+    #[serde(default = "default_analysis_revision")]
+    pub revision: u64,
     pub created_at: DateTime<Utc>,
+}
+
+const fn default_analysis_revision() -> u64 {
+    1
 }
 
 impl MfgOperationalAnalysis {
@@ -74,6 +80,7 @@ impl MfgOperationalAnalysis {
             recommended_actions: Vec::new(),
             confidence: packet.confidence,
             status: "draft".to_string(),
+            revision: default_analysis_revision(),
             created_at: Utc::now(),
         };
 

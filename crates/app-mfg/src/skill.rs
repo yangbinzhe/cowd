@@ -20,6 +20,8 @@ pub struct MfgSkillExecutionContext {
     pub evidence_refs: Vec<String>,
     #[serde(default)]
     pub metric_keys: Vec<String>,
+    #[serde(default)]
+    pub entity_refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -39,6 +41,17 @@ pub struct MfgSkillTelemetry {
     pub tool_call_count: usize,
     pub evidence_ref_count: usize,
     pub confidence: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MfgSkillToolResult {
+    pub tool_name: String,
+    pub status: String,
+    pub summary: String,
+    #[serde(default)]
+    pub result: Value,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -90,6 +103,12 @@ pub struct MfgSkillRun {
     pub execution_context: Option<MfgSkillExecutionContext>,
     #[serde(default)]
     pub tool_plan: Vec<MfgSkillToolCall>,
+    #[serde(default)]
+    pub tool_results: Vec<MfgSkillToolResult>,
+    #[serde(default)]
+    pub runtime_execution_ref: Option<String>,
+    #[serde(default)]
+    pub runtime_commit_cursor: Option<u64>,
     #[serde(default)]
     pub telemetry: Option<MfgSkillTelemetry>,
     #[serde(default)]
@@ -262,8 +281,19 @@ pub fn run_server_manufacturing_skill(
             })
             .unwrap_or_default(),
         metric_keys: skill.input_metric_keys.clone(),
+        entity_refs: packet
+            .map(|packet| {
+                packet
+                    .metric_evidence
+                    .iter()
+                    .chain(packet.change_evidence.iter())
+                    .flat_map(entity_refs_from_value)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect()
+            })
+            .unwrap_or_default(),
     };
-    let started_at = Utc::now();
     let tool_plan = skill
         .tools
         .iter()
@@ -276,6 +306,7 @@ pub fn run_server_manufacturing_skill(
         })
         .collect::<Vec<_>>();
     let structured_report = serde_json::json!({
+        "status": "planned",
         "incident_id": incident.incident_id,
         "skill_id": skill.skill_id,
         "analysis_method": skill.analysis_method,
@@ -294,14 +325,13 @@ pub fn run_server_manufacturing_skill(
         },
         "evidence_packet_confidence": packet.map(|item| item.confidence),
     });
-    let completed_at = Utc::now();
     MfgSkillRun {
         execution_id: Some(format!("skill-execution-{}", uuid::Uuid::new_v4())),
         incident_id: incident.incident_id.clone(),
         skill_id: skill.skill_id.clone(),
-        status: "completed".to_string(),
+        status: "planned".to_string(),
         summary: format!(
-            "{} prepared governed analysis for {} with {} tool calls",
+            "{} prepared a governed Runtime tool plan for {} with {} required calls",
             skill.role,
             incident.title,
             tool_plan.len()
@@ -311,20 +341,36 @@ pub fn run_server_manufacturing_skill(
         agent_node_id: Some(skill_agent_node_id(&skill.skill_id)),
         execution_context: Some(context),
         tool_plan,
-        telemetry: Some(MfgSkillTelemetry {
-            started_at,
-            completed_at,
-            elapsed_ms: completed_at
-                .signed_duration_since(started_at)
-                .num_milliseconds()
-                .max(0) as u64,
-            tool_call_count: skill.tools.len(),
-            evidence_ref_count: packet
-                .map(|item| item.source_refs.len())
-                .unwrap_or_default(),
-            confidence: packet.map(|item| item.confidence).unwrap_or(0.5),
-        }),
+        tool_results: Vec::new(),
+        runtime_execution_ref: None,
+        runtime_commit_cursor: None,
+        telemetry: None,
         structured_report,
+    }
+}
+
+fn entity_refs_from_value(value: &Value) -> Vec<String> {
+    match value {
+        Value::Object(object) => object
+            .iter()
+            .flat_map(|(key, value)| {
+                if key == "entity_refs" {
+                    value
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                } else if key == "entity_id" {
+                    value.as_str().map(str::to_string).into_iter().collect()
+                } else {
+                    entity_refs_from_value(value)
+                }
+            })
+            .collect(),
+        Value::Array(items) => items.iter().flat_map(entity_refs_from_value).collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -447,5 +493,19 @@ mod tests {
         assert!(skills.iter().all(|skill| {
             skill.quality_gate == "evidence_quality_gate_required" && !skill.tools.is_empty()
         }));
+    }
+
+    #[test]
+    fn domain_skill_builder_only_prepares_a_plan_and_never_fabricates_execution() {
+        let incident = MfgIncident::new("GPU shortage");
+        let skill = server_manufacturing_skill_pack().remove(0);
+        let run = run_server_manufacturing_skill(&incident, &skill, None, None);
+
+        assert_eq!(run.status, "planned");
+        assert_eq!(run.tool_plan.len(), skill.tools.len());
+        assert!(run.tool_results.is_empty());
+        assert!(run.telemetry.is_none());
+        assert!(run.runtime_execution_ref.is_none());
+        assert!(run.runtime_commit_cursor.is_none());
     }
 }

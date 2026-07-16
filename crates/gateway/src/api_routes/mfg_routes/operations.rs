@@ -165,7 +165,7 @@ pub(super) async fn mfg_alert_rule_upsert_handler(
         .canonical_receipt()
         .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.message))?;
     Ok(Json(
-        serde_json::json!({ "kind": "mfg.alert_rule", "rule": rule, "receipt": receipt }),
+        serde_json::json!({ "kind": "mfg.alert_rule", "rule": rule, "business_receipt": receipt }),
     ))
 }
 
@@ -283,7 +283,7 @@ pub(super) async fn mfg_alert_subscription_upsert_handler(
         .canonical_receipt()
         .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.message))?;
     Ok(Json(
-        serde_json::json!({ "kind": "mfg.alert_subscription", "subscription": subscription, "receipt": receipt }),
+        serde_json::json!({ "kind": "mfg.alert_subscription", "subscription": subscription, "business_receipt": receipt }),
     ))
 }
 
@@ -294,6 +294,7 @@ pub(super) async fn mfg_alert_command_handler(
     headers: HeaderMap,
     Json(request): Json<MfgAlertCommandRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_mfg_capability(&principal, "mfg.alert.respond")?;
     let idempotency_key = mfg_idempotency_key(&headers, request.idempotency_key)
         .map_err(|error| mfg_api_error(StatusCode::BAD_REQUEST, error.message))?;
     let actor = principal_actor_id(&principal);
@@ -338,7 +339,7 @@ pub(super) async fn mfg_alert_command_handler(
         .canonical_receipt()
         .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.message))?;
     Ok(Json(
-        serde_json::json!({ "kind": "mfg.alert_command_receipt", "occurrence": occurrence, "receipt": receipt }),
+        serde_json::json!({ "kind": "mfg.alert_command_receipt", "occurrence": occurrence, "business_receipt": receipt }),
     ))
 }
 
@@ -375,6 +376,7 @@ pub(super) async fn mfg_assignment_upsert_handler(
     headers: HeaderMap,
     Json(mut request): Json<MfgAssignmentUpsertRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_mfg_capability(&principal, "mfg.assignment.manage")?;
     let expected_revision = request.assignment.expected_revision;
     let actor = principal_actor_id(&principal);
     let idempotency_key = mfg_idempotency_key(&headers, request.idempotency_key.take())
@@ -438,7 +440,7 @@ pub(super) async fn mfg_assignment_upsert_handler(
         .canonical_receipt()
         .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.message))?;
     Ok(Json(
-        serde_json::json!({ "kind": "mfg.assignment", "assignment": assignment, "receipt": receipt }),
+        serde_json::json!({ "kind": "mfg.assignment", "assignment": assignment, "business_receipt": receipt }),
     ))
 }
 
@@ -447,7 +449,7 @@ pub(super) async fn mfg_assignment_list_handler(
     Extension(principal): Extension<AuthenticatedPrincipal>,
     Query(query): Query<MfgAssignmentListQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let items = state
+    let assignments = state
         .services
         .mfg
         .list_assignments(
@@ -460,6 +462,10 @@ pub(super) async fn mfg_assignment_list_handler(
         .into_iter()
         .filter(|item| assignment_visible_to(item, &principal))
         .collect::<Vec<_>>();
+    let items = assignments
+        .iter()
+        .map(|assignment| assignment_with_notification_refs(&state, assignment))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(
         serde_json::json!({ "kind": "mfg.assignment_list", "items": items }),
     ))
@@ -482,9 +488,37 @@ pub(super) async fn mfg_assignment_get_handler(
             "assignment was not found in the verified principal scope",
         ));
     }
+    let assignment = assignment_with_notification_refs(&state, &assignment)?;
     Ok(Json(
         serde_json::json!({ "kind": "mfg.assignment", "assignment": assignment }),
     ))
+}
+
+fn assignment_with_notification_refs(
+    state: &AppState,
+    assignment: &MfgAssignment,
+) -> Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)> {
+    let mut value = serde_json::to_value(assignment).map_err(|error| {
+        mfg_api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to serialize assignment: {error}"),
+        )
+    })?;
+    let notification_refs = state
+        .services
+        .mfg
+        .command_notification_refs_for_resource(
+            &state.config_home,
+            &format!("mfg:assignment:{}", assignment.assignment_id),
+        )
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "notification_refs".to_string(),
+            serde_json::to_value(notification_refs).unwrap_or_default(),
+        );
+    }
+    Ok(value)
 }
 
 pub(super) async fn mfg_assignment_command_handler(
@@ -517,6 +551,83 @@ pub(super) async fn mfg_assignment_command_handler(
     }
     let idempotency_key = mfg_idempotency_key(&headers, request.idempotency_key)
         .map_err(|error| mfg_api_error(StatusCode::BAD_REQUEST, error.message))?;
+    let correlation_id = headers
+        .get("x-cowd-correlation-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("mfg-assignment:{idempotency_key}"));
+    let actor_ref = principal_actor_id(&principal);
+    let action_id = assignment_command_action_id(&request.command);
+    let resource_ref = format!("mfg:assignment:{id}");
+    if let Some(receipt) = state
+        .services
+        .mfg
+        .native_command_receipt_by_identity(
+            &state.config_home,
+            &idempotency_key,
+            &actor_ref,
+            action_id,
+            &resource_ref,
+        )
+        .map_err(mfg_mutation_error)?
+    {
+        let replayed_assignment =
+            serde_json::from_value::<MfgAssignment>(receipt.response_snapshot.clone())
+                .unwrap_or(assignment);
+        let receipt = deliver_assignment_notifications(
+            &state,
+            &replayed_assignment,
+            &receipt,
+            &idempotency_key,
+        )
+        .await?
+        .canonical_receipt()
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.message))?;
+        return Ok(Json(serde_json::json!({
+            "kind": "mfg.assignment_command_receipt",
+            "assignment": replayed_assignment,
+            "business_receipt": receipt
+        })));
+    }
+    let completion_resume = request.command == MfgAssignmentCommand::Complete
+        && assignment.status == "completion_pending"
+        && assignment.lifecycle_correlation_id.as_deref() == Some(correlation_id.as_str());
+    if !completion_resume && request.expected_revision != assignment.revision {
+        return Err(mfg_typed_api_error(assignment_revision_conflict(
+            &assignment,
+            request.expected_revision,
+        )));
+    }
+    let mut command_expected_revision = request.expected_revision;
+    let completion_evidence = if request.command == MfgAssignmentCommand::Complete {
+        let terminal = probe_assignment_completion_terminal(&state, &assignment)
+            .await
+            .map_err(mfg_typed_api_error)?;
+        if completion_resume {
+            command_expected_revision = assignment.revision;
+        } else {
+            let reserved = state
+                .services
+                .mfg
+                .reserve_assignment_completion(
+                    &state.config_home,
+                    &id,
+                    request.expected_revision,
+                    &actor_ref,
+                    &correlation_id,
+                )
+                .map_err(mfg_mutation_error)?;
+            command_expected_revision = reserved.revision;
+        }
+        Some(
+            record_assignment_completion_evidence(&state, &assignment, &correlation_id, terminal)
+                .map_err(mfg_typed_api_error)?,
+        )
+    } else {
+        None
+    };
     let (assignment, receipt) = state
         .services
         .mfg
@@ -525,25 +636,246 @@ pub(super) async fn mfg_assignment_command_handler(
             &id,
             MfgAssignmentCommandInput {
                 command: request.command,
-                actor_ref: principal_actor_id(&principal),
-                expected_revision: request.expected_revision,
+                actor_ref,
+                expected_revision: command_expected_revision,
                 idempotency_key: idempotency_key.clone(),
                 target_ref: request.target_ref,
                 reason: request.reason,
+                correlation_id,
+                completion_evidence,
             },
         )
         .map_err(mfg_mutation_error)?;
-    let receipt = if receipt.idempotent_replay {
-        receipt
-    } else {
-        deliver_assignment_notifications(&state, &assignment, &receipt, &idempotency_key).await?
-    };
+    // Reconcile every target on replay as well. SurfaceSendRequest uses one
+    // deterministic key per target, so a completed delivery is replayed from
+    // the durable Surface outbox while a missing/partial delivery is resumed.
+    let receipt =
+        deliver_assignment_notifications(&state, &assignment, &receipt, &idempotency_key).await?;
     let receipt = receipt
         .canonical_receipt()
         .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.message))?;
     Ok(Json(
-        serde_json::json!({ "kind": "mfg.assignment_command_receipt", "assignment": assignment, "receipt": receipt }),
+        serde_json::json!({ "kind": "mfg.assignment_command_receipt", "assignment": assignment, "business_receipt": receipt }),
     ))
+}
+
+fn assignment_command_action_id(command: &MfgAssignmentCommand) -> &'static str {
+    match command {
+        MfgAssignmentCommand::Assign => "mfg.assignment.assign",
+        MfgAssignmentCommand::Claim => "mfg.assignment.claim",
+        MfgAssignmentCommand::Transfer => "mfg.assignment.transfer",
+        MfgAssignmentCommand::Unassign => "mfg.assignment.unassign",
+        MfgAssignmentCommand::Watch => "mfg.assignment.watch",
+        MfgAssignmentCommand::RequestUpdate => "mfg.assignment.request_update",
+        MfgAssignmentCommand::Escalate => "mfg.assignment.escalate",
+        MfgAssignmentCommand::Start => "mfg.assignment.start",
+        MfgAssignmentCommand::Complete => "mfg.assignment.complete",
+    }
+}
+
+struct AssignmentCompletionTerminal {
+    task_id: String,
+    workflow_node_id: Option<String>,
+    terminal_status: String,
+    source_receipt_ref: String,
+}
+
+async fn probe_assignment_completion_terminal(
+    state: &AppState,
+    assignment: &MfgAssignment,
+) -> Result<AssignmentCompletionTerminal, app_mfg_contract::MfgApiErrorV1> {
+    let task_id = assignment
+        .task_ref
+        .trim()
+        .strip_prefix("task://")
+        .or_else(|| assignment.task_ref.trim().strip_prefix("task:"))
+        .unwrap_or(assignment.task_ref.trim());
+    let task = state
+        .services
+        .task
+        .list_records()
+        .map_err(|message| assignment_completion_internal_error(message))?
+        .into_iter()
+        .find(|task| task.id == task_id)
+        .ok_or_else(|| {
+            app_mfg_contract::MfgApiErrorV1::assignment_task_transition_required(
+                assignment.task_ref.clone(),
+                assignment.workflow_node_id.clone(),
+            )
+        })?;
+
+    if let Some(node_id) = assignment.workflow_node_id.as_deref() {
+        let projection = state
+            .services
+            .task
+            .execution_graph(&task.id)
+            .await
+            .map_err(assignment_completion_internal_error)?
+            .ok_or_else(|| {
+                app_mfg_contract::MfgApiErrorV1::assignment_task_transition_required(
+                    assignment.task_ref.clone(),
+                    assignment.workflow_node_id.clone(),
+                )
+            })?;
+        let node = projection
+            .nodes
+            .iter()
+            .find(|node| node.node_id == node_id)
+            .ok_or_else(|| {
+                app_mfg_contract::MfgApiErrorV1::assignment_task_transition_required(
+                    assignment.task_ref.clone(),
+                    assignment.workflow_node_id.clone(),
+                )
+            })?;
+        if !node.status.is_terminal() {
+            return Err(
+                app_mfg_contract::MfgApiErrorV1::assignment_task_transition_required(
+                    assignment.task_ref.clone(),
+                    assignment.workflow_node_id.clone(),
+                ),
+            );
+        }
+        let terminal_status = format!("{:?}", node.status).to_ascii_lowercase();
+        let source_receipt_ref = node.result_ref.clone().unwrap_or_else(|| {
+            format!(
+                "execution://{}/nodes/{}?revision={}",
+                projection.graph_id, node_id, projection.revision
+            )
+        });
+        return Ok(AssignmentCompletionTerminal {
+            task_id: task.id,
+            workflow_node_id: Some(node_id.to_string()),
+            terminal_status,
+            source_receipt_ref,
+        });
+    }
+
+    let completion_receipt = state
+        .services
+        .task
+        .latest_terminal_runtime_receipt(&task.id)
+        .map_err(assignment_completion_internal_error)?;
+    if let Some(receipt) = completion_receipt {
+        let terminal_status = receipt
+            .payload
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                assignment_completion_internal_error(
+                    "canonical Runtime terminal receipt omitted its terminal status",
+                )
+            })?;
+        let source_receipt_ref = format!(
+            "runtime-event://{}?cursor={}&transaction={}",
+            receipt.event_id, receipt.commit_cursor, receipt.transaction_id
+        );
+        return Ok(AssignmentCompletionTerminal {
+            task_id: task.id,
+            workflow_node_id: None,
+            terminal_status: terminal_status.to_string(),
+            source_receipt_ref,
+        });
+    }
+    if matches!(
+        task.status,
+        crate::task_kernel::TaskStatus::Completed
+            | crate::task_kernel::TaskStatus::Blocked
+            | crate::task_kernel::TaskStatus::Cancelled
+            | crate::task_kernel::TaskStatus::Failed
+    ) {
+        let source_receipt_ref = format!("task://{}?status={}", task.id, task.status.as_str());
+        return Ok(AssignmentCompletionTerminal {
+            task_id: task.id,
+            workflow_node_id: None,
+            terminal_status: task.status.as_str().to_string(),
+            source_receipt_ref,
+        });
+    }
+    Err(
+        app_mfg_contract::MfgApiErrorV1::assignment_task_transition_required(
+            assignment.task_ref.clone(),
+            assignment.workflow_node_id.clone(),
+        ),
+    )
+}
+
+fn record_assignment_completion_evidence(
+    state: &AppState,
+    assignment: &MfgAssignment,
+    correlation_id: &str,
+    terminal: AssignmentCompletionTerminal,
+) -> Result<app_mfg_contract::MfgAssignmentCompletionEvidenceV1, app_mfg_contract::MfgApiErrorV1> {
+    let observation = state
+        .services
+        .task
+        .record_assignment_terminal_observation(
+            &terminal.task_id,
+            &terminal.terminal_status,
+            &terminal.source_receipt_ref,
+            correlation_id,
+        )
+        .map_err(assignment_completion_internal_error)?;
+    Ok(app_mfg_contract::MfgAssignmentCompletionEvidenceV1 {
+        correlation_id: correlation_id.to_string(),
+        owner_kind: "runtime_assignment_terminal_observation".to_string(),
+        task_ref: assignment.task_ref.clone(),
+        workflow_node_id: terminal.workflow_node_id,
+        terminal_status: terminal.terminal_status,
+        receipt_ref: format!(
+            "runtime-event://{}?cursor={}&transaction={}",
+            observation.event_id, observation.commit_cursor, observation.transaction_id
+        ),
+    })
+}
+
+fn assignment_revision_conflict(
+    assignment: &MfgAssignment,
+    expected_revision: u64,
+) -> app_mfg_contract::MfgApiErrorV1 {
+    app_mfg_contract::MfgApiErrorV1 {
+        code: app_mfg_contract::MfgErrorCode::RevisionConflict,
+        message: format!(
+            "assignment revision conflict: expected {expected_revision}, actual {}",
+            assignment.revision
+        ),
+        http_status: 409,
+        details: serde_json::json!({
+            "assignment_id": assignment.assignment_id,
+            "expected_revision": expected_revision,
+            "actual_revision": assignment.revision,
+        }),
+        retryable: false,
+        contract_version: app_mfg_contract::MfgContractVersion::default(),
+        recovery_actions: vec![app_mfg_contract::MfgRecoveryAction {
+            kind: app_mfg_contract::MfgRecoveryActionKind::Compare,
+            label: "Refresh and compare the assignment".to_string(),
+            target: Some(format!("/mfg/assignments/{}", assignment.assignment_id)),
+            enabled: true,
+        }],
+        request_id: None,
+        receipt_ref: None,
+    }
+}
+
+fn assignment_completion_internal_error(
+    message: impl Into<String>,
+) -> app_mfg_contract::MfgApiErrorV1 {
+    app_mfg_contract::MfgApiErrorV1 {
+        code: app_mfg_contract::MfgErrorCode::Internal,
+        message: message.into(),
+        http_status: 503,
+        details: serde_json::Value::Null,
+        retryable: true,
+        contract_version: app_mfg_contract::MfgContractVersion::default(),
+        recovery_actions: vec![app_mfg_contract::MfgRecoveryAction {
+            kind: app_mfg_contract::MfgRecoveryActionKind::RetrySameIntent,
+            label: "Retry the same assignment intent".to_string(),
+            target: None,
+            enabled: true,
+        }],
+        request_id: None,
+        receipt_ref: None,
+    }
 }
 
 fn assignment_visible_to(assignment: &MfgAssignment, principal: &AuthenticatedPrincipal) -> bool {
@@ -582,27 +914,34 @@ async fn deliver_assignment_notifications(
 ) -> Result<app_mfg::MfgCommandReceipt, (StatusCode, Json<ErrorResponse>)> {
     let mut notification_refs = Vec::new();
     for (index, target) in assignment.notification_targets.iter().enumerate() {
+        let delivery_key = format!("{idempotency_key}:surface:{index}");
         let result = state.services.surface.send(SurfaceSendRequest {
             surface: target.surface.clone(), recipient: target.recipient.clone(), thread: target.thread.clone(),
             text: format!("MFG assignment {} is {} (revision {})", assignment.assignment_id, assignment.status, assignment.revision),
-            idempotency_key: Some(format!("{idempotency_key}:surface:{index}")),
+            idempotency_key: Some(delivery_key.clone()),
             metadata: serde_json::json!({ "kind": "mfg.assignment_notification", "assignment_ref": format!("mfg:assignment:{}", assignment.assignment_id), "receipt_id": receipt.receipt_id, "audit_ref": receipt.audit_ref }),
         }).await;
-        match result {
-            Ok(result) => {
-                let message_ref = result
-                    .message_id
-                    .clone()
-                    .unwrap_or_else(|| result.kind.clone());
-                notification_refs.push(format!(
-                    "surface://{}/{}?status={}",
-                    result.surface, message_ref, result.status
-                ));
-            }
-            Err(error) => notification_refs.push(format!(
-                "surface://{}/failed?reason={}",
-                target.surface, error
-            )),
+        // The Surface outbox owns the stable delivery identity even when the
+        // provider call fails. Never persist a result kind or a synthetic
+        // "failed" path as if it were a resolvable object.
+        if let Some(delivery) = state
+            .services
+            .surface
+            .all_outbox()
+            .into_iter()
+            .find(|delivery| delivery.idempotency_key == delivery_key)
+        {
+            notification_refs.push(format!(
+                "surface://{}/delivery/{}",
+                delivery.surface, delivery.delivery_id
+            ));
+        } else if let Err(error) = result {
+            tracing::warn!(
+                assignment_id = %assignment.assignment_id,
+                surface = %target.surface,
+                error = %error,
+                "assignment notification failed before a durable Surface delivery was queued"
+            );
         }
     }
     state
