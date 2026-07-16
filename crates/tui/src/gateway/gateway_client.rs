@@ -2181,6 +2181,21 @@ pub fn gateway_sse_json_to_cowd_event(value: &serde_json::Value) -> Option<CowdE
                 .unwrap_or("Gateway turn error")
                 .to_string(),
         }),
+        "ExecutionPhase" | "execution_phase" => {
+            let status = value
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("running");
+            let detail = value
+                .get("detail")
+                .and_then(serde_json::Value::as_str)
+                .filter(|detail| !detail.trim().is_empty())
+                .map(|detail| format!(": {detail}"))
+                .unwrap_or_default();
+            Some(CowdEvent::Warning {
+                message: format!("Runtime {status}{detail}"),
+            })
+        }
         "SessionInputReceived" | "session_input_received" => {
             let decision = value
                 .get("receipt")
@@ -2359,6 +2374,14 @@ mod tests {
             gateway_sse_json_to_cowd_event(&serde_json::json!({
                 "type": "TurnComplete",
                 "assistant_text": "draft"
+            })),
+            Some(CowdEvent::Warning { .. })
+        ));
+        assert!(matches!(
+            gateway_sse_json_to_cowd_event(&serde_json::json!({
+                "type": "ExecutionPhase",
+                "status": "CallingModel",
+                "detail": "requesting model"
             })),
             Some(CowdEvent::Warning { .. })
         ));

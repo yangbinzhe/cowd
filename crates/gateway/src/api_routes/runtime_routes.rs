@@ -287,12 +287,9 @@ pub(super) async fn get_execution_projection(
 > {
     let context = execution_projection_context(&state, query.detail_scope)?;
     let runtime = execution_runtime(&state)?;
-    let mut projection = runtime::execution_projection::snapshot(&runtime, &execution_id, &context)
+    let projection = runtime::execution_projection::snapshot(&runtime, &execution_id, &context)
         .await
         .map_err(projection_error)?;
-    if let Some(runtime_service) = state.services.runtime.as_ref() {
-        projection.live = runtime_service.execution_live(&execution_id);
-    }
     Ok(Json(projection))
 }
 

@@ -2,7 +2,19 @@
 //! Single entry point replacing runtime::bus::Event + TuiEvent.
 //! Field names aligned with TuiEvent for zero-conversion migration.
 
+use std::sync::{Arc, Mutex};
+
 use tokio::sync::broadcast;
+
+/// Stable Runtime identity attached to every event produced while one
+/// execution owns a conversation host.  Transport consumers may use this for
+/// routing, but Runtime remains the only reducer of lifecycle facts.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CowdExecutionContext {
+    pub execution_id: String,
+    pub session_id: String,
+    pub turn_id: String,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeExecutionGraphSummary {
@@ -53,6 +65,13 @@ pub struct RunModelTelemetry {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum CowdEvent {
+    /// An execution-correlated Runtime event.  `CowdEventBus` adds this
+    /// envelope while an ingress turn owns the host; producers continue to
+    /// emit the domain event itself and never guess a session's latest turn.
+    ExecutionScoped {
+        context: CowdExecutionContext,
+        event: Box<CowdEvent>,
+    },
     // Streaming — field names match TuiEvent
     TextDelta {
         text: String,
@@ -179,20 +198,93 @@ pub enum CowdEvent {
     },
 }
 
+impl CowdEvent {
+    #[must_use]
+    pub fn execution_context(&self) -> Option<&CowdExecutionContext> {
+        match self {
+            Self::ExecutionScoped { context, .. } => Some(context),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn domain_event(&self) -> &CowdEvent {
+        match self {
+            Self::ExecutionScoped { event, .. } => event.domain_event(),
+            event => event,
+        }
+    }
+
+    fn is_execution_scoped(&self) -> bool {
+        matches!(self, Self::ExecutionScoped { .. })
+    }
+}
+
 #[derive(Clone)]
 pub struct CowdEventBus {
     tx: broadcast::Sender<CowdEvent>,
+    execution_context: Arc<Mutex<Option<CowdExecutionContext>>>,
+}
+
+/// Clears the bus execution context even when the owning turn future is
+/// cancelled or dropped before its normal cleanup path runs.
+pub struct CowdExecutionScope {
+    execution_context: Arc<Mutex<Option<CowdExecutionContext>>>,
+    context: CowdExecutionContext,
 }
 
 impl CowdEventBus {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(4096);
-        Self { tx }
+        Self {
+            tx,
+            execution_context: Arc::new(Mutex::new(None)),
+        }
     }
     pub fn subscribe(&self) -> broadcast::Receiver<CowdEvent> {
         self.tx.subscribe()
     }
+
+    #[must_use]
+    pub fn enter_execution(&self, context: CowdExecutionContext) -> CowdExecutionScope {
+        *self
+            .execution_context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(context.clone());
+        CowdExecutionScope {
+            execution_context: Arc::clone(&self.execution_context),
+            context,
+        }
+    }
+
     pub fn emit(&self, event: CowdEvent) {
+        let event = if event.is_execution_scoped() {
+            event
+        } else if let Some(context) = self
+            .execution_context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            CowdEvent::ExecutionScoped {
+                context,
+                event: Box::new(event),
+            }
+        } else {
+            event
+        };
         let _ = self.tx.send(event);
+    }
+}
+
+impl Drop for CowdExecutionScope {
+    fn drop(&mut self) {
+        let mut current = self
+            .execution_context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if current.as_ref() == Some(&self.context) {
+            *current = None;
+        }
     }
 }

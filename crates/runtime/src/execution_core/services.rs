@@ -523,6 +523,7 @@ pub struct RuntimeServices {
     workspace_root: PathBuf,
     workspace_key: String,
     event_store: Arc<RuntimeEventStore>,
+    live_execution_store: Arc<crate::execution_live::ExecutionLiveStore>,
     executor_registry: Arc<NodeExecutorRegistry>,
     model_step_executor: Arc<ScopedNodeExecutor>,
     tool_batch_executor: Arc<ScopedNodeExecutor>,
@@ -770,6 +771,9 @@ impl RuntimeServices {
             workspace_root,
             workspace_key: workspace_key.clone(),
             event_store: Arc::clone(&event_store),
+            live_execution_store: Arc::new(crate::execution_live::ExecutionLiveStore::new(
+                Arc::clone(&event_store),
+            )),
             executor_registry,
             model_step_executor,
             tool_batch_executor,
@@ -1053,6 +1057,63 @@ impl RuntimeServices {
         RuntimeEventReader {
             store: Arc::clone(&self.event_store),
         }
+    }
+
+    /// Register the durable SessionIngress identity before a provider-backed
+    /// turn starts. Runtime owns every subsequent lifecycle transition.
+    pub fn record_live_execution(&self, session_id: &str, execution_id: String, turn_id: String) {
+        self.live_execution_store
+            .record_queued(session_id, execution_id, turn_id);
+    }
+
+    /// Reduce an execution-scoped Runtime event. Events without an execution
+    /// context are intentionally ignored instead of being assigned to the
+    /// session's most recently active turn.
+    pub fn observe_live_execution_event(&self, session_id: &str, event: &crate::CowdEvent) {
+        self.live_execution_store.observe_event(session_id, event);
+    }
+
+    pub fn complete_live_execution(
+        &self,
+        execution_id: &str,
+        report: &harness_contract::context::ContextTurnReport,
+        terminal_ref: String,
+    ) {
+        self.live_execution_store
+            .complete(execution_id, report, terminal_ref);
+    }
+
+    pub fn fail_live_execution(&self, execution_id: &str, error: String) {
+        self.live_execution_store.fail(execution_id, error);
+    }
+
+    pub fn cancel_live_execution(&self, execution_id: &str, detail: String) {
+        self.live_execution_store.cancel(execution_id, detail);
+    }
+
+    #[must_use]
+    pub fn execution_live(
+        &self,
+        execution_id: &str,
+    ) -> Option<harness_contract::projection::ExecutionLiveState> {
+        self.live_execution_store.execution_live(execution_id)
+    }
+
+    #[must_use]
+    pub fn session_execution_index(
+        &self,
+        session_id: &str,
+    ) -> harness_contract::projection::SessionExecutionIndexProjection {
+        self.live_execution_store
+            .session_execution_index(session_id)
+    }
+
+    #[must_use]
+    pub fn running_session_execution_indices(
+        &self,
+    ) -> Vec<harness_contract::projection::SessionExecutionIndexProjection> {
+        self.live_execution_store
+            .running_session_execution_indices()
     }
 
     #[cfg(feature = "test-fixtures")]

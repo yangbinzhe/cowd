@@ -329,6 +329,21 @@ where
         // outbox owns the assistant record. Keep the in-memory transcript for
         // model context, but prohibit a second SQLite transcript writer.
         runtime.set_transcript_persistence(false);
+        let execution_id = crate::session_execution::session_ingress_graph_id(
+            &ingress.session_id,
+            &ingress.request_id,
+            &ingress.turn_id,
+        );
+        // Scope every provider/tool/approval event to the deterministic
+        // SessionIngress execution. The guard clears on cancellation as well
+        // as normal completion, so a later turn can never inherit this id.
+        let _execution_scope = runtime.cowd_bus().cloned().map(|bus| {
+            bus.enter_execution(crate::CowdExecutionContext {
+                execution_id,
+                session_id: ingress.session_id.clone(),
+                turn_id: ingress.turn_id.clone(),
+            })
+        });
         let (runtime, result) = submit_owned_conversation_turn_with_ingress(
             runtime,
             Arc::clone(&self.services),

@@ -185,6 +185,7 @@ pub mod evidence_planner;
 pub mod evolution;
 #[path = "execution_core/mod.rs"]
 pub mod execution_core;
+pub(crate) mod execution_live;
 #[path = "projection/mod.rs"]
 pub mod execution_projection;
 #[path = "infrastructure/execution_scheduler.rs"]
@@ -393,8 +394,8 @@ pub use conversation::{
     ToolExecutor, TurnSummary,
 };
 pub use cowd_event::{
-    CowdEvent, CowdEventBus, RunModelTelemetry, RuntimeExecutionGraphSummary,
-    RuntimePolicyDecisionSummary,
+    CowdEvent, CowdEventBus, CowdExecutionContext, CowdExecutionScope, RunModelTelemetry,
+    RuntimeExecutionGraphSummary, RuntimePolicyDecisionSummary,
 };
 pub use cross_plane_policy::{
     ConnectorActionContext, ConnectorDecisionEvidence, CrossPlaneAction, CrossPlaneAuditRecord,
@@ -565,7 +566,7 @@ pub use policy_engine::{
 pub use profile::{Profile, ProfileManager, ProfileMeta};
 pub use prompt::{
     load_system_prompt, prepend_bullets, ContextFile, ProjectContext, PromptBuildError,
-    SystemPromptBuilder, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+    SystemPromptBuilder, COWD_IDENTITY_CONTRACT_VERSION, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
 pub use prompt_assembly::{PromptAssembly, PromptContextPacket};
 pub use provider::{detect_provider_kind, model_context_window_with_overrides, ProviderKind};

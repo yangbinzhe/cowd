@@ -88,7 +88,7 @@ pub async fn snapshot(
         evidence,
         health,
         recovery,
-        live: None,
+        live: services.execution_live(execution_id),
         available_commands: available_commands(services, execution_id, context).await?,
     })
 }

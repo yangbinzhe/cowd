@@ -6732,11 +6732,10 @@ fn bounded_tool_concurrency(max_concurrency: usize, item_count: usize) -> usize 
     if item_count == 0 {
         return 1;
     }
-    if max_concurrency == usize::MAX {
-        item_count.max(1)
-    } else {
-        max_concurrency.max(1).min(item_count)
-    }
+    max_concurrency
+        .max(1)
+        .min(item_count)
+        .min(crate::execution_scheduler::MAX_PARALLEL_READ_CONCURRENCY)
 }
 
 fn count_failed_tool_results(messages: &[ConversationMessage]) -> usize {

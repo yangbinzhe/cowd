@@ -21,6 +21,7 @@ syntect = { version = "5", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
 toml = "0.8"
 tui-textarea = "0.7"
+unicode-segmentation = "1.13"
 unicode-width = "0.2"
 uuid = { workspace = true }
 

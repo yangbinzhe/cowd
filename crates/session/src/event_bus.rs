@@ -13,6 +13,7 @@ use tokio::sync::RwLock;
 pub type EventSender = mpsc::Sender<String>;
 
 struct SessionSubscriber {
+    id: u64,
     sender: EventSender,
     /// Text SSE is deliberately lossy under pressure.  This bit turns the
     /// loss into an explicit recovery protocol instead of a silent gap.
@@ -32,6 +33,7 @@ pub struct SessionEventBus {
     lag_marked: AtomicU64,
     resync_sent: AtomicU64,
     disconnected: AtomicU64,
+    next_subscriber_id: AtomicU64,
 }
 
 impl SessionEventBus {
@@ -41,30 +43,34 @@ impl SessionEventBus {
             lag_marked: AtomicU64::new(0),
             resync_sent: AtomicU64::new(0),
             disconnected: AtomicU64::new(0),
+            next_subscriber_id: AtomicU64::new(1),
         })
     }
 
     /// Register an event sender for a session. The sender will receive
     /// SSE-formatted event data whenever `broadcast` is called for that session.
-    pub async fn subscribe(&self, session_id: &str, tx: EventSender) {
+    pub async fn subscribe(&self, session_id: &str, tx: EventSender) -> u64 {
+        let id = self.next_subscriber_id.fetch_add(1, Ordering::Relaxed);
         self.listeners
             .write()
             .await
             .entry(session_id.to_string())
             .or_default()
             .push(SessionSubscriber {
+                id,
                 sender: tx,
                 resync_pending: AtomicBool::new(false),
             });
+        id
     }
 
-    /// Remove a specific sender from the session's subscriber list.
-    /// Uses channel identity (same_channel) to match senders, since the
-    /// sender passed to `subscribe` is moved into the subscriber list.
-    pub async fn unsubscribe(&self, session_id: &str, tx: &EventSender) {
+    /// Remove a subscription by its immutable id.  Cleanup may race a new
+    /// listener or another disconnect; vector indexes and channel identity
+    /// are not stable enough for that operation.
+    pub async fn unsubscribe(&self, session_id: &str, subscriber_id: u64) {
         let mut listeners = self.listeners.write().await;
         let should_remove = if let Some(txs) = listeners.get_mut(session_id) {
-            txs.retain(|subscriber| !subscriber.sender.same_channel(tx));
+            txs.retain(|subscriber| subscriber.id != subscriber_id);
             txs.is_empty()
         } else {
             false
@@ -82,7 +88,7 @@ impl SessionEventBus {
         let listeners = self.listeners.read().await;
         if let Some(txs) = listeners.get(session_id) {
             let data = sse_data.to_string();
-            let mut dead_indices = Vec::new();
+            let mut dead_ids = Vec::new();
             for (i, subscriber) in txs.iter().enumerate() {
                 if subscriber.resync_pending.load(Ordering::Acquire) {
                     let marker = serde_json::json!({
@@ -103,7 +109,7 @@ impl SessionEventBus {
                         }
                         Err(mpsc::error::TrySendError::Full(_)) => continue,
                         Err(mpsc::error::TrySendError::Closed(_)) => {
-                            dead_indices.push(i);
+                            dead_ids.push(subscriber.id);
                             continue;
                         }
                     }
@@ -121,19 +127,21 @@ impl SessionEventBus {
                         }
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
-                        dead_indices.push(i);
+                        dead_ids.push(subscriber.id);
                     }
                 }
             }
             // Clean up dead connections
-            if !dead_indices.is_empty() {
+            if !dead_ids.is_empty() {
                 drop(listeners);
                 let mut listeners = self.listeners.write().await;
                 let should_remove = if let Some(txs) = listeners.get_mut(session_id) {
-                    for &i in dead_indices.iter().rev() {
-                        txs.remove(i);
-                        self.disconnected.fetch_add(1, Ordering::Relaxed);
-                    }
+                    let before = txs.len();
+                    txs.retain(|subscriber| !dead_ids.contains(&subscriber.id));
+                    self.disconnected.fetch_add(
+                        u64::try_from(before.saturating_sub(txs.len())).unwrap_or(u64::MAX),
+                        Ordering::Relaxed,
+                    );
                     txs.is_empty()
                 } else {
                     false
@@ -232,11 +240,11 @@ mod tests {
     async fn unsubscribe_removes_empty_session_without_deadlock() {
         let bus = SessionEventBus::new();
         let (tx, _rx) = mpsc::channel(1);
-        bus.subscribe("session-a", tx.clone()).await;
+        let subscription_id = bus.subscribe("session-a", tx).await;
 
         timeout(
             Duration::from_millis(200),
-            bus.unsubscribe("session-a", &tx),
+            bus.unsubscribe("session-a", subscription_id),
         )
         .await
         .expect("unsubscribe should not deadlock");
@@ -248,7 +256,7 @@ mod tests {
     async fn broadcast_cleans_closed_listener_without_deadlock() {
         let bus = SessionEventBus::new();
         let (tx, rx) = mpsc::channel(1);
-        bus.subscribe("session-a", tx).await;
+        let _ = bus.subscribe("session-a", tx).await;
         drop(rx);
 
         timeout(Duration::from_millis(200), bus.broadcast("session-a", "{}"))
@@ -263,8 +271,8 @@ mod tests {
         let bus = SessionEventBus::new();
         let (slow_tx, mut slow_rx) = mpsc::channel(1);
         let (fast_tx, mut fast_rx) = mpsc::channel(8);
-        bus.subscribe("session-a", slow_tx).await;
-        bus.subscribe("session-a", fast_tx).await;
+        let _ = bus.subscribe("session-a", slow_tx).await;
+        let _ = bus.subscribe("session-a", fast_tx).await;
 
         bus.broadcast("session-a", r#"{"type":"TextDelta","content":"one"}"#)
             .await;

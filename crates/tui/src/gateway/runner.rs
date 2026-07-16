@@ -234,7 +234,11 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                                         continue;
                                     }
                                     state.add_message("user", &text);
-                                    state.is_loading = true;
+                                    // The admission request is asynchronous. Mark the turn as
+                                    // active before it leaves the TUI so the user immediately
+                                    // sees a running state instead of an apparently idle screen
+                                    // while Gateway persists/routs the ingress.
+                                    state.apply_event(CowdEvent::TurnStarted);
                                     let resource_ids = state
                                         .app
                                         .pending_resources
@@ -272,7 +276,7 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                         &mut execution_projection_stream,
                     ).await;
                     state.update_startup_phase(startup_ready);
-                    if state.turn_active {
+                    if state.turn_interaction.is_active() {
                         state.tick();
                     }
                 }
@@ -811,7 +815,7 @@ async fn drain_cowd_events_state(
             {
                 Ok(projection) => {
                     let cursor = projection.cursor;
-                    state.app.apply_execution_projection(projection);
+                    state.apply_execution_projection(projection);
                     if execution_projection_stream.as_deref() != Some(execution_id.as_str()) {
                         *execution_projection_stream = Some(execution_id.clone());
                         spawn_execution_projection_stream(
@@ -855,7 +859,7 @@ async fn apply_execution_projection_delta(
             .execution_projection(&delta.execution_id, false)
             .await
         {
-            Ok(snapshot) => state.app.apply_execution_projection(snapshot),
+            Ok(snapshot) => state.apply_execution_projection(snapshot),
             Err(error) => state.add_system_notice(
                 SystemNoticeKind::Warning,
                 &format!("Execution projection resync failed: {error}"),

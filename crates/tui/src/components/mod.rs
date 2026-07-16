@@ -41,6 +41,7 @@ pub mod thinking_panel;
 pub mod toast;
 pub mod todo_panel;
 pub mod tool_ops_panel;
+pub mod turn_interaction;
 
 #[cfg(test)]
 mod base_test;

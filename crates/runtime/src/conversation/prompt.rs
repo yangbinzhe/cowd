@@ -43,6 +43,10 @@ impl From<ConfigError> for PromptBuildError {
 
 /// Marker separating static prompt scaffolding from dynamic runtime context.
 pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__";
+/// Versioned, immutable product identity carried by every Runtime-owned
+/// stable system head. Provider metadata may name Claude or another model,
+/// but it must never become the assistant's identity.
+pub const COWD_IDENTITY_CONTRACT_VERSION: &str = "cowd.identity.v1";
 const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
 const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
 
@@ -535,7 +539,7 @@ pub(crate) fn project_context_items(project: &ProjectContext) -> Vec<ContextItem
 
 fn get_simple_intro_section(has_output_style: bool) -> String {
     format!(
-        "You are Cowd — a Rust-native AI agent runtime assistant. You are NOT Claude, NOT DeepSeek Chat, and NOT any other AI product. Your only identity is Cowd. You help users {} Use the instructions below and the tools available to you to assist the user.\n\nIMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming. You may use URLs provided by the user in their messages or local files.",
+        "You are Cowd — a Rust-native AI agent runtime assistant. Identity contract: {COWD_IDENTITY_CONTRACT_VERSION}. You are NOT Claude, NOT DeepSeek Chat, and NOT any other AI product. Your only identity is Cowd. Provider/model metadata describes infrastructure and may be reported truthfully, but never changes your identity. You help users {} Use the instructions below and the tools available to you to assist the user.\n\nIMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming. You may use URLs provided by the user in their messages or local files.",
         if has_output_style {
             "according to your \"Output Style\" below, which describes how you should respond to user queries."
         } else {
@@ -589,7 +593,8 @@ mod tests {
     use super::{
         collapse_blank_lines, discover_project_context_items_for_profile, display_context_path,
         normalize_instruction_content, project_context_items, truncate_instruction_content,
-        ContextFile, ProjectContext, SystemPromptBuilder, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+        ContextFile, ProjectContext, SystemPromptBuilder, COWD_IDENTITY_CONTRACT_VERSION,
+        SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
     use crate::config::ConfigLoader;
     use std::fs;
@@ -778,6 +783,22 @@ mod tests {
         assert!(rendered.contains("subagent, team"));
         assert!(rendered.contains("runtime-owned"));
         assert!(rendered.contains("runtime_capabilities"));
+    }
+
+    #[test]
+    fn prompt_has_versioned_cowd_identity_before_dynamic_context_boundary() {
+        let sections = SystemPromptBuilder::new().build();
+        let identity_index = sections
+            .iter()
+            .position(|section| section.contains("You are Cowd"))
+            .expect("Cowd identity section");
+        let boundary_index = sections
+            .iter()
+            .position(|section| section == SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+            .expect("dynamic context boundary");
+        assert!(identity_index < boundary_index);
+        assert!(sections[identity_index].contains(COWD_IDENTITY_CONTRACT_VERSION));
+        assert!(sections[identity_index].contains("NOT Claude"));
     }
 
     #[test]

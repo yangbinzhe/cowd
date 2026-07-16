@@ -673,7 +673,7 @@ struct SseStream {
     rx: ReceiverStream<String>,
     session_id: String,
     event_bus: Arc<SessionEventBus>,
-    tx: mpsc::Sender<String>,
+    subscription_id: u64,
     seen_durable_cursors: BTreeSet<u64>,
     durable_cursor_order: VecDeque<u64>,
 }
@@ -717,9 +717,9 @@ impl Drop for SseStream {
     fn drop(&mut self) {
         let event_bus = self.event_bus.clone();
         let session_id = self.session_id.clone();
-        let tx = self.tx.clone();
+        let subscription_id = self.subscription_id;
         tokio::spawn(async move {
-            event_bus.unsubscribe(&session_id, &tx).await;
+            event_bus.unsubscribe(&session_id, subscription_id).await;
         });
     }
 }
@@ -733,7 +733,7 @@ async fn sse_stream_handler(
     let (tx, rx) = mpsc::channel(256);
     let bus_tx = tx.clone();
     let event_bus = state.event_bus();
-    event_bus.subscribe(&session_id, bus_tx).await;
+    let subscription_id = event_bus.subscribe(&session_id, bus_tx).await;
     let resume_cursor = headers
         .get("last-event-id")
         .and_then(|value| value.to_str().ok())
@@ -757,7 +757,7 @@ async fn sse_stream_handler(
         rx: ReceiverStream::new(rx),
         session_id,
         event_bus,
-        tx,
+        subscription_id,
         seen_durable_cursors: BTreeSet::new(),
         durable_cursor_order: VecDeque::new(),
     };

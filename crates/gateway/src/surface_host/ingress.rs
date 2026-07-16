@@ -555,6 +555,30 @@ async fn handle_surface_message(
         pre_messages: pre_messages.into_iter().map(Into::into).collect(),
     })
     .map_err(|error| error.to_string())?;
+    // Persist the deterministic ingress identity before the router admits the
+    // input.  If the process stops after admission but before a response is
+    // returned, the terminal-delivery bridge can still reconstruct exactly
+    // one reply from this durable correlation.
+    let execution_id = runtime::session_ingress_graph_id(
+        &session_id,
+        &inbox.record.idempotency_key,
+        &surface_turn_id,
+    );
+    state.services.surface.mark_inbox_admitted(
+        &inbox.record.idempotency_key,
+        SurfaceTurnCorrelation {
+            surface: surface.clone(),
+            message_id: message_id.clone(),
+            inbox_idempotency_key: inbox.record.idempotency_key.clone(),
+            session_id: session_id.clone(),
+            turn_id: surface_turn_id.clone(),
+            execution_id: execution_id.clone(),
+            reply_to_message_id: surface_platform_reply_to(&payload, &message_id),
+            reply_idempotency_key: format!("surface-reply:{surface}:{message_id}"),
+            terminal_id: None,
+            terminal_delivery_revision: 0,
+        },
+    )?;
     let admission = runtime_service
         .admit_session_input_with_materialized(
             SessionInputEnvelope::text(
@@ -576,21 +600,7 @@ async fn handle_surface_message(
         )
         .await
         .map_err(|error| error.message())?;
-    state.services.surface.mark_inbox_admitted(
-        &inbox.record.idempotency_key,
-        SurfaceTurnCorrelation {
-            surface: surface.clone(),
-            message_id: message_id.clone(),
-            inbox_idempotency_key: inbox.record.idempotency_key.clone(),
-            session_id: session_id.clone(),
-            turn_id: surface_turn_id.clone(),
-            execution_id: admission.execution_graph_id.clone(),
-            reply_to_message_id: surface_platform_reply_to(&payload, &message_id),
-            reply_idempotency_key: format!("surface-reply:{surface}:{message_id}"),
-            terminal_id: None,
-            terminal_delivery_revision: 0,
-        },
-    )?;
+    debug_assert_eq!(execution_id, admission.execution_graph_id);
     append_surface_timeline_event(
         &state,
         &session_id,

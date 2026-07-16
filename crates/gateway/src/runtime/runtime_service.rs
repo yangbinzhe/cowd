@@ -15,10 +15,7 @@ use crate::session_kernel::SessionKernel;
 use crate::session_lifecycle_kernel::SessionLifecycleKernel;
 use harness_contract::{
     context::ContextTurnReport,
-    projection::{
-        ContextUsageProjection, ExecutionLiveState, ExecutionLiveStatus, RunMetricsProjection,
-        SessionExecutionIndexProjection,
-    },
+    projection::{ExecutionLiveState, ExecutionLiveStatus, SessionExecutionIndexProjection},
     task::{TaskId, TaskTurnBinding},
     turn::{
         InputRoutingDecision, SessionInputEnvelope, SessionInputId, SessionInputProjection,
@@ -59,13 +56,14 @@ impl RuntimeTurnExecutionError {
 /// browser/TUI event envelope. This is transport shaping only: it must never
 /// manufacture lifecycle facts or terminal state.
 fn runtime_event_stream_payload(event: runtime::CowdEvent) -> serde_json::Value {
-    let value = serde_json::to_value(event).unwrap_or_else(|error| {
+    let execution_context = event.execution_context().cloned();
+    let value = serde_json::to_value(event.domain_event()).unwrap_or_else(|error| {
         serde_json::json!({
             "type": "RuntimeEventEncodingError",
             "error": error.to_string(),
         })
     });
-    match value {
+    let mut payload = match value {
         serde_json::Value::String(event_type) => serde_json::json!({"type": event_type}),
         serde_json::Value::Object(envelope) if envelope.len() == 1 => {
             let Some((event_type, payload)) = envelope.into_iter().next() else {
@@ -80,7 +78,18 @@ fn runtime_event_stream_payload(event: runtime::CowdEvent) -> serde_json::Value 
             }
         }
         payload => serde_json::json!({"type": "RuntimeEvent", "value": payload}),
+    };
+    if let (Some(context), serde_json::Value::Object(fields)) = (execution_context, &mut payload) {
+        fields.insert(
+            "execution_id".to_string(),
+            serde_json::Value::String(context.execution_id),
+        );
+        fields.insert(
+            "turn_id".to_string(),
+            serde_json::Value::String(context.turn_id),
+        );
     }
+    payload
 }
 
 #[derive(Debug, Clone)]
@@ -159,291 +168,95 @@ fn extract_session_target_ref(content: &str) -> Option<&str> {
     (!target.is_empty()).then_some(target)
 }
 
-fn current_time_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-const LIVE_OUTPUT_PREVIEW_LIMIT: usize = 1_024;
-
-/// RuntimeService owns this carrier while a GatewayRuntimeEntry is busy.  It
-/// contains only facts emitted by Runtime or the canonical SessionIngress;
-/// Gateway HTTP/SSE handlers may read it without taking the long-held
-/// conversation mutex.
-#[derive(Debug, Clone)]
-struct LiveExecutionRecord {
-    session_id: String,
-    execution_id: String,
-    live: ExecutionLiveState,
-    tool_ids: BTreeSet<String>,
-    approval_keys: BTreeSet<String>,
-}
-
-impl LiveExecutionRecord {
-    fn new(session_id: String, execution_id: String, turn_id: String) -> Self {
-        let now = current_time_ms();
-        Self {
-            session_id,
-            execution_id,
-            live: ExecutionLiveState {
-                revision: 1,
-                status: ExecutionLiveStatus::Queued,
-                status_detail: Some("session input accepted".to_string()),
-                turn_id: Some(turn_id),
-                started_at_ms: now,
-                updated_at_ms: now,
-                last_progress_at_ms: now,
-                context_usage: None,
-                metrics: RunMetricsProjection::default(),
-                output_preview: None,
-                terminal_ref: None,
-                error: None,
-            },
-            tool_ids: BTreeSet::new(),
-            approval_keys: BTreeSet::new(),
-        }
-    }
-
-    fn transition(&mut self, status: ExecutionLiveStatus, detail: Option<String>) {
-        if self.live.status == status && self.live.status_detail == detail {
-            return;
-        }
-        if !Self::allows_transition(self.live.status, status) {
-            tracing::warn!(
-                execution_id = %self.execution_id,
-                from = ?self.live.status,
-                to = ?status,
-                "ignored invalid live execution status transition"
-            );
-            return;
-        }
-        let now = current_time_ms();
-        self.live.status = status;
-        self.live.status_detail = detail;
-        self.live.updated_at_ms = now;
-        self.live.last_progress_at_ms = now;
-        self.live.revision = self.live.revision.saturating_add(1);
-    }
-
-    fn touch(&mut self) {
-        let now = current_time_ms();
-        self.live.updated_at_ms = now;
-        self.live.last_progress_at_ms = now;
-        self.live.revision = self.live.revision.saturating_add(1);
-    }
-
-    fn allows_transition(from: ExecutionLiveStatus, to: ExecutionLiveStatus) -> bool {
-        use ExecutionLiveStatus::{
-            CallingModel, CallingTool, Cancelled, Complete, Error, Finalizing, PreparingContext,
-            Queued, Thinking, WaitingApproval,
-        };
-        if from == to {
-            return true;
-        }
-        matches!(
-            (from, to),
-            (Queued, PreparingContext | CallingModel | Error | Cancelled)
-                | (
-                    PreparingContext,
-                    CallingModel
-                        | Thinking
-                        | CallingTool
-                        | WaitingApproval
-                        | Finalizing
-                        | Error
-                        | Cancelled
-                )
-                | (
-                    CallingModel,
-                    Thinking
-                        | CallingTool
-                        | WaitingApproval
-                        | Finalizing
-                        | Complete
-                        | Error
-                        | Cancelled
-                )
-                | (
-                    Thinking,
-                    CallingModel
-                        | CallingTool
-                        | WaitingApproval
-                        | Finalizing
-                        | Complete
-                        | Error
-                        | Cancelled
-                )
-                | (
-                    CallingTool,
-                    CallingModel
-                        | Thinking
-                        | WaitingApproval
-                        | Finalizing
-                        | Complete
-                        | Error
-                        | Cancelled
-                )
-                | (
-                    WaitingApproval,
-                    CallingModel | CallingTool | Thinking | Finalizing | Error | Cancelled
-                )
-                | (Finalizing, Complete | Error | Cancelled)
-        )
-    }
-
-    fn append_preview(&mut self, text: &str) {
-        let mut preview = self.live.output_preview.take().unwrap_or_default();
-        preview.push_str(text);
-        if preview.len() > LIVE_OUTPUT_PREVIEW_LIMIT {
-            let split = preview.len().saturating_sub(LIVE_OUTPUT_PREVIEW_LIMIT);
-            let boundary = preview
-                .char_indices()
-                .find_map(|(index, _)| (index >= split).then_some(index))
-                .unwrap_or(0);
-            preview = preview[boundary..].to_string();
-        }
-        self.live.output_preview = (!preview.is_empty()).then_some(preview);
-        self.touch();
-    }
-
-    fn complete(&mut self, report: &ContextTurnReport, terminal_ref: String) {
-        self.live.context_usage = context_usage_from_report(report);
-        self.live.metrics.tool_calls = self
-            .live
-            .metrics
-            .tool_calls
-            .max(report.observations.len() as u64);
-        self.live.metrics.memory_evidence = self
-            .live
-            .metrics
-            .memory_evidence
-            .max(report.audit_projections.len() as u64);
-        self.live.metrics.context_items = self.live.context_usage.as_ref().map_or(0, |usage| {
-            usage
-                .components
-                .iter()
-                .map(|component| component.occurrences)
-                .sum()
-        });
-        self.live.terminal_ref = Some(terminal_ref);
-        self.live.error = None;
-        self.transition(
-            ExecutionLiveStatus::Complete,
-            Some("terminal committed".to_string()),
-        );
-    }
-
-    fn fail(&mut self, error: String) {
-        self.live.error = Some(error.clone());
-        self.transition(ExecutionLiveStatus::Error, Some(error));
-    }
-}
-
-fn context_usage_from_report(report: &ContextTurnReport) -> Option<ContextUsageProjection> {
-    let ledger = report.ledger.as_ref()?;
-    let input_tokens = ledger
-        .calibrated_input_tokens
-        .unwrap_or(ledger.consumed_tokens);
-    let input_source = if ledger.calibrated_input_tokens.is_some() {
-        "provider_actual"
-    } else {
-        "ledger_estimate"
-    };
-    let usage_percent_bp = (ledger.max_tokens > 0).then(|| {
-        ((u128::from(input_tokens) * 10_000) / u128::from(ledger.max_tokens))
-            .min(u128::from(u16::MAX)) as u16
-    });
-    Some(ContextUsageProjection {
-        model: None,
-        window_tokens: Some(ledger.max_tokens),
-        window_source: Some("runtime_ledger".to_string()),
-        input_tokens: Some(input_tokens),
-        input_source: Some(input_source.to_string()),
-        remaining_tokens: Some(ledger.max_tokens.saturating_sub(input_tokens)),
-        usage_percent_bp,
-        request_sequence: Some(ledger.request_sequence),
-        components: ledger.components.clone(),
-    })
-}
-
-fn observe_live_event(
-    live_executions: &Arc<Mutex<BTreeMap<String, LiveExecutionRecord>>>,
-    session_id: &str,
-    event: &runtime::CowdEvent,
-) {
-    let mut records = live_executions
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(record) = records
-        .values_mut()
-        .filter(|record| record.session_id == session_id && !is_live_terminal(record.live.status))
-        .max_by_key(|record| record.live.updated_at_ms)
-    else {
-        return;
-    };
-    match event {
-        runtime::CowdEvent::ExecutionPhase { status, detail } => {
-            record.transition(*status, detail.clone());
-        }
-        runtime::CowdEvent::TextDelta { text } => record.append_preview(text),
-        runtime::CowdEvent::ThinkingDelta { .. } => {}
-        runtime::CowdEvent::ToolStart { id, .. } => {
-            if record.tool_ids.insert(id.clone()) {
-                record.live.metrics.tool_calls = record.live.metrics.tool_calls.saturating_add(1);
-                record.touch();
-            }
-        }
-        runtime::CowdEvent::ToolProgress { .. } | runtime::CowdEvent::ToolComplete { .. } => {
-            record.touch();
-        }
-        runtime::CowdEvent::ApprovalRequested { tool } => {
-            if record.approval_keys.insert(tool.clone()) {
-                record.live.metrics.approvals = record.live.metrics.approvals.saturating_add(1);
-                record.touch();
-            }
-        }
-        runtime::CowdEvent::ContextWindow(window_tokens) => {
-            let mut usage = record.live.context_usage.clone().unwrap_or_default();
-            usage.window_tokens = Some(*window_tokens);
-            usage.window_source = Some("runtime_event".to_string());
-            if let (Some(input), Some(window)) = (usage.input_tokens, usage.window_tokens) {
-                usage.remaining_tokens = Some(window.saturating_sub(input));
-                usage.usage_percent_bp = (window > 0).then(|| {
-                    ((u128::from(input) * 10_000) / u128::from(window)).min(u128::from(u16::MAX))
-                        as u16
-                });
-            }
-            record.live.context_usage = Some(usage);
-            record.touch();
-        }
-        runtime::CowdEvent::RunModelTelemetry { telemetry } => {
-            record.live.metrics.input_tokens = telemetry.input_tokens;
-            record.live.metrics.output_tokens = telemetry.output_tokens;
-            record.live.metrics.total_tokens = telemetry.total_tokens;
-            let mut usage = record.live.context_usage.clone().unwrap_or_default();
-            usage.model = telemetry.model.clone();
-            usage.input_tokens = Some(telemetry.input_tokens);
-            usage.input_source = Some(telemetry.usage_source.clone());
-            if let Some(window) = usage.window_tokens {
-                usage.remaining_tokens = Some(window.saturating_sub(telemetry.input_tokens));
-                usage.usage_percent_bp = (window > 0).then(|| {
-                    ((u128::from(telemetry.input_tokens) * 10_000) / u128::from(window))
-                        .min(u128::from(u16::MAX)) as u16
-                });
-            }
-            record.live.context_usage = Some(usage);
-            record.touch();
-        }
-        runtime::CowdEvent::TurnError { error } => record.fail(error.clone()),
-        runtime::CowdEvent::TurnComplete { .. } => {}
-        _ => {}
-    }
-}
-
 fn is_live_terminal(status: ExecutionLiveStatus) -> bool {
     status.is_terminal()
+}
+
+/// Operational cancellation is deliberately separate from the durable live
+/// projection.  RuntimeServices owns the lifecycle state; Gateway retains
+/// only a short-lived handle required to signal an in-flight host.
+#[derive(Clone)]
+struct ActiveTurnControl {
+    session_id: String,
+    execution_id: Option<String>,
+    cancellation_token: runtime::CancellationToken,
+}
+
+struct ActiveTurnControlGuard {
+    turn_id: String,
+    controls: Arc<Mutex<BTreeMap<String, ActiveTurnControl>>>,
+}
+
+impl Drop for ActiveTurnControlGuard {
+    fn drop(&mut self) {
+        self.controls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.turn_id);
+    }
+}
+
+/// Restores a moved Runtime host even if the request future is aborted.  The
+/// normal path awaits `restore`; cancellation uses Drop to schedule the same
+/// restoration before another turn can acquire the session.
+struct RuntimeTurnOwner {
+    entry: Arc<tokio::sync::Mutex<crate::runtime_entry::GatewayRuntimeEntry>>,
+    runtime:
+        Option<runtime::StandardRuntimeHost<crate::gateway_tool_executor::GatewayToolExecutor>>,
+}
+
+impl RuntimeTurnOwner {
+    fn new(
+        entry: Arc<tokio::sync::Mutex<crate::runtime_entry::GatewayRuntimeEntry>>,
+        runtime: runtime::StandardRuntimeHost<crate::gateway_tool_executor::GatewayToolExecutor>,
+    ) -> Self {
+        Self {
+            entry,
+            runtime: Some(runtime),
+        }
+    }
+
+    fn runtime_mut(
+        &mut self,
+    ) -> &mut runtime::StandardRuntimeHost<crate::gateway_tool_executor::GatewayToolExecutor> {
+        self.runtime
+            .as_mut()
+            .expect("RuntimeTurnOwner always owns a host until it is restored")
+    }
+
+    async fn restore(&mut self) {
+        let Some(runtime) = self.runtime.take() else {
+            return;
+        };
+        let mut entry = self.entry.lock().await;
+        entry.restore_runtime_after_turn(runtime);
+    }
+}
+
+impl Drop for RuntimeTurnOwner {
+    fn drop(&mut self) {
+        let Some(runtime) = self.runtime.take() else {
+            return;
+        };
+        let entry = Arc::clone(&self.entry);
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let mut entry = entry.lock().await;
+                    if entry.turn_is_owned() {
+                        entry.restore_runtime_after_turn(runtime);
+                    } else {
+                        tracing::error!(
+                            "cancelled turn attempted to restore a Runtime host into an occupied session"
+                        );
+                    }
+                });
+            }
+            Err(_) => tracing::error!(
+                "cancelled turn dropped outside Tokio and could not restore its Runtime host"
+            ),
+        }
+    }
 }
 
 fn session_execution_index_from_outbox(
@@ -497,10 +310,10 @@ pub(crate) struct RuntimeService {
     started_at: Instant,
     turns: Arc<Mutex<BTreeMap<String, TurnReceipt>>>,
     turn_bindings: Arc<Mutex<BTreeMap<String, TaskTurnBinding>>>,
+    active_turn_controls: Arc<Mutex<BTreeMap<String, ActiveTurnControl>>>,
     session_inputs: Arc<Mutex<BTreeMap<String, runtime::SessionInputStream>>>,
     session_event_buses: Arc<Mutex<BTreeMap<String, runtime::CowdEventBus>>>,
     session_event_relays: Arc<Mutex<BTreeMap<String, JoinHandle<()>>>>,
-    live_executions: Arc<Mutex<BTreeMap<String, LiveExecutionRecord>>>,
     session_models: Arc<Mutex<BTreeMap<String, String>>>,
     approval_gate: Option<Arc<runtime::approval_gate::SmartApprovalGate>>,
     provider_registry: Arc<runtime::ProviderRegistry>,
@@ -549,10 +362,10 @@ impl RuntimeService {
             started_at,
             turns: Arc::new(Mutex::new(BTreeMap::new())),
             turn_bindings: Arc::new(Mutex::new(BTreeMap::new())),
+            active_turn_controls: Arc::new(Mutex::new(BTreeMap::new())),
             session_inputs: Arc::new(Mutex::new(BTreeMap::new())),
             session_event_buses: Arc::new(Mutex::new(BTreeMap::new())),
             session_event_relays: Arc::new(Mutex::new(BTreeMap::new())),
-            live_executions: Arc::new(Mutex::new(BTreeMap::new())),
             session_models: Arc::new(Mutex::new(BTreeMap::new())),
             approval_gate: None,
             provider_registry,
@@ -593,75 +406,18 @@ impl RuntimeService {
     }
 
     pub(crate) fn execution_live(&self, execution_id: &str) -> Option<ExecutionLiveState> {
-        self.live_executions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(execution_id)
-            .map(|record| record.live.clone())
+        self.runtime_services.execution_live(execution_id)
     }
 
     pub(crate) fn session_execution_index(
         &self,
         session_id: &str,
     ) -> SessionExecutionIndexProjection {
-        let records = self
-            .live_executions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut matching = records
-            .values()
-            .filter(|record| record.session_id == session_id)
-            .collect::<Vec<_>>();
-        matching.sort_by_key(|record| record.live.updated_at_ms);
-        let latest = matching.last().copied();
-        SessionExecutionIndexProjection {
-            session_id: session_id.to_string(),
-            active_execution_ids: matching
-                .iter()
-                .filter(|record| !is_live_terminal(record.live.status))
-                .map(|record| record.execution_id.clone())
-                .collect(),
-            latest_execution_id: latest.map(|record| record.execution_id.clone()),
-            latest_status: latest.map(|record| record.live.status),
-            latest_live_revision: latest.map(|record| record.live.revision),
-            last_progress_at_ms: latest.map(|record| record.live.last_progress_at_ms),
-            terminal_ref: latest.and_then(|record| record.live.terminal_ref.clone()),
-        }
+        self.runtime_services.session_execution_index(session_id)
     }
 
     pub(crate) fn running_session_execution_indices(&self) -> Vec<SessionExecutionIndexProjection> {
-        let records = self
-            .live_executions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let session_ids = records
-            .values()
-            .filter(|record| !is_live_terminal(record.live.status))
-            .map(|record| record.session_id.clone())
-            .collect::<BTreeSet<_>>();
-        let mut indices = Vec::new();
-        for session_id in &session_ids {
-            let mut matching = records
-                .values()
-                .filter(|record| record.session_id == *session_id)
-                .collect::<Vec<_>>();
-            matching.sort_by_key(|record| record.live.updated_at_ms);
-            let latest = matching.last().copied();
-            indices.push(SessionExecutionIndexProjection {
-                session_id: session_id.clone(),
-                active_execution_ids: matching
-                    .iter()
-                    .filter(|record| !is_live_terminal(record.live.status))
-                    .map(|record| record.execution_id.clone())
-                    .collect(),
-                latest_execution_id: latest.map(|record| record.execution_id.clone()),
-                latest_status: latest.map(|record| record.live.status),
-                latest_live_revision: latest.map(|record| record.live.revision),
-                last_progress_at_ms: latest.map(|record| record.live.last_progress_at_ms),
-                terminal_ref: latest.and_then(|record| record.live.terminal_ref.clone()),
-            });
-        }
-        indices
+        self.runtime_services.running_session_execution_indices()
     }
 
     /// Recover the discovery index after a Gateway restart from the durable
@@ -714,13 +470,8 @@ impl RuntimeService {
     }
 
     fn record_live_execution(&self, session_id: &str, execution_id: String, turn_id: String) {
-        self.live_executions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(execution_id.clone())
-            .or_insert_with(|| {
-                LiveExecutionRecord::new(session_id.to_string(), execution_id, turn_id)
-            });
+        self.runtime_services
+            .record_live_execution(session_id, execution_id, turn_id);
     }
 
     fn complete_live_execution(
@@ -729,25 +480,70 @@ impl RuntimeService {
         report: &ContextTurnReport,
         terminal_ref: String,
     ) {
-        if let Some(record) = self
-            .live_executions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get_mut(execution_id)
-        {
-            record.complete(report, terminal_ref);
-        }
+        self.runtime_services
+            .complete_live_execution(execution_id, report, terminal_ref);
     }
 
     fn fail_live_execution(&self, execution_id: &str, error: String) {
-        if let Some(record) = self
-            .live_executions
+        self.runtime_services
+            .fail_live_execution(execution_id, error);
+    }
+
+    fn install_active_turn_control(
+        &self,
+        turn_id: &str,
+        session_id: &str,
+        execution_id: Option<String>,
+    ) -> (runtime::CancellationToken, ActiveTurnControlGuard) {
+        let cancellation_token = runtime::CancellationToken::new();
+        self.active_turn_controls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get_mut(execution_id)
-        {
-            record.fail(error);
+            .insert(
+                turn_id.to_string(),
+                ActiveTurnControl {
+                    session_id: session_id.to_string(),
+                    execution_id,
+                    cancellation_token: cancellation_token.clone(),
+                },
+            );
+        (
+            cancellation_token,
+            ActiveTurnControlGuard {
+                turn_id: turn_id.to_string(),
+                controls: Arc::clone(&self.active_turn_controls),
+            },
+        )
+    }
+
+    fn cancel_active_turn_control(&self, turn_id: &str, reason: &str) -> Option<String> {
+        let control = self
+            .active_turn_controls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(turn_id)
+            .cloned()?;
+        control.cancellation_token.cancel();
+        if let Some(execution_id) = &control.execution_id {
+            self.runtime_services
+                .cancel_live_execution(execution_id, reason.to_string());
         }
+        Some(control.execution_id.unwrap_or_else(|| turn_id.to_string()))
+    }
+
+    fn cancel_active_session_turns(&self, session_id: &str, reason: &str) -> Vec<String> {
+        let turn_ids = self
+            .active_turn_controls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(_, control)| control.session_id == session_id)
+            .map(|(turn_id, _)| turn_id.clone())
+            .collect::<Vec<_>>();
+        turn_ids
+            .into_iter()
+            .filter_map(|turn_id| self.cancel_active_turn_control(&turn_id, reason))
+            .collect()
     }
 
     pub(crate) fn refresh_resource_capabilities(&self) -> runtime::ResourceCapabilitySnapshot {
@@ -838,6 +634,11 @@ impl RuntimeService {
                 return Err(error);
             }
         };
+        let (cancellation_token, _turn_control) = self.install_active_turn_control(
+            &record.turn_id,
+            &record.session_id,
+            Some(graph_id.clone()),
+        );
         let mut owned_runtime = match async {
             let mut runtime = runtime_entry.lock().await;
             runtime.set_context_profile(ingress_options.profile);
@@ -847,9 +648,14 @@ impl RuntimeService {
                     .await
                     .map_err(|error| error.to_string())?;
             }
-            runtime
+            runtime.install_turn_control(
+                cancellation_token.clone(),
+                runtime::HookAbortSignal::default(),
+            );
+            let host = runtime
                 .take_runtime_for_turn()
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string())?;
+            Ok::<_, String>(RuntimeTurnOwner::new(Arc::clone(&runtime_entry), host))
         }
         .await
         {
@@ -860,18 +666,23 @@ impl RuntimeService {
             }
         };
         let summary_result = owned_runtime
+            .runtime_mut()
             .submit_ingress_turn(
                 content,
                 &runtime::permissions::SharedPrompter::none(),
                 ingress,
             )
             .await;
-        {
-            let mut runtime = runtime_entry.lock().await;
-            runtime.restore_runtime_after_turn(owned_runtime);
-        }
+        owned_runtime.restore().await;
         let summary = summary_result.map_err(|error| {
-            self.fail_live_execution(&graph_id, error.to_string());
+            if cancellation_token.is_cancelled() {
+                self.runtime_services.cancel_live_execution(
+                    &graph_id,
+                    "cancelled while Runtime turn was running".to_string(),
+                );
+            } else {
+                self.fail_live_execution(&graph_id, error.to_string());
+            }
             error.to_string()
         })?;
         let terminal = self
@@ -1188,12 +999,21 @@ impl RuntimeService {
     }
 
     pub(crate) async fn cancel_turn_value(&self, turn_id: &str) -> serde_json::Value {
-        let (turn, aborted_run_id) = {
+        let aborted_run_id = self.cancel_active_turn_control(turn_id, "cancelled by operator");
+        let turn = {
             let mut turns = self
                 .turns
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let Some(turn) = turns.get_mut(turn_id) else {
+                if let Some(aborted_run_id) = aborted_run_id {
+                    return serde_json::json!({
+                        "ok": true,
+                        "cancelled": true,
+                        "aborted_run_id": aborted_run_id,
+                        "turn": null,
+                    });
+                }
                 return serde_json::json!({
                     "ok": false,
                     "error": "turn not found",
@@ -1205,7 +1025,7 @@ impl RuntimeService {
                 TurnId::from_string(turn_id.to_string()),
                 TurnStatus::Cancelled,
             ));
-            (turn.clone(), None::<String>)
+            turn.clone()
         };
         let journal_sequence = self
             .persist_turn_receipt_journal(&turn, TurnJournalPhase::Cancelled, None)
@@ -1225,7 +1045,7 @@ impl RuntimeService {
         serde_json::json!({
             "ok": true,
             "cancelled": true,
-            "aborted_run_id": aborted_run_id,
+            "aborted_run_id": aborted_run_id.unwrap_or_else(|| turn_id.to_string()),
             "journal_sequence": journal_sequence,
             "turn": turn,
         })
@@ -1464,13 +1284,13 @@ impl RuntimeService {
         let session_id = session_id.to_string();
         let relay_session_id = session_id.clone();
         let gateway_bus = self.session_kernel.event_bus();
-        let live_executions = Arc::clone(&self.live_executions);
+        let runtime_services = Arc::clone(&self.runtime_services);
         let mut receiver = bus.subscribe();
         let handle = runtime.spawn(async move {
             loop {
                 match receiver.recv().await {
                     Ok(event) => {
-                        observe_live_event(&live_executions, &relay_session_id, &event);
+                        runtime_services.observe_live_execution_event(&relay_session_id, &event);
                         gateway_bus
                             .broadcast(
                                 &relay_session_id,
@@ -1613,6 +1433,14 @@ impl RuntimeService {
             None,
         )
         .await;
+        let cancelled_execution_ids = self.cancel_active_session_turns(session_id, reason);
+        if !cancelled_execution_ids.is_empty() {
+            tracing::info!(
+                session_id,
+                execution_ids = ?cancelled_execution_ids,
+                "cancelled active Runtime execution(s) for session input"
+            );
+        }
         Ok(receipt)
     }
 
@@ -1965,6 +1793,8 @@ impl RuntimeService {
             RuntimeTurnExecutionError::NotFound(format!("session {session_id} not found"))
         })?;
         let queued_next_options = options.clone();
+        let (cancellation_token, _turn_control) =
+            self.install_active_turn_control(&turn_id.to_string(), session_id, None);
         let mut owned_runtime = {
             let mut runtime_guard = runtime_entry.lock().await;
             runtime_guard.set_context_profile(options.profile);
@@ -1974,20 +1804,23 @@ impl RuntimeService {
                     .await
                     .map_err(|error| RuntimeTurnExecutionError::Runtime(error.to_string()))?;
             }
-            runtime_guard
+            runtime_guard.install_turn_control(
+                cancellation_token.clone(),
+                runtime::HookAbortSignal::default(),
+            );
+            let host = runtime_guard
                 .take_runtime_for_turn()
-                .map_err(|error| RuntimeTurnExecutionError::Runtime(error.to_string()))?
+                .map_err(|error| RuntimeTurnExecutionError::Runtime(error.to_string()))?;
+            RuntimeTurnOwner::new(Arc::clone(&runtime_entry), host)
         };
         // Do not hold `GatewayRuntimeEntry`'s mutex while a provider/tool turn
         // awaits.  The host returns to the entry before this method settles
         // the receipt, so the next turn still observes a single owner.
         let turn_result = owned_runtime
+            .runtime_mut()
             .submit_turn(&content, &runtime::permissions::SharedPrompter::none())
             .await;
-        {
-            let mut runtime_guard = runtime_entry.lock().await;
-            runtime_guard.restore_runtime_after_turn(owned_runtime);
-        }
+        owned_runtime.restore().await;
 
         match turn_result {
             Ok(summary) => {
@@ -2930,6 +2763,21 @@ mod tests {
         assert_eq!(completed["type"], "TurnComplete");
         assert_eq!(completed["assistant_text"], "draft");
         assert!(completed.get("committed").is_none());
+
+        let scoped = runtime_event_stream_payload(runtime::CowdEvent::ExecutionScoped {
+            context: runtime::CowdExecutionContext {
+                execution_id: "execution-1".to_string(),
+                session_id: "session-1".to_string(),
+                turn_id: "turn-1".to_string(),
+            },
+            event: Box::new(runtime::CowdEvent::ExecutionPhase {
+                status: ExecutionLiveStatus::CallingModel,
+                detail: Some("requesting model".to_string()),
+            }),
+        });
+        assert_eq!(scoped["type"], "ExecutionPhase");
+        assert_eq!(scoped["execution_id"], "execution-1");
+        assert_eq!(scoped["turn_id"], "turn-1");
     }
 
     #[tokio::test]
@@ -2954,38 +2802,6 @@ mod tests {
     }
 
     #[test]
-    fn live_context_usage_keeps_ledger_provenance_and_component_counts() {
-        let report = ContextTurnReport::new(
-            "turn-context",
-            harness_contract::context::ContextPressureState::new("default", 32_000, 8_000),
-        )
-        .with_ledger(harness_contract::context::ContextLedgerProjection {
-            max_tokens: 32_000,
-            consumed_tokens: 8_000,
-            remaining_tokens: 24_000,
-            tool_result_limit: 4_000,
-            tool_result_consumed: 750,
-            components: vec![harness_contract::context::ContextComponentUsage {
-                kind: "conversation".to_string(),
-                tokens: 5_000,
-                occurrences: 3,
-            }],
-            request_sequence: 7,
-            calibrated_input_tokens: Some(7_500),
-        });
-
-        let usage = context_usage_from_report(&report).expect("ledger becomes live usage");
-        assert_eq!(usage.window_tokens, Some(32_000));
-        assert_eq!(usage.window_source.as_deref(), Some("runtime_ledger"));
-        assert_eq!(usage.input_tokens, Some(7_500));
-        assert_eq!(usage.input_source.as_deref(), Some("provider_actual"));
-        assert_eq!(usage.remaining_tokens, Some(24_500));
-        assert_eq!(usage.usage_percent_bp, Some(2_343));
-        assert_eq!(usage.request_sequence, Some(7));
-        assert_eq!(usage.components[0].occurrences, 3);
-    }
-
-    #[test]
     fn session_execution_index_exposes_running_only_and_retains_terminal_reference() {
         let service = test_runtime_service(Arc::new(ActiveSessions::default()), None);
         service.record_live_execution(
@@ -2999,19 +2815,15 @@ mod tests {
             "turn-finished".to_string(),
         );
 
-        {
-            let mut records = service
-                .live_executions
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let finished = records
-                .get_mut("execution-finished")
-                .expect("finished live execution exists");
-            finished.live.status = ExecutionLiveStatus::Complete;
-            finished.live.terminal_ref = Some("terminal-finished".to_string());
-            finished.live.updated_at_ms = finished.live.updated_at_ms.saturating_add(1);
-            finished.live.last_progress_at_ms = finished.live.updated_at_ms;
-        }
+        let report = ContextTurnReport::new(
+            "turn-finished",
+            harness_contract::context::ContextPressureState::new("default", 32_000, 8_000),
+        );
+        service.complete_live_execution(
+            "execution-finished",
+            &report,
+            "terminal-finished".to_string(),
+        );
 
         let index = service.session_execution_index("session-index");
         assert_eq!(index.active_execution_ids, vec!["execution-running"]);
@@ -3025,43 +2837,6 @@ mod tests {
             .running_session_execution_indices()
             .iter()
             .any(|entry| entry.session_id == "session-index"));
-    }
-
-    #[test]
-    fn live_execution_rejects_illegal_terminal_transition_and_keeps_revision_monotonic() {
-        let mut record = LiveExecutionRecord::new(
-            "session-transition".to_string(),
-            "execution-transition".to_string(),
-            "turn-transition".to_string(),
-        );
-        let initial_revision = record.live.revision;
-        record.transition(
-            ExecutionLiveStatus::PreparingContext,
-            Some("assembling context".to_string()),
-        );
-        let preparing_revision = record.live.revision;
-        record.transition(
-            ExecutionLiveStatus::CallingModel,
-            Some("requesting model".to_string()),
-        );
-        record.transition(
-            ExecutionLiveStatus::Finalizing,
-            Some("synthesizing terminal".to_string()),
-        );
-        record.transition(
-            ExecutionLiveStatus::Complete,
-            Some("terminal committed".to_string()),
-        );
-        let terminal_revision = record.live.revision;
-        record.transition(
-            ExecutionLiveStatus::CallingTool,
-            Some("must be ignored".to_string()),
-        );
-
-        assert!(preparing_revision > initial_revision);
-        assert!(terminal_revision > preparing_revision);
-        assert_eq!(record.live.revision, terminal_revision);
-        assert_eq!(record.live.status, ExecutionLiveStatus::Complete);
     }
 
     #[test]

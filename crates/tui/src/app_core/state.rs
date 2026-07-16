@@ -58,6 +58,7 @@ use crate::components::thinking_panel::ThinkingPanel;
 use crate::components::toast::{ToastManager, ToastVariant};
 use crate::components::todo_panel::TodoPanel;
 use crate::components::tool_ops_panel::{ToolOpsMode, ToolOpsPanel};
+use crate::components::turn_interaction::TurnInteractionState;
 use crate::components::{Component, RenderContext};
 use crate::context_tokens::{validate_context_tokens_against_entries, ContextWorkspaceEntry};
 use crate::error_recovery::{self, RenderResult};
@@ -181,67 +182,6 @@ fn char_col_to_byte_offset(text: &str, col: usize) -> usize {
         .nth(col)
         .map(|(idx, _)| idx)
         .unwrap_or(text.len())
-}
-
-/// Wrap a single text line to fit within `max_width` display columns.
-/// Uses word boundaries (spaces) for natural breaks, falling back to
-/// character-level breaking for very long words.
-/// Returns a vector of wrapped lines (no line is empty).
-fn wrap_line_to_width(line: &str, max_width: usize) -> Vec<String> {
-    if max_width == 0 {
-        return vec![line.to_string()];
-    }
-
-    let mut result: Vec<String> = Vec::new();
-    let mut remaining = line;
-    while !remaining.is_empty() {
-        let char_count = remaining.chars().count();
-        if char_count <= max_width {
-            result.push(remaining.to_string());
-            break;
-        }
-
-        // Find last space within max_width characters
-        let char_indices: Vec<usize> = remaining.char_indices().map(|(i, _)| i).collect();
-        let break_char_idx = {
-            let slice_end = char_indices
-                .get(max_width)
-                .copied()
-                .unwrap_or(remaining.len());
-            let (visible, _rest) = remaining.split_at(slice_end);
-            // Find last space in visible portion
-            visible.rfind(' ').map(|byte_idx| {
-                // Count chars up to this byte index
-                remaining[..byte_idx].chars().count()
-            })
-        };
-
-        match break_char_idx {
-            Some(idx) if idx > 0 => {
-                let byte_pos = char_indices[idx];
-                let (chunk, rest) = remaining.split_at(byte_pos);
-                result.push(chunk.trim_end().to_string());
-                remaining = rest.trim_start();
-            }
-            _ => {
-                // No word boundary found — break at max_width characters
-                let byte_pos = char_indices
-                    .get(max_width)
-                    .copied()
-                    .unwrap_or(remaining.len());
-                let (chunk, rest) = remaining.split_at(byte_pos);
-                result.push(chunk.to_string());
-                remaining = rest;
-            }
-        }
-    }
-
-    // Ensure no empty strings
-    result.retain(|s| !s.is_empty());
-    if result.is_empty() {
-        result.push(String::new());
-    }
-    result
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -421,6 +361,9 @@ pub struct TuiState {
 
     /// Composer owns the bottom input UI, autocomplete dropdown placement, and submit affordance.
     pub composer: Composer,
+    /// Canonical transport/execution/presentation state for the active TUI
+    /// turn. Text/tool events decorate the timeline but cannot overwrite it.
+    pub turn_interaction: TurnInteractionState,
 
     /// File tree browser with git status overlay.
     pub file_tree: FileTree,
@@ -509,7 +452,7 @@ pub struct TuiState {
     pending_cancel: bool,
     /// Pending quit: Ctrl+C was pressed once — requires second press
     pending_quit: bool,
-    /// Last known terminal width, used for input line wrapping.
+    /// Last known terminal width, retained for responsive layout decisions.
     last_terminal_width: u16,
 }
 
@@ -620,6 +563,7 @@ impl TuiState {
             diff_viewer,
             prompt,
             composer,
+            turn_interaction: TurnInteractionState::default(),
             file_tree,
             session_sidebar,
             memory_panel,
@@ -695,8 +639,21 @@ impl TuiState {
     /// crossterm has no custom event type. Components should check
     /// for this and re-sync from App state as needed.
     pub fn apply_event(&mut self, event: CowdEvent) {
-        let opens_runtime_for_tool = matches!(event, CowdEvent::ToolStart { .. });
-
+        match &event {
+            CowdEvent::TurnStarted => self.turn_interaction.submit_started(),
+            CowdEvent::ExecutionGraphSummary { summary } => {
+                if let Some(execution_id) = summary.graph_id.as_deref() {
+                    self.turn_interaction.ingress_accepted(execution_id);
+                }
+            }
+            CowdEvent::TurnComplete { .. } | CowdEvent::TurnError { .. } => {
+                self.turn_interaction.terminal_observed();
+            }
+            CowdEvent::Warning { message } if message.contains("projection stream interrupted") => {
+                self.turn_interaction.reconnecting();
+            }
+            _ => {}
+        }
         // Push toast on errors
         if let CowdEvent::TurnError { ref error } = event {
             self.toast_manager.push(
@@ -710,10 +667,6 @@ impl TuiState {
         // Preserve ALL existing App behavior
         self.app.apply_event(event);
 
-        if opens_runtime_for_tool {
-            self.open_runtime_sidebar_for_tool();
-        }
-
         // Bridge: notify new components that state has changed.
         // Using Resize(0,0) as a sentinel — real resize events always
         // have non-zero dimensions, so this is unambiguous.
@@ -724,14 +677,12 @@ impl TuiState {
         self.event_dispatcher.dispatch(&self.event_bus);
     }
 
-    fn open_runtime_sidebar_for_tool(&mut self) {
-        self.activity_panel_visible = false;
-        self.active_topic_panel = None;
-        if !self.layout_state.sidebar_visible {
-            self.layout_state.toggle_sidebar(&mut self.layout_tree);
-        }
-        self.sidebar_active_tab = TAB_RUNTIME;
-        self.set_focus_target(FocusTarget::Sidebar);
+    /// Install a canonical Runtime projection and derive only the UI view
+    /// state from its live revision.  Gateway transport may reconnect or
+    /// replay, but older snapshots cannot move this state backward.
+    pub fn apply_execution_projection(&mut self, projection: crate::protocol::ExecutionProjection) {
+        self.turn_interaction.projection_snapshot(&projection);
+        self.app.apply_execution_projection(projection);
     }
 
     // ── Rendering ───────────────────────────────────────────────
@@ -814,7 +765,7 @@ impl TuiState {
         // BUG 5 FIX: Real-time token count update.
         // During active turns, ensure token_count reflects cumulative usage.
         // This acts as a fallback if background TokenUsage events are delayed.
-        if self.app.turn_active {
+        if self.turn_interaction.is_active() {
             let turn_total = self.app.turn_input_tokens + self.app.turn_output_tokens;
             let base_total = self.app.input_tokens + self.app.output_tokens;
             // token_count should reflect the highest known total
@@ -832,11 +783,10 @@ impl TuiState {
             self.activity_panel.sync_from_app(&self.app);
         }
 
-        // BUG 2 FIX: Dynamic input height based on line count.
-        let input_lines =
-            crate::components::base::terminal_len(self.app.input.lines().len().max(1));
         let max_input = (area.height / 2).max(3);
-        let input_h = (input_lines + 2).min(max_input).max(3);
+        let input_h = self
+            .composer
+            .desired_height(&self.app.input, area.width, max_input);
         let frame_areas = TuiFrameAreas::build(area, input_h, self.app.search_active);
 
         // ── Main content: one RenderContext for chat, sidebar, status, input ──
@@ -1207,6 +1157,7 @@ impl TuiState {
         // 2.5. Render the bottom composer. The text buffer remains app.input for
         // history/submit compatibility, but input UI ownership is centralized here.
         {
+            self.composer.mode_label = self.turn_interaction.label();
             let pending_resources = self.app.pending_resources.len();
             let degraded = {
                 let _guard = self.render_profiler.guard("composer");
@@ -1826,8 +1777,11 @@ impl TuiState {
                 }
             }
             // Non-empty input → submit
-            let text = self.app.input.lines().join("\n").trim().to_string();
-            if self.try_open_sidebar_for_panel_command(&text) {
+            let text = self.app.input.lines().join("\n");
+            if text.trim().is_empty() {
+                return ProcessedKey::Nothing;
+            }
+            if self.try_open_sidebar_for_panel_command(text.trim()) {
                 self.replace_input_text("");
                 return ProcessedKey::Nothing;
             }
@@ -1875,7 +1829,7 @@ impl TuiState {
                 self.pending_quit = false;
                 return ProcessedKey::Nothing;
             }
-            if self.app.turn_active {
+            if self.turn_interaction.is_active() {
                 if self.pending_cancel {
                     self.pending_cancel = false;
                     return ProcessedKey::Cancel;
@@ -1916,7 +1870,7 @@ impl TuiState {
             return ProcessedKey::Nothing;
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            if self.app.turn_active {
+            if self.turn_interaction.is_active() {
                 // Ctrl+C during active turn: cancel
                 if self.pending_cancel {
                     self.pending_cancel = false;
@@ -2046,57 +2000,17 @@ impl TuiState {
         self.app.input = input;
     }
 
-    /// Wrap input lines that exceed the visible text width.
-    /// Called after each text modification to prevent horizontal scrolling.
-    /// Uses simple word-boundary wrapping within the visible area (width - 2 for borders).
+    /// Keep user-authored input structurally intact.
+    ///
+    /// `tui-textarea` owns cursor/viewport rendering.  The old implementation
+    /// rewrote a long visual line into literal `\n` bytes and moved the cursor
+    /// to the end after every edit; that corrupted pasted prompts and made
+    /// mid-line editing unpredictable.  Visual layout must never mutate the
+    /// submitted payload.
     fn wrap_input_to_width(&mut self) {
-        let text_width = self.last_terminal_width.saturating_sub(2);
-        if text_width < 10 {
-            return; // Too narrow for meaningful wrapping
-        }
-
-        let lines: Vec<String> = self.app.input.lines().to_vec();
-        let needs_wrap = lines
-            .iter()
-            .any(|l| l.chars().count() > text_width as usize);
-        if !needs_wrap {
-            return;
-        }
-
-        // Wrap each line and collect
-        let mut new_lines: Vec<String> = Vec::new();
-        for line in &lines {
-            let wrapped = wrap_line_to_width(line, text_width as usize);
-            for w in wrapped {
-                new_lines.push(w);
-            }
-        }
-
-        // Rebuild textarea with wrapped lines
-        let mut ta = tui_textarea::TextArea::default();
-        ta.set_block(
-            ratatui::widgets::Block::default()
-                .borders(ratatui::widgets::Borders::ALL)
-                .title(" Input (Enter=send, Esc=quit, Alt+Enter/Ctrl+J=newline) "),
-        );
-        ta.set_style(ratatui::style::Style::default().fg(ratatui::style::Color::White));
-        ta.set_cursor_line_style(ratatui::style::Style::default());
-
-        if !new_lines.is_empty() {
-            let last_idx = new_lines.len() - 1;
-            for (i, line) in new_lines.into_iter().enumerate() {
-                ta.insert_str(&line);
-                if i < last_idx {
-                    ta.insert_newline();
-                }
-            }
-        }
-
-        // Move cursor to end (normal typing flow; cursor restoration for mid-text editing
-        // would require significantly more complexity and is rare for an input box)
-        ta.move_cursor(tui_textarea::CursorMove::End);
-
-        self.app.input = ta;
+        // Intentionally empty; see the contract above.  Keeping the helper
+        // lets all edit paths document that they considered layout without
+        // reintroducing payload rewriting.
     }
 
     fn focus_for_current_surface(&self) -> FocusTarget {
@@ -2110,7 +2024,7 @@ impl TuiState {
             FocusTarget::TopicPanel(topic)
         } else if self.layout_state.sidebar_visible {
             FocusTarget::Sidebar
-        } else if self.activity_panel_visible || self.app.turn_active {
+        } else if self.activity_panel_visible || self.turn_interaction.is_active() {
             FocusTarget::Activity
         } else if !self.app.input.is_empty() {
             FocusTarget::Input
@@ -4909,9 +4823,9 @@ mod tests {
     #[test]
     fn apply_event_tool_lifecycle() {
         let mut state = TuiState::new("m", "s");
+        state.set_focus_target(FocusTarget::Input);
 
         state.apply_event(CowdEvent::TurnStarted);
-        assert!(!state.layout_state.sidebar_visible);
         state.apply_event(CowdEvent::ToolStart {
             id: "t1".into(),
             name: "bash".into(),
@@ -4921,10 +4835,8 @@ mod tests {
         assert!(state.timeline_iter().any(
             |(_, e)| matches!(&e, crate::app::TimelineEntry::ToolCall { id, .. } if id == "t1")
         ));
-        assert!(state.layout_state.sidebar_visible);
-        assert_eq!(state.active_topic_panel, None);
-        assert_eq!(state.sidebar_active_tab, TAB_RUNTIME);
-        assert!(!state.activity_panel_visible);
+        assert_eq!(state.focus_target, FocusTarget::Input);
+        assert!(!state.layout_state.sidebar_visible);
     }
 
     #[test]
@@ -5019,6 +4931,35 @@ mod tests {
             ProcessedKey::Submit(text) => assert_eq!(text, "分析 @file:readme.md"),
             other => panic!("expected submit, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn submit_preserves_authored_whitespace_and_newlines() {
+        let mut state = TuiState::new("m", "s");
+        state.replace_input_text("  keep leading\nkeep trailing  ");
+
+        let result = state.process_raw_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(
+            result,
+            ProcessedKey::Submit(text) if text == "  keep leading\nkeep trailing  "
+        ));
+    }
+
+    #[test]
+    fn long_input_layout_never_inserts_physical_newlines_or_moves_cursor() {
+        let mut state = TuiState::new("m", "s");
+        state.last_terminal_width = 12;
+        state.replace_input_text("abcdefghij klmnopqrstuvwxyz");
+        state.app.input.move_cursor(tui_textarea::CursorMove::Head);
+        let before = state.input_text();
+        let cursor_before = state.app.input.cursor();
+
+        state.wrap_input_to_width();
+
+        assert_eq!(state.input_text(), before);
+        assert_eq!(state.app.input.cursor(), cursor_before);
+        assert!(!state.input_text().contains('\n'));
     }
 
     #[test]

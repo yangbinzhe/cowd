@@ -34,15 +34,23 @@ impl SessionSource {
     }
 
     fn system_prompt(&self) -> Vec<String> {
-        let Self::Surface(surface) = self else {
-            return Vec::new();
-        };
-        vec![format!(
-            "你正在通过 `{surface}` 外部 surface 回复用户。必须优先给出可见、简洁、可执行的阶段性结果。\
-            如果任务需要读代码、检查 README、调研或测试，只检查足以支撑结论的关键证据；不要进行无边界穷举。\
-            如果当前 turn 的信息或时间不足，直接说明已检查内容、当前判断、剩余风险和建议下一步，而不是持续调用工具直到超时。\
-            外部 surface 的用户体验要求：宁可给出有证据的阶段性结论，也不能让用户长时间没有任何回复。"
-        )]
+        // Every activation path must receive the same Cowd identity and
+        // capability contract.  Previously WebUI/TUI/CLI/Socket sessions
+        // returned an empty prompt here, allowing a provider's default
+        // persona (often Claude) to leak into replies after a cold start.
+        let mut builder = runtime::SystemPromptBuilder::new().append_section(format!(
+            "# Active surface\nYou are serving this turn through `{}`. The surface changes presentation only; your identity, governed Runtime tools, execution planning, and evidence rules remain Cowd-owned.",
+            self.platform()
+        ));
+        if let Self::Surface(surface) = self {
+            builder = builder.append_section(format!(
+                "你正在通过 `{surface}` 外部 surface 回复用户。必须优先给出可见、简洁、可执行的阶段性结果。\
+                如果任务需要读代码、检查 README、调研或测试，只检查足以支撑结论的关键证据；不要进行无边界穷举。\
+                如果当前 turn 的信息或时间不足，直接说明已检查内容、当前判断、剩余风险和建议下一步，而不是持续调用工具直到超时。\
+                外部 surface 的用户体验要求：宁可给出有证据的阶段性结论，也不能让用户长时间没有任何回复。"
+            ));
+        }
+        builder.build()
     }
 }
 
@@ -765,14 +773,27 @@ mod tests {
     }
 
     #[test]
-    fn only_external_surfaces_receive_surface_delivery_guidance() {
-        assert!(SessionSource::Surface("feishu".to_string())
+    fn every_surface_receives_cowd_identity_and_only_external_surfaces_receive_delivery_guidance() {
+        for source in [
+            SessionSource::WebUi,
+            SessionSource::Tui,
+            SessionSource::Socket,
+            SessionSource::Cli,
+            SessionSource::Internal,
+            SessionSource::MissionControl,
+        ] {
+            let prompt = source.system_prompt().join("\n");
+            assert!(prompt.contains("You are Cowd"));
+            assert!(prompt.contains(runtime::COWD_IDENTITY_CONTRACT_VERSION));
+            assert!(!prompt.contains("外部 surface 的用户体验要求"));
+        }
+        let surface_prompt = SessionSource::Surface("feishu".to_string())
             .system_prompt()
-            .first()
-            .is_some_and(|prompt| prompt.contains("feishu")));
-        assert!(SessionSource::WebUi.system_prompt().is_empty());
-        assert!(SessionSource::Tui.system_prompt().is_empty());
-        assert!(SessionSource::Socket.system_prompt().is_empty());
+            .join("\n");
+        assert!(surface_prompt.contains("You are Cowd"));
+        assert!(surface_prompt.contains(runtime::COWD_IDENTITY_CONTRACT_VERSION));
+        assert!(surface_prompt.contains("feishu"));
+        assert!(surface_prompt.contains("外部 surface 的用户体验要求"));
     }
 
     #[tokio::test]
