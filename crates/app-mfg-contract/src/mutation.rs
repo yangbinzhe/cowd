@@ -451,10 +451,21 @@ fn multi_action_contracts() -> Vec<MfgActionContract> {
 
     let durable =
         |action_id, route_id, class, risk, confirmation, capabilities: &[&str], availability| {
-            let revision = match class {
-                C => MfgRevisionSemantics::CreateOnly,
-                U => MfgRevisionSemantics::Required,
-                _ => MfgRevisionSemantics::NotApplicable,
+            let revision = if matches!(
+                action_id,
+                A::ReportReviewForceRetry
+                    | A::ReportReviewReroute
+                    | A::ReportReviewAbandon
+                    | A::ReportReviewResolve
+                    | A::ReportReviewReject
+            ) {
+                MfgRevisionSemantics::Required
+            } else {
+                match class {
+                    C => MfgRevisionSemantics::CreateOnly,
+                    U => MfgRevisionSemantics::Required,
+                    _ => MfgRevisionSemantics::NotApplicable,
+                }
             };
             MfgActionContract {
                 action_id: MfgActionId::Multi(action_id),
@@ -831,7 +842,7 @@ fn multi_action_contracts() -> Vec<MfgActionContract> {
             H,
             TC,
             &["mfg.report.review", "approval.respond"],
-            MfgActionAvailability::PlannedV541,
+            MfgActionAvailability::Active,
         ),
         durable(
             A::ReportReviewReroute,
@@ -840,7 +851,7 @@ fn multi_action_contracts() -> Vec<MfgActionContract> {
             H,
             TC,
             &["mfg.report.review", "approval.respond"],
-            MfgActionAvailability::PlannedV541,
+            MfgActionAvailability::Active,
         ),
         durable(
             A::ReportReviewAbandon,
@@ -849,7 +860,7 @@ fn multi_action_contracts() -> Vec<MfgActionContract> {
             H,
             TC,
             &["mfg.report.review", "approval.respond"],
-            MfgActionAvailability::PlannedV541,
+            MfgActionAvailability::Active,
         ),
         durable(
             A::ReportReviewResolve,
@@ -858,7 +869,7 @@ fn multi_action_contracts() -> Vec<MfgActionContract> {
             H,
             TC,
             &["mfg.report.review", "approval.respond"],
-            MfgActionAvailability::PlannedV541,
+            MfgActionAvailability::Active,
         ),
         durable(
             A::ReportReviewReject,
@@ -867,7 +878,7 @@ fn multi_action_contracts() -> Vec<MfgActionContract> {
             M,
             T,
             &["mfg.report.review", "approval.respond"],
-            MfgActionAvailability::PlannedV541,
+            MfgActionAvailability::Active,
         ),
         durable(
             A::SkillRun,

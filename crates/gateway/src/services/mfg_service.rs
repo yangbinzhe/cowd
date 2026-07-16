@@ -1,4 +1,10 @@
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, Weak,
+    },
+};
 
 use super::ServiceEnvelope;
 use app_mfg::{
@@ -12,6 +18,10 @@ use app_mfg::{
     MfgHealth, MfgIncident, MfgLiveProjection, MfgMemoryCase, MfgMetricRecomputeResult,
     MfgOperationalAnalysis, MfgPlaybook, MfgRepositoryError, MfgSkillManifest, MfgSkillPlan,
     MfgSkillRun, MfgStore,
+};
+use app_mfg_contract::{
+    MfgReportDeliveryReview, MfgReportDeliveryReviewDecision, MfgReportDeliveryReviewEffect,
+    MfgReportDeliveryReviewRerouteTarget,
 };
 use connector::{CrossPlaneRisk, DataClassification};
 use matrix_core::{
@@ -75,6 +85,64 @@ fn default_mfg_bridge_mode() -> String {
 pub(crate) struct MfgService {
     pub(crate) label: &'static str,
     pub(crate) owner: &'static str,
+    review_reconciler: Arc<MfgReviewReconcilerLifecycle>,
+}
+
+pub(crate) struct MfgReviewReconcilerLifecycle {
+    started: AtomicBool,
+    cancelled: AtomicBool,
+    handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl MfgReviewReconcilerLifecycle {
+    pub(crate) fn begin(self: &Arc<Self>) -> Option<Weak<Self>> {
+        self.started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            .then(|| Arc::downgrade(self))
+    }
+
+    fn install(&self, handle: tokio::task::JoinHandle<()>) {
+        let mut current = self
+            .handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.cancelled.load(Ordering::Acquire) {
+            handle.abort();
+        } else {
+            *current = Some(handle);
+        }
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    async fn shutdown(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        let handle = self
+            .handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(handle) = handle {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for MfgReviewReconcilerLifecycle {
+    fn drop(&mut self) {
+        if let Some(handle) = self
+            .handle
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            handle.abort();
+        }
+    }
 }
 
 pub(crate) struct MfgIncidentContext {
@@ -88,7 +156,24 @@ impl MfgService {
         Self {
             label: "mfg",
             owner: "0.9.380 GatewayServices",
+            review_reconciler: Arc::new(MfgReviewReconcilerLifecycle {
+                started: AtomicBool::new(false),
+                cancelled: AtomicBool::new(false),
+                handle: Mutex::new(None),
+            }),
         }
+    }
+
+    pub(crate) fn begin_review_reconciler(&self) -> Option<Weak<MfgReviewReconcilerLifecycle>> {
+        self.review_reconciler.begin()
+    }
+
+    pub(crate) fn install_review_reconciler(&self, handle: tokio::task::JoinHandle<()>) {
+        self.review_reconciler.install(handle);
+    }
+
+    pub(crate) async fn shutdown_review_reconciler(&self) {
+        self.review_reconciler.shutdown().await;
     }
 
     pub(crate) fn envelope(&self, operation: &'static str) -> ServiceEnvelope {
@@ -644,6 +729,140 @@ impl MfgService {
             .attach_cockpit_report_delivery(report_id, receipt)
     }
 
+    pub(crate) fn create_report_delivery_review(
+        &self,
+        config_home: impl AsRef<Path>,
+        report: &MfgCockpitReportSnapshot,
+        expected_report_revision: u64,
+        requester_principal: &str,
+        reason: &str,
+        evidence_refs: Vec<String>,
+        idempotency_key: &str,
+    ) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+        self.open_store(config_home)?.create_report_delivery_review(
+            report,
+            expected_report_revision,
+            requester_principal,
+            reason,
+            evidence_refs,
+            idempotency_key,
+        )
+    }
+
+    pub(crate) fn bind_report_delivery_review_approval(
+        &self,
+        config_home: impl AsRef<Path>,
+        review_id: &str,
+        expected_revision: u64,
+        approval_id: &str,
+        actor_principal: &str,
+        idempotency_key: &str,
+    ) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+        self.open_store(config_home)?
+            .bind_report_delivery_review_approval(
+                review_id,
+                expected_revision,
+                approval_id,
+                actor_principal,
+                idempotency_key,
+            )
+    }
+
+    pub(crate) fn get_report_delivery_review(
+        &self,
+        config_home: impl AsRef<Path>,
+        review_id: &str,
+    ) -> Result<Option<MfgReportDeliveryReview>, MfgRepositoryError> {
+        self.open_store(config_home)?
+            .get_report_delivery_review(review_id)
+    }
+
+    pub(crate) fn list_report_delivery_reviews(
+        &self,
+        config_home: impl AsRef<Path>,
+        report_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MfgReportDeliveryReview>, MfgRepositoryError> {
+        self.open_store(config_home)?
+            .list_report_delivery_reviews(report_id, limit)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_report_delivery_review_decision(
+        &self,
+        config_home: impl AsRef<Path>,
+        review_id: &str,
+        expected_revision: u64,
+        decision: MfgReportDeliveryReviewDecision,
+        reviewer_principal: &str,
+        reason: &str,
+        evidence_refs: Vec<String>,
+        reroute: Option<MfgReportDeliveryReviewRerouteTarget>,
+        decision_lease_ref: &str,
+        idempotency_key: &str,
+    ) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+        self.open_store(config_home)?
+            .prepare_report_delivery_review_decision(
+                review_id,
+                expected_revision,
+                decision,
+                reviewer_principal,
+                reason,
+                evidence_refs,
+                reroute,
+                decision_lease_ref,
+                idempotency_key,
+            )
+    }
+
+    pub(crate) fn activate_report_delivery_review_decision(
+        &self,
+        config_home: impl AsRef<Path>,
+        review_id: &str,
+        expected_revision: u64,
+        actor_principal: &str,
+        idempotency_key: &str,
+    ) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+        self.open_store(config_home)?
+            .activate_report_delivery_review_decision(
+                review_id,
+                expected_revision,
+                actor_principal,
+                idempotency_key,
+            )
+    }
+
+    pub(crate) fn claim_report_delivery_review_effects(
+        &self,
+        config_home: impl AsRef<Path>,
+        limit: usize,
+    ) -> Result<Vec<MfgReportDeliveryReviewEffect>, MfgRepositoryError> {
+        self.open_store(config_home)?
+            .claim_report_delivery_review_effects(limit)
+    }
+
+    pub(crate) fn complete_report_delivery_review_effect(
+        &self,
+        config_home: impl AsRef<Path>,
+        effect_key: &str,
+        receipt_ref: &str,
+        actor_principal: &str,
+    ) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+        self.open_store(config_home)?
+            .complete_report_delivery_review_effect(effect_key, receipt_ref, actor_principal)
+    }
+
+    pub(crate) fn fail_report_delivery_review_effect(
+        &self,
+        config_home: impl AsRef<Path>,
+        effect_key: &str,
+        error: &str,
+        actor_principal: &str,
+    ) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+        self.open_store(config_home)?
+            .fail_report_delivery_review_effect(effect_key, error, actor_principal)
+    }
+
     pub(crate) fn delete_cockpit_profile(
         &self,
         config_home: impl AsRef<Path>,
@@ -910,4 +1129,42 @@ impl MfgService {
 
 fn to_mfg_storage_error(error: storage::StorageError) -> MfgRepositoryError {
     MfgRepositoryError::Storage(error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn review_reconciler_has_one_owner_and_weak_shutdown_boundary() {
+        let service = MfgService::new();
+        let lifecycle = service
+            .begin_review_reconciler()
+            .expect("first caller starts reconciler");
+        assert!(service.begin_review_reconciler().is_none());
+        assert!(lifecycle.upgrade().is_some());
+        drop(service);
+        assert!(lifecycle.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn review_reconciler_shutdown_cancels_and_awaits_task() {
+        let service = MfgService::new();
+        let lifecycle = service
+            .begin_review_reconciler()
+            .expect("first caller starts reconciler");
+        let observer = lifecycle.clone();
+        let handle = tokio::spawn(async move {
+            while observer
+                .upgrade()
+                .is_some_and(|owner| !owner.is_cancelled())
+            {
+                tokio::task::yield_now().await;
+            }
+        });
+        service.install_review_reconciler(handle);
+        service.shutdown_review_reconciler().await;
+        assert!(lifecycle.upgrade().unwrap().is_cancelled());
+        assert!(service.review_reconciler.handle.lock().unwrap().is_none());
+    }
 }

@@ -227,7 +227,7 @@ impl MissionControlRuntime {
             ),
         };
         let (status, message, result) = outcome;
-        
+
         MissionControlCommandReceipt {
             kind: "mission_control.command_receipt".to_string(),
             command_id,
@@ -898,6 +898,8 @@ mod tests {
                     agent_id: None,
                     team_id: None,
                     mission_id: Some("mission-control".to_string()),
+                    resource_ref: None,
+                    review_ref: None,
                 },
                 action: "dangerous-test-action".to_string(),
                 summary: "needs approval".to_string(),

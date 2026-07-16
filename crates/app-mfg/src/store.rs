@@ -1,6 +1,10 @@
 use std::path::Path;
 
 use crate::repository::{MfgHealth, MfgMetricRecomputeResult, MfgRepository, MfgRepositoryError};
+use app_mfg_contract::{
+    MfgReportDeliveryReview, MfgReportDeliveryReviewDecision, MfgReportDeliveryReviewEffect,
+    MfgReportDeliveryReviewRerouteTarget,
+};
 use matrix_core::{
     MatrixAttentionItem, MatrixChangeEvent, MatrixEntity, MatrixEvidencePacket, MatrixFact,
     MatrixMetricDefinition, MatrixOntologyPack, MatrixQualityGateDecision, MatrixSourcePack,
@@ -399,6 +403,129 @@ impl MfgStore {
     ) -> Result<MfgCockpitReportSnapshot, MfgRepositoryError> {
         self.repository
             .attach_cockpit_report_delivery(report_id, receipt)
+    }
+
+    pub fn create_report_delivery_review(
+        &self,
+        report: &MfgCockpitReportSnapshot,
+        expected_report_revision: u64,
+        requester_principal: &str,
+        reason: &str,
+        evidence_refs: Vec<String>,
+        idempotency_key: &str,
+    ) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+        self.repository.create_report_delivery_review(
+            report,
+            expected_report_revision,
+            requester_principal,
+            reason,
+            evidence_refs,
+            idempotency_key,
+        )
+    }
+
+    pub fn bind_report_delivery_review_approval(
+        &self,
+        review_id: &str,
+        expected_revision: u64,
+        approval_id: &str,
+        actor_principal: &str,
+        idempotency_key: &str,
+    ) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+        self.repository.bind_report_delivery_review_approval(
+            review_id,
+            expected_revision,
+            approval_id,
+            actor_principal,
+            idempotency_key,
+        )
+    }
+
+    pub fn get_report_delivery_review(
+        &self,
+        review_id: &str,
+    ) -> Result<Option<MfgReportDeliveryReview>, MfgRepositoryError> {
+        self.repository.get_report_delivery_review(review_id)
+    }
+
+    pub fn list_report_delivery_reviews(
+        &self,
+        report_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MfgReportDeliveryReview>, MfgRepositoryError> {
+        self.repository
+            .list_report_delivery_reviews(report_id, limit)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_report_delivery_review_decision(
+        &self,
+        review_id: &str,
+        expected_revision: u64,
+        decision: MfgReportDeliveryReviewDecision,
+        reviewer_principal: &str,
+        reason: &str,
+        evidence_refs: Vec<String>,
+        reroute: Option<MfgReportDeliveryReviewRerouteTarget>,
+        decision_lease_ref: &str,
+        idempotency_key: &str,
+    ) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+        self.repository.prepare_report_delivery_review_decision(
+            review_id,
+            expected_revision,
+            decision,
+            reviewer_principal,
+            reason,
+            evidence_refs,
+            reroute,
+            decision_lease_ref,
+            idempotency_key,
+        )
+    }
+
+    pub fn activate_report_delivery_review_decision(
+        &self,
+        review_id: &str,
+        expected_revision: u64,
+        actor_principal: &str,
+        idempotency_key: &str,
+    ) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+        self.repository.activate_report_delivery_review_decision(
+            review_id,
+            expected_revision,
+            actor_principal,
+            idempotency_key,
+        )
+    }
+
+    pub fn claim_report_delivery_review_effects(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<MfgReportDeliveryReviewEffect>, MfgRepositoryError> {
+        self.repository.claim_report_delivery_review_effects(limit)
+    }
+
+    pub fn complete_report_delivery_review_effect(
+        &self,
+        effect_key: &str,
+        receipt_ref: &str,
+        actor_principal: &str,
+    ) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+        self.repository.complete_report_delivery_review_effect(
+            effect_key,
+            receipt_ref,
+            actor_principal,
+        )
+    }
+
+    pub fn fail_report_delivery_review_effect(
+        &self,
+        effect_key: &str,
+        error: &str,
+        actor_principal: &str,
+    ) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+        self.repository
+            .fail_report_delivery_review_effect(effect_key, error, actor_principal)
     }
 
     pub fn delete_cockpit_profile(

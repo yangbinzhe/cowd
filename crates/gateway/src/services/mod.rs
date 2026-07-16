@@ -55,7 +55,7 @@ pub(crate) use matrix_service::MatrixService;
 pub(crate) use memory_service::MemoryService;
 pub(crate) use mfg_service::{
     MfgCockpitReportDeliveryOutcome, MfgCockpitReportDeliveryRequest, MfgCrossPlaneBridgeRequest,
-    MfgService,
+    MfgReviewReconcilerLifecycle, MfgService,
 };
 pub(crate) use mission_service::{
     AddMissionRelationHttpRequest, CreateMissionScheduleHttpRequest,

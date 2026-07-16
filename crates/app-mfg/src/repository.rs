@@ -8,6 +8,7 @@ use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use storage::{SqliteConnectionFactory, StorageHandle};
 use thiserror::Error;
 
@@ -23,6 +24,10 @@ use crate::{
     MfgWidgetDefinition, MfgWidgetInstance, MfgWorkflowGraph, MfgWorkflowGraphError,
 };
 
+use app_mfg_contract::{
+    MfgReportDeliveryReview, MfgReportDeliveryReviewDecision, MfgReportDeliveryReviewEffect,
+    MfgReportDeliveryReviewRerouteTarget, MfgReportDeliveryReviewStatus,
+};
 use matrix_core::{
     build_metric_compute_jobs, MatrixAttentionItem, MatrixChangeEvent, MatrixComputeJob,
     MatrixComputeJobInput, MatrixComputePlan, MatrixConnectorRun, MatrixConnectorRunInput,
@@ -453,6 +458,168 @@ impl MfgRepository {
         report.attach_delivery_receipt(receipt);
         insert_cockpit_report(&connection, &report)?;
         Ok(report)
+    }
+
+    pub fn create_report_delivery_review(
+        &self,
+        report: &MfgCockpitReportSnapshot,
+        expected_report_revision: u64,
+        requester_principal: &str,
+        reason: &str,
+        evidence_refs: Vec<String>,
+        idempotency_key: &str,
+    ) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        create_report_delivery_review(
+            &connection,
+            report,
+            expected_report_revision,
+            requester_principal,
+            reason,
+            evidence_refs,
+            idempotency_key,
+        )
+    }
+
+    pub fn bind_report_delivery_review_approval(
+        &self,
+        review_id: &str,
+        expected_revision: u64,
+        approval_id: &str,
+        actor_principal: &str,
+        idempotency_key: &str,
+    ) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        bind_report_delivery_review_approval(
+            &connection,
+            review_id,
+            expected_revision,
+            approval_id,
+            actor_principal,
+            idempotency_key,
+        )
+    }
+
+    pub fn get_report_delivery_review(
+        &self,
+        review_id: &str,
+    ) -> Result<Option<MfgReportDeliveryReview>, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        find_report_delivery_review(&connection, review_id)
+    }
+
+    pub fn list_report_delivery_reviews(
+        &self,
+        report_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MfgReportDeliveryReview>, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        list_report_delivery_reviews(&connection, report_id, limit)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_report_delivery_review_decision(
+        &self,
+        review_id: &str,
+        expected_revision: u64,
+        decision: MfgReportDeliveryReviewDecision,
+        reviewer_principal: &str,
+        reason: &str,
+        evidence_refs: Vec<String>,
+        reroute: Option<MfgReportDeliveryReviewRerouteTarget>,
+        decision_lease_ref: &str,
+        idempotency_key: &str,
+    ) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        prepare_report_delivery_review_decision(
+            &connection,
+            review_id,
+            expected_revision,
+            decision,
+            reviewer_principal,
+            reason,
+            evidence_refs,
+            reroute,
+            decision_lease_ref,
+            idempotency_key,
+        )
+    }
+
+    pub fn activate_report_delivery_review_decision(
+        &self,
+        review_id: &str,
+        expected_revision: u64,
+        actor_principal: &str,
+        idempotency_key: &str,
+    ) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        activate_report_delivery_review_decision(
+            &connection,
+            review_id,
+            expected_revision,
+            actor_principal,
+            idempotency_key,
+        )
+    }
+
+    pub fn claim_report_delivery_review_effects(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<MfgReportDeliveryReviewEffect>, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        claim_report_delivery_review_effects(&connection, limit)
+    }
+
+    pub fn complete_report_delivery_review_effect(
+        &self,
+        effect_key: &str,
+        receipt_ref: &str,
+        actor_principal: &str,
+    ) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        complete_report_delivery_review_effect(
+            &connection,
+            effect_key,
+            receipt_ref,
+            actor_principal,
+        )
+    }
+
+    pub fn fail_report_delivery_review_effect(
+        &self,
+        effect_key: &str,
+        error: &str,
+        actor_principal: &str,
+    ) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        fail_report_delivery_review_effect(&connection, effect_key, error, actor_principal)
     }
 
     pub fn delete_cockpit_profile(
@@ -2114,6 +2281,66 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_mfg_cockpit_report_profile
             ON mfg_cockpit_report(profile_id, created_at DESC);
 
+        CREATE TABLE IF NOT EXISTS mfg_report_delivery_review (
+            review_id TEXT PRIMARY KEY,
+            report_id TEXT NOT NULL,
+            report_revision INTEGER NOT NULL,
+            delivery_revision INTEGER NOT NULL,
+            dead_letter_digest TEXT NOT NULL,
+            requester_principal TEXT NOT NULL,
+            approval_id TEXT,
+            correlation_id TEXT NOT NULL,
+            requested_action TEXT,
+            decision TEXT,
+            reviewer_principal TEXT,
+            decision_lease_ref TEXT,
+            effect_key TEXT,
+            effect_receipt_ref TEXT,
+            status TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            review_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS review_approval_id_uq
+            ON mfg_report_delivery_review(approval_id) WHERE approval_id IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS review_correlation_id_uq
+            ON mfg_report_delivery_review(correlation_id);
+        CREATE INDEX IF NOT EXISTS review_status_updated_idx
+            ON mfg_report_delivery_review(status, updated_at);
+
+        CREATE TABLE IF NOT EXISTS mfg_report_delivery_review_transition (
+            transition_id TEXT PRIMARY KEY,
+            review_id TEXT NOT NULL,
+            from_status TEXT NOT NULL,
+            to_status TEXT NOT NULL,
+            action TEXT,
+            actor_principal TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            detail_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(review_id, idempotency_key)
+        );
+        CREATE INDEX IF NOT EXISTS transition_review_created_idx
+            ON mfg_report_delivery_review_transition(review_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS mfg_report_delivery_review_effect_outbox (
+            effect_id TEXT PRIMARY KEY,
+            review_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            effect_key TEXT NOT NULL UNIQUE,
+            payload_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            attempt_count INTEGER NOT NULL,
+            next_attempt_at TEXT,
+            last_error TEXT,
+            receipt_ref TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS outbox_due_idx
+            ON mfg_report_delivery_review_effect_outbox(status, next_attempt_at);
+
         CREATE TABLE IF NOT EXISTS mfg_alert_rule (
             rule_id TEXT PRIMARY KEY,
             owner_ref TEXT NOT NULL,
@@ -2561,7 +2788,22 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             ON mfg_workflow_graph(status, updated_at DESC);",
     )?;
     migrate_mfg_incident_workflow_column(connection)?;
+    recover_interrupted_report_delivery_review_effects(connection)?;
     migrate_mfg_command_receipts(connection)
+}
+
+fn recover_interrupted_report_delivery_review_effects(
+    connection: &Connection,
+) -> rusqlite::Result<()> {
+    connection.execute(
+        "UPDATE mfg_report_delivery_review_effect_outbox
+         SET status = 'retry_wait', next_attempt_at = ?1,
+             last_error = COALESCE(last_error, 'recovered_after_process_restart'),
+             updated_at = ?1
+         WHERE status = 'processing'",
+        params![Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
 }
 
 fn migrate_mfg_incident_workflow_column(connection: &Connection) -> rusqlite::Result<()> {
@@ -3223,7 +3465,11 @@ fn find_cockpit_report(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MfgRepositoryError::from))
+        .map(|json| {
+            let mut report = serde_json::from_str::<MfgCockpitReportSnapshot>(&json)?;
+            report.normalize_legacy();
+            Ok(report)
+        })
         .transpose()
 }
 
@@ -3240,15 +3486,973 @@ fn list_cockpit_reports(
         let rows =
             statement.query_map(params![profile_id, limit], |row| row.get::<_, String>(0))?;
         return rows
-            .map(|row| Ok(serde_json::from_str::<MfgCockpitReportSnapshot>(&row?)?))
+            .map(|row| {
+                let mut report = serde_json::from_str::<MfgCockpitReportSnapshot>(&row?)?;
+                report.normalize_legacy();
+                Ok(report)
+            })
             .collect();
     }
     let mut statement = connection.prepare(
         "SELECT report_json FROM mfg_cockpit_report ORDER BY created_at DESC, report_id ASC LIMIT ?1",
     )?;
     let rows = statement.query_map(params![limit], |row| row.get::<_, String>(0))?;
-    rows.map(|row| Ok(serde_json::from_str::<MfgCockpitReportSnapshot>(&row?)?))
-        .collect()
+    rows.map(|row| {
+        let mut report = serde_json::from_str::<MfgCockpitReportSnapshot>(&row?)?;
+        report.normalize_legacy();
+        Ok(report)
+    })
+    .collect()
+}
+
+fn create_report_delivery_review(
+    connection: &Connection,
+    report: &MfgCockpitReportSnapshot,
+    expected_report_revision: u64,
+    requester_principal: &str,
+    reason: &str,
+    evidence_refs: Vec<String>,
+    idempotency_key: &str,
+) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+    if requester_principal.trim().is_empty() || idempotency_key.trim().is_empty() {
+        return Err(MfgRepositoryError::CommandRejected(
+            "review requester and idempotency key are required".to_string(),
+        ));
+    }
+    ensure_revision(
+        "cockpit_report",
+        &report.report_id,
+        expected_report_revision,
+        report.revision,
+    )?;
+    let delivery_state = crate::MfgCockpitReportDeliveryState::from_report(report);
+    if !delivery_state.dead_lettered {
+        return Err(MfgRepositoryError::CommandRejected(format!(
+            "report delivery is not dead-lettered: {}",
+            delivery_state.classification
+        )));
+    }
+    let dead_letter_digest = stable_review_digest(&serde_json::json!({
+        "report_id": report.report_id,
+        "report_revision": report.revision,
+        "delivery_revision": report.delivery_receipts.len(),
+        "delivery_state": delivery_state,
+    }))?;
+    let stable = stable_review_digest(&serde_json::json!({
+        "report_id": report.report_id,
+        "idempotency_key": idempotency_key,
+        "requester": requester_principal,
+    }))?;
+    let suffix = stable.trim_start_matches("sha256:");
+    let review_id = format!("mfg-report-review-{}", &suffix[..24.min(suffix.len())]);
+    let correlation_id = format!("mfg-report-review-correlation:{suffix}");
+    if let Some(existing) = find_report_delivery_review_by_correlation(connection, &correlation_id)?
+    {
+        if existing.report_id == report.report_id
+            && existing.report_revision == report.revision
+            && existing.requester_principal == requester_principal
+            && existing.dead_letter_digest == dead_letter_digest
+        {
+            return Ok(existing);
+        }
+        return Err(MfgRepositoryError::CommandRejected(
+            "review idempotency key is bound to another request".to_string(),
+        ));
+    }
+    let now = Utc::now();
+    let review = MfgReportDeliveryReview {
+        review_id,
+        report_id: report.report_id.clone(),
+        report_revision: report.revision,
+        delivery_revision: report.delivery_receipts.len() as u64,
+        dead_letter_digest,
+        requester_principal: requester_principal.to_string(),
+        approval_id: None,
+        correlation_id,
+        requested_action: None,
+        decision: None,
+        reviewer_principal: None,
+        reason: reason.trim().to_string(),
+        evidence_refs,
+        decision_lease_ref: None,
+        effect_key: None,
+        effect_payload: Value::Null,
+        effect_receipt_ref: None,
+        effect_error: None,
+        status: MfgReportDeliveryReviewStatus::ApprovalSubmissionPending,
+        revision: 1,
+        created_at: now,
+        updated_at: now,
+    };
+    let transaction = connection.unchecked_transaction()?;
+    insert_report_delivery_review(&transaction, &review)?;
+    insert_report_delivery_review_transition(
+        &transaction,
+        &review.review_id,
+        "none",
+        review.status,
+        None,
+        requester_principal,
+        idempotency_key,
+        serde_json::json!({
+            "report_id": review.report_id,
+            "report_revision": review.report_revision,
+            "dead_letter_digest": review.dead_letter_digest,
+        }),
+    )?;
+    append_projection_event(
+        &transaction,
+        "review",
+        &format!("mfg:report-review:{}", review.review_id),
+        "report_review.requested",
+        serde_json::to_value(&review)?,
+    )?;
+    transaction.commit()?;
+    Ok(review)
+}
+
+fn bind_report_delivery_review_approval(
+    connection: &Connection,
+    review_id: &str,
+    expected_revision: u64,
+    approval_id: &str,
+    actor_principal: &str,
+    idempotency_key: &str,
+) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+    let current = find_report_delivery_review(connection, review_id)?
+        .ok_or_else(|| MfgRepositoryError::NotFound(review_id.to_string()))?;
+    if current.status == MfgReportDeliveryReviewStatus::PendingApproval
+        && current.approval_id.as_deref() == Some(approval_id)
+    {
+        return Ok(current);
+    }
+    if current.status != MfgReportDeliveryReviewStatus::ApprovalSubmissionPending {
+        return Err(review_conflict(&current, expected_revision));
+    }
+    ensure_revision(
+        "report_delivery_review",
+        review_id,
+        expected_revision,
+        current.revision,
+    )?;
+    if approval_id.trim().is_empty() {
+        return Err(MfgRepositoryError::CommandRejected(
+            "approval id must not be empty".to_string(),
+        ));
+    }
+    let mut next = current.clone();
+    next.approval_id = Some(approval_id.to_string());
+    next.status = MfgReportDeliveryReviewStatus::PendingApproval;
+    next.revision = next.revision.saturating_add(1);
+    next.updated_at = Utc::now();
+    persist_report_delivery_review_transition(
+        connection,
+        &current,
+        &next,
+        None,
+        actor_principal,
+        idempotency_key,
+        serde_json::json!({"approval_id": approval_id}),
+    )
+}
+
+fn find_report_delivery_review(
+    connection: &Connection,
+    review_id: &str,
+) -> Result<Option<MfgReportDeliveryReview>, MfgRepositoryError> {
+    connection
+        .query_row(
+            "SELECT review_json FROM mfg_report_delivery_review WHERE review_id = ?1",
+            params![review_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(MfgRepositoryError::from))
+        .transpose()
+}
+
+fn find_report_delivery_review_by_correlation(
+    connection: &Connection,
+    correlation_id: &str,
+) -> Result<Option<MfgReportDeliveryReview>, MfgRepositoryError> {
+    connection
+        .query_row(
+            "SELECT review_json FROM mfg_report_delivery_review WHERE correlation_id = ?1",
+            params![correlation_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(MfgRepositoryError::from))
+        .transpose()
+}
+
+fn list_report_delivery_reviews(
+    connection: &Connection,
+    report_id: Option<&str>,
+    limit: usize,
+) -> Result<Vec<MfgReportDeliveryReview>, MfgRepositoryError> {
+    let limit = limit.clamp(1, 500) as i64;
+    let mut values = Vec::new();
+    if let Some(report_id) = report_id {
+        let mut statement = connection.prepare(
+            "SELECT review_json FROM mfg_report_delivery_review
+             WHERE report_id = ?1 ORDER BY updated_at DESC, review_id ASC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![report_id, limit], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            values.push(serde_json::from_str(&row?)?);
+        }
+    } else {
+        let mut statement = connection.prepare(
+            "SELECT review_json FROM mfg_report_delivery_review
+             ORDER BY updated_at DESC, review_id ASC LIMIT ?1",
+        )?;
+        let rows = statement.query_map(params![limit], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            values.push(serde_json::from_str(&row?)?);
+        }
+    }
+    Ok(values)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_report_delivery_review_decision(
+    connection: &Connection,
+    review_id: &str,
+    expected_revision: u64,
+    decision: MfgReportDeliveryReviewDecision,
+    reviewer_principal: &str,
+    reason: &str,
+    evidence_refs: Vec<String>,
+    reroute: Option<MfgReportDeliveryReviewRerouteTarget>,
+    decision_lease_ref: &str,
+    idempotency_key: &str,
+) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+    if reviewer_principal.trim().is_empty()
+        || decision_lease_ref.trim().is_empty()
+        || idempotency_key.trim().is_empty()
+    {
+        return Err(MfgRepositoryError::CommandRejected(
+            "reviewer, decision lease and idempotency key are required".to_string(),
+        ));
+    }
+    match decision {
+        MfgReportDeliveryReviewDecision::Reroute => {
+            let target = reroute.as_ref().ok_or_else(|| {
+                MfgRepositoryError::CommandRejected(
+                    "reroute decision requires a validated target".to_string(),
+                )
+            })?;
+            if [
+                &target.target_ref,
+                &target.provider_account,
+                &target.channel,
+                &target.requested_capability,
+            ]
+            .iter()
+            .any(|value| value.trim().is_empty())
+            {
+                return Err(MfgRepositoryError::CommandRejected(
+                    "reroute target/provider/channel/capability must not be empty".to_string(),
+                ));
+            }
+        }
+        MfgReportDeliveryReviewDecision::Resolve
+            if reason.trim().is_empty() || evidence_refs.is_empty() =>
+        {
+            return Err(MfgRepositoryError::CommandRejected(
+                "resolve requires an external disposition note and evidence".to_string(),
+            ));
+        }
+        MfgReportDeliveryReviewDecision::Abandon if reason.trim().is_empty() => {
+            return Err(MfgRepositoryError::CommandRejected(
+                "abandon requires an irreversible decision reason".to_string(),
+            ));
+        }
+        _ => {}
+    }
+    let current = find_report_delivery_review(connection, review_id)?
+        .ok_or_else(|| MfgRepositoryError::NotFound(review_id.to_string()))?;
+    let effect_key = format!(
+        "mfg-review-effect:{}",
+        stable_review_digest(&serde_json::json!({
+            "review_id": review_id,
+            "decision": decision,
+            "idempotency_key": idempotency_key,
+        }))?
+        .trim_start_matches("sha256:")
+    );
+    if current.status == MfgReportDeliveryReviewStatus::DecisionPendingEffect
+        && current.decision == Some(decision)
+        && current.effect_key.as_deref() == Some(effect_key.as_str())
+    {
+        return Ok(current);
+    }
+    if current.status != MfgReportDeliveryReviewStatus::PendingApproval {
+        return Err(review_conflict(&current, expected_revision));
+    }
+    ensure_revision(
+        "report_delivery_review",
+        review_id,
+        expected_revision,
+        current.revision,
+    )?;
+    if current.approval_id.is_none() {
+        return Err(MfgRepositoryError::CommandRejected(
+            "review has no correlated approval".to_string(),
+        ));
+    }
+    let mut next = current.clone();
+    next.requested_action = Some(decision);
+    next.decision = Some(decision);
+    next.reviewer_principal = Some(reviewer_principal.to_string());
+    next.reason = reason.trim().to_string();
+    next.evidence_refs = evidence_refs;
+    next.decision_lease_ref = Some(decision_lease_ref.to_string());
+    next.effect_key = Some(effect_key);
+    next.effect_payload = reroute
+        .map(|target| serde_json::to_value(target).unwrap_or(Value::Null))
+        .unwrap_or(Value::Null);
+    next.effect_error = None;
+    next.status = MfgReportDeliveryReviewStatus::DecisionPendingEffect;
+    next.revision = next.revision.saturating_add(1);
+    next.updated_at = Utc::now();
+    persist_report_delivery_review_transition(
+        connection,
+        &current,
+        &next,
+        Some(decision),
+        reviewer_principal,
+        idempotency_key,
+        serde_json::json!({
+            "decision_lease_ref": decision_lease_ref,
+            "effect_key": next.effect_key,
+            "reason": next.reason,
+            "evidence_refs": next.evidence_refs,
+            "effect_payload": next.effect_payload,
+        }),
+    )
+}
+
+fn activate_report_delivery_review_decision(
+    connection: &Connection,
+    review_id: &str,
+    expected_revision: u64,
+    actor_principal: &str,
+    idempotency_key: &str,
+) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+    let current = find_report_delivery_review(connection, review_id)?
+        .ok_or_else(|| MfgRepositoryError::NotFound(review_id.to_string()))?;
+    if current.status.is_terminal()
+        || (matches!(
+            current.status,
+            MfgReportDeliveryReviewStatus::DecisionPendingEffect
+                | MfgReportDeliveryReviewStatus::ApprovedPendingEffect
+        ) && report_delivery_review_effect_exists(connection, review_id)?)
+    {
+        return Ok(current);
+    }
+    if current.status != MfgReportDeliveryReviewStatus::DecisionPendingEffect {
+        return Err(review_conflict(&current, expected_revision));
+    }
+    ensure_revision(
+        "report_delivery_review",
+        review_id,
+        expected_revision,
+        current.revision,
+    )?;
+    let decision = current.decision.ok_or_else(|| {
+        MfgRepositoryError::CommandRejected("review decision is missing".to_string())
+    })?;
+    let transaction = connection.unchecked_transaction()?;
+    let result = match decision {
+        MfgReportDeliveryReviewDecision::Reject => {
+            let mut next = current.clone();
+            next.status = MfgReportDeliveryReviewStatus::Rejected;
+            next.effect_receipt_ref = Some(format!(
+                "mfg://report-review/{}/rejected",
+                current.review_id
+            ));
+            next.revision = next.revision.saturating_add(1);
+            next.updated_at = Utc::now();
+            persist_report_delivery_review_transition_in_transaction(
+                &transaction,
+                &current,
+                &next,
+                Some(decision),
+                actor_principal,
+                idempotency_key,
+                serde_json::json!({"effect": "none", "delivery_unchanged": true}),
+            )?;
+            next
+        }
+        MfgReportDeliveryReviewDecision::Abandon | MfgReportDeliveryReviewDecision::Resolve => {
+            let mut report = find_cockpit_report(&transaction, &current.report_id)?
+                .ok_or_else(|| MfgRepositoryError::NotFound(current.report_id.clone()))?;
+            ensure_revision(
+                "cockpit_report",
+                &report.report_id,
+                current.report_revision,
+                report.revision,
+            )?;
+            report.status = if decision == MfgReportDeliveryReviewDecision::Abandon {
+                "delivery_abandoned".to_string()
+            } else {
+                "delivery_resolved_external".to_string()
+            };
+            report.revision = report.revision.saturating_add(1);
+            insert_cockpit_report(&transaction, &report)?;
+            let mut next = current.clone();
+            next.status = if decision == MfgReportDeliveryReviewDecision::Abandon {
+                MfgReportDeliveryReviewStatus::Abandoned
+            } else {
+                MfgReportDeliveryReviewStatus::ResolvedExternal
+            };
+            next.effect_receipt_ref = Some(format!(
+                "mfg://report/{}/status/{}",
+                report.report_id, report.status
+            ));
+            next.revision = next.revision.saturating_add(1);
+            next.updated_at = Utc::now();
+            persist_report_delivery_review_transition_in_transaction(
+                &transaction,
+                &current,
+                &next,
+                Some(decision),
+                actor_principal,
+                idempotency_key,
+                serde_json::json!({
+                    "effect": "local_terminal",
+                    "report_status": report.status,
+                    "report_revision": report.revision,
+                }),
+            )?;
+            next
+        }
+        MfgReportDeliveryReviewDecision::ForceRetry | MfgReportDeliveryReviewDecision::Reroute => {
+            let effect_key = current.effect_key.clone().ok_or_else(|| {
+                MfgRepositoryError::CommandRejected("review effect key is missing".to_string())
+            })?;
+            let now = Utc::now();
+            transaction.execute(
+                "INSERT INTO mfg_report_delivery_review_effect_outbox (
+                    effect_id, review_id, action, effect_key, payload_json, status,
+                    attempt_count, next_attempt_at, last_error, receipt_ref, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, NULL, NULL, NULL, ?6, ?6)
+                 ON CONFLICT(effect_key) DO NOTHING",
+                params![
+                    format!("mfg-review-effect-{}", uuid::Uuid::new_v4()),
+                    current.review_id,
+                    review_decision_string(decision),
+                    effect_key,
+                    serde_json::to_string(&current.effect_payload)?,
+                    now.to_rfc3339(),
+                ],
+            )?;
+            append_projection_event(
+                &transaction,
+                "review",
+                &format!("mfg:report-review:{}", current.review_id),
+                "report_review.effect_queued",
+                serde_json::json!({
+                    "review_id": current.review_id,
+                    "decision": decision,
+                    "effect_key": current.effect_key,
+                }),
+            )?;
+            current.clone()
+        }
+    };
+    transaction.commit()?;
+    Ok(result)
+}
+
+fn claim_report_delivery_review_effects(
+    connection: &Connection,
+    limit: usize,
+) -> Result<Vec<MfgReportDeliveryReviewEffect>, MfgRepositoryError> {
+    let now = Utc::now();
+    let stale = now - chrono::Duration::minutes(2);
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute(
+        "UPDATE mfg_report_delivery_review_effect_outbox
+         SET status = 'retry_wait', next_attempt_at = ?1,
+             last_error = COALESCE(last_error, 'reclaimed_after_interrupted_processing'),
+             updated_at = ?1
+         WHERE status = 'processing' AND updated_at <= ?2",
+        params![now.to_rfc3339(), stale.to_rfc3339()],
+    )?;
+    let mut statement = transaction.prepare(
+        "SELECT effect_id, review_id, action, effect_key, payload_json, status,
+                attempt_count, next_attempt_at, last_error, receipt_ref, created_at, updated_at
+         FROM mfg_report_delivery_review_effect_outbox
+         WHERE status = 'pending'
+            OR (status = 'retry_wait' AND (next_attempt_at IS NULL OR next_attempt_at <= ?1))
+         ORDER BY created_at ASC, effect_id ASC LIMIT ?2",
+    )?;
+    let rows = statement
+        .query_map(
+            params![now.to_rfc3339(), limit.clamp(1, 100) as i64],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
+                ))
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    let mut claimed = Vec::new();
+    for (
+        effect_id,
+        review_id,
+        action,
+        effect_key,
+        payload_json,
+        _status,
+        attempt_count,
+        next_attempt_at,
+        last_error,
+        receipt_ref,
+        created_at,
+        _updated_at,
+    ) in rows
+    {
+        let changed = transaction.execute(
+            "UPDATE mfg_report_delivery_review_effect_outbox
+             SET status = 'processing', attempt_count = attempt_count + 1, updated_at = ?1
+             WHERE effect_id = ?2 AND status IN ('pending', 'retry_wait')",
+            params![now.to_rfc3339(), effect_id],
+        )?;
+        if changed != 1 {
+            continue;
+        }
+        claimed.push(MfgReportDeliveryReviewEffect {
+            effect_id,
+            review_id,
+            action: parse_review_decision(&action)?,
+            effect_key,
+            payload: serde_json::from_str(&payload_json)?,
+            status: "processing".to_string(),
+            attempt_count: attempt_count.max(0) as u64 + 1,
+            next_attempt_at: next_attempt_at
+                .as_deref()
+                .map(parse_rfc3339_utc)
+                .transpose()?,
+            last_error,
+            receipt_ref,
+            created_at: parse_rfc3339_utc(&created_at)?,
+            updated_at: now,
+        });
+    }
+    transaction.commit()?;
+    Ok(claimed)
+}
+
+fn complete_report_delivery_review_effect(
+    connection: &Connection,
+    effect_key: &str,
+    receipt_ref: &str,
+    actor_principal: &str,
+) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+    let effect = find_report_delivery_review_effect(connection, effect_key)?
+        .ok_or_else(|| MfgRepositoryError::NotFound(effect_key.to_string()))?;
+    let current = find_report_delivery_review(connection, &effect.review_id)?
+        .ok_or_else(|| MfgRepositoryError::NotFound(effect.review_id.clone()))?;
+    if effect.status == "completed" && current.status.is_terminal() {
+        return Ok(current);
+    }
+    if !matches!(
+        current.status,
+        MfgReportDeliveryReviewStatus::DecisionPendingEffect
+            | MfgReportDeliveryReviewStatus::ApprovedPendingEffect
+    ) {
+        return Err(review_conflict(&current, current.revision));
+    }
+    let terminal = match effect.action {
+        MfgReportDeliveryReviewDecision::ForceRetry => {
+            MfgReportDeliveryReviewStatus::EffectAppliedForceRetry
+        }
+        MfgReportDeliveryReviewDecision::Reroute => {
+            MfgReportDeliveryReviewStatus::EffectAppliedReroute
+        }
+        _ => {
+            return Err(MfgRepositoryError::CommandRejected(
+                "outbox contains a non-delivery review action".to_string(),
+            ));
+        }
+    };
+    let mut next = current.clone();
+    next.status = terminal;
+    next.effect_receipt_ref = Some(receipt_ref.to_string());
+    next.effect_error = None;
+    next.revision = next.revision.saturating_add(1);
+    next.updated_at = Utc::now();
+    let transaction = connection.unchecked_transaction()?;
+    persist_report_delivery_review_transition_in_transaction(
+        &transaction,
+        &current,
+        &next,
+        Some(effect.action),
+        actor_principal,
+        &format!("{}:complete", effect.effect_key),
+        serde_json::json!({"receipt_ref": receipt_ref, "attempt_count": effect.attempt_count}),
+    )?;
+    transaction.execute(
+        "UPDATE mfg_report_delivery_review_effect_outbox
+         SET status = 'completed', receipt_ref = ?1, last_error = NULL,
+             next_attempt_at = NULL, updated_at = ?2
+         WHERE effect_key = ?3 AND status = 'processing'",
+        params![receipt_ref, next.updated_at.to_rfc3339(), effect_key],
+    )?;
+    transaction.commit()?;
+    Ok(next)
+}
+
+fn fail_report_delivery_review_effect(
+    connection: &Connection,
+    effect_key: &str,
+    error: &str,
+    actor_principal: &str,
+) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+    let effect = find_report_delivery_review_effect(connection, effect_key)?
+        .ok_or_else(|| MfgRepositoryError::NotFound(effect_key.to_string()))?;
+    let current = find_report_delivery_review(connection, &effect.review_id)?
+        .ok_or_else(|| MfgRepositoryError::NotFound(effect.review_id.clone()))?;
+    let mut next = current.clone();
+    if next.status != MfgReportDeliveryReviewStatus::ApprovedPendingEffect {
+        next.status = MfgReportDeliveryReviewStatus::ApprovedPendingEffect;
+        next.revision = next.revision.saturating_add(1);
+    }
+    next.effect_error = Some(error.to_string());
+    next.updated_at = Utc::now();
+    let backoff_seconds = 2_i64.pow(effect.attempt_count.min(8) as u32).min(300);
+    let next_attempt_at = next.updated_at + chrono::Duration::seconds(backoff_seconds);
+    let transaction = connection.unchecked_transaction()?;
+    if next.revision != current.revision {
+        persist_report_delivery_review_transition_in_transaction(
+            &transaction,
+            &current,
+            &next,
+            Some(effect.action),
+            actor_principal,
+            &format!("{}:failure:{}", effect.effect_key, effect.attempt_count),
+            serde_json::json!({
+                "error": error,
+                "attempt_count": effect.attempt_count,
+                "next_attempt_at": next_attempt_at,
+            }),
+        )?;
+    } else {
+        update_report_delivery_review_row(&transaction, &next, &current)?;
+    }
+    transaction.execute(
+        "UPDATE mfg_report_delivery_review_effect_outbox
+         SET status = 'retry_wait', next_attempt_at = ?1, last_error = ?2, updated_at = ?3
+         WHERE effect_key = ?4 AND status = 'processing'",
+        params![
+            next_attempt_at.to_rfc3339(),
+            error,
+            next.updated_at.to_rfc3339(),
+            effect_key,
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(next)
+}
+
+fn insert_report_delivery_review(
+    connection: &Connection,
+    review: &MfgReportDeliveryReview,
+) -> Result<(), MfgRepositoryError> {
+    connection.execute(
+        "INSERT INTO mfg_report_delivery_review (
+            review_id, report_id, report_revision, delivery_revision, dead_letter_digest,
+            requester_principal, approval_id, correlation_id, requested_action, decision,
+            reviewer_principal, decision_lease_ref, effect_key, effect_receipt_ref,
+            status, revision, review_json, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                   ?15, ?16, ?17, ?18, ?19)",
+        params![
+            review.review_id,
+            review.report_id,
+            review.report_revision as i64,
+            review.delivery_revision as i64,
+            review.dead_letter_digest,
+            review.requester_principal,
+            review.approval_id,
+            review.correlation_id,
+            review.requested_action.map(review_decision_string),
+            review.decision.map(review_decision_string),
+            review.reviewer_principal,
+            review.decision_lease_ref,
+            review.effect_key,
+            review.effect_receipt_ref,
+            review_status_string(review.status),
+            review.revision as i64,
+            serde_json::to_string(review)?,
+            review.created_at.to_rfc3339(),
+            review.updated_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn persist_report_delivery_review_transition(
+    connection: &Connection,
+    current: &MfgReportDeliveryReview,
+    next: &MfgReportDeliveryReview,
+    action: Option<MfgReportDeliveryReviewDecision>,
+    actor_principal: &str,
+    idempotency_key: &str,
+    detail: Value,
+) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+    let transaction = connection.unchecked_transaction()?;
+    persist_report_delivery_review_transition_in_transaction(
+        &transaction,
+        current,
+        next,
+        action,
+        actor_principal,
+        idempotency_key,
+        detail,
+    )?;
+    transaction.commit()?;
+    Ok(next.clone())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_report_delivery_review_transition_in_transaction(
+    connection: &Connection,
+    current: &MfgReportDeliveryReview,
+    next: &MfgReportDeliveryReview,
+    action: Option<MfgReportDeliveryReviewDecision>,
+    actor_principal: &str,
+    idempotency_key: &str,
+    detail: Value,
+) -> Result<(), MfgRepositoryError> {
+    update_report_delivery_review_row(connection, next, current)?;
+    insert_report_delivery_review_transition(
+        connection,
+        &current.review_id,
+        &review_status_string(current.status),
+        next.status,
+        action,
+        actor_principal,
+        idempotency_key,
+        detail,
+    )?;
+    append_projection_event(
+        connection,
+        "review",
+        &format!("mfg:report-review:{}", current.review_id),
+        "report_review.transitioned",
+        serde_json::json!({
+            "review_id": current.review_id,
+            "from_status": current.status,
+            "to_status": next.status,
+            "action": action,
+            "revision": next.revision,
+            "actor_principal": actor_principal,
+        }),
+    )?;
+    Ok(())
+}
+
+fn update_report_delivery_review_row(
+    connection: &Connection,
+    next: &MfgReportDeliveryReview,
+    current: &MfgReportDeliveryReview,
+) -> Result<(), MfgRepositoryError> {
+    let changed = connection.execute(
+        "UPDATE mfg_report_delivery_review
+         SET approval_id = ?1, requested_action = ?2, decision = ?3,
+             reviewer_principal = ?4, decision_lease_ref = ?5, effect_key = ?6,
+             effect_receipt_ref = ?7, status = ?8, revision = ?9,
+             review_json = ?10, updated_at = ?11
+         WHERE review_id = ?12 AND revision = ?13 AND status = ?14",
+        params![
+            next.approval_id,
+            next.requested_action.map(review_decision_string),
+            next.decision.map(review_decision_string),
+            next.reviewer_principal,
+            next.decision_lease_ref,
+            next.effect_key,
+            next.effect_receipt_ref,
+            review_status_string(next.status),
+            next.revision as i64,
+            serde_json::to_string(next)?,
+            next.updated_at.to_rfc3339(),
+            current.review_id,
+            current.revision as i64,
+            review_status_string(current.status),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(review_conflict(current, current.revision));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_report_delivery_review_transition(
+    connection: &Connection,
+    review_id: &str,
+    from_status: &str,
+    to_status: MfgReportDeliveryReviewStatus,
+    action: Option<MfgReportDeliveryReviewDecision>,
+    actor_principal: &str,
+    idempotency_key: &str,
+    detail: Value,
+) -> Result<(), MfgRepositoryError> {
+    connection.execute(
+        "INSERT INTO mfg_report_delivery_review_transition (
+            transition_id, review_id, from_status, to_status, action,
+            actor_principal, idempotency_key, detail_json, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            format!(
+                "mfg-review-transition:{}",
+                stable_review_digest(&serde_json::json!({
+                    "review_id": review_id,
+                    "idempotency_key": idempotency_key,
+                }))?
+                .trim_start_matches("sha256:")
+            ),
+            review_id,
+            from_status,
+            review_status_string(to_status),
+            action.map(review_decision_string),
+            actor_principal,
+            idempotency_key,
+            serde_json::to_string(&detail)?,
+            Utc::now().to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn report_delivery_review_effect_exists(
+    connection: &Connection,
+    review_id: &str,
+) -> Result<bool, MfgRepositoryError> {
+    Ok(connection
+        .query_row(
+            "SELECT 1 FROM mfg_report_delivery_review_effect_outbox WHERE review_id = ?1 LIMIT 1",
+            params![review_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn find_report_delivery_review_effect(
+    connection: &Connection,
+    effect_key: &str,
+) -> Result<Option<MfgReportDeliveryReviewEffect>, MfgRepositoryError> {
+    let row = connection
+        .query_row(
+            "SELECT effect_id, review_id, action, effect_key, payload_json, status,
+                    attempt_count, next_attempt_at, last_error, receipt_ref, created_at, updated_at
+             FROM mfg_report_delivery_review_effect_outbox WHERE effect_key = ?1",
+            params![effect_key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(
+        |(
+            effect_id,
+            review_id,
+            action,
+            effect_key,
+            payload_json,
+            status,
+            attempt_count,
+            next_attempt_at,
+            last_error,
+            receipt_ref,
+            created_at,
+            updated_at,
+        )| {
+            Ok(MfgReportDeliveryReviewEffect {
+                effect_id,
+                review_id,
+                action: parse_review_decision(&action)?,
+                effect_key,
+                payload: serde_json::from_str(&payload_json)?,
+                status,
+                attempt_count: attempt_count.max(0) as u64,
+                next_attempt_at: next_attempt_at
+                    .as_deref()
+                    .map(parse_rfc3339_utc)
+                    .transpose()?,
+                last_error,
+                receipt_ref,
+                created_at: parse_rfc3339_utc(&created_at)?,
+                updated_at: parse_rfc3339_utc(&updated_at)?,
+            })
+        },
+    )
+    .transpose()
+}
+
+fn stable_review_digest(value: &Value) -> Result<String, MfgRepositoryError> {
+    let encoded = serde_json::to_vec(value)?;
+    Ok(format!("sha256:{:x}", Sha256::digest(encoded)))
+}
+
+fn review_status_string(status: MfgReportDeliveryReviewStatus) -> String {
+    serde_json::to_value(status)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn review_decision_string(decision: MfgReportDeliveryReviewDecision) -> String {
+    serde_json::to_value(decision)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn parse_review_decision(
+    value: &str,
+) -> Result<MfgReportDeliveryReviewDecision, MfgRepositoryError> {
+    serde_json::from_value(Value::String(value.to_string())).map_err(MfgRepositoryError::from)
+}
+
+fn review_conflict(review: &MfgReportDeliveryReview, expected_revision: u64) -> MfgRepositoryError {
+    MfgRepositoryError::RevisionConflict {
+        domain: "report_delivery_review".to_string(),
+        subject_id: review.review_id.clone(),
+        expected: Some(expected_revision),
+        actual: Some(review.revision),
+    }
 }
 
 fn render_cockpit_projection(
@@ -8444,6 +9648,311 @@ mod tests {
             store.cockpit_widget_projection(&saved.profile_id, "missing"),
             Err(MfgRepositoryError::NotFound(_))
         ));
+    }
+
+    fn dead_letter_report(repository: &MfgRepository, suffix: &str) -> MfgCockpitReportSnapshot {
+        let profile = MfgCockpitProfile::from_input(MfgCockpitProfileInput {
+            profile_id: Some(format!("review-profile-{suffix}")),
+            owner_ref: "principal:review-requester".to_string(),
+            display_name: Some("Review fixture".to_string()),
+            focus_refs: Vec::new(),
+            focus_metric_ids: Vec::new(),
+            thresholds: Value::Null,
+            template_id: None,
+            cadence: Some("daily".to_string()),
+            expected_revision: None,
+            scope: None,
+            layout: None,
+            global_filters: Value::Null,
+            widget_instances: Vec::new(),
+            sharing_policy: None,
+        });
+        repository.upsert_cockpit_profile(&profile, None).unwrap();
+        let report = repository
+            .generate_cockpit_report(
+                &profile.profile_id,
+                MfgCockpitReportRequest {
+                    report_id: Some(format!("review-report-{suffix}")),
+                    cadence: Some("daily".to_string()),
+                    delivery_ref: Some("channel://feishu/user/review-target".to_string()),
+                    note: None,
+                },
+            )
+            .unwrap();
+        for attempt in 1..=3 {
+            repository
+                .attach_cockpit_report_delivery(
+                    &report.report_id,
+                    MfgCockpitReportDeliveryReceipt::new(
+                        report.report_id.clone(),
+                        format!("review-failure-{suffix}-{attempt}"),
+                        "blocked",
+                        "runtime_unavailable",
+                        Some(format!("review-audit-{suffix}-{attempt}")),
+                    ),
+                )
+                .unwrap();
+        }
+        repository
+            .get_cockpit_report(&report.report_id)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn report_delivery_review_saga_is_idempotent_cas_bound_and_effect_recoverable() {
+        let repository = MfgRepository::in_memory().unwrap();
+        let report = dead_letter_report(&repository, "force");
+        let review = repository
+            .create_report_delivery_review(
+                &report,
+                report.revision,
+                "principal:review-requester",
+                "retry after manual evidence review",
+                vec!["evidence:delivery-failure".to_string()],
+                "review-create-force",
+            )
+            .unwrap();
+        let replay = repository
+            .create_report_delivery_review(
+                &report,
+                report.revision,
+                "principal:review-requester",
+                "retry after manual evidence review",
+                vec!["evidence:delivery-failure".to_string()],
+                "review-create-force",
+            )
+            .unwrap();
+        assert_eq!(review.review_id, replay.review_id);
+        let pending = repository
+            .bind_report_delivery_review_approval(
+                &review.review_id,
+                review.revision,
+                "mfg-approval:force",
+                "principal:review-requester",
+                "review-bind-force",
+            )
+            .unwrap();
+        assert!(matches!(
+            repository.bind_report_delivery_review_approval(
+                &review.review_id,
+                review.revision,
+                "mfg-approval:force",
+                "principal:review-requester",
+                "review-bind-stale",
+            ),
+            Err(MfgRepositoryError::RevisionConflict { .. })
+        ));
+        let prepared = repository
+            .prepare_report_delivery_review_decision(
+                &review.review_id,
+                pending.revision,
+                MfgReportDeliveryReviewDecision::ForceRetry,
+                "principal:reviewer",
+                "approved retry",
+                vec!["evidence:reviewed".to_string()],
+                None,
+                "lease:force",
+                "review-decision-force",
+            )
+            .unwrap();
+        let activated = repository
+            .activate_report_delivery_review_decision(
+                &review.review_id,
+                prepared.revision,
+                "principal:reviewer",
+                "review-activate-force",
+            )
+            .unwrap();
+        assert_eq!(
+            activated.status,
+            MfgReportDeliveryReviewStatus::DecisionPendingEffect
+        );
+        let effects = repository.claim_report_delivery_review_effects(10).unwrap();
+        assert_eq!(effects.len(), 1);
+        let completed = repository
+            .complete_report_delivery_review_effect(
+                &effects[0].effect_key,
+                "cross-plane:receipt:force",
+                "principal:reviewer",
+            )
+            .unwrap();
+        assert_eq!(
+            completed.status,
+            MfgReportDeliveryReviewStatus::EffectAppliedForceRetry
+        );
+        assert_eq!(
+            completed.effect_receipt_ref.as_deref(),
+            Some("cross-plane:receipt:force")
+        );
+    }
+
+    #[test]
+    fn report_delivery_review_reroute_outbox_reopens_and_keeps_one_effect_key() {
+        let path =
+            std::env::temp_dir().join(format!("mfg-review-reopen-{}.sqlite", uuid::Uuid::new_v4()));
+        let effect_key;
+        {
+            let repository = MfgRepository::open(&path).unwrap();
+            let report = dead_letter_report(&repository, "reroute-reopen");
+            let requested = repository
+                .create_report_delivery_review(
+                    &report,
+                    report.revision,
+                    "principal:review-requester",
+                    "reroute after provider outage",
+                    vec!["evidence:provider-outage".to_string()],
+                    "review-create-reroute-reopen",
+                )
+                .unwrap();
+            let pending = repository
+                .bind_report_delivery_review_approval(
+                    &requested.review_id,
+                    requested.revision,
+                    "mfg-approval:reroute-reopen",
+                    "principal:review-requester",
+                    "review-bind-reroute-reopen",
+                )
+                .unwrap();
+            let prepared = repository
+                .prepare_report_delivery_review_decision(
+                    &pending.review_id,
+                    pending.revision,
+                    MfgReportDeliveryReviewDecision::Reroute,
+                    "principal:reviewer",
+                    "reroute to the fallback provider",
+                    vec!["evidence:fallback-validated".to_string()],
+                    Some(MfgReportDeliveryReviewRerouteTarget {
+                        target_ref: "channel://feishu/user/fallback".to_string(),
+                        provider_account: "provider:fallback".to_string(),
+                        channel: "feishu".to_string(),
+                        requested_capability: "channel.send".to_string(),
+                    }),
+                    "lease:reroute-reopen",
+                    "review-decision-reroute-reopen",
+                )
+                .unwrap();
+            repository
+                .activate_report_delivery_review_decision(
+                    &prepared.review_id,
+                    prepared.revision,
+                    "principal:reviewer",
+                    "review-activate-reroute-reopen",
+                )
+                .unwrap();
+            let claimed = repository.claim_report_delivery_review_effects(10).unwrap();
+            assert_eq!(claimed.len(), 1);
+            assert_eq!(claimed[0].action, MfgReportDeliveryReviewDecision::Reroute);
+            assert_eq!(
+                claimed[0].payload["target_ref"],
+                "channel://feishu/user/fallback"
+            );
+            effect_key = claimed[0].effect_key.clone();
+        }
+
+        let reopened = MfgRepository::open(&path).unwrap();
+        let reclaimed = reopened.claim_report_delivery_review_effects(10).unwrap();
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].effect_key, effect_key);
+        assert_eq!(reclaimed[0].attempt_count, 2);
+        let terminal = reopened
+            .complete_report_delivery_review_effect(
+                &effect_key,
+                "cross-plane:receipt:reroute-reopen",
+                "principal:reviewer",
+            )
+            .unwrap();
+        assert_eq!(
+            terminal.status,
+            MfgReportDeliveryReviewStatus::EffectAppliedReroute
+        );
+        assert!(reopened
+            .claim_report_delivery_review_effects(10)
+            .unwrap()
+            .is_empty());
+        drop(reopened);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    }
+
+    #[test]
+    fn review_local_terminals_preserve_delivery_semantics() {
+        for (decision, expected_review, expected_report) in [
+            (
+                MfgReportDeliveryReviewDecision::Reject,
+                MfgReportDeliveryReviewStatus::Rejected,
+                "delivery_dead_lettered",
+            ),
+            (
+                MfgReportDeliveryReviewDecision::Abandon,
+                MfgReportDeliveryReviewStatus::Abandoned,
+                "delivery_abandoned",
+            ),
+            (
+                MfgReportDeliveryReviewDecision::Resolve,
+                MfgReportDeliveryReviewStatus::ResolvedExternal,
+                "delivery_resolved_external",
+            ),
+        ] {
+            let repository = MfgRepository::in_memory().unwrap();
+            let suffix = review_decision_string(decision);
+            let report = dead_letter_report(&repository, &suffix);
+            let requested = repository
+                .create_report_delivery_review(
+                    &report,
+                    report.revision,
+                    "principal:review-requester",
+                    "manual review",
+                    vec!["evidence:failure".to_string()],
+                    &format!("create-{suffix}"),
+                )
+                .unwrap();
+            let pending = repository
+                .bind_report_delivery_review_approval(
+                    &requested.review_id,
+                    requested.revision,
+                    &format!("approval-{suffix}"),
+                    "principal:review-requester",
+                    &format!("bind-{suffix}"),
+                )
+                .unwrap();
+            let prepared = repository
+                .prepare_report_delivery_review_decision(
+                    &pending.review_id,
+                    pending.revision,
+                    decision,
+                    "principal:reviewer",
+                    if decision == MfgReportDeliveryReviewDecision::Resolve {
+                        "resolved by external operator"
+                    } else {
+                        "reviewed"
+                    },
+                    vec!["evidence:reviewed".to_string()],
+                    None,
+                    &format!("lease-{suffix}"),
+                    &format!("decision-{suffix}"),
+                )
+                .unwrap();
+            let terminal = repository
+                .activate_report_delivery_review_decision(
+                    &prepared.review_id,
+                    prepared.revision,
+                    "principal:reviewer",
+                    &format!("activate-{suffix}"),
+                )
+                .unwrap();
+            assert_eq!(terminal.status, expected_review);
+            assert!(terminal.effect_receipt_ref.is_some());
+            let report = repository
+                .get_cockpit_report(&report.report_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                MfgCockpitReportDeliveryState::from_report(&report).classification,
+                expected_report
+            );
+        }
     }
 
     #[test]

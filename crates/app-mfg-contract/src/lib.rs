@@ -37,7 +37,11 @@ pub use operations::{
 };
 pub use receipt::{MfgReceiptStatus, MfgReceiptV1};
 pub use review::{
-    MfgReportDeliveryReview, MfgReportDeliveryReviewDecision, MfgReportDeliveryReviewStatus,
+    MfgReportDeliveryReview, MfgReportDeliveryReviewCollection,
+    MfgReportDeliveryReviewCreateRequest, MfgReportDeliveryReviewDecision,
+    MfgReportDeliveryReviewDecisionRequest, MfgReportDeliveryReviewEffect,
+    MfgReportDeliveryReviewRerouteTarget, MfgReportDeliveryReviewStatus,
+    MfgReportDeliveryReviewSummary,
 };
 pub use route::{
     mfg_route_contract, mfg_route_contracts, MfgCapabilityRequirement, MfgConsumer,
@@ -54,7 +58,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn route_inventory_has_v540_v541_and_v545_boundaries() {
+    fn route_inventory_has_v541_and_v545_boundaries() {
         let routes = mfg_route_contracts();
         assert_eq!(routes.len(), 104);
         assert_eq!(
@@ -62,14 +66,14 @@ mod tests {
                 .iter()
                 .filter(|route| route.availability == MfgActionAvailability::Active)
                 .count(),
-            99
+            103
         );
         assert_eq!(
             routes
                 .iter()
                 .filter(|route| route.availability == MfgActionAvailability::PlannedV541)
                 .count(),
-            4
+            0
         );
         assert_eq!(
             routes
@@ -169,8 +173,8 @@ mod tests {
         assert!(webui.contains(&"mfg.cockpit.manage".to_string()));
         assert!(!tui.contains(&"mfg.cockpit.manage".to_string()));
         assert!(tui.contains(&"mfg.read".to_string()));
-        assert!(!webui.contains(&"mfg.report.review".to_string()));
-        assert!(!tui.contains(&"mfg.report.review".to_string()));
+        assert!(webui.contains(&"mfg.report.review".to_string()));
+        assert!(tui.contains(&"mfg.report.review".to_string()));
         assert!(unknown.is_empty());
     }
 

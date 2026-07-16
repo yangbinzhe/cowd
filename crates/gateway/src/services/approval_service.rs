@@ -70,16 +70,35 @@ impl ApprovalService {
         self.gate.is_some()
     }
 
-    pub(crate) async fn pending(&self) -> serde_json::Value {
+    pub(crate) async fn pending(
+        &self,
+        principal: &runtime::VerifiedPrincipal,
+    ) -> serde_json::Value {
         if let Some(services) = self.runtime_services.as_deref() {
             services.approval_queue().refresh();
         }
         let (projection, pending) = self.runtime_services.as_deref().map_or_else(
             || (serde_json::Value::Null, Vec::new()),
             |services| {
+                let requests = services
+                    .approval_queue()
+                    .list()
+                    .into_iter()
+                    .filter(|request| approval_visible_to(request, principal))
+                    .collect::<Vec<_>>();
+                let pending = requests
+                    .iter()
+                    .filter(|request| request.status == runtime::GlobalApprovalStatus::Pending)
+                    .cloned()
+                    .collect::<Vec<_>>();
                 (
-                    services.approval_queue().projection(),
-                    services.approval_queue().pending(),
+                    serde_json::json!({
+                        "kind": "runtime.global_approvals",
+                        "count": requests.len(),
+                        "pending_count": pending.len(),
+                        "requests": requests,
+                    }),
+                    pending,
                 )
             },
         );
@@ -110,19 +129,70 @@ impl ApprovalService {
         self.update_config(cfg).await
     }
 
-    pub(crate) async fn history(&self, limit: usize, offset: usize) -> serde_json::Value {
+    pub(crate) async fn history(
+        &self,
+        limit: usize,
+        offset: usize,
+        principal: &runtime::VerifiedPrincipal,
+    ) -> serde_json::Value {
+        let mut combined = Vec::new();
+        if let Some(services) = self.runtime_services.as_deref() {
+            services.approval_queue().refresh();
+            combined.extend(
+                services
+                    .approval_queue()
+                    .list()
+                    .into_iter()
+                    .filter(|request| request.status != runtime::GlobalApprovalStatus::Pending)
+                    .filter(|request| approval_visible_to(request, principal))
+                    .filter_map(|request| serde_json::to_value(request).ok()),
+            );
+        }
         if let Some(repository) = &self.repository {
-            if let Ok((history, _total)) = repository.list_history(limit, offset) {
+            if let Ok((history, _total)) = repository.list_history(limit.saturating_add(offset), 0)
+            {
                 if !history.is_empty() {
-                    return serde_json::json!(history);
+                    combined.extend(
+                        history
+                            .into_iter()
+                            .filter_map(|entry| serde_json::to_value(entry).ok()),
+                    );
                 }
             }
         }
-        let history = match &self.gate {
-            Some(gate) => gate.history().list_history(limit, offset).await.0,
-            None => Vec::new(),
-        };
-        serde_json::json!(history)
+        if combined.is_empty() {
+            combined.extend(
+                match &self.gate {
+                    Some(gate) => {
+                        gate.history()
+                            .list_history(limit.saturating_add(offset), 0)
+                            .await
+                            .0
+                    }
+                    None => Vec::new(),
+                }
+                .into_iter()
+                .filter_map(|entry| serde_json::to_value(entry).ok()),
+            );
+        }
+        combined.sort_by(|left, right| {
+            let left_time = left
+                .get("resolved_at_ms")
+                .and_then(serde_json::Value::as_u64)
+                .or_else(|| left.get("timestamp_ms").and_then(serde_json::Value::as_u64))
+                .unwrap_or_default();
+            let right_time = right
+                .get("resolved_at_ms")
+                .and_then(serde_json::Value::as_u64)
+                .or_else(|| {
+                    right
+                        .get("timestamp_ms")
+                        .and_then(serde_json::Value::as_u64)
+                })
+                .unwrap_or_default();
+            right_time.cmp(&left_time)
+        });
+        serde_json::Value::Array(combined.into_iter().skip(offset).take(limit).collect())
     }
 
     pub(crate) async fn respond(
@@ -136,6 +206,13 @@ impl ApprovalService {
             return Err("approval_human_interactive_capability_required".to_string());
         }
         let services = self.runtime_services()?;
+        if services
+            .approval_queue()
+            .get(id)
+            .is_some_and(|request| request.source.kind == runtime::ApprovalSourceKind::Mfg)
+        {
+            return Err("mfg_review_requires_typed_decision_service".to_string());
+        }
         let graph_target = canonical_graph_approval_target(id);
         let graph_before = if let Some((graph_id, node_id)) = &graph_target {
             let graph = services
@@ -255,6 +332,29 @@ impl ApprovalService {
     }
 }
 
+fn approval_visible_to(
+    request: &runtime::GlobalApprovalRequest,
+    principal: &runtime::VerifiedPrincipal,
+) -> bool {
+    if request.source.kind != runtime::ApprovalSourceKind::Mfg {
+        return true;
+    }
+    principal.is_human_interactive()
+        && principal.has_capability("approval.respond")
+        && principal.has_capability("mfg.report.review")
+        && request
+            .source
+            .resource_ref
+            .as_deref()
+            .is_some_and(|resource| {
+                principal.claims().scopes.iter().any(|scope| {
+                    scope == "gateway"
+                        || scope == resource
+                        || resource.starts_with(&format!("{scope}:"))
+                })
+            })
+}
+
 fn canonical_graph_approval_target(approval_id: &str) -> Option<(String, String)> {
     runtime::execution_core::graph::executors::parse_graph_approval_id(approval_id)
 }
@@ -345,6 +445,90 @@ mod tests {
         assert_eq!(
             services.approval_queue().get(&approval_id).unwrap().status,
             runtime::GlobalApprovalStatus::Approved
+        );
+    }
+
+    fn review_principal(capabilities: &[&str]) -> runtime::VerifiedPrincipal {
+        runtime::VerifiedPrincipal::from_test_claims(harness_contract::security::PrincipalClaims {
+            principal_id: "reviewer".to_string(),
+            kind: harness_contract::security::PrincipalKind::Human,
+            scopes: vec!["gateway".to_string()],
+            capabilities: capabilities
+                .iter()
+                .map(|capability| (*capability).to_string())
+                .collect(),
+            assurance: harness_contract::security::PrincipalAssurance::HumanInteractive,
+            issuer: "test".to_string(),
+            issued_at_ms: 1,
+            expires_at_ms: None,
+            credential_fingerprint: "test".to_string(),
+            credential_epoch: 1,
+        })
+    }
+
+    #[tokio::test]
+    async fn mfg_approval_is_cropped_and_generic_response_fails_before_decision_write() {
+        let services = runtime::RuntimeServices::in_memory().unwrap();
+        let request = services
+            .approval_queue()
+            .submit_scoped(
+                "mfg-approval:crop",
+                runtime::SubmitGlobalApprovalRequest {
+                    source: runtime::ApprovalSource {
+                        kind: runtime::ApprovalSourceKind::Mfg,
+                        session_id: None,
+                        agent_id: None,
+                        team_id: None,
+                        mission_id: None,
+                        resource_ref: Some("mfg:cockpit-report:report-crop".to_string()),
+                        review_ref: Some("review-crop".to_string()),
+                    },
+                    action: "mfg.report.review.typed_decision".to_string(),
+                    summary: "review report".to_string(),
+                    risk: harness_contract::core::TaskRisk::High,
+                    evidence_refs: vec!["digest:crop".to_string()],
+                    timeout_policy: runtime::ApprovalTimeoutPolicy::Pending,
+                },
+            )
+            .unwrap();
+        let service = ApprovalService::new().with_runtime_services(Arc::clone(&services));
+        let operator = review_principal(&["approval.respond"]);
+        let reviewer = review_principal(&["approval.respond", "mfg.report.review"]);
+        assert_eq!(
+            service.pending(&operator).await["pending"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            service.pending(&operator).await["approvals"]["requests"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            service.pending(&reviewer).await["pending"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            service
+                .respond(&request.approval_id, true, None, &reviewer)
+                .await
+                .unwrap_err(),
+            "mfg_review_requires_typed_decision_service"
+        );
+        assert_eq!(
+            services
+                .approval_queue()
+                .get(&request.approval_id)
+                .unwrap()
+                .status,
+            runtime::GlobalApprovalStatus::Pending
         );
     }
 }

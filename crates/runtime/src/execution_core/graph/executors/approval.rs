@@ -144,6 +144,8 @@ impl NodeExecutor for ApprovalNodeExecutor {
                         agent_id: payload.agent_id,
                         team_id: payload.team_id,
                         mission_id: payload.mission_id,
+                        resource_ref: None,
+                        review_ref: None,
                     },
                     action: payload.action,
                     summary: payload.summary,

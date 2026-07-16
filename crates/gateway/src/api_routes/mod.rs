@@ -885,6 +885,7 @@ pub mod test_support {
 // ── Router ─────────────────────────────────────────────────────
 
 pub fn api_router(state: Arc<AppState>) -> Router {
+    mfg_routes::start_review_reconciler(&state);
     let public_routes = public_routes::router();
 
     let protected_routes = Router::new()
@@ -9257,6 +9258,8 @@ providers:
                     agent_id: None,
                     team_id: None,
                     mission_id: Some("mission-approval-route".to_string()),
+                    resource_ref: None,
+                    review_ref: None,
                 },
                 action: "apply_patch".to_string(),
                 summary: "modify runtime file".to_string(),

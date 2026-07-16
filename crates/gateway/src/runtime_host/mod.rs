@@ -1090,6 +1090,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     // ── Cleanup after shutdown ──
     tracing::info!("cleaning up runtime host resources...");
 
+    app_state.services.mfg.shutdown_review_reconciler().await;
     session_runtime_bridge.shutdown().await;
     mission_schedule_timer.abort();
     let _ = mission_schedule_timer.await;

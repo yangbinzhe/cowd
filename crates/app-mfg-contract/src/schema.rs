@@ -17,7 +17,11 @@ use crate::{
         MfgReadResourceV1, MfgReadResponseV1,
     },
     receipt::MfgReceiptV1,
-    review::MfgReportDeliveryReview,
+    review::{
+        MfgReportDeliveryReview, MfgReportDeliveryReviewCollection,
+        MfgReportDeliveryReviewCreateRequest, MfgReportDeliveryReviewDecisionRequest,
+        MfgReportDeliveryReviewEffect, MfgReportDeliveryReviewSummary,
+    },
     route::MfgRouteContract,
     surface::{MfgFrontendContractV1, MfgSurfaceContract},
 };
@@ -50,6 +54,17 @@ impl MfgOpenApiSchemaRegistry {
         registry.register_type::<MfgLiveResyncV1>("MfgLiveResyncV1");
         registry.register_type::<MfgLiveHeartbeatV1>("MfgLiveHeartbeatV1");
         registry.register_type::<MfgReportDeliveryReview>("MfgReportDeliveryReview");
+        registry.register_type::<MfgReportDeliveryReviewCollection>(
+            "MfgReportDeliveryReviewCollection",
+        );
+        registry.register_type::<MfgReportDeliveryReviewCreateRequest>(
+            "MfgReportDeliveryReviewCreateRequest",
+        );
+        registry.register_type::<MfgReportDeliveryReviewDecisionRequest>(
+            "MfgReportDeliveryReviewDecisionRequest",
+        );
+        registry.register_type::<MfgReportDeliveryReviewSummary>("MfgReportDeliveryReviewSummary");
+        registry.register_type::<MfgReportDeliveryReviewEffect>("MfgReportDeliveryReviewEffect");
         registry.register_type::<MfgEntitlementProjectionV2>("MfgEntitlementProjectionV2");
         registry.register_type::<MfgContractFreshnessV1>("MfgContractFreshnessV1");
         registry.register_type::<MfgSurfaceStatusV1>("MfgSurfaceStatusV1");

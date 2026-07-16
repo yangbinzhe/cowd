@@ -159,6 +159,8 @@ mod tests {
             agent_id: None,
             team_id: None,
             mission_id: Some("mission-runtime".to_string()),
+            resource_ref: None,
+            review_ref: None,
         }
     }
 

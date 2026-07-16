@@ -49,6 +49,43 @@ use decision::*;
 use incidents::*;
 use operations::*;
 
+pub(super) fn start_review_reconciler(state: &Arc<AppState>) {
+    if state.services.runtime.is_none() {
+        return;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let Some(lifecycle) = state.services.mfg.begin_review_reconciler() else {
+        return;
+    };
+    let state = Arc::downgrade(state);
+    let handle = runtime.spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let Some(lifecycle_owner) = lifecycle.upgrade() else {
+                break;
+            };
+            if lifecycle_owner.is_cancelled() {
+                break;
+            }
+            let Some(state) = state.upgrade() else {
+                break;
+            };
+            if let Err((status, error)) = reconcile_mfg_report_review_saga(&state, None, 32).await {
+                tracing::warn!(
+                    status = %status,
+                    error = ?error.0,
+                    "MFG report review reconciler iteration failed"
+                );
+            }
+        }
+    });
+    state.services.mfg.install_review_reconciler(handle);
+}
+
 /// Public MFG bridge intent. Gateway authentication owns the effective actor;
 /// an actor field in an HTTP body is rejected by this closed schema.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -183,6 +220,7 @@ pub(super) fn register_mfg_openapi_schemas(
     registry.register_type::<MfgCockpitReportDeliveryRetryRequest>(
         "MfgCockpitReportDeliveryRetryRequest",
     );
+    registry.register_type::<MfgReportReviewListQuery>("MfgReportReviewListQuery");
     registry.register_type::<MatrixDecisionTraceQuery>("MatrixDecisionTraceQuery");
     registry.register_type::<MfgRealityFactIngestRequest>("MfgRealityFactIngestRequest");
     registry.register_type::<MfgRealityEntityUpsertRequest>("MfgRealityEntityUpsertRequest");
@@ -273,6 +311,9 @@ pub(super) fn mfg_request_schema_component(route_id: app_mfg_contract::MfgRouteI
         R::ReportList => "MfgCockpitReportListQuery",
         R::ReportDeliver => "MfgCockpitReportDeliveryIntent",
         R::ReportDeliveryRetry => "MfgCockpitReportDeliveryRetryRequest",
+        R::ReportReviewRequest => "MfgReportDeliveryReviewCreateRequest",
+        R::ReportReviewList => "MfgReportReviewListQuery",
+        R::ReportReviewDecide => "MfgReportDeliveryReviewDecisionRequest",
         R::AlertRuleList | R::AlertList | R::AlertSubscriptionList => "MfgAlertListQuery",
         R::AlertRuleUpsert => "MfgAlertRuleUpsertRequest",
         R::AlertSubscriptionUpsert => "MfgAlertSubscriptionUpsertRequest",
@@ -601,6 +642,22 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route(
             "/api/apps/mfg/cockpit/reports/:id/delivery/retry",
             post(mfg_cockpit_report_delivery_retry_handler),
+        )
+        .route(
+            "/api/apps/mfg/cockpit/reports/:id/reviews",
+            post(mfg_cockpit_report_review_request_handler),
+        )
+        .route(
+            "/api/apps/mfg/cockpit/report-reviews",
+            get(mfg_cockpit_report_review_list_handler),
+        )
+        .route(
+            "/api/apps/mfg/cockpit/report-reviews/:id",
+            get(mfg_cockpit_report_review_get_handler),
+        )
+        .route(
+            "/api/apps/mfg/cockpit/report-reviews/:id/decision",
+            post(mfg_cockpit_report_review_decision_handler),
         )
         .route(
             "/api/apps/mfg/focus/alert-rules",
@@ -1126,6 +1183,19 @@ fn resolve_mfg_action_id(
                 "mfg.report.schedule.generate_only"
             }
         }
+        R::ReportReviewDecide => {
+            match find_json_string(body, "decision")
+                .unwrap_or_default()
+                .as_str()
+            {
+                "force_retry" => "mfg.report.review.force_retry",
+                "reroute" => "mfg.report.review.reroute",
+                "abandon" => "mfg.report.review.abandon",
+                "resolve" => "mfg.report.review.resolve",
+                "reject" => "mfg.report.review.reject",
+                _ => route_id.as_str(),
+            }
+        }
         R::IncidentSkillRun => "mfg.skill.run",
         _ => route_id.as_str(),
     }
@@ -1174,6 +1244,18 @@ fn resolve_mfg_resource_ref(
         R::PlaybookUpsert => {
             find_json_string(body, "playbook_id").map(|id| format!("mfg:playbook:{id}"))
         }
+        R::ReportReviewRequest => request_path
+            .split("/reports/")
+            .nth(1)
+            .and_then(|suffix| suffix.split('/').next())
+            .filter(|id| !id.trim().is_empty())
+            .map(|id| format!("mfg:cockpit-report:{id}")),
+        R::ReportReviewDecide => request_path
+            .split("/report-reviews/")
+            .nth(1)
+            .and_then(|suffix| suffix.split('/').next())
+            .filter(|id| !id.trim().is_empty())
+            .map(|id| format!("mfg:report-review:{id}")),
         _ => None,
     };
     identified.unwrap_or_else(|| format!("mfg:http:{request_path}"))
@@ -1718,8 +1800,6 @@ struct MfgCockpitReportDeliveryRetryRequest {
     #[serde(default)]
     idempotency_key: Option<String>,
     #[serde(default)]
-    force: bool,
-    #[serde(default)]
     actor_identity_ref: Option<String>,
     #[serde(default)]
     source_channel: Option<String>,
@@ -1735,6 +1815,14 @@ struct MfgCockpitReportDeliveryRetryRequest {
     channel: Option<String>,
     #[serde(default)]
     template_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct MfgReportReviewListQuery {
+    #[serde(default)]
+    report_id: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -3281,6 +3369,31 @@ mod tests {
                 &serde_json::json!({}),
             ),
             "mfg.skill.run"
+        );
+        for (decision, expected) in [
+            ("force_retry", "mfg.report.review.force_retry"),
+            ("reroute", "mfg.report.review.reroute"),
+            ("abandon", "mfg.report.review.abandon"),
+            ("resolve", "mfg.report.review.resolve"),
+            ("reject", "mfg.report.review.reject"),
+        ] {
+            assert_eq!(
+                resolve_mfg_action_id(
+                    app_mfg_contract::MfgRouteId::ReportReviewDecide,
+                    &serde_json::json!({"decision": decision, "expected_revision": 2}),
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn public_report_retry_rejects_legacy_force_bypass() {
+        assert!(
+            serde_json::from_value::<MfgCockpitReportDeliveryRetryRequest>(
+                serde_json::json!({"mode": "commit", "force": true})
+            )
+            .is_err()
         );
     }
 }

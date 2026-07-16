@@ -292,7 +292,8 @@ fn mfg_response_schema_ref(route: &app_mfg_contract::MfgRouteContract) -> &'stat
     match route.route_id {
         R::ContractGet => "MfgFrontendContractV1",
         R::AppGet => "MfgApplicationDescriptor",
-        R::ReportReviewList | R::ReportReviewGet => "MfgReportDeliveryReview",
+        R::ReportReviewList => "MfgReportDeliveryReviewCollection",
+        R::ReportReviewGet => "MfgReportDeliveryReview",
         R::LiveSnapshot => "MfgLiveEnvelopeV1",
         _ if matches!(route.class, app_mfg_contract::MfgMutationClass::Read) => "MfgReadResponseV1",
         _ => "MfgMutationResponseV1",
@@ -1479,7 +1480,7 @@ mod tests {
             .into_iter()
             .filter(|route| route.availability == app_mfg_contract::MfgActionAvailability::Active)
             .collect::<Vec<_>>();
-        assert_eq!(active.len(), 99);
+        assert_eq!(active.len(), 103);
 
         for route in active {
             let path = openapi_path(&route.path);
