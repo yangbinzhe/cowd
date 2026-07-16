@@ -14,8 +14,6 @@ use super::*;
 #[derive(Debug, Deserialize)]
 pub(super) struct MfgAlertListQuery {
     #[serde(default)]
-    owner_ref: Option<String>,
-    #[serde(default)]
     status: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
@@ -107,13 +105,12 @@ pub(super) async fn mfg_alert_rule_list_handler(
     Query(query): Query<MfgAlertListQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let actor = principal_actor_id(&principal);
-    let owner = query.owner_ref.as_deref().unwrap_or(&actor);
     let rules = state
         .services
         .mfg
         .list_alert_rules(
             &state.config_home,
-            Some(owner),
+            Some(&actor),
             query.limit.unwrap_or(100).clamp(1, 500),
         )
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
@@ -439,12 +436,7 @@ pub(super) async fn mfg_assignment_list_handler(
         )
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .into_iter()
-        .filter(|item| {
-            item.visibility != "private"
-                || item.created_by == actor
-                || item.assignee_ref == actor
-                || item.watcher_refs.contains(&actor)
-        })
+        .filter(|item| assignment_visible_to(item, &principal))
         .collect::<Vec<_>>();
     Ok(Json(
         serde_json::json!({ "kind": "mfg.assignment_list", "items": items }),
@@ -462,12 +454,7 @@ pub(super) async fn mfg_assignment_get_handler(
         .get_assignment(&state.config_home, &id)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG assignment not found"))?;
-    let actor = principal_actor_id(&principal);
-    if assignment.visibility == "private"
-        && assignment.created_by != actor
-        && assignment.assignee_ref != actor
-        && !assignment.watcher_refs.contains(&actor)
-    {
+    if !assignment_visible_to(&assignment, &principal) {
         return Err(api_error(
             StatusCode::FORBIDDEN,
             "assignment is not visible to this principal",
@@ -484,6 +471,18 @@ pub(super) async fn mfg_assignment_command_handler(
     Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(request): Json<MfgAssignmentCommandRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let assignment = state
+        .services
+        .mfg
+        .get_assignment(&state.config_home, &id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG assignment not found"))?;
+    if !assignment_visible_to(&assignment, &principal) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "assignment is not actionable by this principal",
+        ));
+    }
     let idempotency_key = request.idempotency_key.clone();
     let (assignment, receipt) = state
         .services
@@ -509,6 +508,34 @@ pub(super) async fn mfg_assignment_command_handler(
     Ok(Json(
         serde_json::json!({ "kind": "mfg.assignment_command_receipt", "assignment": assignment, "receipt": receipt }),
     ))
+}
+
+fn assignment_visible_to(assignment: &MfgAssignment, principal: &AuthenticatedPrincipal) -> bool {
+    let actor = principal_actor_id(principal);
+    if assignment.created_by == actor
+        || assignment.assignee_ref == actor
+        || assignment.watcher_refs.contains(&actor)
+    {
+        return true;
+    }
+    match assignment.visibility.as_str() {
+        "public" => true,
+        "team"
+            if matches!(
+                assignment.assignee_kind.as_str(),
+                "team" | "role" | "organization"
+            ) =>
+        {
+            let qualified = format!("{}:{}", assignment.assignee_kind, assignment.assignee_ref);
+            principal
+                .0
+                .claims()
+                .scopes
+                .iter()
+                .any(|scope| scope == &assignment.assignee_ref || scope == &qualified)
+        }
+        _ => false,
+    }
 }
 
 async fn deliver_assignment_notifications(

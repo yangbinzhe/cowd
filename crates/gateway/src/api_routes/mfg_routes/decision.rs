@@ -1,3 +1,7 @@
+use axum::extract::Extension;
+
+use crate::api_routes::AuthenticatedPrincipal;
+
 use super::*;
 
 pub(super) async fn mfg_skills_handler(
@@ -97,6 +101,7 @@ pub(super) async fn mfg_command_center_live_handler(
 
 pub(super) async fn mfg_decision_trace_handler(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Query(query): Query<MatrixDecisionTraceQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let source_pack = state
@@ -180,6 +185,22 @@ pub(super) async fn mfg_decision_trace_handler(
             .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
     } else {
         None
+    };
+    let report = match report {
+        Some(report)
+            if cockpit_report_accessible_to(&state, &report, &principal).map_err(|error| {
+                api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+            })? =>
+        {
+            Some(report)
+        }
+        Some(_) => {
+            return Err(api_error(
+                StatusCode::FORBIDDEN,
+                "MFG cockpit report is not accessible",
+            ))
+        }
+        None => None,
     };
     let delivery_state = report
         .as_ref()

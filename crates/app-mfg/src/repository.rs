@@ -302,6 +302,22 @@ impl MfgRepository {
         render_cockpit_projection(&connection, profile)
     }
 
+    pub fn cockpit_projection_with_filters(
+        &self,
+        profile_id: &str,
+        filters: Value,
+    ) -> Result<MfgCockpitProjection, MfgRepositoryError> {
+        validate_cockpit_filters(&filters, "projection.query", false)?;
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut profile = find_cockpit_profile(&connection, profile_id)?
+            .ok_or_else(|| MfgRepositoryError::NotFound(profile_id.to_string()))?;
+        profile.global_filters = filters;
+        render_cockpit_projection(&connection, profile)
+    }
+
     pub fn cockpit_widget_projection(
         &self,
         profile_id: &str,
@@ -313,6 +329,48 @@ impl MfgRepository {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut profile = find_cockpit_profile(&connection, profile_id)?
             .ok_or_else(|| MfgRepositoryError::NotFound(profile_id.to_string()))?;
+        profile.normalize_legacy();
+        let instance = profile
+            .widget_instances
+            .iter()
+            .find(|instance| instance.instance_id == instance_id && instance.visible)
+            .ok_or_else(|| MfgRepositoryError::NotFound(instance_id.to_string()))?;
+        let definition = mfg_widget_catalog()
+            .into_iter()
+            .find(|definition| definition.definition_id == instance.definition_id);
+        let scoped = effective_cockpit_profile(&profile, instance);
+        let widget = match definition.as_ref() {
+            Some(definition) => render_cockpit_widget(&connection, &scoped, instance, definition)
+                .unwrap_or_else(|error| {
+                    MfgCockpitWidget::unavailable(instance, Some(definition), error.to_string())
+                }),
+            None => {
+                MfgCockpitWidget::unavailable(instance, None, "widget definition is not registered")
+            }
+        };
+        Ok(MfgCockpitWidgetProjection {
+            projection_id: format!("cockpit-widget-projection-{}", uuid::Uuid::new_v4()),
+            profile_id: profile.profile_id,
+            profile_revision: profile.revision,
+            widget,
+            generated_at: Utc::now(),
+        })
+    }
+
+    pub fn cockpit_widget_projection_with_filters(
+        &self,
+        profile_id: &str,
+        instance_id: &str,
+        filters: Value,
+    ) -> Result<MfgCockpitWidgetProjection, MfgRepositoryError> {
+        validate_cockpit_filters(&filters, "widget_projection.query", false)?;
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut profile = find_cockpit_profile(&connection, profile_id)?
+            .ok_or_else(|| MfgRepositoryError::NotFound(profile_id.to_string()))?;
+        profile.global_filters = filters;
         profile.normalize_legacy();
         let instance = profile
             .widget_instances
@@ -367,6 +425,18 @@ impl MfgRepository {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         find_cockpit_report(&connection, report_id)
+    }
+
+    pub fn list_cockpit_reports(
+        &self,
+        profile_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MfgCockpitReportSnapshot>, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        list_cockpit_reports(&connection, profile_id, limit)
     }
 
     pub fn attach_cockpit_report_delivery(
@@ -2590,6 +2660,36 @@ fn validate_cockpit_profile(profile: &MfgCockpitProfile) -> Result<(), MfgReposi
         ));
     }
     validate_cockpit_filters(&profile.global_filters, "profile.global_filters", false)?;
+    match profile.scope.kind.as_str() {
+        "personal"
+            if profile
+                .scope
+                .scope_ref
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty()) => {}
+        "personal" => {
+            return Err(MfgRepositoryError::CommandRejected(
+                "personal dashboard scope must not carry scope_ref".to_string(),
+            ))
+        }
+        "team" | "role" | "organization"
+            if profile
+                .scope
+                .scope_ref
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty()) => {}
+        "team" | "role" | "organization" => {
+            return Err(MfgRepositoryError::CommandRejected(format!(
+                "{} dashboard scope requires scope_ref",
+                profile.scope.kind
+            )))
+        }
+        _ => {
+            return Err(MfgRepositoryError::CommandRejected(
+                "dashboard scope must be personal, team, role, or organization".to_string(),
+            ))
+        }
+    }
     if !matches!(
         profile.sharing_policy.visibility.as_str(),
         "private" | "team" | "public"
@@ -2685,6 +2785,9 @@ fn validate_cockpit_config(config: &Value, instance_id: &str) -> Result<(), MfgR
                 .is_some_and(|title| !title.trim().is_empty() && title.len() <= 120),
             "show_legend" => value.is_boolean(),
             "precision" => value.as_u64().is_some_and(|precision| precision <= 6),
+            "refresh_interval_seconds" => value
+                .as_u64()
+                .is_some_and(|seconds| (10..=3600).contains(&seconds)),
             _ => false,
         };
         if !valid {
@@ -2722,6 +2825,9 @@ fn validate_cockpit_filters(
                     )
                 })
             }),
+            "from" | "to" => value
+                .as_str()
+                .is_some_and(|text| chrono::DateTime::parse_from_rfc3339(text).is_ok()),
             "limit" if allow_limit => value
                 .as_u64()
                 .is_some_and(|limit| (1..=100).contains(&limit)),
@@ -2805,6 +2911,30 @@ fn find_cockpit_report(
         .optional()?
         .map(|json| serde_json::from_str(&json).map_err(MfgRepositoryError::from))
         .transpose()
+}
+
+fn list_cockpit_reports(
+    connection: &Connection,
+    profile_id: Option<&str>,
+    limit: usize,
+) -> Result<Vec<MfgCockpitReportSnapshot>, MfgRepositoryError> {
+    let limit = limit.clamp(1, 500) as i64;
+    if let Some(profile_id) = profile_id {
+        let mut statement = connection.prepare(
+            "SELECT report_json FROM mfg_cockpit_report WHERE profile_id = ?1 ORDER BY created_at DESC, report_id ASC LIMIT ?2",
+        )?;
+        let rows =
+            statement.query_map(params![profile_id, limit], |row| row.get::<_, String>(0))?;
+        return rows
+            .map(|row| Ok(serde_json::from_str::<MfgCockpitReportSnapshot>(&row?)?))
+            .collect();
+    }
+    let mut statement = connection.prepare(
+        "SELECT report_json FROM mfg_cockpit_report ORDER BY created_at DESC, report_id ASC LIMIT ?1",
+    )?;
+    let rows = statement.query_map(params![limit], |row| row.get::<_, String>(0))?;
+    rows.map(|row| Ok(serde_json::from_str::<MfgCockpitReportSnapshot>(&row?)?))
+        .collect()
 }
 
 fn render_cockpit_projection(
@@ -3121,8 +3251,9 @@ fn list_recent_metric_states(
     rows.map(|row| Ok(serde_json::from_str::<MatrixMetricState>(&row?)?))
         .filter(|result| {
             result.as_ref().map_or(true, |state| {
-                profile.focus_metric_ids.is_empty()
-                    || profile.focus_metric_ids.contains(&state.metric_id)
+                (profile.focus_metric_ids.is_empty()
+                    || profile.focus_metric_ids.contains(&state.metric_id))
+                    && cockpit_time_matches(state.computed_at, profile)
             })
         })
         .take(limit)
@@ -3130,6 +3261,9 @@ fn list_recent_metric_states(
 }
 
 fn attention_matches_profile(item: &MatrixAttentionItem, profile: &MfgCockpitProfile) -> bool {
+    if !cockpit_time_matches(item.updated_at, profile) {
+        return false;
+    }
     let severities = profile
         .global_filters
         .get("severities")
@@ -3171,6 +3305,22 @@ fn attention_matches_profile(item: &MatrixAttentionItem, profile: &MfgCockpitPro
             .any(|metric_id| metric_ref == metric_id)
     });
     no_focus || entity_match || metric_match
+}
+
+fn cockpit_time_matches(timestamp: chrono::DateTime<Utc>, profile: &MfgCockpitProfile) -> bool {
+    let from_matches = profile
+        .global_filters
+        .get("from")
+        .and_then(Value::as_str)
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .is_none_or(|from| timestamp >= from.with_timezone(&Utc));
+    let to_matches = profile
+        .global_filters
+        .get("to")
+        .and_then(Value::as_str)
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .is_none_or(|to| timestamp <= to.with_timezone(&Utc));
+    from_matches && to_matches
 }
 
 fn ensure_revision(
@@ -3533,6 +3683,7 @@ fn upsert_alert_rule(
     expected_revision: Option<u64>,
 ) -> Result<MfgAlertRule, MfgRepositoryError> {
     let mut rule = rule.clone();
+    validate_alert_rule_condition(&rule.condition)?;
     let existing = find_alert_rule(connection, &rule.rule_id)?;
     match existing {
         Some(existing) => {
@@ -3711,6 +3862,7 @@ fn materialize_alert_occurrences(
                     .entity_ref
                     .as_ref()
                     .is_some_and(|value| rule.entity_refs.contains(value)))
+            && attention_matches_alert_condition(item, &rule.condition)
     }) {
         let occurrence_id = format!(
             "alert-occurrence-{}-{}",
@@ -3748,6 +3900,144 @@ fn materialize_alert_occurrences(
         )?;
     }
     Ok(())
+}
+
+fn validate_alert_rule_condition(condition: &Value) -> Result<(), MfgRepositoryError> {
+    if condition.is_null() {
+        return Ok(());
+    }
+    let object = condition.as_object().ok_or_else(|| {
+        MfgRepositoryError::CommandRejected("alert rule condition must be an object".to_string())
+    })?;
+    if object.is_empty() {
+        return Ok(());
+    }
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "field" | "operator" | "threshold" | "severity_in" | "status_in" | "window_minutes"
+        ) {
+            return Err(MfgRepositoryError::CommandRejected(format!(
+                "unsupported alert rule condition key: {key}"
+            )));
+        }
+    }
+    let numeric_keys_present = object.contains_key("field")
+        || object.contains_key("operator")
+        || object.contains_key("threshold");
+    if numeric_keys_present {
+        let field = object.get("field").and_then(Value::as_str).ok_or_else(|| {
+            MfgRepositoryError::CommandRejected(
+                "alert rule numeric condition requires field".to_string(),
+            )
+        })?;
+        if !matches!(
+            field,
+            "priority_score" | "urgency" | "confidence" | "strategic_weight"
+        ) {
+            return Err(MfgRepositoryError::CommandRejected(format!(
+                "unsupported alert rule condition field: {field}"
+            )));
+        }
+        let operator = object
+            .get("operator")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                MfgRepositoryError::CommandRejected(
+                    "alert rule numeric condition requires operator".to_string(),
+                )
+            })?;
+        if !matches!(operator, "gt" | "gte" | "lt" | "lte" | "eq") {
+            return Err(MfgRepositoryError::CommandRejected(format!(
+                "unsupported alert rule condition operator: {operator}"
+            )));
+        }
+        if object.get("threshold").and_then(Value::as_f64).is_none() {
+            return Err(MfgRepositoryError::CommandRejected(
+                "alert rule numeric condition requires a numeric threshold".to_string(),
+            ));
+        }
+    }
+    for key in ["severity_in", "status_in"] {
+        if let Some(value) = object.get(key) {
+            let valid = value.as_array().is_some_and(|values| {
+                !values.is_empty() && values.iter().all(|value| value.as_str().is_some())
+            });
+            if !valid {
+                return Err(MfgRepositoryError::CommandRejected(format!(
+                    "alert rule condition {key} must be a non-empty string array"
+                )));
+            }
+        }
+    }
+    if object.get("window_minutes").is_some_and(|value| {
+        !value
+            .as_u64()
+            .is_some_and(|minutes| (1..=10_080).contains(&minutes))
+    }) {
+        return Err(MfgRepositoryError::CommandRejected(
+            "alert rule condition window_minutes must be between 1 and 10080".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn attention_matches_alert_condition(attention: &MatrixAttentionItem, condition: &Value) -> bool {
+    let Some(object) = condition.as_object() else {
+        return condition.is_null();
+    };
+    if object.is_empty() {
+        return true;
+    }
+    if let Some(window_minutes) = object.get("window_minutes").and_then(Value::as_u64) {
+        let oldest = Utc::now() - chrono::Duration::minutes(window_minutes as i64);
+        if attention.updated_at < oldest {
+            return false;
+        }
+    }
+    if let Some(values) = object.get("severity_in").and_then(Value::as_array) {
+        let severity = match attention.severity {
+            MatrixSeverity::Normal => "normal",
+            MatrixSeverity::Warning => "warning",
+            MatrixSeverity::Critical => "critical",
+            MatrixSeverity::Unknown => "unknown",
+        };
+        if !values.iter().any(|value| value.as_str() == Some(severity)) {
+            return false;
+        }
+    }
+    if let Some(values) = object.get("status_in").and_then(Value::as_array) {
+        if !values
+            .iter()
+            .any(|value| value.as_str() == Some(attention.status.as_str()))
+        {
+            return false;
+        }
+    }
+    let Some(field) = object.get("field").and_then(Value::as_str) else {
+        return true;
+    };
+    let Some(operator) = object.get("operator").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(threshold) = object.get("threshold").and_then(Value::as_f64) else {
+        return false;
+    };
+    let actual = match field {
+        "priority_score" => f64::from(attention.priority_score),
+        "urgency" => f64::from(attention.urgency),
+        "confidence" => f64::from(attention.confidence),
+        "strategic_weight" => f64::from(attention.strategic_weight),
+        _ => return false,
+    };
+    match operator {
+        "gt" => actual > threshold,
+        "gte" => actual >= threshold,
+        "lt" => actual < threshold,
+        "lte" => actual <= threshold,
+        "eq" => (actual - threshold).abs() <= f64::EPSILON,
+        _ => false,
+    }
 }
 
 fn save_alert_occurrence(
@@ -3934,11 +4224,7 @@ fn upsert_assignment(
     assignment: &MfgAssignment,
     expected_revision: Option<u64>,
 ) -> Result<MfgAssignment, MfgRepositoryError> {
-    if assignment.task_ref.trim().is_empty() {
-        return Err(MfgRepositoryError::CommandRejected(
-            "assignment must reference an existing task".to_string(),
-        ));
-    }
+    validate_assignment(assignment)?;
     if let Some(workflow_id) = &assignment.workflow_id {
         let graph = find_workflow_graph(connection, "workflow_id", workflow_id)?
             .ok_or_else(|| MfgRepositoryError::NotFound(workflow_id.clone()))?;
@@ -3990,6 +4276,63 @@ fn upsert_assignment(
         serde_json::to_value(&assignment)?,
     )?;
     Ok(assignment)
+}
+
+fn validate_assignment(assignment: &MfgAssignment) -> Result<(), MfgRepositoryError> {
+    if assignment.task_ref.trim().is_empty() || assignment.assignee_ref.trim().is_empty() {
+        return Err(MfgRepositoryError::CommandRejected(
+            "assignment requires task_ref and assignee_ref".to_string(),
+        ));
+    }
+    if !matches!(
+        assignment.assignee_kind.as_str(),
+        "user" | "agent" | "team" | "role" | "organization"
+    ) {
+        return Err(MfgRepositoryError::CommandRejected(
+            "assignment assignee_kind must be user, agent, team, role, or organization".to_string(),
+        ));
+    }
+    if !matches!(
+        assignment.priority.as_str(),
+        "low" | "normal" | "high" | "critical" | "urgent"
+    ) {
+        return Err(MfgRepositoryError::CommandRejected(
+            "assignment priority must be low, normal, high, critical, or urgent".to_string(),
+        ));
+    }
+    if !matches!(
+        assignment.visibility.as_str(),
+        "private" | "team" | "public"
+    ) {
+        return Err(MfgRepositoryError::CommandRejected(
+            "assignment visibility must be private, team, or public".to_string(),
+        ));
+    }
+    if assignment.sla_minutes == Some(0) {
+        return Err(MfgRepositoryError::CommandRejected(
+            "assignment sla_minutes must be greater than zero".to_string(),
+        ));
+    }
+    let mut watchers = BTreeSet::new();
+    if assignment
+        .watcher_refs
+        .iter()
+        .any(|watcher| watcher.trim().is_empty() || !watchers.insert(watcher))
+    {
+        return Err(MfgRepositoryError::CommandRejected(
+            "assignment watcher_refs must be unique and non-empty".to_string(),
+        ));
+    }
+    if assignment
+        .notification_targets
+        .iter()
+        .any(|target| target.surface.trim().is_empty() || target.recipient.trim().is_empty())
+    {
+        return Err(MfgRepositoryError::CommandRejected(
+            "assignment notification targets require surface and recipient".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn save_assignment(
@@ -4108,10 +4451,14 @@ fn command_assignment(
                 .ok_or_else(|| {
                     MfgRepositoryError::CommandRejected("target_ref is required".to_string())
                 })?;
+            if let Some(kind) = assignment_kind_from_ref(&assignment.assignee_ref) {
+                assignment.assignee_kind = kind.to_string();
+            }
             assignment.status = "assigned".to_string();
         }
         MfgAssignmentCommand::Claim => {
             assignment.assignee_ref = input.actor_ref.clone();
+            assignment.assignee_kind = "user".to_string();
             assignment.status = "claimed".to_string();
         }
         MfgAssignmentCommand::Unassign => assignment.status = "unassigned".to_string(),
@@ -4156,6 +4503,12 @@ fn command_assignment(
         serde_json::json!({ "assignment": assignment, "receipt": receipt, "reason": input.reason }),
     )?;
     Ok((assignment, receipt))
+}
+
+fn assignment_kind_from_ref(reference: &str) -> Option<&'static str> {
+    ["user", "agent", "team", "role", "organization"]
+        .into_iter()
+        .find(|kind| reference.starts_with(&format!("{kind}:")))
 }
 
 fn build_live_projection(
@@ -4643,6 +4996,9 @@ fn upsert_attention(
             item.updated_at.to_rfc3339(),
         ],
     )?;
+    for rule in list_alert_rules(connection, None, 500)? {
+        materialize_alert_occurrences(connection, &rule)?;
+    }
     Ok(())
 }
 
@@ -6120,7 +6476,7 @@ fn attention_from_change(
 mod tests {
     use super::*;
     use crate::{
-        MfgCockpitProfileInput, MfgCockpitReportDeliveryPayload,
+        MfgAlertRuleInput, MfgCockpitProfileInput, MfgCockpitReportDeliveryPayload,
         MfgCockpitReportDeliveryPayloadRequest, MfgCockpitReportDeliveryReceipt,
         MfgCockpitReportDeliveryState, MfgCockpitReportRequest,
     };
@@ -6161,6 +6517,180 @@ mod tests {
 
         assert!(columns.iter().any(|column| column == "workflow_graph_id"));
         assert!(!columns.iter().any(|column| column == "agent_graph_id"));
+    }
+
+    #[test]
+    fn legacy_four_widget_profile_migrates_losslessly_without_dual_write() {
+        let repository = MfgRepository::in_memory().unwrap();
+        let now = Utc::now();
+        let legacy = serde_json::json!({
+            "profile_id": "cockpit-profile-legacy-four",
+            "owner_ref": "user:legacy-planner",
+            "display_name": "Legacy operations cockpit",
+            "focus_refs": ["entity:legacy-line"],
+            "focus_metric_ids": ["metric:legacy-output"],
+            "thresholds": { "metric:legacy-output": { "critical": 42 } },
+            "template_id": "mfg.legacy_ops",
+            "cadence": "weekly",
+            "revision": 0,
+            "created_at": now,
+            "updated_at": now
+        });
+        let mut profile: MfgCockpitProfile = serde_json::from_value(legacy).unwrap();
+        profile.normalize_legacy();
+
+        assert_eq!(profile.revision, 1);
+        assert_eq!(profile.widget_instances, default_mfg_widget_instances());
+        assert_eq!(profile.focus_refs, vec!["entity:legacy-line"]);
+        assert_eq!(profile.focus_metric_ids, vec!["metric:legacy-output"]);
+        assert_eq!(profile.thresholds["metric:legacy-output"]["critical"], 42);
+
+        let saved = repository
+            .upsert_cockpit_profile(&profile, None)
+            .expect("legacy profile saves through the canonical profile writer");
+        let loaded = repository
+            .get_cockpit_profile(&saved.profile_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.focus_refs, profile.focus_refs);
+        assert_eq!(loaded.focus_metric_ids, profile.focus_metric_ids);
+        assert_eq!(loaded.thresholds, profile.thresholds);
+        assert_eq!(loaded.widget_instances, default_mfg_widget_instances());
+
+        let connection = repository.connection.lock().unwrap();
+        let row_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM mfg_cockpit_profile WHERE profile_id = ?1",
+                params![saved.profile_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let profile_json: String = connection
+            .query_row(
+                "SELECT profile_json FROM mfg_cockpit_profile WHERE profile_id = ?1",
+                params![saved.profile_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let persisted: Value = serde_json::from_str(&profile_json).unwrap();
+        assert_eq!(row_count, 1);
+        assert_eq!(persisted["widget_instances"].as_array().unwrap().len(), 4);
+        assert!(persisted.get("widgets").is_none());
+    }
+
+    #[test]
+    fn alert_conditions_trigger_for_future_attention_and_deduplicate() {
+        let repository = MfgRepository::in_memory().unwrap();
+        let rule = MfgAlertRule::from_input(MfgAlertRuleInput {
+            rule_id: Some("alert-rule-priority".to_string()),
+            owner_ref: "user:planner".to_string(),
+            name: "High priority attention".to_string(),
+            metric_refs: vec!["metric:output".to_string()],
+            entity_refs: vec!["entity:line-a".to_string()],
+            condition: serde_json::json!({
+                "field": "priority_score",
+                "operator": "gte",
+                "threshold": 0.8,
+                "window_minutes": 30
+            }),
+            severity: "critical".to_string(),
+            enabled: true,
+            expected_revision: None,
+        });
+        repository.upsert_alert_rule(&rule, None).unwrap();
+        assert!(repository
+            .list_alert_occurrences(None, 10)
+            .unwrap()
+            .is_empty());
+
+        let now = Utc::now();
+        let matching = MatrixAttentionItem {
+            attention_id: "attention-priority-high".to_string(),
+            title: "Line A output risk".to_string(),
+            business_domain: "manufacturing".to_string(),
+            entity_ref: Some("entity:line-a".to_string()),
+            metric_refs: vec!["metric:output".to_string()],
+            period: None,
+            priority_score: 0.91,
+            severity: MatrixSeverity::Critical,
+            urgency: 0.9,
+            strategic_weight: 0.8,
+            confidence: 0.95,
+            reason_codes: vec!["threshold".to_string()],
+            linked_changes: vec!["matrix:change:output".to_string()],
+            linked_anomalies: Vec::new(),
+            linked_impacts: Vec::new(),
+            owner_roles: vec!["operations".to_string()],
+            status: "open".to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+        {
+            let connection = repository.connection.lock().unwrap();
+            upsert_attention(&connection, &matching).unwrap();
+            upsert_attention(&connection, &matching).unwrap();
+            let mut below = matching.clone();
+            below.attention_id = "attention-priority-low".to_string();
+            below.priority_score = 0.4;
+            upsert_attention(&connection, &below).unwrap();
+            let mut stale = matching.clone();
+            stale.attention_id = "attention-priority-stale".to_string();
+            stale.updated_at = now - chrono::Duration::hours(2);
+            upsert_attention(&connection, &stale).unwrap();
+        }
+        let occurrences = repository.list_alert_occurrences(None, 10).unwrap();
+        assert_eq!(occurrences.len(), 1);
+        assert_eq!(occurrences[0].rule_id, rule.rule_id);
+        assert_eq!(occurrences[0].severity, "critical");
+    }
+
+    #[test]
+    fn assignment_contract_validates_operational_fields_and_transfer_kind() {
+        let repository = MfgRepository::in_memory().unwrap();
+        let mut invalid = MfgAssignment::from_input(
+            MfgAssignmentInput {
+                assignment_id: Some("assignment-invalid".to_string()),
+                task_ref: "task:canonical".to_string(),
+                workflow_id: None,
+                workflow_node_id: None,
+                incident_id: None,
+                assignee_ref: "operator-a".to_string(),
+                assignee_kind: "unknown".to_string(),
+                watcher_refs: Vec::new(),
+                priority: "normal".to_string(),
+                due_at: None,
+                sla_minutes: Some(30),
+                notification_targets: Vec::new(),
+                visibility: "team".to_string(),
+                expected_revision: None,
+            },
+            "user:dispatcher".to_string(),
+        );
+        assert!(matches!(
+            repository.upsert_assignment(&invalid, None),
+            Err(MfgRepositoryError::CommandRejected(_))
+        ));
+
+        invalid.assignment_id = "assignment-valid".to_string();
+        invalid.assignee_kind = "agent".to_string();
+        invalid.assignee_ref = "agent:planner".to_string();
+        let saved = repository.upsert_assignment(&invalid, None).unwrap();
+        let (transferred, receipt) = repository
+            .command_assignment(
+                &saved.assignment_id,
+                MfgAssignmentCommandInput {
+                    command: MfgAssignmentCommand::Transfer,
+                    actor_ref: "user:dispatcher".to_string(),
+                    expected_revision: saved.revision,
+                    idempotency_key: "assignment-transfer-kind".to_string(),
+                    target_ref: Some("team:operations".to_string()),
+                    reason: Some("move ownership to the operations team".to_string()),
+                },
+            )
+            .unwrap();
+        assert_eq!(transferred.assignee_ref, "team:operations");
+        assert_eq!(transferred.assignee_kind, "team");
+        assert_eq!(receipt.current_revision, saved.revision + 1);
     }
 
     #[test]
@@ -7080,6 +7610,33 @@ mod tests {
             store.upsert_cockpit_profile(&profile, None),
             Err(MfgRepositoryError::CommandRejected(_))
         ));
+
+        profile.widget_instances[1].query = Value::Null;
+        profile.widget_instances[0].config = serde_json::json!({ "refresh_interval_seconds": 5 });
+        assert!(matches!(
+            store.upsert_cockpit_profile(&profile, None),
+            Err(MfgRepositoryError::CommandRejected(_))
+        ));
+
+        profile.widget_instances[0].config = serde_json::json!({ "refresh_interval_seconds": 60 });
+        profile.scope = MfgDashboardScope {
+            kind: "team".to_string(),
+            scope_ref: None,
+        };
+        assert!(matches!(
+            store.upsert_cockpit_profile(&profile, None),
+            Err(MfgRepositoryError::CommandRejected(_))
+        ));
+
+        profile.scope.scope_ref = Some("operations".to_string());
+        profile.global_filters = serde_json::json!({ "from": "not-a-timestamp" });
+        assert!(matches!(
+            store.upsert_cockpit_profile(&profile, None),
+            Err(MfgRepositoryError::CommandRejected(_))
+        ));
+
+        profile.global_filters = serde_json::json!({ "from": "2026-07-16T00:00:00Z" });
+        assert!(store.upsert_cockpit_profile(&profile, None).is_ok());
     }
 
     #[test]

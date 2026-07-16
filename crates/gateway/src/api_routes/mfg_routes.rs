@@ -111,6 +111,27 @@ pub(super) struct MfgCockpitReportDeliveryIntent {
     template_id: Option<String>,
 }
 
+/// Public action execution intent. The authenticated gateway principal is the
+/// only source of the effective operator id.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct MfgActionExecutionIntent {
+    #[serde(default = "default_mfg_bridge_mode")]
+    mode: String,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+impl MfgActionExecutionIntent {
+    pub(super) fn into_request(self, operator_id: String) -> MfgActionExecutionRequest {
+        MfgActionExecutionRequest {
+            mode: self.mode,
+            operator_id: Some(operator_id),
+            note: self.note,
+        }
+    }
+}
+
 impl MfgCockpitReportDeliveryIntent {
     pub(super) fn into_request(self, actor_principal: String) -> MfgCockpitReportDeliveryRequest {
         MfgCockpitReportDeliveryRequest {
@@ -429,6 +450,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             post(mfg_cockpit_report_schedule_run_handler),
         )
         .route(
+            "/api/apps/mfg/cockpit/reports",
+            get(mfg_cockpit_report_list_handler),
+        )
+        .route(
             "/api/apps/mfg/cockpit/reports/:id",
             get(mfg_cockpit_report_get_handler),
         )
@@ -520,6 +545,22 @@ struct MfgCockpitProfileDeleteQuery {
     idempotency_key: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct MfgCockpitProjectionQuery {
+    #[serde(default)]
+    entity: Option<String>,
+    #[serde(default)]
+    metric: Option<String>,
+    #[serde(default)]
+    severity: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    to: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MfgCockpitProfileCloneRequest {
@@ -554,6 +595,14 @@ struct MfgCockpitReportGenerateRequest {
     session_id: Option<String>,
     #[serde(default)]
     report: MfgCockpitReportRequest,
+}
+
+#[derive(Debug, Deserialize)]
+struct MfgCockpitReportListQuery {
+    #[serde(default)]
+    profile_id: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -603,6 +652,7 @@ struct MfgIncidentCreateRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MfgExecutionFeedbackRequest {
     outcome: String,
     note: String,
@@ -1913,15 +1963,22 @@ async fn mfg_server_manufacturing_ontology_seed_handler(
 async fn mfg_execution_feedback_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(request): Json<MfgExecutionFeedbackRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let actor = principal_actor_id(&principal);
     let execution = state
         .services
         .mfg
         .record_execution_feedback(
             &state.config_home,
             &id,
-            MfgActionFeedback::new(request.outcome, request.note, request.metric_delta),
+            MfgActionFeedback::new_attributed(
+                request.outcome,
+                request.note,
+                request.metric_delta,
+                actor,
+            ),
         )
         .map_err(|error| match error {
             MfgRepositoryError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
@@ -1935,7 +1992,10 @@ async fn mfg_execution_feedback_handler(
 
 #[cfg(test)]
 mod tests {
-    use super::{MfgCockpitReportDeliveryIntent, MfgCrossPlaneBridgeIntent};
+    use super::{
+        MfgActionExecutionIntent, MfgCockpitReportDeliveryIntent, MfgCrossPlaneBridgeIntent,
+        MfgExecutionFeedbackRequest,
+    };
 
     #[test]
     fn mfg_effect_intents_reject_client_supplied_actor_principals() {
@@ -1945,9 +2005,17 @@ mod tests {
         let delivery = serde_json::from_str::<MfgCockpitReportDeliveryIntent>(
             r#"{"actor_principal":"user:forged","mode":"dry_run"}"#,
         );
+        let action = serde_json::from_str::<MfgActionExecutionIntent>(
+            r#"{"operator_id":"user:forged","mode":"commit"}"#,
+        );
+        let feedback = serde_json::from_str::<MfgExecutionFeedbackRequest>(
+            r#"{"outcome":"resolved","note":"forged","actor_ref":"user:forged"}"#,
+        );
 
         assert!(bridge.is_err());
         assert!(delivery.is_err());
+        assert!(action.is_err());
+        assert!(feedback.is_err());
     }
 
     #[test]
@@ -1961,6 +2029,15 @@ mod tests {
         assert_eq!(
             request.requested_capability.as_deref(),
             Some("channel.feishu.send")
+        );
+
+        let action: MfgActionExecutionIntent =
+            serde_json::from_str(r#"{"mode":"dry_run","note":"inspect only"}"#)
+                .expect("valid MFG action intent");
+        let request = action.into_request("principal:verified-human".to_string());
+        assert_eq!(
+            request.operator_id.as_deref(),
+            Some("principal:verified-human")
         );
     }
 }

@@ -57,6 +57,8 @@ pub struct MfgActionFeedback {
     pub outcome: String,
     pub note: String,
     #[serde(default)]
+    pub actor_ref: Option<String>,
+    #[serde(default)]
     pub metric_delta: Option<f64>,
     pub recorded_at: DateTime<Utc>,
 }
@@ -170,6 +172,23 @@ impl MfgActionFeedback {
         Self {
             outcome: outcome.into(),
             note: note.into(),
+            actor_ref: None,
+            metric_delta,
+            recorded_at: Utc::now(),
+        }
+    }
+
+    #[must_use]
+    pub fn new_attributed(
+        outcome: impl Into<String>,
+        note: impl Into<String>,
+        metric_delta: Option<f64>,
+        actor_ref: impl Into<String>,
+    ) -> Self {
+        Self {
+            outcome: outcome.into(),
+            note: note.into(),
+            actor_ref: Some(actor_ref.into()),
             metric_delta,
             recorded_at: Utc::now(),
         }

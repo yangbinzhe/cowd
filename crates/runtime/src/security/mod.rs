@@ -58,6 +58,18 @@ impl VerifiedPrincipal {
     pub fn credential_epoch(&self) -> u64 {
         self.claims.credential_epoch
     }
+
+    /// Construct a verified principal only inside explicit test builds.
+    ///
+    /// Production callers must continue to pass through `PrincipalVerifier`;
+    /// this fixture exists so downstream route tests can exercise permission
+    /// matrices with multiple signed-identity shapes without exposing a
+    /// forgeable constructor in normal builds.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    #[must_use]
+    pub fn from_test_claims(claims: PrincipalClaims) -> Self {
+        Self { claims }
+    }
 }
 
 /// Exact protected operation to which a human decision lease must be bound.

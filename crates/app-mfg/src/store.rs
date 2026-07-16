@@ -340,6 +340,15 @@ impl MfgStore {
         self.repository.cockpit_projection(profile_id)
     }
 
+    pub fn cockpit_projection_with_filters(
+        &self,
+        profile_id: &str,
+        filters: serde_json::Value,
+    ) -> Result<MfgCockpitProjection, MfgRepositoryError> {
+        self.repository
+            .cockpit_projection_with_filters(profile_id, filters)
+    }
+
     pub fn cockpit_widget_projection(
         &self,
         profile_id: &str,
@@ -347,6 +356,16 @@ impl MfgStore {
     ) -> Result<MfgCockpitWidgetProjection, MfgRepositoryError> {
         self.repository
             .cockpit_widget_projection(profile_id, instance_id)
+    }
+
+    pub fn cockpit_widget_projection_with_filters(
+        &self,
+        profile_id: &str,
+        instance_id: &str,
+        filters: serde_json::Value,
+    ) -> Result<MfgCockpitWidgetProjection, MfgRepositoryError> {
+        self.repository
+            .cockpit_widget_projection_with_filters(profile_id, instance_id, filters)
     }
 
     pub fn generate_cockpit_report(
@@ -362,6 +381,14 @@ impl MfgStore {
         report_id: &str,
     ) -> Result<Option<MfgCockpitReportSnapshot>, MfgRepositoryError> {
         self.repository.get_cockpit_report(report_id)
+    }
+
+    pub fn list_cockpit_reports(
+        &self,
+        profile_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MfgCockpitReportSnapshot>, MfgRepositoryError> {
+        self.repository.list_cockpit_reports(profile_id, limit)
     }
 
     pub fn attach_cockpit_report_delivery(

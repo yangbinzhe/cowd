@@ -452,6 +452,7 @@ fn human_capabilities() -> Vec<String> {
         "evolution.release.manage".to_string(),
         "runtime.maintenance.manage".to_string(),
         "runtime.outbox.retry".to_string(),
+        "mfg.read".to_string(),
     ]
 }
 
@@ -3484,6 +3485,17 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(create.status(), StatusCode::OK);
         assert_eq!(create.headers().get("etag").unwrap(), "\"1\"");
+        let create_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(create.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(create_json["profile"]["owner_ref"], gateway_test_actor());
+        assert_eq!(
+            create_json["profile"]["widget_instances"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
 
         let widget = app
             .clone()
@@ -3609,6 +3621,26 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(report.status(), StatusCode::OK);
+
+        let report_list = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/mfg/cockpit/reports?profile_id=trace-profile")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(report_list.status(), StatusCode::OK);
+        let report_list: serde_json::Value =
+            serde_json::from_slice(&to_bytes(report_list.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(report_list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|report| report["report_id"] == "trace-report"));
 
         let response = app
             .oneshot(
@@ -5254,7 +5286,6 @@ pub(crate) mod tests {
                     .body(Body::from(
                         serde_json::json!({
                             "mode": "commit",
-                            "operator_id": "user:ops-planner",
                             "note": "queue reviewed recovery action"
                         })
                         .to_string(),
@@ -5270,6 +5301,10 @@ pub(crate) mod tests {
         assert_eq!(
             execution_json["execution"]["status"],
             "queued_for_human_review"
+        );
+        assert_eq!(
+            execution_json["execution"]["operator_id"],
+            gateway_test_actor()
         );
         let execution_id = execution_json["execution"]["execution_id"]
             .as_str()

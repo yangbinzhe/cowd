@@ -441,8 +441,10 @@ pub(super) async fn mfg_analysis_get_handler(
 pub(super) async fn mfg_action_execute_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath((analysis_id, action_id)): AxumPath<(String, String)>,
-    Json(request): Json<MfgActionExecutionRequest>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Json(intent): Json<MfgActionExecutionIntent>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let request = intent.into_request(principal_actor_id(&principal));
     let execution = state
         .services
         .mfg

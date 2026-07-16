@@ -484,7 +484,9 @@ pub fn mfg_cockpit_global_filter_schema() -> Value {
             "entity_refs": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
             "metric_ids": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
             "severities": { "type": "array", "items": { "enum": ["normal", "warning", "critical", "unknown"] }, "uniqueItems": true },
-            "statuses": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true }
+            "statuses": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+            "from": { "type": "string", "format": "date-time" },
+            "to": { "type": "string", "format": "date-time" }
         },
         "additionalProperties": false
     })
@@ -513,6 +515,10 @@ fn mfg_widget_config_schema(definition_id: &str) -> Value {
             "show_legend".to_string(),
             serde_json::json!({ "type": "boolean" }),
         ),
+        (
+            "refresh_interval_seconds".to_string(),
+            serde_json::json!({ "type": "integer", "minimum": 10, "maximum": 3600 }),
+        ),
     ]);
     if matches!(definition_id, "kpi.summary" | "trend.metrics") {
         properties.insert(
@@ -528,6 +534,14 @@ fn mfg_widget_query_schema(definition_id: &str) -> Value {
         "limit".to_string(),
         serde_json::json!({ "type": "integer", "minimum": 1, "maximum": 100 }),
     )]);
+    properties.insert(
+        "from".to_string(),
+        serde_json::json!({ "type": "string", "format": "date-time" }),
+    );
+    properties.insert(
+        "to".to_string(),
+        serde_json::json!({ "type": "string", "format": "date-time" }),
+    );
     if matches!(
         definition_id,
         "attention.queue" | "risk.matrix" | "entity.impact"

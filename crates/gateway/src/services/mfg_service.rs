@@ -573,6 +573,16 @@ impl MfgService {
         self.open_store(config_home)?.cockpit_projection(profile_id)
     }
 
+    pub(crate) fn cockpit_projection_with_filters(
+        &self,
+        config_home: impl AsRef<Path>,
+        profile_id: &str,
+        filters: serde_json::Value,
+    ) -> Result<MfgCockpitProjection, MfgRepositoryError> {
+        self.open_store(config_home)?
+            .cockpit_projection_with_filters(profile_id, filters)
+    }
+
     pub(crate) fn cockpit_widget_projection(
         &self,
         config_home: impl AsRef<Path>,
@@ -581,6 +591,17 @@ impl MfgService {
     ) -> Result<MfgCockpitWidgetProjection, MfgRepositoryError> {
         self.open_store(config_home)?
             .cockpit_widget_projection(profile_id, instance_id)
+    }
+
+    pub(crate) fn cockpit_widget_projection_with_filters(
+        &self,
+        config_home: impl AsRef<Path>,
+        profile_id: &str,
+        instance_id: &str,
+        filters: serde_json::Value,
+    ) -> Result<MfgCockpitWidgetProjection, MfgRepositoryError> {
+        self.open_store(config_home)?
+            .cockpit_widget_projection_with_filters(profile_id, instance_id, filters)
     }
 
     pub(crate) fn generate_cockpit_report(
@@ -599,6 +620,16 @@ impl MfgService {
         report_id: &str,
     ) -> Result<Option<MfgCockpitReportSnapshot>, MfgRepositoryError> {
         self.open_store(config_home)?.get_cockpit_report(report_id)
+    }
+
+    pub(crate) fn list_cockpit_reports(
+        &self,
+        config_home: impl AsRef<Path>,
+        profile_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MfgCockpitReportSnapshot>, MfgRepositoryError> {
+        self.open_store(config_home)?
+            .list_cockpit_reports(profile_id, limit)
     }
 
     pub(crate) fn attach_cockpit_report_delivery(
