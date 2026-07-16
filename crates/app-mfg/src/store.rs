@@ -11,9 +11,9 @@ use crate::{
     MfgAlertOccurrence, MfgAlertRule, MfgAlertSubscription, MfgAssignment,
     MfgAssignmentCommandInput, MfgCasePromotion, MfgCockpitProfile, MfgCockpitProjection,
     MfgCockpitReportDeliveryReceipt, MfgCockpitReportRequest, MfgCockpitReportSnapshot,
-    MfgCommandReceipt, MfgCrossPlaneBridgeReceipt, MfgDomainSeedResult, MfgForecastProjection,
-    MfgIncident, MfgLiveProjection, MfgMemoryCase, MfgOperationalAnalysis, MfgPlaybook,
-    MfgSkillRun, MfgWorkflowGraph,
+    MfgCockpitWidgetProjection, MfgCommandReceipt, MfgCrossPlaneBridgeReceipt, MfgDomainSeedResult,
+    MfgForecastProjection, MfgIncident, MfgLiveProjection, MfgMemoryCase, MfgOperationalAnalysis,
+    MfgPlaybook, MfgSkillRun, MfgWorkflowGraph,
 };
 
 /// Application-layer store facade for MFG.
@@ -338,6 +338,15 @@ impl MfgStore {
         profile_id: &str,
     ) -> Result<MfgCockpitProjection, MfgRepositoryError> {
         self.repository.cockpit_projection(profile_id)
+    }
+
+    pub fn cockpit_widget_projection(
+        &self,
+        profile_id: &str,
+        instance_id: &str,
+    ) -> Result<MfgCockpitWidgetProjection, MfgRepositoryError> {
+        self.repository
+            .cockpit_widget_projection(profile_id, instance_id)
     }
 
     pub fn generate_cockpit_report(

@@ -3429,6 +3429,124 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn mfg_cockpit_contract_supports_schema_isolated_retry_and_structured_conflict() {
+        let workspace = test_temp_dir("mfg-cockpit-contract");
+        let config_home = test_temp_dir("mfg-cockpit-contract-config");
+        let app = api_router(test_state_with_workspace(
+            workspace.clone(),
+            config_home.clone(),
+        ));
+
+        let catalog = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/mfg/cockpit/widget-catalog")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(catalog.status(), StatusCode::OK);
+        let catalog: serde_json::Value =
+            serde_json::from_slice(&to_bytes(catalog.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            catalog["filter_merge_policy"]["policy_id"],
+            "mfg.cockpit.filters.widget_overrides.v1"
+        );
+        assert!(catalog["global_filter_schema"]["properties"]["metric_ids"].is_object());
+
+        let create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apps/mfg/cockpit/profiles/upsert")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "profile": {
+                                "profile_id": "contract-profile",
+                                "owner_ref": "ignored-at-boundary",
+                                "display_name": "Contract Profile",
+                                "focus_refs": [],
+                                "focus_metric_ids": [],
+                                "thresholds": null,
+                                "global_filters": { "severities": ["critical"] }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::OK);
+        assert_eq!(create.headers().get("etag").unwrap(), "\"1\"");
+
+        let widget = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/mfg/cockpit/profiles/contract-profile/widgets/default-attention/projection")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(widget.status(), StatusCode::OK);
+        let widget: serde_json::Value =
+            serde_json::from_slice(&to_bytes(widget.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(widget["kind"], "mfg.cockpit.widget_projection");
+        assert_eq!(
+            widget["projection"]["widget"]["instance_id"],
+            "default-attention"
+        );
+
+        let conflict = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apps/mfg/cockpit/profiles/upsert")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "profile": {
+                                "profile_id": "contract-profile",
+                                "owner_ref": "ignored-at-boundary",
+                                "display_name": "Stale Contract Profile",
+                                "focus_refs": [],
+                                "focus_metric_ids": [],
+                                "thresholds": null,
+                                "expected_revision": 0
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        let conflict: serde_json::Value =
+            serde_json::from_slice(&to_bytes(conflict.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(conflict["code"], "mfg_revision_conflict");
+        assert_eq!(conflict["details"]["actual_revision"], 1);
+        assert!(conflict["recovery"]["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action == "save_as"));
+
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[tokio::test]
     async fn mfg_decision_trace_projects_matrix_to_cockpit_report() {
         let workspace = test_temp_dir("mfg-decision-trace");
         let config_home = test_temp_dir("mfg-decision-trace-config");

@@ -7,10 +7,11 @@ use app_mfg::{
     MfgActionFeedback, MfgAlertCommandInput, MfgAlertOccurrence, MfgAlertRule,
     MfgAlertSubscription, MfgAssignment, MfgAssignmentCommandInput, MfgCasePromotion,
     MfgCockpitProfile, MfgCockpitProjection, MfgCockpitReportDeliveryReceipt,
-    MfgCockpitReportRequest, MfgCockpitReportSnapshot, MfgCommandReceipt,
-    MfgCrossPlaneBridgeReceipt, MfgDomainSeedResult, MfgForecastProjection, MfgHealth, MfgIncident,
-    MfgLiveProjection, MfgMemoryCase, MfgMetricRecomputeResult, MfgOperationalAnalysis,
-    MfgPlaybook, MfgRepositoryError, MfgSkillManifest, MfgSkillPlan, MfgSkillRun, MfgStore,
+    MfgCockpitReportRequest, MfgCockpitReportSnapshot, MfgCockpitWidgetProjection,
+    MfgCommandReceipt, MfgCrossPlaneBridgeReceipt, MfgDomainSeedResult, MfgForecastProjection,
+    MfgHealth, MfgIncident, MfgLiveProjection, MfgMemoryCase, MfgMetricRecomputeResult,
+    MfgOperationalAnalysis, MfgPlaybook, MfgRepositoryError, MfgSkillManifest, MfgSkillPlan,
+    MfgSkillRun, MfgStore,
 };
 use connector::{CrossPlaneRisk, DataClassification};
 use matrix_core::{
@@ -570,6 +571,16 @@ impl MfgService {
         profile_id: &str,
     ) -> Result<MfgCockpitProjection, MfgRepositoryError> {
         self.open_store(config_home)?.cockpit_projection(profile_id)
+    }
+
+    pub(crate) fn cockpit_widget_projection(
+        &self,
+        config_home: impl AsRef<Path>,
+        profile_id: &str,
+        instance_id: &str,
+    ) -> Result<MfgCockpitWidgetProjection, MfgRepositoryError> {
+        self.open_store(config_home)?
+            .cockpit_widget_projection(profile_id, instance_id)
     }
 
     pub(crate) fn generate_cockpit_report(

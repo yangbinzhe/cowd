@@ -36,10 +36,12 @@ pub use app::{
     MfgApplicationSurface, MfgApplicationSurfaceKind,
 };
 pub use cockpit::{
-    default_mfg_widget_instances, mfg_widget_catalog, MfgCockpitProfile, MfgCockpitProfileInput,
-    MfgCockpitProjection, MfgCockpitReportDeliveryPayload, MfgCockpitReportDeliveryPayloadRequest,
-    MfgCockpitReportDeliveryReceipt, MfgCockpitReportDeliveryState, MfgCockpitReportRequest,
-    MfgCockpitReportSnapshot, MfgCockpitWidget, MfgDashboardLayout, MfgDashboardScope,
+    default_mfg_widget_instances, mfg_cockpit_filter_merge_policy,
+    mfg_cockpit_global_filter_schema, mfg_widget_catalog, MfgCockpitProfile,
+    MfgCockpitProfileInput, MfgCockpitProjection, MfgCockpitReportDeliveryPayload,
+    MfgCockpitReportDeliveryPayloadRequest, MfgCockpitReportDeliveryReceipt,
+    MfgCockpitReportDeliveryState, MfgCockpitReportRequest, MfgCockpitReportSnapshot,
+    MfgCockpitWidget, MfgCockpitWidgetProjection, MfgDashboardLayout, MfgDashboardScope,
     MfgDashboardSharingPolicy, MfgWidgetDefinition, MfgWidgetInstance, MfgWidgetPlacement,
 };
 pub use domain::{

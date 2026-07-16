@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
 use app_mfg::{
-    mfg_widget_catalog, MfgActionExecutionRequest, MfgActionFeedback, MfgAlertCommand,
-    MfgAlertCommandInput, MfgAlertRule, MfgAlertRuleInput, MfgAlertSubscription,
-    MfgAlertSubscriptionInput, MfgAssignment, MfgAssignmentCommand, MfgAssignmentCommandInput,
-    MfgAssignmentInput, MfgCockpitProfile, MfgCockpitProfileInput, MfgCockpitReportDeliveryState,
+    mfg_cockpit_filter_merge_policy, mfg_cockpit_global_filter_schema, mfg_widget_catalog,
+    MfgActionExecutionRequest, MfgActionFeedback, MfgAlertCommand, MfgAlertCommandInput,
+    MfgAlertRule, MfgAlertRuleInput, MfgAlertSubscription, MfgAlertSubscriptionInput,
+    MfgAssignment, MfgAssignmentCommand, MfgAssignmentCommandInput, MfgAssignmentInput,
+    MfgCockpitProfile, MfgCockpitProfileInput, MfgCockpitReportDeliveryState,
     MfgCockpitReportRequest, MfgCockpitReportSnapshot, MfgIncident, MfgPlaybook,
     MfgRepositoryError,
 };
@@ -414,6 +415,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route(
             "/api/apps/mfg/cockpit/profiles/:id/projection",
             get(mfg_cockpit_projection_handler),
+        )
+        .route(
+            "/api/apps/mfg/cockpit/profiles/:id/widgets/:instance_id/projection",
+            get(mfg_cockpit_widget_projection_handler),
         )
         .route(
             "/api/apps/mfg/cockpit/profiles/:id/reports/generate",

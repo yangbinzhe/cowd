@@ -195,6 +195,15 @@ pub struct MfgCockpitProjection {
     pub generated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MfgCockpitWidgetProjection {
+    pub projection_id: String,
+    pub profile_id: String,
+    pub profile_revision: u64,
+    pub widget: MfgCockpitWidget,
+    pub generated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MfgCockpitReportRequest {
     #[serde(default)]
@@ -439,20 +448,103 @@ pub fn mfg_widget_catalog() -> Vec<MfgWidgetDefinition> {
         ("data.freshness", "Data freshness", "freshness"),
         ("focus.summary", "Personal focus and thresholds", "focus"),
     ];
-    definitions.into_iter().enumerate().map(|(index, (id, title, renderer))| MfgWidgetDefinition {
-        definition_id: id.to_string(),
-        title: title.to_string(),
-        renderer: renderer.to_string(),
-        renderer_version: 1,
-        config_schema: serde_json::json!({ "type": "object", "additionalProperties": false }),
-        query_schema: serde_json::json!({ "type": "object", "properties": { "limit": { "type": "integer", "minimum": 1, "maximum": 100 } }, "additionalProperties": true }),
-        min_width: 3,
-        min_height: 2,
-        max_width: 12,
-        max_height: 12,
-        required_capability: "mfg.read".to_string(),
-        default_placement: MfgWidgetPlacement { x: ((index * 3) % 12) as u16, y: ((index * 3) / 12 * 3) as u16, width: 6, height: 4 },
-    }).collect()
+    definitions
+        .into_iter()
+        .enumerate()
+        .map(|(index, (id, title, renderer))| MfgWidgetDefinition {
+            definition_id: id.to_string(),
+            title: title.to_string(),
+            renderer: renderer.to_string(),
+            renderer_version: 1,
+            config_schema: mfg_widget_config_schema(id),
+            query_schema: mfg_widget_query_schema(id),
+            min_width: 3,
+            min_height: 2,
+            max_width: 12,
+            max_height: 12,
+            required_capability: "mfg.read".to_string(),
+            default_placement: MfgWidgetPlacement {
+                x: ((index * 3) % 12) as u16,
+                y: ((index * 3) / 12 * 3) as u16,
+                width: 6,
+                height: 4,
+            },
+        })
+        .collect()
+}
+
+/// Filter vocabulary shared by a dashboard and its widget instances.
+/// Widget query values replace global values for the same key; omitted keys inherit.
+#[must_use]
+pub fn mfg_cockpit_global_filter_schema() -> Value {
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+            "entity_refs": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+            "metric_ids": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+            "severities": { "type": "array", "items": { "enum": ["normal", "warning", "critical", "unknown"] }, "uniqueItems": true },
+            "statuses": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true }
+        },
+        "additionalProperties": false
+    })
+}
+
+#[must_use]
+pub fn mfg_cockpit_filter_merge_policy() -> Value {
+    serde_json::json!({
+        "policy_id": "mfg.cockpit.filters.widget_overrides.v1",
+        "precedence": ["profile.global_filters", "widget.query"],
+        "semantics": "widget query replaces a global value for the same key; omitted keys inherit",
+        "legacy_fallback": {
+            "entity_refs": "profile.focus_refs",
+            "metric_ids": "profile.focus_metric_ids"
+        }
+    })
+}
+
+fn mfg_widget_config_schema(definition_id: &str) -> Value {
+    let mut properties = serde_json::Map::from_iter([
+        (
+            "title".to_string(),
+            serde_json::json!({ "type": "string", "minLength": 1, "maxLength": 120 }),
+        ),
+        (
+            "show_legend".to_string(),
+            serde_json::json!({ "type": "boolean" }),
+        ),
+    ]);
+    if matches!(definition_id, "kpi.summary" | "trend.metrics") {
+        properties.insert(
+            "precision".to_string(),
+            serde_json::json!({ "type": "integer", "minimum": 0, "maximum": 6 }),
+        );
+    }
+    serde_json::json!({ "type": "object", "properties": properties, "additionalProperties": false })
+}
+
+fn mfg_widget_query_schema(definition_id: &str) -> Value {
+    let mut properties = serde_json::Map::from_iter([(
+        "limit".to_string(),
+        serde_json::json!({ "type": "integer", "minimum": 1, "maximum": 100 }),
+    )]);
+    if matches!(
+        definition_id,
+        "attention.queue" | "risk.matrix" | "entity.impact"
+    ) {
+        properties.insert("entity_refs".to_string(), serde_json::json!({ "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true }));
+    }
+    if matches!(
+        definition_id,
+        "attention.queue" | "risk.matrix" | "metric.lineage" | "kpi.summary" | "trend.metrics"
+    ) {
+        properties.insert("metric_ids".to_string(), serde_json::json!({ "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true }));
+    }
+    if matches!(definition_id, "attention.queue" | "risk.matrix") {
+        properties.insert("severities".to_string(), serde_json::json!({ "type": "array", "items": { "enum": ["normal", "warning", "critical", "unknown"] }, "uniqueItems": true }));
+        properties.insert("statuses".to_string(), serde_json::json!({ "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true }));
+    }
+    serde_json::json!({ "type": "object", "properties": properties, "additionalProperties": false })
 }
 
 impl MfgCockpitReportSnapshot {

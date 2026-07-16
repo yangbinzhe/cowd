@@ -5,6 +5,87 @@ use crate::api_routes::{principal_actor_id, AuthenticatedPrincipal};
 
 use super::*;
 
+type MfgCockpitApiError = (StatusCode, Json<serde_json::Value>);
+
+fn cockpit_api_error(
+    status: StatusCode,
+    code: &str,
+    message: impl Into<String>,
+    details: serde_json::Value,
+    actions: &[&str],
+) -> MfgCockpitApiError {
+    (
+        status,
+        Json(serde_json::json!({
+            "error": message.into(),
+            "code": code,
+            "details": details,
+            "recovery": { "actions": actions },
+        })),
+    )
+}
+
+fn cockpit_internal_error(error: impl ToString) -> MfgCockpitApiError {
+    cockpit_api_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "mfg_cockpit_internal",
+        error.to_string(),
+        serde_json::Value::Null,
+        &["retry"],
+    )
+}
+
+fn cockpit_not_found(resource: &str, id: &str) -> MfgCockpitApiError {
+    cockpit_api_error(
+        StatusCode::NOT_FOUND,
+        "mfg_cockpit_not_found",
+        format!("{resource} not found"),
+        serde_json::json!({ "resource": resource, "id": id }),
+        &["reload"],
+    )
+}
+
+fn cockpit_forbidden(resource: &str, id: &str, required: &str) -> MfgCockpitApiError {
+    cockpit_api_error(
+        StatusCode::FORBIDDEN,
+        "mfg_cockpit_forbidden",
+        format!("{resource} is not accessible by this principal"),
+        serde_json::json!({ "resource": resource, "id": id, "required": required }),
+        &["request_access", "reload"],
+    )
+}
+
+fn cockpit_mutation_error(error: MfgRepositoryError) -> MfgCockpitApiError {
+    match error {
+        MfgRepositoryError::NotFound(id) => cockpit_not_found("cockpit_profile", &id),
+        MfgRepositoryError::RevisionConflict {
+            domain,
+            subject_id,
+            expected,
+            actual,
+        } => cockpit_api_error(
+            StatusCode::CONFLICT,
+            "mfg_revision_conflict",
+            "cockpit profile changed since it was loaded",
+            serde_json::json!({
+                "domain": domain,
+                "subject_id": subject_id,
+                "expected_revision": expected,
+                "actual_revision": actual,
+            }),
+            &["reload", "compare", "save_as"],
+        ),
+        MfgRepositoryError::CommandRejected(message) => cockpit_api_error(
+            StatusCode::CONFLICT,
+            "mfg_cockpit_validation_failed",
+            message,
+            serde_json::Value::Null,
+            &["edit", "save_as"],
+        ),
+        other => cockpit_internal_error(other),
+    }
+}
+
 pub(super) async fn mfg_cockpit_profile_list_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
@@ -29,14 +110,19 @@ pub(super) async fn mfg_cockpit_profile_list_handler(
 }
 
 pub(super) async fn mfg_cockpit_widget_catalog_handler() -> impl IntoResponse {
-    Json(serde_json::json!({ "kind": "mfg.cockpit.widget_catalog", "items": mfg_widget_catalog() }))
+    Json(serde_json::json!({
+        "kind": "mfg.cockpit.widget_catalog",
+        "items": mfg_widget_catalog(),
+        "global_filter_schema": mfg_cockpit_global_filter_schema(),
+        "filter_merge_policy": mfg_cockpit_filter_merge_policy(),
+    }))
 }
 
 pub(super) async fn mfg_cockpit_profile_upsert_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(mut request): Json<MfgCockpitProfileUpsertRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<impl IntoResponse, MfgCockpitApiError> {
     let expected_revision = request.profile.expected_revision;
     let actor = principal_actor_id(&principal);
     let idempotency_key = mfg_idempotency_key(request.idempotency_key.take(), "cockpit-profile");
@@ -54,13 +140,14 @@ pub(super) async fn mfg_cockpit_profile_upsert_handler(
             .services
             .mfg
             .get_cockpit_profile(&state.config_home, profile_id)
-            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+            .map_err(cockpit_internal_error)?
         {
             if existing.owner_ref != actor && !existing.sharing_policy.editor_refs.contains(&actor)
             {
-                return Err(api_error(
-                    StatusCode::FORBIDDEN,
-                    "cockpit profile is not editable by this principal",
+                return Err(cockpit_forbidden(
+                    "cockpit_profile",
+                    profile_id,
+                    "owner_or_editor",
                 ));
             }
         }
@@ -77,7 +164,7 @@ pub(super) async fn mfg_cockpit_profile_upsert_handler(
             &principal_actor_id(&principal),
             &idempotency_key,
         )
-        .map_err(mfg_mutation_error)?;
+        .map_err(cockpit_mutation_error)?;
     let revision = profile.revision;
     Ok(cockpit_profile_response(
         serde_json::json!({
@@ -95,18 +182,15 @@ pub(super) async fn mfg_cockpit_profile_get_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<impl IntoResponse, MfgCockpitApiError> {
     let profile = state
         .services
         .mfg
         .get_cockpit_profile(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG cockpit profile not found"))?;
+        .map_err(cockpit_internal_error)?
+        .ok_or_else(|| cockpit_not_found("cockpit_profile", &id))?;
     if !cockpit_profile_visible_to(&profile, &principal_actor_id(&principal)) {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
-            "cockpit profile is not visible to this principal",
-        ));
+        return Err(cockpit_forbidden("cockpit_profile", &id, "viewer"));
     }
     let revision = profile.revision;
     Ok(cockpit_profile_response(
@@ -123,19 +207,16 @@ pub(super) async fn mfg_cockpit_profile_delete_handler(
     AxumPath(id): AxumPath<String>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
     Query(query): Query<MfgCockpitProfileDeleteQuery>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<impl IntoResponse, MfgCockpitApiError> {
     let existing = state
         .services
         .mfg
         .get_cockpit_profile(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(cockpit_internal_error)?;
     let actor = principal_actor_id(&principal);
     if let Some(existing) = existing {
         if existing.owner_ref != actor && !existing.sharing_policy.editor_refs.contains(&actor) {
-            return Err(api_error(
-                StatusCode::FORBIDDEN,
-                "cockpit profile is not editable by this principal",
-            ));
+            return Err(cockpit_forbidden("cockpit_profile", &id, "owner_or_editor"));
         }
     }
     let idempotency_key = mfg_idempotency_key(query.idempotency_key, "cockpit-profile-delete");
@@ -149,7 +230,7 @@ pub(super) async fn mfg_cockpit_profile_delete_handler(
             &actor,
             &idempotency_key,
         )
-        .map_err(mfg_mutation_error)?;
+        .map_err(cockpit_mutation_error)?;
     let revision = receipt.current_revision;
     Ok(cockpit_profile_response(
         serde_json::json!({ "kind": "mfg.cockpit.profile_deleted", "profile": profile, "receipt": receipt }),
@@ -162,20 +243,17 @@ pub(super) async fn mfg_cockpit_profile_clone_handler(
     AxumPath(id): AxumPath<String>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(request): Json<MfgCockpitProfileCloneRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<impl IntoResponse, MfgCockpitApiError> {
     let idempotency_key =
         mfg_idempotency_key(request.idempotency_key.clone(), "cockpit-profile-clone");
     let source = state
         .services
         .mfg
         .get_cockpit_profile(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG cockpit profile not found"))?;
+        .map_err(cockpit_internal_error)?
+        .ok_or_else(|| cockpit_not_found("cockpit_profile", &id))?;
     if !cockpit_profile_visible_to(&source, &principal_actor_id(&principal)) {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
-            "cockpit profile is not visible to this principal",
-        ));
+        return Err(cockpit_forbidden("cockpit_profile", &id, "viewer"));
     }
     let mut clone = source;
     clone.profile_id = request
@@ -195,13 +273,14 @@ pub(super) async fn mfg_cockpit_profile_clone_handler(
         .services
         .mfg
         .get_cockpit_profile(&state.config_home, &clone.profile_id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(cockpit_internal_error)?
     {
         let actor = principal_actor_id(&principal);
         if existing.owner_ref != actor && !existing.sharing_policy.editor_refs.contains(&actor) {
-            return Err(api_error(
-                StatusCode::FORBIDDEN,
-                "clone target is not editable by this principal",
+            return Err(cockpit_forbidden(
+                "cockpit_profile",
+                &clone.profile_id,
+                "owner_or_editor",
             ));
         }
     }
@@ -216,7 +295,7 @@ pub(super) async fn mfg_cockpit_profile_clone_handler(
             &principal_actor_id(&principal),
             &idempotency_key,
         )
-        .map_err(mfg_mutation_error)?;
+        .map_err(cockpit_mutation_error)?;
     let revision = clone.revision;
     Ok(cockpit_profile_response(
         serde_json::json!({ "kind": "mfg.cockpit.profile_cloned", "source_profile_id": id, "profile": clone, "receipt": receipt }),
@@ -229,25 +308,22 @@ pub(super) async fn mfg_cockpit_profile_share_handler(
     AxumPath(id): AxumPath<String>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(request): Json<MfgCockpitProfileShareRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<impl IntoResponse, MfgCockpitApiError> {
     let idempotency_key =
         mfg_idempotency_key(request.idempotency_key.clone(), "cockpit-profile-share");
     let mut profile = state
         .services
         .mfg
         .get_cockpit_profile(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG cockpit profile not found"))?;
+        .map_err(cockpit_internal_error)?
+        .ok_or_else(|| cockpit_not_found("cockpit_profile", &id))?;
     if profile.owner_ref != principal_actor_id(&principal)
         && !profile
             .sharing_policy
             .editor_refs
             .contains(&principal_actor_id(&principal))
     {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
-            "cockpit profile is not editable by this principal",
-        ));
+        return Err(cockpit_forbidden("cockpit_profile", &id, "owner_or_editor"));
     }
     profile.sharing_policy = request.sharing_policy;
     let (profile, receipt) = state
@@ -261,7 +337,7 @@ pub(super) async fn mfg_cockpit_profile_share_handler(
             &principal_actor_id(&principal),
             &idempotency_key,
         )
-        .map_err(mfg_mutation_error)?;
+        .map_err(cockpit_mutation_error)?;
     let revision = profile.revision;
     Ok(cockpit_profile_response(
         serde_json::json!({ "kind": "mfg.cockpit.profile_shared", "profile": profile, "receipt": receipt }),
@@ -292,41 +368,69 @@ fn cockpit_profile_visible_to(profile: &MfgCockpitProfile, actor: &str) -> bool 
             .viewer_refs
             .iter()
             .any(|value| value == actor)
-        || matches!(
-            profile.sharing_policy.visibility.as_str(),
-            "team" | "public"
-        )
+        || profile.sharing_policy.visibility == "public"
 }
 
 pub(super) async fn mfg_cockpit_projection_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<impl IntoResponse, MfgCockpitApiError> {
     let profile = state
         .services
         .mfg
         .get_cockpit_profile(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG cockpit profile not found"))?;
+        .map_err(cockpit_internal_error)?
+        .ok_or_else(|| cockpit_not_found("cockpit_profile", &id))?;
     if !cockpit_profile_visible_to(&profile, &principal_actor_id(&principal)) {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
-            "cockpit profile is not visible to this principal",
-        ));
+        return Err(cockpit_forbidden("cockpit_profile", &id, "viewer"));
     }
     let projection = state
         .services
         .mfg
         .cockpit_projection(&state.config_home, &id)
         .map_err(|error| match error {
-            MfgRepositoryError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
-            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+            MfgRepositoryError::NotFound(message) => cockpit_not_found("cockpit_profile", &message),
+            other => cockpit_internal_error(other),
         })?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.cockpit.projection",
-        "projection": projection,
-    })))
+    let revision = projection.profile.revision;
+    Ok(cockpit_profile_response(
+        serde_json::json!({
+            "kind": "mfg.cockpit.projection", "projection": projection,
+        }),
+        revision,
+    ))
+}
+
+pub(super) async fn mfg_cockpit_widget_projection_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath((id, instance_id)): AxumPath<(String, String)>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+) -> Result<impl IntoResponse, MfgCockpitApiError> {
+    let profile = state
+        .services
+        .mfg
+        .get_cockpit_profile(&state.config_home, &id)
+        .map_err(cockpit_internal_error)?
+        .ok_or_else(|| cockpit_not_found("cockpit_profile", &id))?;
+    if !cockpit_profile_visible_to(&profile, &principal_actor_id(&principal)) {
+        return Err(cockpit_forbidden("cockpit_profile", &id, "viewer"));
+    }
+    let projection = state
+        .services
+        .mfg
+        .cockpit_widget_projection(&state.config_home, &id, &instance_id)
+        .map_err(|error| match error {
+            MfgRepositoryError::NotFound(_) => cockpit_not_found("cockpit_widget", &instance_id),
+            other => cockpit_internal_error(other),
+        })?;
+    let revision = projection.profile_revision;
+    Ok(cockpit_profile_response(
+        serde_json::json!({
+            "kind": "mfg.cockpit.widget_projection", "projection": projection,
+        }),
+        revision,
+    ))
 }
 
 pub(super) async fn mfg_cockpit_report_generate_handler(

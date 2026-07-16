@@ -17,8 +17,8 @@ use crate::{
     MfgAlertOccurrence, MfgAlertRule, MfgAlertSubscription, MfgAssignment, MfgAssignmentCommand,
     MfgAssignmentCommandInput, MfgCasePromotion, MfgCockpitProfile, MfgCockpitProjection,
     MfgCockpitReportDeliveryReceipt, MfgCockpitReportRequest, MfgCockpitReportSnapshot,
-    MfgCockpitWidget, MfgCommandReceipt, MfgCrossPlaneBridgeReceipt, MfgDomainSeedResult,
-    MfgForecastProjection, MfgForecastSignal, MfgIncident, MfgLiveProjection,
+    MfgCockpitWidget, MfgCockpitWidgetProjection, MfgCommandReceipt, MfgCrossPlaneBridgeReceipt,
+    MfgDomainSeedResult, MfgForecastProjection, MfgForecastSignal, MfgIncident, MfgLiveProjection,
     MfgLiveProjectionEvent, MfgMemoryCase, MfgOperationalAnalysis, MfgPlaybook, MfgSkillRun,
     MfgWidgetDefinition, MfgWidgetInstance, MfgWorkflowGraph, MfgWorkflowGraphError,
 };
@@ -300,6 +300,45 @@ impl MfgRepository {
         let profile = find_cockpit_profile(&connection, profile_id)?
             .ok_or_else(|| MfgRepositoryError::NotFound(profile_id.to_string()))?;
         render_cockpit_projection(&connection, profile)
+    }
+
+    pub fn cockpit_widget_projection(
+        &self,
+        profile_id: &str,
+        instance_id: &str,
+    ) -> Result<MfgCockpitWidgetProjection, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut profile = find_cockpit_profile(&connection, profile_id)?
+            .ok_or_else(|| MfgRepositoryError::NotFound(profile_id.to_string()))?;
+        profile.normalize_legacy();
+        let instance = profile
+            .widget_instances
+            .iter()
+            .find(|instance| instance.instance_id == instance_id && instance.visible)
+            .ok_or_else(|| MfgRepositoryError::NotFound(instance_id.to_string()))?;
+        let definition = mfg_widget_catalog()
+            .into_iter()
+            .find(|definition| definition.definition_id == instance.definition_id);
+        let scoped = effective_cockpit_profile(&profile, instance);
+        let widget = match definition.as_ref() {
+            Some(definition) => render_cockpit_widget(&connection, &scoped, instance, definition)
+                .unwrap_or_else(|error| {
+                    MfgCockpitWidget::unavailable(instance, Some(definition), error.to_string())
+                }),
+            None => {
+                MfgCockpitWidget::unavailable(instance, None, "widget definition is not registered")
+            }
+        };
+        Ok(MfgCockpitWidgetProjection {
+            projection_id: format!("cockpit-widget-projection-{}", uuid::Uuid::new_v4()),
+            profile_id: profile.profile_id,
+            profile_revision: profile.revision,
+            widget,
+            generated_at: Utc::now(),
+        })
     }
 
     pub fn generate_cockpit_report(
@@ -2550,6 +2589,15 @@ fn validate_cockpit_profile(profile: &MfgCockpitProfile) -> Result<(), MfgReposi
             "dashboard layout is outside supported bounds".to_string(),
         ));
     }
+    validate_cockpit_filters(&profile.global_filters, "profile.global_filters", false)?;
+    if !matches!(
+        profile.sharing_policy.visibility.as_str(),
+        "private" | "team" | "public"
+    ) {
+        return Err(MfgRepositoryError::CommandRejected(
+            "dashboard sharing visibility must be private, team, or public".to_string(),
+        ));
+    }
     let catalog = mfg_widget_catalog()
         .into_iter()
         .map(|item| (item.definition_id.clone(), item))
@@ -2574,6 +2622,42 @@ fn validate_cockpit_profile(profile: &MfgCockpitProfile) -> Result<(), MfgReposi
                 "widget config and query must be JSON objects".to_string(),
             ));
         }
+        validate_cockpit_config(&instance.config, &instance.instance_id)?;
+        validate_cockpit_filters(&instance.query, &instance.instance_id, true)?;
+        let supported_config_keys = definition
+            .config_schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .map(|properties| properties.keys().cloned().collect::<BTreeSet<_>>())
+            .unwrap_or_default();
+        if let Some(config) = instance.config.as_object() {
+            if let Some(unsupported) = config
+                .keys()
+                .find(|key| !supported_config_keys.contains(key.as_str()))
+            {
+                return Err(MfgRepositoryError::CommandRejected(format!(
+                    "widget `{}` config `{unsupported}` is not supported by `{}`",
+                    instance.instance_id, instance.definition_id
+                )));
+            }
+        }
+        let supported_query_keys = definition
+            .query_schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .map(|properties| properties.keys().cloned().collect::<BTreeSet<_>>())
+            .unwrap_or_default();
+        if let Some(query) = instance.query.as_object() {
+            if let Some(unsupported) = query
+                .keys()
+                .find(|key| !supported_query_keys.contains(key.as_str()))
+            {
+                return Err(MfgRepositoryError::CommandRejected(format!(
+                    "widget `{}` query `{unsupported}` is not supported by `{}`",
+                    instance.instance_id, instance.definition_id
+                )));
+            }
+        }
         let placement = &instance.placement;
         if placement.width < definition.min_width
             || placement.width > definition.max_width
@@ -2584,6 +2668,68 @@ fn validate_cockpit_profile(profile: &MfgCockpitProfile) -> Result<(), MfgReposi
             return Err(MfgRepositoryError::CommandRejected(format!(
                 "widget `{}` placement is outside its definition or dashboard bounds",
                 instance.instance_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_cockpit_config(config: &Value, instance_id: &str) -> Result<(), MfgRepositoryError> {
+    let Some(config) = config.as_object() else {
+        return Ok(());
+    };
+    for (key, value) in config {
+        let valid = match key.as_str() {
+            "title" => value
+                .as_str()
+                .is_some_and(|title| !title.trim().is_empty() && title.len() <= 120),
+            "show_legend" => value.is_boolean(),
+            "precision" => value.as_u64().is_some_and(|precision| precision <= 6),
+            _ => false,
+        };
+        if !valid {
+            return Err(MfgRepositoryError::CommandRejected(format!(
+                "widget `{instance_id}` has invalid config `{key}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_cockpit_filters(
+    filters: &Value,
+    source: &str,
+    allow_limit: bool,
+) -> Result<(), MfgRepositoryError> {
+    if filters.is_null() {
+        return Ok(());
+    }
+    let filters = filters.as_object().ok_or_else(|| {
+        MfgRepositoryError::CommandRejected(format!("{source} filters must be a JSON object"))
+    })?;
+    for (key, value) in filters {
+        let valid = match key.as_str() {
+            "entity_refs" | "metric_ids" | "statuses" => value.as_array().is_some_and(|items| {
+                items
+                    .iter()
+                    .all(|item| item.as_str().is_some_and(|text| !text.trim().is_empty()))
+            }),
+            "severities" => value.as_array().is_some_and(|items| {
+                items.iter().all(|item| {
+                    matches!(
+                        item.as_str(),
+                        Some("normal" | "warning" | "critical" | "unknown")
+                    )
+                })
+            }),
+            "limit" if allow_limit => value
+                .as_u64()
+                .is_some_and(|limit| (1..=100).contains(&limit)),
+            _ => false,
+        };
+        if !valid {
+            return Err(MfgRepositoryError::CommandRejected(format!(
+                "{source} has invalid or unsupported filter `{key}`"
             )));
         }
     }
@@ -2675,10 +2821,15 @@ fn render_cockpit_projection(
         .iter()
         .filter(|instance| instance.visible)
         .map(|instance| match catalog.get(&instance.definition_id) {
-            Some(definition) => render_cockpit_widget(connection, &profile, instance, definition)
-                .unwrap_or_else(|error| {
-                    MfgCockpitWidget::unavailable(instance, Some(definition), error.to_string())
-                }),
+            Some(definition) => render_cockpit_widget(
+                connection,
+                &effective_cockpit_profile(&profile, instance),
+                instance,
+                definition,
+            )
+            .unwrap_or_else(|error| {
+                MfgCockpitWidget::unavailable(instance, Some(definition), error.to_string())
+            }),
             None => {
                 MfgCockpitWidget::unavailable(instance, None, "widget definition is not registered")
             }
@@ -2706,6 +2857,41 @@ fn render_cockpit_projection(
         summary,
         generated_at: Utc::now(),
     })
+}
+
+fn effective_cockpit_profile(
+    profile: &MfgCockpitProfile,
+    instance: &MfgWidgetInstance,
+) -> MfgCockpitProfile {
+    let mut scoped = profile.clone();
+    let mut merged = profile
+        .global_filters
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    if let Some(query) = instance.query.as_object() {
+        for (key, value) in query {
+            if key != "limit" {
+                merged.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    if let Some(values) = merged.get("entity_refs").and_then(Value::as_array) {
+        scoped.focus_refs = values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+    }
+    if let Some(values) = merged.get("metric_ids").and_then(Value::as_array) {
+        scoped.focus_metric_ids = values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+    }
+    scoped.global_filters = Value::Object(merged);
+    scoped
 }
 
 fn render_cockpit_widget(
@@ -2899,10 +3085,17 @@ fn render_cockpit_widget(
             )))
         }
     };
+    let title = instance
+        .config
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or(&definition.title)
+        .to_string();
     Ok(MfgCockpitWidget {
         widget_id: instance.instance_id.clone(),
         widget_type: definition.renderer.clone(),
-        title: definition.title.clone(),
+        title,
         status: status.to_string(),
         priority_score: priority,
         data,
@@ -2937,23 +3130,47 @@ fn list_recent_metric_states(
 }
 
 fn attention_matches_profile(item: &MatrixAttentionItem, profile: &MfgCockpitProfile) -> bool {
-    if profile.focus_refs.is_empty() && profile.focus_metric_ids.is_empty() {
-        return true;
+    let severities = profile
+        .global_filters
+        .get("severities")
+        .and_then(Value::as_array);
+    if severities.is_some_and(|values| {
+        let actual = match item.severity {
+            MatrixSeverity::Normal => "normal",
+            MatrixSeverity::Warning => "warning",
+            MatrixSeverity::Critical => "critical",
+            MatrixSeverity::Unknown => "unknown",
+        };
+        !values.iter().any(|value| value.as_str() == Some(actual))
+    }) {
+        return false;
     }
-    if item.entity_ref.as_ref().is_some_and(|entity_ref| {
+    if profile
+        .global_filters
+        .get("statuses")
+        .and_then(Value::as_array)
+        .is_some_and(|values| {
+            !values
+                .iter()
+                .any(|value| value.as_str() == Some(item.status.as_str()))
+        })
+    {
+        return false;
+    }
+    let no_focus = profile.focus_refs.is_empty() && profile.focus_metric_ids.is_empty();
+    let entity_match = item.entity_ref.as_ref().is_some_and(|entity_ref| {
         profile
             .focus_refs
             .iter()
             .any(|focus_ref| focus_ref == entity_ref)
-    }) {
-        return true;
-    }
-    item.metric_refs.iter().any(|metric_ref| {
+    });
+    let metric_match = item.metric_refs.iter().any(|metric_ref| {
         profile
             .focus_metric_ids
             .iter()
             .any(|metric_id| metric_ref == metric_id)
-    })
+    });
+    no_focus || entity_match || metric_match
 }
 
 fn ensure_revision(
@@ -6782,6 +6999,87 @@ mod tests {
             )
             .expect("report delivery deduplicates");
         assert_eq!(delivered.delivery_receipts.len(), 1);
+    }
+
+    #[test]
+    fn cockpit_widget_projection_isolated_retry_and_filter_override_are_contractual() {
+        let store = MfgRepository::in_memory().expect("store opens");
+        let mut profile = MfgCockpitProfile::from_input(MfgCockpitProfileInput {
+            profile_id: Some("cockpit-profile-isolated".to_string()),
+            owner_ref: "user:planner".to_string(),
+            display_name: Some("Isolated widgets".to_string()),
+            focus_refs: vec!["entity:legacy".to_string()],
+            focus_metric_ids: vec!["metric:legacy".to_string()],
+            thresholds: Value::Null,
+            template_id: None,
+            cadence: None,
+            expected_revision: None,
+            scope: None,
+            layout: None,
+            global_filters: serde_json::json!({
+                "entity_refs": ["entity:global"],
+                "metric_ids": ["metric:global"]
+            }),
+            widget_instances: Vec::new(),
+            sharing_policy: None,
+        });
+        profile.widget_instances[0].query = serde_json::json!({
+            "entity_refs": ["entity:widget"],
+            "metric_ids": ["metric:widget"],
+            "limit": 5
+        });
+        let scoped = effective_cockpit_profile(&profile, &profile.widget_instances[0]);
+        assert_eq!(scoped.focus_refs, vec!["entity:widget"]);
+        assert_eq!(scoped.focus_metric_ids, vec!["metric:widget"]);
+
+        let saved = store
+            .upsert_cockpit_profile(&profile, None)
+            .expect("profile saves");
+        let projection = store
+            .cockpit_widget_projection(&saved.profile_id, "default-attention")
+            .expect("single widget projects");
+        assert_eq!(projection.profile_revision, saved.revision);
+        assert_eq!(projection.widget.instance_id, "default-attention");
+        assert!(store
+            .cockpit_widget_projection(&saved.profile_id, "default-quality")
+            .is_ok());
+        assert!(matches!(
+            store.cockpit_widget_projection(&saved.profile_id, "missing"),
+            Err(MfgRepositoryError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn cockpit_catalog_and_validation_expose_only_supported_query_contracts() {
+        let attention = mfg_widget_catalog()
+            .into_iter()
+            .find(|definition| definition.definition_id == "attention.queue")
+            .expect("attention definition");
+        assert!(attention.query_schema["properties"]["severities"].is_object());
+        assert_eq!(attention.query_schema["additionalProperties"], false);
+
+        let store = MfgRepository::in_memory().expect("store opens");
+        let mut profile = MfgCockpitProfile::from_input(MfgCockpitProfileInput {
+            profile_id: Some("cockpit-profile-invalid-query".to_string()),
+            owner_ref: "user:planner".to_string(),
+            display_name: None,
+            focus_refs: Vec::new(),
+            focus_metric_ids: Vec::new(),
+            thresholds: Value::Null,
+            template_id: None,
+            cadence: None,
+            expected_revision: None,
+            scope: None,
+            layout: None,
+            global_filters: Value::Null,
+            widget_instances: Vec::new(),
+            sharing_policy: None,
+        });
+        profile.widget_instances[1].query = serde_json::json!({ "metric_ids": ["not-supported"] });
+        assert!(matches!(
+            store.upsert_cockpit_profile(&profile, None),
+            Err(MfgRepositoryError::CommandRejected(_))
+        ));
     }
 
     #[test]
