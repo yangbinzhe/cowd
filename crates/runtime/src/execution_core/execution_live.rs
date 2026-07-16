@@ -21,6 +21,14 @@ const LIVE_OUTPUT_PREVIEW_LIMIT: usize = 1_024;
 const LIVE_EVENT_SCAN_LIMIT: usize = 10_000;
 const LIVE_CACHE_MAX_RECORDS: usize = 512;
 
+/// Live execution snapshots are an execution-correlated projection, not
+/// `ExecutionGraph` events.  Keeping a separate stream prevents early status
+/// updates (queued/preparing/model) from consuming the canonical graph's
+/// revision zero before graph registration.
+fn live_stream_id(execution_id: &str) -> String {
+    format!("execution-live:{execution_id}")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LiveExecutionRecord {
     session_id: String,
@@ -391,19 +399,28 @@ impl ExecutionLiveStore {
     }
 
     fn load_record(&self, execution_id: &str) -> Option<LiveExecutionRecord> {
-        self.event_store
-            .list_stream(execution_id)
-            .ok()?
-            .into_iter()
-            .rev()
-            .find(|event| event.kind == LIVE_EVENT_KIND)
-            .and_then(|event| serde_json::from_value(event.payload).ok())
+        let decode_latest = |stream_id: &str| {
+            self.event_store
+                .list_stream(stream_id)
+                .ok()
+                .and_then(|events| {
+                    events
+                        .into_iter()
+                        .rev()
+                        .find(|event| event.kind == LIVE_EVENT_KIND)
+                        .and_then(|event| serde_json::from_value(event.payload).ok())
+                })
+        };
+        // V504 stored snapshots on the graph stream.  Keep a read-only
+        // fallback so an in-flight execution survives the V505 stream split;
+        // all V505+ writes use the dedicated stream above.
+        decode_latest(&live_stream_id(execution_id)).or_else(|| decode_latest(execution_id))
     }
 
     fn persist(&self, record: &LiveExecutionRecord) {
         if let Err(error) = self.event_store.append(RuntimeEventInput {
-            stream_id: record.execution_id.clone(),
-            scope: RuntimeEventScope::ExecutionGraph,
+            stream_id: live_stream_id(&record.execution_id),
+            scope: RuntimeEventScope::ExecutionLive,
             kind: LIVE_EVENT_KIND.to_string(),
             status: Some(format!("{:?}", record.live.status).to_lowercase()),
             actor: Some("runtime_live_reducer".to_string()),
@@ -572,9 +589,61 @@ mod tests {
             ExecutionLiveStatus::Queued
         );
 
-        let rehydrated = ExecutionLiveStore::new(event_store);
+        let rehydrated = ExecutionLiveStore::new(Arc::clone(&event_store));
         assert_eq!(
             rehydrated.execution_live("execution-a").unwrap().status,
+            ExecutionLiveStatus::CallingModel
+        );
+        assert_eq!(event_store.stream_revision("execution-a").unwrap(), 0);
+        assert_eq!(
+            event_store
+                .stream_revision(&live_stream_id("execution-a"))
+                .unwrap(),
+            2
+        );
+        assert!(event_store
+            .list_scope(RuntimeEventScope::ExecutionGraph, 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            event_store
+                .list_scope(RuntimeEventScope::ExecutionLive, 10)
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn legacy_graph_stream_snapshot_rehydrates_after_live_stream_split() {
+        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let mut legacy_record = LiveExecutionRecord::new(
+            "session-legacy".to_string(),
+            "execution-legacy".to_string(),
+            "turn-legacy".to_string(),
+        );
+        assert!(legacy_record.transition(
+            ExecutionLiveStatus::CallingModel,
+            Some("legacy provider request".to_string()),
+        ));
+        event_store
+            .append(RuntimeEventInput {
+                stream_id: legacy_record.execution_id.clone(),
+                scope: RuntimeEventScope::ExecutionGraph,
+                kind: LIVE_EVENT_KIND.to_string(),
+                status: Some("calling_model".to_string()),
+                actor: Some("runtime_live_reducer".to_string()),
+                refs: Vec::new(),
+                payload: serde_json::to_value(&legacy_record).unwrap(),
+            })
+            .unwrap();
+
+        let rehydrated = ExecutionLiveStore::new(event_store);
+        assert_eq!(
+            rehydrated
+                .execution_live("execution-legacy")
+                .unwrap()
+                .status,
             ExecutionLiveStatus::CallingModel
         );
     }

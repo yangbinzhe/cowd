@@ -24,6 +24,11 @@ const MAX_TRANSACTION_BYTES: usize = 32 * 1024 * 1024;
 pub enum RuntimeEventScope {
     ExecutionGraph,
     ExecutionNode,
+    /// Durable hot-state snapshots for a provider-backed execution.  This
+    /// must remain distinct from the canonical `ExecutionGraph` stream: graph
+    /// registration starts at revision zero while the live reducer may emit
+    /// progress before the graph itself is committed.
+    ExecutionLive,
     Goal,
     Mission,
     Session,
@@ -57,6 +62,7 @@ impl RuntimeEventScope {
         match self {
             Self::ExecutionGraph => "execution_graph",
             Self::ExecutionNode => "execution_node",
+            Self::ExecutionLive => "execution_live",
             Self::Goal => "goal",
             Self::Mission => "mission",
             Self::Session => "session",
@@ -84,6 +90,7 @@ impl RuntimeEventScope {
         match value {
             "execution_graph" => Ok(Self::ExecutionGraph),
             "execution_node" => Ok(Self::ExecutionNode),
+            "execution_live" => Ok(Self::ExecutionLive),
             "goal" => Ok(Self::Goal),
             "mission" => Ok(Self::Mission),
             "session" => Ok(Self::Session),
@@ -646,6 +653,11 @@ impl RuntimeEventStore {
                 continue;
             }
             related.extend(self.list_stream(&graph_id)?);
+            // Live status is persisted on an isolated stream so early
+            // progress cannot collide with canonical graph revisions.  Once
+            // a graph is related to this session, retain those snapshots in
+            // the durable session timeline as well.
+            related.extend(self.list_stream(&format!("execution-live:{graph_id}"))?);
             let lineage_stream = format!("execution-lineage:{graph_id}");
             let lineage_events = self.list_stream(&lineage_stream)?;
             for event in &lineage_events {

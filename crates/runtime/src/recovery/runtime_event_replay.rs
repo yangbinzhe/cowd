@@ -126,6 +126,7 @@ pub fn candidate_from_action(action: &RuntimeRecoveryAction) -> Option<RuntimeRe
         RuntimeEventScope::ExecutionGraph | RuntimeEventScope::ExecutionNode => {
             "runtime.execution_graph"
         }
+        RuntimeEventScope::ExecutionLive => "runtime.execution_live",
         RuntimeEventScope::Goal => "runtime.goal_runtime",
         RuntimeEventScope::Session
         | RuntimeEventScope::SessionInput
@@ -196,6 +197,7 @@ fn recovery_action(scope: RuntimeEventScope, status: &str) -> (RuntimeRecoveryAc
         (
             RuntimeEventScope::ExecutionGraph
             | RuntimeEventScope::ExecutionNode
+            | RuntimeEventScope::ExecutionLive
             | RuntimeEventScope::Goal
             | RuntimeEventScope::Team
             | RuntimeEventScope::Agent
