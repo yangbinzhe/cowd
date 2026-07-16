@@ -23,7 +23,6 @@ SMOKE_ID="release-smoke-$$"
 PRINCIPAL="principal:local-human"
 GRANT_ID="grant-$SMOKE_ID"
 API_TOKEN="release-smoke-$$_credential"
-AUTH_BROKER_BIN="${COWD_AUTH_BROKER_BIN:-$TARGET_ROOT/debug/cowd-auth-broker}"
 FAILED=0
 
 curl() {
@@ -69,10 +68,6 @@ done
 
 if [[ ! -x "$BIN" ]]; then
   echo "missing executable cowd binary at $BIN" >&2
-  exit 1
-fi
-if [[ ! -x "$AUTH_BROKER_BIN" ]]; then
-  echo "cowd-auth-broker is required at $AUTH_BROKER_BIN" >&2
   exit 1
 fi
 if ss -ltnp | rg -q ":$PORT\\b|:$PROVIDER_PORT\\b"; then
@@ -171,7 +166,6 @@ cp "$CONFIG_HOME/config.yaml" "$WORKDIR/.cowd/config.yaml"
 tmux new-session -d -s "$SESSION" \
   "bash -lc \"cd '$WORKDIR' && \
     export COWD_CONFIG_HOME='$CONFIG_HOME' && \
-    export COWD_AUTH_BROKER_BIN='$AUTH_BROKER_BIN' && \
     export HOME='$HOME_DIR' && \
     (python3 '$TMP_DIR/mock_provider.py' '$PROVIDER_PORT' & \
     '$BIN' gateway run) >'$LOG' 2>&1\""

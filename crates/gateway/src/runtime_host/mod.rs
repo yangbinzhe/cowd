@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -89,8 +89,9 @@ impl AuthBrokerProcess {
             std::fs::remove_file(&socket_path)
                 .map_err(|error| format!("failed to remove stale auth broker socket: {error}"))?;
         }
-        let binary = auth_broker_binary()?;
-        let mut child = Command::new(binary)
+        let mut child = sandbox_launcher::cowd_internal_process_command()?
+            .arg("__cowd_internal")
+            .arg("auth-broker")
             .arg("--root")
             .arg(&root)
             .arg("--socket")
@@ -135,33 +136,6 @@ impl AuthBrokerProcess {
         let _ = self.child.wait();
         let _ = std::fs::remove_file(&self.socket_path);
     }
-}
-
-fn auth_broker_binary() -> Result<PathBuf, String> {
-    if let Some(path) = std::env::var_os("COWD_AUTH_BROKER_BIN") {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return Ok(path);
-        }
-        return Err(format!(
-            "COWD_AUTH_BROKER_BIN does not point to a file: {}",
-            path.display()
-        ));
-    }
-    let current = std::env::current_exe()
-        .map_err(|error| format!("failed to locate current executable: {error}"))?;
-    let binary_name = if cfg!(windows) {
-        "cowd-auth-broker.exe"
-    } else {
-        "cowd-auth-broker"
-    };
-    let candidate = current.with_file_name(binary_name);
-    candidate.is_file().then_some(candidate.clone()).ok_or_else(|| {
-        format!(
-            "auth broker binary is missing; install it beside Gateway or set COWD_AUTH_BROKER_BIN ({})",
-            candidate.display()
-        )
-    })
 }
 
 #[derive(Clone, Default)]

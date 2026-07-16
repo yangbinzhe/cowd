@@ -6,7 +6,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+auth-broker = { path = "../auth-broker" }
 gateway = { path = "../gateway" }
+sandbox-launcher = { path = "../sandbox-launcher" }
 serde.workspace = true
 tui = { path = "../tui", optional = true }
 

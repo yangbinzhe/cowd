@@ -164,7 +164,6 @@ pub(crate) use entry::gateway_projection_entry::{
     GatewayTaskSlashCommand,
 };
 use entry::init_entry::{init_claude_md, init_json_value, run_init};
-use entry::install_entry::run_install;
 #[cfg(test)]
 pub(crate) use entry::local_command_entry::print_help_to;
 #[cfg(test)]
@@ -678,7 +677,6 @@ fn run_static_entry() -> Result<(), Box<dyn std::error::Error>> {
             action,
             output_format,
         } => run_gateway_action(&action, output_format)?,
-        CliAction::Install { systemd, path } => run_install(systemd, path.as_deref())?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
     }
@@ -994,10 +992,6 @@ pub(crate) enum CliAction {
     Gateway {
         action: GatewayAction,
         output_format: CliOutputFormat,
-    },
-    Install {
-        systemd: bool,
-        path: Option<String>,
     },
     HelpTopic(LocalHelpTopic),
     // prompt-mode formatting is only supported for non-interactive runs
@@ -1554,29 +1548,6 @@ fn parse_system_prompt_args(
         date,
         output_format,
     })
-}
-
-fn parse_install_args(
-    args: &[String],
-    _output_format: CliOutputFormat,
-) -> Result<CliAction, String> {
-    let mut systemd = false;
-    let mut path = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--systemd" => {
-                systemd = true;
-                i += 1;
-            }
-            "--path" if i + 1 < args.len() => {
-                path = Some(args[i + 1].clone());
-                i += 2;
-            }
-            other => return Err(format!("unknown install flag: {other}")),
-        }
-    }
-    Ok(CliAction::Install { systemd, path })
 }
 
 fn parse_export_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {

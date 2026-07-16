@@ -15,7 +15,6 @@ HOME_DIR="$TMP_DIR/home"
 LOG="$TMP_DIR/gateway.log"
 FAILED=0
 API_TOKEN="skill-surface-$$_credential"
-AUTH_BROKER_BIN="${COWD_AUTH_BROKER_BIN:-$TARGET_ROOT/debug/cowd-auth-broker}"
 
 curl() {
   command curl -H "Authorization: Bearer $API_TOKEN" "$@"
@@ -63,10 +62,6 @@ if ! command -v tmux >/dev/null 2>&1; then
   exit 1
 fi
 
-if [[ ! -x "$AUTH_BROKER_BIN" ]]; then
-  echo "cowd-auth-broker is required at $AUTH_BROKER_BIN" >&2
-  exit 1
-fi
 
 if [[ ! -x "$BIN" ]]; then
   echo "cowd binary not found at $BIN; build it first or set COWD_BIN" >&2
@@ -114,7 +109,6 @@ cp "$CONFIG_HOME/config.yaml" "$WORKDIR/.cowd/config.yaml"
 tmux new-session -d -s "$SESSION" \
   "bash -lc \"cd '$WORKDIR' && \
     export COWD_CONFIG_HOME='$CONFIG_HOME' && \
-    export COWD_AUTH_BROKER_BIN='$AUTH_BROKER_BIN' && \
     export HOME='$HOME_DIR' && \
     '$BIN' gateway run >'$LOG' 2>&1\""
 

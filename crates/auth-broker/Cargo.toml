@@ -9,10 +9,6 @@ publish.workspace = true
 name = "auth_broker"
 path = "src/lib.rs"
 
-[[bin]]
-name = "cowd-auth-broker"
-path = "src/main.rs"
-
 [features]
 test-support = []
 

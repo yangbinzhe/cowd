@@ -17,7 +17,6 @@ TUI_CAPTURE="$TMP_DIR/tui-pane.txt"
 TUI_RUNTIME_SESSION="tui-daemon-attach-$$_session"
 SCENARIO_API_KEY="${ANTHROPIC_API_KEY:-test-dummy-key-for-tui-gateway-scenario}"
 API_TOKEN="tui-daemon-attach-$$_credential"
-AUTH_BROKER_BIN="${COWD_AUTH_BROKER_BIN:-$TARGET_ROOT/debug/cowd-auth-broker}"
 FAILED=0
 
 curl() {
@@ -70,10 +69,6 @@ if ss -ltnp | rg -q ":$PORT\\b"; then
   echo "port $PORT is already in use" >&2
   exit 1
 fi
-if [[ ! -x "$AUTH_BROKER_BIN" ]]; then
-  echo "cowd-auth-broker is required at $AUTH_BROKER_BIN" >&2
-  exit 1
-fi
 
 cd "$ROOT"
 if [[ "${COWD_SCENARIO_SKIP_BUILD:-0}" != "1" ]]; then
@@ -116,7 +111,6 @@ cp "$CONFIG_HOME/config.yaml" "$WORKDIR/.cowd/config.yaml"
 tmux new-session -d -s "$GATEWAY_SESSION" \
   "bash -lc \"cd '$WORKDIR' && \
     export COWD_CONFIG_HOME='$CONFIG_HOME' && \
-    export COWD_AUTH_BROKER_BIN='$AUTH_BROKER_BIN' && \
     export HOME='$HOME_DIR' && \
     '$BIN' gateway run >'$GATEWAY_LOG' 2>&1\""
 

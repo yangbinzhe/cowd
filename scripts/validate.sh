@@ -215,10 +215,8 @@ run_serial_global() {
 }
 
 run_scenario() {
-  run_step cargo_build_cli cargo build -p cli -p sandbox-launcher --no-default-features
-  run_step cargo_build_auth_broker cargo build -p auth-broker
+  run_step cargo_build_cli cargo build -p cli --no-default-features
   export COWD_BIN="$CARGO_TARGET_DIR/debug/cowd"
-  export COWD_AUTH_BROKER_BIN="$CARGO_TARGET_DIR/debug/cowd-auth-broker"
   run_step ai_harness bash scripts/ci/ai-harness.sh
   run_step gateway_baseline bash scripts/scenarios/gateway-webui-contract.sh
   run_step session_runtime bash scripts/scenarios/runtime-surface.sh
@@ -228,7 +226,7 @@ run_scenario() {
 }
 
 run_surface() {
-  run_step cargo_build_cli cargo build -p cli -p sandbox-launcher --no-default-features
+  run_step cargo_build_cli cargo build -p cli --no-default-features
   export COWD_BIN="$CARGO_TARGET_DIR/debug/cowd"
   run_step cli_minimal_contract cargo test -p cli --test output_format_contract --no-default-features -- --nocapture --test-threads=1
   run_step tui_projection_smoke bash scripts/scenarios/tui-interaction-quality.sh
@@ -242,7 +240,7 @@ run_release() {
     run_step clean_tmp bash scripts/release/clean-build-artifacts.sh --tmp
   fi
   run_step cargo_fmt cargo fmt --check
-  run_step cargo_build_debug cargo build -p cli -p sandbox-launcher --no-default-features
+  run_step cargo_build_debug cargo build -p cli --features full
   run_step install_debug bash -lc 'scripts/release/install-debug-to-ai.sh --current --print-path-only | tee "$0"' "$INSTALL_DIR_FILE"
   local install_dir
   install_dir="$(cat "$INSTALL_DIR_FILE")"

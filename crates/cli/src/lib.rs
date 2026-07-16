@@ -1,4 +1,32 @@
+use std::process::ExitCode;
+
 use serde::{Deserialize, Serialize};
+
+const INTERNAL_DISPATCH: &str = "__cowd_internal";
+
+/// 在公开 CLI 解析前分发 Cowd 的内部子进程角色。
+///
+/// 这些角色不会出现在帮助面中，但仍由操作系统以独立进程运行。
+#[must_use]
+#[doc(hidden)]
+pub fn dispatch_internal_process(args: &[String]) -> Option<ExitCode> {
+    if args.first().map(String::as_str) != Some(INTERNAL_DISPATCH) {
+        return None;
+    }
+    let Some(role) = args.get(1).map(String::as_str) else {
+        eprintln!("Cowd internal process role is required");
+        return Some(ExitCode::from(64));
+    };
+    let role_args = args.get(2..).unwrap_or_default();
+    Some(match role {
+        "auth-broker" => auth_broker::internal_process_entry(role_args),
+        "sandbox-launcher" => sandbox_launcher::internal_process_entry(role_args),
+        _ => {
+            eprintln!("unsupported Cowd internal process role: {role}");
+            ExitCode::from(64)
+        }
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CliSurfaceCommand {
@@ -57,6 +85,19 @@ impl CliSurfacePolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_arguments_do_not_enter_internal_dispatch() {
+        assert_eq!(dispatch_internal_process(&["gateway".to_string()]), None);
+    }
+
+    #[test]
+    fn unknown_internal_role_fails_closed() {
+        assert_eq!(
+            dispatch_internal_process(&[INTERNAL_DISPATCH.to_string(), "unknown".to_string()]),
+            Some(ExitCode::from(64))
+        );
+    }
 
     #[test]
     fn cli_surface_defaults_to_tui_and_blocks_business_commands() {

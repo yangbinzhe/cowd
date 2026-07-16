@@ -16,7 +16,6 @@ GATEWAY_LOG="$TMP_DIR/gateway.log"
 SESSION_ID="runtime-surface-session-$$"
 SCENARIO_API_KEY="${ANTHROPIC_API_KEY:-test-dummy-key-for-runtime-surface-scenario}"
 API_TOKEN="runtime-surface-$$_credential"
-AUTH_BROKER_BIN="${COWD_AUTH_BROKER_BIN:-$TARGET_ROOT/debug/cowd-auth-broker}"
 
 curl() {
   command curl -H "Authorization: Bearer $API_TOKEN" "$@"
@@ -81,10 +80,6 @@ if [[ ! -x "$BIN" ]]; then
   exit 1
 fi
 
-if [[ ! -x "$AUTH_BROKER_BIN" ]]; then
-  echo "cowd-auth-broker is required at $AUTH_BROKER_BIN" >&2
-  exit 1
-fi
 
 mkdir -p "$WORKDIR/.cowd" "$CONFIG_HOME" "$HOME_DIR/.cowd"
 
@@ -119,7 +114,6 @@ cp "$CONFIG_HOME/config.yaml" "$WORKDIR/.cowd/config.yaml"
 tmux new-session -d -s "$GATEWAY_SESSION" \
   "bash -lc \"cd '$WORKDIR' && \
     export COWD_CONFIG_HOME='$CONFIG_HOME' && \
-    export COWD_AUTH_BROKER_BIN='$AUTH_BROKER_BIN' && \
     export HOME='$HOME_DIR' && \
     '$BIN' gateway run >'$GATEWAY_LOG' 2>&1\""
 

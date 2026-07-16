@@ -4,10 +4,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT/target}"
 BIN="${COWD_BIN:-$TARGET_ROOT/debug/cowd}"
-SANDBOX_BIN="${COWD_SANDBOX_BIN:-$TARGET_ROOT/debug/cowd-sandbox-launcher}"
 AI_ROOT="${COWD_AI_ROOT:-$HOME/AI}"
 VERSION="$(awk -F '"' '/^version = / {print $2; exit}' "$ROOT/Cargo.toml")"
-STAMP="${COWD_INSTALL_STAMP:-$(date +%Y%m%d-%H%M%S)}"
 INSTALL_DIR="${COWD_INSTALL_DIR:-$AI_ROOT}"
 UPDATE_CURRENT=0
 PRINT_ONLY=0
@@ -47,16 +45,22 @@ if [[ ! -x "$BIN" ]]; then
   echo "missing executable cowd binary at $BIN" >&2
   exit 1
 fi
-if [[ ! -x "$SANDBOX_BIN" ]]; then
-  echo "missing sandbox helper at $SANDBOX_BIN; build package sandbox-launcher first" >&2
+BIN_VERSION="$("$BIN" --version | awk '$1 == "Version" {print $2; exit}')"
+if [[ "$BIN_VERSION" != "$VERSION" ]]; then
+  echo "cowd binary version mismatch: expected $VERSION, got ${BIN_VERSION:-unknown}" >&2
   exit 1
 fi
-
 mkdir -p "$INSTALL_DIR" "$INSTALL_DIR/docs" "$AI_ROOT"
-cp "$BIN" "$INSTALL_DIR/cowd"
-chmod +x "$INSTALL_DIR/cowd"
-cp "$SANDBOX_BIN" "$INSTALL_DIR/cowd-sandbox-launcher"
-chmod +x "$INSTALL_DIR/cowd-sandbox-launcher"
+INSTALL_TMP="$(mktemp "$INSTALL_DIR/.cowd.install.XXXXXX")"
+trap 'rm -f "$INSTALL_TMP"' EXIT
+install -m 0755 "$BIN" "$INSTALL_TMP"
+mv -f "$INSTALL_TMP" "$INSTALL_DIR/cowd"
+trap - EXIT
+rm -f \
+  "$INSTALL_DIR/cowd-auth-broker" \
+  "$INSTALL_DIR/cowd-sandbox-launcher" \
+  "$INSTALL_DIR"/.cowd-auth-broker.prev-* \
+  "$INSTALL_DIR"/.cowd-sandbox-launcher.prev-*
 
 cat >"$INSTALL_DIR/install.json" <<EOF
 {
@@ -64,7 +68,7 @@ cat >"$INSTALL_DIR/install.json" <<EOF
   "installed_at": "$(date -Iseconds)",
   "source_root": "$ROOT",
   "binary": "$INSTALL_DIR/cowd",
-  "sandbox_helper": "$INSTALL_DIR/cowd-sandbox-launcher"
+  "process_model": "single_binary_multi_process"
 }
 EOF
 

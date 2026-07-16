@@ -9,7 +9,11 @@
 )]
 
 fn main() -> std::process::ExitCode {
+    sandbox_launcher::register_cowd_process_host();
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if let Some(status) = cli::dispatch_internal_process(&args) {
+        return status;
+    }
     let first_arg = args.first().map(String::as_str);
 
     if should_open_tui(&args) || matches!(first_arg, Some("tui")) {

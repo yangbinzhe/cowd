@@ -78,7 +78,7 @@ EVAL_TOKEN="${COWD_EVAL_GATEWAY_TOKEN:-$(sed -n '/auth:/,/platform_type:/ { s/^[
 [[ -n "$EVAL_TOKEN" ]] || { echo "missing Gateway API token; set COWD_EVAL_GATEWAY_TOKEN or configure api_server.auth.token" >&2; exit 1; }
 
 cd "$ROOT"
-cargo build -p cli -p sandbox-launcher --features tui-surface
+cargo build -p cli --features tui-surface
 cargo build -p harness-eval
 start_gateway
 

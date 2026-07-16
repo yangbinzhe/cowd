@@ -17,7 +17,6 @@ WORKSPACE="$TMP_DIR/workspace"
 GATEWAY_LOG="$TMP_DIR/gateway.log"
 SMOKE_API_KEY="${ANTHROPIC_API_KEY:-test-dummy-key-for-tui-smoke}"
 API_TOKEN="tui-smoke-$$_credential"
-AUTH_BROKER_BIN="${COWD_AUTH_BROKER_BIN:-$TARGET_ROOT/debug/cowd-auth-broker}"
 
 curl() {
   command curl -H "Authorization: Bearer $API_TOKEN" "$@"
@@ -41,10 +40,6 @@ done
 
 if [[ ! -x "$BIN" ]]; then
   echo "missing cowd binary at $BIN; run cargo build -p cli first" >&2
-  exit 1
-fi
-if [[ ! -x "$AUTH_BROKER_BIN" ]]; then
-  echo "cowd-auth-broker is required at $AUTH_BROKER_BIN" >&2
   exit 1
 fi
 if ss -ltnp | rg -q ":$PORT\\b"; then
@@ -84,7 +79,6 @@ cp "$CONFIG_HOME/config.yaml" "$WORKSPACE/.cowd/config.yaml"
 
 tmux new-session -d -s "$GATEWAY_SESSION" -c "$WORKSPACE" \
   "exec env COWD_CONFIG_HOME='$CONFIG_HOME' \
-    COWD_AUTH_BROKER_BIN='$AUTH_BROKER_BIN' \
     HOME='$HOME_DIR' \
     '$BIN' gateway run >'$GATEWAY_LOG' 2>&1"
 

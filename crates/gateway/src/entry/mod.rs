@@ -1,7 +1,6 @@
 pub(crate) mod env_entry;
 pub(crate) mod gateway_projection_entry;
 pub(crate) mod init_entry;
-pub(crate) mod install_entry;
 pub(crate) mod local_command_entry;
 pub(crate) mod mcp_entry;
 pub(crate) mod plugin_entry;

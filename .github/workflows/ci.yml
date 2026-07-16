@@ -40,7 +40,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p runtime release_gate
-      - run: cargo test -p cowd-cli cowd_release_gate
+      - run: cargo test -p gateway cowd_release_gate_route_reports_missing_timeline_evidence
 
   validate-scenario:
     runs-on: ubuntu-latest

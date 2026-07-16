@@ -14,9 +14,19 @@ use std::{
     env, fs,
     io::Read,
     path::{Component, Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{Command, ExitCode, Output, Stdio},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
+#[cfg(target_os = "linux")]
+use std::{collections::BTreeMap, convert::TryInto};
+
+#[cfg(target_os = "linux")]
+use landlock::{
+    Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI,
+};
+#[cfg(target_os = "linux")]
+use seccompiler::{BpfProgram, SeccompAction, SeccompFilter};
 use thiserror::Error;
 
 const SYSTEM_READ_ONLY_ROOTS: &[&str] = &["/usr", "/bin", "/lib", "/lib64", "/etc"];
@@ -25,6 +35,207 @@ const BOOTSTRAP_SHELL: &str = "/bin/bash";
 const INNER_LAUNCHER_PATH: &str = "/run/cowd-sandbox-inner";
 const LAUNCHER_PROTOCOL: &str =
     concat!("sandbox-launcher/", env!("CARGO_PKG_VERSION"), "/kernel-v1");
+const INTERNAL_DISPATCH: &str = "__cowd_internal";
+const INTERNAL_ROLE: &str = "sandbox-launcher";
+static COWD_PROCESS_HOST: AtomicBool = AtomicBool::new(false);
+
+/// 标记当前进程由唯一的 `cowd` 可执行文件启动。
+///
+/// 生产主入口必须在任何 Gateway、Runtime 或工具初始化前调用。这样沙箱
+/// 可直接复用 `current_exe`，无需为同一文件重复启动协议探测子进程。
+#[doc(hidden)]
+pub fn register_cowd_process_host() {
+    COWD_PROCESS_HOST.store(true, Ordering::Release);
+}
+
+/// 构造一个固定到当前 Cowd 运行映像的内部子进程命令。
+///
+/// Linux 的 `/proc/self/exe` 在 `exec` 发生前始终引用调用进程当前映像，
+/// 因此磁盘上的 `cowd` 被原子替换时不会混入新版本。
+#[doc(hidden)]
+pub fn cowd_internal_process_command() -> Result<Command, String> {
+    if !COWD_PROCESS_HOST.load(Ordering::Acquire) {
+        return Err("Cowd process host identity was not registered".to_string());
+    }
+    platform_internal_process_command()
+}
+
+#[cfg(target_os = "linux")]
+fn platform_internal_process_command() -> Result<Command, String> {
+    use std::os::unix::process::CommandExt;
+
+    let display_path =
+        env::current_exe().map_err(|error| format!("failed to locate Cowd executable: {error}"))?;
+    fs::metadata("/proc/self/exe")
+        .map_err(|error| format!("failed to inspect running Cowd executable: {error}"))?;
+    let mut command = Command::new("/proc/self/exe");
+    command.arg0(display_path);
+    Ok(command)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn platform_internal_process_command() -> Result<Command, String> {
+    Err("Cowd internal process hosting requires Linux executable identity pinning".to_string())
+}
+
+/// 运行 Cowd 单文件架构中的沙箱子进程角色。
+///
+/// 外层模式只用于诊断和真实验收；生产工具链通常把同一个 `cowd` 文件
+/// 只读挂载进 bwrap，再通过 `--inner` 安装 Landlock 与 seccomp。
+#[doc(hidden)]
+pub fn internal_process_entry(args: &[String]) -> ExitCode {
+    if args.first().map(String::as_str) == Some("--protocol-version") {
+        println!("{LAUNCHER_PROTOCOL}");
+        return ExitCode::SUCCESS;
+    }
+    if args.first().map(String::as_str) == Some("--inner") {
+        return inner_process_entry(&args[1..]);
+    }
+    let Some(workspace) = args.first() else {
+        eprintln!(
+            "usage: cowd __cowd_internal sandbox-launcher <absolute-workspace> <shell-command>"
+        );
+        return ExitCode::from(64);
+    };
+    let command = args[1..].join(" ");
+    if command.trim().is_empty() {
+        eprintln!("shell command is required");
+        return ExitCode::from(64);
+    }
+    let spec = SandboxLaunchSpec::workspace(workspace);
+    match shell_command(&command, &spec) {
+        Ok(prepared) => match prepared.into_command().status() {
+            Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+            Err(error) => {
+                eprintln!("failed to launch sandbox: {error}");
+                ExitCode::from(1)
+            }
+        },
+        Err(error) => {
+            eprintln!("sandbox unavailable: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn inner_process_entry(args: &[String]) -> ExitCode {
+    let mut workspace = None;
+    let mut writable = Vec::new();
+    let mut command = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--workspace" if index + 1 < args.len() => {
+                workspace = Some(PathBuf::from(&args[index + 1]));
+                index += 2;
+            }
+            "--writable" if index + 1 < args.len() => {
+                writable.push(PathBuf::from(&args[index + 1]));
+                index += 2;
+            }
+            "--" if index + 1 < args.len() => {
+                command = Some(args[index + 1..].join(" "));
+                break;
+            }
+            _ => return ExitCode::from(64),
+        }
+    }
+    let Some(workspace) = workspace else {
+        eprintln!("sandbox inner launcher requires --workspace");
+        return ExitCode::from(64);
+    };
+    let Some(command) = command else {
+        eprintln!("sandbox inner launcher requires a command after --");
+        return ExitCode::from(64);
+    };
+    writable.push(workspace);
+    writable.push(PathBuf::from("/tmp"));
+    writable.push(PathBuf::from("/dev"));
+    if let Err(error) = install_landlock(&writable) {
+        eprintln!("failed to install Landlock: {error}");
+        return ExitCode::from(125);
+    }
+    if let Err(error) = install_seccomp() {
+        eprintln!("failed to install seccomp: {error}");
+        return ExitCode::from(125);
+    }
+    match Command::new("/bin/sh").arg("-c").arg(command).status() {
+        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+        Err(error) => {
+            eprintln!("failed to execute hardened sandbox command: {error}");
+            ExitCode::from(125)
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn inner_process_entry(_args: &[String]) -> ExitCode {
+    eprintln!("sandbox inner launcher is only supported on Linux");
+    ExitCode::from(125)
+}
+
+#[cfg(target_os = "linux")]
+fn install_landlock(writable: &[PathBuf]) -> Result<(), String> {
+    let abi = ABI::V5;
+    let access_all = AccessFs::from_all(abi);
+    let access_read = AccessFs::from_read(abi);
+    let mut ruleset = Ruleset::default()
+        .handle_access(access_all)
+        .map_err(|error| error.to_string())?
+        .create()
+        .map_err(|error| error.to_string())?
+        .add_rule(PathBeneath::new(
+            PathFd::new(Path::new("/")).map_err(|error| error.to_string())?,
+            access_read,
+        ))
+        .map_err(|error| error.to_string())?;
+    for root in writable.iter().filter(|root| root.exists()) {
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(
+                PathFd::new(root).map_err(|error| error.to_string())?,
+                access_all,
+            ))
+            .map_err(|error| error.to_string())?;
+    }
+    let status = ruleset.restrict_self().map_err(|error| error.to_string())?;
+    let rendered = format!("{status:?}");
+    if !rendered.contains("FullyEnforced") || !rendered.contains("no_new_privs: true") {
+        return Err(format!("Landlock was not fully enforced: {rendered}"));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn install_seccomp() -> Result<(), String> {
+    let syscalls = [
+        libc::SYS_ptrace,
+        libc::SYS_process_vm_readv,
+        libc::SYS_process_vm_writev,
+        libc::SYS_keyctl,
+        libc::SYS_open_by_handle_at,
+        libc::SYS_mount,
+        libc::SYS_umount2,
+        libc::SYS_bpf,
+        libc::SYS_kexec_load,
+    ];
+    let rules = syscalls
+        .into_iter()
+        .map(|syscall| (syscall, Vec::new()))
+        .collect::<BTreeMap<_, _>>();
+    let filter: BpfProgram = SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::Trap,
+        std::env::consts::ARCH
+            .try_into()
+            .map_err(|error| format!("unsupported seccomp architecture: {error}"))?,
+    )
+    .map_err(|error| error.to_string())?
+    .try_into()
+    .map_err(|error: seccompiler::BackendError| error.to_string())?;
+    seccompiler::apply_filter(&filter).map_err(|error| error.to_string())
+}
 
 /// The hardening features which have actually been installed in a child.
 ///
@@ -41,6 +252,8 @@ pub enum SandboxSecurityPosture {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxPreflight {
     pub bwrap_path: PathBuf,
+    /// 已通过内部协议验证、将被只读挂载进沙箱的同一个 Cowd 文件。
+    pub cowd_binary_path: PathBuf,
     pub deny_probe_passed: bool,
     pub no_new_privs_verified: bool,
     pub inherited_fds_closed: bool,
@@ -237,7 +450,7 @@ pub fn preflight(spec: &SandboxLaunchSpec) -> Result<SandboxPreflight, SandboxEr
     spec.validate()?;
     let bwrap_path = bwrap_path().ok_or(SandboxError::LauncherUnavailable)?;
     ensure_bootstrap_shell()?;
-    ensure_launcher_protocol(&launcher_binary_path()?)?;
+    let cowd_binary_path = launcher_binary_path()?;
     let fixture = ProbeFixture::new()?;
     let mut probe_spec = SandboxLaunchSpec::workspace(&spec.workspace_root);
     probe_spec.working_directory = spec.working_directory.clone();
@@ -252,16 +465,18 @@ pub fn preflight(spec: &SandboxLaunchSpec) -> Result<SandboxPreflight, SandboxEr
 
     let args = bwrap_args(
         &bwrap_path,
+        &cowd_binary_path,
         &probe_spec,
         probe_command(&fixture.control, &probe_spec.environment),
     )?;
-    let output = run_fd_closing_wrapper(&bwrap_path, &args)?;
+    let output = run_fd_closing_wrapper(&bwrap_path, &cowd_binary_path, &args)?;
     if !output.status.success() {
         return Err(SandboxError::ProbeFailed(render_output(&output)));
     }
 
     let preflight = SandboxPreflight {
         bwrap_path,
+        cowd_binary_path,
         deny_probe_passed: true,
         no_new_privs_verified: true,
         inherited_fds_closed: true,
@@ -281,12 +496,17 @@ pub fn shell_command(
     spec: &SandboxLaunchSpec,
 ) -> Result<PreparedSandboxCommand, SandboxError> {
     let preflight = preflight(spec)?;
-    let args = bwrap_args(&preflight.bwrap_path, spec, command.to_string())?;
+    let args = bwrap_args(
+        &preflight.bwrap_path,
+        &preflight.cowd_binary_path,
+        spec,
+        command.to_string(),
+    )?;
     Ok(PreparedSandboxCommand {
         program: BOOTSTRAP_SHELL.to_string(),
         args: vec![
             "-c".to_string(),
-            fd_closing_script(&preflight.bwrap_path, &args),
+            fd_closing_script(&preflight.bwrap_path, &preflight.cowd_binary_path, &args),
         ],
         environment: Vec::new(),
         preflight,
@@ -314,6 +534,7 @@ pub fn program_command(
 
 fn bwrap_args(
     _bwrap_path: &Path,
+    _inner_launcher: &Path,
     spec: &SandboxLaunchSpec,
     command: String,
 ) -> Result<Vec<String>, SandboxError> {
@@ -325,8 +546,6 @@ fn bwrap_args(
         .map(canonical)
         .transpose()?
         .unwrap_or_else(|| workspace.clone());
-    let inner_launcher = launcher_binary_path()?;
-
     let mut args = vec![
         "--die-with-parent".to_string(),
         "--new-session".to_string(),
@@ -369,7 +588,7 @@ fn bwrap_args(
         "--dir".to_string(),
         "/run".to_string(),
         "--ro-bind".to_string(),
-        inner_launcher.display().to_string(),
+        "/proc/self/fd/3".to_string(),
         INNER_LAUNCHER_PATH.to_string(),
     ]);
 
@@ -399,7 +618,13 @@ fn bwrap_args(
         "--chdir".to_string(),
         working_directory.display().to_string(),
         "--".to_string(),
+        BOOTSTRAP_SHELL.to_string(),
+        "-c".to_string(),
+        "exec 3>&-; exec /usr/bin/env -u SHLVL -u _ \"$@\"".to_string(),
+        "cowd-sandbox-bootstrap".to_string(),
         INNER_LAUNCHER_PATH.to_string(),
+        INTERNAL_DISPATCH.to_string(),
+        INTERNAL_ROLE.to_string(),
         "--inner".to_string(),
         "--workspace".to_string(),
         workspace.display().to_string(),
@@ -413,10 +638,8 @@ fn bwrap_args(
 }
 
 fn launcher_binary_path() -> Result<PathBuf, SandboxError> {
-    if let Some(path) = env::var_os("COWD_SANDBOX_LAUNCHER").map(PathBuf::from) {
-        if path.is_file() {
-            return canonical(&path);
-        }
+    if COWD_PROCESS_HOST.load(Ordering::Acquire) {
+        return process_host_executable_path();
     }
     let current = env::current_exe().map_err(|error| {
         SandboxError::ProbeFailed(format!("resolve current executable: {error}"))
@@ -424,37 +647,52 @@ fn launcher_binary_path() -> Result<PathBuf, SandboxError> {
     let parent = current.parent().ok_or_else(|| {
         SandboxError::ProbeFailed("current executable has no parent directory".to_string())
     })?;
-    for candidate in [
-        parent.join("cowd-sandbox-launcher"),
-        parent
-            .parent()
-            .unwrap_or(parent)
-            .join("cowd-sandbox-launcher"),
-    ] {
-        if candidate.is_file() {
-            return canonical(&candidate);
+    let mut candidates = Vec::new();
+    candidates.push(current.clone());
+    candidates.push(parent.join("cowd"));
+    if let Some(grandparent) = parent.parent() {
+        candidates.push(grandparent.join("cowd"));
+    }
+    let mut inspected = HashSet::new();
+    for candidate in candidates {
+        if !candidate.is_file() {
+            continue;
+        }
+        let candidate = canonical(&candidate)?;
+        if inspected.insert(candidate.clone()) && launcher_protocol_matches(&candidate) {
+            return Ok(candidate);
         }
     }
     Err(SandboxError::KernelHardeningUnavailable(
-        "cowd-sandbox-launcher inner hardener is not installed beside the host binary".to_string(),
+        "the current Cowd executable does not expose the sandbox inner process role".to_string(),
     ))
 }
 
-fn ensure_launcher_protocol(path: &Path) -> Result<(), SandboxError> {
+#[cfg(target_os = "linux")]
+fn process_host_executable_path() -> Result<PathBuf, SandboxError> {
+    let path = PathBuf::from(format!("/proc/{}/exe", std::process::id()));
+    fs::metadata(&path).map_err(|error| {
+        SandboxError::ProbeFailed(format!("pin running Cowd executable image: {error}"))
+    })?;
+    Ok(path)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_host_executable_path() -> Result<PathBuf, SandboxError> {
+    Err(SandboxError::UnsupportedPlatform)
+}
+
+fn launcher_protocol_matches(path: &Path) -> bool {
     let output = Command::new(path)
-        .arg("--protocol-version")
+        .args([INTERNAL_DISPATCH, INTERNAL_ROLE, "--protocol-version"])
         .env_clear()
         .stdin(Stdio::null())
-        .output()
-        .map_err(|error| SandboxError::ProbeFailed(error.to_string()))?;
+        .output();
+    let Ok(output) = output else {
+        return false;
+    };
     let actual = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if output.status.success() && actual == LAUNCHER_PROTOCOL {
-        Ok(())
-    } else {
-        Err(SandboxError::KernelHardeningUnavailable(format!(
-            "sandbox helper protocol mismatch: expected `{LAUNCHER_PROTOCOL}`, got `{actual}`"
-        )))
-    }
+    output.status.success() && actual == LAUNCHER_PROTOCOL
 }
 
 fn append_environment(
@@ -476,19 +714,24 @@ fn append_environment(
     Ok(())
 }
 
-fn run_fd_closing_wrapper(bwrap_path: &Path, args: &[String]) -> Result<Output, SandboxError> {
+fn run_fd_closing_wrapper(
+    bwrap_path: &Path,
+    inner_launcher: &Path,
+    args: &[String],
+) -> Result<Output, SandboxError> {
     ensure_bootstrap_shell()?;
     Command::new(BOOTSTRAP_SHELL)
         .arg("-c")
-        .arg(fd_closing_script(bwrap_path, args))
+        .arg(fd_closing_script(bwrap_path, inner_launcher, args))
         .env_clear()
         .stdin(Stdio::null())
         .output()
         .map_err(|error| SandboxError::ProbeFailed(error.to_string()))
 }
 
-fn fd_closing_script(bwrap_path: &Path, args: &[String]) -> String {
+fn fd_closing_script(bwrap_path: &Path, inner_launcher: &Path, args: &[String]) -> String {
     let bwrap = shell_quote(&bwrap_path.display().to_string());
+    let inner_launcher = shell_quote(&inner_launcher.display().to_string());
     let args = args
         .iter()
         .map(|argument| shell_quote(argument))
@@ -496,11 +739,13 @@ fn fd_closing_script(bwrap_path: &Path, args: &[String]) -> String {
         .join(" ");
     // This shell is trusted bootstrap only: all untrusted command text is a
     // single shell-quoted bwrap argument after `--`. Rust's safe process API
-    // has no close_range primitive, so enumerate this bootstrap process's
-    // Linux FD table and close every descriptor above stderr before exec.
-    // Absence of procfs is a hard failure, never a fallback with leaked FDs.
+    // has no close_range primitive, so open exactly one trusted Cowd image
+    // descriptor, enumerate this bootstrap process's Linux FD table, and
+    // close every other descriptor above stderr before exec. bwrap resolves
+    // its own `/proc/self/fd/3`, preserving the running Cowd inode across an
+    // atomic on-disk replacement. Absence of procfs is a hard failure.
     format!(
-        "[ -d /proc/$$/fd ] || {{ echo 'sandbox bootstrap requires /proc/self/fd' >&2; exit 125; }}; for entry in /proc/$$/fd/*; do fd=${{entry##*/}}; case \"$fd\" in 0|1|2|*[!0-9]*|'') ;; *) eval \"exec $fd>&-\" ;; esac; done; exec {bwrap} {args}"
+        "exec 3<{inner_launcher} || {{ echo 'sandbox bootstrap cannot pin the running Cowd image' >&2; exit 125; }}; [ -d /proc/$$/fd ] || {{ echo 'sandbox bootstrap requires /proc/self/fd' >&2; exit 125; }}; for entry in /proc/$$/fd/*; do fd=${{entry##*/}}; case \"$fd\" in 0|1|2|3|*[!0-9]*|'') ;; *) eval \"exec $fd>&-\" ;; esac; done; exec {bwrap} {args}"
     )
 }
 
@@ -743,6 +988,40 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_host_path_is_pinned_to_the_running_linux_image() {
+        use std::os::unix::fs::MetadataExt;
+
+        let pinned = process_host_executable_path().expect("pinned process image");
+        let pinned_image = fs::metadata(&pinned).expect("pinned image");
+        let running_image = fs::metadata("/proc/self/exe").expect("running image");
+
+        assert_eq!(
+            pinned,
+            PathBuf::from(format!("/proc/{}/exe", std::process::id()))
+        );
+        assert_eq!(pinned_image.dev(), running_image.dev());
+        assert_eq!(pinned_image.ino(), running_image.ino());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn internal_process_command_is_pinned_to_the_running_linux_image() {
+        use std::os::unix::fs::MetadataExt;
+
+        let command = platform_internal_process_command().expect("internal process command");
+        let command_image = fs::metadata(command.get_program()).expect("command image");
+        let running_image = fs::metadata("/proc/self/exe").expect("running image");
+
+        assert_eq!(
+            command.get_program(),
+            std::ffi::OsStr::new("/proc/self/exe")
+        );
+        assert_eq!(command_image.dev(), running_image.dev());
+        assert_eq!(command_image.ino(), running_image.ino());
+    }
+
     #[test]
     fn rejects_control_root_covered_by_workspace() {
         let root = ProbeFixture::new().expect("fixture");
@@ -844,7 +1123,7 @@ mod tests {
         }
         let root = ProbeFixture::new().expect("fixture");
         let prepared = shell_command(
-            "test ! -e /proc/self/fd/1025 && printf fd-closed",
+            "test ! -e /proc/self/fd/3 && test ! -e /proc/self/fd/1025 && printf fd-closed",
             &SandboxLaunchSpec::workspace(&root.workspace),
         )
         .expect("prepare sandbox");
