@@ -363,9 +363,12 @@ impl RealityService {
             query.limit.saturating_mul(6).max(12),
         );
         let stages = fact_flow_stages(&events, &promotions);
+        let edges = fact_flow_edges(&stages);
 
         serde_json::json!({
             "kind": "reality.fact_flow",
+            "schema_version": "reality.fact_flow.v1",
+            "revision": events.len().saturating_add(promotions.len()),
             "ok": true,
             "generated_at": Utc::now(),
             "envelope": self.flow_contract(),
@@ -377,6 +380,7 @@ impl RealityService {
             "event_count": events.len(),
             "promotion_count": promotions.len(),
             "stages": stages,
+            "edges": edges,
             "events": events,
             "promotions": promotions,
         })
@@ -1177,6 +1181,58 @@ fn fact_flow_stages(
         }));
     }
     stages
+}
+
+fn fact_flow_edges(stages: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let mut event_by_ref = std::collections::BTreeMap::new();
+    let mut candidate_by_target = std::collections::BTreeMap::new();
+    for stage in stages {
+        let Some(stage_id) = stage.get("stage_id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let kind = stage
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if kind == "event" {
+            if let Some(reference) = stage.get("source_ref").and_then(serde_json::Value::as_str) {
+                event_by_ref.insert(reference.to_string(), stage_id.to_string());
+            }
+        } else if matches!(kind, "memory_candidate" | "matrix_signal" | "evidence") {
+            if let Some(reference) = stage.get("target_ref").and_then(serde_json::Value::as_str) {
+                candidate_by_target.insert(reference.to_string(), stage_id.to_string());
+            }
+        }
+    }
+
+    stages
+        .iter()
+        .filter_map(|stage| {
+            let target = stage.get("stage_id")?.as_str()?;
+            let kind = stage.get("kind")?.as_str()?;
+            if kind == "event" {
+                return None;
+            }
+            let correlation = stage
+                .get("source_ref")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| stage.get("target_ref").and_then(serde_json::Value::as_str))
+                .unwrap_or_default();
+            let source = event_by_ref.get(correlation).or_else(|| {
+                matches!(kind, "fact_decision" | "memory_target")
+                    .then(|| candidate_by_target.get(correlation))
+                    .flatten()
+            })?;
+            Some(serde_json::json!({
+                "edge_id": format!("flow:{source}:{target}"),
+                "from": source,
+                "to": target,
+                "kind": stage.get("decision").and_then(serde_json::Value::as_str).unwrap_or("correlates"),
+                "status": stage.get("status").cloned().unwrap_or(serde_json::Value::Null),
+                "correlation_ref": correlation,
+            }))
+        })
+        .collect()
 }
 
 fn promotion_kind(target: &str) -> &'static str {

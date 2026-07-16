@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use axum::{
     extract::{Path, Query, State as AxumState},
@@ -69,6 +72,7 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         )
         .route("/api/memory/entities", get(memory_entities_handler))
         .route("/api/memory/triples", get(memory_triples_handler))
+        .route("/api/memory/graph", get(memory_graph_handler))
         .route(
             "/api/memory/symbol-links",
             get(memory_symbol_links_handler).post(create_memory_symbol_link_handler),
@@ -778,6 +782,127 @@ async fn memory_triples_handler(AxumState(state): AxumState<Arc<AppState>>) -> i
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct MemoryGraphQuery {
+    #[serde(default)]
+    focus: Option<String>,
+    #[serde(default)]
+    depth: Option<usize>,
+    #[serde(default)]
+    filter: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    cursor: Option<usize>,
+}
+
+async fn memory_graph_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Query(query): Query<MemoryGraphQuery>,
+) -> impl IntoResponse {
+    let Some(mgr) = state.services.memory.manager() else {
+        return Json(serde_json::json!({
+            "kind": "memory.knowledge_subgraph",
+            "schema_version": "memory.knowledge_subgraph.v1",
+            "enabled": false,
+            "entities": [],
+            "triples": [],
+            "truncated": false,
+            "next_cursor": null,
+            "degraded_reason": "memory not configured",
+        }));
+    };
+    let mut entities = mgr.list_entities().await.unwrap_or_default();
+    let mut triples = mgr.list_triples().await.unwrap_or_default();
+    entities.sort_by(|left, right| left.id.cmp(&right.id));
+    triples.sort_by(|left, right| left.id.cmp(&right.id));
+
+    let focus = query.focus.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    let depth = query.depth.unwrap_or(2).clamp(1, 6);
+    let filter = query
+        .filter
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
+    let mut included: HashSet<String> = if let Some(focus) = focus {
+        let normalized = focus.to_ascii_lowercase();
+        entities
+            .iter()
+            .filter(|entity| {
+                entity.id.eq_ignore_ascii_case(focus)
+                    || entity.name.to_ascii_lowercase().contains(&normalized)
+            })
+            .map(|entity| entity.id.clone())
+            .collect()
+    } else {
+        entities.iter().map(|entity| entity.id.clone()).collect()
+    };
+
+    if focus.is_some() {
+        let mut frontier = included.clone();
+        for _ in 0..depth {
+            let mut next = HashSet::new();
+            for triple in &triples {
+                if frontier.contains(&triple.subject_id) && !included.contains(&triple.object_id) {
+                    next.insert(triple.object_id.clone());
+                }
+                if frontier.contains(&triple.object_id) && !included.contains(&triple.subject_id) {
+                    next.insert(triple.subject_id.clone());
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            included.extend(next.iter().cloned());
+            frontier = next;
+        }
+    }
+
+    entities.retain(|entity| {
+        included.contains(&entity.id)
+            && filter.as_ref().map_or(true, |filter| {
+                entity.id.to_ascii_lowercase().contains(filter)
+                    || entity.name.to_ascii_lowercase().contains(filter)
+                    || entity.entity_type.to_string().to_ascii_lowercase().contains(filter)
+            })
+    });
+    let total_entities = entities.len();
+    let cursor = query.cursor.unwrap_or(0).min(total_entities);
+    let limit = query.limit.unwrap_or(80).clamp(1, 200);
+    let end = cursor.saturating_add(limit).min(total_entities);
+    let page_entities = &entities[cursor..end];
+    let page_ids: HashSet<&str> = page_entities.iter().map(|entity| entity.id.as_str()).collect();
+    let edge_limit = limit.saturating_mul(4);
+    let mut page_triples = triples
+        .into_iter()
+        .filter(|triple| {
+            page_ids.contains(triple.subject_id.as_str()) && page_ids.contains(triple.object_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    let edge_truncated = page_triples.len() > edge_limit;
+    page_triples.truncate(edge_limit);
+    let truncated = end < total_entities || edge_truncated;
+
+    Json(serde_json::json!({
+        "kind": "memory.knowledge_subgraph",
+        "schema_version": "memory.knowledge_subgraph.v1",
+        "enabled": true,
+        "focus": focus,
+        "depth": depth,
+        "filter": filter,
+        "limit": limit,
+        "cursor": cursor,
+        "total_entities": total_entities,
+        "entities": page_entities,
+        "triples": page_triples,
+        "truncated": truncated,
+        "edge_truncated": edge_truncated,
+        "next_cursor": (end < total_entities).then_some(end),
+        "degraded_reason": null,
+    }))
+}
+
 async fn create_memory_symbol_link_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(body): Json<CreateSymbolLinkRequest>,
@@ -845,11 +970,28 @@ async fn memory_symbol_links_handler(
         .await
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let total = entries.len();
+    let limit = params
+        .get("limit")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(80)
+        .clamp(1, 200);
+    let cursor = params
+        .get("cursor")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(total);
+    let end = cursor.saturating_add(limit).min(total);
+    let truncated = end < total;
+    let entries = entries.into_iter().skip(cursor).take(limit).collect::<Vec<_>>();
     Ok(Json(serde_json::json!({
         "enabled": true,
         "symbol": symbol,
         "entries": entries,
         "total": total,
+        "limit": limit,
+        "cursor": cursor,
+        "truncated": truncated,
+        "next_cursor": truncated.then_some(end),
     })))
 }
 
@@ -996,19 +1138,63 @@ async fn memory_runtime_handler(
 struct MemoryClusterQuery {
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    cursor: Option<usize>,
+    #[serde(default)]
+    focus: Option<String>,
+    #[serde(default)]
+    filter: Option<String>,
+    #[serde(default)]
+    depth: Option<usize>,
 }
 
 async fn memory_clusters_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Query(query): Query<MemoryClusterQuery>,
 ) -> Json<serde_json::Value> {
-    Json(
-        state
-            .services
-            .memory
-            .clusters_projection(query.limit.unwrap_or(24))
-            .await,
-    )
+    let limit = query.limit.unwrap_or(24).clamp(1, 100);
+    let cursor = query.cursor.unwrap_or(0).min(500);
+    let fetch_limit = cursor.saturating_add(limit).saturating_add(1).min(501);
+    let mut projection = state
+        .services
+        .memory
+        .clusters_projection(fetch_limit)
+        .await;
+    let mut clusters = projection
+        .get_mut("clusters")
+        .and_then(serde_json::Value::as_array_mut)
+        .map(std::mem::take)
+        .unwrap_or_default();
+    let needle = query
+        .filter
+        .as_deref()
+        .or(query.focus.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
+    if let Some(needle) = &needle {
+        clusters.retain(|cluster| cluster.to_string().to_ascii_lowercase().contains(needle));
+    }
+    let available = clusters.len();
+    let start = cursor.min(available);
+    let end = start.saturating_add(limit).min(available);
+    let truncated = end < available;
+    let page = clusters.into_iter().skip(start).take(limit).collect::<Vec<_>>();
+    if let Some(object) = projection.as_object_mut() {
+        object.insert("clusters".to_string(), serde_json::json!(page));
+        object.insert("focus".to_string(), serde_json::json!(query.focus));
+        object.insert("filter".to_string(), serde_json::json!(query.filter));
+        object.insert("depth".to_string(), serde_json::json!(query.depth.unwrap_or(1)));
+        object.insert("limit".to_string(), serde_json::json!(limit));
+        object.insert("cursor".to_string(), serde_json::json!(start));
+        object.insert("total".to_string(), serde_json::json!(available));
+        object.insert("truncated".to_string(), serde_json::json!(truncated));
+        object.insert(
+            "next_cursor".to_string(),
+            serde_json::json!(truncated.then_some(end)),
+        );
+    }
+    Json(projection)
 }
 
 async fn memory_lifecycle_handler(

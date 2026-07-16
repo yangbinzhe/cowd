@@ -1131,6 +1131,7 @@ async fn mfg_reality_metric_lineage_handler(
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.metric.lineage",
+        "schema_version": "matrix.metric_lineage.v1",
         "lineage": lineage,
         "boundary": mfg_reality_boundary(),
     })))
@@ -1431,6 +1432,7 @@ async fn mfg_reality_entity_relations_handler(
         .map_err(matrix_error)?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.entity.relations",
+        "schema_version": "matrix.entity_relations.v1",
         "entity_id": id,
         "relations": relations,
         "boundary": mfg_reality_boundary(),
@@ -1448,6 +1450,7 @@ async fn mfg_reality_entity_impact_path_handler(
         .map_err(matrix_error)?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.entity.impact_path",
+        "schema_version": "matrix.entity_impact.v1",
         "trace": trace,
         "boundary": mfg_reality_boundary(),
     })))

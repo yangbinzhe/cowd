@@ -446,7 +446,7 @@ impl MemoryService {
             });
         };
         let kernel = MemoryKernel::new(Arc::clone(&mgr));
-        match kernel.clusters(limit.min(200)).await {
+        match kernel.clusters(limit.min(501)).await {
             Ok(clusters) => serde_json::json!({
                 "enabled": true,
                 "clusters": clusters,
