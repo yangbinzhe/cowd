@@ -1,4 +1,5 @@
 pub mod layout;
+pub mod model;
 
 use ratatui::{
     layout::Rect,
@@ -55,9 +56,14 @@ impl Composer {
         } else {
             format!(" · {pending_resources} resource(s)")
         };
+        let active = !matches!(
+            self.mode_label.as_str(),
+            "Chat" | "Runtime: Completed" | "Runtime: Failed" | "Runtime: Cancelled"
+        );
+        let running_hint = if active { " · Esc cancel" } else { "" };
         let block = Block::default().borders(Borders::ALL).title(format!(
-            " {} Composer (Enter=send, Ctrl+J newline, Ctrl+P actions{}) ",
-            self.mode_label, resource_hint
+            " {} · Enter send · Ctrl+J newline · Ctrl+P actions{}{} ",
+            self.mode_label, resource_hint, running_hint
         ));
         let layout = layout::ComposerLayout::from_textarea(input, area.width.saturating_sub(2));
         let viewport = layout.viewport(area.height.saturating_sub(2));

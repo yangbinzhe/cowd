@@ -108,6 +108,32 @@ impl ComposerLayout {
             },
         }
     }
+
+    /// Maps a visual row/column back to the canonical logical line byte
+    /// offset.  Columns inside a wide grapheme snap to its leading boundary;
+    /// callers can therefore move a cursor without splitting combining text.
+    #[must_use]
+    pub fn logical_position_for_visual(
+        &self,
+        visual_row: usize,
+        column: u16,
+    ) -> Option<(usize, usize)> {
+        let row = self.rows.get(visual_row)?;
+        let mut width = 0usize;
+        let mut byte = row.start_byte;
+        for (offset, grapheme) in row.text.grapheme_indices(true) {
+            let next_width = width.saturating_add(UnicodeWidthStr::width(grapheme));
+            if next_width > usize::from(column) {
+                break;
+            }
+            width = next_width;
+            byte = row
+                .start_byte
+                .saturating_add(offset)
+                .saturating_add(grapheme.len());
+        }
+        Some((row.logical_line, byte))
+    }
 }
 
 fn append_wrapped_rows(
@@ -256,6 +282,44 @@ mod tests {
                 previous_line = Some(row.logical_line);
             }
             result
+        }
+    }
+
+    #[test]
+    fn fixtures_preserve_bytes_at_every_supported_width() {
+        let fixtures = [
+            "ASCII path/without/any/spaces/for/a/long/time",
+            "中文 日本語 العربية",
+            "🙂👨‍👩‍👧‍👦e\u{301}",
+            "  leading  and  repeated spaces  ",
+            "first\r\nsecond\n\nlast",
+            "\tindent\tand tabs",
+        ];
+        for fixture in fixtures {
+            let lines = fixture.split('\n').map(str::to_string).collect::<Vec<_>>();
+            for width in [0, 1, 2, 5, 10, 20, 40, 80] {
+                let layout = ComposerLayout::from_lines(&lines, (0, 0), width);
+                assert_eq!(layout.rows.concat_text(), fixture.replace('\n', ""));
+                assert!(!layout.rows.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn visual_to_logical_mapping_stays_on_grapheme_boundaries() {
+        let text = "a e\u{301}🙂".to_string();
+        let layout = ComposerLayout::from_lines(&[text.clone()], (0, 0), 2);
+        for row in 0..layout.rows.len() {
+            for column in 0..=2 {
+                let (_, byte) = layout
+                    .logical_position_for_visual(row, column)
+                    .expect("row exists");
+                assert!(text.is_char_boundary(byte));
+                assert!(UnicodeSegmentation::grapheme_indices(text.as_str(), true)
+                    .map(|(index, _)| index)
+                    .chain(std::iter::once(text.len()))
+                    .any(|boundary| boundary == byte));
+            }
         }
     }
 }
