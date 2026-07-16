@@ -145,12 +145,12 @@ mod tests {
     // in tui::events still works after the EventBus module is introduced.
     #[test]
     fn existing_events_tests_still_pass() {
-        let (tx, rx) = crate::events::cowd_event_channel();
+        let (tx, mut rx) = crate::events::cowd_event_channel();
         tx.send(CowdEvent::TextDelta {
             text: "backward-compat".into(),
         })
         .unwrap();
-        let event = rx.recv().unwrap();
+        let event = rx.try_recv().unwrap();
         assert!(matches!(event, CowdEvent::TextDelta { text } if text == "backward-compat"));
     }
 

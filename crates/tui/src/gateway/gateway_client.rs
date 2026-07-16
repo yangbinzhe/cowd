@@ -1,12 +1,11 @@
 use std::fmt;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
-use std::sync::mpsc;
 use std::time::Duration;
 
 use futures::StreamExt;
 
-use crate::CowdEvent;
+use crate::{events::CowdEventSender, CowdEvent};
 
 const GATEWAY_READY_RETRY_ATTEMPTS: usize = 20;
 const GATEWAY_READY_RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -454,7 +453,7 @@ impl GatewayApiClient {
     pub async fn subscribe_session_events(
         &self,
         session_id: &str,
-        tx: mpsc::SyncSender<CowdEvent>,
+        tx: CowdEventSender,
         after_commit_cursor: Option<u64>,
     ) -> Result<Option<u64>, GatewayApiError> {
         let suffix = after_commit_cursor
@@ -713,7 +712,7 @@ impl GatewayApiClient {
         execution_id: &str,
         after_cursor: u64,
         full: bool,
-        tx: mpsc::SyncSender<CowdEvent>,
+        tx: CowdEventSender,
     ) -> Result<u64, GatewayApiError> {
         let scope = if full { "full" } else { "summary" };
         let url = format!(

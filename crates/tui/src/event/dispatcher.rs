@@ -5,7 +5,7 @@
 
 use super::{ComponentId, EventPriority, RoutedEvent};
 use std::collections::BinaryHeap;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc;
 use std::sync::Mutex;
 
@@ -32,6 +32,7 @@ pub struct EventBus {
     receiver: Mutex<mpsc::Receiver<RoutedEvent>>,
     /// Monotonically increasing sequence counter for FIFO ordering.
     next_seq: AtomicU64,
+    state_changed: AtomicBool,
 }
 
 impl EventBus {
@@ -43,6 +44,7 @@ impl EventBus {
             sender: tx,
             receiver: Mutex::new(rx),
             next_seq: AtomicU64::new(0),
+            state_changed: AtomicBool::new(false),
         }
     }
 
@@ -60,6 +62,18 @@ impl EventBus {
     /// This call never blocks (unbounded mpsc channel).
     pub fn send(&self, event: crossterm::event::Event, priority: EventPriority) {
         self.send_targeted(ComponentId::broadcast(), event, priority);
+    }
+
+    /// A typed internal notification for App/projection changes.  It replaces
+    /// the historical fake terminal resize event, so a real resize can never
+    /// be confused with a data-change signal.
+    pub fn notify_state_changed(&self) {
+        self.state_changed.store(true, AtomicOrdering::Release);
+    }
+
+    #[must_use]
+    pub fn take_state_changed(&self) -> bool {
+        self.state_changed.swap(false, AtomicOrdering::AcqRel)
     }
 
     /// Fire-and-forget event addressed to a specific component.

@@ -83,7 +83,7 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let (tui_tx, tui_rx) = cowd_event_channel();
+    let (tui_tx, mut tui_rx) = cowd_event_channel();
     let session_id = config.session_id.clone();
     let display_model = config
         .model
@@ -158,6 +158,10 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                     }
                     if let Event::Key(key) = event {
                         if key.kind == KeyEventKind::Press {
+                            // Keyboard input is a render cause even when it
+                            // only changes the composer buffer (which is not
+                            // part of the timeline version counter).
+                            state.app.mark_dirty();
                             if state.picker_active {
                                 state.open_session_picker_dialog();
                             }
@@ -269,19 +273,24 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                 }
                 _ = tokio::time::sleep(Duration::from_millis(16)) => {
                     drain_cowd_events_state(
-                        &tui_rx,
+                        &mut tui_rx,
                         &mut state,
                         &gateway_client,
                         &tui_tx,
                         &mut execution_projection_stream,
                     ).await;
                     state.update_startup_phase(startup_ready);
-                    if state.turn_interaction.is_active() {
+                    if state.app.turn_is_active() {
                         state.tick();
                     }
                 }
             }
-            terminal.draw(|frame| state.render(frame))?;
+            // Do not redraw a quiescent terminal at a fixed 16 ms cadence.
+            // Active runs still tick for elapsed/status feedback; input and
+            // state changes advance `msg_version` above.
+            if state.app.last_drawn_version != state.app.msg_version || state.app.turn_is_active() {
+                terminal.draw(|frame| state.render(frame))?;
+            }
         }
         Ok::<(), Box<dyn std::error::Error>>(())
     });
@@ -786,14 +795,14 @@ fn dispatch_execution_projection_command(
 }
 
 async fn drain_cowd_events_state(
-    rx: &crate::CowdEventReceiver,
+    rx: &mut crate::CowdEventReceiver,
     state: &mut TuiState,
     gateway_client: &GatewayApiClient,
     event_tx: &CowdEventSender,
     execution_projection_stream: &mut Option<String>,
 ) {
     let mut count = 0;
-    let limit = if state.turn_active { 64 } else { 256 };
+    let limit = if state.app.turn_is_active() { 64 } else { 256 };
     while let Ok(event) = rx.try_recv() {
         let execution_id = match &event {
             CowdEvent::ExecutionGraphSummary { summary } => summary.graph_id.clone(),
