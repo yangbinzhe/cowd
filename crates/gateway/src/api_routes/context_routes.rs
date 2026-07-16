@@ -4,7 +4,7 @@ use axum::{
     extract::{Path, Query, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
@@ -28,6 +28,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             get(get_context_recommendation_stats).post(record_context_recommendation_action),
         )
         .route("/api/evidence/resolve", get(resolve_evidence_ref_handler))
+        .route(
+            "/api/evidence/resolve/batch",
+            post(resolve_evidence_refs_batch_handler),
+        )
         .route(
             "/api/evidence/projections",
             get(list_evidence_audit_projections),
@@ -60,6 +64,15 @@ struct ContextRecommendationActionRequest {
     action: String,
     #[serde(default)]
     note: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct EvidenceBatchResolveRequest {
+    refs: Vec<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    snippet_bytes: Option<usize>,
 }
 
 fn default_context_recommendation_action() -> String {
@@ -214,6 +227,69 @@ async fn resolve_evidence_ref_handler(
         .await
         .map(Json)
         .map_err(context_service_error)
+}
+
+async fn resolve_evidence_refs_batch_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(request): Json<EvidenceBatchResolveRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let refs = request
+        .refs
+        .into_iter()
+        .map(|reference| reference.trim().to_string())
+        .filter(|reference| !reference.is_empty())
+        .collect::<Vec<_>>();
+    if refs.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "at least one evidence ref is required".to_string(),
+            }),
+        ));
+    }
+    if refs.len() > 100 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "evidence batch is limited to 100 refs".to_string(),
+            }),
+        ));
+    }
+    let session_id = request
+        .session_id
+        .or_else(|| state.list_active_session_ids().into_iter().next());
+    let mut items = Vec::with_capacity(refs.len());
+    for reference in refs {
+        let resolved = state
+            .services
+            .context
+            .resolve_evidence_ref_with_snippet(
+                &state.services.session,
+                &state.services.connector,
+                &state.workspace_root,
+                &reference,
+                session_id.as_deref(),
+                request.snippet_bytes,
+            )
+            .await;
+        match resolved {
+            Ok(evidence) => items.push(serde_json::json!({
+                "ref": reference,
+                "status": if evidence.get("available").and_then(serde_json::Value::as_bool) == Some(false) { "unavailable" } else { "resolved" },
+                "evidence": evidence,
+            })),
+            Err(error) => items.push(serde_json::json!({
+                "ref": reference,
+                "status": "unavailable",
+                "error": error.message(),
+            })),
+        }
+    }
+    Ok(Json(serde_json::json!({
+        "kind": "evidence_batch_projection",
+        "count": items.len(),
+        "items": items,
+    })))
 }
 
 async fn list_evidence_audit_projections(

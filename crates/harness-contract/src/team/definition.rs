@@ -458,11 +458,11 @@ fn validate_dependencies(
             .entry(dependency.from_role_id.as_str())
             .or_default()
             .push(dependency.to_role_id.as_str());
-        let Some(target) = indegree.get_mut(dependency.to_role_id.as_str()) else {
-            return Err(ValidationError::InvalidContract {
-                message: "declared team role disappeared while validating dependencies".to_string(),
-            });
-        };
+        let target = indegree
+            .get_mut(dependency.to_role_id.as_str())
+            .ok_or_else(|| ValidationError::InvalidContract {
+                message: "team dependency target disappeared during validation".to_string(),
+            })?;
         *target += 1;
     }
 
@@ -474,12 +474,12 @@ fn validate_dependencies(
     while let Some(role_id) = frontier.pop() {
         visited += 1;
         for target in outgoing.get(role_id).into_iter().flatten() {
-            let Some(count) = indegree.get_mut(target) else {
-                return Err(ValidationError::InvalidContract {
-                    message: "declared team role disappeared while traversing dependencies"
-                        .to_string(),
-                });
-            };
+            let count =
+                indegree
+                    .get_mut(target)
+                    .ok_or_else(|| ValidationError::InvalidContract {
+                        message: "team dependency edge points to an undeclared role".to_string(),
+                    })?;
             *count -= 1;
             if *count == 0 {
                 frontier.push(target);

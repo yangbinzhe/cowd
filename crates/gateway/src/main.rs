@@ -5179,6 +5179,34 @@ mod tests {
         }
     }
 
+    struct EnvVarGuard {
+        name: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let original = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, original }
+        }
+
+        fn remove(name: &'static str) -> Self {
+            let original = std::env::var_os(name);
+            std::env::remove_var(name);
+            Self { name, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+
     fn env_lock() -> MutexGuard<'static, ()> {
         crate::test_process_env_lock()
     }
@@ -6568,16 +6596,14 @@ mod tests {
         fs::create_dir_all(&root).expect("root dir");
         let config_home = root.join("config");
         fs::create_dir_all(&config_home).expect("config home dir");
-        std::env::set_var("COWD_CONFIG_HOME", &config_home);
-        std::env::remove_var("ANTHROPIC_MODEL");
-        std::env::set_var("ANTHROPIC_MODEL", "claude-sonnet-4-6");
+        let _config_home = EnvVarGuard::set("COWD_CONFIG_HOME", &config_home);
+        let _cowd_model = EnvVarGuard::remove("COWD_MODEL");
+        let _anthropic_model = EnvVarGuard::set("ANTHROPIC_MODEL", "claude-sonnet-4-6");
 
         let resolved = with_current_dir(&root, || resolve_tui_model(DEFAULT_MODEL.to_string()));
 
         assert_eq!(resolved, "claude-sonnet-4-6");
 
-        std::env::remove_var("ANTHROPIC_MODEL");
-        std::env::remove_var("COWD_CONFIG_HOME");
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
@@ -6585,19 +6611,18 @@ mod tests {
     #[ignore = "serial global env/provider test; run scripts/test/gateway-global-env.sh"]
     fn resolve_tui_model_returns_default_when_env_unset_and_no_config() {
         let _guard = env_lock();
-        let _cfg_guard = ConfigHomeGuard::new();
         let root = temp_dir();
         fs::create_dir_all(&root).expect("root dir");
         let config_home = root.join("config");
         fs::create_dir_all(&config_home).expect("config home dir");
-        std::env::set_var("COWD_CONFIG_HOME", &config_home);
-        std::env::remove_var("ANTHROPIC_MODEL");
+        let _config_home = EnvVarGuard::set("COWD_CONFIG_HOME", &config_home);
+        let _cowd_model = EnvVarGuard::remove("COWD_MODEL");
+        let _anthropic_model = EnvVarGuard::remove("ANTHROPIC_MODEL");
 
         let resolved = with_current_dir(&root, || resolve_tui_model(DEFAULT_MODEL.to_string()));
 
         assert_eq!(resolved, DEFAULT_MODEL);
 
-        std::env::remove_var("COWD_CONFIG_HOME");
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
@@ -8239,7 +8264,6 @@ UU conflicted.rs",
         assert!(!rendered.contains("step 1"));
     }
 
-    #[ignore]
     #[test]
     fn runtime_bootstrap_state_merges_plugin_hooks_into_runtime_features() {
         let config_home = temp_dir();
@@ -8472,13 +8496,13 @@ UU conflicted.rs",
         let _ = fs::remove_dir_all(workspace);
     }
 
-    #[ignore]
     #[test]
     fn create_runtime_entry_runs_plugin_lifecycle_init_and_shutdown() {
         // Serialize access to process-wide env vars so parallel tests that
         // set/remove ANTHROPIC_API_KEY do not race with this test.
         let _guard = env_lock();
         let config_home = temp_dir();
+        let original_api_key = std::env::var_os("ANTHROPIC_API_KEY");
         // Inject a dummy API key so runtime construction succeeds without real credentials.
         // This test only exercises plugin lifecycle (init/shutdown), never calls the API.
         std::env::set_var("ANTHROPIC_API_KEY", "test-dummy-key-for-plugin-lifecycle");
@@ -8550,7 +8574,10 @@ UU conflicted.rs",
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(source_root);
-        std::env::remove_var("ANTHROPIC_API_KEY");
+        match original_api_key {
+            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        }
     }
 
     #[test]

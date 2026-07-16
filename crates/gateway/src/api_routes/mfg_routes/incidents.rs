@@ -152,6 +152,11 @@ pub(super) async fn mfg_incident_room_handler(
         .open_store(&state.config_home)
         .and_then(|store| store.workflow_graph_for_incident(&id))
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let assignments = state
+        .services
+        .mfg
+        .list_assignments(&state.config_home, None, Some(&id), 100)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.incident_room",
         "incident": incident,
@@ -162,6 +167,8 @@ pub(super) async fn mfg_incident_room_handler(
         "memory_cases": memory_cases,
         "playbooks": playbooks,
         "workflow_graph": workflow_graph,
+        "canonical_task_ref": incident.task_id.as_ref().map(|task_id| format!("task:{task_id}")),
+        "assignments": assignments,
     })))
 }
 
@@ -434,8 +441,10 @@ pub(super) async fn mfg_analysis_get_handler(
 pub(super) async fn mfg_action_execute_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath((analysis_id, action_id)): AxumPath<(String, String)>,
-    Json(request): Json<MfgActionExecutionRequest>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Json(intent): Json<MfgActionExecutionIntent>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let request = intent.into_request(principal_actor_id(&principal));
     let execution = state
         .services
         .mfg

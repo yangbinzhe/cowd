@@ -274,7 +274,10 @@ pub(crate) fn build_plugin_manager(
     let plugin_settings = runtime_config.plugins();
     let mut plugin_config = PluginManagerConfig::new(loader.config_home().to_path_buf());
     plugin_config.enabled_plugins = plugin_settings.enabled_plugins().clone();
-    let state_path = runtime::cowd_dirs::config_home_dir().join("plugin-state.json");
+    // The loader's config home is the authoritative scope for installed-plugin
+    // state. Reading the process-global default here made custom profiles and
+    // test workspaces silently lose their enabled plugins.
+    let state_path = loader.config_home().join("plugin-state.json");
     if let Ok(content) = std::fs::read_to_string(&state_path) {
         if !content.trim().is_empty() {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {

@@ -11,7 +11,8 @@ use harness_contract::agent::{
     ReleaseAssignmentStatus, ReleaseAuthorization, ReleaseChannel, RevisionSelector,
 };
 use harness_contract::team::{
-    TeamTemplateDefinitionId, TeamTemplateRevisionRef, TeamTopologyContract,
+    TeamRoleDefinition, TeamRoleDependency, TeamTemplateDefinitionId, TeamTemplateRevisionRef,
+    TeamTopologyContract,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -48,6 +49,10 @@ pub struct RuntimeTeamTemplateCatalogEntry {
     pub name: String,
     pub topology: TeamTopologyContract,
     pub role_count: usize,
+    #[serde(default)]
+    pub roles: Vec<TeamRoleDefinition>,
+    #[serde(default)]
+    pub dependencies: Vec<TeamRoleDependency>,
     pub result_fields: Vec<String>,
 }
 
@@ -282,6 +287,8 @@ impl RuntimeDefinitionRegistry {
                 name: manifest.name.clone(),
                 topology: manifest.topology.clone(),
                 role_count: manifest.roles.len(),
+                roles: manifest.roles.clone(),
+                dependencies: manifest.dependencies.clone(),
                 result_fields: manifest.result_contract.required_fields.clone(),
             });
         }

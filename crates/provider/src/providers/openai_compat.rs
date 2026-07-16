@@ -876,7 +876,7 @@ impl StreamState {
             .map(ToolCallState::block_index)
             .max();
         if self.reasoning_started {
-            highest = Some(highest.unwrap_or(0));
+            highest = Some(highest.unwrap_or_default());
         }
         if self.text_started {
             highest = Some(highest.unwrap_or(0).max(self.reasoning_started as u32));
