@@ -18,7 +18,8 @@ pub use repository::{
     MatrixRepository, MatrixRepositoryConfig, MatrixRepositoryError, MatrixRepositoryHandle,
 };
 pub use sqlite_repository::{
-    MatrixHealth, MatrixMetricRecomputeResult, MatrixSqliteRepository, MatrixSqliteRepositoryError,
+    MatrixHealth, MatrixMetricRecomputeResult, MatrixRevisioned, MatrixSqliteRepository,
+    MatrixSqliteRepositoryError,
 };
 
 pub fn open_matrix_sqlite_repository(

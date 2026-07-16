@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use super::source::MatrixSourceSnapshot;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixSnapshotRef {
     pub snapshot_id: String,
     pub snapshot_ref: String,
@@ -42,7 +42,7 @@ impl MatrixSnapshotRef {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixScenarioOutputContract {
     pub required_outputs: Vec<String>,
     pub evidence_required: bool,
@@ -64,7 +64,7 @@ impl MatrixScenarioOutputContract {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixScenarioSpec {
     pub scenario_id: String,
     pub base_snapshot: MatrixSnapshotRef,
@@ -106,7 +106,7 @@ impl MatrixScenarioSpec {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MatrixScenarioRunStatus {
     Running,
@@ -115,7 +115,7 @@ pub enum MatrixScenarioRunStatus {
     Cancelled,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixScenarioRun {
     pub run_id: String,
     pub scenario_id: String,
@@ -157,7 +157,7 @@ impl MatrixScenarioRun {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixScenarioResult {
     pub result_id: String,
     pub run_id: String,

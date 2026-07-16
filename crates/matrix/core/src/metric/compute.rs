@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixComputeJobInput {
     #[serde(default)]
     pub job_id: Option<String>,
@@ -19,7 +19,7 @@ pub struct MatrixComputeJobInput {
     pub priority: Option<f32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixComputeJob {
     pub job_id: String,
     pub trigger_fact_type: String,
@@ -63,7 +63,7 @@ impl MatrixComputeJob {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixComputePlan {
     pub job: MatrixComputeJob,
     #[serde(default)]

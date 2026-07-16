@@ -6,7 +6,7 @@ use matrix_core::MatrixEvidencePacket;
 
 use super::{MfgIncident, MfgOperationalAnalysis};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgSkillExecutionContext {
     pub incident_id: String,
     pub skill_id: String,
@@ -22,7 +22,7 @@ pub struct MfgSkillExecutionContext {
     pub metric_keys: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgSkillToolCall {
     pub tool_name: String,
     pub purpose: String,
@@ -31,7 +31,7 @@ pub struct MfgSkillToolCall {
     pub expected_output: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgSkillTelemetry {
     pub started_at: DateTime<Utc>,
     pub completed_at: DateTime<Utc>,
@@ -41,7 +41,7 @@ pub struct MfgSkillTelemetry {
     pub confidence: f32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgSkillManifest {
     pub skill_id: String,
     pub role: String,
@@ -61,7 +61,7 @@ pub struct MfgSkillManifest {
     pub success_criteria: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgSkillPlan {
     pub incident_id: String,
     #[serde(default)]
@@ -72,7 +72,7 @@ pub struct MfgSkillPlan {
     pub planned_agent_nodes: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgSkillRun {
     #[serde(default)]
     pub execution_id: Option<String>,

@@ -14,7 +14,8 @@ use super::capability_contract::{
 };
 use super::route_manifest::gateway_route_manifest;
 use super::{
-    authenticated_human_principal, cookie_value, issue_web_session, web_session_principal,
+    authenticated_human_principal_for_surface, cookie_value, issue_web_session,
+    surface_capability_inventory, validate_surface_capability_request, web_session_principal,
     AppState, ErrorResponse, WEB_SESSION_COOKIE,
 };
 
@@ -110,6 +111,10 @@ async fn openai_tools_handler() -> Json<serde_json::Value> {
 #[derive(Deserialize)]
 struct LoginRequest {
     token: String,
+    #[serde(default)]
+    surface_id: Option<String>,
+    #[serde(default)]
+    requested_capabilities: Vec<String>,
 }
 
 async fn login_handler(
@@ -124,7 +129,31 @@ async fn login_handler(
             }),
         )),
         Some(expected) if expected == &body.token => {
-            let session = issue_web_session(&state.config_home, &body.token).map_err(|error| {
+            let surface_id = body
+                .surface_id
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("legacy_gateway");
+            let allowed = surface_capability_inventory(surface_id);
+            let requested_capabilities = if body.requested_capabilities.is_empty() {
+                allowed
+            } else {
+                let mut requested =
+                    validate_surface_capability_request(surface_id, body.requested_capabilities)
+                        .map_err(|error| {
+                            (StatusCode::BAD_REQUEST, Json(ErrorResponse { error }))
+                        })?;
+                requested.sort();
+                requested.dedup();
+                requested
+            };
+            let (session, entitlement) = issue_web_session(
+                &state.config_home,
+                &body.token,
+                surface_id,
+                requested_capabilities,
+            )
+            .map_err(|error| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse {
@@ -150,6 +179,8 @@ async fn login_handler(
                     "success": true,
                     "auth_required": true,
                     "session_kind": "broker_signed_http_only_cookie",
+                    "surface_id": surface_id,
+                    "entitlement": entitlement,
                 })),
             ))
         }
@@ -182,7 +213,13 @@ async fn verify_handler(
 
     match auth_header {
         Some(value) if value == format!("Bearer {auth_token}") => {
-            authenticated_human_principal(&state.config_home, auth_token).map_err(|error| {
+            let (_, entitlement) = authenticated_human_principal_for_surface(
+                &state.config_home,
+                auth_token,
+                "legacy_gateway",
+                surface_capability_inventory("legacy_gateway"),
+            )
+            .map_err(|error| {
                 (
                     StatusCode::UNAUTHORIZED,
                     Json(ErrorResponse {
@@ -194,22 +231,39 @@ async fn verify_handler(
                 "valid": true,
                 "auth_required": true,
                 "transport": "bearer",
+                "entitlement": entitlement,
             })))
         }
         _ if cookie_value(&headers, WEB_SESSION_COOKIE).is_some() => {
-            web_session_principal(&state.config_home, &headers, state.auth_token.as_deref())
-                .map_err(|error| {
-                    (
-                        StatusCode::UNAUTHORIZED,
-                        Json(ErrorResponse {
-                            error: format!("invalid_browser_session:{error}"),
-                        }),
-                    )
-                })?;
+            let principal =
+                web_session_principal(&state.config_home, &headers, state.auth_token.as_deref())
+                    .map_err(|error| {
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            Json(ErrorResponse {
+                                error: format!("invalid_browser_session:{error}"),
+                            }),
+                        )
+                    })?;
+            let (_, entitlement) = authenticated_human_principal_for_surface(
+                &state.config_home,
+                auth_token,
+                "legacy_gateway",
+                principal.claims().capabilities.clone(),
+            )
+            .map_err(|error| {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(ErrorResponse {
+                        error: format!("browser_session_entitlement_error:{error}"),
+                    }),
+                )
+            })?;
             Ok(Json(serde_json::json!({
                 "valid": true,
                 "auth_required": true,
                 "transport": "browser_session",
+                "entitlement": entitlement,
             })))
         }
         _ => Err((

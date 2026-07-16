@@ -134,6 +134,72 @@ pub(crate) fn gateway_openapi_document() -> Value {
             openapi_operation(capability),
         );
     }
+    let mut schemas = Map::new();
+    schemas.insert(
+        "GatewayError".to_string(),
+        json!({
+            "type": "object",
+            "properties": {
+                "error": {"type": "string"}
+            },
+            "required": ["error"]
+        }),
+    );
+    for (name, schema) in [
+        (
+            "ExecutionProjectionEntity",
+            execution_projection_entity_schema(),
+        ),
+        (
+            "ExecutionNodeProjection",
+            execution_node_projection_schema(),
+        ),
+        (
+            "ExecutionEdgeProjection",
+            execution_edge_projection_schema(),
+        ),
+        ("ExecutionParentBinding", execution_parent_binding_schema()),
+        (
+            "ExecutionGraphProjection",
+            execution_graph_projection_schema(),
+        ),
+        (
+            "ChildExecutionProjection",
+            child_execution_projection_schema(),
+        ),
+        ("ContextComponentUsage", context_component_usage_schema()),
+        ("ContextUsageProjection", context_usage_projection_schema()),
+        ("RunMetricsProjection", run_metrics_projection_schema()),
+        ("ExecutionLiveState", execution_live_state_schema()),
+        ("ExecutionProjection", execution_projection_schema()),
+        (
+            "SessionExecutionIndexProjection",
+            session_execution_index_projection_schema(),
+        ),
+        (
+            "SessionExecutionIndicesProjection",
+            session_execution_indices_projection_schema(),
+        ),
+        ("EvidenceFreshness", evidence_freshness_schema()),
+        ("TurnEvidenceProjection", turn_evidence_projection_schema()),
+        (
+            "SessionEvidenceProjection",
+            session_evidence_projection_schema(),
+        ),
+        ("ProjectionEvent", projection_event_schema()),
+        ("ProjectionDelta", projection_delta_schema()),
+        (
+            "ExecutionCommandRequest",
+            execution_command_request_schema(),
+        ),
+        (
+            "ExecutionCommandReceipt",
+            execution_command_receipt_schema(),
+        ),
+    ] {
+        schemas.insert(name.to_string(), schema);
+    }
+    schemas.extend(mfg_openapi_components());
 
     json!({
         "openapi": "3.1.0",
@@ -151,35 +217,7 @@ pub(crate) fn gateway_openapi_document() -> Value {
                     "scheme": "bearer"
                 }
             },
-            "schemas": {
-                "GatewayError": {
-                    "type": "object",
-                    "properties": {
-                        "error": {"type": "string"}
-                    },
-                    "required": ["error"]
-                },
-                "ExecutionProjectionEntity": execution_projection_entity_schema(),
-                "ExecutionNodeProjection": execution_node_projection_schema(),
-                "ExecutionEdgeProjection": execution_edge_projection_schema(),
-                "ExecutionParentBinding": execution_parent_binding_schema(),
-                "ExecutionGraphProjection": execution_graph_projection_schema(),
-                "ChildExecutionProjection": child_execution_projection_schema(),
-                "ContextComponentUsage": context_component_usage_schema(),
-                "ContextUsageProjection": context_usage_projection_schema(),
-                "RunMetricsProjection": run_metrics_projection_schema(),
-                "ExecutionLiveState": execution_live_state_schema(),
-                "ExecutionProjection": execution_projection_schema(),
-                "SessionExecutionIndexProjection": session_execution_index_projection_schema(),
-                "SessionExecutionIndicesProjection": session_execution_indices_projection_schema(),
-                "EvidenceFreshness": evidence_freshness_schema(),
-                "TurnEvidenceProjection": turn_evidence_projection_schema(),
-                "SessionEvidenceProjection": session_evidence_projection_schema(),
-                "ProjectionEvent": projection_event_schema(),
-                "ProjectionDelta": projection_delta_schema(),
-                "ExecutionCommandRequest": execution_command_request_schema(),
-                "ExecutionCommandReceipt": execution_command_receipt_schema()
-            }
+            "schemas": Value::Object(schemas)
         },
         "paths": Value::Object(paths),
         "x-cowd-contract": {
@@ -190,6 +228,75 @@ pub(crate) fn gateway_openapi_document() -> Value {
             "coverage": contract.coverage
         }
     })
+}
+
+fn mfg_openapi_components() -> Map<String, Value> {
+    let mut registry = app_mfg_contract::MfgOpenApiSchemaRegistry::canonical();
+    super::mfg_routes::register_mfg_openapi_schemas(&mut registry);
+    registry.register_type::<app_mfg::MfgApplicationDescriptor>("MfgApplicationDescriptor");
+    registry.register_type::<app_mfg::MfgIncident>("MfgIncident");
+    registry.register_type::<app_mfg::MfgOperationalAnalysis>("MfgOperationalAnalysis");
+    registry.register_type::<app_mfg::MfgActionExecution>("MfgActionExecution");
+    registry.register_type::<app_mfg::MfgActionFeedback>("MfgActionFeedback");
+    registry.register_type::<app_mfg::MfgCockpitProfile>("MfgCockpitProfile");
+    registry.register_type::<app_mfg::MfgCockpitProjection>("MfgCockpitProjection");
+    registry.register_type::<app_mfg::MfgCockpitWidgetProjection>("MfgCockpitWidgetProjection");
+    registry.register_type::<app_mfg::MfgCockpitReportSnapshot>("MfgCockpitReportSnapshot");
+    registry
+        .register_type::<app_mfg::MfgCockpitReportDeliveryState>("MfgCockpitReportDeliveryState");
+    registry.register_type::<app_mfg::MfgAlertRule>("MfgAlertRule");
+    registry.register_type::<app_mfg::MfgAlertOccurrence>("MfgAlertOccurrence");
+    registry.register_type::<app_mfg::MfgAlertSubscription>("MfgAlertSubscription");
+    registry.register_type::<app_mfg::MfgAssignment>("MfgAssignment");
+    registry.register_type::<app_mfg::MfgForecastProjection>("MfgForecastProjection");
+    registry.register_type::<app_mfg::MfgSkillManifest>("MfgSkillManifest");
+    registry.register_type::<app_mfg::MfgSkillRun>("MfgSkillRun");
+    registry.register_type::<app_mfg::MfgMemoryCase>("MfgMemoryCase");
+    registry.register_type::<app_mfg::MfgPlaybook>("MfgPlaybook");
+    registry.register_type::<matrix_core::MatrixDataPlaneHealth>("MatrixDataPlaneHealth");
+    registry.register_type::<matrix_core::MatrixDataPlaneIngestPlan>("MatrixDataPlaneIngestPlan");
+    registry.register_type::<matrix_core::MatrixSourcePack>("MatrixSourcePack");
+    registry.register_type::<matrix_core::MatrixSourcePackValidation>("MatrixSourcePackValidation");
+    registry.register_type::<matrix_core::MatrixSourceDeltaPlan>("MatrixSourceDeltaPlan");
+    registry.register_type::<matrix_core::MatrixConnectorRun>("MatrixConnectorRun");
+    registry.register_type::<matrix_core::MatrixMetricDefinition>("MatrixMetricDefinition");
+    registry.register_type::<matrix_core::MatrixMetricSnapshot>("MatrixMetricSnapshot");
+    registry.register_type::<matrix_core::MatrixMetricLineage>("MatrixMetricLineage");
+    registry.register_type::<matrix_core::MatrixMetricAttentionPlan>("MatrixMetricAttentionPlan");
+    registry.register_type::<matrix_core::MatrixComputeJob>("MatrixComputeJob");
+    registry.register_type::<matrix_core::MatrixEntity>("MatrixEntity");
+    registry.register_type::<matrix_core::MatrixRelation>("MatrixRelation");
+    registry.register_type::<matrix_core::MatrixFact>("MatrixFact");
+    registry.register_type::<matrix_core::MatrixChangeEvent>("MatrixChangeEvent");
+    registry.register_type::<matrix_core::MatrixAttentionItem>("MatrixAttentionItem");
+    registry.register_type::<matrix_core::MatrixEvidencePacket>("MatrixEvidencePacket");
+    registry.register_type::<matrix_core::MatrixQualityGateDecision>("MatrixQualityGateDecision");
+
+    for route in app_mfg_contract::mfg_route_contracts() {
+        let response_ref = mfg_response_schema_ref(&route);
+        registry.register_schema(
+            route.response_schema,
+            json!({"$ref": format!("#/components/schemas/{response_ref}")}),
+        );
+        let request_ref = super::mfg_routes::mfg_request_schema_component(route.route_id);
+        registry.register_schema(
+            route.request_schema,
+            json!({"$ref": format!("#/components/schemas/{request_ref}")}),
+        );
+    }
+    registry.into_components().into_iter().collect()
+}
+
+fn mfg_response_schema_ref(route: &app_mfg_contract::MfgRouteContract) -> &'static str {
+    use app_mfg_contract::MfgRouteId as R;
+    match route.route_id {
+        R::ContractGet => "MfgFrontendContractV1",
+        R::AppGet => "MfgApplicationDescriptor",
+        R::ReportReviewList | R::ReportReviewGet => "MfgReportDeliveryReview",
+        R::LiveSnapshot => "MfgLiveEnvelopeV1",
+        _ if matches!(route.class, app_mfg_contract::MfgMutationClass::Read) => "MfgReadResponseV1",
+        _ => "MfgMutationResponseV1",
+    }
 }
 
 pub(crate) fn gateway_openai_tools() -> Value {
@@ -740,7 +847,8 @@ fn openapi_operation(capability: &GatewayCapability) -> Value {
         "operationId".to_string(),
         Value::String(
             stable_metadata
-                .map(|metadata| metadata.operation_id.to_string())
+                .as_ref()
+                .map(|metadata| metadata.operation_id.clone())
                 .unwrap_or_else(|| openapi_operation_id(&capability.id)),
         ),
     );
@@ -769,18 +877,24 @@ fn openapi_operation(capability: &GatewayCapability) -> Value {
         operation.insert("parameters".to_string(), Value::Array(parameters));
     }
     if capability.http.method != "GET" && capability.http.method != "DELETE" {
+        let request_schema =
+            stable_request_schema(capability).unwrap_or_else(|| capability.input_schema.clone());
+        let mut request_content = Map::new();
+        request_content.insert(
+            "application/json".to_string(),
+            json!({"schema": request_schema.clone()}),
+        );
+        if !capability.http.path.starts_with("/api/apps/mfg/") {
+            request_content.insert(
+                "multipart/form-data".to_string(),
+                json!({"schema": request_schema}),
+            );
+        }
         operation.insert(
             "requestBody".to_string(),
             json!({
                 "required": false,
-                "content": {
-                    "application/json": {
-                        "schema": stable_request_schema(capability).unwrap_or_else(|| capability.input_schema.clone())
-                    },
-                    "multipart/form-data": {
-                        "schema": stable_request_schema(capability).unwrap_or_else(|| capability.input_schema.clone())
-                    }
-                }
+                "content": Value::Object(request_content)
             }),
         );
     }
@@ -791,17 +905,37 @@ fn openapi_operation(capability: &GatewayCapability) -> Value {
         "application/json".to_string(),
         json!({"schema": response_schema}),
     );
-    if stable_metadata.is_some_and(|metadata| metadata.streaming) {
+    if stable_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.streaming)
+    {
+        let event_schema = stable_metadata
+            .as_ref()
+            .map(|metadata| metadata.response_schema.as_str())
+            .unwrap_or("ProjectionDelta");
         content.insert(
             "text/event-stream".to_string(),
             json!({
                 "schema": {"type": "string", "format": "event-stream"},
-                "x-cowd-event-schema": {"$ref": "#/components/schemas/ProjectionDelta"}
+                "x-cowd-event-schema": {"$ref": format!("#/components/schemas/{event_schema}")}
             }),
         );
     }
-    operation.insert(
-        "responses".to_string(),
+    let responses = if capability.http.path.starts_with("/api/apps/mfg/") {
+        json!({
+            "200": {
+                "description": "Successful Gateway response",
+                "content": Value::Object(content)
+            },
+            "400": mfg_openapi_error_response("Bad request"),
+            "401": mfg_openapi_error_response("Unauthorized"),
+            "403": mfg_openapi_error_response("Capability or scope denied"),
+            "404": mfg_openapi_error_response("Resource is outside the verified scope"),
+            "409": mfg_openapi_error_response("Revision or idempotency conflict"),
+            "429": mfg_openapi_error_response("Rate limited"),
+            "500": mfg_openapi_error_response("Gateway internal error")
+        })
+    } else {
         json!({
             "200": {
                 "description": "Successful Gateway response",
@@ -810,8 +944,9 @@ fn openapi_operation(capability: &GatewayCapability) -> Value {
             "400": {"description": "Bad request"},
             "401": {"description": "Unauthorized"},
             "500": {"description": "Gateway internal error"}
-        }),
-    );
+        })
+    };
+    operation.insert("responses".to_string(), responses);
     operation.insert(
         "x-cowd".to_string(),
         json!({
@@ -825,6 +960,17 @@ fn openapi_operation(capability: &GatewayCapability) -> Value {
         }),
     );
     Value::Object(operation)
+}
+
+fn mfg_openapi_error_response(description: &str) -> Value {
+    json!({
+        "description": description,
+        "content": {
+            "application/json": {
+                "schema": {"$ref": "#/components/schemas/MfgApiErrorV1"}
+            }
+        }
+    })
 }
 
 fn stable_request_schema(capability: &GatewayCapability) -> Option<Value> {
@@ -1321,6 +1467,75 @@ mod tests {
             command["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
             "#/components/schemas/ExecutionCommandReceipt"
         );
+    }
+
+    #[test]
+    fn active_mfg_openapi_uses_only_named_contract_components() {
+        let document = gateway_openapi_document();
+        let schemas = document["components"]["schemas"]
+            .as_object()
+            .expect("OpenAPI schemas");
+        let active = app_mfg_contract::mfg_route_contracts()
+            .into_iter()
+            .filter(|route| route.availability == app_mfg_contract::MfgActionAvailability::Active)
+            .collect::<Vec<_>>();
+        assert_eq!(active.len(), 99);
+
+        for route in active {
+            let path = openapi_path(&route.path);
+            let method = route.method.to_ascii_lowercase();
+            let operation = &document["paths"][&path][&method];
+            assert!(operation.is_object(), "missing {} {}", route.method, path);
+            let response_ref = operation["responses"]["200"]["content"]["application/json"]
+                ["schema"]["$ref"]
+                .as_str()
+                .expect("MFG response must use a named schema");
+            assert_eq!(
+                response_ref,
+                format!("#/components/schemas/{}", route.response_schema)
+            );
+            assert!(
+                schemas.contains_key(&route.response_schema),
+                "missing response component {}",
+                route.response_schema
+            );
+            let response_alias = &schemas[&route.response_schema];
+            assert!(
+                response_alias.get("$ref").is_some(),
+                "response alias must not be an anonymous object: {}",
+                route.response_schema
+            );
+
+            assert!(
+                schemas.contains_key(&route.request_schema),
+                "missing request component {}",
+                route.request_schema
+            );
+            let request_alias = &schemas[&route.request_schema];
+            assert!(
+                request_alias.get("$ref").is_some(),
+                "request alias must not be an anonymous object: {}",
+                route.request_schema
+            );
+            if route.method != "GET" && route.method != "DELETE" {
+                assert_eq!(
+                    operation["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+                    format!("#/components/schemas/{}", route.request_schema)
+                );
+                assert!(
+                    operation["requestBody"]["content"]
+                        .get("multipart/form-data")
+                        .is_none(),
+                    "MFG route must not advertise an unwired multipart transport"
+                );
+            }
+            for status in ["400", "401", "403", "404", "409", "429", "500"] {
+                assert_eq!(
+                    operation["responses"][status]["content"]["application/json"]["schema"]["$ref"],
+                    "#/components/schemas/MfgApiErrorV1"
+                );
+            }
+        }
     }
 
     #[test]

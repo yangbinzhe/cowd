@@ -19,6 +19,20 @@ pub(crate) struct GatewayRouteManifestEntry {
     pub(crate) stability: &'static str,
     pub(crate) source: String,
     pub(crate) handler: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) mfg: Option<GatewayMfgSemanticMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub(crate) struct GatewayMfgSemanticMetadata {
+    pub(crate) route_id: String,
+    pub(crate) request_schema: String,
+    pub(crate) response_schema: String,
+    pub(crate) class: String,
+    pub(crate) capability: String,
+    pub(crate) risk: String,
+    pub(crate) confirmation: String,
+    pub(crate) emits_live_event: bool,
 }
 
 pub(crate) fn gateway_route_manifest() -> Vec<GatewayRouteManifestEntry> {
@@ -29,26 +43,51 @@ pub(crate) fn gateway_route_manifest() -> Vec<GatewayRouteManifestEntry> {
     // Typed routes are registered through constant specs, so there is no
     // literal `.route("...")` for the build generator to collect.
     for route in execution_projection_route_metadata() {
-        let generated = GeneratedRouteMetadata {
-            method: route.method,
-            path: route.path,
-            source: "route_registry.rs",
-            handler: route.operation_id,
-        };
         // Session execution/evidence routes have literal Axum registrations,
         // so the build-generated inventory already owns their manifest row.
         // The typed metadata enriches OpenAPI response schemas, but must not
         // produce a second public method/path entry with a different source.
         if !entries.iter().any(|entry: &GatewayRouteManifestEntry| {
-            entry.method == generated.method && entry.path == generated.path
+            entry.method == route.method && entry.path == route.path
         }) {
-            entries.insert(manifest_entry(&generated));
+            entries.insert(GatewayRouteManifestEntry {
+                method: route.method,
+                path: route.path,
+                group: "route_registry".to_string(),
+                owner: "gateway",
+                criticality: route_criticality("runtime"),
+                stability: "stable",
+                source: "route_registry.rs".to_string(),
+                handler: route.operation_id,
+                mfg: None,
+            });
         }
     }
     entries.into_iter().collect()
 }
 
 fn manifest_entry(route: &GeneratedRouteMetadata) -> GatewayRouteManifestEntry {
+    let mfg = app_mfg_contract::route::mfg_route_contract_by_method_path(route.method, route.path)
+        .map(|contract| GatewayMfgSemanticMetadata {
+            route_id: contract.route_id.as_str().to_string(),
+            request_schema: contract.request_schema,
+            response_schema: contract.response_schema,
+            class: format!("{:?}", contract.class).to_ascii_lowercase(),
+            capability: match contract.capability {
+                app_mfg_contract::MfgCapabilityRequirement::One { capability } => {
+                    capability.as_str().to_string()
+                }
+                app_mfg_contract::MfgCapabilityRequirement::All { capabilities } => capabilities
+                    .into_iter()
+                    .map(app_mfg_contract::MfgCapabilityId::as_str)
+                    .collect::<Vec<_>>()
+                    .join("+"),
+                app_mfg_contract::MfgCapabilityRequirement::PerAction => "per_action".to_string(),
+            },
+            risk: format!("{:?}", contract.risk).to_ascii_lowercase(),
+            confirmation: format!("{:?}", contract.confirmation).to_ascii_lowercase(),
+            emits_live_event: contract.emits_live_event,
+        });
     GatewayRouteManifestEntry {
         method: route.method,
         path: route.path.to_string(),
@@ -58,6 +97,7 @@ fn manifest_entry(route: &GeneratedRouteMetadata) -> GatewayRouteManifestEntry {
         stability: route_stability(route.path),
         source: route.source.to_string(),
         handler: route.handler.to_string(),
+        mfg,
     }
 }
 
@@ -159,5 +199,21 @@ mod tests {
                 && entry.source == "public_routes.rs"
         }));
         assert!(generated_route_metadata().len() > 50);
+    }
+
+    #[test]
+    fn active_mfg_contract_matches_global_route_inventory_bidirectionally() {
+        let manifest = gateway_route_manifest()
+            .into_iter()
+            .filter(|entry| entry.path.starts_with("/api/apps/mfg/"))
+            .map(|entry| (entry.method.to_string(), entry.path))
+            .collect::<BTreeSet<_>>();
+        let contract = app_mfg_contract::mfg_route_contracts()
+            .into_iter()
+            .filter(|route| route.availability == app_mfg_contract::MfgActionAvailability::Active)
+            .map(|route| (route.method, route.path))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(contract.len(), 99);
+        assert_eq!(manifest, contract);
     }
 }

@@ -23,6 +23,10 @@ pub struct GatewayApiClient {
 pub enum GatewayApiError {
     Http(reqwest::Error),
     Status(reqwest::StatusCode, String),
+    Mfg {
+        status: reqwest::StatusCode,
+        error: app_mfg_contract::MfgApiErrorV1,
+    },
     Url(String),
 }
 
@@ -265,7 +269,7 @@ impl GatewayApiClient {
         let status = response.status();
         let text = response.text().await.map_err(GatewayApiError::Http)?;
         if !status.is_success() {
-            return Err(GatewayApiError::Status(status, text));
+            return Err(gateway_status_error(status, text));
         }
         serde_json::from_str(&text).map_err(|error| GatewayApiError::Url(error.to_string()))
     }
@@ -408,7 +412,7 @@ impl GatewayApiClient {
         let status = response.status();
         let text = response.text().await.map_err(GatewayApiError::Http)?;
         if !status.is_success() {
-            return Err(GatewayApiError::Status(status, text));
+            return Err(gateway_status_error(status, text));
         }
         serde_json::from_str(&text).map_err(|error| GatewayApiError::Url(error.to_string()))
     }
@@ -496,7 +500,7 @@ impl GatewayApiClient {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(GatewayApiError::Status(status, body));
+            return Err(gateway_status_error(status, body));
         }
 
         let mut buffer = String::new();
@@ -753,7 +757,7 @@ impl GatewayApiClient {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(GatewayApiError::Status(status, body));
+            return Err(gateway_status_error(status, body));
         }
 
         let mut buffer = String::new();
@@ -1913,7 +1917,7 @@ impl GatewayApiClient {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(GatewayApiError::Status(status, body));
+            return Err(gateway_status_error(status, body));
         }
         response.json().await.map_err(GatewayApiError::Http)
     }
@@ -1936,7 +1940,7 @@ impl GatewayApiClient {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(GatewayApiError::Status(status, body));
+            return Err(gateway_status_error(status, body));
         }
         response.json().await.map_err(GatewayApiError::Http)
     }
@@ -1959,7 +1963,7 @@ impl GatewayApiClient {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(GatewayApiError::Status(status, body));
+            return Err(gateway_status_error(status, body));
         }
         response.json().await.map_err(GatewayApiError::Http)
     }
@@ -1978,7 +1982,7 @@ impl GatewayApiClient {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(GatewayApiError::Status(status, body));
+            return Err(gateway_status_error(status, body));
         }
         response.json().await.map_err(GatewayApiError::Http)
     }
@@ -1997,7 +2001,7 @@ impl GatewayApiClient {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(GatewayApiError::Status(status, body));
+            return Err(gateway_status_error(status, body));
         }
         response
             .bytes()
@@ -2077,12 +2081,22 @@ fn url_encode(value: &str) -> String {
         .collect()
 }
 
+fn gateway_status_error(status: reqwest::StatusCode, body: String) -> GatewayApiError {
+    match serde_json::from_str::<app_mfg_contract::MfgApiErrorV1>(&body) {
+        Ok(error) => GatewayApiError::Mfg { status, error },
+        Err(_) => GatewayApiError::Status(status, body),
+    }
+}
+
 impl fmt::Display for GatewayApiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Http(err) => write!(f, "Gateway API HTTP failed: {err}"),
             Self::Status(status, body) => {
                 write!(f, "Gateway API returned {status}: {body}")
+            }
+            Self::Mfg { status, error } => {
+                write!(f, "MFG API returned {status}: {}", error.message)
             }
             Self::Url(err) => write!(f, "Gateway API URL error: {err}"),
         }
@@ -2357,6 +2371,25 @@ mod tests {
     #[test]
     fn url_encode_encodes_session_ids() {
         assert_eq!(url_encode("session a/b"), "session%20a%2Fb");
+    }
+
+    #[test]
+    fn typed_mfg_api_errors_are_preserved_for_future_mfg_clients() {
+        let body = serde_json::to_string(&app_mfg_contract::MfgApiErrorV1::capability_denied(
+            "mfg.report.review",
+        ))
+        .expect("MFG error JSON");
+        let error = gateway_status_error(reqwest::StatusCode::FORBIDDEN, body);
+        assert!(matches!(
+            error,
+            GatewayApiError::Mfg {
+                status: reqwest::StatusCode::FORBIDDEN,
+                error: app_mfg_contract::MfgApiErrorV1 {
+                    code: app_mfg_contract::MfgErrorCode::CapabilityDenied,
+                    ..
+                },
+            }
+        ));
     }
 
     #[test]

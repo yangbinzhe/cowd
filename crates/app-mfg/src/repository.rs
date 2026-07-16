@@ -723,6 +723,59 @@ impl MfgRepository {
         record_command_notifications(&connection, idempotency_key, notification_refs)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_mutation_receipt(
+        &self,
+        idempotency_key: &str,
+        actor_principal: &str,
+        action_id: &str,
+        resource_ref: &str,
+        payload_digest: &str,
+    ) -> Result<Option<(app_mfg_contract::MfgReceiptV1, serde_json::Value)>, MfgRepositoryError>
+    {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        find_mutation_receipt(
+            &connection,
+            idempotency_key,
+            actor_principal,
+            action_id,
+            resource_ref,
+            payload_digest,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_mutation_receipt(
+        &self,
+        idempotency_key: &str,
+        actor_principal: &str,
+        action_id: &str,
+        resource_ref: &str,
+        expected_revision: Option<u64>,
+        result_revision: Option<u64>,
+        payload_digest: &str,
+        response: &serde_json::Value,
+    ) -> Result<app_mfg_contract::MfgReceiptV1, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        record_mutation_receipt(
+            &connection,
+            idempotency_key,
+            actor_principal,
+            action_id,
+            resource_ref,
+            expected_revision,
+            result_revision,
+            payload_digest,
+            response,
+        )
+    }
+
     pub fn upsert_entity(&self, entity: &MatrixEntity) -> Result<MatrixEntity, MfgRepositoryError> {
         let connection = self
             .connection
@@ -1939,13 +1992,46 @@ impl MfgRepository {
     pub fn upsert_playbook(
         &self,
         playbook: &MfgPlaybook,
+        expected_revision: Option<u64>,
     ) -> Result<MfgPlaybook, MfgRepositoryError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        insert_playbook(&connection, playbook)?;
-        Ok(playbook.clone())
+        let existing = find_playbook(&connection, &playbook.playbook_id)?;
+        let mut playbook = playbook.clone();
+        match existing {
+            Some(existing) => {
+                if expected_revision != Some(existing.revision) {
+                    return Err(MfgRepositoryError::RevisionConflict {
+                        domain: "playbook".to_string(),
+                        subject_id: playbook.playbook_id.clone(),
+                        expected: expected_revision,
+                        actual: Some(existing.revision),
+                    });
+                }
+                playbook.revision = existing.revision.checked_add(1).ok_or_else(|| {
+                    MfgRepositoryError::CommandRejected(
+                        "playbook revision cannot be advanced further".to_string(),
+                    )
+                })?;
+                playbook.created_at = existing.created_at;
+                playbook.updated_at = Utc::now();
+            }
+            None => {
+                if expected_revision.is_some() {
+                    return Err(MfgRepositoryError::RevisionConflict {
+                        domain: "playbook".to_string(),
+                        subject_id: playbook.playbook_id.clone(),
+                        expected: expected_revision,
+                        actual: None,
+                    });
+                }
+                playbook.revision = 1;
+            }
+        }
+        insert_playbook(&connection, &playbook)?;
+        Ok(playbook)
     }
 
     pub fn get_playbook(
@@ -2089,6 +2175,39 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             domain TEXT NOT NULL,
             subject_ref TEXT NOT NULL,
             receipt_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS mfg_mutation_receipt (
+            receipt_id TEXT PRIMARY KEY,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            actor_principal TEXT NOT NULL,
+            action_id TEXT NOT NULL,
+            resource_ref TEXT NOT NULL,
+            expected_revision INTEGER,
+            result_revision INTEGER,
+            payload_digest TEXT NOT NULL,
+            status TEXT NOT NULL,
+            response_json TEXT NOT NULL,
+            contract_version TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS mfg_mutation_receipt_idempotency_uq
+            ON mfg_mutation_receipt(idempotency_key);
+
+        CREATE TABLE IF NOT EXISTS mfg_mutation_receipt_alias (
+            legacy_idempotency_key TEXT PRIMARY KEY,
+            receipt_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(receipt_id) REFERENCES mfg_mutation_receipt(receipt_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS mfg_mutation_receipt_repair_report (
+            report_id TEXT PRIMARY KEY,
+            idempotency_key TEXT NOT NULL,
+            existing_receipt_json TEXT NOT NULL,
+            incoming_receipt_json TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
 
@@ -2441,7 +2560,8 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_mfg_workflow_graph_status
             ON mfg_workflow_graph(status, updated_at DESC);",
     )?;
-    migrate_mfg_incident_workflow_column(connection)
+    migrate_mfg_incident_workflow_column(connection)?;
+    migrate_mfg_command_receipts(connection)
 }
 
 fn migrate_mfg_incident_workflow_column(connection: &Connection) -> rusqlite::Result<()> {
@@ -2457,6 +2577,200 @@ fn migrate_mfg_incident_workflow_column(connection: &Connection) -> rusqlite::Re
         )?;
     }
     Ok(())
+}
+
+fn migrate_mfg_command_receipts(connection: &Connection) -> rusqlite::Result<()> {
+    let mut statement = connection.prepare(
+        "SELECT idempotency_key, domain, subject_ref, receipt_json, created_at
+         FROM mfg_command_receipt ORDER BY idempotency_key",
+    )?;
+    let legacy = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    if legacy.is_empty() {
+        return Ok(());
+    }
+
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let mut repair_report: Option<(String, String, String)> = None;
+    let migrated = (|| -> rusqlite::Result<()> {
+        for (key, domain, subject_ref, receipt_json, created_at) in legacy {
+            let migrated_alias = connection
+                .query_row(
+                    "SELECT receipt.receipt_id
+                     FROM mfg_mutation_receipt_alias AS alias
+                     JOIN mfg_mutation_receipt AS receipt
+                       ON receipt.receipt_id = alias.receipt_id
+                     WHERE alias.legacy_idempotency_key = ?1",
+                    params![key],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if migrated_alias.is_some() {
+                continue;
+            }
+            let mut receipt =
+                serde_json::from_str::<MfgCommandReceipt>(&receipt_json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            if receipt.action_id.is_empty() || receipt.action_id.ends_with(".upsert") {
+                receipt.action_id = if receipt.command.ends_with(".upsert") {
+                    canonical_upsert_action_id(&domain, &receipt.command, receipt.previous_revision)
+                } else {
+                    canonical_action_id(&domain, &receipt.command)
+                };
+            }
+            if receipt.payload_digest.is_empty() {
+                receipt.payload_digest = stable_payload_digest(&(
+                    domain.as_str(),
+                    subject_ref.as_str(),
+                    &receipt.command,
+                ))
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            }
+            if receipt.contract_version.is_empty() {
+                receipt.contract_version = app_mfg_contract::MFG_CONTRACT_VERSION.to_string();
+            }
+            let encoded = serde_json::to_string(&receipt)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            let existing = connection
+                .query_row(
+                    "SELECT receipt_id, actor_principal, action_id, resource_ref,
+                            payload_digest, response_json, result_revision
+                     FROM mfg_mutation_receipt WHERE idempotency_key = ?1",
+                    params![key],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, Option<i64>>(6)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let target_receipt_id = if let Some((
+                existing_receipt_id,
+                existing_actor,
+                existing_action,
+                existing_resource,
+                existing_digest,
+                existing_response,
+                existing_result_revision,
+            )) = existing
+            {
+                let existing_response_value = serde_json::from_str::<Value>(&existing_response)
+                    .map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            5,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                let incoming_response_value = serde_json::from_str::<Value>(&encoded)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                let same = existing_actor == receipt.actor_ref
+                    && existing_action == receipt.action_id
+                    && existing_resource == subject_ref
+                    && existing_digest == receipt.payload_digest
+                    && existing_result_revision == Some(receipt.current_revision as i64)
+                    && existing_response_value == incoming_response_value;
+                if !same {
+                    repair_report = Some((
+                        key.clone(),
+                        serde_json::json!({
+                            "receipt_id": existing_receipt_id,
+                            "actor_principal": existing_actor,
+                            "action_id": existing_action,
+                            "resource_ref": existing_resource,
+                            "payload_digest": existing_digest,
+                            "result_revision": existing_result_revision,
+                            "response": existing_response_value,
+                        })
+                        .to_string(),
+                        encoded,
+                    ));
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                existing_receipt_id
+            } else {
+                let expected_revision = if receipt.action_id.ends_with(".create") {
+                    None
+                } else {
+                    Some(receipt.previous_revision as i64)
+                };
+                connection.execute(
+                    "INSERT INTO mfg_mutation_receipt (
+                        receipt_id, idempotency_key, actor_principal, action_id, resource_ref,
+                        expected_revision, result_revision, payload_digest, status, response_json,
+                        contract_version, created_at, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'completed', ?9, ?10, ?11, ?11)",
+                    params![
+                        receipt.receipt_id,
+                        key,
+                        receipt.actor_ref,
+                        receipt.action_id,
+                        subject_ref,
+                        expected_revision,
+                        receipt.current_revision as i64,
+                        receipt.payload_digest,
+                        encoded,
+                        receipt.contract_version,
+                        created_at,
+                    ],
+                )?;
+                receipt.receipt_id.clone()
+            };
+            connection.execute(
+                "INSERT INTO mfg_mutation_receipt_alias (
+                    legacy_idempotency_key, receipt_id, created_at
+                 ) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(legacy_idempotency_key) DO UPDATE SET
+                    receipt_id = excluded.receipt_id,
+                    created_at = excluded.created_at",
+                params![key, target_receipt_id, created_at],
+            )?;
+        }
+        Ok(())
+    })();
+    match migrated {
+        Ok(()) => connection.execute_batch("COMMIT"),
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            if let Some((key, existing, incoming)) = repair_report {
+                connection.execute(
+                    "INSERT INTO mfg_mutation_receipt_repair_report (
+                        report_id, idempotency_key, existing_receipt_json,
+                        incoming_receipt_json, created_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        format!("repair-{}", uuid::Uuid::new_v4()),
+                        key,
+                        existing,
+                        incoming,
+                        Utc::now().to_rfc3339(),
+                    ],
+                )?;
+            }
+            Err(error)
+        }
+    }
 }
 
 fn schema_version(connection: &Connection) -> rusqlite::Result<i64> {
@@ -2594,7 +2908,7 @@ fn upsert_cockpit_profile(
         }
         profile.created_at = existing.created_at;
         profile.revision = existing.revision.saturating_add(1);
-    } else if expected_revision.is_some_and(|revision| revision != 0) {
+    } else if expected_revision.is_some() {
         return Err(MfgRepositoryError::RevisionConflict {
             domain: "cockpit_profile".to_string(),
             subject_id: profile.profile_id.clone(),
@@ -2670,7 +2984,7 @@ fn validate_cockpit_profile(profile: &MfgCockpitProfile) -> Result<(), MfgReposi
         "personal" => {
             return Err(MfgRepositoryError::CommandRejected(
                 "personal dashboard scope must not carry scope_ref".to_string(),
-            ))
+            ));
         }
         "team" | "role" | "organization"
             if profile
@@ -2682,12 +2996,12 @@ fn validate_cockpit_profile(profile: &MfgCockpitProfile) -> Result<(), MfgReposi
             return Err(MfgRepositoryError::CommandRejected(format!(
                 "{} dashboard scope requires scope_ref",
                 profile.scope.kind
-            )))
+            )));
         }
         _ => {
             return Err(MfgRepositoryError::CommandRejected(
                 "dashboard scope must be personal, team, role, or organization".to_string(),
-            ))
+            ));
         }
     }
     if !matches!(
@@ -3212,7 +3526,7 @@ fn render_cockpit_widget(
         other => {
             return Err(MfgRepositoryError::CommandRejected(format!(
                 "renderer is not implemented for {other}"
-            )))
+            )));
         }
     };
     let title = instance
@@ -3358,19 +3672,37 @@ fn append_projection_event(
 fn find_command_receipt(
     connection: &Connection,
     key: &str,
-    domain: &str,
-    subject_ref: &str,
+    actor_principal: &str,
+    action_id: &str,
+    resource_ref: &str,
+    payload_digest: &str,
 ) -> Result<Option<MfgCommandReceipt>, MfgRepositoryError> {
-    let value = connection.query_row(
-        "SELECT domain, subject_ref, receipt_json FROM mfg_command_receipt WHERE idempotency_key = ?1",
-        params![key], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
-    ).optional()?;
-    let Some((stored_domain, stored_subject, json)) = value else {
+    let value = connection
+        .query_row(
+            "SELECT actor_principal, action_id, resource_ref, payload_digest, response_json
+         FROM mfg_mutation_receipt WHERE idempotency_key = ?1",
+            params![key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((stored_actor, stored_action, stored_resource, stored_digest, json)) = value else {
         return Ok(None);
     };
-    if stored_domain != domain || stored_subject != subject_ref {
+    if stored_actor != actor_principal
+        || stored_action != action_id
+        || stored_resource != resource_ref
+        || stored_digest != payload_digest
+    {
         return Err(MfgRepositoryError::CommandRejected(
-            "idempotency key is already bound to another command subject".to_string(),
+            "idempotency key is already bound to another actor/action/resource/payload".to_string(),
         ));
     }
     let mut receipt: MfgCommandReceipt = serde_json::from_str(&json)?;
@@ -3378,13 +3710,37 @@ fn find_command_receipt(
     Ok(Some(receipt))
 }
 
+fn command_receipt_snapshot<T: serde::de::DeserializeOwned>(
+    receipt: &MfgCommandReceipt,
+) -> Option<T> {
+    (!receipt.response_snapshot.is_null())
+        .then(|| serde_json::from_value(receipt.response_snapshot.clone()).ok())
+        .flatten()
+}
+
 fn insert_command_receipt(
     connection: &Connection,
     receipt: &MfgCommandReceipt,
 ) -> Result<(), MfgRepositoryError> {
     connection.execute(
-        "INSERT INTO mfg_command_receipt (idempotency_key, domain, subject_ref, receipt_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![receipt.idempotency_key, receipt.domain, receipt.subject_ref, serde_json::to_string(receipt)?, receipt.created_at.to_rfc3339()],
+        "INSERT INTO mfg_mutation_receipt (
+            receipt_id, idempotency_key, actor_principal, action_id, resource_ref,
+            expected_revision, result_revision, payload_digest, status, response_json,
+            contract_version, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'completed', ?9, ?10, ?11, ?11)",
+        params![
+            receipt.receipt_id,
+            receipt.idempotency_key,
+            receipt.actor_ref,
+            receipt.action_id,
+            receipt.subject_ref,
+            receipt.previous_revision as i64,
+            receipt.current_revision as i64,
+            receipt.payload_digest,
+            serde_json::to_string(receipt)?,
+            receipt.contract_version,
+            receipt.created_at.to_rfc3339(),
+        ],
     )?;
     Ok(())
 }
@@ -3395,6 +3751,7 @@ fn mutation_receipt(
     command: &str,
     actor_ref: &str,
     idempotency_key: &str,
+    payload_digest: String,
     previous_revision: u64,
     current_revision: u64,
 ) -> Result<MfgCommandReceipt, MfgRepositoryError> {
@@ -3403,13 +3760,25 @@ fn mutation_receipt(
             "actor and idempotency key are required".to_string(),
         ));
     }
+    let mut action_id = canonical_action_id(domain, command);
+    if command.ends_with(".upsert") {
+        action_id = action_id.trim_end_matches(".upsert").to_string()
+            + if previous_revision == 0 {
+                ".create"
+            } else {
+                ".update"
+            };
+    }
     Ok(MfgCommandReceipt {
         receipt_id: format!("receipt-{}", uuid::Uuid::new_v4()),
         domain: domain.to_string(),
         subject_ref: subject_ref.clone(),
         command: command.to_string(),
+        action_id,
         actor_ref: actor_ref.to_string(),
         idempotency_key: idempotency_key.to_string(),
+        payload_digest,
+        contract_version: app_mfg_contract::MFG_CONTRACT_VERSION.to_string(),
         idempotent_replay: false,
         previous_revision,
         current_revision,
@@ -3419,8 +3788,236 @@ fn mutation_receipt(
             current_revision
         ),
         notification_refs: Vec::new(),
+        response_snapshot: Value::Null,
         created_at: Utc::now(),
     })
+}
+
+fn canonical_action_id(domain: &str, command: &str) -> String {
+    match (domain, command) {
+        ("cockpit", "profile.upsert") => "mfg.cockpit.profile.upsert".to_string(),
+        ("cockpit", "profile.clone") => "mfg.cockpit.profile.clone".to_string(),
+        ("cockpit", "profile.share") => "mfg.cockpit.profile.share".to_string(),
+        ("cockpit", "profile.delete") => "mfg.cockpit.profile.delete".to_string(),
+        ("alert", "rule.upsert") => "mfg.alert_rule.upsert".to_string(),
+        ("alert", "subscription.upsert") => "mfg.alert_subscription.upsert".to_string(),
+        ("assignment", "assignment.upsert") => "mfg.assignment.upsert".to_string(),
+        ("assignment", "requestupdate") => "mfg.assignment.request_update".to_string(),
+        ("alert", command) => format!("mfg.alert.{command}"),
+        ("assignment", command) => format!("mfg.assignment.{command}"),
+        _ => format!("mfg.{domain}.{}", command.replace('_', ".")),
+    }
+}
+
+fn canonical_upsert_action_id(domain: &str, command: &str, previous_revision: u64) -> String {
+    let base = canonical_action_id(domain, command);
+    format!(
+        "{}.{}",
+        base.trim_end_matches(".upsert"),
+        if previous_revision == 0 {
+            "create"
+        } else {
+            "update"
+        }
+    )
+}
+
+fn stable_payload_digest<T: serde::Serialize>(value: &T) -> Result<String, MfgRepositoryError> {
+    use sha2::{Digest, Sha256};
+    let encoded = serde_json::to_vec(value)?;
+    let digest = Sha256::digest(encoded);
+    Ok(format!("sha256:{digest:x}"))
+}
+
+fn stable_upsert_payload_digest<T: serde::Serialize>(
+    resource: &T,
+    expected_revision: Option<u64>,
+    command: &str,
+) -> Result<String, MfgRepositoryError> {
+    let mut resource = serde_json::to_value(resource)?;
+    if let Some(object) = resource.as_object_mut() {
+        for server_owned in [
+            "revision",
+            "created_at",
+            "updated_at",
+            "created_by",
+            "status",
+        ] {
+            object.remove(server_owned);
+        }
+    }
+    stable_payload_digest(&(resource, expected_revision, command))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn find_mutation_receipt(
+    connection: &Connection,
+    idempotency_key: &str,
+    actor_principal: &str,
+    action_id: &str,
+    resource_ref: &str,
+    payload_digest: &str,
+) -> Result<Option<(app_mfg_contract::MfgReceiptV1, serde_json::Value)>, MfgRepositoryError> {
+    let stored = connection
+        .query_row(
+            "SELECT receipt_id, actor_principal, action_id, resource_ref,
+                    expected_revision, result_revision, payload_digest, status,
+                    response_json, contract_version, created_at, updated_at
+             FROM mfg_mutation_receipt WHERE idempotency_key = ?1",
+            params![idempotency_key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        receipt_id,
+        stored_actor,
+        stored_action,
+        stored_resource,
+        expected_revision,
+        result_revision,
+        stored_digest,
+        status,
+        response_json,
+        contract_version,
+        created_at,
+        updated_at,
+    )) = stored
+    else {
+        return Ok(None);
+    };
+    if stored_actor != actor_principal
+        || stored_action != action_id
+        || stored_resource != resource_ref
+        || stored_digest != payload_digest
+    {
+        return Err(MfgRepositoryError::CommandRejected(
+            "idempotency key is already bound to another actor/action/resource/payload".to_string(),
+        ));
+    }
+    let action_id = app_mfg_contract::MfgActionId::parse(&stored_action).ok_or_else(|| {
+        MfgRepositoryError::CommandRejected(format!(
+            "stored receipt action is not in the canonical contract: {stored_action}"
+        ))
+    })?;
+    let parse_time = |value: String| {
+        chrono::DateTime::parse_from_rfc3339(&value)
+            .map(|value| value.with_timezone(&Utc))
+            .map_err(|error| {
+                MfgRepositoryError::CommandRejected(format!(
+                    "stored receipt timestamp is invalid: {error}"
+                ))
+            })
+    };
+    let receipt_status = match status.as_str() {
+        "preview" => app_mfg_contract::MfgReceiptStatus::Preview,
+        "accepted" => app_mfg_contract::MfgReceiptStatus::Accepted,
+        "replayed" => app_mfg_contract::MfgReceiptStatus::Replayed,
+        "conflict" => app_mfg_contract::MfgReceiptStatus::Conflict,
+        "rejected" => app_mfg_contract::MfgReceiptStatus::Rejected,
+        "failed" => app_mfg_contract::MfgReceiptStatus::Failed,
+        _ => app_mfg_contract::MfgReceiptStatus::Completed,
+    };
+    let response = serde_json::from_str::<serde_json::Value>(&response_json)?;
+    Ok(Some((
+        app_mfg_contract::MfgReceiptV1 {
+            receipt_id,
+            idempotency_key: idempotency_key.to_string(),
+            actor_principal: stored_actor,
+            action_id,
+            resource_ref: stored_resource,
+            expected_revision: expected_revision.map(|value| value as u64),
+            result_revision: result_revision.map(|value| value as u64),
+            payload_digest: stored_digest,
+            status: receipt_status,
+            response: response.clone(),
+            contract_version: app_mfg_contract::MfgContractVersion(contract_version),
+            created_at: parse_time(created_at)?,
+            updated_at: parse_time(updated_at)?,
+        },
+        response,
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_mutation_receipt(
+    connection: &Connection,
+    idempotency_key: &str,
+    actor_principal: &str,
+    action_id: &str,
+    resource_ref: &str,
+    expected_revision: Option<u64>,
+    result_revision: Option<u64>,
+    payload_digest: &str,
+    response: &serde_json::Value,
+) -> Result<app_mfg_contract::MfgReceiptV1, MfgRepositoryError> {
+    if let Some((mut receipt, _)) = find_mutation_receipt(
+        connection,
+        idempotency_key,
+        actor_principal,
+        action_id,
+        resource_ref,
+        payload_digest,
+    )? {
+        receipt.status = app_mfg_contract::MfgReceiptStatus::Replayed;
+        return Ok(receipt);
+    }
+    let action_id_value = app_mfg_contract::MfgActionId::parse(action_id).ok_or_else(|| {
+        MfgRepositoryError::CommandRejected(format!(
+            "action is not in the canonical MFG contract: {action_id}"
+        ))
+    })?;
+    let now = Utc::now();
+    let receipt = app_mfg_contract::MfgReceiptV1 {
+        receipt_id: format!("receipt-{}", uuid::Uuid::new_v4()),
+        idempotency_key: idempotency_key.to_string(),
+        actor_principal: actor_principal.to_string(),
+        action_id: action_id_value,
+        resource_ref: resource_ref.to_string(),
+        expected_revision,
+        result_revision,
+        payload_digest: payload_digest.to_string(),
+        status: app_mfg_contract::MfgReceiptStatus::Completed,
+        response: response.clone(),
+        contract_version: app_mfg_contract::MfgContractVersion::default(),
+        created_at: now,
+        updated_at: now,
+    };
+    connection.execute(
+        "INSERT INTO mfg_mutation_receipt (
+            receipt_id, idempotency_key, actor_principal, action_id, resource_ref,
+            expected_revision, result_revision, payload_digest, status, response_json,
+            contract_version, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'completed', ?9, ?10, ?11, ?11)",
+        params![
+            receipt.receipt_id,
+            receipt.idempotency_key,
+            receipt.actor_principal,
+            action_id,
+            receipt.resource_ref,
+            expected_revision.map(|value| value as i64),
+            result_revision.map(|value| value as i64),
+            receipt.payload_digest,
+            serde_json::to_string(response)?,
+            receipt.contract_version.0,
+            now.to_rfc3339(),
+        ],
+    )?;
+    Ok(receipt)
 }
 
 fn upsert_cockpit_profile_receipted(
@@ -3432,31 +4029,45 @@ fn upsert_cockpit_profile_receipted(
     idempotency_key: &str,
 ) -> Result<(MfgCockpitProfile, MfgCommandReceipt), MfgRepositoryError> {
     let subject_ref = format!("mfg:cockpit-profile:{}", profile.profile_id);
-    if let Some(receipt) =
-        find_command_receipt(connection, idempotency_key, "cockpit", &subject_ref)?
-    {
+    let previous_revision = find_cockpit_profile(connection, &profile.profile_id)?
+        .map(|item| item.revision)
+        .unwrap_or_default();
+    let action_id = canonical_upsert_action_id(
+        "cockpit",
+        command,
+        if expected_revision.is_some() { 1 } else { 0 },
+    );
+    let payload_digest = stable_upsert_payload_digest(profile, expected_revision, command)?;
+    if let Some(receipt) = find_command_receipt(
+        connection,
+        idempotency_key,
+        actor_ref,
+        &action_id,
+        &subject_ref,
+        &payload_digest,
+    )? {
         if receipt.actor_ref != actor_ref {
             return Err(MfgRepositoryError::CommandRejected(
                 "idempotency key is bound to another actor".to_string(),
             ));
         }
-        let profile = find_cockpit_profile(connection, &profile.profile_id)?
+        let profile = command_receipt_snapshot(&receipt)
+            .or(find_cockpit_profile(connection, &profile.profile_id)?)
             .ok_or_else(|| MfgRepositoryError::NotFound(profile.profile_id.clone()))?;
         return Ok((profile, receipt));
     }
-    let previous_revision = find_cockpit_profile(connection, &profile.profile_id)?
-        .map(|item| item.revision)
-        .unwrap_or_default();
     let profile = upsert_cockpit_profile(connection, profile, expected_revision)?;
-    let receipt = mutation_receipt(
+    let mut receipt = mutation_receipt(
         "cockpit",
         subject_ref.clone(),
         command,
         actor_ref,
         idempotency_key,
+        payload_digest,
         previous_revision,
         profile.revision,
     )?;
+    receipt.response_snapshot = serde_json::to_value(&profile)?;
     insert_command_receipt(connection, &receipt)?;
     append_projection_event(
         connection,
@@ -3476,15 +4087,23 @@ fn delete_cockpit_profile_receipted(
     idempotency_key: &str,
 ) -> Result<(Option<MfgCockpitProfile>, MfgCommandReceipt), MfgRepositoryError> {
     let subject_ref = format!("mfg:cockpit-profile:{profile_id}");
-    if let Some(receipt) =
-        find_command_receipt(connection, idempotency_key, "cockpit", &subject_ref)?
-    {
+    let action_id = canonical_action_id("cockpit", "profile.delete");
+    let payload_digest = stable_payload_digest(&(profile_id, expected_revision))?;
+    if let Some(receipt) = find_command_receipt(
+        connection,
+        idempotency_key,
+        actor_ref,
+        &action_id,
+        &subject_ref,
+        &payload_digest,
+    )? {
         if receipt.actor_ref != actor_ref {
             return Err(MfgRepositoryError::CommandRejected(
                 "idempotency key is bound to another actor".to_string(),
             ));
         }
-        return Ok((None, receipt));
+        let profile = command_receipt_snapshot(&receipt);
+        return Ok((profile, receipt));
     }
     let profile = find_cockpit_profile(connection, profile_id)?
         .ok_or_else(|| MfgRepositoryError::NotFound(profile_id.to_string()))?;
@@ -3498,15 +4117,17 @@ fn delete_cockpit_profile_receipted(
         "DELETE FROM mfg_cockpit_profile WHERE profile_id = ?1",
         params![profile_id],
     )?;
-    let receipt = mutation_receipt(
+    let mut receipt = mutation_receipt(
         "cockpit",
         subject_ref.clone(),
         "profile.delete",
         actor_ref,
         idempotency_key,
+        payload_digest,
         profile.revision,
         profile.revision,
     )?;
+    receipt.response_snapshot = serde_json::to_value(&profile)?;
     insert_command_receipt(connection, &receipt)?;
     append_projection_event(
         connection,
@@ -3526,30 +4147,45 @@ fn upsert_alert_rule_receipted(
     idempotency_key: &str,
 ) -> Result<(MfgAlertRule, MfgCommandReceipt), MfgRepositoryError> {
     let subject_ref = format!("mfg:alert-rule:{}", rule.rule_id);
-    if let Some(receipt) = find_command_receipt(connection, idempotency_key, "alert", &subject_ref)?
-    {
+    let previous_revision = find_alert_rule(connection, &rule.rule_id)?
+        .map(|item| item.revision)
+        .unwrap_or_default();
+    let action_id = canonical_upsert_action_id(
+        "alert",
+        "rule.upsert",
+        if expected_revision.is_some() { 1 } else { 0 },
+    );
+    let payload_digest = stable_upsert_payload_digest(rule, expected_revision, "rule.upsert")?;
+    if let Some(receipt) = find_command_receipt(
+        connection,
+        idempotency_key,
+        actor_ref,
+        &action_id,
+        &subject_ref,
+        &payload_digest,
+    )? {
         if receipt.actor_ref != actor_ref {
             return Err(MfgRepositoryError::CommandRejected(
                 "idempotency key is bound to another actor".to_string(),
             ));
         }
-        let rule = find_alert_rule(connection, &rule.rule_id)?
+        let rule = command_receipt_snapshot(&receipt)
+            .or(find_alert_rule(connection, &rule.rule_id)?)
             .ok_or_else(|| MfgRepositoryError::NotFound(rule.rule_id.clone()))?;
         return Ok((rule, receipt));
     }
-    let previous_revision = find_alert_rule(connection, &rule.rule_id)?
-        .map(|item| item.revision)
-        .unwrap_or_default();
     let rule = upsert_alert_rule(connection, rule, expected_revision)?;
-    let receipt = mutation_receipt(
+    let mut receipt = mutation_receipt(
         "alert",
         subject_ref.clone(),
         "rule.upsert",
         actor_ref,
         idempotency_key,
+        payload_digest,
         previous_revision,
         rule.revision,
     )?;
+    receipt.response_snapshot = serde_json::to_value(&rule)?;
     insert_command_receipt(connection, &receipt)?;
     append_projection_event(
         connection,
@@ -3569,30 +4205,49 @@ fn upsert_alert_subscription_receipted(
     idempotency_key: &str,
 ) -> Result<(MfgAlertSubscription, MfgCommandReceipt), MfgRepositoryError> {
     let subject_ref = format!("mfg:alert-subscription:{}", subscription.subscription_id);
-    if let Some(receipt) = find_command_receipt(connection, idempotency_key, "alert", &subject_ref)?
-    {
+    let previous_revision = find_alert_subscription(connection, &subscription.subscription_id)?
+        .map(|item| item.revision)
+        .unwrap_or_default();
+    let action_id = canonical_upsert_action_id(
+        "alert",
+        "subscription.upsert",
+        if expected_revision.is_some() { 1 } else { 0 },
+    );
+    let payload_digest =
+        stable_upsert_payload_digest(subscription, expected_revision, "subscription.upsert")?;
+    if let Some(receipt) = find_command_receipt(
+        connection,
+        idempotency_key,
+        actor_ref,
+        &action_id,
+        &subject_ref,
+        &payload_digest,
+    )? {
         if receipt.actor_ref != actor_ref {
             return Err(MfgRepositoryError::CommandRejected(
                 "idempotency key is bound to another actor".to_string(),
             ));
         }
-        let subscription = find_alert_subscription(connection, &subscription.subscription_id)?
+        let subscription = command_receipt_snapshot(&receipt)
+            .or(find_alert_subscription(
+                connection,
+                &subscription.subscription_id,
+            )?)
             .ok_or_else(|| MfgRepositoryError::NotFound(subscription.subscription_id.clone()))?;
         return Ok((subscription, receipt));
     }
-    let previous_revision = find_alert_subscription(connection, &subscription.subscription_id)?
-        .map(|item| item.revision)
-        .unwrap_or_default();
     let subscription = upsert_alert_subscription(connection, subscription, expected_revision)?;
-    let receipt = mutation_receipt(
+    let mut receipt = mutation_receipt(
         "alert",
         subject_ref.clone(),
         "subscription.upsert",
         actor_ref,
         idempotency_key,
+        payload_digest,
         previous_revision,
         subscription.revision,
     )?;
+    receipt.response_snapshot = serde_json::to_value(&subscription)?;
     insert_command_receipt(connection, &receipt)?;
     append_projection_event(
         connection,
@@ -3612,31 +4267,46 @@ fn upsert_assignment_receipted(
     idempotency_key: &str,
 ) -> Result<(MfgAssignment, MfgCommandReceipt), MfgRepositoryError> {
     let subject_ref = format!("mfg:assignment:{}", assignment.assignment_id);
-    if let Some(receipt) =
-        find_command_receipt(connection, idempotency_key, "assignment", &subject_ref)?
-    {
+    let previous_revision = find_assignment(connection, &assignment.assignment_id)?
+        .map(|item| item.revision)
+        .unwrap_or_default();
+    let action_id = canonical_upsert_action_id(
+        "assignment",
+        "assignment.upsert",
+        if expected_revision.is_some() { 1 } else { 0 },
+    );
+    let payload_digest =
+        stable_upsert_payload_digest(assignment, expected_revision, "assignment.upsert")?;
+    if let Some(receipt) = find_command_receipt(
+        connection,
+        idempotency_key,
+        actor_ref,
+        &action_id,
+        &subject_ref,
+        &payload_digest,
+    )? {
         if receipt.actor_ref != actor_ref {
             return Err(MfgRepositoryError::CommandRejected(
                 "idempotency key is bound to another actor".to_string(),
             ));
         }
-        let assignment = find_assignment(connection, &assignment.assignment_id)?
+        let assignment = command_receipt_snapshot(&receipt)
+            .or(find_assignment(connection, &assignment.assignment_id)?)
             .ok_or_else(|| MfgRepositoryError::NotFound(assignment.assignment_id.clone()))?;
         return Ok((assignment, receipt));
     }
-    let previous_revision = find_assignment(connection, &assignment.assignment_id)?
-        .map(|item| item.revision)
-        .unwrap_or_default();
     let assignment = upsert_assignment(connection, assignment, expected_revision)?;
-    let receipt = mutation_receipt(
+    let mut receipt = mutation_receipt(
         "assignment",
         subject_ref.clone(),
         "assignment.upsert",
         actor_ref,
         idempotency_key,
+        payload_digest,
         previous_revision,
         assignment.revision,
     )?;
+    receipt.response_snapshot = serde_json::to_value(&assignment)?;
     insert_command_receipt(connection, &receipt)?;
     append_projection_event(
         connection,
@@ -3655,7 +4325,7 @@ fn record_command_notifications(
 ) -> Result<MfgCommandReceipt, MfgRepositoryError> {
     let value = connection
         .query_row(
-            "SELECT receipt_json FROM mfg_command_receipt WHERE idempotency_key = ?1",
+            "SELECT response_json FROM mfg_mutation_receipt WHERE idempotency_key = ?1",
             params![idempotency_key],
             |row| row.get::<_, String>(0),
         )
@@ -3664,8 +4334,14 @@ fn record_command_notifications(
     let mut receipt: MfgCommandReceipt = serde_json::from_str(&value)?;
     receipt.notification_refs = notification_refs;
     connection.execute(
-        "UPDATE mfg_command_receipt SET receipt_json = ?2 WHERE idempotency_key = ?1",
-        params![idempotency_key, serde_json::to_string(&receipt)?],
+        "UPDATE mfg_mutation_receipt
+         SET response_json = ?2, updated_at = ?3
+         WHERE idempotency_key = ?1",
+        params![
+            idempotency_key,
+            serde_json::to_string(&receipt)?,
+            Utc::now().to_rfc3339()
+        ],
     )?;
     append_projection_event(
         connection,
@@ -3698,7 +4374,7 @@ fn upsert_alert_rule(
             rule.created_at = existing.created_at;
             rule.revision = existing.revision.saturating_add(1);
         }
-        None if expected_revision.is_some_and(|revision| revision != 0) => {
+        None if expected_revision.is_some() => {
             return Err(MfgRepositoryError::RevisionConflict {
                 domain: "alert_rule".to_string(),
                 subject_id: rule.rule_id.clone(),
@@ -3783,13 +4459,13 @@ fn upsert_alert_subscription(
             subscription.created_at = existing.created_at;
             subscription.revision = existing.revision.saturating_add(1);
         }
-        None if expected_revision.is_some_and(|revision| revision != 0) => {
+        None if expected_revision.is_some() => {
             return Err(MfgRepositoryError::RevisionConflict {
                 domain: "alert_subscription".to_string(),
                 subject_id: subscription.subscription_id.clone(),
                 expected: expected_revision,
                 actual: None,
-            })
+            });
         }
         None => {}
     }
@@ -4094,15 +4770,24 @@ fn command_alert(
     input: MfgAlertCommandInput,
 ) -> Result<(MfgAlertOccurrence, MfgCommandReceipt), MfgRepositoryError> {
     let subject_ref = format!("mfg:alert-occurrence:{occurrence_id}");
-    if let Some(receipt) =
-        find_command_receipt(connection, &input.idempotency_key, "alert", &subject_ref)?
-    {
+    let command = format!("{:?}", input.command).to_lowercase();
+    let action_id = canonical_action_id("alert", &command);
+    let payload_digest = stable_payload_digest(&input)?;
+    if let Some(receipt) = find_command_receipt(
+        connection,
+        &input.idempotency_key,
+        &input.actor_ref,
+        &action_id,
+        &subject_ref,
+        &payload_digest,
+    )? {
         if receipt.actor_ref != input.actor_ref {
             return Err(MfgRepositoryError::CommandRejected(
                 "idempotency key is bound to another actor".to_string(),
             ));
         }
-        let occurrence = find_alert_occurrence(connection, occurrence_id)?
+        let occurrence = command_receipt_snapshot(&receipt)
+            .or(find_alert_occurrence(connection, occurrence_id)?)
             .ok_or_else(|| MfgRepositoryError::NotFound(occurrence_id.to_string()))?;
         return Ok((occurrence, receipt));
     }
@@ -4135,19 +4820,22 @@ fn command_alert(
     occurrence.revision = occurrence.revision.saturating_add(1);
     occurrence.updated_at = Utc::now();
     save_alert_occurrence(connection, &occurrence)?;
-    let command = format!("{:?}", input.command).to_lowercase();
     let receipt = MfgCommandReceipt {
         receipt_id: format!("receipt-{}", uuid::Uuid::new_v4()),
         domain: "alert".to_string(),
         subject_ref: subject_ref.clone(),
         command: command.clone(),
+        action_id,
         actor_ref: input.actor_ref,
         idempotency_key: input.idempotency_key,
+        payload_digest,
+        contract_version: app_mfg_contract::MFG_CONTRACT_VERSION.to_string(),
         idempotent_replay: false,
         previous_revision,
         current_revision: occurrence.revision,
         audit_ref: format!("audit://mfg/alert/{occurrence_id}/{}", occurrence.revision),
         notification_refs: Vec::new(),
+        response_snapshot: serde_json::to_value(&occurrence)?,
         created_at: Utc::now(),
     };
     insert_command_receipt(connection, &receipt)?;
@@ -4256,13 +4944,13 @@ fn upsert_assignment(
             assignment.status = existing.status;
             assignment.revision = existing.revision.saturating_add(1);
         }
-        None if expected_revision.is_some_and(|revision| revision != 0) => {
+        None if expected_revision.is_some() => {
             return Err(MfgRepositoryError::RevisionConflict {
                 domain: "assignment".to_string(),
                 subject_id: assignment.assignment_id.clone(),
                 expected: expected_revision,
                 actual: None,
-            })
+            });
         }
         None => {}
     }
@@ -4391,18 +5079,24 @@ fn command_assignment(
     input: MfgAssignmentCommandInput,
 ) -> Result<(MfgAssignment, MfgCommandReceipt), MfgRepositoryError> {
     let subject_ref = format!("mfg:assignment:{assignment_id}");
+    let command = format!("{:?}", input.command).to_lowercase();
+    let action_id = canonical_action_id("assignment", &command);
+    let payload_digest = stable_payload_digest(&input)?;
     if let Some(receipt) = find_command_receipt(
         connection,
         &input.idempotency_key,
-        "assignment",
+        &input.actor_ref,
+        &action_id,
         &subject_ref,
+        &payload_digest,
     )? {
         if receipt.actor_ref != input.actor_ref {
             return Err(MfgRepositoryError::CommandRejected(
                 "idempotency key is bound to another actor".to_string(),
             ));
         }
-        let assignment = find_assignment(connection, assignment_id)?
+        let assignment = command_receipt_snapshot(&receipt)
+            .or(find_assignment(connection, assignment_id)?)
             .ok_or_else(|| MfgRepositoryError::NotFound(assignment_id.to_string()))?;
         return Ok((assignment, receipt));
     }
@@ -4428,6 +5122,8 @@ fn command_assignment(
             | MfgAssignmentCommand::Transfer
             | MfgAssignmentCommand::Unassign
             | MfgAssignmentCommand::Escalate
+            | MfgAssignmentCommand::Start
+            | MfgAssignmentCommand::Complete
     ) && input.actor_ref != assignment.created_by
         && input.actor_ref != assignment.assignee_ref
     {
@@ -4472,18 +5168,41 @@ fn command_assignment(
             assignment.status = "escalated".to_string();
             assignment.priority = "urgent".to_string();
         }
+        MfgAssignmentCommand::Start => {
+            if !matches!(
+                assignment.status.as_str(),
+                "assigned" | "claimed" | "update_requested"
+            ) {
+                return Err(MfgRepositoryError::CommandRejected(format!(
+                    "assignment cannot start from status {}",
+                    assignment.status
+                )));
+            }
+            assignment.status = "in_progress".to_string();
+        }
+        MfgAssignmentCommand::Complete => {
+            if assignment.status != "in_progress" {
+                return Err(MfgRepositoryError::CommandRejected(format!(
+                    "assignment cannot complete from status {}",
+                    assignment.status
+                )));
+            }
+            assignment.status = "completed".to_string();
+        }
     }
     assignment.revision = assignment.revision.saturating_add(1);
     assignment.updated_at = Utc::now();
     save_assignment(connection, &assignment)?;
-    let command = format!("{:?}", input.command).to_lowercase();
     let receipt = MfgCommandReceipt {
         receipt_id: format!("receipt-{}", uuid::Uuid::new_v4()),
         domain: "assignment".to_string(),
         subject_ref: subject_ref.clone(),
         command: command.clone(),
+        action_id,
         actor_ref: input.actor_ref,
         idempotency_key: input.idempotency_key,
+        payload_digest,
+        contract_version: app_mfg_contract::MFG_CONTRACT_VERSION.to_string(),
         idempotent_replay: false,
         previous_revision,
         current_revision: assignment.revision,
@@ -4492,6 +5211,7 @@ fn command_assignment(
             assignment.revision
         ),
         notification_refs: Vec::new(),
+        response_snapshot: serde_json::to_value(&assignment)?,
         created_at: Utc::now(),
     };
     insert_command_receipt(connection, &receipt)?;
@@ -6476,8 +7196,8 @@ fn attention_from_change(
 mod tests {
     use super::*;
     use crate::{
-        default_mfg_widget_instances, MfgAlertRuleInput, MfgAssignmentInput,
-        MfgCockpitProfileInput, MfgCockpitReportDeliveryPayload,
+        default_mfg_widget_instances, MfgAlertRuleInput, MfgAlertSubscriptionInput,
+        MfgAssignmentInput, MfgCockpitProfileInput, MfgCockpitReportDeliveryPayload,
         MfgCockpitReportDeliveryPayloadRequest, MfgCockpitReportDeliveryReceipt,
         MfgCockpitReportDeliveryState, MfgCockpitReportRequest, MfgDashboardScope,
     };
@@ -6518,6 +7238,120 @@ mod tests {
 
         assert!(columns.iter().any(|column| column == "workflow_graph_id"));
         assert!(!columns.iter().any(|column| column == "agent_graph_id"));
+    }
+
+    #[test]
+    fn legacy_receipt_binding_conflict_rolls_back_and_persists_repair_report() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                r"CREATE TABLE mfg_command_receipt (
+                    idempotency_key TEXT PRIMARY KEY,
+                    domain TEXT NOT NULL,
+                    subject_ref TEXT NOT NULL,
+                    receipt_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE mfg_mutation_receipt (
+                    receipt_id TEXT PRIMARY KEY,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    actor_principal TEXT NOT NULL,
+                    action_id TEXT NOT NULL,
+                    resource_ref TEXT NOT NULL,
+                    expected_revision INTEGER,
+                    result_revision INTEGER,
+                    payload_digest TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    response_json TEXT NOT NULL,
+                    contract_version TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE mfg_mutation_receipt_alias (
+                    legacy_idempotency_key TEXT PRIMARY KEY,
+                    receipt_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE mfg_mutation_receipt_repair_report (
+                    report_id TEXT PRIMARY KEY,
+                    idempotency_key TEXT NOT NULL,
+                    existing_receipt_json TEXT NOT NULL,
+                    incoming_receipt_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+        let legacy = MfgCommandReceipt {
+            receipt_id: "legacy-receipt".to_string(),
+            domain: "alert".to_string(),
+            subject_ref: "mfg:alert-rule:rule-a".to_string(),
+            command: "rule.upsert".to_string(),
+            action_id: "mfg.alert_rule.create".to_string(),
+            actor_ref: "principal:legacy".to_string(),
+            idempotency_key: "conflicting-key".to_string(),
+            payload_digest: "sha256:legacy".to_string(),
+            contract_version: app_mfg_contract::MFG_CONTRACT_VERSION.to_string(),
+            idempotent_replay: false,
+            previous_revision: 0,
+            current_revision: 1,
+            audit_ref: "audit://legacy".to_string(),
+            notification_refs: Vec::new(),
+            response_snapshot: Value::Null,
+            created_at: Utc::now(),
+        };
+        connection
+            .execute(
+                "INSERT INTO mfg_command_receipt (
+                    idempotency_key, domain, subject_ref, receipt_json, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    legacy.idempotency_key,
+                    legacy.domain,
+                    legacy.subject_ref,
+                    serde_json::to_string(&legacy).unwrap(),
+                    legacy.created_at.to_rfc3339(),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO mfg_mutation_receipt (
+                    receipt_id, idempotency_key, actor_principal, action_id, resource_ref,
+                    expected_revision, result_revision, payload_digest, status, response_json,
+                    contract_version, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, 1, ?6, 'completed', ?7, ?8, ?9, ?9)",
+                params![
+                    "existing-receipt",
+                    "conflicting-key",
+                    "principal:other",
+                    "mfg.alert_rule.create",
+                    "mfg:alert-rule:rule-a",
+                    "sha256:other",
+                    serde_json::json!({"existing": true}).to_string(),
+                    app_mfg_contract::MFG_CONTRACT_VERSION,
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .unwrap();
+
+        assert!(initialize_schema(&connection).is_err());
+        let repair_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM mfg_mutation_receipt_repair_report
+                 WHERE idempotency_key = 'conflicting-key'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let alias_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM mfg_mutation_receipt_alias",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(repair_count, 1);
+        assert_eq!(alias_count, 0);
     }
 
     #[test]
@@ -7673,6 +8507,177 @@ mod tests {
     }
 
     #[test]
+    fn playbook_upsert_distinguishes_create_from_revision_checked_update() {
+        let repository = MfgRepository::in_memory().unwrap();
+        let now = Utc::now();
+        let playbook = MfgPlaybook {
+            playbook_id: "playbook-revision".to_string(),
+            revision: 1,
+            domain: "supply".to_string(),
+            scenario: "shortage".to_string(),
+            trigger_fact_types: Vec::new(),
+            metric_keys: vec!["shortage_risk".to_string()],
+            recommended_steps: Vec::new(),
+            required_evidence: Vec::new(),
+            quality_gate_policy: "quality_gate".to_string(),
+            cross_plane_policy: "dry_run_first".to_string(),
+            success_metrics: vec!["shortage_risk".to_string()],
+            created_from_case_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let created = repository.upsert_playbook(&playbook, None).unwrap();
+        assert_eq!(created.revision, 1);
+        assert!(matches!(
+            repository.upsert_playbook(&playbook, None),
+            Err(MfgRepositoryError::RevisionConflict { .. })
+        ));
+        let updated = repository
+            .upsert_playbook(&playbook, Some(created.revision))
+            .unwrap();
+        assert_eq!(updated.revision, 2);
+    }
+
+    #[test]
+    fn alert_subscription_and_assignment_upserts_emit_create_then_update_actions() {
+        let repository = MfgRepository::in_memory().unwrap();
+        let actor = "principal:operator";
+
+        let rule = MfgAlertRule::from_input(MfgAlertRuleInput {
+            rule_id: Some("alert-rule-revision".to_string()),
+            owner_ref: actor.to_string(),
+            name: "Revision rule".to_string(),
+            metric_refs: Vec::new(),
+            entity_refs: Vec::new(),
+            condition: Value::Null,
+            severity: "warning".to_string(),
+            enabled: true,
+            expected_revision: None,
+        });
+        let (created_rule, created_rule_receipt) = repository
+            .upsert_alert_rule_receipted(&rule, None, actor, "rule-create-key")
+            .unwrap();
+        assert_eq!(created_rule_receipt.action_id, "mfg.alert_rule.create");
+        let mut changed_rule = created_rule.clone();
+        changed_rule.name = "Revision rule updated".to_string();
+        let (updated_rule, updated_rule_receipt) = repository
+            .upsert_alert_rule_receipted(
+                &changed_rule,
+                Some(created_rule.revision),
+                actor,
+                "rule-update-key",
+            )
+            .unwrap();
+        assert_eq!(updated_rule.revision, 2);
+        assert_eq!(updated_rule_receipt.action_id, "mfg.alert_rule.update");
+
+        let subscription = MfgAlertSubscription::from_input(
+            MfgAlertSubscriptionInput {
+                subscription_id: Some("alert-subscription-revision".to_string()),
+                rule_id: created_rule.rule_id,
+                channels: vec!["webui".to_string()],
+                enabled: true,
+                expected_revision: None,
+            },
+            actor.to_string(),
+        );
+        let (created_subscription, created_subscription_receipt) = repository
+            .upsert_alert_subscription_receipted(
+                &subscription,
+                None,
+                actor,
+                "subscription-create-key",
+            )
+            .unwrap();
+        assert_eq!(
+            created_subscription_receipt.action_id,
+            "mfg.alert_subscription.create"
+        );
+        let mut changed_subscription = created_subscription.clone();
+        changed_subscription.channels.push("tui".to_string());
+        let (updated_subscription, updated_subscription_receipt) = repository
+            .upsert_alert_subscription_receipted(
+                &changed_subscription,
+                Some(created_subscription.revision),
+                actor,
+                "subscription-update-key",
+            )
+            .unwrap();
+        assert_eq!(updated_subscription.revision, 2);
+        assert_eq!(
+            updated_subscription_receipt.action_id,
+            "mfg.alert_subscription.update"
+        );
+
+        let assignment = MfgAssignment::from_input(
+            MfgAssignmentInput {
+                assignment_id: Some("assignment-revision".to_string()),
+                task_ref: "task:revision-fixture".to_string(),
+                workflow_id: None,
+                workflow_node_id: None,
+                incident_id: None,
+                assignee_ref: "principal:worker".to_string(),
+                assignee_kind: "user".to_string(),
+                watcher_refs: Vec::new(),
+                priority: "normal".to_string(),
+                due_at: None,
+                sla_minutes: None,
+                notification_targets: Vec::new(),
+                visibility: "private".to_string(),
+                expected_revision: None,
+            },
+            actor.to_string(),
+        );
+        let (created_assignment, created_assignment_receipt) = repository
+            .upsert_assignment_receipted(&assignment, None, actor, "assignment-create-key")
+            .unwrap();
+        assert_eq!(
+            created_assignment_receipt.action_id,
+            "mfg.assignment.create"
+        );
+        let mut changed_assignment = created_assignment.clone();
+        changed_assignment.priority = "high".to_string();
+        let (updated_assignment, updated_assignment_receipt) = repository
+            .upsert_assignment_receipted(
+                &changed_assignment,
+                Some(created_assignment.revision),
+                actor,
+                "assignment-update-key",
+            )
+            .unwrap();
+        assert_eq!(updated_assignment.revision, 2);
+        assert_eq!(
+            updated_assignment_receipt.action_id,
+            "mfg.assignment.update"
+        );
+        assert!(matches!(
+            repository.upsert_assignment(
+                &MfgAssignment::from_input(
+                    MfgAssignmentInput {
+                        assignment_id: Some("assignment-create-with-revision".to_string()),
+                        task_ref: "task:revision-fixture".to_string(),
+                        workflow_id: None,
+                        workflow_node_id: None,
+                        incident_id: None,
+                        assignee_ref: "principal:worker".to_string(),
+                        assignee_kind: "user".to_string(),
+                        watcher_refs: Vec::new(),
+                        priority: "normal".to_string(),
+                        due_at: None,
+                        sla_minutes: None,
+                        notification_targets: Vec::new(),
+                        visibility: "private".to_string(),
+                        expected_revision: Some(0),
+                    },
+                    actor.to_string(),
+                ),
+                Some(0)
+            ),
+            Err(MfgRepositoryError::RevisionConflict { .. })
+        ));
+    }
+
+    #[test]
     fn cockpit_profile_mutations_persist_actor_bound_idempotency_receipts() {
         let store = MfgRepository::in_memory().expect("store opens");
         let profile = MfgCockpitProfile::from_input(MfgCockpitProfileInput {
@@ -7713,20 +8718,36 @@ mod tests {
         assert_eq!(replayed.revision, saved.revision);
         assert_eq!(replay_receipt.receipt_id, receipt.receipt_id);
         assert!(replay_receipt.idempotent_replay);
+        assert_eq!(receipt.action_id, "mfg.cockpit.profile.create");
+        assert_eq!(replay_receipt.action_id, "mfg.cockpit.profile.create");
         assert!(receipt.audit_ref.contains("cockpit-profile-idempotency"));
+
+        let mut changed = saved.clone();
+        changed.display_name = "Idempotent cockpit updated".to_string();
+        let (updated, update_receipt) = store
+            .upsert_cockpit_profile_receipted(
+                &changed,
+                Some(saved.revision),
+                "profile.upsert",
+                "user:planner",
+                "cockpit-update-key",
+            )
+            .expect("profile updates with a receipt");
+        assert_eq!(updated.revision, 2);
+        assert_eq!(update_receipt.action_id, "mfg.cockpit.profile.update");
 
         let (deleted, deletion_receipt) = store
             .delete_cockpit_profile_receipted(
-                &saved.profile_id,
-                saved.revision,
+                &updated.profile_id,
+                updated.revision,
                 "user:planner",
                 "cockpit-delete-key",
             )
             .expect("profile deletes with a receipt");
         let (deleted_replay, deletion_replay) = store
             .delete_cockpit_profile_receipted(
-                &saved.profile_id,
-                saved.revision,
+                &updated.profile_id,
+                updated.revision,
                 "user:planner",
                 "cockpit-delete-key",
             )
@@ -7735,7 +8756,12 @@ mod tests {
             deleted.expect("first deletion returns profile").profile_id,
             saved.profile_id
         );
-        assert!(deleted_replay.is_none());
+        assert_eq!(
+            deleted_replay
+                .expect("replay returns the original deleted snapshot")
+                .profile_id,
+            saved.profile_id
+        );
         assert_eq!(deletion_replay.receipt_id, deletion_receipt.receipt_id);
         assert!(deletion_replay.idempotent_replay);
     }

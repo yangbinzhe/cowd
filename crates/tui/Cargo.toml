@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+app-mfg-contract = { path = "../app-mfg-contract" }
 harness-contract = { path = "../harness-contract" }
 chrono = { version = "0.4", features = ["serde"] }
 crossterm = { version = "0.28", features = ["event-stream"] }

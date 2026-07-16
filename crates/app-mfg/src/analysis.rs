@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use matrix_core::MatrixEvidencePacket;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgAttributionCandidate {
     pub cause_id: String,
     pub cause_type: String,
@@ -18,7 +18,7 @@ pub struct MfgAttributionCandidate {
     pub priority_score: f32,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgImpactPath {
     pub path_id: String,
     pub from_entity: String,
@@ -31,7 +31,7 @@ pub struct MfgImpactPath {
     pub confidence: f32,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgRecommendedAction {
     pub action_id: String,
     pub action_type: String,
@@ -46,7 +46,7 @@ pub struct MfgRecommendedAction {
     pub governance: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgOperationalAnalysis {
     pub analysis_id: String,
     pub incident_id: String,

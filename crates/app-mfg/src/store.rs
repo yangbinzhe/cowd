@@ -272,8 +272,9 @@ impl MfgStore {
     pub fn upsert_playbook(
         &self,
         playbook: &MfgPlaybook,
+        expected_revision: Option<u64>,
     ) -> Result<MfgPlaybook, MfgRepositoryError> {
-        self.repository.upsert_playbook(playbook)
+        self.repository.upsert_playbook(playbook, expected_revision)
     }
 
     pub fn get_playbook(
@@ -577,6 +578,49 @@ impl MfgStore {
     ) -> Result<MfgCommandReceipt, MfgRepositoryError> {
         self.repository
             .record_command_notifications(idempotency_key, notification_refs)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_mutation_receipt(
+        &self,
+        idempotency_key: &str,
+        actor_principal: &str,
+        action_id: &str,
+        resource_ref: &str,
+        payload_digest: &str,
+    ) -> Result<Option<(app_mfg_contract::MfgReceiptV1, serde_json::Value)>, MfgRepositoryError>
+    {
+        self.repository.find_mutation_receipt(
+            idempotency_key,
+            actor_principal,
+            action_id,
+            resource_ref,
+            payload_digest,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_mutation_receipt(
+        &self,
+        idempotency_key: &str,
+        actor_principal: &str,
+        action_id: &str,
+        resource_ref: &str,
+        expected_revision: Option<u64>,
+        result_revision: Option<u64>,
+        payload_digest: &str,
+        response: &serde_json::Value,
+    ) -> Result<app_mfg_contract::MfgReceiptV1, MfgRepositoryError> {
+        self.repository.record_mutation_receipt(
+            idempotency_key,
+            actor_principal,
+            action_id,
+            resource_ref,
+            expected_revision,
+            result_revision,
+            payload_digest,
+            response,
+        )
     }
 
     pub fn save_workflow_graph(

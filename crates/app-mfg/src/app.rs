@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{server_manufacturing_domain_pack, server_manufacturing_skill_pack};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MfgApplicationSurfaceKind {
     Management,
@@ -10,7 +10,7 @@ pub enum MfgApplicationSurfaceKind {
     Cli,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgApplicationSurface {
     pub surface: MfgApplicationSurfaceKind,
     pub role: String,
@@ -20,7 +20,7 @@ pub struct MfgApplicationSurface {
     pub actions: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgApplicationDomain {
     pub domain_id: String,
     pub name: String,
@@ -35,7 +35,7 @@ pub struct MfgApplicationDomain {
     pub scenario_count: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgApplicationDescriptor {
     pub app_id: String,
     pub name: String,
@@ -115,24 +115,15 @@ pub fn manufacturing_app_descriptor() -> MfgApplicationDescriptor {
             },
             MfgApplicationSurface {
                 surface: MfgApplicationSurfaceKind::Tui,
-                role: "console_full_capability".to_string(),
-                entrypoints: vec![
-                    "/api/apps/mfg/app".to_string(),
-                    "/api/cowd/projection?surface=tui".to_string(),
-                ],
-                actions: vec![
-                    "browse_domain".to_string(),
-                    "inspect_source_packs".to_string(),
-                    "inspect_evidence".to_string(),
-                    "run_manufacturing_skills".to_string(),
-                    "diagnose_quality".to_string(),
-                ],
+                role: "console_unavailable".to_string(),
+                entrypoints: Vec::new(),
+                actions: Vec::new(),
             },
             MfgApplicationSurface {
                 surface: MfgApplicationSurfaceKind::Cli,
                 role: "minimal_core_control".to_string(),
                 entrypoints: vec!["/api/apps/mfg/app".to_string()],
-                actions: vec!["show".to_string(), "export".to_string(), "diagnose".to_string()],
+                actions: Vec::new(),
             },
         ],
     }
@@ -181,7 +172,7 @@ mod tests {
             .expect("cli surface should be described");
 
         assert_eq!(cli.role, "minimal_core_control");
-        assert_eq!(cli.actions, vec!["show", "export", "diagnose"]);
-        assert!(!cli.actions.contains(&"manage_source_packs".to_string()));
+        assert!(cli.actions.is_empty());
+        assert_eq!(cli.entrypoints, vec!["/api/apps/mfg/app"]);
     }
 }

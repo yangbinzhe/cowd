@@ -52,22 +52,37 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "app-mfg"
-version = "0.9.530"
+version = "0.9.540"
 dependencies = [
+ "app-mfg-contract",
  "chrono",
  "matrix-core",
  "matrix-repository",
  "rusqlite",
+ "schemars",
  "serde",
  "serde_json",
+ "sha2",
  "storage",
  "thiserror",
  "uuid",
 ]
 
 [[package]]
+name = "app-mfg-contract"
+version = "0.9.540"
+dependencies = [
+ "chrono",
+ "matrix-core",
+ "schemars",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "approval"
-version = "0.9.530"
+version = "0.9.540"
 dependencies = [
  "serde",
  "serde_json",
@@ -95,11 +110,13 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "auth-broker"
-version = "0.9.530"
+version = "0.9.540"
 dependencies = [
+ "app-mfg-contract",
  "base64",
  "harness-contract",
  "ring",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "subtle",
@@ -291,8 +308,10 @@ dependencies = [
 
 [[package]]
 name = "cli"
-version = "0.9.530"
+version = "0.9.540"
 dependencies = [
+ "app-mfg-contract",
+ "auth-broker",
  "gateway",
  "serde",
  "serde_json",
@@ -316,7 +335,7 @@ dependencies = [
 
 [[package]]
 name = "connector"
-version = "0.9.530"
+version = "0.9.540"
 dependencies = [
  "chrono",
  "harness-contract",
@@ -510,6 +529,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "dyn-clone"
+version = "1.0.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
+
+[[package]]
 name = "either"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -562,7 +587,7 @@ dependencies = [
 
 [[package]]
 name = "fact-kernel"
-version = "0.9.530"
+version = "0.9.540"
 dependencies = [
  "chrono",
  "serde",
@@ -744,9 +769,10 @@ dependencies = [
 
 [[package]]
 name = "gateway"
-version = "0.9.530"
+version = "0.9.540"
 dependencies = [
  "app-mfg",
+ "app-mfg-contract",
  "approval",
  "async-trait",
  "auth-broker",
@@ -861,7 +887,7 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "harness-contract"
-version = "0.9.530"
+version = "0.9.540"
 dependencies = [
  "chrono",
  "serde",
@@ -873,7 +899,7 @@ dependencies = [
 
 [[package]]
 name = "harness-eval"
-version = "0.9.530"
+version = "0.9.540"
 dependencies = [
  "async-trait",
  "fact-kernel",
@@ -1406,10 +1432,11 @@ checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
 name = "matrix-core"
-version = "0.9.530"
+version = "0.9.540"
 dependencies = [
  "chrono",
  "fact-kernel",
+ "schemars",
  "serde",
  "serde_json",
  "sha2",
@@ -1418,7 +1445,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-repository"
-version = "0.9.530"
+version = "0.9.540"
 dependencies = [
  "chrono",
  "matrix-core",
@@ -1434,7 +1461,7 @@ dependencies = [
 
 [[package]]
 name = "mcp"
-version = "0.9.530"
+version = "0.9.540"
 dependencies = [
  "serde",
  "serde_json",
@@ -1449,7 +1476,7 @@ checksum = "6b947ae49db0d222b1dbc6b113ce7248a3fc3a6ca21b696717bfc000ba4484d8"
 
 [[package]]
 name = "memory"
-version = "0.9.530"
+version = "0.9.540"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1539,7 +1566,7 @@ dependencies = [
 
 [[package]]
 name = "model-protocol"
-version = "0.9.530"
+version = "0.9.540"
 dependencies = [
  "lru",
  "serde",
@@ -1726,7 +1753,7 @@ dependencies = [
 
 [[package]]
 name = "plugins"
-version = "0.9.530"
+version = "0.9.540"
 dependencies = [
  "serde",
  "serde_json",
@@ -1777,7 +1804,7 @@ dependencies = [
 
 [[package]]
 name = "provider"
-version = "0.9.530"
+version = "0.9.540"
 dependencies = [
  "model-protocol",
  "reqwest",
@@ -2022,6 +2049,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ref-cast"
+version = "1.0.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f354300ae66f76f1c85c5f84693f0ce81d747e2c3f21a45fef496d89c960bf7d"
+dependencies = [
+ "ref-cast-impl",
+]
+
+[[package]]
+name = "ref-cast-impl"
+version = "1.0.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7186006dcb21920990093f30e3dea63b7d6e977bf1256be20c3563a5db070da"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "regex"
 version = "1.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2109,7 +2156,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.9.530"
+version = "0.9.540"
 dependencies = [
  "approval",
  "async-trait",
@@ -2261,7 +2308,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-launcher"
-version = "0.9.530"
+version = "0.9.540"
 dependencies = [
  "landlock",
  "libc",
@@ -2276,6 +2323,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3cbc66816425a074528352f5789333ecff06ca41b36b0b0efdfbb29edc391a19"
 dependencies = [
  "parking_lot",
+]
+
+[[package]]
+name = "schemars"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2b42f36aa1cd011945615b92222f6bf73c599a102a300334cd7f8dbeec726cc"
+dependencies = [
+ "chrono",
+ "dyn-clone",
+ "ref-cast",
+ "schemars_derive",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "schemars_derive"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d115b50f4aaeea07e79c1912f645c7513d81715d0420f8bc77a18c6260b307f"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde_derive_internals",
+ "syn",
 ]
 
 [[package]]
@@ -2323,6 +2397,17 @@ name = "serde_derive"
 version = "1.0.228"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d540f220d3187173da220f885ab66608367b6574e925011a9353e4badda91d79"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "serde_derive_internals"
+version = "0.29.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18d26a20a969b9e3fdf2fc2d9f21eda6c40e2de84c9408bb5d3b05d499aae711"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2414,7 +2499,7 @@ dependencies = [
 
 [[package]]
 name = "session"
-version = "0.9.530"
+version = "0.9.540"
 dependencies = [
  "memory",
  "serde",
@@ -2500,7 +2585,7 @@ checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "skill"
-version = "0.9.530"
+version = "0.9.540"
 dependencies = [
  "harness-contract",
  "regex",
@@ -2552,7 +2637,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "storage"
-version = "0.9.530"
+version = "0.9.540"
 dependencies = [
  "rusqlite",
  "serde",
@@ -2603,7 +2688,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "surface"
-version = "0.9.530"
+version = "0.9.540"
 dependencies = [
  "chrono",
  "serde",
@@ -2884,7 +2969,7 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "tools"
-version = "0.9.530"
+version = "0.9.540"
 dependencies = [
  "base64",
  "flate2",
@@ -3126,7 +3211,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tui"
-version = "0.9.530"
+version = "0.9.540"
 dependencies = [
  "chrono",
  "crossterm",

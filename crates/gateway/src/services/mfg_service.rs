@@ -495,8 +495,10 @@ impl MfgService {
         &self,
         config_home: impl AsRef<Path>,
         playbook: &MfgPlaybook,
+        expected_revision: Option<u64>,
     ) -> Result<MfgPlaybook, MfgRepositoryError> {
-        self.open_store(config_home)?.upsert_playbook(playbook)
+        self.open_store(config_home)?
+            .upsert_playbook(playbook, expected_revision)
     }
 
     pub(crate) fn get_playbook(
@@ -845,6 +847,51 @@ impl MfgService {
     ) -> Result<MfgCommandReceipt, MfgRepositoryError> {
         self.open_store(config_home)?
             .record_command_notifications(idempotency_key, notification_refs)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn find_mutation_receipt(
+        &self,
+        config_home: impl AsRef<Path>,
+        idempotency_key: &str,
+        actor_principal: &str,
+        action_id: &str,
+        resource_ref: &str,
+        payload_digest: &str,
+    ) -> Result<Option<(app_mfg_contract::MfgReceiptV1, serde_json::Value)>, MfgRepositoryError>
+    {
+        self.open_store(config_home)?.find_mutation_receipt(
+            idempotency_key,
+            actor_principal,
+            action_id,
+            resource_ref,
+            payload_digest,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_mutation_receipt(
+        &self,
+        config_home: impl AsRef<Path>,
+        idempotency_key: &str,
+        actor_principal: &str,
+        action_id: &str,
+        resource_ref: &str,
+        expected_revision: Option<u64>,
+        result_revision: Option<u64>,
+        payload_digest: &str,
+        response: &serde_json::Value,
+    ) -> Result<app_mfg_contract::MfgReceiptV1, MfgRepositoryError> {
+        self.open_store(config_home)?.record_mutation_receipt(
+            idempotency_key,
+            actor_principal,
+            action_id,
+            resource_ref,
+            expected_revision,
+            result_revision,
+            payload_digest,
+            response,
+        )
     }
 
     pub(super) fn contracts(&self) -> Vec<ServiceEnvelope> {

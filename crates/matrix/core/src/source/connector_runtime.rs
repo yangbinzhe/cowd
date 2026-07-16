@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use super::{MatrixSourceDeltaPlan, MatrixSourcePack};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixConnectorRunInput {
     #[serde(default)]
     pub run_id: Option<String>,
@@ -22,7 +22,7 @@ pub struct MatrixConnectorRunInput {
     pub checksum: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixConnectorQualityReport {
     pub status: String,
     #[serde(default)]
@@ -32,7 +32,7 @@ pub struct MatrixConnectorQualityReport {
     pub score: f32,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixConnectorReceipt {
     pub receipt_id: String,
     pub status: String,
@@ -41,7 +41,7 @@ pub struct MatrixConnectorReceipt {
     pub recorded_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixConnectorRun {
     pub run_id: String,
     pub source_pack_id: String,

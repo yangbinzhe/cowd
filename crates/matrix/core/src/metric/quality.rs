@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use super::MatrixEvidencePacket;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixQualityGateDecision {
     pub gate_id: String,
     pub target_ref: String,

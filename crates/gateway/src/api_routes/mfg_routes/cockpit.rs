@@ -7,26 +7,75 @@ use super::*;
 
 type MfgCockpitApiError = (StatusCode, Json<serde_json::Value>);
 
-fn cockpit_api_error(
+fn cockpit_mfg_api_error(
     status: StatusCode,
     code: &str,
     message: impl Into<String>,
     details: serde_json::Value,
     actions: &[&str],
 ) -> MfgCockpitApiError {
+    let error_code = match status {
+        StatusCode::UNAUTHORIZED => app_mfg_contract::MfgErrorCode::AuthenticationRequired,
+        StatusCode::FORBIDDEN => app_mfg_contract::MfgErrorCode::CapabilityDenied,
+        StatusCode::NOT_FOUND => app_mfg_contract::MfgErrorCode::ScopeNotFound,
+        StatusCode::CONFLICT => app_mfg_contract::MfgErrorCode::RevisionConflict,
+        StatusCode::TOO_MANY_REQUESTS => app_mfg_contract::MfgErrorCode::RateLimited,
+        status if status.is_client_error() => app_mfg_contract::MfgErrorCode::ValidationFailed,
+        _ => app_mfg_contract::MfgErrorCode::Internal,
+    };
+    let recovery_actions = actions
+        .iter()
+        .filter_map(|action| {
+            let kind = match *action {
+                "reload" | "retry" | "edit" => app_mfg_contract::MfgRecoveryActionKind::Reload,
+                "compare" => app_mfg_contract::MfgRecoveryActionKind::Compare,
+                "save_as" => app_mfg_contract::MfgRecoveryActionKind::SaveAs,
+                "request_access" => app_mfg_contract::MfgRecoveryActionKind::RequestAccess,
+                "retry_same_intent" => app_mfg_contract::MfgRecoveryActionKind::RetrySameIntent,
+                _ => return None,
+            };
+            Some(app_mfg_contract::MfgRecoveryAction {
+                kind,
+                label: (*action).replace('_', " "),
+                target: None,
+                enabled: true,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut details = details;
+    if let Some(object) = details.as_object_mut() {
+        object.insert(
+            "legacy_code".to_string(),
+            serde_json::Value::String(code.to_string()),
+        );
+    } else {
+        details = serde_json::json!({"legacy_code": code, "detail": details});
+    }
+    let error = app_mfg_contract::MfgApiErrorV1 {
+        code: error_code,
+        message: message.into(),
+        http_status: status.as_u16(),
+        details,
+        retryable: status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS,
+        contract_version: app_mfg_contract::MfgContractVersion::default(),
+        recovery_actions,
+        request_id: None,
+        receipt_ref: None,
+    };
     (
         status,
-        Json(serde_json::json!({
-            "error": message.into(),
-            "code": code,
-            "details": details,
-            "recovery": { "actions": actions },
+        Json(serde_json::to_value(error).unwrap_or_else(|_| {
+            serde_json::json!({
+                "code": "internal",
+                "message": "failed to serialize MFG cockpit error",
+                "http_status": 500
+            })
         })),
     )
 }
 
 fn cockpit_internal_error(error: impl ToString) -> MfgCockpitApiError {
-    cockpit_api_error(
+    cockpit_mfg_api_error(
         StatusCode::INTERNAL_SERVER_ERROR,
         "mfg_cockpit_internal",
         error.to_string(),
@@ -36,7 +85,7 @@ fn cockpit_internal_error(error: impl ToString) -> MfgCockpitApiError {
 }
 
 fn cockpit_not_found(resource: &str, id: &str) -> MfgCockpitApiError {
-    cockpit_api_error(
+    cockpit_mfg_api_error(
         StatusCode::NOT_FOUND,
         "mfg_cockpit_not_found",
         format!("{resource} not found"),
@@ -45,13 +94,23 @@ fn cockpit_not_found(resource: &str, id: &str) -> MfgCockpitApiError {
     )
 }
 
-fn cockpit_forbidden(resource: &str, id: &str, required: &str) -> MfgCockpitApiError {
-    cockpit_api_error(
+fn cockpit_capability_denied(resource: &str, id: &str, required: &str) -> MfgCockpitApiError {
+    cockpit_mfg_api_error(
         StatusCode::FORBIDDEN,
         "mfg_cockpit_forbidden",
         format!("{resource} is not accessible by this principal"),
         serde_json::json!({ "resource": resource, "id": id, "required": required }),
         &["request_access", "reload"],
+    )
+}
+
+fn cockpit_scope_not_found(resource: &str, id: &str) -> MfgCockpitApiError {
+    cockpit_mfg_api_error(
+        StatusCode::NOT_FOUND,
+        "mfg_scope_not_found",
+        format!("{resource} was not found in the verified principal scope"),
+        serde_json::json!({ "resource": resource, "id": id }),
+        &["reload"],
     )
 }
 
@@ -63,7 +122,7 @@ fn cockpit_mutation_error(error: MfgRepositoryError) -> MfgCockpitApiError {
             subject_id,
             expected,
             actual,
-        } => cockpit_api_error(
+        } => cockpit_mfg_api_error(
             StatusCode::CONFLICT,
             "mfg_revision_conflict",
             "cockpit profile changed since it was loaded",
@@ -75,7 +134,7 @@ fn cockpit_mutation_error(error: MfgRepositoryError) -> MfgCockpitApiError {
             }),
             &["reload", "compare", "save_as"],
         ),
-        MfgRepositoryError::CommandRejected(message) => cockpit_api_error(
+        MfgRepositoryError::CommandRejected(message) => cockpit_mfg_api_error(
             StatusCode::CONFLICT,
             "mfg_cockpit_validation_failed",
             message,
@@ -99,7 +158,7 @@ pub(super) async fn mfg_cockpit_profile_list_handler(
             query.cadence.as_deref(),
             query.limit.unwrap_or(100).clamp(1, 500),
         )
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .into_iter()
         .filter(|profile| cockpit_profile_visible_to(profile, &principal))
         .map(|profile| cockpit_profile_cropped_for(profile, &principal))
@@ -123,15 +182,25 @@ pub(super) async fn mfg_cockpit_widget_catalog_handler(
 pub(super) async fn mfg_cockpit_profile_upsert_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
+    headers: HeaderMap,
     Json(mut request): Json<MfgCockpitProfileUpsertRequest>,
 ) -> Result<impl IntoResponse, MfgCockpitApiError> {
     let expected_revision = request.profile.expected_revision;
     let actor = principal_actor_id(&principal);
-    let idempotency_key = mfg_idempotency_key(request.idempotency_key.take(), "cockpit-profile");
+    let idempotency_key =
+        mfg_idempotency_key(&headers, request.idempotency_key.take()).map_err(|error| {
+            cockpit_mfg_api_error(
+                StatusCode::BAD_REQUEST,
+                "mfg_idempotency_key_invalid",
+                error.message,
+                serde_json::Value::Null,
+                &["retry_same_intent"],
+            )
+        })?;
     request
         .profile
         .profile_id
-        .get_or_insert_with(|| format!("cockpit-profile-{}", uuid::Uuid::new_v4()));
+        .get_or_insert_with(|| stable_mfg_resource_id("cockpit-profile", &idempotency_key));
     let mut effective_owner = actor.clone();
     if let Some(profile_id) = request
         .profile
@@ -147,11 +216,7 @@ pub(super) async fn mfg_cockpit_profile_upsert_handler(
         {
             if existing.owner_ref != actor && !existing.sharing_policy.editor_refs.contains(&actor)
             {
-                return Err(cockpit_forbidden(
-                    "cockpit_profile",
-                    profile_id,
-                    "owner_or_editor",
-                ));
+                return Err(cockpit_scope_not_found("cockpit_profile", profile_id));
             }
             effective_owner = existing.owner_ref;
         }
@@ -165,7 +230,7 @@ pub(super) async fn mfg_cockpit_profile_upsert_handler(
                 cockpit_not_found("cockpit_widget_definition", &instance.definition_id)
             })?;
         if !cockpit_widget_allowed(&definition, &principal) {
-            return Err(cockpit_forbidden(
+            return Err(cockpit_capability_denied(
                 "cockpit_widget_definition",
                 &instance.definition_id,
                 &definition.required_capability,
@@ -185,6 +250,9 @@ pub(super) async fn mfg_cockpit_profile_upsert_handler(
         )
         .map_err(cockpit_mutation_error)?;
     let revision = profile.revision;
+    let receipt = receipt
+        .canonical_receipt()
+        .map_err(cockpit_internal_error)?;
     let profile = cockpit_profile_cropped_for(profile, &principal);
     Ok(cockpit_profile_response(
         serde_json::json!({
@@ -210,7 +278,7 @@ pub(super) async fn mfg_cockpit_profile_get_handler(
         .map_err(cockpit_internal_error)?
         .ok_or_else(|| cockpit_not_found("cockpit_profile", &id))?;
     if !cockpit_profile_visible_to(&profile, &principal) {
-        return Err(cockpit_forbidden("cockpit_profile", &id, "viewer"));
+        return Err(cockpit_scope_not_found("cockpit_profile", &id));
     }
     let revision = profile.revision;
     let profile = cockpit_profile_cropped_for(profile, &principal);
@@ -227,6 +295,7 @@ pub(super) async fn mfg_cockpit_profile_delete_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
+    headers: HeaderMap,
     Query(query): Query<MfgCockpitProfileDeleteQuery>,
 ) -> Result<impl IntoResponse, MfgCockpitApiError> {
     let existing = state
@@ -237,10 +306,19 @@ pub(super) async fn mfg_cockpit_profile_delete_handler(
     let actor = principal_actor_id(&principal);
     if let Some(existing) = existing {
         if existing.owner_ref != actor && !existing.sharing_policy.editor_refs.contains(&actor) {
-            return Err(cockpit_forbidden("cockpit_profile", &id, "owner_or_editor"));
+            return Err(cockpit_scope_not_found("cockpit_profile", &id));
         }
     }
-    let idempotency_key = mfg_idempotency_key(query.idempotency_key, "cockpit-profile-delete");
+    let idempotency_key =
+        mfg_idempotency_key(&headers, query.idempotency_key).map_err(|error| {
+            cockpit_mfg_api_error(
+                StatusCode::BAD_REQUEST,
+                "mfg_idempotency_key_invalid",
+                error.message,
+                serde_json::Value::Null,
+                &["retry_same_intent"],
+            )
+        })?;
     let (profile, receipt) = state
         .services
         .mfg
@@ -253,6 +331,9 @@ pub(super) async fn mfg_cockpit_profile_delete_handler(
         )
         .map_err(cockpit_mutation_error)?;
     let revision = receipt.current_revision;
+    let receipt = receipt
+        .canonical_receipt()
+        .map_err(cockpit_internal_error)?;
     Ok(cockpit_profile_response(
         serde_json::json!({ "kind": "mfg.cockpit.profile_deleted", "profile": profile, "receipt": receipt }),
         revision,
@@ -263,10 +344,19 @@ pub(super) async fn mfg_cockpit_profile_clone_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
+    headers: HeaderMap,
     Json(request): Json<MfgCockpitProfileCloneRequest>,
 ) -> Result<impl IntoResponse, MfgCockpitApiError> {
     let idempotency_key =
-        mfg_idempotency_key(request.idempotency_key.clone(), "cockpit-profile-clone");
+        mfg_idempotency_key(&headers, request.idempotency_key.clone()).map_err(|error| {
+            cockpit_mfg_api_error(
+                StatusCode::BAD_REQUEST,
+                "mfg_idempotency_key_invalid",
+                error.message,
+                serde_json::Value::Null,
+                &["retry_same_intent"],
+            )
+        })?;
     let source = state
         .services
         .mfg
@@ -274,13 +364,13 @@ pub(super) async fn mfg_cockpit_profile_clone_handler(
         .map_err(cockpit_internal_error)?
         .ok_or_else(|| cockpit_not_found("cockpit_profile", &id))?;
     if !cockpit_profile_visible_to(&source, &principal) {
-        return Err(cockpit_forbidden("cockpit_profile", &id, "viewer"));
+        return Err(cockpit_scope_not_found("cockpit_profile", &id));
     }
     let mut clone = cockpit_profile_cropped_for(source, &principal);
     clone.profile_id = request
         .profile_id
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| format!("cockpit-profile-{}", uuid::Uuid::new_v4()));
+        .unwrap_or_else(|| stable_mfg_resource_id("cockpit-profile", &idempotency_key));
     clone.owner_ref = principal_actor_id(&principal);
     clone.display_name = request
         .display_name
@@ -298,10 +388,9 @@ pub(super) async fn mfg_cockpit_profile_clone_handler(
     {
         let actor = principal_actor_id(&principal);
         if existing.owner_ref != actor && !existing.sharing_policy.editor_refs.contains(&actor) {
-            return Err(cockpit_forbidden(
+            return Err(cockpit_scope_not_found(
                 "cockpit_profile",
                 &clone.profile_id,
-                "owner_or_editor",
             ));
         }
     }
@@ -318,6 +407,9 @@ pub(super) async fn mfg_cockpit_profile_clone_handler(
         )
         .map_err(cockpit_mutation_error)?;
     let revision = clone.revision;
+    let receipt = receipt
+        .canonical_receipt()
+        .map_err(cockpit_internal_error)?;
     let clone = cockpit_profile_cropped_for(clone, &principal);
     Ok(cockpit_profile_response(
         serde_json::json!({ "kind": "mfg.cockpit.profile_cloned", "source_profile_id": id, "profile": clone, "receipt": receipt }),
@@ -329,10 +421,19 @@ pub(super) async fn mfg_cockpit_profile_share_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
+    headers: HeaderMap,
     Json(request): Json<MfgCockpitProfileShareRequest>,
 ) -> Result<impl IntoResponse, MfgCockpitApiError> {
     let idempotency_key =
-        mfg_idempotency_key(request.idempotency_key.clone(), "cockpit-profile-share");
+        mfg_idempotency_key(&headers, request.idempotency_key.clone()).map_err(|error| {
+            cockpit_mfg_api_error(
+                StatusCode::BAD_REQUEST,
+                "mfg_idempotency_key_invalid",
+                error.message,
+                serde_json::Value::Null,
+                &["retry_same_intent"],
+            )
+        })?;
     let mut profile = state
         .services
         .mfg
@@ -345,7 +446,7 @@ pub(super) async fn mfg_cockpit_profile_share_handler(
             .editor_refs
             .contains(&principal_actor_id(&principal))
     {
-        return Err(cockpit_forbidden("cockpit_profile", &id, "owner_or_editor"));
+        return Err(cockpit_scope_not_found("cockpit_profile", &id));
     }
     profile.sharing_policy = request.sharing_policy;
     let (profile, receipt) = state
@@ -361,6 +462,9 @@ pub(super) async fn mfg_cockpit_profile_share_handler(
         )
         .map_err(cockpit_mutation_error)?;
     let revision = profile.revision;
+    let receipt = receipt
+        .canonical_receipt()
+        .map_err(cockpit_internal_error)?;
     let profile = cockpit_profile_cropped_for(profile, &principal);
     Ok(cockpit_profile_response(
         serde_json::json!({ "kind": "mfg.cockpit.profile_shared", "profile": profile, "receipt": receipt }),
@@ -561,7 +665,7 @@ pub(super) async fn mfg_cockpit_projection_handler(
         .map_err(cockpit_internal_error)?
         .ok_or_else(|| cockpit_not_found("cockpit_profile", &id))?;
     if !cockpit_profile_visible_to(&profile, &principal) {
-        return Err(cockpit_forbidden("cockpit_profile", &id, "viewer"));
+        return Err(cockpit_scope_not_found("cockpit_profile", &id));
     }
     let filters = cockpit_projection_filters(&profile, query);
     let mut projection = state
@@ -612,7 +716,7 @@ pub(super) async fn mfg_cockpit_widget_projection_handler(
         .map_err(cockpit_internal_error)?
         .ok_or_else(|| cockpit_not_found("cockpit_profile", &id))?;
     if !cockpit_profile_visible_to(&profile, &principal) {
-        return Err(cockpit_forbidden("cockpit_profile", &id, "viewer"));
+        return Err(cockpit_scope_not_found("cockpit_profile", &id));
     }
     let instance = profile
         .widget_instances
@@ -624,7 +728,7 @@ pub(super) async fn mfg_cockpit_widget_projection_handler(
         .find(|definition| definition.definition_id == instance.definition_id)
         .ok_or_else(|| cockpit_not_found("cockpit_widget_definition", &instance.definition_id))?;
     if !cockpit_widget_allowed(&definition, &principal) {
-        return Err(cockpit_forbidden(
+        return Err(cockpit_capability_denied(
             "cockpit_widget",
             &instance_id,
             &definition.required_capability,
@@ -663,7 +767,7 @@ pub(super) async fn mfg_cockpit_report_generate_handler(
     if !cockpit_profile_editable_by(&profile, &principal)
         || !cockpit_profile_report_allowed(&profile, &principal)
     {
-        return Err(cockpit_forbidden(
+        return Err(cockpit_capability_denied(
             "cockpit_profile_report",
             &id,
             "owner_or_editor_and_all_widget_capabilities",
@@ -727,7 +831,7 @@ pub(super) async fn mfg_cockpit_report_get_handler(
         .map_err(cockpit_internal_error)?
         .ok_or_else(|| cockpit_not_found("cockpit_report", &id))?;
     if !cockpit_report_accessible_to(&state, &report, &principal).map_err(cockpit_internal_error)? {
-        return Err(cockpit_forbidden("cockpit_report", &id, "profile_viewer"));
+        return Err(cockpit_scope_not_found("cockpit_report", &id));
     }
     Ok(Json(serde_json::json!({
         "kind": "mfg.cockpit.report",
@@ -741,25 +845,31 @@ pub(super) async fn mfg_cockpit_report_deliver_handler(
     Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(intent): Json<MfgCockpitReportDeliveryIntent>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let capability = if intent.mode.trim().eq_ignore_ascii_case("dry_run") {
+        "mfg.read"
+    } else {
+        "mfg.report.deliver"
+    };
+    require_mfg_capability(&principal, capability)?;
     let request = intent.into_request(principal_actor_id(&principal));
     let report = state
         .services
         .mfg
         .get_cockpit_report(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG cockpit report not found"))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| mfg_api_error(StatusCode::NOT_FOUND, "MFG cockpit report not found"))?;
     if !cockpit_report_accessible_to(&state, &report, &principal)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
     {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
-            "MFG cockpit report is not accessible",
+        return Err(mfg_api_error(
+            StatusCode::NOT_FOUND,
+            "MFG cockpit report was not found in the verified principal scope",
         ));
     }
     if !cockpit_report_mutable_by(&state, &report, &principal)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
     {
-        return Err(api_error(
+        return Err(mfg_api_error(
             StatusCode::FORBIDDEN,
             "MFG cockpit report is not deliverable by this principal",
         ));
@@ -786,14 +896,14 @@ pub(super) async fn mfg_cockpit_report_delivery_state_handler(
         .services
         .mfg
         .get_cockpit_report(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG cockpit report not found"))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| mfg_api_error(StatusCode::NOT_FOUND, "MFG cockpit report not found"))?;
     if !cockpit_report_accessible_to(&state, &report, &principal)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
     {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
-            "MFG cockpit report is not accessible",
+        return Err(mfg_api_error(
+            StatusCode::NOT_FOUND,
+            "MFG cockpit report was not found in the verified principal scope",
         ));
     }
     let delivery_state = MfgCockpitReportDeliveryState::from_report(&report);
@@ -810,31 +920,38 @@ pub(super) async fn mfg_cockpit_report_delivery_retry_handler(
     Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(request): Json<MfgCockpitReportDeliveryRetryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let normalized_mode = state.services.mfg.normalize_bridge_mode(&request.mode);
+    let capability = if normalized_mode == "dry_run" {
+        "mfg.read"
+    } else {
+        "mfg.report.deliver"
+    };
+    require_mfg_capability(&principal, capability)?;
     let report = state
         .services
         .mfg
         .get_cockpit_report(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG cockpit report not found"))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| mfg_api_error(StatusCode::NOT_FOUND, "MFG cockpit report not found"))?;
     if !cockpit_report_accessible_to(&state, &report, &principal)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
     {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
-            "MFG cockpit report is not accessible",
+        return Err(mfg_api_error(
+            StatusCode::NOT_FOUND,
+            "MFG cockpit report was not found in the verified principal scope",
         ));
     }
     if !cockpit_report_mutable_by(&state, &report, &principal)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
     {
-        return Err(api_error(
+        return Err(mfg_api_error(
             StatusCode::FORBIDDEN,
             "MFG cockpit report delivery is not retryable by this principal",
         ));
     }
     let before_state = MfgCockpitReportDeliveryState::from_report(&report);
     if !before_state.retryable && !request.force {
-        return Err(api_error(
+        return Err(mfg_api_error(
             StatusCode::CONFLICT,
             format!(
                 "MFG cockpit report delivery is not retryable: {}",
@@ -863,12 +980,16 @@ pub(super) async fn mfg_cockpit_report_schedule_run_handler(
     Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(request): Json<MfgCockpitReportScheduleRunRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_mfg_capability(&principal, "mfg.report.generate")?;
+    if request.deliver {
+        require_mfg_capability(&principal, "mfg.report.deliver")?;
+    }
     let limit = request.limit.unwrap_or(50).clamp(1, 100);
     let profiles = state
         .services
         .mfg
         .list_cockpit_profiles(&state.config_home, request.cadence.as_deref(), limit)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .into_iter()
         .filter(|profile| {
             cockpit_profile_editable_by(profile, &principal)
@@ -906,8 +1027,10 @@ pub(super) async fn mfg_cockpit_report_schedule_run_handler(
                 },
             )
             .map_err(|error| match error {
-                MfgRepositoryError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
-                other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+                MfgRepositoryError::NotFound(message) => {
+                    mfg_api_error(StatusCode::NOT_FOUND, message)
+                }
+                other => mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
             })?;
 
         if request.deliver {
@@ -1109,7 +1232,7 @@ pub(super) async fn deliver_mfg_cockpit_report(
                 .mfg
                 .report_delivery_receipt_matches(&receipt, &report)
             {
-                return Err(api_error(
+                return Err(mfg_api_error(
                     StatusCode::CONFLICT,
                     "MFG cockpit report delivery idempotency key belongs to another cross-plane action",
                 ));
@@ -1118,7 +1241,9 @@ pub(super) async fn deliver_mfg_cockpit_report(
                 .services
                 .mfg
                 .attach_report_delivery_receipt(&state.config_home, &report, &receipt)
-                .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+                .map_err(|error| {
+                    mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+                })?;
             return Ok(MfgCockpitReportDeliveryOutcome {
                 mode: receipt.mode.clone(),
                 status: receipt.status.clone(),
@@ -1161,7 +1286,7 @@ pub(super) async fn deliver_mfg_cockpit_report(
             .cross_plane
             .execute_commit_graph(&action, &decision, &graph_key, executor)
             .await
-            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+            .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
         state
             .services
             .cross_plane
@@ -1173,19 +1298,19 @@ pub(super) async fn deliver_mfg_cockpit_report(
                 target,
                 &projection,
             )
-            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+            .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
     } else {
         state
             .services
             .cross_plane
             .record_non_commit_action(idempotency_key, mode.clone(), action, decision, evidence)
-            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+            .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
     };
     let report = state
         .services
         .mfg
         .attach_report_delivery_receipt(&state.config_home, &report, &receipt)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(MfgCockpitReportDeliveryOutcome {
         mode: receipt.mode.clone(),
         status: receipt.status.clone(),

@@ -37,7 +37,7 @@ pub enum MfgWorkflowGraphError {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MfgWorkflowStatus {
     Active,
@@ -58,7 +58,7 @@ impl MfgWorkflowStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MfgWorkflowNodeStatus {
     Pending,
@@ -92,7 +92,7 @@ impl MfgWorkflowNodeStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MfgWorkflowNodeKind {
     Planning,
@@ -103,7 +103,7 @@ pub enum MfgWorkflowNodeKind {
     Action,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgWorkflowNode {
     pub node_id: String,
     pub kind: MfgWorkflowNodeKind,
@@ -152,7 +152,7 @@ impl MfgWorkflowNode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgWorkflowEvidence {
     pub evidence_id: String,
     pub node_id: String,
@@ -162,7 +162,7 @@ pub struct MfgWorkflowEvidence {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MfgWorkflowReviewVerdict {
     Accept,
@@ -170,7 +170,7 @@ pub enum MfgWorkflowReviewVerdict {
     Reject,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgWorkflowReview {
     pub review_id: String,
     pub node_id: String,
@@ -184,7 +184,7 @@ pub struct MfgWorkflowReview {
 ///
 /// Runtime execution graphs may execute work on behalf of this graph, but are
 /// not its persistence model or mutation authority.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgWorkflowGraph {
     pub workflow_id: String,
     pub incident_id: String,

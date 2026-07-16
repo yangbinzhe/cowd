@@ -6,13 +6,16 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+app-mfg-contract = { path = "../app-mfg-contract" }
 chrono.workspace = true
 matrix-core = { path = "../matrix/core" }
 matrix-repository = { path = "../matrix/repository" }
 storage = { path = "../storage" }
 rusqlite = { version = "0.31", features = ["bundled"] }
+schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
 thiserror = "2"
 uuid.workspace = true
 

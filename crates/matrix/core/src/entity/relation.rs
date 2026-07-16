@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use super::MatrixEntity;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixRelationInput {
     #[serde(default)]
     pub relation_id: Option<String>,
@@ -17,7 +17,7 @@ pub struct MatrixRelationInput {
     pub confidence: Option<f32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixRelation {
     pub relation_id: String,
     pub relation_type: String,
@@ -49,7 +49,7 @@ impl MatrixRelation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixImpactHop {
     pub depth: usize,
     pub traversal_direction: String,
@@ -60,7 +60,7 @@ pub struct MatrixImpactHop {
     pub to_entity: Option<MatrixEntity>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixImpactTrace {
     pub root_entity_id: String,
     pub max_depth: usize,

@@ -57,7 +57,7 @@ impl<Request, Query, Response> TypedRouteSpec<Request, Query, Response> {
         }
     }
 
-    const fn metadata(
+    fn metadata(
         &self,
         request_schema: Option<&'static str>,
         response_schema: &'static str,
@@ -65,10 +65,10 @@ impl<Request, Query, Response> TypedRouteSpec<Request, Query, Response> {
     ) -> StableRouteMetadata {
         StableRouteMetadata {
             method: self.method,
-            path: self.path,
-            operation_id: self.operation_id,
-            request_schema,
-            response_schema,
+            path: self.path.to_string(),
+            operation_id: self.operation_id.to_string(),
+            request_schema: request_schema.map(str::to_string),
+            response_schema: response_schema.to_string(),
             streaming,
         }
     }
@@ -77,13 +77,13 @@ impl<Request, Query, Response> TypedRouteSpec<Request, Query, Response> {
 /// Non-generic metadata consumed by capability/OpenAPI generation. It is
 /// derived from a `TypedRouteSpec`; no feature-specific string matching is
 /// permitted outside this registry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StableRouteMetadata {
     pub(crate) method: &'static str,
-    pub(crate) path: &'static str,
-    pub(crate) operation_id: &'static str,
-    pub(crate) request_schema: Option<&'static str>,
-    pub(crate) response_schema: &'static str,
+    pub(crate) path: String,
+    pub(crate) operation_id: String,
+    pub(crate) request_schema: Option<String>,
+    pub(crate) response_schema: String,
     pub(crate) streaming: bool,
 }
 
@@ -158,9 +158,32 @@ pub(crate) fn execution_projection_route_metadata() -> Vec<StableRouteMetadata> 
     ]
 }
 
+pub(crate) fn mfg_route_metadata() -> Vec<StableRouteMetadata> {
+    app_mfg_contract::mfg_route_contracts()
+        .into_iter()
+        .map(|route| StableRouteMetadata {
+            method: match route.method.as_str() {
+                "GET" => "GET",
+                "POST" => "POST",
+                "PUT" => "PUT",
+                "PATCH" => "PATCH",
+                "DELETE" => "DELETE",
+                _ => "UNKNOWN",
+            },
+            path: route.path,
+            operation_id: route.route_id.as_str().replace('.', "_"),
+            request_schema: (!matches!(route.method.as_str(), "GET" | "DELETE"))
+                .then_some(route.request_schema),
+            response_schema: route.response_schema,
+            streaming: route.route_id == app_mfg_contract::MfgRouteId::LiveStream,
+        })
+        .collect()
+}
+
 pub(crate) fn stable_route_metadata(method: &str, path: &str) -> Option<StableRouteMetadata> {
     execution_projection_route_metadata()
         .into_iter()
+        .chain(mfg_route_metadata())
         .find(|spec| spec.method == method && spec.path == path)
 }
 

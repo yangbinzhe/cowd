@@ -72,6 +72,16 @@ impl MatrixService {
         self.envelope("repository")
     }
 
+    pub(crate) fn resource_revision(
+        &self,
+        config_home: impl AsRef<Path>,
+        resource_kind: &str,
+        resource_id: &str,
+    ) -> Result<u64, GatewayMatrixRepositoryError> {
+        self.sqlite_repository(config_home)?
+            .resource_revision_for_existing(resource_kind, resource_id)
+    }
+
     pub(crate) fn repository_health(
         &self,
         config_home: impl AsRef<Path>,
@@ -93,6 +103,17 @@ impl MatrixService {
     ) -> Result<MatrixSourcePack, GatewayMatrixRepositoryError> {
         self.sqlite_repository(config_home)?
             .upsert_source_pack(source_pack)
+    }
+
+    pub(crate) fn upsert_source_pack_checked(
+        &self,
+        config_home: impl AsRef<Path>,
+        source_pack: MatrixSourcePack,
+        expected_revision: Option<u64>,
+    ) -> Result<matrix_repository::MatrixRevisioned<MatrixSourcePack>, GatewayMatrixRepositoryError>
+    {
+        self.sqlite_repository(config_home)?
+            .upsert_source_pack_checked(source_pack, expected_revision)
     }
 
     pub(crate) fn list_source_packs(
@@ -366,6 +387,17 @@ impl MatrixService {
         self.sqlite_repository(config_home)?.upsert_entity(entity)
     }
 
+    pub(crate) fn upsert_entity_checked(
+        &self,
+        config_home: impl AsRef<Path>,
+        entity: &MatrixEntity,
+        expected_revision: Option<u64>,
+    ) -> Result<matrix_repository::MatrixRevisioned<MatrixEntity>, GatewayMatrixRepositoryError>
+    {
+        self.sqlite_repository(config_home)?
+            .upsert_entity_checked(entity, expected_revision)
+    }
+
     pub(crate) fn get_entity(
         &self,
         config_home: impl AsRef<Path>,
@@ -419,6 +451,17 @@ impl MatrixService {
     ) -> Result<MatrixRelation, GatewayMatrixRepositoryError> {
         self.sqlite_repository(config_home)?
             .upsert_relation(relation)
+    }
+
+    pub(crate) fn upsert_relation_checked(
+        &self,
+        config_home: impl AsRef<Path>,
+        relation: &MatrixRelation,
+        expected_revision: Option<u64>,
+    ) -> Result<matrix_repository::MatrixRevisioned<MatrixRelation>, GatewayMatrixRepositoryError>
+    {
+        self.sqlite_repository(config_home)?
+            .upsert_relation_checked(relation, expected_revision)
     }
 
     pub(crate) fn list_entity_relations(
@@ -510,6 +553,19 @@ impl MatrixService {
     ) -> Result<MatrixMetricDependency, GatewayMatrixRepositoryError> {
         self.sqlite_repository(config_home)?
             .upsert_metric_dependency(dependency)
+    }
+
+    pub(crate) fn upsert_metric_dependency_checked(
+        &self,
+        config_home: impl AsRef<Path>,
+        dependency: &MatrixMetricDependency,
+        expected_revision: Option<u64>,
+    ) -> Result<
+        matrix_repository::MatrixRevisioned<MatrixMetricDependency>,
+        GatewayMatrixRepositoryError,
+    > {
+        self.sqlite_repository(config_home)?
+            .upsert_metric_dependency_checked(dependency, expected_revision)
     }
 
     pub(crate) fn metrics_affected_by_fact_type(

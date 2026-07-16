@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgAlertRuleInput {
     #[serde(default)]
     pub rule_id: Option<String>,
@@ -22,7 +22,7 @@ pub struct MfgAlertRuleInput {
     pub expected_revision: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgAlertRule {
     pub rule_id: String,
     pub owner_ref: String,
@@ -63,7 +63,7 @@ impl MfgAlertRule {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgAlertOccurrence {
     pub occurrence_id: String,
     pub rule_id: String,
@@ -83,7 +83,7 @@ pub struct MfgAlertOccurrence {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgAlertSubscriptionInput {
     #[serde(default)]
     pub subscription_id: Option<String>,
@@ -96,7 +96,7 @@ pub struct MfgAlertSubscriptionInput {
     pub expected_revision: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgAlertSubscription {
     pub subscription_id: String,
     pub rule_id: String,
@@ -129,7 +129,7 @@ impl MfgAlertSubscription {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MfgAlertCommand {
     Acknowledge,
@@ -138,7 +138,7 @@ pub enum MfgAlertCommand {
     Escalate,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgAlertCommandInput {
     pub command: MfgAlertCommand,
     pub actor_ref: String,
@@ -150,7 +150,7 @@ pub struct MfgAlertCommandInput {
     pub reason: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgAssignmentInput {
     #[serde(default)]
     pub assignment_id: Option<String>,
@@ -180,7 +180,7 @@ pub struct MfgAssignmentInput {
     pub expected_revision: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgAssignment {
     pub assignment_id: String,
     pub task_ref: String,
@@ -241,7 +241,7 @@ impl MfgAssignment {
 
 /// A delivery address owned by the Surface boundary.  It deliberately carries
 /// no provider token or task state; Surface owns transport and recovery.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgSurfaceNotificationTarget {
     pub surface: String,
     pub recipient: String,
@@ -249,7 +249,7 @@ pub struct MfgSurfaceNotificationTarget {
     pub thread: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MfgAssignmentCommand {
     Assign,
@@ -259,9 +259,11 @@ pub enum MfgAssignmentCommand {
     Watch,
     RequestUpdate,
     Escalate,
+    Start,
+    Complete,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgAssignmentCommandInput {
     pub command: MfgAssignmentCommand,
     pub actor_ref: String,
@@ -273,24 +275,84 @@ pub struct MfgAssignmentCommandInput {
     pub reason: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgCommandReceipt {
     pub receipt_id: String,
     pub domain: String,
     pub subject_ref: String,
     pub command: String,
+    #[serde(default)]
+    pub action_id: String,
     pub actor_ref: String,
     pub idempotency_key: String,
+    #[serde(default)]
+    pub payload_digest: String,
+    #[serde(default = "default_mfg_contract_version")]
+    pub contract_version: String,
     pub idempotent_replay: bool,
     pub previous_revision: u64,
     pub current_revision: u64,
     pub audit_ref: String,
     #[serde(default)]
     pub notification_refs: Vec<String>,
+    #[serde(default)]
+    pub response_snapshot: Value,
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+impl MfgCommandReceipt {
+    pub fn canonical_receipt(
+        &self,
+    ) -> Result<app_mfg_contract::MfgReceiptV1, app_mfg_contract::MfgApiErrorV1> {
+        let action_id = app_mfg_contract::MfgActionId::parse(&self.action_id).ok_or_else(|| {
+            app_mfg_contract::MfgApiErrorV1 {
+                code: app_mfg_contract::MfgErrorCode::ContractMismatch,
+                message: format!(
+                    "legacy MFG receipt action is absent from the canonical contract: {}",
+                    self.action_id
+                ),
+                http_status: 500,
+                details: serde_json::json!({"receipt_id": self.receipt_id}),
+                retryable: false,
+                contract_version: app_mfg_contract::MfgContractVersion::default(),
+                recovery_actions: Vec::new(),
+                request_id: None,
+                receipt_ref: Some(self.receipt_id.clone()),
+            }
+        })?;
+        let is_create = app_mfg_contract::mfg_action_contracts()
+            .into_iter()
+            .find(|contract| contract.action_id == action_id)
+            .is_some_and(|contract| {
+                matches!(contract.class, app_mfg_contract::MfgMutationClass::Create)
+            });
+        Ok(app_mfg_contract::MfgReceiptV1 {
+            receipt_id: self.receipt_id.clone(),
+            idempotency_key: self.idempotency_key.clone(),
+            actor_principal: self.actor_ref.clone(),
+            action_id,
+            resource_ref: self.subject_ref.clone(),
+            expected_revision: (!is_create).then_some(self.previous_revision),
+            result_revision: Some(self.current_revision),
+            payload_digest: self.payload_digest.clone(),
+            status: if self.idempotent_replay {
+                app_mfg_contract::MfgReceiptStatus::Replayed
+            } else {
+                app_mfg_contract::MfgReceiptStatus::Completed
+            },
+            response: serde_json::to_value(self).unwrap_or(serde_json::Value::Null),
+            contract_version: app_mfg_contract::MfgContractVersion(self.contract_version.clone()),
+            created_at: self.created_at,
+            updated_at: self.created_at,
+        })
+    }
+}
+
+fn default_mfg_contract_version() -> String {
+    app_mfg_contract::MFG_CONTRACT_VERSION.to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgForecastSignal {
     pub signal_ref: String,
     pub label: String,
@@ -298,7 +360,7 @@ pub struct MfgForecastSignal {
     pub weight: f32,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgForecastProjection {
     pub forecast_id: String,
     pub metric_ref: String,
@@ -322,7 +384,7 @@ pub struct MfgForecastProjection {
     pub unavailable_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgLiveProjectionEvent {
     pub cursor: u64,
     pub event_type: String,
@@ -332,7 +394,7 @@ pub struct MfgLiveProjectionEvent {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgLiveProjection {
     pub kind: String,
     pub cursor: u64,

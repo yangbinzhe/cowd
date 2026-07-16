@@ -17,9 +17,11 @@ path = "src/main.rs"
 test-support = []
 
 [dependencies]
+app-mfg-contract = { path = "../app-mfg-contract" }
 base64 = "0.22"
 harness-contract = { path = "../harness-contract" }
 ring = "0.17"
+rustix = { version = "1.1", features = ["net", "process"] }
 serde.workspace = true
 serde_json.workspace = true
 subtle = "2"

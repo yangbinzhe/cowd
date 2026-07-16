@@ -5,7 +5,7 @@ use matrix_core::MatrixEvidencePacket;
 
 use super::{MfgActionExecution, MfgIncident, MfgOperationalAnalysis};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgMemoryCase {
     pub case_id: String,
     pub incident_id: String,
@@ -34,7 +34,7 @@ pub struct MfgMemoryCase {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgPlaybookStep {
     pub step_id: String,
     pub title: String,
@@ -45,9 +45,11 @@ pub struct MfgPlaybookStep {
     pub required_evidence: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgPlaybook {
     pub playbook_id: String,
+    #[serde(default = "default_playbook_revision")]
+    pub revision: u64,
     pub domain: String,
     pub scenario: String,
     #[serde(default)]
@@ -68,7 +70,11 @@ pub struct MfgPlaybook {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+fn default_playbook_revision() -> u64 {
+    1
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgCasePromotion {
     pub memory_case: MfgMemoryCase,
     pub playbook: MfgPlaybook,
@@ -199,6 +205,7 @@ impl MfgPlaybook {
             .collect::<Vec<_>>();
         Self {
             playbook_id: format!("playbook-{}", uuid::Uuid::new_v4()),
+            revision: 1,
             domain: domain_for_case(case),
             scenario: scenario_for_case(case),
             trigger_fact_types: Vec::new(),

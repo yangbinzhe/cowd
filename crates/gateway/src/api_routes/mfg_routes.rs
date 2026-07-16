@@ -10,9 +10,11 @@ use app_mfg::{
     MfgRepositoryError,
 };
 use axum::{
-    extract::{Path as AxumPath, Query, State as AxumState},
-    http::StatusCode,
-    response::IntoResponse,
+    body::Body,
+    extract::{MatchedPath, Path as AxumPath, Query, State as AxumState},
+    http::{HeaderMap, Request, StatusCode},
+    middleware::Next,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Extension, Json, Router,
 };
@@ -22,6 +24,7 @@ use matrix_core::{
     MatrixMetricDependencyInput, MatrixRelation, MatrixRelationInput, MatrixSourcePack,
     MATRIX_SCHEMA_VERSION,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::services::{
@@ -40,7 +43,7 @@ mod cockpit;
 mod decision;
 mod incidents;
 mod operations;
-use super::{api_error, principal_actor_id, AppState, AuthenticatedPrincipal, ErrorResponse};
+use super::{principal_actor_id, AppState, AuthenticatedPrincipal, ErrorResponse};
 use cockpit::*;
 use decision::*;
 use incidents::*;
@@ -48,7 +51,7 @@ use operations::*;
 
 /// Public MFG bridge intent. Gateway authentication owns the effective actor;
 /// an actor field in an HTTP body is rejected by this closed schema.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(super) struct MfgCrossPlaneBridgeIntent {
     #[serde(default = "default_mfg_bridge_mode")]
@@ -86,7 +89,7 @@ impl MfgCrossPlaneBridgeIntent {
 }
 
 /// Public MFG delivery intent. It cannot deserialize service-owned actor data.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(super) struct MfgCockpitReportDeliveryIntent {
     #[serde(default = "default_mfg_bridge_mode")]
@@ -113,7 +116,7 @@ pub(super) struct MfgCockpitReportDeliveryIntent {
 
 /// Public action execution intent. The authenticated gateway principal is the
 /// only source of the effective operator id.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(super) struct MfgActionExecutionIntent {
     #[serde(default = "default_mfg_bridge_mode")]
@@ -154,8 +157,138 @@ fn default_mfg_bridge_mode() -> String {
     "dry_run".to_string()
 }
 
-pub(super) fn router() -> Router<Arc<AppState>> {
+pub(super) fn register_mfg_openapi_schemas(
+    registry: &mut app_mfg_contract::MfgOpenApiSchemaRegistry,
+) {
+    registry.register_type::<MfgCrossPlaneBridgeIntent>("MfgCrossPlaneBridgeIntent");
+    registry.register_type::<MfgCockpitReportDeliveryIntent>("MfgCockpitReportDeliveryIntent");
+    registry.register_type::<MfgActionExecutionIntent>("MfgActionExecutionIntent");
+    registry.register_type::<MfgCockpitProfileUpsertRequest>("MfgCockpitProfileUpsertRequest");
+    registry.register_type::<MfgCockpitProfileListQuery>("MfgCockpitProfileListQuery");
+    registry.register_type::<MfgCockpitProfileDeleteQuery>("MfgCockpitProfileDeleteQuery");
+    registry.register_type::<MfgCockpitProjectionQuery>("MfgCockpitProjectionQuery");
+    registry.register_type::<MfgCockpitProfileCloneRequest>("MfgCockpitProfileCloneRequest");
+    registry.register_type::<MfgCockpitProfileShareRequest>("MfgCockpitProfileShareRequest");
+    registry.register_type::<MfgCockpitReportGenerateRequest>("MfgCockpitReportGenerateRequest");
+    registry.register_type::<MfgCockpitReportListQuery>("MfgCockpitReportListQuery");
+    registry
+        .register_type::<MfgCockpitReportScheduleRunRequest>("MfgCockpitReportScheduleRunRequest");
+    registry.register_type::<MfgIncidentCreateRequest>("MfgIncidentCreateRequest");
+    registry.register_type::<MfgExecutionFeedbackRequest>("MfgExecutionFeedbackRequest");
+    registry.register_type::<MfgCaseSearchQuery>("MfgCaseSearchQuery");
+    registry.register_type::<MfgPlaybookUpsertRequest>("MfgPlaybookUpsertRequest");
+    registry.register_type::<MfgPlaybookRecommendRequest>("MfgPlaybookRecommendRequest");
+    registry.register_type::<MfgSkillPlanRequest>("MfgSkillPlanRequest");
+    registry.register_type::<MfgSkillRunRequest>("MfgSkillRunRequest");
+    registry.register_type::<MfgCockpitReportDeliveryRetryRequest>(
+        "MfgCockpitReportDeliveryRetryRequest",
+    );
+    registry.register_type::<MatrixDecisionTraceQuery>("MatrixDecisionTraceQuery");
+    registry.register_type::<MfgRealityFactIngestRequest>("MfgRealityFactIngestRequest");
+    registry.register_type::<MfgRealityEntityUpsertRequest>("MfgRealityEntityUpsertRequest");
+    registry.register_type::<MfgRealityEntityResolveSourceKeyRequest>(
+        "MfgRealityEntityResolveSourceKeyRequest",
+    );
+    registry.register_type::<MfgRealityEntityMatchCandidateRequest>(
+        "MfgRealityEntityMatchCandidateRequest",
+    );
+    registry.register_type::<MfgRealityEntityConflictDecisionRequest>(
+        "MfgRealityEntityConflictDecisionRequest",
+    );
+    registry.register_type::<MfgRealityRelationUpsertRequest>("MfgRealityRelationUpsertRequest");
+    registry.register_type::<MfgRealityMetricDependencyUpsertRequest>(
+        "MfgRealityMetricDependencyUpsertRequest",
+    );
+    registry.register_type::<MfgRealityMetricAttentionPlanRequest>(
+        "MfgRealityMetricAttentionPlanRequest",
+    );
+    registry.register_type::<MfgRealityMetricSnapshotMaterializeRequest>(
+        "MfgRealityMetricSnapshotMaterializeRequest",
+    );
+    registry.register_type::<MfgRealityAffectedByFactTypeRequest>(
+        "MfgRealityAffectedByFactTypeRequest",
+    );
+    registry.register_type::<MfgRealityComputeJobPlanRequest>("MfgRealityComputeJobPlanRequest");
+    registry.register_type::<MfgRealityDataPlaneIngestPlanRequest>(
+        "MfgRealityDataPlaneIngestPlanRequest",
+    );
+    registry.register_type::<MfgRealityEvidenceBuildRequest>("MfgRealityEvidenceBuildRequest");
+    registry
+        .register_type::<MfgRealitySourcePackUpsertRequest>("MfgRealitySourcePackUpsertRequest");
+    registry.register_type::<MfgRealitySourcePackIngestFileRequest>(
+        "MfgRealitySourcePackIngestFileRequest",
+    );
+    registry.register_type::<MfgRealityConnectorRunRequest>("MfgRealityConnectorRunRequest");
+    registry.register_type::<MfgAlertListQuery>("MfgAlertListQuery");
+    registry.register_type::<MfgAlertRuleUpsertRequest>("MfgAlertRuleUpsertRequest");
+    registry
+        .register_type::<MfgAlertSubscriptionUpsertRequest>("MfgAlertSubscriptionUpsertRequest");
+    registry.register_type::<MfgAlertCommandRequest>("MfgAlertCommandRequest");
+    registry.register_type::<MfgForecastQuery>("MfgForecastQuery");
+    registry.register_type::<MfgAssignmentListQuery>("MfgAssignmentListQuery");
+    registry.register_type::<MfgAssignmentUpsertRequest>("MfgAssignmentUpsertRequest");
+    registry.register_type::<MfgAssignmentCommandRequest>("MfgAssignmentCommandRequest");
+    registry.register_type::<MfgLiveQuery>("MfgLiveQuery");
+}
+
+pub(super) fn mfg_request_schema_component(route_id: app_mfg_contract::MfgRouteId) -> &'static str {
+    use app_mfg_contract::MfgRouteId as R;
+    match route_id {
+        R::RealityDataPlaneIngestPlan => "MfgRealityDataPlaneIngestPlanRequest",
+        R::RealitySourcePackUpsert => "MfgRealitySourcePackUpsertRequest",
+        R::RealitySourcePackIngestFile => "MfgRealitySourcePackIngestFileRequest",
+        R::RealityConnectorRunPlan | R::RealityConnectorRunExecute => {
+            "MfgRealityConnectorRunRequest"
+        }
+        R::RealityMetricAttentionPlan => "MfgRealityMetricAttentionPlanRequest",
+        R::RealityMetricSnapshotMaterialize => "MfgRealityMetricSnapshotMaterializeRequest",
+        R::RealityMetricDependencyUpsert => "MfgRealityMetricDependencyUpsertRequest",
+        R::RealityMetricDependencyAffectedPlan => "MfgRealityAffectedByFactTypeRequest",
+        R::RealityComputeJobPlan => "MfgRealityComputeJobPlanRequest",
+        R::RealityEntityUpsert => "MfgRealityEntityUpsertRequest",
+        R::RealityEntityResolveSourceKey => "MfgRealityEntityResolveSourceKeyRequest",
+        R::RealityEntityMatchCandidate => "MfgRealityEntityMatchCandidateRequest",
+        R::RealityEntityConflictDecision => "MfgRealityEntityConflictDecisionRequest",
+        R::RealityRelationUpsert => "MfgRealityRelationUpsertRequest",
+        R::RealityFactIngest => "MfgRealityFactIngestRequest",
+        R::RealityEvidenceBuild => "MfgRealityEvidenceBuildRequest",
+        R::DecisionTraceGet => "MatrixDecisionTraceQuery",
+        R::IncidentCreate => "MfgIncidentCreateRequest",
+        R::IncidentPlaybookRecommend => "MfgPlaybookRecommendRequest",
+        R::IncidentSkillPlan => "MfgSkillPlanRequest",
+        R::IncidentSkillRun => "MfgSkillRunRequest",
+        R::CaseSearch => "MfgCaseSearchQuery",
+        R::PlaybookUpsert => "MfgPlaybookUpsertRequest",
+        R::AnalysisActionExecute => "MfgActionExecutionIntent",
+        R::ExecutionCrossPlaneExecute => "MfgCrossPlaneBridgeIntent",
+        R::ExecutionFeedbackCreate => "MfgExecutionFeedbackRequest",
+        R::CockpitProfileList => "MfgCockpitProfileListQuery",
+        R::CockpitProfileUpsert => "MfgCockpitProfileUpsertRequest",
+        R::CockpitProfileDelete => "MfgCockpitProfileDeleteQuery",
+        R::CockpitProfileClone => "MfgCockpitProfileCloneRequest",
+        R::CockpitProfileShare => "MfgCockpitProfileShareRequest",
+        R::CockpitProjectionGet | R::CockpitWidgetProjectionGet => "MfgCockpitProjectionQuery",
+        R::ReportGenerate => "MfgCockpitReportGenerateRequest",
+        R::ReportScheduleRun => "MfgCockpitReportScheduleRunRequest",
+        R::ReportList => "MfgCockpitReportListQuery",
+        R::ReportDeliver => "MfgCockpitReportDeliveryIntent",
+        R::ReportDeliveryRetry => "MfgCockpitReportDeliveryRetryRequest",
+        R::AlertRuleList | R::AlertList | R::AlertSubscriptionList => "MfgAlertListQuery",
+        R::AlertRuleUpsert => "MfgAlertRuleUpsertRequest",
+        R::AlertSubscriptionUpsert => "MfgAlertSubscriptionUpsertRequest",
+        R::AlertCommand => "MfgAlertCommandRequest",
+        R::ForecastList => "MfgForecastQuery",
+        R::AssignmentList => "MfgAssignmentListQuery",
+        R::AssignmentUpsert => "MfgAssignmentUpsertRequest",
+        R::AssignmentCommand => "MfgAssignmentCommandRequest",
+        R::LiveStream => "MfgLiveQuery",
+        _ => "MfgNoBodyRequestV1",
+    }
+}
+
+pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
     Router::new()
+        .route("/api/apps/mfg/contract", get(mfg_contract_handler))
         .route("/api/apps/mfg/app", get(mfg_app_handler))
         .route(
             "/api/apps/mfg/production/governance",
@@ -502,16 +635,783 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             post(mfg_assignment_command_handler),
         )
         .route("/api/apps/mfg/live", get(mfg_live_projection_handler))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state,
+            mfg_capability_middleware,
+        ))
+}
+
+async fn mfg_capability_middleware(
+    AxumState(state): AxumState<Arc<AppState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let method = request.method().as_str();
+    let path = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(MatchedPath::as_str)
+        .unwrap_or_else(|| request.uri().path());
+    let Some(contract) = app_mfg_contract::route::mfg_route_contract_by_method_path(method, path)
+    else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(app_mfg_contract::MfgApiErrorV1 {
+                code: app_mfg_contract::MfgErrorCode::ContractMismatch,
+                message: format!(
+                    "MFG route is not present in the canonical contract: {method} {path}"
+                ),
+                http_status: 500,
+                details: serde_json::json!({"method": method, "path": path}),
+                retryable: false,
+                contract_version: app_mfg_contract::MfgContractVersion::default(),
+                recovery_actions: Vec::new(),
+                request_id: None,
+                receipt_ref: None,
+            }),
+        )
+            .into_response();
+    };
+    if contract.availability != app_mfg_contract::MfgActionAvailability::Active {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(app_mfg_contract::MfgApiErrorV1 {
+                code: app_mfg_contract::MfgErrorCode::ScopeNotFound,
+                message: "MFG route is declared but not active in this version".to_string(),
+                http_status: 404,
+                details: serde_json::json!({"route_id": contract.route_id.as_str()}),
+                retryable: false,
+                contract_version: app_mfg_contract::MfgContractVersion::default(),
+                recovery_actions: Vec::new(),
+                request_id: None,
+                receipt_ref: None,
+            }),
+        )
+            .into_response();
+    }
+    let Some(principal) = request
+        .extensions()
+        .get::<AuthenticatedPrincipal>()
+        .cloned()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(app_mfg_contract::MfgApiErrorV1::authentication_required(
+                "verified principal is missing",
+            )),
+        )
+            .into_response();
+    };
+    let granted = &principal.0.claims().capabilities;
+    let required = match &contract.capability {
+        app_mfg_contract::MfgCapabilityRequirement::One { capability } => {
+            vec![capability.as_str()]
+        }
+        app_mfg_contract::MfgCapabilityRequirement::All { capabilities } => capabilities
+            .iter()
+            .copied()
+            .map(app_mfg_contract::MfgCapabilityId::as_str)
+            .collect(),
+        // Per-action handlers perform the stronger check after parsing the
+        // closed action/mode. Read is the minimum transport capability.
+        app_mfg_contract::MfgCapabilityRequirement::PerAction => vec!["mfg.read"],
+    };
+    if let Some(missing) = required
+        .into_iter()
+        .find(|required| !granted.iter().any(|capability| capability == required))
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(app_mfg_contract::MfgApiErrorV1::capability_denied(missing)),
+        )
+            .into_response();
+    }
+    if contract.class != app_mfg_contract::MfgMutationClass::Read
+        && !route_has_native_receipt(contract.route_id)
+    {
+        return mfg_mutation_ledger_middleware(state, request, next, contract, principal).await;
+    }
+    let response = next.run(request).await;
+    if response.status() == StatusCode::UNPROCESSABLE_ENTITY {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(app_mfg_contract::MfgApiErrorV1 {
+                code: app_mfg_contract::MfgErrorCode::ValidationFailed,
+                message: "MFG request payload could not be decoded by the canonical contract"
+                    .to_string(),
+                http_status: StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
+                details: serde_json::Value::Null,
+                retryable: false,
+                contract_version: app_mfg_contract::MfgContractVersion::default(),
+                recovery_actions: vec![app_mfg_contract::MfgRecoveryAction {
+                    kind: app_mfg_contract::MfgRecoveryActionKind::Reload,
+                    label: "Review the request and try again".to_string(),
+                    target: None,
+                    enabled: true,
+                }],
+                request_id: None,
+                receipt_ref: None,
+            }),
+        )
+            .into_response();
+    }
+    response
+}
+
+fn route_has_native_receipt(route_id: app_mfg_contract::MfgRouteId) -> bool {
+    use app_mfg_contract::MfgRouteId as R;
+    matches!(
+        route_id,
+        R::CockpitProfileUpsert
+            | R::CockpitProfileDelete
+            | R::CockpitProfileClone
+            | R::CockpitProfileShare
+            | R::AlertRuleUpsert
+            | R::AlertSubscriptionUpsert
+            | R::AlertCommand
+            | R::AssignmentUpsert
+            | R::AssignmentCommand
+    )
+}
+
+async fn mfg_mutation_ledger_middleware(
+    state: Arc<AppState>,
+    request: Request<Body>,
+    next: Next,
+    contract: app_mfg_contract::MfgRouteContract,
+    principal: AuthenticatedPrincipal,
+) -> Response {
+    use app_mfg_contract::{MfgMutationClass, MfgReceiptStatus, MfgReceiptV1};
+    use sha2::{Digest, Sha256};
+
+    const MAX_MFG_MUTATION_BODY: usize = 64 * 1024 * 1024;
+    let request_path = request.uri().path().to_string();
+    let query = request.uri().query().unwrap_or_default().to_string();
+    let header_key = request
+        .headers()
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let is_json_body = request
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_none_or(|value| value.contains("json"));
+    let (parts, body) = request.into_parts();
+    let bytes = match axum::body::to_bytes(body, MAX_MFG_MUTATION_BODY).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return mfg_error_response(
+                StatusCode::BAD_REQUEST,
+                app_mfg_contract::MfgErrorCode::ValidationFailed,
+                format!("failed to read MFG request body: {error}"),
+                false,
+            );
+        }
+    };
+    let body_json = if bytes.is_empty() || !is_json_body {
+        serde_json::Value::Null
+    } else {
+        match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(value) => value,
+            Err(error) => {
+                return mfg_error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    app_mfg_contract::MfgErrorCode::ValidationFailed,
+                    format!("MFG request body is not valid JSON: {error}"),
+                    false,
+                );
+            }
+        }
+    };
+    let body_key = find_json_string(&body_json, "idempotency_key");
+    let query_key = query.split('&').find_map(|pair| {
+        pair.split_once('=')
+            .filter(|(name, _)| *name == "idempotency_key")
+            .map(|(_, value)| value.to_string())
+    });
+    let legacy_key = body_key.or(query_key);
+    let idempotency_key = match (header_key, legacy_key) {
+        (Some(header), Some(legacy)) if header != legacy => {
+            return mfg_error_response(
+                StatusCode::BAD_REQUEST,
+                app_mfg_contract::MfgErrorCode::IdempotencyConflict,
+                "Idempotency-Key header conflicts with legacy body/query value".to_string(),
+                false,
+            );
+        }
+        (Some(header), _) => Some(header),
+        (None, legacy) => legacy,
+    };
+    let action_id = resolve_mfg_action_id(contract.route_id, &body_json);
+    let Some(action_contract) = app_mfg_contract::mfg_action_contracts()
+        .into_iter()
+        .find(|action| action.action_id.as_str() == action_id)
+    else {
+        return mfg_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            app_mfg_contract::MfgErrorCode::ContractMismatch,
+            format!("resolved action is absent from the canonical contract: {action_id}"),
+            false,
+        );
+    };
+    let resource_ref = resolve_mfg_resource_ref(contract.route_id, &request_path, &body_json);
+    if let Some(missing) = action_contract
+        .required_capabilities
+        .iter()
+        .find(|required| {
+            !principal
+                .0
+                .claims()
+                .capabilities
+                .iter()
+                .any(|granted| granted == *required)
+        })
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(app_mfg_contract::MfgApiErrorV1::capability_denied(
+                missing.clone(),
+            )),
+        )
+            .into_response();
+    }
+    let expected_revision = find_json_u64(&body_json, "expected_revision");
+    if let app_mfg_contract::MfgMutationSemantics::DurableReceipt { revision, .. } =
+        action_contract.mutation
+    {
+        match revision {
+            app_mfg_contract::MfgRevisionSemantics::Required if expected_revision.is_none() => {
+                return mfg_error_response(
+                    StatusCode::CONFLICT,
+                    app_mfg_contract::MfgErrorCode::RevisionConflict,
+                    format!(
+                        "action {} requires expected_revision",
+                        action_contract.action_id.as_str()
+                    ),
+                    false,
+                );
+            }
+            app_mfg_contract::MfgRevisionSemantics::CreateOnly if expected_revision.is_some() => {
+                return mfg_error_response(
+                    StatusCode::CONFLICT,
+                    app_mfg_contract::MfgErrorCode::RevisionConflict,
+                    format!(
+                        "create action {} does not accept expected_revision",
+                        action_contract.action_id.as_str()
+                    ),
+                    false,
+                );
+            }
+            _ => {}
+        }
+    }
+    let digest_payload = if is_json_body {
+        let mut digest_body = body_json.clone();
+        remove_json_field(&mut digest_body, "idempotency_key");
+        serde_json::to_vec(&digest_body).unwrap_or_else(|_| bytes.to_vec())
+    } else {
+        bytes.to_vec()
+    };
+    let payload_digest = format!("sha256:{:x}", Sha256::digest(&digest_payload));
+    let actor_principal = principal_actor_id(&principal);
+    let durable = !matches!(contract.class, MfgMutationClass::Preview)
+        && !matches!(action_contract.class, MfgMutationClass::Preview);
+    let idempotency_key = if durable {
+        match idempotency_key {
+            Some(key) => key,
+            None => {
+                return mfg_error_response(
+                    StatusCode::BAD_REQUEST,
+                    app_mfg_contract::MfgErrorCode::ValidationFailed,
+                    "Idempotency-Key is required for durable MFG mutations".to_string(),
+                    false,
+                );
+            }
+        }
+    } else {
+        idempotency_key.unwrap_or_else(|| format!("preview-{}", uuid::Uuid::new_v4()))
+    };
+    if durable {
+        match state.services.mfg.find_mutation_receipt(
+            &state.config_home,
+            &idempotency_key,
+            &actor_principal,
+            &action_id,
+            &resource_ref,
+            &payload_digest,
+        ) {
+            Ok(Some((mut receipt, mut response))) => {
+                receipt.status = MfgReceiptStatus::Replayed;
+                attach_mfg_receipt(&mut response, &receipt);
+                return json_response_with_receipt(StatusCode::OK, response, &receipt);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return mfg_error_response(
+                    StatusCode::CONFLICT,
+                    app_mfg_contract::MfgErrorCode::IdempotencyConflict,
+                    error.to_string(),
+                    false,
+                );
+            }
+        }
+    }
+
+    let request = Request::from_parts(parts, Body::from(bytes));
+    let response = next.run(request).await;
+    if response.status() == StatusCode::UNPROCESSABLE_ENTITY {
+        return mfg_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            app_mfg_contract::MfgErrorCode::ValidationFailed,
+            "MFG request payload could not be decoded by the canonical contract".to_string(),
+            false,
+        );
+    }
+    if !response.status().is_success() {
+        return response;
+    }
+    let status = response.status();
+    let (mut response_parts, response_body) = response.into_parts();
+    let response_bytes = match axum::body::to_bytes(response_body, MAX_MFG_MUTATION_BODY).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return mfg_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                app_mfg_contract::MfgErrorCode::Internal,
+                format!("failed to capture MFG mutation response: {error}"),
+                true,
+            );
+        }
+    };
+    let mut response_json = serde_json::from_slice::<serde_json::Value>(&response_bytes)
+        .unwrap_or_else(|_| serde_json::json!({"data": String::from_utf8_lossy(&response_bytes)}));
+    let result_revision = find_json_u64(&response_json, "revision")
+        .or_else(|| find_json_u64(&response_json, "current_revision"));
+    let receipt = if durable {
+        match state.services.mfg.record_mutation_receipt(
+            &state.config_home,
+            &idempotency_key,
+            &actor_principal,
+            &action_id,
+            &resource_ref,
+            expected_revision,
+            result_revision,
+            &payload_digest,
+            &response_json,
+        ) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                return mfg_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    app_mfg_contract::MfgErrorCode::Internal,
+                    format!("failed to persist MFG mutation receipt: {error}"),
+                    true,
+                );
+            }
+        }
+    } else {
+        let now = chrono::Utc::now();
+        MfgReceiptV1 {
+            receipt_id: format!("preview-receipt-{}", uuid::Uuid::new_v4()),
+            idempotency_key,
+            actor_principal,
+            action_id: action_contract.action_id,
+            resource_ref,
+            expected_revision,
+            result_revision,
+            payload_digest,
+            status: MfgReceiptStatus::Preview,
+            response: response_json.clone(),
+            contract_version: app_mfg_contract::MfgContractVersion::default(),
+            created_at: now,
+            updated_at: now,
+        }
+    };
+    attach_mfg_receipt(&mut response_json, &receipt);
+    response_parts
+        .headers
+        .remove(axum::http::header::CONTENT_LENGTH);
+    if let Ok(value) = axum::http::HeaderValue::from_bytes(receipt.receipt_id.as_bytes()) {
+        response_parts
+            .headers
+            .insert("x-cowd-mfg-receipt-id", value);
+    }
+    response_parts.headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    let body = serde_json::to_vec(&response_json).unwrap_or_else(|_| response_bytes.to_vec());
+    Response::from_parts(response_parts, Body::from(body))
+}
+
+fn resolve_mfg_action_id(
+    route_id: app_mfg_contract::MfgRouteId,
+    body: &serde_json::Value,
+) -> String {
+    use app_mfg_contract::MfgRouteId as R;
+    let mode = find_json_string(body, "mode")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match route_id {
+        R::RealitySourcePackUpsert => {
+            if find_json_u64(body, "expected_revision").is_some() {
+                "mfg.reality.source_pack.update"
+            } else {
+                "mfg.reality.source_pack.create"
+            }
+        }
+        R::RealityMetricDependencyUpsert => {
+            if find_json_u64(body, "expected_revision").is_some() {
+                "mfg.reality.metric_dependency.update"
+            } else {
+                "mfg.reality.metric_dependency.create"
+            }
+        }
+        R::RealityEntityUpsert => {
+            if find_json_u64(body, "expected_revision").is_some() {
+                "mfg.reality.entity.update"
+            } else {
+                "mfg.reality.entity.create"
+            }
+        }
+        R::RealityRelationUpsert => {
+            if find_json_u64(body, "expected_revision").is_some() {
+                "mfg.reality.relation.update"
+            } else {
+                "mfg.reality.relation.create"
+            }
+        }
+        R::PlaybookUpsert => {
+            if find_json_u64(body, "expected_revision").is_some() {
+                "mfg.playbook.update"
+            } else {
+                "mfg.playbook.create"
+            }
+        }
+        R::AnalysisActionExecute => {
+            if mode.is_empty() || matches!(mode.as_str(), "dry_run" | "plan") {
+                "mfg.analysis.action.dry_run"
+            } else {
+                "mfg.analysis.action.commit"
+            }
+        }
+        R::ExecutionCrossPlaneExecute => {
+            if mode.is_empty() || matches!(mode.as_str(), "dry_run" | "plan") {
+                "mfg.execution.cross_plane.dry_run"
+            } else {
+                "mfg.execution.cross_plane.commit"
+            }
+        }
+        R::ReportDeliver => {
+            if mode.is_empty() || matches!(mode.as_str(), "dry_run" | "plan") {
+                "mfg.report.deliver.dry_run"
+            } else {
+                "mfg.report.deliver.commit"
+            }
+        }
+        R::ReportDeliveryRetry => {
+            if mode.is_empty() || matches!(mode.as_str(), "dry_run" | "plan") {
+                "mfg.report.delivery.retry_dry_run"
+            } else {
+                "mfg.report.delivery.retry_commit"
+            }
+        }
+        R::ReportScheduleRun => {
+            if find_json_bool(body, "deliver").unwrap_or(false) {
+                "mfg.report.schedule.generate_and_deliver"
+            } else {
+                "mfg.report.schedule.generate_only"
+            }
+        }
+        R::IncidentSkillRun => "mfg.skill.run",
+        _ => route_id.as_str(),
+    }
+    .to_string()
+}
+
+fn resolve_mfg_resource_ref(
+    route_id: app_mfg_contract::MfgRouteId,
+    request_path: &str,
+    body: &serde_json::Value,
+) -> String {
+    use app_mfg_contract::MfgRouteId as R;
+    let identified = match route_id {
+        R::RealitySourcePackUpsert => {
+            find_json_string(body, "source_pack_id").map(|id| format!("matrix:source_pack:{id}"))
+        }
+        R::RealityMetricDependencyUpsert => find_json_string(body, "dependency_id")
+            .map(|id| format!("matrix:metric_dependency:{id}"))
+            .or_else(|| {
+                Some(format!(
+                    "matrix:metric_dependency:{}:{}:{}",
+                    find_json_string(body, "upstream_metric_id")?,
+                    find_json_string(body, "downstream_metric_id")?,
+                    find_json_string(body, "dependency_type")?,
+                ))
+            }),
+        R::RealityEntityUpsert => find_json_string(body, "entity_id")
+            .map(|id| format!("matrix:entity:{id}"))
+            .or_else(|| {
+                Some(format!(
+                    "matrix:entity:{}:{}",
+                    find_json_string(body, "entity_type")?,
+                    find_json_string(body, "canonical_key")?,
+                ))
+            }),
+        R::RealityRelationUpsert => find_json_string(body, "relation_id")
+            .map(|id| format!("matrix:relation:{id}"))
+            .or_else(|| {
+                Some(format!(
+                    "matrix:relation:{}:{}:{}",
+                    find_json_string(body, "relation_type")?,
+                    find_json_string(body, "from_entity_id")?,
+                    find_json_string(body, "to_entity_id")?,
+                ))
+            }),
+        R::PlaybookUpsert => {
+            find_json_string(body, "playbook_id").map(|id| format!("mfg:playbook:{id}"))
+        }
+        _ => None,
+    };
+    identified.unwrap_or_else(|| format!("mfg:http:{request_path}"))
+}
+
+fn find_json_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    match value {
+        serde_json::Value::Object(object) => object
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                object
+                    .values()
+                    .find_map(|value| find_json_string(value, key))
+            }),
+        serde_json::Value::Array(items) => {
+            items.iter().find_map(|value| find_json_string(value, key))
+        }
+        _ => None,
+    }
+}
+
+fn find_json_u64(value: &serde_json::Value, key: &str) -> Option<u64> {
+    match value {
+        serde_json::Value::Object(object) => object
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| object.values().find_map(|value| find_json_u64(value, key))),
+        serde_json::Value::Array(items) => items.iter().find_map(|value| find_json_u64(value, key)),
+        _ => None,
+    }
+}
+
+fn find_json_bool(value: &serde_json::Value, key: &str) -> Option<bool> {
+    match value {
+        serde_json::Value::Object(object) => object
+            .get(key)
+            .and_then(serde_json::Value::as_bool)
+            .or_else(|| object.values().find_map(|value| find_json_bool(value, key))),
+        serde_json::Value::Array(items) => {
+            items.iter().find_map(|value| find_json_bool(value, key))
+        }
+        _ => None,
+    }
+}
+
+fn remove_json_field(value: &mut serde_json::Value, key: &str) {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.remove(key);
+            for value in object.values_mut() {
+                remove_json_field(value, key);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                remove_json_field(item, key);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn attach_mfg_receipt(response: &mut serde_json::Value, receipt: &app_mfg_contract::MfgReceiptV1) {
+    if let Some(object) = response.as_object_mut() {
+        object.insert(
+            "_mfg_receipt".to_string(),
+            serde_json::to_value(receipt).unwrap_or(serde_json::Value::Null),
+        );
+    }
+}
+
+fn json_response_with_receipt(
+    status: StatusCode,
+    response: serde_json::Value,
+    receipt: &app_mfg_contract::MfgReceiptV1,
+) -> Response {
+    let mut response = (status, Json(response)).into_response();
+    if let Ok(value) = axum::http::HeaderValue::from_bytes(receipt.receipt_id.as_bytes()) {
+        response
+            .headers_mut()
+            .insert("x-cowd-mfg-receipt-id", value);
+    }
+    response
+}
+
+fn mfg_error_response(
+    status: StatusCode,
+    code: app_mfg_contract::MfgErrorCode,
+    message: String,
+    retryable: bool,
+) -> Response {
+    (
+        status,
+        Json(app_mfg_contract::MfgApiErrorV1 {
+            code,
+            message,
+            http_status: status.as_u16(),
+            details: serde_json::Value::Null,
+            retryable,
+            contract_version: app_mfg_contract::MfgContractVersion::default(),
+            recovery_actions: if retryable {
+                vec![app_mfg_contract::MfgRecoveryAction {
+                    kind: app_mfg_contract::MfgRecoveryActionKind::RetrySameIntent,
+                    label: "Retry the same intent".to_string(),
+                    target: None,
+                    enabled: true,
+                }]
+            } else {
+                Vec::new()
+            },
+            request_id: None,
+            receipt_ref: None,
+        }),
+    )
+        .into_response()
+}
+
+pub(super) fn require_mfg_capability(
+    principal: &AuthenticatedPrincipal,
+    capability: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if principal
+        .0
+        .claims()
+        .capabilities
+        .iter()
+        .any(|granted| granted == capability)
+    {
+        Ok(())
+    } else {
+        Err(mfg_api_error(
+            StatusCode::FORBIDDEN,
+            format!("required capability is not granted: {capability}"),
+        ))
+    }
+}
+
+pub(super) fn mfg_api_error(
+    status: StatusCode,
+    message: impl Into<String>,
+) -> (StatusCode, Json<ErrorResponse>) {
+    use app_mfg_contract::{MfgErrorCode, MfgRecoveryAction, MfgRecoveryActionKind};
+
+    let message = message.into();
+    let (code, retryable, recovery_actions) = match status {
+        StatusCode::UNAUTHORIZED => (
+            MfgErrorCode::AuthenticationRequired,
+            false,
+            vec![MfgRecoveryAction {
+                kind: MfgRecoveryActionKind::RequestAccess,
+                label: "Authenticate again".to_string(),
+                target: Some("/api/auth/login".to_string()),
+                enabled: true,
+            }],
+        ),
+        StatusCode::FORBIDDEN => (
+            MfgErrorCode::CapabilityDenied,
+            false,
+            vec![MfgRecoveryAction {
+                kind: MfgRecoveryActionKind::RequestAccess,
+                label: "Request access".to_string(),
+                target: None,
+                enabled: true,
+            }],
+        ),
+        StatusCode::NOT_FOUND => (MfgErrorCode::ScopeNotFound, false, Vec::new()),
+        StatusCode::CONFLICT => (
+            MfgErrorCode::RevisionConflict,
+            false,
+            vec![
+                MfgRecoveryAction {
+                    kind: MfgRecoveryActionKind::Compare,
+                    label: "Compare changes".to_string(),
+                    target: None,
+                    enabled: true,
+                },
+                MfgRecoveryAction {
+                    kind: MfgRecoveryActionKind::Reload,
+                    label: "Reload current state".to_string(),
+                    target: None,
+                    enabled: true,
+                },
+            ],
+        ),
+        StatusCode::TOO_MANY_REQUESTS => (
+            MfgErrorCode::RateLimited,
+            true,
+            vec![MfgRecoveryAction {
+                kind: MfgRecoveryActionKind::RetrySameIntent,
+                label: "Retry the same intent".to_string(),
+                target: None,
+                enabled: true,
+            }],
+        ),
+        status if status.is_client_error() => (MfgErrorCode::ValidationFailed, false, Vec::new()),
+        _ => (
+            MfgErrorCode::Internal,
+            true,
+            vec![MfgRecoveryAction {
+                kind: MfgRecoveryActionKind::Reload,
+                label: "Reload".to_string(),
+                target: None,
+                enabled: true,
+            }],
+        ),
+    };
+    let error = app_mfg_contract::MfgApiErrorV1 {
+        code,
+        message,
+        http_status: status.as_u16(),
+        details: serde_json::Value::Null,
+        retryable,
+        contract_version: app_mfg_contract::MfgContractVersion::default(),
+        recovery_actions,
+        request_id: None,
+        receipt_ref: None,
+    };
+    let encoded = serde_json::to_string(&error).unwrap_or_else(|_| {
+        "{\"code\":\"internal\",\"message\":\"serialization failed\"}".to_string()
+    });
+    (
+        status,
+        Json(ErrorResponse {
+            error: format!("__mfg_api_error_v1__:{encoded}"),
+        }),
+    )
 }
 
 fn mfg_mutation_error(error: MfgRepositoryError) -> (StatusCode, Json<ErrorResponse>) {
     match error {
-        MfgRepositoryError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+        MfgRepositoryError::NotFound(message) => mfg_api_error(StatusCode::NOT_FOUND, message),
         conflict @ (MfgRepositoryError::RevisionConflict { .. }
         | MfgRepositoryError::CommandRejected(_)) => {
-            api_error(StatusCode::CONFLICT, conflict.to_string())
+            mfg_api_error(StatusCode::CONFLICT, conflict.to_string())
         }
-        other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        other => mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
     }
 }
 
@@ -519,7 +1419,80 @@ async fn mfg_app_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl Int
     Json(state.services.mfg.app_descriptor())
 }
 
-#[derive(Debug, Deserialize)]
+async fn mfg_contract_handler() -> Json<app_mfg_contract::MfgFrontendContractV1> {
+    use app_mfg_contract::{
+        MfgActionAvailability, MfgConsumer, MfgFrontendContractV1, MfgSurfaceContract,
+        MfgSurfaceKind, MfgSurfaceRole,
+    };
+
+    let routes = app_mfg_contract::mfg_route_contracts();
+    let actions = app_mfg_contract::mfg_action_contracts();
+    let active_route_count = routes
+        .iter()
+        .filter(|route| route.availability == MfgActionAvailability::Active)
+        .count();
+    let planned_route_count = routes.len().saturating_sub(active_route_count);
+    let webui_routes = routes
+        .iter()
+        .filter(|route| {
+            route.availability == MfgActionAvailability::Active
+                && route.consumers.contains(&MfgConsumer::Webui)
+        })
+        .map(|route| route.route_id)
+        .collect::<Vec<_>>();
+    let webui_route_set = webui_routes
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let cli_routes = vec![
+        app_mfg_contract::MfgRouteId::ContractGet,
+        app_mfg_contract::MfgRouteId::AppGet,
+    ];
+    let webui_actions = actions
+        .iter()
+        .filter(|action| {
+            action.availability == MfgActionAvailability::Active
+                && webui_route_set.contains(&action.route_id)
+        })
+        .map(|action| action.action_id)
+        .collect();
+
+    Json(MfgFrontendContractV1 {
+        kind: "mfg.frontend_contract".to_string(),
+        contract_version: app_mfg_contract::MfgContractVersion::default(),
+        generated_at: chrono::Utc::now(),
+        app_id: "mfg.manufacturing".to_string(),
+        active_route_count,
+        planned_route_count,
+        routes,
+        actions,
+        surfaces: vec![
+            MfgSurfaceContract {
+                surface: MfgSurfaceKind::Management,
+                role: MfgSurfaceRole::EnhancedManagement,
+                entrypoints: vec!["/api/apps/mfg/contract".to_string()],
+                routes: webui_routes,
+                actions: webui_actions,
+            },
+            MfgSurfaceContract {
+                surface: MfgSurfaceKind::Tui,
+                role: MfgSurfaceRole::ConsoleUnavailable,
+                entrypoints: Vec::new(),
+                routes: Vec::new(),
+                actions: Vec::new(),
+            },
+            MfgSurfaceContract {
+                surface: MfgSurfaceKind::Cli,
+                role: MfgSurfaceRole::MinimalCoreControl,
+                entrypoints: vec!["/api/apps/mfg/contract".to_string()],
+                routes: cli_routes,
+                actions: Vec::new(),
+            },
+        ],
+    })
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgCockpitProfileUpsertRequest {
     #[serde(default)]
     request_id: Option<String>,
@@ -530,7 +1503,7 @@ struct MfgCockpitProfileUpsertRequest {
     profile: MfgCockpitProfileInput,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgCockpitProfileListQuery {
     #[serde(default)]
     cadence: Option<String>,
@@ -538,14 +1511,14 @@ struct MfgCockpitProfileListQuery {
     limit: Option<usize>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgCockpitProfileDeleteQuery {
     expected_revision: u64,
     #[serde(default)]
     idempotency_key: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 struct MfgCockpitProjectionQuery {
     #[serde(default)]
     entity: Option<String>,
@@ -561,7 +1534,7 @@ struct MfgCockpitProjectionQuery {
     to: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct MfgCockpitProfileCloneRequest {
     #[serde(default)]
@@ -572,7 +1545,7 @@ struct MfgCockpitProfileCloneRequest {
     idempotency_key: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct MfgCockpitProfileShareRequest {
     expected_revision: u64,
@@ -581,13 +1554,44 @@ struct MfgCockpitProfileShareRequest {
     idempotency_key: Option<String>,
 }
 
-pub(super) fn mfg_idempotency_key(value: Option<String>, scope: &str) -> String {
-    value
-        .filter(|key| !key.trim().is_empty())
-        .unwrap_or_else(|| format!("gateway-{scope}-{}", uuid::Uuid::new_v4()))
+pub(super) fn mfg_idempotency_key(
+    headers: &HeaderMap,
+    legacy_value: Option<String>,
+) -> Result<String, MfgIdempotencyKeyError> {
+    let header_value = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let legacy_value = legacy_value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    match (header_value, legacy_value) {
+        (Some(header), Some(legacy)) if header != legacy => Err(MfgIdempotencyKeyError {
+            message: "Idempotency-Key header conflicts with legacy body/query idempotency_key"
+                .to_string(),
+        }),
+        (Some(header), _) => Ok(header),
+        (None, Some(legacy)) => Ok(legacy),
+        (None, None) => Err(MfgIdempotencyKeyError {
+            message: "Idempotency-Key header is required for this MFG mutation".to_string(),
+        }),
+    }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone)]
+pub(super) struct MfgIdempotencyKeyError {
+    pub(super) message: String,
+}
+
+pub(super) fn stable_mfg_resource_id(prefix: &str, idempotency_key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("{prefix}:{idempotency_key}").as_bytes());
+    format!("{prefix}-{digest:x}")[..prefix.len() + 1 + 20].to_string()
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgCockpitReportGenerateRequest {
     #[serde(default)]
     request_id: Option<String>,
@@ -597,7 +1601,7 @@ struct MfgCockpitReportGenerateRequest {
     report: MfgCockpitReportRequest,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgCockpitReportListQuery {
     #[serde(default)]
     profile_id: Option<String>,
@@ -605,7 +1609,7 @@ struct MfgCockpitReportListQuery {
     limit: Option<usize>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgCockpitReportScheduleRunRequest {
     #[serde(default)]
     request_id: Option<String>,
@@ -637,7 +1641,7 @@ struct MfgCockpitReportScheduleRunRequest {
     template_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgIncidentCreateRequest {
     #[serde(default)]
     request_id: Option<String>,
@@ -651,7 +1655,7 @@ struct MfgIncidentCreateRequest {
     evidence_packet_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct MfgExecutionFeedbackRequest {
     outcome: String,
@@ -660,7 +1664,7 @@ struct MfgExecutionFeedbackRequest {
     metric_delta: Option<f64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgCaseSearchQuery {
     #[serde(default)]
     q: Option<String>,
@@ -668,16 +1672,18 @@ struct MfgCaseSearchQuery {
     limit: Option<usize>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgPlaybookUpsertRequest {
     #[serde(default)]
     request_id: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
+    #[serde(default)]
+    expected_revision: Option<u64>,
     playbook: MfgPlaybook,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgPlaybookRecommendRequest {
     #[serde(default)]
     request_id: Option<String>,
@@ -687,7 +1693,7 @@ struct MfgPlaybookRecommendRequest {
     limit: Option<usize>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgSkillPlanRequest {
     #[serde(default)]
     request_id: Option<String>,
@@ -697,7 +1703,7 @@ struct MfgSkillPlanRequest {
     limit: Option<usize>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgSkillRunRequest {
     #[serde(default)]
     request_id: Option<String>,
@@ -705,7 +1711,7 @@ struct MfgSkillRunRequest {
     session_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 struct MfgCockpitReportDeliveryRetryRequest {
     #[serde(default)]
     mode: String,
@@ -731,7 +1737,7 @@ struct MfgCockpitReportDeliveryRetryRequest {
     template_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 struct MatrixDecisionTraceQuery {
     #[serde(default)]
     incident_id: Option<String>,
@@ -739,7 +1745,7 @@ struct MatrixDecisionTraceQuery {
     report_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgRealityFactIngestRequest {
     #[serde(default)]
     request_id: Option<String>,
@@ -749,16 +1755,18 @@ struct MfgRealityFactIngestRequest {
     facts: Vec<MatrixFactInput>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgRealityEntityUpsertRequest {
     #[serde(default)]
     request_id: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
+    #[serde(default)]
+    expected_revision: Option<u64>,
     entity: MatrixEntityInput,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgRealityEntityResolveSourceKeyRequest {
     #[serde(default)]
     request_id: Option<String>,
@@ -768,7 +1776,7 @@ struct MfgRealityEntityResolveSourceKeyRequest {
     source_key: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgRealityEntityMatchCandidateRequest {
     #[serde(default)]
     request_id: Option<String>,
@@ -778,7 +1786,7 @@ struct MfgRealityEntityMatchCandidateRequest {
     right_entity_id: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgRealityEntityConflictDecisionRequest {
     #[serde(default)]
     request_id: Option<String>,
@@ -792,25 +1800,29 @@ struct MfgRealityEntityConflictDecisionRequest {
     notes: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgRealityRelationUpsertRequest {
     #[serde(default)]
     request_id: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
+    #[serde(default)]
+    expected_revision: Option<u64>,
     relation: MatrixRelationInput,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgRealityMetricDependencyUpsertRequest {
     #[serde(default)]
     request_id: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
+    #[serde(default)]
+    expected_revision: Option<u64>,
     dependency: MatrixMetricDependencyInput,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgRealityMetricAttentionPlanRequest {
     #[serde(default)]
     request_id: Option<String>,
@@ -825,7 +1837,7 @@ struct MfgRealityMetricAttentionPlanRequest {
     limit: Option<usize>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgRealityMetricSnapshotMaterializeRequest {
     #[serde(default)]
     request_id: Option<String>,
@@ -836,7 +1848,7 @@ struct MfgRealityMetricSnapshotMaterializeRequest {
     scope_ref: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgRealityAffectedByFactTypeRequest {
     #[serde(default)]
     request_id: Option<String>,
@@ -845,7 +1857,7 @@ struct MfgRealityAffectedByFactTypeRequest {
     fact_type: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgRealityComputeJobPlanRequest {
     #[serde(default)]
     request_id: Option<String>,
@@ -854,7 +1866,7 @@ struct MfgRealityComputeJobPlanRequest {
     job: MatrixComputeJobInput,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgRealityDataPlaneIngestPlanRequest {
     #[serde(default)]
     request_id: Option<String>,
@@ -863,7 +1875,7 @@ struct MfgRealityDataPlaneIngestPlanRequest {
     ingest: MatrixDataPlaneIngestPlanInput,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgRealityEvidenceBuildRequest {
     #[serde(default)]
     request_id: Option<String>,
@@ -875,16 +1887,18 @@ struct MfgRealityEvidenceBuildRequest {
     problem_statement: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgRealitySourcePackUpsertRequest {
     #[serde(default)]
     request_id: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
+    #[serde(default)]
+    expected_revision: Option<u64>,
     source_pack: MatrixSourcePack,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgRealitySourcePackIngestFileRequest {
     #[serde(default)]
     request_id: Option<String>,
@@ -894,7 +1908,7 @@ struct MfgRealitySourcePackIngestFileRequest {
     facts: Vec<MatrixFactInput>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgRealityConnectorRunRequest {
     #[serde(default)]
     request_id: Option<String>,
@@ -996,12 +2010,12 @@ async fn mfg_reality_health_handler(
         .services
         .matrix
         .repository_health(&state.config_home)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let store_path = state
         .services
         .matrix
         .store_path(&state.config_home)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.health",
         "status": "ready",
@@ -1038,7 +2052,7 @@ async fn mfg_reality_data_plane_health_handler(
         .services
         .matrix
         .data_plane_health(&state.config_home)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.data_plane.health",
         "health": health,
@@ -1055,14 +2069,14 @@ async fn mfg_reality_data_plane_ingest_plan_handler(
         .services
         .matrix
         .plan_data_plane_ingest(&state.config_home, request.ingest)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     append_matrix_execution_outcome(
         &state,
         session_id.as_deref(),
         matrix_ingest_plan_outcome(&plan),
     )
     .await
-    .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.data_plane.ingest_plan",
         "request_id": request.request_id,
@@ -1076,16 +2090,23 @@ async fn mfg_reality_source_pack_upsert_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<MfgRealitySourcePackUpsertRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let source_pack = state
+    let outcome = state
         .services
         .matrix
-        .upsert_source_pack(&state.config_home, request.source_pack)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .upsert_source_pack_checked(
+            &state.config_home,
+            request.source_pack,
+            request.expected_revision,
+        )
+        .map_err(matrix_error)?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.source_pack",
         "request_id": request.request_id,
         "session_id": request.session_id,
-        "source_pack": source_pack,
+        "source_pack": outcome.resource,
+        "created": outcome.created,
+        "previous_revision": outcome.previous_revision,
+        "revision": outcome.revision,
         "boundary": mfg_reality_boundary(),
     })))
 }
@@ -1098,11 +2119,21 @@ async fn mfg_reality_source_pack_get_handler(
         .services
         .matrix
         .get_source_pack(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG Reality source pack not found"))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| mfg_api_error(StatusCode::NOT_FOUND, "MFG Reality source pack not found"))?;
+    let revision = state
+        .services
+        .matrix
+        .resource_revision(
+            &state.config_home,
+            "source_pack",
+            &source_pack.source_pack_id,
+        )
+        .map_err(matrix_error)?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.source_pack",
         "source_pack": source_pack,
+        "revision": revision,
         "boundary": mfg_reality_boundary(),
     })))
 }
@@ -1156,7 +2187,7 @@ async fn mfg_reality_source_pack_ingest_file_handler(
             .services
             .matrix
             .ingest_fact(&state.config_home, &fact)
-            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+            .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
         attention.push(item);
     }
     Ok(Json(serde_json::json!({
@@ -1236,8 +2267,10 @@ async fn mfg_reality_connector_run_get_handler(
         .services
         .matrix
         .get_connector_run(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG Reality connector run not found"))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| {
+            mfg_api_error(StatusCode::NOT_FOUND, "MFG Reality connector run not found")
+        })?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.connector_run",
         "run": run,
@@ -1252,7 +2285,7 @@ async fn mfg_reality_metrics_handler(
         .services
         .matrix
         .list_metric_definitions(&state.config_home)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.metrics",
         "metrics": metrics,
@@ -1268,9 +2301,9 @@ async fn mfg_reality_metric_detail_handler(
         .services
         .matrix
         .metric_states(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     if states.is_empty() {
-        return Err(api_error(
+        return Err(mfg_api_error(
             StatusCode::NOT_FOUND,
             "MFG Reality metric state not found",
         ));
@@ -1291,11 +2324,31 @@ async fn mfg_reality_metric_lineage_handler(
         .services
         .matrix
         .metric_lineage(&state.config_home, &id, 6)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let mut dependency_revisions = std::collections::BTreeMap::new();
+    for dependency in lineage
+        .upstream_dependencies
+        .iter()
+        .chain(lineage.downstream_dependencies.iter())
+    {
+        dependency_revisions.insert(
+            dependency.dependency_id.clone(),
+            state
+                .services
+                .matrix
+                .resource_revision(
+                    &state.config_home,
+                    "metric_dependency",
+                    &dependency.dependency_id,
+                )
+                .map_err(matrix_error)?,
+        );
+    }
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.metric.lineage",
         "schema_version": "matrix.metric_lineage.v1",
         "lineage": lineage,
+        "dependency_revisions": dependency_revisions,
         "boundary": mfg_reality_boundary(),
     })))
 }
@@ -1314,7 +2367,7 @@ async fn mfg_reality_metric_attention_plan_handler(
             request.period,
             request.limit.unwrap_or(12),
         )
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.metric_attention.plan",
         "request_id": request.request_id,
@@ -1329,7 +2382,7 @@ async fn mfg_reality_metric_snapshot_materialize_handler(
     Json(request): Json<MfgRealityMetricSnapshotMaterializeRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     if request.metric_ids.is_empty() {
-        return Err(api_error(
+        return Err(mfg_api_error(
             StatusCode::BAD_REQUEST,
             "at least one metric_id is required",
         ));
@@ -1338,7 +2391,7 @@ async fn mfg_reality_metric_snapshot_materialize_handler(
         .services
         .matrix
         .materialize_metric_snapshot(&state.config_home, request.metric_ids, request.scope_ref)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.metric_snapshot",
         "request_id": request.request_id,
@@ -1352,19 +2405,23 @@ async fn mfg_reality_metric_dependency_upsert_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<MfgRealityMetricDependencyUpsertRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let dependency = state
+    let outcome = state
         .services
         .matrix
-        .upsert_metric_dependency(
+        .upsert_metric_dependency_checked(
             &state.config_home,
             &MatrixMetricDependency::from_input(request.dependency),
+            request.expected_revision,
         )
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(matrix_error)?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.metric_dependency",
         "request_id": request.request_id,
         "session_id": request.session_id,
-        "dependency": dependency,
+        "dependency": outcome.resource,
+        "created": outcome.created,
+        "previous_revision": outcome.previous_revision,
+        "revision": outcome.revision,
         "boundary": mfg_reality_boundary(),
     })))
 }
@@ -1377,7 +2434,7 @@ async fn mfg_reality_metric_affected_by_fact_type_handler(
         .services
         .matrix
         .metrics_affected_by_fact_type(&state.config_home, &request.fact_type)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.metric_dependency.affected_by_fact_type",
         "request_id": request.request_id,
@@ -1396,7 +2453,7 @@ async fn mfg_reality_compute_job_plan_handler(
         .services
         .matrix
         .plan_compute_job_for_fact_type(&state.config_home, request.job)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.compute.plan",
         "request_id": request.request_id,
@@ -1414,8 +2471,8 @@ async fn mfg_reality_compute_job_get_handler(
         .services
         .matrix
         .get_compute_job(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG Reality compute job not found"))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| mfg_api_error(StatusCode::NOT_FOUND, "MFG Reality compute job not found"))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.compute.job",
         "job": job,
@@ -1446,7 +2503,7 @@ async fn mfg_reality_metric_recompute_handler(
         .services
         .matrix
         .recompute_metrics(&state.config_home)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.metrics.recompute",
         "result": result,
@@ -1461,10 +2518,22 @@ async fn mfg_reality_entities_handler(
         .services
         .matrix
         .list_entities(&state.config_home, 100)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let mut revisions = std::collections::BTreeMap::new();
+    for entity in &entities {
+        revisions.insert(
+            entity.entity_id.clone(),
+            state
+                .services
+                .matrix
+                .resource_revision(&state.config_home, "entity", &entity.entity_id)
+                .map_err(matrix_error)?,
+        );
+    }
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.entities",
         "entities": entities,
+        "revisions": revisions,
         "boundary": mfg_reality_boundary(),
     })))
 }
@@ -1477,11 +2546,17 @@ async fn mfg_reality_entity_get_handler(
         .services
         .matrix
         .get_entity(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG Reality entity not found"))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| mfg_api_error(StatusCode::NOT_FOUND, "MFG Reality entity not found"))?;
+    let revision = state
+        .services
+        .matrix
+        .resource_revision(&state.config_home, "entity", &entity.entity_id)
+        .map_err(matrix_error)?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.entity",
         "entity": entity,
+        "revision": revision,
         "boundary": mfg_reality_boundary(),
     })))
 }
@@ -1490,19 +2565,23 @@ async fn mfg_reality_entity_upsert_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<MfgRealityEntityUpsertRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let entity = state
+    let outcome = state
         .services
         .matrix
-        .upsert_entity(
+        .upsert_entity_checked(
             &state.config_home,
             &MatrixEntity::from_input(request.entity),
+            request.expected_revision,
         )
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(matrix_error)?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.entity",
         "request_id": request.request_id,
         "session_id": request.session_id,
-        "entity": entity,
+        "entity": outcome.resource,
+        "created": outcome.created,
+        "previous_revision": outcome.previous_revision,
+        "revision": outcome.revision,
         "boundary": mfg_reality_boundary(),
     })))
 }
@@ -1519,13 +2598,18 @@ async fn mfg_reality_entity_resolve_source_key_handler(
             &request.source_system,
             &request.source_key,
         )
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .ok_or_else(|| {
-            api_error(
+            mfg_api_error(
                 StatusCode::NOT_FOUND,
                 "MFG Reality entity source key not found",
             )
         })?;
+    let revision = state
+        .services
+        .matrix
+        .resource_revision(&state.config_home, "entity", &entity.entity_id)
+        .map_err(matrix_error)?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.entity.resolution",
         "request_id": request.request_id,
@@ -1533,6 +2617,7 @@ async fn mfg_reality_entity_resolve_source_key_handler(
         "source_system": request.source_system,
         "source_key": request.source_key,
         "entity": entity,
+        "revision": revision,
         "boundary": mfg_reality_boundary(),
     })))
 }
@@ -1593,11 +2678,23 @@ async fn mfg_reality_entity_relations_handler(
         .matrix
         .list_entity_relations(&state.config_home, &id, 100)
         .map_err(matrix_error)?;
+    let mut revisions = std::collections::BTreeMap::new();
+    for relation in &relations {
+        revisions.insert(
+            relation.relation_id.clone(),
+            state
+                .services
+                .matrix
+                .resource_revision(&state.config_home, "relation", &relation.relation_id)
+                .map_err(matrix_error)?,
+        );
+    }
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.entity.relations",
         "schema_version": "matrix.entity_relations.v1",
         "entity_id": id,
         "relations": relations,
+        "revisions": revisions,
         "boundary": mfg_reality_boundary(),
     })))
 }
@@ -1623,19 +2720,23 @@ async fn mfg_reality_relation_upsert_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<MfgRealityRelationUpsertRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let relation = state
+    let outcome = state
         .services
         .matrix
-        .upsert_relation(
+        .upsert_relation_checked(
             &state.config_home,
             &MatrixRelation::from_input(request.relation),
+            request.expected_revision,
         )
         .map_err(matrix_error)?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.relation",
         "request_id": request.request_id,
         "session_id": request.session_id,
-        "relation": relation,
+        "relation": outcome.resource,
+        "created": outcome.created,
+        "previous_revision": outcome.previous_revision,
+        "revision": outcome.revision,
         "boundary": mfg_reality_boundary(),
     })))
 }
@@ -1645,7 +2746,7 @@ async fn mfg_reality_fact_ingest_handler(
     Json(request): Json<MfgRealityFactIngestRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     if request.facts.is_empty() {
-        return Err(api_error(
+        return Err(mfg_api_error(
             StatusCode::BAD_REQUEST,
             "at least one MFG Reality fact is required",
         ));
@@ -1659,10 +2760,10 @@ async fn mfg_reality_fact_ingest_handler(
             .services
             .matrix
             .ingest_fact(&state.config_home, &fact)
-            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+            .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
         append_matrix_execution_outcome(&state, session_id.as_deref(), matrix_fact_outcome(&fact))
             .await
-            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+            .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
         facts.push(fact);
         attention.push(item);
     }
@@ -1684,7 +2785,7 @@ async fn mfg_reality_changes_handler(
         .services
         .matrix
         .list_changes(&state.config_home, 100)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.changes",
         "changes": changes,
@@ -1699,7 +2800,7 @@ async fn mfg_reality_attention_hot_handler(
         .services
         .matrix
         .list_attention(&state.config_home, 50)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.attention.hot",
         "items": items,
@@ -1727,7 +2828,7 @@ async fn mfg_reality_evidence_build_handler(
         matrix_evidence_packet_outcome(&packet),
     )
     .await
-    .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.evidence.packet",
         "request_id": request.request_id,
@@ -1745,9 +2846,9 @@ async fn mfg_reality_evidence_get_handler(
         .services
         .matrix
         .get_evidence_packet(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .ok_or_else(|| {
-            api_error(
+            mfg_api_error(
                 StatusCode::NOT_FOUND,
                 "MFG Reality evidence packet not found",
             )
@@ -1783,8 +2884,10 @@ async fn mfg_reality_quality_gate_get_handler(
         .services
         .matrix
         .get_quality_gate(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG Reality quality gate not found"))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| {
+            mfg_api_error(StatusCode::NOT_FOUND, "MFG Reality quality gate not found")
+        })?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.quality_gate",
         "gate": gate,
@@ -1800,9 +2903,9 @@ async fn mfg_reality_evidence_context_handler(
         .services
         .matrix
         .get_evidence_packet(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .ok_or_else(|| {
-            api_error(
+            mfg_api_error(
                 StatusCode::NOT_FOUND,
                 "MFG Reality evidence packet not found",
             )
@@ -1816,8 +2919,11 @@ async fn mfg_reality_evidence_context_handler(
 
 fn matrix_error(error: MatrixStoreError) -> (StatusCode, Json<ErrorResponse>) {
     match error {
-        MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
-        other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        MatrixStoreError::NotFound(message) => mfg_api_error(StatusCode::NOT_FOUND, message),
+        conflict @ MatrixStoreError::RevisionConflict { .. } => {
+            mfg_api_error(StatusCode::CONFLICT, conflict.to_string())
+        }
+        other => mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
     }
 }
 
@@ -1907,7 +3013,7 @@ async fn mfg_incidents_list_handler(
         .services
         .mfg
         .list_incidents(&state.config_home, 50)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.incident.list",
         "items": incidents,
@@ -1930,7 +3036,7 @@ async fn mfg_server_manufacturing_seed_handler(
         .services
         .mfg
         .seed_mfg_domain(&state.config_home)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.domain_seed",
         "result": result,
@@ -1953,7 +3059,7 @@ async fn mfg_server_manufacturing_ontology_seed_handler(
         .services
         .mfg
         .seed_mfg_ontology(&state.config_home)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.ontology_seed",
         "pack": pack,
@@ -1981,8 +3087,8 @@ async fn mfg_execution_feedback_handler(
             ),
         )
         .map_err(|error| match error {
-            MfgRepositoryError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
-            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+            MfgRepositoryError::NotFound(message) => mfg_api_error(StatusCode::NOT_FOUND, message),
+            other => mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.action_execution",
@@ -1993,9 +3099,11 @@ async fn mfg_execution_feedback_handler(
 #[cfg(test)]
 mod tests {
     use super::{
+        mfg_api_error, mfg_idempotency_key, resolve_mfg_action_id, resolve_mfg_resource_ref,
         MfgActionExecutionIntent, MfgCockpitReportDeliveryIntent, MfgCrossPlaneBridgeIntent,
         MfgExecutionFeedbackRequest,
     };
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
 
     #[test]
     fn mfg_effect_intents_reject_client_supplied_actor_principals() {
@@ -2038,6 +3146,141 @@ mod tests {
         assert_eq!(
             request.operator_id.as_deref(),
             Some("principal:verified-human")
+        );
+    }
+
+    #[test]
+    fn capability_denial_and_scope_hiding_use_distinct_typed_errors() {
+        let (_, axum::Json(capability)) =
+            mfg_api_error(StatusCode::FORBIDDEN, "mfg.report.deliver is required");
+        let (_, axum::Json(scope)) =
+            mfg_api_error(StatusCode::NOT_FOUND, "resource is outside verified scope");
+        let capability = serde_json::to_value(capability).expect("capability error");
+        let scope = serde_json::to_value(scope).expect("scope error");
+        assert_eq!(capability["code"], "capability_denied");
+        assert_eq!(capability["http_status"], 403);
+        assert_eq!(scope["code"], "scope_not_found");
+        assert_eq!(scope["http_status"], 404);
+        for (status, expected_code) in [
+            (StatusCode::BAD_REQUEST, "validation_failed"),
+            (StatusCode::UNAUTHORIZED, "authentication_required"),
+            (StatusCode::CONFLICT, "revision_conflict"),
+            (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+        ] {
+            let (_, axum::Json(error)) = mfg_api_error(status, "fixture");
+            let error = serde_json::to_value(error).expect("typed MFG error");
+            assert_eq!(error["code"], expected_code);
+            assert_eq!(error["http_status"], status.as_u16());
+        }
+    }
+
+    #[test]
+    fn idempotency_header_is_canonical_and_conflicting_legacy_value_is_rejected() {
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", HeaderValue::from_static("intent-1"));
+        assert_eq!(
+            mfg_idempotency_key(&headers, None).unwrap(),
+            "intent-1".to_string()
+        );
+        assert!(mfg_idempotency_key(&headers, Some("intent-2".to_string())).is_err());
+        assert_eq!(
+            mfg_idempotency_key(&HeaderMap::new(), Some("legacy-intent".to_string())).unwrap(),
+            "legacy-intent".to_string()
+        );
+    }
+
+    #[test]
+    fn multi_action_and_resource_resolution_is_derived_from_canonical_request_fields() {
+        let create = serde_json::json!({
+            "entity": {
+                "entity_type": "part",
+                "canonical_key": "gpu"
+            }
+        });
+        let update = serde_json::json!({
+            "expected_revision": 3,
+            "entity": {
+                "entity_id": "entity-gpu",
+                "entity_type": "part",
+                "canonical_key": "gpu"
+            }
+        });
+        assert_eq!(
+            resolve_mfg_action_id(app_mfg_contract::MfgRouteId::RealityEntityUpsert, &create),
+            "mfg.reality.entity.create"
+        );
+        assert_eq!(
+            resolve_mfg_action_id(app_mfg_contract::MfgRouteId::RealityEntityUpsert, &update),
+            "mfg.reality.entity.update"
+        );
+        assert_eq!(
+            resolve_mfg_resource_ref(
+                app_mfg_contract::MfgRouteId::RealityEntityUpsert,
+                "/api/apps/mfg/reality/entities/upsert",
+                &create,
+            ),
+            "matrix:entity:part:gpu"
+        );
+        assert_eq!(
+            resolve_mfg_resource_ref(
+                app_mfg_contract::MfgRouteId::RealityEntityUpsert,
+                "/api/apps/mfg/reality/entities/upsert",
+                &update,
+            ),
+            "matrix:entity:entity-gpu"
+        );
+        assert_eq!(
+            resolve_mfg_action_id(
+                app_mfg_contract::MfgRouteId::ReportScheduleRun,
+                &serde_json::json!({"deliver": true}),
+            ),
+            "mfg.report.schedule.generate_and_deliver"
+        );
+        for (route, dry_run, commit) in [
+            (
+                app_mfg_contract::MfgRouteId::AnalysisActionExecute,
+                "mfg.analysis.action.dry_run",
+                "mfg.analysis.action.commit",
+            ),
+            (
+                app_mfg_contract::MfgRouteId::ExecutionCrossPlaneExecute,
+                "mfg.execution.cross_plane.dry_run",
+                "mfg.execution.cross_plane.commit",
+            ),
+            (
+                app_mfg_contract::MfgRouteId::ReportDeliver,
+                "mfg.report.deliver.dry_run",
+                "mfg.report.deliver.commit",
+            ),
+            (
+                app_mfg_contract::MfgRouteId::ReportDeliveryRetry,
+                "mfg.report.delivery.retry_dry_run",
+                "mfg.report.delivery.retry_commit",
+            ),
+        ] {
+            assert_eq!(
+                resolve_mfg_action_id(route, &serde_json::json!({"mode": "dry_run"})),
+                dry_run
+            );
+            assert_eq!(
+                resolve_mfg_action_id(route, &serde_json::json!({"mode": "commit"})),
+                commit
+            );
+        }
+        assert_eq!(
+            resolve_mfg_action_id(
+                app_mfg_contract::MfgRouteId::ReportScheduleRun,
+                &serde_json::json!({"deliver": false}),
+            ),
+            "mfg.report.schedule.generate_only"
+        );
+        assert_eq!(
+            resolve_mfg_action_id(
+                app_mfg_contract::MfgRouteId::IncidentSkillRun,
+                &serde_json::json!({}),
+            ),
+            "mfg.skill.run"
         );
     }
 }

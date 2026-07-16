@@ -12,7 +12,7 @@ use axum::{
     extract::State as AxumState,
     http::{header, Request, StatusCode},
     middleware::{self, Next},
-    response::{IntoResponse, Json},
+    response::{IntoResponse, Json, Response},
     Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -183,7 +183,8 @@ async fn auth_middleware(
     AxumState(state): AxumState<Arc<AppState>>,
     mut request: Request<Body>,
     next: Next,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Response, Response> {
+    let is_mfg = request.uri().path().starts_with("/api/apps/mfg");
     let claims = if let Some(token) = &state.auth_token {
         let auth_header = request
             .headers()
@@ -192,12 +193,22 @@ async fn auth_middleware(
 
         match auth_header {
             Some(h) if h == format!("Bearer {token}") => {
-                authenticated_human_principal(&state.config_home, token).map_err(|error| {
-                    (
+                let (surface_id, requested_capabilities) =
+                    requested_capabilities_for_headers(request.headers()).map_err(|error| {
+                        auth_error_response(is_mfg, StatusCode::BAD_REQUEST, error)
+                    })?;
+                authenticated_human_principal_for_surface(
+                    &state.config_home,
+                    token,
+                    &surface_id,
+                    requested_capabilities,
+                )
+                .map(|(principal, _)| principal)
+                .map_err(|error| {
+                    auth_error_response(
+                        is_mfg,
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ErrorResponse {
-                            error: format!("authentication_authority_error:{error}"),
-                        }),
+                        format!("authentication_authority_error:{error}"),
                     )
                 })?
             }
@@ -207,11 +218,10 @@ async fn auth_middleware(
                 state.auth_token.as_deref(),
             )
             .map_err(|error| {
-                (
+                auth_error_response(
+                    is_mfg,
                     StatusCode::UNAUTHORIZED,
-                    Json(ErrorResponse {
-                        error: format!("unauthorized:{error}"),
-                    }),
+                    format!("unauthorized:{error}"),
                 )
             })?,
         }
@@ -221,11 +231,10 @@ async fn auth_middleware(
             test_human_principal()
         }
         #[cfg(not(any(test, feature = "test-support")))]
-        return Err((
+        return Err(auth_error_response(
+            is_mfg,
             StatusCode::UNAUTHORIZED,
-            Json(ErrorResponse {
-                error: "authentication_not_configured".to_string(),
-            }),
+            "authentication_not_configured".to_string(),
         ));
     };
     request
@@ -234,17 +243,86 @@ async fn auth_middleware(
     Ok(next.run(request).await)
 }
 
+fn auth_error_response(is_mfg: bool, status: StatusCode, message: String) -> Response {
+    if is_mfg {
+        let mut error = match status {
+            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+                app_mfg_contract::MfgApiErrorV1 {
+                    code: app_mfg_contract::MfgErrorCode::ValidationFailed,
+                    message,
+                    http_status: status.as_u16(),
+                    details: serde_json::Value::Null,
+                    retryable: false,
+                    contract_version: app_mfg_contract::MfgContractVersion::default(),
+                    recovery_actions: Vec::new(),
+                    request_id: None,
+                    receipt_ref: None,
+                }
+            }
+            StatusCode::FORBIDDEN => app_mfg_contract::MfgApiErrorV1::capability_denied(message),
+            status if status.is_server_error() => app_mfg_contract::MfgApiErrorV1 {
+                code: app_mfg_contract::MfgErrorCode::Internal,
+                message,
+                http_status: status.as_u16(),
+                details: serde_json::Value::Null,
+                retryable: true,
+                contract_version: app_mfg_contract::MfgContractVersion::default(),
+                recovery_actions: vec![app_mfg_contract::MfgRecoveryAction {
+                    kind: app_mfg_contract::MfgRecoveryActionKind::RetrySameIntent,
+                    label: "Retry authentication".to_string(),
+                    target: None,
+                    enabled: true,
+                }],
+                request_id: None,
+                receipt_ref: None,
+            },
+            _ => app_mfg_contract::MfgApiErrorV1::authentication_required(message),
+        };
+        error.http_status = status.as_u16();
+        return (status, Json(error)).into_response();
+    }
+    (status, Json(ErrorResponse { error: message })).into_response()
+}
+
 pub(super) fn authenticated_human_principal(
     config_home: &std::path::Path,
     token: &str,
 ) -> Result<runtime::VerifiedPrincipal, String> {
+    authenticated_human_principal_for_surface(
+        config_home,
+        token,
+        "legacy_gateway",
+        human_capabilities(),
+    )
+    .map(|(principal, _)| principal)
+}
+
+pub(super) fn authenticated_human_principal_for_surface(
+    config_home: &std::path::Path,
+    token: &str,
+    surface_id: &str,
+    requested_capabilities: Vec<String>,
+) -> Result<
+    (
+        runtime::VerifiedPrincipal,
+        app_mfg_contract::MfgEntitlementProjectionV2,
+    ),
+    String,
+> {
+    let requested_capabilities =
+        validate_surface_capability_request(surface_id, requested_capabilities)?;
     #[cfg(not(any(test, feature = "test-support")))]
     {
         let client = auth_broker::BrokerClient::new(auth_broker::BrokerClient::default_socket(
             config_home.join("auth-broker"),
         ));
-        let (envelope, public_key) = client
-            .authenticate_human(token, human_capabilities(), Some(5 * 60 * 1_000))
+        let result = client
+            .authenticate_human_for_surface(
+                token,
+                surface_id,
+                requested_capabilities,
+                Some(5 * 60 * 1_000),
+            )
             .map_err(|error| error.to_string())?;
         let lifecycle = client
             .credential_lifecycle()
@@ -252,11 +330,15 @@ pub(super) fn authenticated_human_principal(
         if lifecycle.status != auth_broker::CredentialLifecycleStatus::Active {
             return Err("local human credential is revoked".to_string());
         }
-        runtime::PrincipalVerifier::from_base64(&envelope.key_id, &public_key)
-            .map_err(|error| error.to_string())?
-            .requiring_credential_epoch(lifecycle.credential_epoch)
-            .verify(&envelope)
-            .map_err(|error| error.to_string())
+        let principal = runtime::PrincipalVerifier::from_base64(
+            &result.envelope.key_id,
+            &result.public_key_base64,
+        )
+        .map_err(|error| error.to_string())?
+        .requiring_credential_epoch(lifecycle.credential_epoch)
+        .verify(&result.envelope)
+        .map_err(|error| error.to_string())?;
+        Ok((principal, result.entitlement))
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -264,14 +346,26 @@ pub(super) fn authenticated_human_principal(
         let (envelope, public_key) = auth_broker::test_support::issue_human_principal(
             config_home.join("auth-broker"),
             token,
-            human_capabilities(),
+            requested_capabilities.clone(),
             Some(5 * 60 * 1_000),
         )
         .map_err(|error| error.to_string())?;
-        runtime::PrincipalVerifier::from_base64(&envelope.key_id, &public_key)
+        let principal = runtime::PrincipalVerifier::from_base64(&envelope.key_id, &public_key)
             .map_err(|error| error.to_string())?
             .verify(&envelope)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        Ok((
+            principal,
+            app_mfg_contract::MfgEntitlementProjectionV2 {
+                core_profile_id: app_mfg_contract::MfgCoreProfileId::CoreManager,
+                mfg_profile_id: app_mfg_contract::MfgProfileId::MfgManager,
+                profile_revision: 1,
+                credential_epoch: 1,
+                ceiling: human_capabilities(),
+                granted: requested_capabilities,
+                denied: Vec::new(),
+            },
+        ))
     }
 }
 
@@ -282,14 +376,23 @@ pub(super) fn authenticated_human_principal(
 pub(super) fn issue_web_session(
     config_home: &std::path::Path,
     credential: &str,
-) -> Result<String, String> {
+    surface_id: &str,
+    requested_capabilities: Vec<String>,
+) -> Result<(String, app_mfg_contract::MfgEntitlementProjectionV2), String> {
+    let requested_capabilities =
+        validate_surface_capability_request(surface_id, requested_capabilities)?;
     #[cfg(not(any(test, feature = "test-support")))]
     {
         let client = auth_broker::BrokerClient::new(auth_broker::BrokerClient::default_socket(
             config_home.join("auth-broker"),
         ));
-        let (envelope, public_key) = client
-            .authenticate_human(credential, human_capabilities(), Some(5 * 60 * 1_000))
+        let result = client
+            .authenticate_human_for_surface(
+                credential,
+                surface_id,
+                requested_capabilities,
+                Some(5 * 60 * 1_000),
+            )
             .map_err(|error| error.to_string())?;
         let lifecycle = client
             .credential_lifecycle()
@@ -297,8 +400,12 @@ pub(super) fn issue_web_session(
         if lifecycle.status != auth_broker::CredentialLifecycleStatus::Active {
             return Err("local human credential is revoked".to_string());
         }
-        verify_human_envelope(&envelope, &public_key, lifecycle.credential_epoch)?;
-        encode_web_session(&envelope)
+        verify_human_envelope(
+            &result.envelope,
+            &result.public_key_base64,
+            lifecycle.credential_epoch,
+        )?;
+        encode_web_session(&result.envelope).map(|session| (session, result.entitlement))
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -306,12 +413,25 @@ pub(super) fn issue_web_session(
         let (envelope, public_key) = auth_broker::test_support::issue_human_principal(
             config_home.join("auth-broker"),
             credential,
-            human_capabilities(),
+            requested_capabilities.clone(),
             Some(5 * 60 * 1_000),
         )
         .map_err(|error| error.to_string())?;
         verify_human_envelope(&envelope, &public_key, 0)?;
-        encode_web_session(&envelope)
+        encode_web_session(&envelope).map(|session| {
+            (
+                session,
+                app_mfg_contract::MfgEntitlementProjectionV2 {
+                    core_profile_id: app_mfg_contract::MfgCoreProfileId::CoreManager,
+                    mfg_profile_id: app_mfg_contract::MfgProfileId::MfgManager,
+                    profile_revision: 1,
+                    credential_epoch: 1,
+                    ceiling: human_capabilities(),
+                    granted: requested_capabilities,
+                    denied: Vec::new(),
+                },
+            )
+        })
     }
 }
 
@@ -446,14 +566,96 @@ pub(super) fn issue_human_decision_lease(
 }
 
 fn human_capabilities() -> Vec<String> {
-    vec![
+    let mut capabilities = vec![
         "approval.respond".to_string(),
         "definition.manage".to_string(),
+        "definition.default.set".to_string(),
+        "definition.rollback".to_string(),
         "evolution.release.manage".to_string(),
         "runtime.maintenance.manage".to_string(),
         "runtime.outbox.retry".to_string(),
-        "mfg.read".to_string(),
-    ]
+    ];
+    capabilities.extend(
+        app_mfg_contract::MfgCapabilityId::ALL
+            .iter()
+            .copied()
+            .map(|capability| capability.as_str().to_string()),
+    );
+    capabilities.sort();
+    capabilities.dedup();
+    capabilities
+}
+
+fn surface_capability_inventory(surface_id: &str) -> Vec<String> {
+    let mut inventory = human_capabilities()
+        .into_iter()
+        .filter(|capability| !capability.starts_with("mfg."))
+        .collect::<Vec<_>>();
+    inventory.extend(app_mfg_contract::active_mfg_capabilities_for_surface(
+        surface_id,
+    ));
+    inventory.sort();
+    inventory.dedup();
+    inventory
+}
+
+fn requested_capabilities_for_headers(
+    headers: &axum::http::HeaderMap,
+) -> Result<(String, Vec<String>), String> {
+    let surface_id = headers
+        .get("x-cowd-surface-id")
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| "x-cowd-surface-id must be valid UTF-8".to_string())
+        })
+        .transpose()?
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("legacy_gateway")
+        .trim()
+        .to_string();
+    let allowed = surface_capability_inventory(&surface_id);
+    let requested = headers
+        .get("x-cowd-requested-capabilities")
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| "x-cowd-requested-capabilities must be valid UTF-8".to_string())
+        })
+        .transpose()?
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .filter(|requested| !requested.is_empty())
+        .unwrap_or_else(|| allowed.clone());
+    let mut requested = validate_surface_capability_request(&surface_id, requested)?;
+    requested.sort();
+    requested.dedup();
+    Ok((surface_id, requested))
+}
+
+pub(super) fn validate_surface_capability_request(
+    surface_id: &str,
+    requested: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let allowed = surface_capability_inventory(surface_id);
+    let unknown = requested
+        .iter()
+        .filter(|capability| !allowed.contains(capability))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "surface {surface_id} requested capabilities outside its inventory: {}",
+            unknown.join(",")
+        ));
+    }
+    Ok(requested)
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -700,7 +902,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .merge(harness_eval_routes::router())
         .merge(managed_agent_routes::router())
         .merge(matrix_routes::router())
-        .merge(mfg_routes::router())
+        .merge(mfg_routes::router(state.clone()))
         .merge(mission_routes::router())
         .merge(memory_routes::router())
         .merge(message_routes::router())
@@ -725,9 +927,25 @@ pub fn api_router(state: Arc<AppState>) -> Router {
 
 // ── Response types ─────────────────────────────────────────────
 
-#[derive(Serialize)]
 struct ErrorResponse {
     error: String,
+}
+
+impl Serialize for ErrorResponse {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        const MFG_PREFIX: &str = "__mfg_api_error_v1__:";
+        if let Some(encoded) = self.error.strip_prefix(MFG_PREFIX) {
+            let value = serde_json::from_str::<serde_json::Value>(encoded)
+                .map_err(serde::ser::Error::custom)?;
+            return value.serialize(serializer);
+        }
+        let mut state = serializer.serialize_struct("ErrorResponse", 1)?;
+        serde::ser::SerializeStruct::serialize_field(&mut state, "error", &self.error)?;
+        serde::ser::SerializeStruct::end(state)
+    }
 }
 
 fn default_config_home() -> PathBuf {
@@ -882,6 +1100,19 @@ pub(crate) mod tests {
 
     struct CrossPlaneApprovalTestBackend {
         calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[test]
+    fn surface_capability_requests_reject_unknown_values_instead_of_dropping_them() {
+        let webui_inventory = surface_capability_inventory("webui");
+        assert!(webui_inventory.contains(&"mfg.read".to_string()));
+        assert!(validate_surface_capability_request("webui", vec!["mfg.read".to_string()]).is_ok());
+        let error = validate_surface_capability_request(
+            "webui",
+            vec!["mfg.read".to_string(), "mfg.not_real".to_string()],
+        )
+        .expect_err("unknown capability must fail closed");
+        assert!(error.contains("mfg.not_real"));
     }
 
     #[async_trait::async_trait]
@@ -3352,15 +3583,13 @@ pub(crate) mod tests {
             .unwrap()
             .iter()
             .any(|capability| capability == "cowd.matrix.runtime"));
-        assert!(json["surfaces"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|surface| surface["entrypoints"]
+        assert!(json["surfaces"].as_array().unwrap().iter().all(|surface| {
+            surface["entrypoints"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|entrypoint| entrypoint == "/api/apps/mfg/app")));
+                .any(|entrypoint| entrypoint == "/api/apps/mfg/app")
+        }));
     }
 
     #[tokio::test]
@@ -4086,7 +4315,7 @@ pub(crate) mod tests {
         assert_eq!(json["webui_tui_full_parity"], true);
         assert_eq!(json["cli_is_minimal_control"], true);
         assert_eq!(json["webui"]["role"], "enhanced_management");
-        assert_eq!(json["tui"]["role"], "console_full_capability");
+        assert_eq!(json["tui"]["role"], "console_unavailable");
         assert_eq!(json["cli"]["role"], "minimal_core_control");
     }
 
@@ -5011,15 +5240,13 @@ pub(crate) mod tests {
         assert_eq!(hot.status(), StatusCode::OK);
         let body = to_bytes(hot.into_body(), usize::MAX).await.unwrap();
         let hot_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(hot_json["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["reason_codes"]
+        assert!(hot_json["items"].as_array().unwrap().iter().any(|item| {
+            item["reason_codes"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|reason| reason == "metric_delta_detected")));
+                .any(|reason| reason == "metric_delta_detected")
+        }));
         let _ = std::fs::remove_dir_all(workspace);
     }
 
@@ -9388,15 +9615,17 @@ providers:
         assert!(platforms.iter().any(|item| item["name"] == "feishu"
             && item["status"] == "disabled"
             && item["credential_present"] == false));
-        assert!(platforms.iter().any(|item| item["name"] == "wechat-ilink"
-            && item["capabilities"]
-                .as_array()
-                .unwrap()
-                .contains(&serde_json::json!("message.ingress"))
-            && item["capabilities"]
-                .as_array()
-                .unwrap()
-                .contains(&serde_json::json!("message.send.text"))));
+        assert!(platforms.iter().any(|item| {
+            item["name"] == "wechat-ilink"
+                && item["capabilities"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!("message.ingress"))
+                && item["capabilities"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!("message.send.text"))
+        }));
     }
 
     #[tokio::test]
@@ -9485,10 +9714,12 @@ providers:
             .iter()
             .any(|item| item["capability_id"] == "service.local.docs.read"
                 && item["plane"] == "service"));
-        assert!(!list.iter().any(|item| item["capability_id"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("feishu_document_operation")));
+        assert!(!list.iter().any(|item| {
+            item["capability_id"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("feishu_document_operation")
+        }));
     }
 
     #[tokio::test]

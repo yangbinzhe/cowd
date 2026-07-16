@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use super::MatrixEntity;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixOntologyConcept {
     pub concept_id: String,
     pub name: String,
@@ -17,7 +17,7 @@ pub struct MatrixOntologyConcept {
     pub version: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixOntologyRelation {
     pub relation_type: String,
     pub from_concept_id: String,
@@ -26,7 +26,7 @@ pub struct MatrixOntologyRelation {
     pub version: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixOntologyMetricBinding {
     pub metric_id: String,
     pub concept_id: String,
@@ -35,7 +35,7 @@ pub struct MatrixOntologyMetricBinding {
     pub version: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixOntologyPack {
     pub ontology_id: String,
     pub domain: String,
@@ -48,7 +48,7 @@ pub struct MatrixOntologyPack {
     pub metric_bindings: Vec<MatrixOntologyMetricBinding>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixEntityMatchCandidate {
     pub candidate_id: String,
     pub left_entity_id: String,
@@ -61,7 +61,7 @@ pub struct MatrixEntityMatchCandidate {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixEntityConflictDecision {
     pub decision_id: String,
     pub candidate_id: String,

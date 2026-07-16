@@ -14,7 +14,9 @@ pub(super) async fn mfg_incident_create_handler(
                 .services
                 .mfg
                 .get_evidence_packet(&state.config_home, packet_id)
-                .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+                .map_err(|error| {
+                    mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+                })?;
             match mfg_packet {
                 Some(packet) => packet,
                 None => state
@@ -22,7 +24,7 @@ pub(super) async fn mfg_incident_create_handler(
                     .matrix
                     .get_evidence_packet(&state.config_home, packet_id)
                     .map_err(|error| {
-                        api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+                        mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
                     })?
                     .map(|packet| {
                         state
@@ -32,10 +34,10 @@ pub(super) async fn mfg_incident_create_handler(
                     })
                     .transpose()
                     .map_err(|error| {
-                        api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+                        mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
                     })?
                     .ok_or_else(|| {
-                        api_error(StatusCode::NOT_FOUND, "MFG evidence packet not found")
+                        mfg_api_error(StatusCode::NOT_FOUND, "MFG evidence packet not found")
                     })?,
             }
         }
@@ -48,8 +50,10 @@ pub(super) async fn mfg_incident_create_handler(
                 request.title.as_deref(),
             )
             .map_err(|error| match error {
-                MfgRepositoryError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
-                other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+                MfgRepositoryError::NotFound(message) => {
+                    mfg_api_error(StatusCode::NOT_FOUND, message)
+                }
+                other => mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
             })?,
     };
     let title = request
@@ -60,7 +64,7 @@ pub(super) async fn mfg_incident_create_handler(
         .services
         .task
         .start_goal(format!("MFG incident analysis: {title}"), false)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     let mut incident = MfgIncident::new(title);
     incident.attention_id = packet.attention_id.clone();
     incident.evidence_packet_id = Some(packet.packet_id.clone());
@@ -70,7 +74,7 @@ pub(super) async fn mfg_incident_create_handler(
         .mfg
         .open_store(&state.config_home)
         .and_then(|store| store.create_incident_workflow(&incident, &packet))
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.incident",
         "request_id": request.request_id,
@@ -90,8 +94,8 @@ pub(super) async fn mfg_incident_get_handler(
         .services
         .mfg
         .get_incident(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG incident not found"))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| mfg_api_error(StatusCode::NOT_FOUND, "MFG incident not found"))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.incident",
         "incident": incident,
@@ -106,8 +110,8 @@ pub(super) async fn mfg_incident_room_handler(
         .services
         .mfg
         .get_incident(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG incident not found"))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| mfg_api_error(StatusCode::NOT_FOUND, "MFG incident not found"))?;
     let evidence_packet = incident
         .evidence_packet_id
         .as_deref()
@@ -130,12 +134,12 @@ pub(super) async fn mfg_incident_room_handler(
         .services
         .mfg
         .latest_analysis_for_incident(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let executions = state
         .services
         .mfg
         .list_executions_for_incident(&state.config_home, &id, 20)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let memory_cases = state
         .services
         .mfg
@@ -151,12 +155,12 @@ pub(super) async fn mfg_incident_room_handler(
         .mfg
         .open_store(&state.config_home)
         .and_then(|store| store.workflow_graph_for_incident(&id))
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let assignments = state
         .services
         .mfg
         .list_assignments(&state.config_home, None, Some(&id), 100)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.incident_room",
         "incident": incident,
@@ -181,8 +185,8 @@ pub(super) async fn mfg_incident_analyze_handler(
         .mfg
         .analyze_incident(&state.config_home, &id)
         .map_err(|error| match error {
-            MfgRepositoryError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
-            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+            MfgRepositoryError::NotFound(message) => mfg_api_error(StatusCode::NOT_FOUND, message),
+            other => mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.operational_analysis",
@@ -199,8 +203,8 @@ pub(super) async fn mfg_incident_case_promote_handler(
         .mfg
         .promote_incident_to_memory_case(&state.config_home, &id)
         .map_err(|error| match error {
-            MfgRepositoryError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
-            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+            MfgRepositoryError::NotFound(message) => mfg_api_error(StatusCode::NOT_FOUND, message),
+            other => mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.memory_case.promotion",
@@ -217,8 +221,8 @@ pub(super) async fn mfg_memory_case_get_handler(
         .services
         .mfg
         .get_memory_case(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG memory case not found"))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| mfg_api_error(StatusCode::NOT_FOUND, "MFG memory case not found"))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.memory_case",
         "memory_case": memory_case,
@@ -237,7 +241,7 @@ pub(super) async fn mfg_memory_case_search_handler(
             query.q.as_deref(),
             query.limit.unwrap_or(20).min(100),
         )
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.memory_case.search",
         "items": cases,
@@ -251,12 +255,17 @@ pub(super) async fn mfg_playbook_upsert_handler(
     let playbook = state
         .services
         .mfg
-        .upsert_playbook(&state.config_home, &request.playbook)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .upsert_playbook(
+            &state.config_home,
+            &request.playbook,
+            request.expected_revision,
+        )
+        .map_err(mfg_mutation_error)?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.playbook",
         "request_id": request.request_id,
         "session_id": request.session_id,
+        "revision": playbook.revision,
         "playbook": playbook,
     })))
 }
@@ -269,8 +278,8 @@ pub(super) async fn mfg_playbook_get_handler(
         .services
         .mfg
         .get_playbook(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG playbook not found"))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| mfg_api_error(StatusCode::NOT_FOUND, "MFG playbook not found"))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.playbook",
         "playbook": playbook,
@@ -291,8 +300,8 @@ pub(super) async fn mfg_incident_playbook_recommend_handler(
             request.limit.unwrap_or(5).min(20),
         )
         .map_err(|error| match error {
-            MfgRepositoryError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
-            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+            MfgRepositoryError::NotFound(message) => mfg_api_error(StatusCode::NOT_FOUND, message),
+            other => mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.playbook.recommendation",
@@ -312,8 +321,8 @@ pub(super) async fn mfg_incident_skill_plan_handler(
         .services
         .mfg
         .incident_context(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG incident not found"))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| mfg_api_error(StatusCode::NOT_FOUND, "MFG incident not found"))?;
     let plan = state.services.mfg.plan_server_skills(
         &context.incident,
         context.analysis.as_ref(),
@@ -325,7 +334,7 @@ pub(super) async fn mfg_incident_skill_plan_handler(
         .mfg
         .open_store(&state.config_home)
         .and_then(|store| store.plan_incident_workflow_skills(&id, &plan))
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.skill.plan",
         "request_id": request.request_id,
@@ -346,13 +355,13 @@ pub(super) async fn mfg_incident_skill_run_handler(
         .services
         .mfg
         .incident_context(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG incident not found"))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| mfg_api_error(StatusCode::NOT_FOUND, "MFG incident not found"))?;
     let skill = state
         .services
         .mfg
         .skill_manifest(&skill_id)
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG skill not found"))?;
+        .ok_or_else(|| mfg_api_error(StatusCode::NOT_FOUND, "MFG skill not found"))?;
     let run = state.services.mfg.run_server_skill(
         &context.incident,
         &skill,
@@ -364,7 +373,7 @@ pub(super) async fn mfg_incident_skill_run_handler(
         .mfg
         .open_store(&state.config_home)
         .and_then(|store| store.record_skill_run_and_complete_workflow(&run))
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     append_mfg_execution_outcome(
         &state,
         session_id
@@ -373,7 +382,7 @@ pub(super) async fn mfg_incident_skill_run_handler(
         mfg_skill_run_execution_outcome(&run),
     )
     .await
-    .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.skill.run",
         "request_id": request.request_id,
@@ -392,13 +401,13 @@ pub(super) async fn mfg_incident_skill_runs_handler(
         .services
         .mfg
         .get_incident(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG incident not found"))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| mfg_api_error(StatusCode::NOT_FOUND, "MFG incident not found"))?;
     let runs = state
         .services
         .mfg
         .list_skill_runs_for_incident(&state.config_home, &incident.incident_id, 24)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.skill.run_list",
         "incident_id": incident.incident_id,
@@ -414,8 +423,8 @@ pub(super) async fn mfg_skill_run_get_handler(
         .services
         .mfg
         .get_skill_run(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG skill run not found"))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| mfg_api_error(StatusCode::NOT_FOUND, "MFG skill run not found"))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.skill.run",
         "skill_run": run,
@@ -430,8 +439,10 @@ pub(super) async fn mfg_analysis_get_handler(
         .services
         .mfg
         .get_analysis(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG operational analysis not found"))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| {
+            mfg_api_error(StatusCode::NOT_FOUND, "MFG operational analysis not found")
+        })?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.operational_analysis",
         "analysis": analysis,
@@ -444,20 +455,26 @@ pub(super) async fn mfg_action_execute_handler(
     Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(intent): Json<MfgActionExecutionIntent>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let action_capability = if intent.mode.trim().eq_ignore_ascii_case("dry_run") {
+        "mfg.read"
+    } else {
+        "mfg.execution.operate"
+    };
+    require_mfg_capability(&principal, action_capability)?;
     let request = intent.into_request(principal_actor_id(&principal));
     let execution = state
         .services
         .mfg
         .execute_recommended_action(&state.config_home, &analysis_id, &action_id, &request)
         .map_err(|error| match error {
-            MfgRepositoryError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
-            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+            MfgRepositoryError::NotFound(message) => mfg_api_error(StatusCode::NOT_FOUND, message),
+            other => mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
     let incident = state
         .services
         .mfg
         .get_incident(&state.config_home, &execution.incident_id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     append_mfg_execution_outcome(
         &state,
         incident
@@ -467,7 +484,7 @@ pub(super) async fn mfg_action_execute_handler(
         mfg_action_execution_outcome(&execution),
     )
     .await
-    .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.action_execution",
         "execution": execution,
@@ -482,8 +499,8 @@ pub(super) async fn mfg_execution_get_handler(
         .services
         .mfg
         .get_execution(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG action execution not found"))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| mfg_api_error(StatusCode::NOT_FOUND, "MFG action execution not found"))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.action_execution",
         "execution": execution,
@@ -496,13 +513,19 @@ pub(super) async fn mfg_execution_cross_plane_bridge_handler(
     Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(intent): Json<MfgCrossPlaneBridgeIntent>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let action_capability = if intent.mode.trim().eq_ignore_ascii_case("dry_run") {
+        "mfg.read"
+    } else {
+        "mfg.execution.operate"
+    };
+    require_mfg_capability(&principal, action_capability)?;
     let request = intent.into_request(principal_actor_id(&principal));
     let execution = state
         .services
         .mfg
         .get_execution(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG action execution not found"))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| mfg_api_error(StatusCode::NOT_FOUND, "MFG action execution not found"))?;
     let mode = state.services.mfg.normalize_bridge_mode(&request.mode);
     let idempotency_key = request
         .idempotency_key
@@ -521,7 +544,9 @@ pub(super) async fn mfg_execution_cross_plane_bridge_handler(
                 .services
                 .mfg
                 .attach_execution_cross_plane_receipt(&state.config_home, &execution, &receipt)
-                .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+                .map_err(|error| {
+                    mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+                })?;
             return Ok(Json(serde_json::json!({
                 "kind": "mfg.cross_plane_action_bridge",
                 "mode": receipt.mode,
@@ -564,7 +589,7 @@ pub(super) async fn mfg_execution_cross_plane_bridge_handler(
             .cross_plane
             .execute_commit_graph(&action, &decision, &graph_key, executor)
             .await
-            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+            .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
         state
             .services
             .cross_plane
@@ -576,19 +601,19 @@ pub(super) async fn mfg_execution_cross_plane_bridge_handler(
                 target,
                 &projection,
             )
-            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+            .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
     } else {
         state
             .services
             .cross_plane
             .record_non_commit_action(idempotency_key, mode.clone(), action, decision, evidence)
-            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+            .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
     };
     let execution = state
         .services
         .mfg
         .attach_execution_cross_plane_receipt(&state.config_home, &execution, &receipt)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.cross_plane_action_bridge",
         "mode": receipt.mode.clone(),
