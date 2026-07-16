@@ -495,6 +495,8 @@ struct MfgCockpitProfileUpsertRequest {
     request_id: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
     profile: MfgCockpitProfileInput,
 }
 
@@ -509,6 +511,8 @@ struct MfgCockpitProfileListQuery {
 #[derive(Debug, Deserialize)]
 struct MfgCockpitProfileDeleteQuery {
     expected_revision: u64,
+    #[serde(default)]
+    idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -518,6 +522,8 @@ struct MfgCockpitProfileCloneRequest {
     profile_id: Option<String>,
     #[serde(default)]
     display_name: Option<String>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -525,6 +531,14 @@ struct MfgCockpitProfileCloneRequest {
 struct MfgCockpitProfileShareRequest {
     expected_revision: u64,
     sharing_policy: app_mfg::MfgDashboardSharingPolicy,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+pub(super) fn mfg_idempotency_key(value: Option<String>, scope: &str) -> String {
+    value
+        .filter(|key| !key.trim().is_empty())
+        .unwrap_or_else(|| format!("gateway-{scope}-{}", uuid::Uuid::new_v4()))
 }
 
 #[derive(Debug, Deserialize)]

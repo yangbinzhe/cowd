@@ -39,6 +39,11 @@ pub(super) async fn mfg_cockpit_profile_upsert_handler(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let expected_revision = request.profile.expected_revision;
     let actor = principal_actor_id(&principal);
+    let idempotency_key = mfg_idempotency_key(request.idempotency_key.take(), "cockpit-profile");
+    request
+        .profile
+        .profile_id
+        .get_or_insert_with(|| format!("cockpit-profile-{}", uuid::Uuid::new_v4()));
     if let Some(profile_id) = request
         .profile
         .profile_id
@@ -61,13 +66,16 @@ pub(super) async fn mfg_cockpit_profile_upsert_handler(
         }
     }
     request.profile.owner_ref = actor;
-    let profile = state
+    let (profile, receipt) = state
         .services
         .mfg
-        .upsert_cockpit_profile(
+        .upsert_cockpit_profile_receipted(
             &state.config_home,
             &MfgCockpitProfile::from_input(request.profile),
             expected_revision,
+            "profile.upsert",
+            &principal_actor_id(&principal),
+            &idempotency_key,
         )
         .map_err(mfg_mutation_error)?;
     let revision = profile.revision;
@@ -77,6 +85,7 @@ pub(super) async fn mfg_cockpit_profile_upsert_handler(
             "request_id": request.request_id,
             "session_id": request.session_id,
             "profile": profile,
+            "receipt": receipt,
         }),
         revision,
     ))
@@ -119,23 +128,31 @@ pub(super) async fn mfg_cockpit_profile_delete_handler(
         .services
         .mfg
         .get_cockpit_profile(&state.config_home, &id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG cockpit profile not found"))?;
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let actor = principal_actor_id(&principal);
-    if existing.owner_ref != actor && !existing.sharing_policy.editor_refs.contains(&actor) {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
-            "cockpit profile is not editable by this principal",
-        ));
+    if let Some(existing) = existing {
+        if existing.owner_ref != actor && !existing.sharing_policy.editor_refs.contains(&actor) {
+            return Err(api_error(
+                StatusCode::FORBIDDEN,
+                "cockpit profile is not editable by this principal",
+            ));
+        }
     }
-    let profile = state
+    let idempotency_key = mfg_idempotency_key(query.idempotency_key, "cockpit-profile-delete");
+    let (profile, receipt) = state
         .services
         .mfg
-        .delete_cockpit_profile(&state.config_home, &id, query.expected_revision)
+        .delete_cockpit_profile_receipted(
+            &state.config_home,
+            &id,
+            query.expected_revision,
+            &actor,
+            &idempotency_key,
+        )
         .map_err(mfg_mutation_error)?;
-    let revision = profile.revision;
+    let revision = receipt.current_revision;
     Ok(cockpit_profile_response(
-        serde_json::json!({ "kind": "mfg.cockpit.profile_deleted", "profile": profile }),
+        serde_json::json!({ "kind": "mfg.cockpit.profile_deleted", "profile": profile, "receipt": receipt }),
         revision,
     ))
 }
@@ -146,12 +163,19 @@ pub(super) async fn mfg_cockpit_profile_clone_handler(
     Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(request): Json<MfgCockpitProfileCloneRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let idempotency_key = mfg_idempotency_key(request.idempotency_key.clone(), "cockpit-profile-clone");
     let source = state
         .services
         .mfg
         .get_cockpit_profile(&state.config_home, &id)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG cockpit profile not found"))?;
+    if !cockpit_profile_visible_to(&source, &principal_actor_id(&principal)) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "cockpit profile is not visible to this principal",
+        ));
+    }
     let mut clone = source;
     clone.profile_id = request
         .profile_id
@@ -166,14 +190,35 @@ pub(super) async fn mfg_cockpit_profile_clone_handler(
     clone.created_at = chrono::Utc::now();
     clone.updated_at = clone.created_at;
     clone.sharing_policy = Default::default();
-    let clone = state
+    if let Some(existing) = state
         .services
         .mfg
-        .upsert_cockpit_profile(&state.config_home, &clone, None)
+        .get_cockpit_profile(&state.config_home, &clone.profile_id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+    {
+        let actor = principal_actor_id(&principal);
+        if existing.owner_ref != actor && !existing.sharing_policy.editor_refs.contains(&actor) {
+            return Err(api_error(
+                StatusCode::FORBIDDEN,
+                "clone target is not editable by this principal",
+            ));
+        }
+    }
+    let (clone, receipt) = state
+        .services
+        .mfg
+        .upsert_cockpit_profile_receipted(
+            &state.config_home,
+            &clone,
+            None,
+            "profile.clone",
+            &principal_actor_id(&principal),
+            &idempotency_key,
+        )
         .map_err(mfg_mutation_error)?;
     let revision = clone.revision;
     Ok(cockpit_profile_response(
-        serde_json::json!({ "kind": "mfg.cockpit.profile_cloned", "source_profile_id": id, "profile": clone }),
+        serde_json::json!({ "kind": "mfg.cockpit.profile_cloned", "source_profile_id": id, "profile": clone, "receipt": receipt }),
         revision,
     ))
 }
@@ -184,6 +229,7 @@ pub(super) async fn mfg_cockpit_profile_share_handler(
     Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(request): Json<MfgCockpitProfileShareRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let idempotency_key = mfg_idempotency_key(request.idempotency_key.clone(), "cockpit-profile-share");
     let mut profile = state
         .services
         .mfg
@@ -202,18 +248,21 @@ pub(super) async fn mfg_cockpit_profile_share_handler(
         ));
     }
     profile.sharing_policy = request.sharing_policy;
-    let profile = state
+    let (profile, receipt) = state
         .services
         .mfg
-        .upsert_cockpit_profile(
+        .upsert_cockpit_profile_receipted(
             &state.config_home,
             &profile,
             Some(request.expected_revision),
+            "profile.share",
+            &principal_actor_id(&principal),
+            &idempotency_key,
         )
         .map_err(mfg_mutation_error)?;
     let revision = profile.revision;
     Ok(cockpit_profile_response(
-        serde_json::json!({ "kind": "mfg.cockpit.profile_shared", "profile": profile }),
+        serde_json::json!({ "kind": "mfg.cockpit.profile_shared", "profile": profile, "receipt": receipt }),
         revision,
     ))
 }

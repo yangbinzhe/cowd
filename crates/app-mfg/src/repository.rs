@@ -244,6 +244,28 @@ impl MfgRepository {
         upsert_cockpit_profile(&connection, profile, expected_revision)
     }
 
+    pub fn upsert_cockpit_profile_receipted(
+        &self,
+        profile: &MfgCockpitProfile,
+        expected_revision: Option<u64>,
+        command: &str,
+        actor_ref: &str,
+        idempotency_key: &str,
+    ) -> Result<(MfgCockpitProfile, MfgCommandReceipt), MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        upsert_cockpit_profile_receipted(
+            &connection,
+            profile,
+            expected_revision,
+            command,
+            actor_ref,
+            idempotency_key,
+        )
+    }
+
     pub fn get_cockpit_profile(
         &self,
         profile_id: &str,
@@ -355,6 +377,26 @@ impl MfgRepository {
         Ok(profile)
     }
 
+    pub fn delete_cockpit_profile_receipted(
+        &self,
+        profile_id: &str,
+        expected_revision: u64,
+        actor_ref: &str,
+        idempotency_key: &str,
+    ) -> Result<(Option<MfgCockpitProfile>, MfgCommandReceipt), MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        delete_cockpit_profile_receipted(
+            &connection,
+            profile_id,
+            expected_revision,
+            actor_ref,
+            idempotency_key,
+        )
+    }
+
     pub fn upsert_alert_rule(
         &self,
         rule: &MfgAlertRule,
@@ -365,6 +407,26 @@ impl MfgRepository {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         upsert_alert_rule(&connection, rule, expected_revision)
+    }
+
+    pub fn upsert_alert_rule_receipted(
+        &self,
+        rule: &MfgAlertRule,
+        expected_revision: Option<u64>,
+        actor_ref: &str,
+        idempotency_key: &str,
+    ) -> Result<(MfgAlertRule, MfgCommandReceipt), MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        upsert_alert_rule_receipted(
+            &connection,
+            rule,
+            expected_revision,
+            actor_ref,
+            idempotency_key,
+        )
     }
 
     pub fn list_alert_rules(
@@ -401,6 +463,26 @@ impl MfgRepository {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         upsert_alert_subscription(&connection, subscription, expected_revision)
+    }
+
+    pub fn upsert_alert_subscription_receipted(
+        &self,
+        subscription: &MfgAlertSubscription,
+        expected_revision: Option<u64>,
+        actor_ref: &str,
+        idempotency_key: &str,
+    ) -> Result<(MfgAlertSubscription, MfgCommandReceipt), MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        upsert_alert_subscription_receipted(
+            &connection,
+            subscription,
+            expected_revision,
+            actor_ref,
+            idempotency_key,
+        )
     }
 
     pub fn list_alert_subscriptions(
@@ -450,6 +532,26 @@ impl MfgRepository {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         upsert_assignment(&connection, assignment, expected_revision)
+    }
+
+    pub fn upsert_assignment_receipted(
+        &self,
+        assignment: &MfgAssignment,
+        expected_revision: Option<u64>,
+        actor_ref: &str,
+        idempotency_key: &str,
+    ) -> Result<(MfgAssignment, MfgCommandReceipt), MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        upsert_assignment_receipted(
+            &connection,
+            assignment,
+            expected_revision,
+            actor_ref,
+            idempotency_key,
+        )
     }
 
     pub fn get_assignment(
@@ -2920,6 +3022,215 @@ fn insert_command_receipt(
     Ok(())
 }
 
+fn mutation_receipt(
+    domain: &str,
+    subject_ref: String,
+    command: &str,
+    actor_ref: &str,
+    idempotency_key: &str,
+    previous_revision: u64,
+    current_revision: u64,
+) -> Result<MfgCommandReceipt, MfgRepositoryError> {
+    if actor_ref.trim().is_empty() || idempotency_key.trim().is_empty() {
+        return Err(MfgRepositoryError::CommandRejected(
+            "actor and idempotency key are required".to_string(),
+        ));
+    }
+    Ok(MfgCommandReceipt {
+        receipt_id: format!("receipt-{}", uuid::Uuid::new_v4()),
+        domain: domain.to_string(),
+        subject_ref: subject_ref.clone(),
+        command: command.to_string(),
+        actor_ref: actor_ref.to_string(),
+        idempotency_key: idempotency_key.to_string(),
+        idempotent_replay: false,
+        previous_revision,
+        current_revision,
+        audit_ref: format!("audit://mfg/{domain}/{}/{}", subject_ref.rsplit(':').next().unwrap_or("unknown"), current_revision),
+        notification_refs: Vec::new(),
+        created_at: Utc::now(),
+    })
+}
+
+fn upsert_cockpit_profile_receipted(
+    connection: &Connection,
+    profile: &MfgCockpitProfile,
+    expected_revision: Option<u64>,
+    command: &str,
+    actor_ref: &str,
+    idempotency_key: &str,
+) -> Result<(MfgCockpitProfile, MfgCommandReceipt), MfgRepositoryError> {
+    let subject_ref = format!("mfg:cockpit-profile:{}", profile.profile_id);
+    if let Some(receipt) = find_command_receipt(connection, idempotency_key, "cockpit", &subject_ref)? {
+        if receipt.actor_ref != actor_ref {
+            return Err(MfgRepositoryError::CommandRejected(
+                "idempotency key is bound to another actor".to_string(),
+            ));
+        }
+        let profile = find_cockpit_profile(connection, &profile.profile_id)?
+            .ok_or_else(|| MfgRepositoryError::NotFound(profile.profile_id.clone()))?;
+        return Ok((profile, receipt));
+    }
+    let previous_revision = find_cockpit_profile(connection, &profile.profile_id)?
+        .map(|item| item.revision)
+        .unwrap_or_default();
+    let profile = upsert_cockpit_profile(connection, profile, expected_revision)?;
+    let receipt = mutation_receipt(
+        "cockpit",
+        subject_ref.clone(),
+        command,
+        actor_ref,
+        idempotency_key,
+        previous_revision,
+        profile.revision,
+    )?;
+    insert_command_receipt(connection, &receipt)?;
+    append_projection_event(connection, "cockpit", &subject_ref, "profile.receipted", serde_json::json!({ "profile": profile, "receipt": receipt }))?;
+    Ok((profile, receipt))
+}
+
+fn delete_cockpit_profile_receipted(
+    connection: &Connection,
+    profile_id: &str,
+    expected_revision: u64,
+    actor_ref: &str,
+    idempotency_key: &str,
+) -> Result<(Option<MfgCockpitProfile>, MfgCommandReceipt), MfgRepositoryError> {
+    let subject_ref = format!("mfg:cockpit-profile:{profile_id}");
+    if let Some(receipt) = find_command_receipt(connection, idempotency_key, "cockpit", &subject_ref)? {
+        if receipt.actor_ref != actor_ref {
+            return Err(MfgRepositoryError::CommandRejected(
+                "idempotency key is bound to another actor".to_string(),
+            ));
+        }
+        return Ok((None, receipt));
+    }
+    let profile = find_cockpit_profile(connection, profile_id)?
+        .ok_or_else(|| MfgRepositoryError::NotFound(profile_id.to_string()))?;
+    ensure_revision("cockpit_profile", profile_id, expected_revision, profile.revision)?;
+    connection.execute("DELETE FROM mfg_cockpit_profile WHERE profile_id = ?1", params![profile_id])?;
+    let receipt = mutation_receipt(
+        "cockpit",
+        subject_ref.clone(),
+        "profile.delete",
+        actor_ref,
+        idempotency_key,
+        profile.revision,
+        profile.revision,
+    )?;
+    insert_command_receipt(connection, &receipt)?;
+    append_projection_event(connection, "cockpit", &subject_ref, "profile.deleted", serde_json::json!({ "profile": profile, "receipt": receipt }))?;
+    Ok((Some(profile), receipt))
+}
+
+fn upsert_alert_rule_receipted(
+    connection: &Connection,
+    rule: &MfgAlertRule,
+    expected_revision: Option<u64>,
+    actor_ref: &str,
+    idempotency_key: &str,
+) -> Result<(MfgAlertRule, MfgCommandReceipt), MfgRepositoryError> {
+    let subject_ref = format!("mfg:alert-rule:{}", rule.rule_id);
+    if let Some(receipt) = find_command_receipt(connection, idempotency_key, "alert", &subject_ref)? {
+        if receipt.actor_ref != actor_ref {
+            return Err(MfgRepositoryError::CommandRejected(
+                "idempotency key is bound to another actor".to_string(),
+            ));
+        }
+        let rule = find_alert_rule(connection, &rule.rule_id)?
+            .ok_or_else(|| MfgRepositoryError::NotFound(rule.rule_id.clone()))?;
+        return Ok((rule, receipt));
+    }
+    let previous_revision = find_alert_rule(connection, &rule.rule_id)?
+        .map(|item| item.revision)
+        .unwrap_or_default();
+    let rule = upsert_alert_rule(connection, rule, expected_revision)?;
+    let receipt = mutation_receipt(
+        "alert",
+        subject_ref.clone(),
+        "rule.upsert",
+        actor_ref,
+        idempotency_key,
+        previous_revision,
+        rule.revision,
+    )?;
+    insert_command_receipt(connection, &receipt)?;
+    append_projection_event(connection, "alert", &subject_ref, "alert_rule.receipted", serde_json::json!({ "rule": rule, "receipt": receipt }))?;
+    Ok((rule, receipt))
+}
+
+fn upsert_alert_subscription_receipted(
+    connection: &Connection,
+    subscription: &MfgAlertSubscription,
+    expected_revision: Option<u64>,
+    actor_ref: &str,
+    idempotency_key: &str,
+) -> Result<(MfgAlertSubscription, MfgCommandReceipt), MfgRepositoryError> {
+    let subject_ref = format!("mfg:alert-subscription:{}", subscription.subscription_id);
+    if let Some(receipt) = find_command_receipt(connection, idempotency_key, "alert", &subject_ref)? {
+        if receipt.actor_ref != actor_ref {
+            return Err(MfgRepositoryError::CommandRejected(
+                "idempotency key is bound to another actor".to_string(),
+            ));
+        }
+        let subscription = find_alert_subscription(connection, &subscription.subscription_id)?
+            .ok_or_else(|| MfgRepositoryError::NotFound(subscription.subscription_id.clone()))?;
+        return Ok((subscription, receipt));
+    }
+    let previous_revision = find_alert_subscription(connection, &subscription.subscription_id)?
+        .map(|item| item.revision)
+        .unwrap_or_default();
+    let subscription = upsert_alert_subscription(connection, subscription, expected_revision)?;
+    let receipt = mutation_receipt(
+        "alert",
+        subject_ref.clone(),
+        "subscription.upsert",
+        actor_ref,
+        idempotency_key,
+        previous_revision,
+        subscription.revision,
+    )?;
+    insert_command_receipt(connection, &receipt)?;
+    append_projection_event(connection, "alert", &subject_ref, "alert_subscription.receipted", serde_json::json!({ "subscription": subscription, "receipt": receipt }))?;
+    Ok((subscription, receipt))
+}
+
+fn upsert_assignment_receipted(
+    connection: &Connection,
+    assignment: &MfgAssignment,
+    expected_revision: Option<u64>,
+    actor_ref: &str,
+    idempotency_key: &str,
+) -> Result<(MfgAssignment, MfgCommandReceipt), MfgRepositoryError> {
+    let subject_ref = format!("mfg:assignment:{}", assignment.assignment_id);
+    if let Some(receipt) = find_command_receipt(connection, idempotency_key, "assignment", &subject_ref)? {
+        if receipt.actor_ref != actor_ref {
+            return Err(MfgRepositoryError::CommandRejected(
+                "idempotency key is bound to another actor".to_string(),
+            ));
+        }
+        let assignment = find_assignment(connection, &assignment.assignment_id)?
+            .ok_or_else(|| MfgRepositoryError::NotFound(assignment.assignment_id.clone()))?;
+        return Ok((assignment, receipt));
+    }
+    let previous_revision = find_assignment(connection, &assignment.assignment_id)?
+        .map(|item| item.revision)
+        .unwrap_or_default();
+    let assignment = upsert_assignment(connection, assignment, expected_revision)?;
+    let receipt = mutation_receipt(
+        "assignment",
+        subject_ref.clone(),
+        "assignment.upsert",
+        actor_ref,
+        idempotency_key,
+        previous_revision,
+        assignment.revision,
+    )?;
+    insert_command_receipt(connection, &receipt)?;
+    append_projection_event(connection, "assignment", &subject_ref, "assignment.receipted", serde_json::json!({ "assignment": assignment, "receipt": receipt }))?;
+    Ok((assignment, receipt))
+}
+
 fn record_command_notifications(
     connection: &Connection,
     idempotency_key: &str,
@@ -3040,15 +3351,7 @@ fn upsert_alert_subscription(
         return Err(MfgRepositoryError::NotFound(subscription.rule_id.clone()));
     }
     let mut subscription = subscription.clone();
-    let existing = connection
-        .query_row(
-            "SELECT subscription_json FROM mfg_alert_subscription WHERE subscription_id = ?1",
-            params![subscription.subscription_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?
-        .map(|json| serde_json::from_str::<MfgAlertSubscription>(&json))
-        .transpose()?;
+    let existing = find_alert_subscription(connection, &subscription.subscription_id)?;
     match existing {
         Some(existing) => {
             if expected_revision != Some(existing.revision) {
@@ -3084,6 +3387,21 @@ fn upsert_alert_subscription(
         serde_json::to_value(&subscription)?,
     )?;
     Ok(subscription)
+}
+
+fn find_alert_subscription(
+    connection: &Connection,
+    subscription_id: &str,
+) -> Result<Option<MfgAlertSubscription>, MfgRepositoryError> {
+    connection
+        .query_row(
+            "SELECT subscription_json FROM mfg_alert_subscription WHERE subscription_id = ?1",
+            params![subscription_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(MfgRepositoryError::from))
+        .transpose()
 }
 
 fn list_alert_subscriptions(
@@ -3220,6 +3538,11 @@ fn command_alert(
     if let Some(receipt) =
         find_command_receipt(connection, &input.idempotency_key, "alert", &subject_ref)?
     {
+        if receipt.actor_ref != input.actor_ref {
+            return Err(MfgRepositoryError::CommandRejected(
+                "idempotency key is bound to another actor".to_string(),
+            ));
+        }
         let occurrence = find_alert_occurrence(connection, occurrence_id)?
             .ok_or_else(|| MfgRepositoryError::NotFound(occurrence_id.to_string()))?;
         return Ok((occurrence, receipt));
@@ -3462,6 +3785,11 @@ fn command_assignment(
         "assignment",
         &subject_ref,
     )? {
+        if receipt.actor_ref != input.actor_ref {
+            return Err(MfgRepositoryError::CommandRejected(
+                "idempotency key is bound to another actor".to_string(),
+            ));
+        }
         let assignment = find_assignment(connection, assignment_id)?
             .ok_or_else(|| MfgRepositoryError::NotFound(assignment_id.to_string()))?;
         return Ok((assignment, receipt));
@@ -6402,6 +6730,71 @@ mod tests {
             )
             .expect("report delivery deduplicates");
         assert_eq!(delivered.delivery_receipts.len(), 1);
+    }
+
+    #[test]
+    fn cockpit_profile_mutations_persist_actor_bound_idempotency_receipts() {
+        let store = MfgRepository::in_memory().expect("store opens");
+        let profile = MfgCockpitProfile::from_input(MfgCockpitProfileInput {
+            profile_id: Some("cockpit-profile-idempotency".to_string()),
+            owner_ref: "user:planner".to_string(),
+            display_name: Some("Idempotent cockpit".to_string()),
+            focus_refs: Vec::new(),
+            focus_metric_ids: Vec::new(),
+            thresholds: Value::Null,
+            template_id: None,
+            cadence: Some("daily".to_string()),
+            expected_revision: None,
+            scope: None,
+            layout: None,
+            global_filters: Value::Null,
+            widget_instances: Vec::new(),
+            sharing_policy: None,
+        });
+        let (saved, receipt) = store
+            .upsert_cockpit_profile_receipted(
+                &profile,
+                None,
+                "profile.upsert",
+                "user:planner",
+                "cockpit-upsert-key",
+            )
+            .expect("profile saves with a receipt");
+        let (replayed, replay_receipt) = store
+            .upsert_cockpit_profile_receipted(
+                &profile,
+                None,
+                "profile.upsert",
+                "user:planner",
+                "cockpit-upsert-key",
+            )
+            .expect("profile write replays");
+        assert_eq!(saved.revision, 1);
+        assert_eq!(replayed.revision, saved.revision);
+        assert_eq!(replay_receipt.receipt_id, receipt.receipt_id);
+        assert!(replay_receipt.idempotent_replay);
+        assert!(receipt.audit_ref.contains("cockpit-profile-idempotency"));
+
+        let (deleted, deletion_receipt) = store
+            .delete_cockpit_profile_receipted(
+                &saved.profile_id,
+                saved.revision,
+                "user:planner",
+                "cockpit-delete-key",
+            )
+            .expect("profile deletes with a receipt");
+        let (deleted_replay, deletion_replay) = store
+            .delete_cockpit_profile_receipted(
+                &saved.profile_id,
+                saved.revision,
+                "user:planner",
+                "cockpit-delete-key",
+            )
+            .expect("profile deletion replays");
+        assert_eq!(deleted.expect("first deletion returns profile").profile_id, saved.profile_id);
+        assert!(deleted_replay.is_none());
+        assert_eq!(deletion_replay.receipt_id, deletion_receipt.receipt_id);
+        assert!(deletion_replay.idempotent_replay);
     }
 
     #[test]

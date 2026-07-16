@@ -24,12 +24,16 @@ struct MfgAlertListQuery {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MfgAlertRuleUpsertRequest {
+    #[serde(default)]
+    idempotency_key: Option<String>,
     rule: MfgAlertRuleInput,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MfgAlertSubscriptionUpsertRequest {
+    #[serde(default)]
+    idempotency_key: Option<String>,
     subscription: MfgAlertSubscriptionInput,
 }
 
@@ -72,6 +76,8 @@ struct MfgAssignmentListQuery {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MfgAssignmentUpsertRequest {
+    #[serde(default)]
+    idempotency_key: Option<String>,
     assignment: MfgAssignmentInput,
 }
 
@@ -122,22 +128,57 @@ pub(super) async fn mfg_alert_rule_upsert_handler(
     Json(mut request): Json<MfgAlertRuleUpsertRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let expected_revision = request.rule.expected_revision;
-    request.rule.owner_ref = principal_actor_id(&principal);
-    let rule = MfgAlertRule::from_input(request.rule);
-    let rule = state
+    let actor = principal_actor_id(&principal);
+    let idempotency_key = mfg_idempotency_key(request.idempotency_key.take(), "alert-rule");
+    request
+        .rule
+        .rule_id
+        .get_or_insert_with(|| format!("alert-rule-{}", uuid::Uuid::new_v4()));
+    let existing_rule = state
         .services
         .mfg
-        .upsert_alert_rule(&state.config_home, &rule, expected_revision)
+        .list_alert_rules(&state.config_home, None, 500)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .into_iter()
+        .find(|rule| rule.rule_id == request.rule.rule_id.as_deref().unwrap_or_default());
+    if existing_rule.is_some_and(|rule| rule.owner_ref != actor) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "alert rule is not editable by this principal",
+        ));
+    }
+    request.rule.owner_ref = actor.clone();
+    let rule = MfgAlertRule::from_input(request.rule);
+    let (rule, receipt) = state
+        .services
+        .mfg
+        .upsert_alert_rule_receipted(
+            &state.config_home,
+            &rule,
+            expected_revision,
+            &actor,
+            &idempotency_key,
+        )
         .map_err(mfg_mutation_error)?;
     Ok(Json(
-        serde_json::json!({ "kind": "mfg.alert_rule", "rule": rule }),
+        serde_json::json!({ "kind": "mfg.alert_rule", "rule": rule, "receipt": receipt }),
     ))
 }
 
 pub(super) async fn mfg_alert_occurrence_list_handler(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Query(query): Query<MfgAlertListQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let actor = principal_actor_id(&principal);
+    let visible_rule_ids = state
+        .services
+        .mfg
+        .list_alert_rules(&state.config_home, Some(&actor), 500)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .into_iter()
+        .map(|rule| rule.rule_id)
+        .collect::<std::collections::BTreeSet<_>>();
     let items = state
         .services
         .mfg
@@ -146,7 +187,10 @@ pub(super) async fn mfg_alert_occurrence_list_handler(
             query.status.as_deref(),
             query.limit.unwrap_or(100).clamp(1, 500),
         )
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .into_iter()
+        .filter(|occurrence| visible_rule_ids.contains(&occurrence.rule_id))
+        .collect::<Vec<_>>();
     Ok(Json(
         serde_json::json!({ "kind": "mfg.alert_occurrence_list", "items": items }),
     ))
@@ -175,18 +219,55 @@ pub(super) async fn mfg_alert_subscription_list_handler(
 pub(super) async fn mfg_alert_subscription_upsert_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
-    Json(request): Json<MfgAlertSubscriptionUpsertRequest>,
+    Json(mut request): Json<MfgAlertSubscriptionUpsertRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let expected_revision = request.subscription.expected_revision;
-    let subscription =
-        MfgAlertSubscription::from_input(request.subscription, principal_actor_id(&principal));
-    let subscription = state
+    let actor = principal_actor_id(&principal);
+    let idempotency_key = mfg_idempotency_key(request.idempotency_key.take(), "alert-subscription");
+    request
+        .subscription
+        .subscription_id
+        .get_or_insert_with(|| format!("alert-subscription-{}", uuid::Uuid::new_v4()));
+    let existing_subscription = state
         .services
         .mfg
-        .upsert_alert_subscription(&state.config_home, &subscription, expected_revision)
+        .list_alert_subscriptions(&state.config_home, None, 500)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .into_iter()
+        .find(|subscription| subscription.subscription_id == request.subscription.subscription_id.as_deref().unwrap_or_default());
+    if existing_subscription.is_some_and(|subscription| subscription.subscriber_ref != actor) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "alert subscription is not editable by this principal",
+        ));
+    }
+    let owns_rule = state
+        .services
+        .mfg
+        .list_alert_rules(&state.config_home, Some(&actor), 500)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .iter()
+        .any(|rule| rule.rule_id == request.subscription.rule_id);
+    if !owns_rule {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "alert subscription requires an alert rule owned by this principal",
+        ));
+    }
+    let subscription = MfgAlertSubscription::from_input(request.subscription, actor.clone());
+    let (subscription, receipt) = state
+        .services
+        .mfg
+        .upsert_alert_subscription_receipted(
+            &state.config_home,
+            &subscription,
+            expected_revision,
+            &actor,
+            &idempotency_key,
+        )
         .map_err(mfg_mutation_error)?;
     Ok(Json(
-        serde_json::json!({ "kind": "mfg.alert_subscription", "subscription": subscription }),
+        serde_json::json!({ "kind": "mfg.alert_subscription", "subscription": subscription, "receipt": receipt }),
     ))
 }
 
@@ -196,6 +277,28 @@ pub(super) async fn mfg_alert_command_handler(
     Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(request): Json<MfgAlertCommandRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let actor = principal_actor_id(&principal);
+    let visible_rule_ids = state
+        .services
+        .mfg
+        .list_alert_rules(&state.config_home, Some(&actor), 500)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .into_iter()
+        .map(|rule| rule.rule_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let occurrence = state
+        .services
+        .mfg
+        .list_alert_occurrences(&state.config_home, None, 500)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .into_iter()
+        .find(|item| item.occurrence_id == id);
+    if !occurrence.is_some_and(|item| visible_rule_ids.contains(&item.rule_id)) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "alert occurrence is not actionable by this principal",
+        ));
+    }
     let (occurrence, receipt) = state
         .services
         .mfg
@@ -204,7 +307,7 @@ pub(super) async fn mfg_alert_command_handler(
             &id,
             MfgAlertCommandInput {
                 command: request.command,
-                actor_ref: principal_actor_id(&principal),
+                actor_ref: actor,
                 expected_revision: request.expected_revision,
                 idempotency_key: request.idempotency_key,
                 until: request.until,
@@ -247,9 +350,31 @@ pub(super) async fn mfg_forecast_list_handler(
 pub(super) async fn mfg_assignment_upsert_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
-    Json(request): Json<MfgAssignmentUpsertRequest>,
+    Json(mut request): Json<MfgAssignmentUpsertRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let expected_revision = request.assignment.expected_revision;
+    let actor = principal_actor_id(&principal);
+    let idempotency_key = mfg_idempotency_key(request.idempotency_key.take(), "assignment");
+    request
+        .assignment
+        .assignment_id
+        .get_or_insert_with(|| format!("assignment-{}", uuid::Uuid::new_v4()));
+    if let Some(existing) = state
+        .services
+        .mfg
+        .get_assignment(
+            &state.config_home,
+            request.assignment.assignment_id.as_deref().unwrap_or_default(),
+        )
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+    {
+        if existing.created_by != actor {
+            return Err(api_error(
+                StatusCode::FORBIDDEN,
+                "assignment is not editable by this principal",
+            ));
+        }
+    }
     let task_id = request
         .assignment
         .task_ref
@@ -269,14 +394,20 @@ pub(super) async fn mfg_assignment_upsert_handler(
             "assignment task_ref does not resolve to an existing task",
         ));
     }
-    let assignment = MfgAssignment::from_input(request.assignment, principal_actor_id(&principal));
-    let assignment = state
+    let assignment = MfgAssignment::from_input(request.assignment, actor.clone());
+    let (assignment, receipt) = state
         .services
         .mfg
-        .upsert_assignment(&state.config_home, &assignment, expected_revision)
+        .upsert_assignment_receipted(
+            &state.config_home,
+            &assignment,
+            expected_revision,
+            &actor,
+            &idempotency_key,
+        )
         .map_err(mfg_mutation_error)?;
     Ok(Json(
-        serde_json::json!({ "kind": "mfg.assignment", "assignment": assignment }),
+        serde_json::json!({ "kind": "mfg.assignment", "assignment": assignment, "receipt": receipt }),
     ))
 }
 

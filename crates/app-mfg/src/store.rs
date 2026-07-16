@@ -301,6 +301,23 @@ impl MfgStore {
             .upsert_cockpit_profile(profile, expected_revision)
     }
 
+    pub fn upsert_cockpit_profile_receipted(
+        &self,
+        profile: &MfgCockpitProfile,
+        expected_revision: Option<u64>,
+        command: &str,
+        actor_ref: &str,
+        idempotency_key: &str,
+    ) -> Result<(MfgCockpitProfile, MfgCommandReceipt), MfgRepositoryError> {
+        self.repository.upsert_cockpit_profile_receipted(
+            profile,
+            expected_revision,
+            command,
+            actor_ref,
+            idempotency_key,
+        )
+    }
+
     pub fn get_cockpit_profile(
         &self,
         profile_id: &str,
@@ -356,12 +373,42 @@ impl MfgStore {
             .delete_cockpit_profile(profile_id, expected_revision)
     }
 
+    pub fn delete_cockpit_profile_receipted(
+        &self,
+        profile_id: &str,
+        expected_revision: u64,
+        actor_ref: &str,
+        idempotency_key: &str,
+    ) -> Result<(Option<MfgCockpitProfile>, MfgCommandReceipt), MfgRepositoryError> {
+        self.repository.delete_cockpit_profile_receipted(
+            profile_id,
+            expected_revision,
+            actor_ref,
+            idempotency_key,
+        )
+    }
+
     pub fn upsert_alert_rule(
         &self,
         rule: &MfgAlertRule,
         expected_revision: Option<u64>,
     ) -> Result<MfgAlertRule, MfgRepositoryError> {
         self.repository.upsert_alert_rule(rule, expected_revision)
+    }
+
+    pub fn upsert_alert_rule_receipted(
+        &self,
+        rule: &MfgAlertRule,
+        expected_revision: Option<u64>,
+        actor_ref: &str,
+        idempotency_key: &str,
+    ) -> Result<(MfgAlertRule, MfgCommandReceipt), MfgRepositoryError> {
+        self.repository.upsert_alert_rule_receipted(
+            rule,
+            expected_revision,
+            actor_ref,
+            idempotency_key,
+        )
     }
 
     pub fn list_alert_rules(
@@ -387,6 +434,21 @@ impl MfgStore {
     ) -> Result<MfgAlertSubscription, MfgRepositoryError> {
         self.repository
             .upsert_alert_subscription(subscription, expected_revision)
+    }
+
+    pub fn upsert_alert_subscription_receipted(
+        &self,
+        subscription: &MfgAlertSubscription,
+        expected_revision: Option<u64>,
+        actor_ref: &str,
+        idempotency_key: &str,
+    ) -> Result<(MfgAlertSubscription, MfgCommandReceipt), MfgRepositoryError> {
+        self.repository.upsert_alert_subscription_receipted(
+            subscription,
+            expected_revision,
+            actor_ref,
+            idempotency_key,
+        )
     }
 
     pub fn list_alert_subscriptions(
@@ -422,6 +484,21 @@ impl MfgStore {
     ) -> Result<MfgAssignment, MfgRepositoryError> {
         self.repository
             .upsert_assignment(assignment, expected_revision)
+    }
+
+    pub fn upsert_assignment_receipted(
+        &self,
+        assignment: &MfgAssignment,
+        expected_revision: Option<u64>,
+        actor_ref: &str,
+        idempotency_key: &str,
+    ) -> Result<(MfgAssignment, MfgCommandReceipt), MfgRepositoryError> {
+        self.repository.upsert_assignment_receipted(
+            assignment,
+            expected_revision,
+            actor_ref,
+            idempotency_key,
+        )
     }
 
     pub fn get_assignment(

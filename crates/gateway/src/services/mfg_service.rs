@@ -526,6 +526,24 @@ impl MfgService {
             .upsert_cockpit_profile(profile, expected_revision)
     }
 
+    pub(crate) fn upsert_cockpit_profile_receipted(
+        &self,
+        config_home: impl AsRef<Path>,
+        profile: &MfgCockpitProfile,
+        expected_revision: Option<u64>,
+        command: &str,
+        actor_ref: &str,
+        idempotency_key: &str,
+    ) -> Result<(MfgCockpitProfile, MfgCommandReceipt), MfgRepositoryError> {
+        self.open_store(config_home)?.upsert_cockpit_profile_receipted(
+            profile,
+            expected_revision,
+            command,
+            actor_ref,
+            idempotency_key,
+        )
+    }
+
     pub(crate) fn get_cockpit_profile(
         &self,
         config_home: impl AsRef<Path>,
@@ -591,6 +609,22 @@ impl MfgService {
             .delete_cockpit_profile(profile_id, expected_revision)
     }
 
+    pub(crate) fn delete_cockpit_profile_receipted(
+        &self,
+        config_home: impl AsRef<Path>,
+        profile_id: &str,
+        expected_revision: u64,
+        actor_ref: &str,
+        idempotency_key: &str,
+    ) -> Result<(Option<MfgCockpitProfile>, MfgCommandReceipt), MfgRepositoryError> {
+        self.open_store(config_home)?.delete_cockpit_profile_receipted(
+            profile_id,
+            expected_revision,
+            actor_ref,
+            idempotency_key,
+        )
+    }
+
     pub(crate) fn upsert_alert_rule(
         &self,
         config_home: impl AsRef<Path>,
@@ -599,6 +633,22 @@ impl MfgService {
     ) -> Result<MfgAlertRule, MfgRepositoryError> {
         self.open_store(config_home)?
             .upsert_alert_rule(rule, expected_revision)
+    }
+
+    pub(crate) fn upsert_alert_rule_receipted(
+        &self,
+        config_home: impl AsRef<Path>,
+        rule: &MfgAlertRule,
+        expected_revision: Option<u64>,
+        actor_ref: &str,
+        idempotency_key: &str,
+    ) -> Result<(MfgAlertRule, MfgCommandReceipt), MfgRepositoryError> {
+        self.open_store(config_home)?.upsert_alert_rule_receipted(
+            rule,
+            expected_revision,
+            actor_ref,
+            idempotency_key,
+        )
     }
 
     pub(crate) fn list_alert_rules(
@@ -629,6 +679,22 @@ impl MfgService {
     ) -> Result<MfgAlertSubscription, MfgRepositoryError> {
         self.open_store(config_home)?
             .upsert_alert_subscription(subscription, expected_revision)
+    }
+
+    pub(crate) fn upsert_alert_subscription_receipted(
+        &self,
+        config_home: impl AsRef<Path>,
+        subscription: &MfgAlertSubscription,
+        expected_revision: Option<u64>,
+        actor_ref: &str,
+        idempotency_key: &str,
+    ) -> Result<(MfgAlertSubscription, MfgCommandReceipt), MfgRepositoryError> {
+        self.open_store(config_home)?.upsert_alert_subscription_receipted(
+            subscription,
+            expected_revision,
+            actor_ref,
+            idempotency_key,
+        )
     }
 
     pub(crate) fn list_alert_subscriptions(
@@ -670,6 +736,22 @@ impl MfgService {
     ) -> Result<MfgAssignment, MfgRepositoryError> {
         self.open_store(config_home)?
             .upsert_assignment(assignment, expected_revision)
+    }
+
+    pub(crate) fn upsert_assignment_receipted(
+        &self,
+        config_home: impl AsRef<Path>,
+        assignment: &MfgAssignment,
+        expected_revision: Option<u64>,
+        actor_ref: &str,
+        idempotency_key: &str,
+    ) -> Result<(MfgAssignment, MfgCommandReceipt), MfgRepositoryError> {
+        self.open_store(config_home)?.upsert_assignment_receipted(
+            assignment,
+            expected_revision,
+            actor_ref,
+            idempotency_key,
+        )
     }
 
     pub(crate) fn get_assignment(
