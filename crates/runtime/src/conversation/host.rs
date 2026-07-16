@@ -267,6 +267,10 @@ where
         self.runtime_ref().set_context_profile(profile);
     }
 
+    pub fn set_model_step_limit_override(&self, limit: usize) {
+        self.runtime_ref().set_model_step_limit_override(limit);
+    }
+
     /// Control whether this host may publish transcript rows. Delegated
     /// Agent hosts disable it while retaining durable evidence and domain
     /// events under the parent Session authority.
@@ -333,12 +337,7 @@ where
             &ingress.request_id,
             &ingress.turn_id,
         );
-        self.start_turn(
-            runtime,
-            content,
-            prompter,
-            Some((ingress, execution_id)),
-        );
+        self.start_turn(runtime, content, prompter, Some((ingress, execution_id)));
         self.await_started_turn().await
     }
 
@@ -448,13 +447,17 @@ where
     async fn await_started_turn(&mut self) -> Result<TurnSummary, RuntimeError> {
         let completion = {
             let Some(receiver) = self.inflight_turn.as_mut() else {
-                return Err(RuntimeError::new("Runtime host has no submitted turn to await"));
+                return Err(RuntimeError::new(
+                    "Runtime host has no submitted turn to await",
+                ));
             };
             receiver.await
         };
         self.inflight_turn = None;
         let (runtime, result) = completion.map_err(|error| {
-            RuntimeError::new(format!("submitted Runtime turn ended before recovery: {error}"))
+            RuntimeError::new(format!(
+                "submitted Runtime turn ended before recovery: {error}"
+            ))
         })?;
         self.runtime = Some(runtime);
         result
@@ -475,7 +478,9 @@ where
         };
         self.inflight_turn = None;
         let (runtime, _result) = completion.map_err(|error| {
-            RuntimeError::new(format!("interrupted Runtime turn ended before recovery: {error}"))
+            RuntimeError::new(format!(
+                "interrupted Runtime turn ended before recovery: {error}"
+            ))
         })?;
         self.runtime = Some(runtime);
         Ok(())
@@ -511,8 +516,7 @@ where
 fn canonical_host_system_prompt(mut supplied: Vec<String>) -> Vec<String> {
     let contract = crate::CowdIdentityContract::default();
     let has_contract_head = supplied.first().is_some_and(|section| {
-        section.contains("You are Cowd")
-            && section.contains(crate::COWD_IDENTITY_CONTRACT_VERSION)
+        section.contains("You are Cowd") && section.contains(crate::COWD_IDENTITY_CONTRACT_VERSION)
     });
     if !has_contract_head {
         supplied.insert(0, contract.stable_head(false));
@@ -603,15 +607,22 @@ where
             force_text_only_next_model: false,
             terminal_recovery_attempts: 0,
             bounded_evidence_role: false,
+            clean_terminal_synthesis_next: false,
+            clean_terminal_synthesis_attempted: false,
+            clean_terminal_retry_attempted: false,
+            consecutive_tool_failure_batches: 0,
+            successful_tool_calls: 0,
+            team_orchestration_requests: 0,
         }));
 
-        let (strategy, context_window, context_profile) = {
+        let (strategy, context_window, context_profile, owner_step_limit) = {
             let runtime = runtime.lock().await;
             (
                 crate::execution_core::StrategyDecisionEngine
                     .decide(content, Some(runtime.context_profile())),
                 runtime.model_context_window(),
                 runtime.context_profile(),
+                runtime.model_step_limit_override(),
             )
         };
         let compile_target = strategy.compile_target;
@@ -620,7 +631,7 @@ where
             graph_state.safety_lease = crate::execution_core::SafetyFusePolicy::derive(
                 context_window,
                 strategy.complexity(),
-                explicit_model_step_limit(content),
+                explicit_model_step_limit(content).or(owner_step_limit),
             );
             graph_state.bounded_evidence_role = context_profile == ContextProfile::SubAgent
                 || compile_target == crate::execution_core::RuntimeCompileTarget::EvidenceGraph;
@@ -926,6 +937,12 @@ struct TurnGraphState {
     force_text_only_next_model: bool,
     terminal_recovery_attempts: u8,
     bounded_evidence_role: bool,
+    clean_terminal_synthesis_next: bool,
+    clean_terminal_synthesis_attempted: bool,
+    clean_terminal_retry_attempted: bool,
+    consecutive_tool_failure_batches: usize,
+    successful_tool_calls: usize,
+    team_orchestration_requests: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1109,31 +1126,54 @@ where
         &self,
         ticket: &NodeExecutionTicket,
     ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
-        let (content, first_step, fuse_intervention, force_text_only_response) = {
+        let (
+            content,
+            first_step,
+            fuse_intervention,
+            force_text_only_response,
+            clean_terminal_synthesis,
+            clean_terminal_evidence,
+        ) = {
             let mut state = self.state.lock().await;
             let first = state.first_model_step;
             state.first_model_step = false;
+            let mut clean_terminal_synthesis =
+                std::mem::take(&mut state.clean_terminal_synthesis_next);
+            if !clean_terminal_synthesis
+                && !state.clean_terminal_synthesis_attempted
+                && state.successful_tool_calls > 0
+                && state.iterations.saturating_add(2) >= state.safety_lease.max_model_steps
+            {
+                state.clean_terminal_synthesis_attempted = true;
+                clean_terminal_synthesis = true;
+            }
+            let clean_terminal_evidence =
+                clean_terminal_synthesis.then(|| terminal_evidence_digest(&state.tool_results));
             let made_progress = std::mem::take(&mut state.last_verified_progress);
-            let intervention = match crate::execution_core::SafetyFusePolicy::evaluate(
-                &state.safety_lease,
-                state.iterations,
-                made_progress,
-            ) {
-                crate::execution_core::SafetyFuseDecision::Continue => None,
-                crate::execution_core::SafetyFuseDecision::Block { reason } => {
-                    state.terminal_override = Some((
-                        GoalCompletion::Blocked,
-                        format!(
-                            "Execution blocked safely: {reason}\n\nChecked evidence and progress were preserved. Continue with a new constraint, additional evidence, or an explicit replan."
-                        ),
-                    ));
-                    Some(RuntimeIntervention {
-                        goal_id: state.goal_id.clone(),
-                        kind: RuntimeInterventionKind::Block,
-                        reason,
-                        evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
-                        expected_graph_revision: None,
-                    })
+            let intervention = if clean_terminal_synthesis {
+                None
+            } else {
+                match crate::execution_core::SafetyFusePolicy::evaluate(
+                    &state.safety_lease,
+                    state.iterations,
+                    made_progress,
+                ) {
+                    crate::execution_core::SafetyFuseDecision::Continue => None,
+                    crate::execution_core::SafetyFuseDecision::Block { reason } => {
+                        state.terminal_override = Some((
+                            GoalCompletion::Blocked,
+                            format!(
+                                "Execution blocked safely: {reason}\n\nChecked evidence and progress were preserved. Continue with a new constraint, additional evidence, or an explicit replan."
+                            ),
+                        ));
+                        Some(RuntimeIntervention {
+                            goal_id: state.goal_id.clone(),
+                            kind: RuntimeInterventionKind::Block,
+                            reason,
+                            evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
+                            expected_graph_revision: None,
+                        })
+                    }
                 }
             };
             (
@@ -1144,6 +1184,8 @@ where
                 // recovery may schedule another explicit override below, but
                 // stale state must never disable tools for later turns.
                 std::mem::take(&mut state.force_text_only_next_model),
+                clean_terminal_synthesis,
+                clean_terminal_evidence,
             )
         };
         if let Some(intervention) = fuse_intervention {
@@ -1187,11 +1229,20 @@ where
                 detail: Some("requesting model".to_string()),
             });
         }
-        if force_text_only_response {
+        if force_text_only_response && !clean_terminal_synthesis {
             runtime.require_next_model_final_response();
         }
         let transcript_len = runtime.session_async().await.messages.len();
-        let result = runtime.execute_model_step(&content, first_step).await;
+        let result = if clean_terminal_synthesis {
+            runtime
+                .execute_clean_terminal_synthesis(
+                    &content,
+                    clean_terminal_evidence.as_deref().unwrap_or_default(),
+                )
+                .await
+        } else {
+            runtime.execute_model_step(&content, first_step).await
+        };
         rollback_uncommitted_transcript(
             &mut runtime.session_mut_async().await.messages,
             transcript_len,
@@ -1498,7 +1549,27 @@ where
                 let mut model_intervention = None;
                 let next = match intent {
                     ModelStepIntent::FinalAnswer { text } => {
-                        let text = strip_trailing_simulated_tool_markup(text);
+                        let mut text = strip_trailing_simulated_tool_markup(text);
+                        let normalized = normalize_terminal_answer_with_evidence(
+                            &text,
+                            &state.tool_results,
+                            self.services.workspace_root(),
+                            &state.content,
+                        );
+                        if normalized != text {
+                            text = normalized;
+                            let TurnGraphState {
+                                assistant_messages,
+                                pending_transcript,
+                                ..
+                            } = &mut *state;
+                            replace_latest_assistant_text(
+                                assistant_messages,
+                                pending_transcript,
+                                &ticket.node_id,
+                                &text,
+                            );
+                        }
                         let normal_reasoning_continuation = if reasoning_only_response
                             && !force_text_only_response
                             && !step.text_only_response
@@ -1547,26 +1618,29 @@ where
                         };
                         if let Some(next) = normal_reasoning_continuation {
                             next
-                        } else if let Some(reason) =
-                            final_answer_recovery_reason(&text, self.services.workspace_root())
-                        {
-                            // An empty answer or simulated XML tool call is a
-                            // malformed provider turn, not proof that the
-                            // user goal failed. Give the model one explicit,
-                            // text-only recovery using committed evidence;
-                            // only then terminate honestly instead of leaving
-                            // the root graph failed without a receipt.
+                        } else if let Some(reason) = final_answer_recovery_reason_for_objective(
+                            &text,
+                            self.services.workspace_root(),
+                            &state.content,
+                        ) {
+                            // A malformed or obviously unfinished answer is
+                            // not proof that the user goal failed. First try
+                            // one normal text-only continuation. If the
+                            // exploratory transcript still traps the
+                            // provider in its prior tool protocol, run one
+                            // clean evidence-only synthesis with no historical
+                            // tool-call messages. Neither path may loop.
                             state.assistant_messages.pop();
                             state.pending_transcript.remove(&ticket.node_id);
                             state.terminal_recovery_attempts =
                                 state.terminal_recovery_attempts.saturating_add(1);
-                            let recovery_retry_budget =
-                                terminal_recovery_retry_budget(&state.safety_lease);
-                            if state.terminal_recovery_attempts <= recovery_retry_budget {
+                            let normal_recovery_budget =
+                                terminal_recovery_retry_budget(&state.safety_lease).min(1);
+                            if state.terminal_recovery_attempts <= normal_recovery_budget {
                                 let instruction = format!(
                                     "Runtime final-answer recovery (mandatory): the prior provider response was unusable ({reason}). Do not call tools or emit simulated tool markup. Use only already committed evidence and return a concise final answer now; name any remaining uncertainty explicitly. Recovery attempt {}/{}.",
                                     state.terminal_recovery_attempts,
-                                    recovery_retry_budget,
+                                    normal_recovery_budget,
                                 );
                                 state.content.push_str("\n\n");
                                 state.content.push_str(&instruction);
@@ -1590,19 +1664,122 @@ where
                                     "inline_model",
                                     "inline_model",
                                 )]
+                            } else if !state.clean_terminal_synthesis_attempted
+                                && state.iterations < state.safety_lease.max_model_steps
+                            {
+                                state.clean_terminal_synthesis_attempted = true;
+                                state.clean_terminal_synthesis_next = true;
+                                model_intervention =
+                                    Some(harness_contract::goal::RuntimeIntervention {
+                                        goal_id: state.goal_id.clone(),
+                                        kind: RuntimeInterventionKind::Synthesize,
+                                        reason: format!(
+                                            "normal final-answer recovery remained unusable ({reason}); isolate committed evidence from exploratory history and synthesize once"
+                                        ),
+                                        evidence_refs: vec![format!(
+                                            "execution_node:{}",
+                                            ticket.node_id
+                                        )],
+                                        expected_graph_revision: None,
+                                    });
+                                vec![dynamic_node(
+                                    ticket,
+                                    state.iterations,
+                                    "clean-terminal-synthesis-model",
+                                    ExecutionNodeKind::InlineModel,
+                                    "inline_model",
+                                    "inline_model",
+                                )]
+                            } else if let Some(fallback) = retained_orchestration_terminal_candidate(
+                                &state.tool_results,
+                                self.services.workspace_root(),
+                                &state.content,
+                            ) {
+                                state
+                                    .assistant_messages
+                                    .push(ConversationMessage::assistant(vec![
+                                        ContentBlock::Text {
+                                            text: fallback.clone(),
+                                        },
+                                    ]));
+                                state.pending_transcript.insert(
+                                    ticket.node_id.clone(),
+                                    vec![ConversationMessage::assistant(vec![
+                                        ContentBlock::Text {
+                                            text: fallback.clone(),
+                                        },
+                                    ])],
+                                );
+                                committed_result_ref = format!(
+                                    "assistant_json:{}",
+                                    serde_json::to_string(&fallback).map_err(|error| {
+                                        NodeExecutorError::Poll {
+                                            node_id: ticket.node_id.clone(),
+                                            reason: error.to_string(),
+                                        }
+                                    })?
+                                );
+                                model_intervention =
+                                    Some(harness_contract::goal::RuntimeIntervention {
+                                        goal_id: state.goal_id.clone(),
+                                        kind: RuntimeInterventionKind::Synthesize,
+                                        reason: "clean provider synthesis was unusable; published the checked Team terminal candidate after deterministic source-evidence normalization"
+                                            .to_string(),
+                                        evidence_refs: vec![format!(
+                                            "execution_node:{}",
+                                            ticket.node_id
+                                        )],
+                                        expected_graph_revision: None,
+                                    });
+                                let mut node = dynamic_node(
+                                    ticket,
+                                    state.iterations,
+                                    "retained-team-terminal-synthesize",
+                                    ExecutionNodeKind::Synthesize,
+                                    crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND,
+                                    "inline_model",
+                                );
+                                node.executor_kind = crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND.to_string();
+                                vec![node]
+                            } else if state.clean_terminal_synthesis_attempted
+                                && !state.clean_terminal_retry_attempted
+                                && state.iterations < state.safety_lease.max_model_steps
+                            {
+                                state.clean_terminal_retry_attempted = true;
+                                state.clean_terminal_synthesis_next = true;
+                                model_intervention =
+                                    Some(harness_contract::goal::RuntimeIntervention {
+                                        goal_id: state.goal_id.clone(),
+                                        kind: RuntimeInterventionKind::Synthesize,
+                                        reason: format!(
+                                            "the first isolated terminal synthesis remained unusable ({reason}); retry exactly once from the same committed evidence without exploratory history"
+                                        ),
+                                        evidence_refs: vec![format!(
+                                            "execution_node:{}",
+                                            ticket.node_id
+                                        )],
+                                        expected_graph_revision: None,
+                                    });
+                                vec![dynamic_node(
+                                    ticket,
+                                    state.iterations,
+                                    "clean-terminal-synthesis-retry-model",
+                                    ExecutionNodeKind::InlineModel,
+                                    "inline_model",
+                                    "inline_model",
+                                )]
                             } else {
                                 state.terminal_override = Some((
                                     GoalCompletion::Blocked,
                                     format!(
-                                        "Execution could not obtain a usable final answer after governed recovery: {reason}. Committed evidence was retained; provide a new constraint, provider, or explicit replan to continue."
+                                        "Execution could not obtain a usable final answer after bounded normal and clean synthesis recovery: {reason}. Committed evidence was retained; provide a new constraint, provider, or explicit replan to continue."
                                     ),
                                 ));
                                 model_intervention = Some(harness_contract::goal::RuntimeIntervention {
                                     goal_id: state.goal_id.clone(),
                                     kind: RuntimeInterventionKind::Block,
                                     reason: format!(
-                                        "provider produced unusable final output after {} governed recovery attempt(s): {reason}",
-                                        recovery_retry_budget,
+                                        "provider produced unusable final output after one normal and one clean synthesis attempt: {reason}",
                                     ),
                                     evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
                                     expected_graph_revision: None,
@@ -1643,125 +1820,79 @@ where
                         }
                     }
                     ModelStepIntent::ToolCalls { calls } => {
-                        let batches = tool_batches_for_turn(&calls).map_err(|reason| {
-                            NodeExecutorError::Poll {
-                                node_id: ticket.node_id.clone(),
-                                reason,
-                            }
-                        })?;
-                        state.next_calls.clear();
-                        state.next_resource_scopes.clear();
-                        // The next model node is added by the ToolBatch
-                        // checkpoint after the intervention policy sees real
-                        // tool evidence. This prevents the model from racing
-                        // ahead of the tool result and makes Runner the sole
-                        // owner of Continue/Retrieve/Replan/Switch application.
-                        let batch_count = batches.len();
-                        batches
-                            .into_iter()
-                            .enumerate()
-                            .map(|(index, calls)| {
-                                let mut tool_node = dynamic_node(
+                        if requests_team_orchestration(&calls) {
+                            if state.team_orchestration_requests >= 1 {
+                                state.assistant_messages.pop();
+                                state.pending_transcript.remove(&ticket.node_id);
+                                state.clean_terminal_synthesis_attempted = true;
+                                state.clean_terminal_synthesis_next = true;
+                                model_intervention =
+                                    Some(harness_contract::goal::RuntimeIntervention {
+                                        goal_id: state.goal_id.clone(),
+                                        kind: RuntimeInterventionKind::Synthesize,
+                                        reason: "one Team execution has already consumed this turn's collaboration lease; synthesize from its retained terminal and evidence receipts instead of starting another Team"
+                                            .to_string(),
+                                        evidence_refs: vec![format!(
+                                            "execution_node:{}",
+                                            ticket.node_id
+                                        )],
+                                        expected_graph_revision: None,
+                                    });
+                                vec![dynamic_node(
                                     ticket,
                                     state.iterations,
-                                    &format!("tools-{}", index + 1),
-                                    ExecutionNodeKind::ToolBatch,
-                                    "tool_batch",
+                                    "team-lease-clean-synthesis-model",
+                                    ExecutionNodeKind::InlineModel,
                                     "inline_model",
-                                );
-                                tool_node.payload_ref = encode_tool_calls_with_continuation(
+                                    "inline_model",
+                                )]
+                            } else {
+                                state.team_orchestration_requests = 1;
+                                tool_nodes_for_calls(
+                                    ticket,
+                                    state.iterations,
                                     &state.session_id,
-                                    &calls,
-                                    index + 1 < batch_count,
-                                )
-                                .map_err(|error| NodeExecutorError::Poll {
-                                    node_id: ticket.node_id.clone(),
-                                    reason: error.to_string(),
-                                })?;
-                                tool_node.resource_scopes = resource_scopes_for_tool_calls(&calls);
-                                Ok(tool_node)
-                            })
-                            .collect::<Result<Vec<_>, NodeExecutorError>>()?
-                    }
-                    ModelStepIntent::AgentProposal { calls }
-                    | ModelStepIntent::TeamProposal { calls } => {
-                        state.next_calls = calls;
-                        let mut agent_node = dynamic_node(
-                            ticket,
-                            state.iterations,
-                            "agent-task",
-                            ExecutionNodeKind::AgentTask,
-                            crate::execution_core::graph::executors::AgentTaskExecutor::KIND,
-                            "inline_model",
-                        );
-                        agent_node.executor_kind =
-                            crate::execution_core::graph::executors::AgentTaskExecutor::KIND
-                                .to_string();
-                        let intent = AgentTaskIntent {
-                            selected_agent_id: None,
-                            definition_ref: None,
-                            granted_capabilities: Vec::new(),
-                            run_id: format!("agent-run:{}", agent_node.id),
-                            task_id: agent_node.id.clone(),
-                            session_id: state.session_id.clone(),
-                            mission_id: None,
-                            team_id: None,
-                            graph_id: ticket.graph_id.clone(),
-                            node_id: agent_node.id.clone(),
-                            attempt: 1,
-                            expected_graph_revision: 0,
-                            objective: state.content.clone(),
-                            acceptance: agent_node.acceptance.criteria.clone(),
-                            constraints: Vec::new(),
-                            context_refs: Vec::new(),
-                            evidence_refs: Vec::new(),
-                            allowed_tools: state
-                                .next_calls
-                                .iter()
-                                .map(|call| call.name.clone())
-                                .collect(),
-                            allowed_skills: Vec::new(),
-                            permission_lease: "turn-permission-lease".to_string(),
-                            model_lease: state.model.clone().unwrap_or_default(),
-                            budget_lease: harness_contract::context::ContextBudgetLeaseRef::new(
-                                format!("budget:{}", agent_node.id),
-                                agent_node.id.clone(),
-                                "agent_task",
-                                0,
-                                0,
-                            ),
-                            managed_invocation: None,
-                            idempotency_key: agent_node.idempotency_key.clone(),
-                        };
-                        let resource_scopes = resource_scopes_for_agent_intent(&intent);
-                        let packet =
-                            self.services
-                                .compile_agent_task_intent(intent)
-                                .map_err(|error| NodeExecutorError::Poll {
-                                    node_id: ticket.node_id.clone(),
-                                    reason: format!(
-                                    "compile AgentTask Binding before graph persistence: {error}"
-                                ),
-                                })?;
-                        agent_node.payload_ref =
-                            serde_json::to_string(&packet).map_err(|error| {
-                                NodeExecutorError::Poll {
-                                    node_id: ticket.node_id.clone(),
-                                    reason: error.to_string(),
-                                }
-                            })?;
-                        agent_node.resource_scopes = resource_scopes;
-                        vec![
-                            agent_node,
-                            dynamic_node(
+                                    calls,
+                                )?
+                            }
+                        } else {
+                            tool_nodes_for_calls(
                                 ticket,
                                 state.iterations,
-                                "model",
+                                &state.session_id,
+                                calls,
+                            )?
+                        }
+                    }
+                    ModelStepIntent::AgentProposal { calls } => {
+                        agent_proposal_nodes(ticket, &mut state, calls, &self.services)?
+                    }
+                    ModelStepIntent::TeamProposal { calls } => {
+                        if state.team_orchestration_requests >= 1 {
+                            state.assistant_messages.pop();
+                            state.pending_transcript.remove(&ticket.node_id);
+                            state.clean_terminal_synthesis_attempted = true;
+                            state.clean_terminal_synthesis_next = true;
+                            model_intervention = Some(harness_contract::goal::RuntimeIntervention {
+                                goal_id: state.goal_id.clone(),
+                                kind: RuntimeInterventionKind::Synthesize,
+                                reason: "one Team execution has already consumed this turn's collaboration lease; synthesize from retained evidence"
+                                    .to_string(),
+                                evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
+                                expected_graph_revision: None,
+                            });
+                            vec![dynamic_node(
+                                ticket,
+                                state.iterations,
+                                "team-proposal-lease-clean-synthesis-model",
                                 ExecutionNodeKind::InlineModel,
                                 "inline_model",
                                 "inline_model",
-                            ),
-                        ]
+                            )]
+                        } else {
+                            state.team_orchestration_requests = 1;
+                            agent_proposal_nodes(ticket, &mut state, calls, &self.services)?
+                        }
                     }
                     ModelStepIntent::ApprovalRequired { calls } => {
                         state.next_resource_scopes = resource_scopes_for_tool_calls(&calls);
@@ -1990,8 +2121,8 @@ where
                             reason,
                         })?;
                 observations.push(observation.clone());
-                let intervention = crate::execution_core::InterventionPolicy
-                    .propose(&goal, &observations);
+                let intervention =
+                    crate::execution_core::InterventionPolicy.propose(&goal, &observations);
                 let (next, replan_reason, next_model_instruction) = {
                     let mut state = self.state.lock().await;
                     let (node, next_model_instruction) = match intervention.kind {
@@ -2145,6 +2276,137 @@ where
     }
 }
 
+fn requests_team_orchestration(calls: &[ModelToolCall]) -> bool {
+    calls.iter().any(|call| {
+        if !call.name.eq_ignore_ascii_case("runtime_orchestrate") {
+            return false;
+        }
+        serde_json::from_str::<serde_json::Value>(&call.input)
+            .ok()
+            .and_then(|input| {
+                input
+                    .get("action")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|action| action.eq_ignore_ascii_case("request_team"))
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn tool_nodes_for_calls(
+    ticket: &NodeExecutionTicket,
+    iteration: usize,
+    session_id: &str,
+    calls: Vec<ModelToolCall>,
+) -> Result<Vec<ExecutionNodeSpec>, NodeExecutorError> {
+    let batches = tool_batches_for_turn(&calls).map_err(|reason| NodeExecutorError::Poll {
+        node_id: ticket.node_id.clone(),
+        reason,
+    })?;
+    let batch_count = batches.len();
+    batches
+        .into_iter()
+        .enumerate()
+        .map(|(index, calls)| {
+            let mut tool_node = dynamic_node(
+                ticket,
+                iteration,
+                &format!("tools-{}", index + 1),
+                ExecutionNodeKind::ToolBatch,
+                "tool_batch",
+                "inline_model",
+            );
+            tool_node.payload_ref =
+                encode_tool_calls_with_continuation(session_id, &calls, index + 1 < batch_count)
+                    .map_err(|error| NodeExecutorError::Poll {
+                        node_id: ticket.node_id.clone(),
+                        reason: error.to_string(),
+                    })?;
+            tool_node.resource_scopes = resource_scopes_for_tool_calls(&calls);
+            Ok(tool_node)
+        })
+        .collect()
+}
+
+fn agent_proposal_nodes(
+    ticket: &NodeExecutionTicket,
+    state: &mut TurnGraphState,
+    calls: Vec<ModelToolCall>,
+    services: &Arc<crate::RuntimeServices>,
+) -> Result<Vec<ExecutionNodeSpec>, NodeExecutorError> {
+    state.next_calls = calls;
+    let mut agent_node = dynamic_node(
+        ticket,
+        state.iterations,
+        "agent-task",
+        ExecutionNodeKind::AgentTask,
+        crate::execution_core::graph::executors::AgentTaskExecutor::KIND,
+        "inline_model",
+    );
+    agent_node.executor_kind =
+        crate::execution_core::graph::executors::AgentTaskExecutor::KIND.to_string();
+    let intent = AgentTaskIntent {
+        selected_agent_id: None,
+        definition_ref: None,
+        granted_capabilities: Vec::new(),
+        run_id: format!("agent-run:{}", agent_node.id),
+        task_id: agent_node.id.clone(),
+        session_id: state.session_id.clone(),
+        mission_id: None,
+        team_id: None,
+        graph_id: ticket.graph_id.clone(),
+        node_id: agent_node.id.clone(),
+        attempt: 1,
+        expected_graph_revision: 0,
+        objective: state.content.clone(),
+        acceptance: agent_node.acceptance.criteria.clone(),
+        constraints: Vec::new(),
+        context_refs: Vec::new(),
+        evidence_refs: Vec::new(),
+        allowed_tools: state
+            .next_calls
+            .iter()
+            .map(|call| call.name.clone())
+            .collect(),
+        allowed_skills: Vec::new(),
+        permission_lease: "turn-permission-lease".to_string(),
+        model_lease: state.model.clone().unwrap_or_default(),
+        budget_lease: harness_contract::context::ContextBudgetLeaseRef::new(
+            format!("budget:{}", agent_node.id),
+            agent_node.id.clone(),
+            "agent_task",
+            0,
+            0,
+        ),
+        managed_invocation: None,
+        idempotency_key: agent_node.idempotency_key.clone(),
+    };
+    let resource_scopes = resource_scopes_for_agent_intent(&intent);
+    let packet = services
+        .compile_agent_task_intent(intent)
+        .map_err(|error| NodeExecutorError::Poll {
+            node_id: ticket.node_id.clone(),
+            reason: format!("compile AgentTask Binding before graph persistence: {error}"),
+        })?;
+    agent_node.payload_ref =
+        serde_json::to_string(&packet).map_err(|error| NodeExecutorError::Poll {
+            node_id: ticket.node_id.clone(),
+            reason: error.to_string(),
+        })?;
+    agent_node.resource_scopes = resource_scopes;
+    Ok(vec![
+        agent_node,
+        dynamic_node(
+            ticket,
+            state.iterations,
+            "model",
+            ExecutionNodeKind::InlineModel,
+            "inline_model",
+            "inline_model",
+        ),
+    ])
+}
+
 struct TurnToolBatchBackend<C: ApiClient, T: ToolExecutor> {
     runtime: Arc<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
     state: Arc<tokio::sync::Mutex<TurnGraphState>>,
@@ -2167,13 +2429,14 @@ where
                 detail: Some("executing tool batch".to_string()),
             });
         }
-        let (prompter, iteration, session_id, model_lease) = {
+        let (prompter, iteration, session_id, model_lease, require_source_path_evidence) = {
             let state = self.state.lock().await;
             (
                 state.prompter.clone(),
                 state.iterations,
                 state.session_id.clone(),
                 state.model.clone(),
+                objective_requires_workspace_source_evidence(&state.content),
             )
         };
         let (calls, continue_with_tool_batch) =
@@ -2221,50 +2484,67 @@ where
             }
             auths
         };
-        let result = if let Some(host) = self.services.tool_execution_host() {
-            let raw_messages = execute_governed_runtime_tool_batch(
-                Arc::clone(host),
-                &calls,
-                &session_id,
-                model_lease.as_deref(),
-                ticket,
-                &tool_authorizations,
-            )
-            .await;
-            // Graph scheduling executes outside the legacy adapter. Before
-            // the next model node sees the result, route its raw output
-            // through the same durable evidence and context-ledger path used
-            // by normal conversation tool calls.
-            let messages =
-                compact_governed_tool_messages(&self.runtime, &calls, raw_messages).await;
-            crate::conversation::ToolBatchStepResult {
-                failed: messages
-                    .iter()
-                    .flat_map(|message| &message.blocks)
-                    .filter(|block| {
-                        matches!(block, ContentBlock::ToolResult { is_error: true, .. })
-                    })
-                    .count(),
-                messages,
-            }
-        } else {
-            let mut runtime = self.runtime.lock().await;
-            let transcript_len = runtime.session_async().await.messages.len();
-            let result = runtime
-                .execute_tool_batch_step(&calls, &prompter, iteration)
+        let (result, orchestration_terminal_summary) =
+            if let Some(host) = self.services.tool_execution_host() {
+                let raw_messages = execute_governed_runtime_tool_batch(
+                    Arc::clone(host),
+                    &calls,
+                    &session_id,
+                    model_lease.as_deref(),
+                    ticket,
+                    &tool_authorizations,
+                )
                 .await;
-            // The legacy conversation engine writes tool messages eagerly. Roll them
-            // back until the graph transition commits; after_commit publishes them.
-            rollback_uncommitted_transcript(
-                &mut runtime.session_mut_async().await.messages,
-                transcript_len,
-            );
-            drop(runtime);
-            result.map_err(|error| NodeExecutorError::Poll {
-                node_id: ticket.node_id.clone(),
-                reason: error.to_string(),
-            })?
-        };
+                let orchestration_terminal_summary = completed_orchestration_terminal_summary(
+                    &calls,
+                    &raw_messages,
+                    self.services.workspace_root(),
+                    require_source_path_evidence,
+                );
+                // Graph scheduling executes outside the legacy adapter. Before
+                // the next model node sees the result, route its raw output
+                // through the same durable evidence and context-ledger path used
+                // by normal conversation tool calls.
+                let messages =
+                    compact_governed_tool_messages(&self.runtime, &calls, raw_messages).await;
+                (
+                    crate::conversation::ToolBatchStepResult {
+                        failed: messages
+                            .iter()
+                            .flat_map(|message| &message.blocks)
+                            .filter(|block| {
+                                matches!(block, ContentBlock::ToolResult { is_error: true, .. })
+                            })
+                            .count(),
+                        messages,
+                    },
+                    orchestration_terminal_summary,
+                )
+            } else {
+                let mut runtime = self.runtime.lock().await;
+                let transcript_len = runtime.session_async().await.messages.len();
+                let result = runtime
+                    .execute_tool_batch_step(&calls, &prompter, iteration)
+                    .await;
+                // The legacy conversation engine writes tool messages eagerly. Roll them
+                // back until the graph transition commits; after_commit publishes them.
+                rollback_uncommitted_transcript(
+                    &mut runtime.session_mut_async().await.messages,
+                    transcript_len,
+                );
+                drop(runtime);
+                let result = result.map_err(|error| NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason: error.to_string(),
+                })?;
+                let orchestration_terminal_summary = completed_orchestration_terminal_summary(
+                    &calls,
+                    &result.messages,
+                    self.services.workspace_root(),
+                    require_source_path_evidence,
+                );
+                (result, orchestration_terminal_summary)
+            };
         let tool_calls = result.messages.len() as u64;
         let failed = result.failed;
         let failed_tools = failed_tool_names(&result.messages);
@@ -2326,6 +2606,19 @@ where
         state
             .pending_transcript
             .insert(ticket.node_id.clone(), result.messages.clone());
+        state.successful_tool_calls = state.successful_tool_calls.saturating_add(
+            usize::try_from(tool_calls)
+                .unwrap_or(usize::MAX)
+                .saturating_sub(failed),
+        );
+        if failed > 0 {
+            state.consecutive_tool_failure_batches =
+                state.consecutive_tool_failure_batches.saturating_add(1);
+        } else {
+            state.consecutive_tool_failure_batches = 0;
+        }
+        let repeated_local_failures = state.consecutive_tool_failure_batches >= 2;
+        let has_successful_tool_evidence = state.successful_tool_calls > 0;
         state.tool_results.extend(result.messages);
         state.last_verified_progress =
             failed == 0 && !repeated_success && !low_novelty && !scope_saturated;
@@ -2393,31 +2686,53 @@ where
         };
         let goal_id = state.goal_id.clone();
         drop(state);
-        let intervention = (!continue_with_tool_batch)
-            .then(|| {
-                self.services
-                    .goal_store()
-                    .get(&goal_id)
-                    .map_err(|reason| NodeExecutorError::Poll {
-                        node_id: ticket.node_id.clone(),
-                        reason,
-                    })?
-                    .map(|goal| {
-                        let mut observations =
-                            self.services.goal_store().observations(&goal_id).map_err(
-                                |reason| NodeExecutorError::Poll {
-                                    node_id: ticket.node_id.clone(),
-                                    reason,
-                                },
-                            )?;
-                        observations.push(observation.clone());
-                        Ok(crate::execution_core::InterventionPolicy
-                            .propose(&goal, &observations))
-                    })
-                    .transpose()
+        let intervention = if continue_with_tool_batch || orchestration_terminal_summary.is_some() {
+            None
+        } else if repeated_local_failures {
+            Some(RuntimeIntervention {
+                goal_id: goal_id.clone(),
+                kind: if has_successful_tool_evidence {
+                    RuntimeInterventionKind::Synthesize
+                } else {
+                    RuntimeInterventionKind::Block
+                },
+                reason: if has_successful_tool_evidence {
+                    "multiple consecutive tool batches failed after checked evidence was already retained; stop retrying and synthesize the bounded result with the failure explicit"
+                        .to_string()
+                } else {
+                    "multiple consecutive tool batches failed before any checked evidence was retained; stop speculative retries"
+                        .to_string()
+                },
+                evidence_refs: observation.evidence_refs.clone(),
+                expected_graph_revision: None,
             })
-            .transpose()?
-            .flatten();
+        } else {
+            (!continue_with_tool_batch)
+                .then(|| {
+                    self.services
+                        .goal_store()
+                        .get(&goal_id)
+                        .map_err(|reason| NodeExecutorError::Poll {
+                            node_id: ticket.node_id.clone(),
+                            reason,
+                        })?
+                        .map(|goal| {
+                            let mut observations =
+                                self.services.goal_store().observations(&goal_id).map_err(
+                                    |reason| NodeExecutorError::Poll {
+                                        node_id: ticket.node_id.clone(),
+                                        reason,
+                                    },
+                                )?;
+                            observations.push(observation.clone());
+                            Ok(crate::execution_core::InterventionPolicy
+                                .propose(&goal, &observations))
+                        })
+                        .transpose()
+                })
+                .transpose()?
+                .flatten()
+        };
         if let Some(intervention) = intervention
             .as_ref()
             .filter(|intervention| intervention.kind != RuntimeInterventionKind::Continue)
@@ -2429,56 +2744,72 @@ where
         }
         let next = {
             let mut state = self.state.lock().await;
-            let kind = intervention
-                .as_ref()
-                .map_or(RuntimeInterventionKind::Continue, |value| value.kind);
-            let node = match kind {
-                RuntimeInterventionKind::Synthesize => {
-                    state.force_text_only_next_model = true;
-                    state.content.push_str(
+            let node = if let Some(answer) = orchestration_terminal_summary.as_ref() {
+                state.terminal_override = Some((GoalCompletion::Satisfied, answer.clone()));
+                let mut node = dynamic_node(
+                    ticket,
+                    state.iterations,
+                    "orchestration-terminal-synthesize",
+                    ExecutionNodeKind::Synthesize,
+                    crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND,
+                    "inline_model",
+                );
+                node.executor_kind =
+                    crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND
+                        .to_string();
+                node
+            } else {
+                let kind = intervention
+                    .as_ref()
+                    .map_or(RuntimeInterventionKind::Continue, |value| value.kind);
+                match kind {
+                    RuntimeInterventionKind::Synthesize => {
+                        state.force_text_only_next_model = true;
+                        state.content.push_str(
                         "\n\nRuntime evidence checkpoint: consecutive tool batches added no new evidence coverage. The next response must synthesize a final answer from retained receipts; tools are disabled for that response. State remaining uncertainty explicitly.\n",
                     );
-                    dynamic_node(
-                        ticket,
-                        state.iterations,
-                        "policy-text-only-conclusion",
-                        ExecutionNodeKind::InlineModel,
-                        "inline_model",
-                        "inline_model",
-                    )
-                }
-                RuntimeInterventionKind::Block => {
-                    let reason = intervention
-                        .as_ref()
-                        .map(|value| value.reason.as_str())
-                        .unwrap_or("goal intervention blocked execution");
-                    state.terminal_override = Some((
+                        dynamic_node(
+                            ticket,
+                            state.iterations,
+                            "policy-text-only-conclusion",
+                            ExecutionNodeKind::InlineModel,
+                            "inline_model",
+                            "inline_model",
+                        )
+                    }
+                    RuntimeInterventionKind::Block => {
+                        let reason = intervention
+                            .as_ref()
+                            .map(|value| value.reason.as_str())
+                            .unwrap_or("goal intervention blocked execution");
+                        state.terminal_override = Some((
                         GoalCompletion::Blocked,
                         format!(
                             "Execution blocked: {reason}\n\nChecked evidence was retained and no further speculative work was performed."
                         ),
                     ));
-                    let mut node = dynamic_node(
+                        let mut node = dynamic_node(
+                            ticket,
+                            state.iterations,
+                            "policy-block-synthesize",
+                            ExecutionNodeKind::Synthesize,
+                            crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND,
+                            "inline_model",
+                        );
+                        node.executor_kind =
+                            crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND
+                                .to_string();
+                        node
+                    }
+                    _ => dynamic_node(
                         ticket,
                         state.iterations,
-                        "policy-block-synthesize",
-                        ExecutionNodeKind::Synthesize,
-                        crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND,
+                        "model",
+                        ExecutionNodeKind::InlineModel,
                         "inline_model",
-                    );
-                    node.executor_kind =
-                        crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND
-                            .to_string();
-                    node
+                        "inline_model",
+                    ),
                 }
-                _ => dynamic_node(
-                    ticket,
-                    state.iterations,
-                    "model",
-                    ExecutionNodeKind::InlineModel,
-                    "inline_model",
-                    "inline_model",
-                ),
             };
             node
         };
@@ -2518,15 +2849,22 @@ where
                     })?,
             );
         }
-        if !continue_with_tool_batch {
+        if !continue_with_tool_batch || orchestration_terminal_summary.is_some() {
             outcome.replan = Some(ExecutionGraphReplan {
                 nodes: vec![next.clone()],
                 edges: dynamic_edges(&ticket.node_id, &[next]),
                 reason: format!(
-                    "Runner applied goal intervention: {:?}",
-                    intervention
-                        .as_ref()
-                        .map_or(RuntimeInterventionKind::Continue, |value| value.kind)
+                    "{}",
+                    if orchestration_terminal_summary.is_some() {
+                        "Runner committed completed orchestration terminal summary".to_string()
+                    } else {
+                        format!(
+                            "Runner applied goal intervention: {:?}",
+                            intervention
+                                .as_ref()
+                                .map_or(RuntimeInterventionKind::Continue, |value| value.kind)
+                        )
+                    }
                 ),
             });
         }
@@ -2550,6 +2888,90 @@ where
             .extend(messages);
         Ok(())
     }
+}
+
+fn completed_orchestration_terminal_summary(
+    calls: &[ModelToolCall],
+    messages: &[ConversationMessage],
+    workspace_root: &std::path::Path,
+    require_source_path_evidence: bool,
+) -> Option<String> {
+    let orchestration_ids = calls
+        .iter()
+        .filter(|call| call.name.eq_ignore_ascii_case("runtime_orchestrate"))
+        .map(|call| call.id.as_str())
+        .collect::<BTreeSet<_>>();
+    if orchestration_ids.is_empty() {
+        return None;
+    }
+    messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                tool_name,
+                output,
+                is_error: false,
+            } if tool_name.eq_ignore_ascii_case("runtime_orchestrate")
+                && orchestration_ids.contains(tool_use_id.as_str()) =>
+            {
+                Some(output.as_str())
+            }
+            _ => None,
+        })
+        .filter_map(orchestration_receipt_json)
+        .find_map(|receipt| {
+            (receipt.get("status").and_then(serde_json::Value::as_str) == Some("completed"))
+                .then(|| {
+                    receipt
+                        .get("terminal_summary")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|summary| {
+                            !summary.is_empty()
+                                && final_answer_recovery_reason(summary, workspace_root).is_none()
+                                && (!require_source_path_evidence
+                                    || existing_workspace_source_path_count(
+                                        summary,
+                                        workspace_root,
+                                    ) >= 2)
+                        })
+                        .map(ToString::to_string)
+                })
+                .flatten()
+        })
+}
+
+fn objective_requires_workspace_source_evidence(objective: &str) -> bool {
+    let normalized = objective.to_ascii_lowercase();
+    [
+        "源码路径",
+        "实际源码",
+        "文件路径作为证据",
+        "source path",
+        "source-file evidence",
+        "actual source file",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
+fn existing_workspace_source_path_count(text: &str, workspace_root: &std::path::Path) -> usize {
+    cited_workspace_paths(text)
+        .into_iter()
+        .filter(|path| looks_like_workspace_file_reference(path))
+        .filter(|path| workspace_root.join(path).is_file())
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
+fn orchestration_receipt_json(output: &str) -> Option<serde_json::Value> {
+    serde_json::from_str(output).ok().or_else(|| {
+        output
+            .find('{')
+            .and_then(|start| serde_json::from_str(&output[start..]).ok())
+    })
 }
 
 async fn compact_governed_tool_messages<C, T>(
@@ -2647,12 +3069,11 @@ async fn execute_governed_runtime_tool_batch(
                     authorization,
                 );
                 async move {
-                    let _permit = match crate::execution_scheduler::acquire_process_tool_permit()
-                        .await
-                    {
-                        Ok(permit) => permit,
-                        Err(error) => return (index, Err(error)),
-                    };
+                    let _permit =
+                        match crate::execution_scheduler::acquire_process_tool_permit().await {
+                            Ok(permit) => permit,
+                            Err(error) => return (index, Err(error)),
+                        };
                     let joined =
                         tokio::task::spawn_blocking(move || host.execute_runtime_tool(&request))
                             .await;
@@ -2974,10 +3395,11 @@ fn model_intent_summary(intent: &ModelStepIntent) -> String {
 }
 
 fn final_answer_recovery_reason(text: &str, workspace_root: &std::path::Path) -> Option<String> {
-    if text.trim().is_empty() {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
         return Some("empty final answer".to_string());
     }
-    let normalized = text.to_ascii_lowercase();
+    let normalized = trimmed.to_ascii_lowercase();
     if [
         "<tool_call",
         "<function=",
@@ -2992,6 +3414,9 @@ fn final_answer_recovery_reason(text: &str, workspace_root: &std::path::Path) ->
     {
         return Some("simulated tool-call markup in a final answer".to_string());
     }
+    if looks_like_unfinished_work_preamble(trimmed) {
+        return Some("unfinished work preamble was presented as a final answer".to_string());
+    }
     let missing = cited_workspace_paths(text)
         .into_iter()
         .filter(|path| looks_like_workspace_file_reference(path))
@@ -3003,6 +3428,305 @@ fn final_answer_recovery_reason(text: &str, workspace_root: &std::path::Path) ->
             missing.join(", ")
         )
     })
+}
+
+fn final_answer_recovery_reason_for_objective(
+    text: &str,
+    workspace_root: &std::path::Path,
+    objective: &str,
+) -> Option<String> {
+    final_answer_recovery_reason(text, workspace_root).or_else(|| {
+        (objective_requires_workspace_source_evidence(objective)
+            && existing_workspace_source_path_count(text, workspace_root) < 2)
+            .then(|| {
+                "final answer did not include at least two existing workspace source files required by the objective"
+                    .to_string()
+            })
+    })
+}
+
+fn looks_like_unfinished_work_preamble(text: &str) -> bool {
+    if text.chars().count() > 420 || text.lines().count() > 3 {
+        return false;
+    }
+    let normalized = text.trim().to_ascii_lowercase();
+    let promises_more_work = [
+        "let me try",
+        "let me read",
+        "let me inspect",
+        "i will now read",
+        "i will now inspect",
+        "i'll read",
+        "i'll inspect",
+        "i need to read",
+        "let me continue",
+        "让我再",
+        "让我尝试",
+        "让我使用",
+        "让我获取",
+        "让我读取",
+        "让我搜索",
+        "我再读取",
+        "我来执行",
+        "我将继续",
+        "接下来我会",
+        "继续读取",
+        "继续检查",
+        "用 glob",
+        "用 grep",
+        "用 read",
+        "现在读取",
+        "先读取",
+        "需要查看",
+    ]
+    .iter()
+    .any(|prefix| normalized.starts_with(prefix));
+    let explicit_continuation = [
+        "let me try",
+        "let me read",
+        "let me inspect",
+        "let me continue",
+        "i will now read",
+        "i will now inspect",
+        "i'll read",
+        "i'll inspect",
+        "i need to read",
+        "让我继续",
+        "让我尝试",
+        "让我使用",
+        "让我获取",
+        "让我读取",
+        "让我搜索",
+        "同时查看可用的工具",
+        "继续收集完整证据",
+        "需要小段读取",
+        "需要分块读取",
+        "同时搜索",
+        "先收集证据",
+        "先获取",
+        "让我直接搜索",
+        "let me continue",
+        "continue collecting evidence",
+    ]
+    .iter()
+    .any(|fragment| normalized.contains(fragment));
+    explicit_continuation
+        || promises_more_work
+            && (normalized.ends_with(':')
+                || normalized.ends_with('：')
+                || normalized.contains("once more")
+                || normalized.contains("再试一次"))
+}
+
+fn omit_nonexistent_workspace_path_lines(
+    text: &str,
+    workspace_root: &std::path::Path,
+) -> Option<String> {
+    let missing = cited_workspace_paths(text)
+        .into_iter()
+        .filter(|path| looks_like_workspace_file_reference(path))
+        .filter(|path| !workspace_root.join(path).is_file())
+        .collect::<BTreeSet<_>>();
+    if missing.is_empty() {
+        return None;
+    }
+    let sanitized = text
+        .lines()
+        .filter(|line| !missing.iter().any(|path| line.contains(path)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let sanitized = sanitized.trim();
+    (!sanitized.is_empty() && sanitized != text.trim()).then(|| sanitized.to_string())
+}
+
+fn normalize_terminal_answer_with_evidence(
+    text: &str,
+    tool_results: &[ConversationMessage],
+    workspace_root: &std::path::Path,
+    objective: &str,
+) -> String {
+    if looks_like_unfinished_work_preamble(text) {
+        return text.trim().to_string();
+    }
+    let mut normalized = omit_nonexistent_workspace_path_lines(text, workspace_root)
+        .unwrap_or_else(|| text.trim().to_string());
+    if !objective_requires_workspace_source_evidence(objective) {
+        return normalized;
+    }
+    let mut existing = cited_workspace_paths(&normalized)
+        .into_iter()
+        .filter(|path| looks_like_workspace_file_reference(path))
+        .filter(|path| workspace_root.join(path).is_file())
+        .collect::<BTreeSet<_>>();
+    if existing.len() >= 2 {
+        return normalized;
+    }
+    let verified = verified_source_paths_from_tool_results(tool_results, workspace_root);
+    let mut appended = Vec::new();
+    for path in verified {
+        if existing.insert(path.clone()) {
+            appended.push(path);
+        }
+        if existing.len() >= 2 {
+            break;
+        }
+    }
+    if !appended.is_empty() {
+        normalized.push_str("\n\nVerified source files from committed tool receipts:");
+        for path in appended {
+            normalized.push_str(&format!("\n- `{path}`"));
+        }
+    }
+    normalized
+}
+
+fn verified_source_paths_from_tool_results(
+    messages: &[ConversationMessage],
+    workspace_root: &std::path::Path,
+) -> Vec<String> {
+    let mut paths = BTreeSet::new();
+    for output in messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult {
+                output,
+                is_error: false,
+                ..
+            } => Some(output.as_str()),
+            _ => None,
+        })
+    {
+        for path in cited_workspace_paths(output) {
+            if looks_like_workspace_file_reference(&path) && workspace_root.join(&path).is_file() {
+                paths.insert(path);
+            }
+        }
+    }
+    paths.into_iter().collect()
+}
+
+fn retained_orchestration_terminal_candidate(
+    messages: &[ConversationMessage],
+    workspace_root: &std::path::Path,
+    objective: &str,
+) -> Option<String> {
+    let mut candidates = messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult {
+                tool_name,
+                output,
+                is_error: false,
+                ..
+            } if tool_name.eq_ignore_ascii_case("runtime_orchestrate") => {
+                orchestration_receipt_json(output)
+            }
+            _ => None,
+        })
+        .filter_map(|receipt| {
+            receipt
+                .get("terminal_summary")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|summary| {
+                    !summary.is_empty() && !looks_like_unfinished_work_preamble(summary)
+                })
+                .map(ToString::to_string)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.chars().count()));
+    candidates.into_iter().find_map(|candidate| {
+        let normalized = normalize_terminal_answer_with_evidence(
+            &candidate,
+            messages,
+            workspace_root,
+            objective,
+        );
+        final_answer_recovery_reason_for_objective(&normalized, workspace_root, objective)
+            .is_none()
+            .then_some(normalized)
+    })
+}
+
+fn replace_latest_assistant_text(
+    assistant_messages: &mut [ConversationMessage],
+    pending_transcript: &mut BTreeMap<String, Vec<ConversationMessage>>,
+    node_id: &str,
+    text: &str,
+) {
+    let replace = |message: &mut ConversationMessage| {
+        if let Some(ContentBlock::Text { text: current }) = message
+            .blocks
+            .iter_mut()
+            .find(|block| matches!(block, ContentBlock::Text { .. }))
+        {
+            *current = text.to_string();
+        }
+    };
+    if let Some(message) = assistant_messages.last_mut() {
+        replace(message);
+    }
+    if let Some(message) = pending_transcript
+        .get_mut(node_id)
+        .and_then(|messages| messages.last_mut())
+    {
+        replace(message);
+    }
+}
+
+fn terminal_evidence_digest(messages: &[ConversationMessage]) -> String {
+    const MAX_RECEIPTS: usize = 32;
+    const MAX_CHARS_PER_RECEIPT: usize = 4_000;
+    const MAX_TOTAL_CHARS: usize = 48_000;
+
+    let mut receipts = messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult {
+                tool_name,
+                output,
+                is_error,
+                ..
+            } => Some((tool_name.as_str(), output.as_str(), *is_error)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if receipts.len() > MAX_RECEIPTS {
+        receipts.drain(..receipts.len() - MAX_RECEIPTS);
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut rendered = String::new();
+    for (index, (tool_name, output, is_error)) in receipts.into_iter().enumerate() {
+        let fingerprint = sha256_digest(output);
+        if !seen.insert(fingerprint) {
+            continue;
+        }
+        let body = output
+            .chars()
+            .take(MAX_CHARS_PER_RECEIPT)
+            .collect::<String>();
+        let receipt = format!(
+            "\n\n### Receipt {} · {} · {}\n{}",
+            index + 1,
+            tool_name,
+            if is_error { "failed" } else { "completed" },
+            body,
+        );
+        if rendered
+            .chars()
+            .count()
+            .saturating_add(receipt.chars().count())
+            > MAX_TOTAL_CHARS
+        {
+            break;
+        }
+        rendered.push_str(&receipt);
+    }
+    rendered.trim().to_string()
 }
 
 /// Bounds no-tool final-answer recovery using the same Runtime lease that
@@ -3062,7 +3786,11 @@ fn strip_trailing_simulated_tool_markup(text: String) -> String {
         || lower_suffix.starts_with("<｜｜dsml｜｜tool_calls>")
         || lower_suffix.starts_with("<｜｜dsml｜｜invoke")
         || lower_suffix.starts_with("```tool_use");
-    if start > 0 && is_direct_markup { text[..start].trim_end().to_string() } else { text }
+    if start > 0 && is_direct_markup {
+        text[..start].trim_end().to_string()
+    } else {
+        text
+    }
 }
 
 fn looks_like_workspace_file_reference(path: &str) -> bool {
@@ -3578,7 +4306,9 @@ mod tests {
         ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
             self.requests.lock().expect("capture lock").push(request);
             Box::pin(stream::iter(vec![
-                Ok(AssistantEvent::TextDelta("Cowd identity verified".to_string())),
+                Ok(AssistantEvent::TextDelta(
+                    "Cowd identity verified".to_string(),
+                )),
                 Ok(AssistantEvent::MessageStop),
             ]))
         }
@@ -3700,11 +4430,155 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct CleanTerminalRecoveryClient {
+        attempts: Arc<AtomicUsize>,
+        saw_clean_terminal_prompt: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ApiClient for CleanTerminalRecoveryClient {
+        fn stream(
+            &mut self,
+            request: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            let clean_terminal = request
+                .prompt
+                .trusted_system
+                .iter()
+                .any(|fragment| fragment.contains("Clean terminal synthesis"));
+            if clean_terminal {
+                self.saw_clean_terminal_prompt.store(true, Ordering::SeqCst);
+                return Box::pin(stream::iter(vec![
+                    Ok(AssistantEvent::TextDelta(
+                        "Final conclusion from the isolated evidence receipt.\nEvidence: crates/runtime/src/lib.rs\nUnverified suggestion: crates/memory/src/store.rs"
+                            .to_string(),
+                    )),
+                    Ok(AssistantEvent::MessageStop),
+                ]));
+            }
+            assert!(
+                attempt < 2,
+                "the third request must use the isolated clean synthesis path"
+            );
+            Box::pin(stream::iter(vec![
+                Ok(AssistantEvent::TextDelta(
+                    "<tool_call><function=read_file></function></tool_call>".to_string(),
+                )),
+                Ok(AssistantEvent::MessageStop),
+            ]))
+        }
+    }
+
+    #[derive(Clone)]
+    struct TeamTerminalReceiptClient {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    impl ApiClient for TeamTerminalReceiptClient {
+        fn stream(
+            &mut self,
+            _request: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt > 0 {
+                return Box::pin(stream::iter(vec![
+                    Ok(AssistantEvent::TextDelta(
+                        "unexpected parent re-exploration".to_string(),
+                    )),
+                    Ok(AssistantEvent::MessageStop),
+                ]));
+            }
+            Box::pin(stream::iter(vec![
+                Ok(AssistantEvent::ToolUse {
+                    id: "team-1".to_string(),
+                    name: "runtime_orchestrate".to_string(),
+                    input: r#"{"action":"request_team","intent":"review architecture"}"#
+                        .to_string(),
+                }),
+                Ok(AssistantEvent::MessageStop),
+            ]))
+        }
+    }
+
     struct NoopToolExecutor;
 
     impl ToolExecutor for NoopToolExecutor {
         fn execute(&self, name: &str, _input: &str) -> Result<String, ToolError> {
             Err(ToolError::new(format!("unexpected tool call: {name}")))
+        }
+    }
+
+    struct TeamTerminalReceiptExecutor;
+
+    impl ToolExecutor for TeamTerminalReceiptExecutor {
+        fn execute(&self, name: &str, _input: &str) -> Result<String, ToolError> {
+            assert_eq!(name, "runtime_orchestrate");
+            Ok(serde_json::json!({
+                "status": "completed",
+                "terminal_summary": "Team completed the architecture review with checked runtime evidence."
+            })
+            .to_string())
+        }
+
+        fn available_tool_names(&self) -> Vec<String> {
+            vec!["runtime_orchestrate".to_string()]
+        }
+
+        fn classify_tool_safety(
+            &self,
+            name: &str,
+            _input: &str,
+        ) -> Option<crate::tool_orchestrator::ToolSafetyCategory> {
+            (name == "runtime_orchestrate")
+                .then_some(crate::tool_orchestrator::ToolSafetyCategory::WriteLocal)
+        }
+
+        fn collaboration_runtime_available(&self) -> bool {
+            true
+        }
+
+        fn describe_tool_effect(
+            &self,
+            name: &str,
+            _input: &serde_json::Value,
+        ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
+            use harness_contract::policy::{
+                PermissionOperation, PermissionResource, PermissionScope,
+            };
+            use harness_contract::tool::{
+                ToolApprovalClass, ToolEffectDescriptor, ToolEffectKind, ToolIdempotency,
+                ToolPermissionMode,
+            };
+
+            (name == "runtime_orchestrate").then(|| ToolEffectDescriptor {
+                tool_id: name.to_string(),
+                descriptor_hash: "test-runtime-orchestrate-v1".to_string(),
+                effect_kind: ToolEffectKind::Write,
+                idempotency: ToolIdempotency::IdempotentWithKey,
+                scopes: vec![PermissionScope::new(
+                    PermissionResource::Session,
+                    PermissionOperation::Control,
+                )],
+                required_permission: ToolPermissionMode::WorkspaceWrite,
+                approval_class: ToolApprovalClass::Policy,
+                uses_network: false,
+                spawns_process: false,
+                mutates_packages: false,
+                mutates_system: false,
+            })
+        }
+
+        fn execute_authorized(
+            &self,
+            authorization: &harness_contract::tool::ToolExecutionAuthorization,
+            name: &str,
+            input: &str,
+        ) -> Result<String, ToolError> {
+            if authorization.tool_id != name {
+                return Err(ToolError::new("authorization tool does not match request"));
+            }
+            self.execute(name, input)
         }
     }
 
@@ -3826,9 +4700,8 @@ mod tests {
         let host = Arc::new(tokio::sync::Mutex::new(host));
 
         let waiting_host = Arc::clone(&host);
-        let waiter = tokio::spawn(async move {
-            waiting_host.lock().await.await_started_turn().await
-        });
+        let waiter =
+            tokio::spawn(async move { waiting_host.lock().await.await_started_turn().await });
         tokio::task::yield_now().await;
         waiter.abort();
         let _ = waiter.await;
@@ -4250,6 +5123,77 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn invalid_terminal_markup_falls_back_to_one_isolated_clean_synthesis() {
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let saw_clean_terminal_prompt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runtime = crate::ConversationRuntime::new(
+            Session::new(),
+            CleanTerminalRecoveryClient {
+                attempts: Arc::clone(&attempts),
+                saw_clean_terminal_prompt: Arc::clone(&saw_clean_terminal_prompt),
+            },
+            NoopToolExecutor,
+            PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
+            vec!["answer from checked evidence".to_string()],
+        )
+        .without_memory();
+
+        let (_runtime, result) = submit_owned_conversation_turn(
+            runtime,
+            Arc::clone(&services),
+            "return the checked conclusion",
+            &SharedPrompter::none(),
+        )
+        .await;
+        let summary = result.expect("clean terminal synthesis must finish the turn");
+
+        assert_eq!(
+            summary.final_answer,
+            "Final conclusion from the isolated evidence receipt."
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert!(
+            saw_clean_terminal_prompt.load(Ordering::SeqCst),
+            "the last request must exclude the exploratory transcript and use the clean synthesis contract"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn completed_team_terminal_receipt_finishes_without_parent_reexploration() {
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let runtime = crate::ConversationRuntime::new(
+            Session::new(),
+            TeamTerminalReceiptClient {
+                attempts: Arc::clone(&attempts),
+            },
+            TeamTerminalReceiptExecutor,
+            PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
+            vec!["delegate the architecture review".to_string()],
+        )
+        .without_memory();
+
+        let (_runtime, result) = submit_owned_conversation_turn(
+            runtime,
+            Arc::clone(&services),
+            "review the architecture with a Team",
+            &SharedPrompter::none(),
+        )
+        .await;
+        let summary = result.expect("completed Team receipt must finish the parent turn");
+
+        assert_eq!(
+            summary.final_answer,
+            "Team completed the architecture review with checked runtime evidence.",
+            "tool results: {:?}",
+            summary.tool_results
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(summary.tool_results.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn model_step_only_plans_then_runner_executes_dependent_tool_wave_once() {
         let services = crate::RuntimeServices::in_memory().expect("runtime services");
         let executed = Arc::new(AtomicUsize::new(0));
@@ -4522,6 +5466,31 @@ mod tests {
     }
 
     #[test]
+    fn only_request_team_consumes_the_turn_collaboration_lease() {
+        let request_team = ModelToolCall {
+            id: "team".into(),
+            name: "runtime_orchestrate".into(),
+            input: r#"{"action":"request_team","intent":"review"}"#.into(),
+            depends_on: Vec::new(),
+        };
+        let parallel_tools = ModelToolCall {
+            id: "parallel".into(),
+            input: r#"{"action":"request_parallel_tools","intent":"read files"}"#.into(),
+            ..request_team.clone()
+        };
+        let ordinary = ModelToolCall {
+            id: "read".into(),
+            name: "read_file".into(),
+            input: r#"{"path":"Cargo.toml"}"#.into(),
+            depends_on: Vec::new(),
+        };
+
+        assert!(requests_team_orchestration(&[request_team]));
+        assert!(!requests_team_orchestration(&[parallel_tools]));
+        assert!(!requests_team_orchestration(&[ordinary]));
+    }
+
+    #[test]
     fn runtime_orchestration_dependency_runs_before_dependent_workspace_tools() {
         let calls = vec![
             ModelToolCall {
@@ -4649,6 +5618,41 @@ mod tests {
         );
         assert_eq!(
             final_answer_recovery_reason(
+                "Let me try once more to read the gateway sources:",
+                workspace.path()
+            ),
+            Some("unfinished work preamble was presented as a final answer".to_string())
+        );
+        assert_eq!(
+            final_answer_recovery_reason(
+                "团队已创建但部分节点被阻塞。让我继续收集完整证据，同时查看可用的工具。",
+                workspace.path()
+            ),
+            Some("unfinished work preamble was presented as a final answer".to_string())
+        );
+        assert_eq!(
+            final_answer_recovery_reason(
+                "用 glob 查找 memory crate 中实际存在的文件：",
+                workspace.path()
+            ),
+            Some("unfinished work preamble was presented as a final answer".to_string())
+        );
+        assert_eq!(
+            final_answer_recovery_reason(
+                "Gateway 文件较大，需要小段读取。同时搜索 memory store trait 和 gateway session 核心。",
+                workspace.path()
+            ),
+            Some("unfinished work preamble was presented as a final answer".to_string())
+        );
+        assert_eq!(
+            final_answer_recovery_reason(
+                "让我尝试使用 execute_code 来获取完整文件内容。",
+                workspace.path()
+            ),
+            Some("unfinished work preamble was presented as a final answer".to_string())
+        );
+        assert_eq!(
+            final_answer_recovery_reason(
                 "<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"read_file\"></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>",
                 workspace.path()
             ),
@@ -4696,6 +5700,187 @@ mod tests {
                 "Verified conclusion.\n<function=read_file><parameter=path>src/lib.rs".to_string()
             ),
             "Verified conclusion."
+        );
+    }
+
+    #[test]
+    fn completed_orchestration_receipt_accepts_raw_and_compacted_tool_output() {
+        let calls = vec![ModelToolCall {
+            id: "team-1".to_string(),
+            name: "runtime_orchestrate".to_string(),
+            input: "{}".to_string(),
+            depends_on: Vec::new(),
+        }];
+        let receipt = serde_json::json!({
+            "status": "completed",
+            "terminal_summary": "Checked Team conclusion."
+        })
+        .to_string();
+        let raw = vec![ConversationMessage::tool_result(
+            "team-1",
+            "runtime_orchestrate",
+            receipt.clone(),
+            false,
+        )];
+        let compacted = vec![ConversationMessage::tool_result(
+            "team-1",
+            "runtime_orchestrate",
+            format!("durable evidence receipt: {receipt}"),
+            false,
+        )];
+
+        assert_eq!(
+            completed_orchestration_terminal_summary(
+                &calls,
+                &raw,
+                std::path::Path::new("."),
+                false,
+            )
+            .as_deref(),
+            Some("Checked Team conclusion.")
+        );
+        assert_eq!(
+            completed_orchestration_terminal_summary(
+                &calls,
+                &compacted,
+                std::path::Path::new("."),
+                false,
+            )
+            .as_deref(),
+            Some("Checked Team conclusion.")
+        );
+
+        let invalid = vec![ConversationMessage::tool_result(
+            "team-1",
+            "runtime_orchestrate",
+            serde_json::json!({
+                "status": "completed",
+                "terminal_summary": "Evidence: crates/does-not-exist/src/lib.rs"
+            })
+            .to_string(),
+            false,
+        )];
+        assert_eq!(
+            completed_orchestration_terminal_summary(
+                &calls,
+                &invalid,
+                std::path::Path::new("."),
+                false,
+            ),
+            None,
+            "a Team terminal summary must pass the same source-truth gate as a normal final answer"
+        );
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        for path in ["crates/runtime/src/lib.rs", "crates/memory/src/lib.rs"] {
+            let path = workspace.path().join(path);
+            std::fs::create_dir_all(path.parent().expect("source parent")).expect("source parent");
+            std::fs::write(path, "pub mod checked;").expect("source");
+        }
+        let evidenced = vec![ConversationMessage::tool_result(
+            "team-1",
+            "runtime_orchestrate",
+            serde_json::json!({
+                "status": "completed",
+                "terminal_summary": "Evidence: crates/runtime/src/lib.rs and crates/memory/src/lib.rs"
+            })
+            .to_string(),
+            false,
+        )];
+        assert_eq!(
+            completed_orchestration_terminal_summary(&calls, &evidenced, workspace.path(), true,)
+                .as_deref(),
+            Some("Evidence: crates/runtime/src/lib.rs and crates/memory/src/lib.rs")
+        );
+        assert_eq!(
+            completed_orchestration_terminal_summary(&calls, &raw, workspace.path(), true),
+            None,
+            "an objective that requests source evidence cannot accept a path-free Team terminal"
+        );
+    }
+
+    #[test]
+    fn clean_synthesis_omits_only_lines_with_nonexistent_source_claims() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(workspace.path().join("crates/runtime/src"))
+            .expect("runtime source root");
+        std::fs::write(
+            workspace.path().join("crates/runtime/src/lib.rs"),
+            "pub mod runtime;",
+        )
+        .expect("runtime source");
+        let answer = "Architecture conclusion.\nEvidence: crates/runtime/src/lib.rs\nPossible follow-up: crates/memory/src/store.rs";
+
+        assert_eq!(
+            omit_nonexistent_workspace_path_lines(answer, workspace.path()).as_deref(),
+            Some("Architecture conclusion.\nEvidence: crates/runtime/src/lib.rs")
+        );
+        assert_eq!(
+            final_answer_recovery_reason_for_objective(
+                "Evidence: crates/runtime/src/lib.rs",
+                workspace.path(),
+                "给出至少两个实际源码路径作为证据",
+            ),
+            Some(
+                "final answer did not include at least two existing workspace source files required by the objective"
+                    .to_string()
+            )
+        );
+        std::fs::create_dir_all(workspace.path().join("crates/memory/src"))
+            .expect("memory source root");
+        std::fs::write(
+            workspace.path().join("crates/memory/src/lib.rs"),
+            "pub mod memory;",
+        )
+        .expect("memory source");
+        assert_eq!(
+            final_answer_recovery_reason_for_objective(
+                "Evidence: crates/runtime/src/lib.rs and crates/memory/src/lib.rs",
+                workspace.path(),
+                "给出至少两个实际源码路径作为证据",
+            ),
+            None
+        );
+
+        let retained = vec![
+            ConversationMessage::tool_result(
+                "read-runtime",
+                "read_file",
+                r#"{"path":"crates/runtime/src/lib.rs","content":"runtime"}"#,
+                false,
+            ),
+            ConversationMessage::tool_result(
+                "read-memory",
+                "read_file",
+                r#"{"path":"crates/memory/src/lib.rs","content":"memory"}"#,
+                false,
+            ),
+            ConversationMessage::tool_result(
+                "team",
+                "runtime_orchestrate",
+                serde_json::json!({
+                    "status": "blocked",
+                    "terminal_summary": "Runtime boundary, Memory boundary, Gateway boundary, canonical state, and a concrete risk were reviewed."
+                })
+                .to_string(),
+                false,
+            ),
+        ];
+        let candidate = retained_orchestration_terminal_candidate(
+            &retained,
+            workspace.path(),
+            "给出至少两个实际源码路径作为证据",
+        )
+        .expect("retained Team summary can be normalized from checked tool receipts");
+        assert!(candidate.contains("crates/runtime/src/lib.rs"));
+        assert!(candidate.contains("crates/memory/src/lib.rs"));
+        assert_eq!(
+            final_answer_recovery_reason_for_objective(
+                &candidate,
+                workspace.path(),
+                "给出至少两个实际源码路径作为证据",
+            ),
+            None
         );
     }
 

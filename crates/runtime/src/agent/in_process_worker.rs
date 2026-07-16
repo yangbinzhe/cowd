@@ -201,6 +201,9 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         // parent session authority but must not inherit MainTurn's broad,
         // open-ended exploration profile.
         runtime.set_context_profile(ContextProfile::SubAgent);
+        if let Some(limit) = agent_model_step_limit(packet.budget_lease.max_tokens) {
+            runtime.set_model_step_limit_override(limit);
+        }
         // Delegated Agents share the parent Session's evidence authority, but
         // only the parent Turn may publish conversation messages. The child
         // result returns through AgentReturnPacket and the Team reducer.
@@ -322,6 +325,21 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             }
         }
     }
+}
+
+fn agent_model_step_limit(max_tokens: u64) -> Option<usize> {
+    if max_tokens == 0 {
+        return None;
+    }
+    // One Agent model step commonly repacks several thousand input tokens.
+    // Convert the immutable token lease into a conservative absolute step
+    // ceiling so cumulative request growth cannot turn a 24k role lease into
+    // hundreds of thousands of provider tokens.
+    Some(
+        usize::try_from(max_tokens.saturating_add(3_999) / 4_000)
+            .unwrap_or(8)
+            .clamp(3, 8),
+    )
 }
 
 fn agent_terminal_outcome(
@@ -705,6 +723,14 @@ mod tests {
             policy.required_mode_for("write_file"),
             PermissionMode::WorkspaceWrite
         );
+    }
+
+    #[test]
+    fn delegated_agent_step_limit_is_bounded_by_the_context_lease() {
+        assert_eq!(agent_model_step_limit(0), None);
+        assert_eq!(agent_model_step_limit(8_000), Some(3));
+        assert_eq!(agent_model_step_limit(24_000), Some(6));
+        assert_eq!(agent_model_step_limit(128_000), Some(8));
     }
 
     #[test]

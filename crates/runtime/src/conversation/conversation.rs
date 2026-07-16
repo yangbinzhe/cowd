@@ -3,7 +3,7 @@ use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1144,6 +1144,10 @@ pub struct ConversationRuntime<C, T> {
     /// inherited wording as context but remain leaf protocol work unless a
     /// future packet explicitly grants subdelegation.
     explicit_team_escalation: bool,
+    /// Runtime-issued absolute model-step ceiling for the next and subsequent
+    /// turns owned by this host. `0` means derive the normal main-turn lease.
+    /// Delegated Agent workers bind this from their immutable budget packet.
+    model_step_limit_override: AtomicUsize,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -1378,6 +1382,7 @@ where
             )),
             tool_timeout: Some(Duration::from_secs(120)),
             explicit_team_escalation: true,
+            model_step_limit_override: AtomicUsize::new(0),
         }
     }
 
@@ -1440,6 +1445,23 @@ where
     pub fn set_context_profile(&self, profile: ContextProfile) {
         if let Ok(mut guard) = self.context_profile.lock() {
             *guard = profile;
+        }
+    }
+
+    /// Bind an absolute model-step ceiling supplied by the Runtime owner.
+    /// This is not model-visible prompt text and cannot be raised by a
+    /// delegated provider response.
+    pub fn set_model_step_limit_override(&self, limit: usize) {
+        self.model_step_limit_override
+            .store(limit.max(1), Ordering::SeqCst);
+    }
+
+    /// Return the Runtime-issued model-step ceiling, if one is active.
+    #[must_use]
+    pub fn model_step_limit_override(&self) -> Option<usize> {
+        match self.model_step_limit_override.load(Ordering::SeqCst) {
+            0 => None,
+            limit => Some(limit),
         }
     }
 
@@ -1557,6 +1579,149 @@ where
     /// checkpoint. The normal dynamic tool exposure is restored afterwards.
     pub(crate) fn require_next_model_final_response(&self) {
         self.next_model_text_only.store(true, Ordering::SeqCst);
+    }
+
+    /// Run one clean, zero-tool synthesis request from the original objective
+    /// and already-committed evidence receipts. Unlike the normal continuation
+    /// path, this request carries no exploratory assistant/tool-call history,
+    /// so a provider that became stuck repeating its prior tool protocol gets
+    /// one bounded opportunity to convert evidence into a deliverable.
+    pub(crate) async fn execute_clean_terminal_synthesis(
+        &mut self,
+        objective: &str,
+        evidence: &str,
+    ) -> Result<ModelStepResult, RuntimeError> {
+        let started_at = Instant::now();
+        let revision = self
+            .tool_exposure_revision
+            .fetch_add(1, Ordering::SeqCst)
+            .saturating_add(1);
+        let discovery = self.tool_executor.tool_discovery_receipt();
+        let deferred = discovery
+            .descriptors
+            .iter()
+            .map(|descriptor| descriptor.canonical_id.clone())
+            .collect();
+        self.api_client.configure_tool_exposure(
+            ToolExposureState {
+                catalog_revision: discovery.catalog_revision,
+                bootstrap: Default::default(),
+                active: Default::default(),
+                deferred,
+                reason: "clean terminal synthesis exposes no executable tools".to_string(),
+                revision,
+                fallback_full: false,
+            }
+            .projection(0),
+        );
+
+        let mut prompt = PromptAssembly::new(self.system_prompt.clone());
+        prompt.push_trusted_system(
+            "## Clean terminal synthesis\n\
+             Produce the final user-facing answer for the supplied objective from the checked \
+             evidence receipts only. This request has no tools and no continuation work. Do not \
+             emit function calls, simulated tool markup, plans to inspect more data, or promises \
+             to continue. Give the best supported conclusion now and state unresolved facts \
+             explicitly.",
+        );
+        let evidence = if evidence.trim().is_empty() {
+            "No checked tool receipt was available; give an honest bounded answer and name the missing evidence."
+        } else {
+            evidence
+        };
+        let messages = vec![ConversationMessage::user_text(format!(
+            "Original objective:\n{objective}\n\nChecked evidence receipts:\n{evidence}\n\nReturn the final answer now."
+        ))];
+        let inventory = self.api_client.context_inventory();
+        let mut last_error = None;
+
+        for model in self.model_candidates_for_turn(objective) {
+            let request = match self.pack_provider_attempt(&prompt, &messages, &model, inventory) {
+                Ok(request) => request,
+                Err(error) => {
+                    last_error = Some(error);
+                    continue;
+                }
+            };
+            let mut stream = self.api_client.stream(request);
+            let mut text = String::new();
+            let mut thinking = String::new();
+            let mut signature = String::new();
+            let mut calls = Vec::new();
+            let mut usage = TokenUsage::default();
+            let mut cache_events = Vec::new();
+            let mut effective_model = None;
+            let mut failed = None;
+            use futures::StreamExt;
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(AssistantEvent::ProviderModel { model }) => {
+                        effective_model = Some(model);
+                    }
+                    Ok(AssistantEvent::TextDelta(delta)) => text.push_str(&delta),
+                    Ok(AssistantEvent::ThinkingDelta(delta)) => thinking.push_str(&delta),
+                    Ok(AssistantEvent::SignatureDelta(delta)) => signature.push_str(&delta),
+                    Ok(AssistantEvent::ToolUse { id, name, input }) => {
+                        calls.push(ModelToolCall {
+                            id,
+                            name,
+                            input,
+                            depends_on: Vec::new(),
+                        });
+                    }
+                    Ok(AssistantEvent::Usage(value)) => usage = value,
+                    Ok(AssistantEvent::PromptCache(value)) => cache_events.push(value),
+                    Ok(AssistantEvent::MessageStop) => break,
+                    Ok(
+                        AssistantEvent::ToolStart { .. }
+                        | AssistantEvent::ToolProgress { .. }
+                        | AssistantEvent::ToolComplete { .. },
+                    ) => {}
+                    Err(error) => {
+                        failed = Some(error);
+                        break;
+                    }
+                }
+            }
+            drop(stream);
+            if let Some(error) = failed {
+                last_error = Some(error);
+                continue;
+            }
+
+            let mut blocks = Vec::new();
+            if !thinking.is_empty() {
+                blocks.push(ContentBlock::Thinking {
+                    thinking,
+                    signature: (!signature.is_empty()).then_some(signature),
+                });
+            }
+            blocks.push(ContentBlock::Text { text: text.clone() });
+            for call in &calls {
+                blocks.push(ContentBlock::ToolUse {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    input: call.input.clone(),
+                });
+            }
+            return Ok(ModelStepResult {
+                intent: classify_model_step_intent(text, calls),
+                assistant_message: ConversationMessage {
+                    role: crate::session::MessageRole::Assistant,
+                    blocks,
+                    usage: Some(usage),
+                },
+                usage,
+                prompt_cache_events: cache_events,
+                model: effective_model.or(Some(model)),
+                wall_duration_ms: millis_since(started_at).max(1),
+                text_only_response: true,
+            });
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            RuntimeError::new("clean terminal synthesis exhausted all provider candidates")
+        }))
     }
 
     /// Remove runtime-owned context items from a given source.
@@ -5960,12 +6125,37 @@ where
             raw_ref.clone(),
             granted.max(24),
         );
+        // `runtime_orchestrate` already returns a deliberately bounded model
+        // receipt. Preserve a completed terminal summary as valid JSON so the
+        // parent graph can consume it directly even on embedded/legacy hosts;
+        // generic head-tail evidence compaction can otherwise split the JSON
+        // and force an unnecessary parent model round.
+        if !is_error
+            && tool_name.eq_ignore_ascii_case("runtime_orchestrate")
+            && output.len() <= 24_000
+            && serde_json::from_str::<serde_json::Value>(output)
+                .ok()
+                .is_some_and(|value| {
+                    value.get("status").and_then(serde_json::Value::as_str) == Some("completed")
+                        && value
+                            .get("terminal_summary")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|summary| !summary.trim().is_empty())
+                })
+        {
+            receipt.summary = output.to_string();
+            receipt.receipt_tokens = raw_tokens;
+            receipt.omitted_tokens = 0;
+            receipt.truncated = false;
+        }
         if access.is_none() {
-            receipt.summary = receipt.summary.replacen(
-                "Evidence: tool://",
-                "Ephemeral evidence (active runtime only): tool://",
-                1,
-            );
+            if receipt.summary.starts_with("Tool `") {
+                receipt.summary = receipt.summary.replacen(
+                    "Evidence: tool://",
+                    "Ephemeral evidence (active runtime only): tool://",
+                    1,
+                );
+            }
             receipt.receipt_tokens = crate::context_ledger::estimate_text_tokens(&receipt.summary);
             receipt.omitted_tokens = raw_tokens.saturating_sub(receipt.receipt_tokens);
             receipt.truncated = receipt.receipt_tokens < raw_tokens;

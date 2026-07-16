@@ -1,7 +1,9 @@
 //! Dynamic last-resort execution safety fuse.
 //!
 //! Goal acceptance and Runner synthesis decide business completion. This policy
-//! only prevents an objectively stalled graph from growing without bound.
+//! bounds the amount of model work a graph may perform before it must publish
+//! an honest terminal result. Progress influences intervention choice inside
+//! the lease, but never turns a declared maximum into an advisory threshold.
 
 use harness_contract::core::TaskComplexity;
 use serde::{Deserialize, Serialize};
@@ -44,20 +46,21 @@ impl SafetyFusePolicy {
         complexity: TaskComplexity,
         explicit_user_limit: Option<usize>,
     ) -> ExecutionBudgetLease {
-        let context_scale = usize::try_from(context_window.max(16_384) / 16_384)
-            .unwrap_or(1)
-            .clamp(1, 16);
-        let complexity_multiplier = match complexity {
-            TaskComplexity::Trivial => 1,
-            TaskComplexity::Simple => 2,
-            TaskComplexity::Moderate => 3,
-            TaskComplexity::Complex => 5,
-            TaskComplexity::Strategic => 8,
+        let base_steps = match complexity {
+            TaskComplexity::Trivial => 4,
+            TaskComplexity::Simple => 8,
+            TaskComplexity::Moderate => 14,
+            TaskComplexity::Complex => 24,
+            TaskComplexity::Strategic => 32,
         };
-        let derived = context_scale
-            .saturating_mul(complexity_multiplier)
-            .saturating_mul(4)
-            .clamp(8, 512);
+        // A larger context window lets one model step inspect more evidence;
+        // it is not a reason to multiply the number of steps linearly. Keep a
+        // small bounded allowance for very large models and leave the real
+        // work budget dominated by task complexity.
+        let context_bonus = usize::try_from(context_window.max(16_384) / 131_072)
+            .unwrap_or_default()
+            .min(4);
+        let derived = base_steps + context_bonus;
         let max_model_steps =
             explicit_user_limit.map_or(derived, |limit| derived.min(limit.max(1)));
         ExecutionBudgetLease {
@@ -120,14 +123,14 @@ impl SafetyFusePolicy {
     pub fn evaluate(
         lease: &ExecutionBudgetLease,
         model_steps: usize,
-        made_progress: bool,
+        _made_progress: bool,
     ) -> SafetyFuseDecision {
-        if model_steps < lease.max_model_steps || made_progress {
+        if model_steps < lease.max_model_steps {
             return SafetyFuseDecision::Continue;
         }
         SafetyFuseDecision::Block {
             reason: format!(
-                "safety fuse exhausted after {model_steps} model steps without new goal progress; {}",
+                "safety fuse exhausted after {model_steps} model steps at the absolute lease limit; {}",
                 lease.reason
             ),
         }
@@ -171,5 +174,19 @@ mod tests {
             },
         );
         assert!(pressured.max_model_steps < lease.max_model_steps);
+    }
+
+    #[test]
+    fn reaching_the_lease_limit_blocks_even_when_the_latest_step_made_progress() {
+        let lease = SafetyFusePolicy::derive(128_000, TaskComplexity::Complex, Some(3));
+        assert_eq!(lease.max_model_steps, 3);
+        assert_eq!(
+            SafetyFusePolicy::evaluate(&lease, 2, true),
+            SafetyFuseDecision::Continue
+        );
+        assert!(matches!(
+            SafetyFusePolicy::evaluate(&lease, 3, true),
+            SafetyFuseDecision::Block { .. }
+        ));
     }
 }

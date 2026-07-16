@@ -54,10 +54,13 @@ pub fn compile_orchestration(
         // before Runtime can create a graph.
         let selected_template_path = requested_template_path(request, fallback_template_path);
         let template_selector = requested_template_selector(selected_template_path)?;
+        let team_id = format!("runtime-team:{request_id}");
+        let agent_budget_tokens =
+            orchestration_agent_budget_tokens(plan.execution_decision.complexity());
         let instantiated = team_runtime
             .plan(harness_contract::team::TeamInstantiationRequest {
                 request_id: request_id.to_string(),
-                team_id: format!("runtime-team:{request_id}"),
+                team_id: team_id.clone(),
                 session_id: request.session_id.clone().unwrap_or_default(),
                 mission_id: None,
                 parent_execution: parent_execution.clone(),
@@ -80,7 +83,13 @@ pub fn compile_orchestration(
                     .filter(|model| !model.trim().is_empty())
                     .unwrap_or("default")
                     .to_string(),
-                budget_lease: None,
+                budget_lease: Some(harness_contract::context::ContextBudgetLeaseRef::new(
+                    format!("runtime-team-budget:{request_id}"),
+                    team_id,
+                    "runtime_team_agent",
+                    agent_budget_tokens,
+                    1,
+                )),
                 managed_invocation: None,
                 resource_scopes: orchestration_resource_scopes(request),
             })
@@ -105,6 +114,18 @@ pub fn compile_orchestration(
         command: ExecutionGraphCommand::Start { expected_revision },
         execute_without_protocol: false,
     })
+}
+
+const fn orchestration_agent_budget_tokens(
+    complexity: harness_contract::core::TaskComplexity,
+) -> u64 {
+    match complexity {
+        harness_contract::core::TaskComplexity::Trivial => 8_000,
+        harness_contract::core::TaskComplexity::Simple => 12_000,
+        harness_contract::core::TaskComplexity::Moderate => 16_000,
+        harness_contract::core::TaskComplexity::Complex => 24_000,
+        harness_contract::core::TaskComplexity::Strategic => 32_000,
+    }
 }
 
 fn compile_session_dispatch(
@@ -345,6 +366,10 @@ mod tests {
                 tool.as_str(),
                 "runtime_orchestrate" | "runtime_capabilities"
             )));
+            assert!(
+                packet.budget_lease.max_tokens > 0,
+                "every model-originated Team agent must receive an explicit context budget"
+            );
         }
         assert!(packets.iter().all(|packet| packet.binding.is_some()));
     }
