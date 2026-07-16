@@ -284,6 +284,9 @@ pub struct MfgCockpitReportDeliveryState {
     pub report_id: String,
     pub report_status: String,
     pub attempt_count: usize,
+    pub retry_attempt_count: usize,
+    pub max_attempts: usize,
+    pub dead_lettered: bool,
     #[serde(default)]
     pub latest_receipt: Option<MfgCockpitReportDeliveryReceipt>,
     pub classification: String,
@@ -689,17 +692,24 @@ impl MfgCockpitReportDeliveryReceipt {
 impl MfgCockpitReportDeliveryState {
     #[must_use]
     pub fn from_report(report: &MfgCockpitReportSnapshot) -> Self {
-        let latest_receipt = report
+        let latest_receipt = report.delivery_receipts.last().cloned();
+        let retry_attempt_count = report
             .delivery_receipts
             .iter()
-            .max_by_key(|receipt| receipt.delivered_at)
-            .cloned();
+            .rev()
+            .take_while(|receipt| {
+                is_retryable_delivery_dispatch(&receipt.cross_plane_dispatch_status)
+            })
+            .count();
         let (classification, retryable, recommended_mode, reasons) =
-            classify_report_delivery(report, latest_receipt.as_ref());
+            classify_report_delivery(report, latest_receipt.as_ref(), retry_attempt_count);
         Self {
             report_id: report.report_id.clone(),
             report_status: report.status.clone(),
             attempt_count: report.delivery_receipts.len(),
+            retry_attempt_count,
+            max_attempts: REPORT_DELIVERY_MAX_ATTEMPTS,
+            dead_lettered: classification == "delivery_dead_lettered",
             latest_receipt,
             classification,
             retryable,
@@ -712,6 +722,7 @@ impl MfgCockpitReportDeliveryState {
 fn classify_report_delivery(
     report: &MfgCockpitReportSnapshot,
     latest_receipt: Option<&MfgCockpitReportDeliveryReceipt>,
+    retry_attempt_count: usize,
 ) -> (String, bool, String, Vec<String>) {
     let Some(receipt) = latest_receipt else {
         return (
@@ -721,6 +732,18 @@ fn classify_report_delivery(
             vec!["delivery:not_attempted".to_string()],
         );
     };
+    if retry_attempt_count >= REPORT_DELIVERY_MAX_ATTEMPTS {
+        return (
+            "delivery_dead_lettered".to_string(),
+            false,
+            "manual_review".to_string(),
+            vec![
+                "delivery:dead_lettered".to_string(),
+                format!("delivery:retry_attempts_exhausted:{REPORT_DELIVERY_MAX_ATTEMPTS}"),
+                format!("dispatch:{}", receipt.cross_plane_dispatch_status),
+            ],
+        );
+    }
     match (
         receipt.cross_plane_status.as_str(),
         receipt.cross_plane_dispatch_status.as_str(),
@@ -772,6 +795,8 @@ fn classify_report_delivery(
         ),
     }
 }
+
+const REPORT_DELIVERY_MAX_ATTEMPTS: usize = 3;
 
 fn is_retryable_delivery_dispatch(dispatch_status: &str) -> bool {
     matches!(

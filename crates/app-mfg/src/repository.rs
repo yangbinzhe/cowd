@@ -6476,9 +6476,10 @@ fn attention_from_change(
 mod tests {
     use super::*;
     use crate::{
-        MfgAlertRuleInput, MfgCockpitProfileInput, MfgCockpitReportDeliveryPayload,
+        default_mfg_widget_instances, MfgAlertRuleInput, MfgAssignmentInput,
+        MfgCockpitProfileInput, MfgCockpitReportDeliveryPayload,
         MfgCockpitReportDeliveryPayloadRequest, MfgCockpitReportDeliveryReceipt,
-        MfgCockpitReportDeliveryState, MfgCockpitReportRequest,
+        MfgCockpitReportDeliveryState, MfgCockpitReportRequest, MfgDashboardScope,
     };
     use matrix_core::{
         MatrixComputeJobInput, MatrixEntityInput, MatrixFactInput, MatrixMetricStatus,
@@ -7516,6 +7517,7 @@ mod tests {
         assert_eq!(delivery_state.classification, "dry_run_planned");
         assert!(!delivery_state.retryable);
         assert_eq!(delivery_state.attempt_count, 1);
+        assert_eq!(delivery_state.retry_attempt_count, 0);
         let delivered = store
             .attach_cockpit_report_delivery(
                 &report.report_id,
@@ -7529,6 +7531,37 @@ mod tests {
             )
             .expect("report delivery deduplicates");
         assert_eq!(delivered.delivery_receipts.len(), 1);
+        for attempt in 1..=3 {
+            store
+                .attach_cockpit_report_delivery(
+                    &report.report_id,
+                    MfgCockpitReportDeliveryReceipt::new(
+                        report.report_id.clone(),
+                        format!("cpx-report-failure-{attempt}"),
+                        "blocked",
+                        "runtime_unavailable",
+                        Some(format!("cpa-report-failure-{attempt}")),
+                    ),
+                )
+                .expect("retryable report delivery failure attaches");
+        }
+        let dead_lettered = store
+            .get_cockpit_report(&report.report_id)
+            .expect("dead-lettered report loads")
+            .expect("dead-lettered report exists");
+        let delivery_state = MfgCockpitReportDeliveryState::from_report(&dead_lettered);
+        assert_eq!(delivery_state.classification, "delivery_dead_lettered");
+        assert!(delivery_state.dead_lettered);
+        assert_eq!(delivery_state.attempt_count, 4);
+        assert_eq!(
+            delivery_state.retry_attempt_count,
+            delivery_state.max_attempts
+        );
+        assert!(!delivery_state.retryable);
+        assert_eq!(delivery_state.recommended_mode, "manual_review");
+        assert!(delivery_state
+            .reasons
+            .contains(&"delivery:retry_attempts_exhausted:3".to_string()));
     }
 
     #[test]

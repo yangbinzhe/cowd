@@ -424,7 +424,6 @@ pub(super) async fn mfg_assignment_list_handler(
     Extension(principal): Extension<AuthenticatedPrincipal>,
     Query(query): Query<MfgAssignmentListQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let actor = principal_actor_id(&principal);
     let items = state
         .services
         .mfg

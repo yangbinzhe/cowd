@@ -37,6 +37,7 @@ const HUMAN_CAPABILITIES: &[&str] = &[
     "definition.default.set",
     "definition.rollback",
     "evolution.release.manage",
+    "mfg.read",
     "runtime.maintenance.manage",
     "runtime.outbox.retry",
 ];

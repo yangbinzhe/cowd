@@ -14,7 +14,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use matrix_core::{
     MatrixComputeJobInput, MatrixConnectorRunInput, MatrixDataPlaneIngestPlanInput, MatrixEntity,
@@ -40,7 +40,7 @@ mod cockpit;
 mod decision;
 mod incidents;
 mod operations;
-use super::{api_error, AppState, ErrorResponse};
+use super::{api_error, principal_actor_id, AppState, AuthenticatedPrincipal, ErrorResponse};
 use cockpit::*;
 use decision::*;
 use incidents::*;

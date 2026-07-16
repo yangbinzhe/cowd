@@ -5745,6 +5745,9 @@ mod tests {
 
     #[test]
     fn given_timeout_ms_when_repl_blocks_then_returns_timeout_error() {
+        let _guard = crate::test_process_environment_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = execute_tool(
             "REPL",
             &json!({
