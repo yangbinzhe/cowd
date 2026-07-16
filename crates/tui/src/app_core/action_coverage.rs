@@ -228,6 +228,13 @@ pub fn action_coverage_summary() -> Vec<&'static str> {
         .collect()
 }
 
+pub fn mfg_tui_p0_read_coverage() -> Vec<app_mfg_contract::MfgRouteId> {
+    app_mfg_contract::mfg_tui_p0_read_route_contracts()
+        .into_iter()
+        .map(|route| route.route_id)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,6 +253,8 @@ mod tests {
         include_str!("../../../gateway/src/api_routes/harness_eval_routes.rs");
     const EVOLUTION_ROUTES: &str =
         include_str!("../../../gateway/src/api_routes/evolution_routes.rs");
+    const MFG_PANEL: &str = include_str!("../components/mfg_operations_panel.rs");
+    const MFG_STATE: &str = include_str!("runtime_control_store.rs");
 
     #[test]
     fn action_coverage_has_expected_core_actions() {
@@ -262,6 +271,27 @@ mod tests {
         assert!(ids.contains(&"harness_eval.run_smoke"));
         assert!(ids.contains(&"evolution.overview"));
         assert!(ids.len() >= 23);
+    }
+
+    #[test]
+    fn mfg_read_coverage_is_contract_derived_and_wired_to_client_state_and_panel() {
+        let routes = mfg_tui_p0_read_coverage();
+        let expected = routes
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let panel = crate::components::mfg_operations_panel::MFG_PANEL_READ_ROUTE_IDS
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(routes.len(), 19);
+        assert!(!routes.contains(&app_mfg_contract::MfgRouteId::LiveSnapshot));
+        assert_eq!(panel, expected);
+        assert!(GATEWAY_CLIENT.contains("mfg_tui_read"));
+        assert!(GATEWAY_CLIENT.contains("mfg_tui_read_path"));
+        assert!(MFG_STATE.contains("MfgOperationsState"));
+        assert!(MFG_STATE.contains("selection_revision"));
+        assert!(MFG_PANEL.contains("render_state"));
+        assert!(MFG_PANEL.contains("Backlinks"));
     }
 
     #[test]

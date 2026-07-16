@@ -13,8 +13,8 @@ use crate::{
     },
     mutation::{MfgActionContract, MfgMutationContextV1},
     operations::{
-        MfgContractDiagnosticV1, MfgMutationResponseV1, MfgNoBodyRequestV1, MfgReadCollectionV1,
-        MfgReadResourceV1, MfgReadResponseV1,
+        MfgContractDiagnosticV1, MfgIncidentListQuery, MfgMutationResponseV1, MfgNoBodyRequestV1,
+        MfgReadCollectionV1, MfgReadResourceV1, MfgReadResponseV1,
     },
     receipt::MfgReceiptV1,
     review::{
@@ -70,6 +70,7 @@ impl MfgOpenApiSchemaRegistry {
         registry.register_type::<MfgSurfaceStatusV1>("MfgSurfaceStatusV1");
         registry.register_type::<MfgContractDiagnosticV1>("MfgContractDiagnosticV1");
         registry.register_type::<MfgNoBodyRequestV1>("MfgNoBodyRequestV1");
+        registry.register_type::<MfgIncidentListQuery>("MfgIncidentListQuery");
         registry.register_type::<MfgReadResponseV1>("MfgReadResponseV1");
         registry.register_type::<MfgMutationResponseV1>("MfgMutationResponseV1");
         registry.register_type::<MfgReadResourceV1<MfgRouteContract>>("MfgRouteContractResourceV1");

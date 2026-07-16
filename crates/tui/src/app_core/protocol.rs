@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
 
+use crate::runtime_control_store::MfgOperationsSnapshot;
+
 pub use harness_contract::projection::{
     ExecutionCommandReceipt, ExecutionCommandRequest, ExecutionProjection, ProjectionDelta,
 };
@@ -184,6 +186,19 @@ pub enum CowdEvent {
     },
     ApprovalRequested {
         tool: String,
+    },
+    MfgContract {
+        generation: u64,
+        contract: app_mfg_contract::MfgFrontendContractV1,
+    },
+    MfgSnapshot {
+        generation: u64,
+        snapshot: MfgOperationsSnapshot,
+    },
+    MfgReadFailed {
+        generation: u64,
+        section: String,
+        error: app_mfg_contract::MfgApiErrorV1,
     },
 }
 

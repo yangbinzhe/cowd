@@ -77,6 +77,9 @@ fn is_reliable_event(event: &CowdEvent) -> bool {
             | CowdEvent::ApprovalRequested { .. }
             | CowdEvent::ExecutionProjectionDelta { .. }
             | CowdEvent::ExecutionGraphSummary { .. }
+            | CowdEvent::MfgContract { .. }
+            | CowdEvent::MfgSnapshot { .. }
+            | CowdEvent::MfgReadFailed { .. }
     )
 }
 
@@ -102,6 +105,48 @@ fn retain_reliable_event(queue: &mut VecDeque<CowdEvent>, event: CowdEvent) {
                 }
             }
         }
+        CowdEvent::MfgContract { .. }
+        | CowdEvent::MfgSnapshot { .. }
+        | CowdEvent::MfgReadFailed { .. } => {
+            if let Some(index) = queue.iter().position(|queued| match (&event, queued) {
+                (
+                    CowdEvent::MfgContract {
+                        generation: event_generation,
+                        ..
+                    },
+                    CowdEvent::MfgContract {
+                        generation: queued_generation,
+                        ..
+                    },
+                ) => queued_generation == event_generation,
+                (
+                    CowdEvent::MfgSnapshot {
+                        generation: event_generation,
+                        ..
+                    },
+                    CowdEvent::MfgSnapshot {
+                        generation: queued_generation,
+                        ..
+                    },
+                ) => queued_generation == event_generation,
+                (
+                    CowdEvent::MfgReadFailed {
+                        generation: event_generation,
+                        section: event_section,
+                        ..
+                    },
+                    CowdEvent::MfgReadFailed {
+                        generation: queued_generation,
+                        section: queued_section,
+                        ..
+                    },
+                ) => queued_generation == event_generation && queued_section == event_section,
+                _ => false,
+            }) {
+                queue[index] = event;
+                return;
+            }
+        }
         _ => {}
     }
 
@@ -114,6 +159,9 @@ fn retain_reliable_event(queue: &mut VecDeque<CowdEvent>, event: CowdEvent) {
                 queued,
                 CowdEvent::ExecutionProjectionDelta { .. }
                     | CowdEvent::ExecutionGraphSummary { .. }
+                    | CowdEvent::MfgContract { .. }
+                    | CowdEvent::MfgSnapshot { .. }
+                    | CowdEvent::MfgReadFailed { .. }
             )
         }) {
             queue.remove(index);

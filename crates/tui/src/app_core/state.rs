@@ -43,6 +43,7 @@ use crate::components::file_tree::FileTree;
 use crate::components::gateway_panel::GatewayPanel;
 use crate::components::goal_workbench_panel::GoalWorkbenchPanel;
 use crate::components::memory_panel::MemoryPanel;
+use crate::components::mfg_operations_panel::MfgOperationsPanel;
 use crate::components::performance_dashboard::PerformanceDashboard;
 use crate::components::prompt::Prompt;
 use crate::components::question_form::QuestionForm;
@@ -68,6 +69,7 @@ use crate::keybind::which_key::WhichKey;
 use crate::keybind::{default_bindings, KeybindEngine};
 use crate::layout::{LayoutState, LayoutTree};
 use crate::profiler::{FrameTimer, RenderProfiler};
+use crate::runtime_control_store::{MfgBacklinkKind, MfgViewFocus};
 use crate::theme::ThemeEngine;
 use crate::workbench::panel_registry;
 use crate::CowdEvent;
@@ -81,7 +83,7 @@ pub enum ProcessedKey {
     Nothing,
 }
 
-pub(crate) const SIDEBAR_TAB_COUNT: usize = 10;
+pub(crate) const SIDEBAR_TAB_COUNT: usize = 11;
 pub(crate) const TAB_RUNTIME: usize = 0;
 pub(crate) const TAB_TOOLS: usize = 1;
 pub(crate) const TAB_CHANGES: usize = 2;
@@ -91,7 +93,8 @@ pub(crate) const TAB_TODO: usize = 5;
 pub(crate) const TAB_FILES: usize = 6;
 pub(crate) const TAB_SESSIONS: usize = 7;
 pub(crate) const TAB_SURFACES: usize = 8;
-pub(crate) const TAB_GATEWAY: usize = 9;
+pub(crate) const TAB_MFG: usize = 9;
+pub(crate) const TAB_GATEWAY: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FocusTarget {
@@ -393,6 +396,9 @@ pub struct TuiState {
     /// Surface panel showing Gateway-managed UI and external surface registry.
     pub surface_panel: SurfacePanel,
 
+    /// Read-only MFG control-plane panel. It owns no business state.
+    pub mfg_operations_panel: MfgOperationsPanel,
+
     /// Runtime activity panel summarizing run/context/tool state.
     pub runtime_activity_panel: RuntimeActivityPanel,
 
@@ -407,7 +413,7 @@ pub struct TuiState {
     pub activity_panel_visible: bool,
 
     /// Active tab index in the sidebar.
-    /// 0=Runtime, 1=Tools, 2=Changes, 3=Goals, 4=Approvals, 5=Todo, 6=Files, 7=Sessions, 8=Surfaces, 9=Gateway.
+    /// 0=Runtime, 1=Tools, 2=Changes, 3=Goals, 4=Approvals, 5=Todo, 6=Files, 7=Sessions, 8=Surfaces, 9=MFG, 10=Gateway.
     pub sidebar_active_tab: usize,
 
     /// Heavy topic panel opened on demand instead of participating in normal tab rotation.
@@ -523,6 +529,7 @@ impl TuiState {
         let config_panel = ConfigPanel::new();
         let gateway_panel = GatewayPanel::new();
         let surface_panel = SurfacePanel::new();
+        let mfg_operations_panel = MfgOperationsPanel::new();
         let runtime_activity_panel = RuntimeActivityPanel::new();
         let tool_ops_panel = ToolOpsPanel::new();
         let system_status_bar = SystemStatusBar::new();
@@ -575,6 +582,7 @@ impl TuiState {
             config_panel,
             gateway_panel,
             surface_panel,
+            mfg_operations_panel,
             runtime_activity_panel,
             tool_ops_panel,
             system_status_bar,
@@ -747,6 +755,7 @@ impl TuiState {
                             .set_current_session(&self.app.session_id);
                     }
                     TAB_SURFACES => self.surface_panel.sync_from_app(&self.app),
+                    TAB_MFG => {}
                     TAB_GATEWAY => self.gateway_panel.sync_from_app(&self.app),
                     _ => {}
                 }
@@ -835,6 +844,9 @@ impl TuiState {
             let topic_fullscreen = self.layout_state.sidebar_visible
                 && self.active_topic_panel.is_some()
                 && frame_areas.body.width < 100;
+            let mfg_fullscreen = self.layout_state.sidebar_visible
+                && self.active_topic_panel.is_none()
+                && self.sidebar_active_tab == TAB_MFG;
             if self.layout_state.sidebar_visible
                 && self.active_topic_panel.is_some()
                 && frame_areas.body.width >= 100
@@ -847,7 +859,7 @@ impl TuiState {
                 .clamp(48, max_topic_w);
                 chat_area.width = frame_areas.body.width.saturating_sub(topic_w).max(40);
             }
-            if topic_fullscreen {
+            if topic_fullscreen || mfg_fullscreen {
                 chat_area.width = 0;
                 toast_anchor_area = ratatui::layout::Rect::new(
                     frame_areas.body.x,
@@ -877,7 +889,7 @@ impl TuiState {
             } else {
                 None
             };
-            let sidebar_area = if topic_fullscreen {
+            let sidebar_area = if topic_fullscreen || mfg_fullscreen {
                 frame_areas.body
             } else {
                 let sidebar_x = chat_area.x.saturating_add(chat_area.width);
@@ -1116,6 +1128,18 @@ impl TuiState {
                                 "surface_panel",
                                 AssertUnwindSafe(|| {
                                     self.surface_panel.render(&mut main_ctx, panel_area);
+                                }),
+                            );
+                        }
+                        TAB_MFG => {
+                            let _ = error_recovery::catch_render_panic(
+                                "mfg_operations_panel",
+                                AssertUnwindSafe(|| {
+                                    self.mfg_operations_panel.render_state(
+                                        &mut main_ctx,
+                                        panel_area,
+                                        &self.app.mfg_operations,
+                                    );
                                 }),
                             );
                         }
@@ -1451,6 +1475,10 @@ impl TuiState {
             }
         }
 
+        if self.handle_mfg_panel_key(event) {
+            return true;
+        }
+
         if self.handle_terminal_control_shortcut(event) {
             return true;
         }
@@ -1627,6 +1655,10 @@ impl TuiState {
                 }
                 return ProcessedKey::Nothing;
             }
+        }
+
+        if self.handle_mfg_panel_key(key) {
+            return ProcessedKey::Nothing;
         }
 
         // ── Prompt autocomplete routing (Tab / Shift+Tab / Esc) ──
@@ -1938,7 +1970,10 @@ impl TuiState {
             }
             // Ctrl+A/E/W/U/K/Z → textarea for editing
             if event.modifiers == KeyModifiers::CONTROL {
-                return matches!(event.code, KeyCode::Char('a' | 'e' | 'w' | 'u' | 'k' | 'y' | 'z'));
+                return matches!(
+                    event.code,
+                    KeyCode::Char('a' | 'e' | 'w' | 'u' | 'k' | 'y' | 'z')
+                );
             }
             return false;
         }
@@ -2042,10 +2077,8 @@ impl TuiState {
         self.app.input.insert_paste(text);
         self.composer_desired_column = None;
         let input_text = self.input_text();
-        self.prompt.refresh_suggestions_from_text_at_cursor(
-            &input_text,
-            self.input_cursor_byte_offset(),
-        );
+        self.prompt
+            .refresh_suggestions_from_text_at_cursor(&input_text, self.input_cursor_byte_offset());
         self.app.mark_dirty();
     }
 
@@ -2255,6 +2288,17 @@ impl TuiState {
                     self.surface_panel.handle_event(&event)
                 }
             }
+            TAB_MFG => {
+                if let crossterm::event::Event::Key(key) = event {
+                    if self.handle_mfg_panel_key(key) {
+                        crate::components::EventResult::Consumed
+                    } else {
+                        crate::components::EventResult::NotConsumed
+                    }
+                } else {
+                    crate::components::EventResult::NotConsumed
+                }
+            }
             TAB_GATEWAY => {
                 if self.handle_gateway_panel_action(&event) {
                     crate::components::EventResult::Consumed
@@ -2268,6 +2312,130 @@ impl TuiState {
             self.set_focus_target(FocusTarget::Sidebar);
         }
         consumed
+    }
+
+    fn handle_mfg_panel_key(&mut self, key: KeyEvent) -> bool {
+        if !self.layout_state.sidebar_visible
+            || self.active_topic_panel.is_some()
+            || self.sidebar_active_tab != TAB_MFG
+            || self.focus_target != FocusTarget::Sidebar
+        {
+            return false;
+        }
+        match key.code {
+            KeyCode::Tab => {
+                self.app.mfg_operations.focus = match self.app.mfg_operations.focus {
+                    MfgViewFocus::Tabs => MfgViewFocus::List,
+                    MfgViewFocus::List => MfgViewFocus::Detail,
+                    MfgViewFocus::Detail => MfgViewFocus::Backlinks,
+                    MfgViewFocus::Backlinks => MfgViewFocus::Tabs,
+                };
+                true
+            }
+            KeyCode::BackTab => {
+                self.app.mfg_operations.focus = match self.app.mfg_operations.focus {
+                    MfgViewFocus::Tabs => MfgViewFocus::Backlinks,
+                    MfgViewFocus::List => MfgViewFocus::Tabs,
+                    MfgViewFocus::Detail => MfgViewFocus::List,
+                    MfgViewFocus::Backlinks => MfgViewFocus::Detail,
+                };
+                true
+            }
+            KeyCode::Left if self.app.mfg_operations.focus == MfgViewFocus::Tabs => {
+                self.app.mfg_operations.cycle_tab(true);
+                true
+            }
+            KeyCode::Right if self.app.mfg_operations.focus == MfgViewFocus::Tabs => {
+                self.app.mfg_operations.cycle_tab(false);
+                true
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if self.app.mfg_operations.focus == MfgViewFocus::Detail {
+                    self.app.mfg_operations.detail_scroll =
+                        self.app.mfg_operations.detail_scroll.saturating_add(1);
+                } else {
+                    self.app.mfg_operations.move_selection(true);
+                }
+                true
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if self.app.mfg_operations.focus == MfgViewFocus::Detail {
+                    self.app.mfg_operations.detail_scroll =
+                        self.app.mfg_operations.detail_scroll.saturating_sub(1);
+                } else {
+                    self.app.mfg_operations.move_selection(false);
+                }
+                true
+            }
+            KeyCode::Enter => {
+                self.app.mfg_operations.focus = match self.app.mfg_operations.focus {
+                    MfgViewFocus::Detail | MfgViewFocus::Backlinks => MfgViewFocus::List,
+                    MfgViewFocus::Tabs | MfgViewFocus::List => MfgViewFocus::Detail,
+                };
+                true
+            }
+            KeyCode::Char('r') => {
+                self.app.mfg_operations.request_refresh();
+                self.toast_manager.push(
+                    ToastVariant::Info,
+                    Some("MFG".into()),
+                    "Refreshing canonical MFG projection".into(),
+                    1600,
+                );
+                true
+            }
+            KeyCode::Char(']') => {
+                if self.app.mfg_operations.adjust_page_limit(true) {
+                    self.toast_manager.push(
+                        ToastVariant::Info,
+                        Some("MFG pagination".into()),
+                        "Loading more records from Gateway".into(),
+                        1600,
+                    );
+                }
+                true
+            }
+            KeyCode::Char('[') => {
+                if self.app.mfg_operations.adjust_page_limit(false) {
+                    self.toast_manager.push(
+                        ToastVariant::Info,
+                        Some("MFG pagination".into()),
+                        "Reducing the canonical page window".into(),
+                        1600,
+                    );
+                }
+                true
+            }
+            KeyCode::Char('e') => self.activate_mfg_backlink(MfgBacklinkKind::Evidence),
+            KeyCode::Char('p') => self.activate_mfg_backlink(MfgBacklinkKind::Approval),
+            KeyCode::Char('s') => self.activate_mfg_backlink(MfgBacklinkKind::Surface),
+            KeyCode::Char('x') => self.activate_mfg_backlink(MfgBacklinkKind::Runtime),
+            KeyCode::Esc => {
+                self.layout_state.toggle_sidebar(&mut self.layout_tree);
+                self.set_focus_target(FocusTarget::Chat);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn activate_mfg_backlink(&mut self, kind: MfgBacklinkKind) -> bool {
+        let Some(backlink) = self.app.mfg_operations.activate_backlink(kind) else {
+            self.toast_manager.push(
+                ToastVariant::Warning,
+                Some("MFG backlink".into()),
+                format!("No {} backlink is available", kind.label()),
+                1800,
+            );
+            return true;
+        };
+        self.toast_manager.push(
+            ToastVariant::Info,
+            Some(format!("{} backlink", kind.label())),
+            backlink.target,
+            2200,
+        );
+        true
     }
 
     fn refresh_file_preview_from_gateway(&mut self) {
@@ -3174,6 +3342,9 @@ impl TuiState {
         if self.sidebar_active_tab == TAB_TOOLS {
             self.refresh_tool_ops_panel_overview();
         }
+        if self.sidebar_active_tab == TAB_MFG && self.app.mfg_operations.last_updated_at.is_none() {
+            self.app.mfg_operations.request_refresh();
+        }
         self.toast_manager.push(
             ToastVariant::Info,
             Some("Panel".into()),
@@ -3340,6 +3511,9 @@ impl TuiState {
             "approvals" => self.open_sidebar_tab(TAB_APPROVALS, "Approvals"),
             "session" | "resume" => self.open_sidebar_tab(TAB_SESSIONS, "Sessions"),
             "surfaces" | "surface" => self.open_sidebar_tab(TAB_SURFACES, "Surfaces"),
+            "mfg" | "manufacturing" | "operations" => {
+                self.open_sidebar_tab(TAB_MFG, "MFG Operations")
+            }
             "gateway" => self.open_sidebar_tab(TAB_GATEWAY, "Gateway"),
             _ => {}
         }
@@ -3354,7 +3528,7 @@ impl TuiState {
             self.toast_manager.push(
                 ToastVariant::Info,
                 Some("Focus".into()),
-                "Use /focus chat|input|activity|runtime|tools|files|sessions|gateway|diff|memory|skills|config"
+                "Use /focus chat|input|activity|runtime|tools|files|sessions|mfg|gateway|diff|memory|skills|config"
                     .into(),
                 2400,
             );
@@ -5147,12 +5321,14 @@ mod tests {
         assert_eq!(compact[TAB_TOOLS], "Tool");
         assert_eq!(compact[TAB_APPROVALS], "Appr");
         assert_eq!(compact[TAB_FILES], "File");
+        assert_eq!(compact[TAB_MFG], "MFG");
         assert!(!compact.contains(&"Mem"));
         assert!(!compact.contains(&"Skill"));
         assert_eq!(full[TAB_RUNTIME], "Runtime");
         assert_eq!(full[TAB_TOOLS], "Tools");
         assert_eq!(full[TAB_APPROVALS], "Approvals");
         assert_eq!(full[TAB_FILES], "Files");
+        assert_eq!(full[TAB_MFG], "MFG");
         assert!(!full.contains(&"Memory"));
         assert!(!full.contains(&"Skills"));
     }
@@ -5336,7 +5512,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_and_gateway_panel_commands_open_expected_tabs() {
+    fn runtime_mfg_and_gateway_panel_commands_open_expected_tabs() {
         let mut state = TuiState::new("m", "s");
 
         state.dispatch_action(Action::Execute("/runtime".into()));
@@ -5351,11 +5527,38 @@ mod tests {
         assert_eq!(state.sidebar_active_tab, TAB_TOOLS);
         assert_eq!(state.focus_target, FocusTarget::Sidebar);
 
+        state.dispatch_action(Action::Execute("/mfg".into()));
+        assert!(state.layout_state.sidebar_visible);
+        assert_eq!(state.active_topic_panel, None);
+        assert_eq!(state.sidebar_active_tab, TAB_MFG);
+        assert_eq!(state.focus_target, FocusTarget::Sidebar);
+        assert!(state.app.mfg_operations.refresh_requested);
+
         state.dispatch_action(Action::Execute("/gateway".into()));
         assert!(state.layout_state.sidebar_visible);
         assert_eq!(state.active_topic_panel, None);
         assert_eq!(state.sidebar_active_tab, TAB_GATEWAY);
         assert_eq!(state.focus_target, FocusTarget::Sidebar);
+    }
+
+    #[test]
+    fn mfg_focus_chain_consumes_tab_before_global_sidebar_rotation() {
+        let mut state = TuiState::new("m", "s");
+        state.dispatch_action(Action::Execute("/mfg".into()));
+        assert_eq!(state.sidebar_active_tab, TAB_MFG);
+        assert_eq!(state.app.mfg_operations.focus, MfgViewFocus::Tabs);
+
+        state.process_raw_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(state.sidebar_active_tab, TAB_MFG);
+        assert_eq!(state.app.mfg_operations.focus, MfgViewFocus::List);
+
+        state.process_raw_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(state.sidebar_active_tab, TAB_MFG);
+        assert_eq!(state.app.mfg_operations.focus, MfgViewFocus::Tabs);
+
+        state.app.mfg_operations.active_tab = crate::runtime_control_store::MfgViewTab::Incidents;
+        state.process_raw_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+        assert_eq!(state.app.mfg_operations.pagination["incidents"].limit, 100);
     }
 
     #[test]
@@ -5802,6 +6005,39 @@ mod tests {
                     "tab {tab} at {width}x{height} rendered an empty buffer"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn mfg_uses_the_full_workbench_for_real_80_96_120_frame_layouts() {
+        for (width, height, expect_detail, expect_backlinks) in [
+            (80, 24, false, false),
+            (96, 30, true, false),
+            (120, 40, true, true),
+        ] {
+            let mut state = TuiState::new("m", "mfg-layout");
+            state.layout_state.toggle_sidebar(&mut state.layout_tree);
+            state.sidebar_active_tab = TAB_MFG;
+            state.app.mfg_operations.active_tab =
+                crate::runtime_control_store::MfgViewTab::Incidents;
+            state.app.mfg_operations.focus = MfgViewFocus::List;
+            state.app.mfg_operations.incidents =
+                vec![crate::runtime_control_store::MfgItemSummary {
+                    id: "incident-1".to_string(),
+                    kind: "incident".to_string(),
+                    title: "Line stop".to_string(),
+                    status: "open".to_string(),
+                    ..crate::runtime_control_store::MfgItemSummary::default()
+                }];
+            state.app.mfg_operations.selected_incident_id = Some("incident-1".to_string());
+
+            let mut terminal = MockTerminal::new(width, height);
+            terminal.draw(|frame| state.render(frame));
+            let joined = terminal.buffer_lines().join("\n");
+            assert!(joined.contains("MFG Operations"));
+            assert!(joined.contains("incident-1"));
+            assert_eq!(joined.contains("Detail"), expect_detail);
+            assert_eq!(joined.contains("Backlinks"), expect_backlinks);
         }
     }
 

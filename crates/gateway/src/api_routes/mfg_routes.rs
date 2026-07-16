@@ -291,6 +291,7 @@ pub(super) fn mfg_request_schema_component(route_id: app_mfg_contract::MfgRouteI
         R::RealityFactIngest => "MfgRealityFactIngestRequest",
         R::RealityEvidenceBuild => "MfgRealityEvidenceBuildRequest",
         R::DecisionTraceGet => "MatrixDecisionTraceQuery",
+        R::IncidentList => "MfgIncidentListQuery",
         R::IncidentCreate => "MfgIncidentCreateRequest",
         R::IncidentPlaybookRecommend => "MfgPlaybookRecommendRequest",
         R::IncidentSkillPlan => "MfgSkillPlanRequest",
@@ -1530,6 +1531,10 @@ async fn mfg_contract_handler() -> Json<app_mfg_contract::MfgFrontendContractV1>
         app_mfg_contract::MfgRouteId::ContractGet,
         app_mfg_contract::MfgRouteId::AppGet,
     ];
+    let tui_routes = app_mfg_contract::mfg_tui_p0_read_route_contracts()
+        .into_iter()
+        .map(|route| route.route_id)
+        .collect::<Vec<_>>();
     let webui_actions = actions
         .iter()
         .filter(|action| {
@@ -1558,9 +1563,9 @@ async fn mfg_contract_handler() -> Json<app_mfg_contract::MfgFrontendContractV1>
             },
             MfgSurfaceContract {
                 surface: MfgSurfaceKind::Tui,
-                role: MfgSurfaceRole::ConsoleUnavailable,
-                entrypoints: Vec::new(),
-                routes: Vec::new(),
+                role: MfgSurfaceRole::ConsoleReadOnly,
+                entrypoints: vec!["/api/apps/mfg/contract".to_string(), "/mfg".to_string()],
+                routes: tui_routes,
                 actions: Vec::new(),
             },
             MfgSurfaceContract {
@@ -3096,11 +3101,12 @@ fn mfg_application_capabilities() -> Vec<&'static str> {
 
 async fn mfg_incidents_list_handler(
     AxumState(state): AxumState<Arc<AppState>>,
+    Query(query): Query<app_mfg_contract::MfgIncidentListQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let incidents = state
         .services
         .mfg
-        .list_incidents(&state.config_home, 50)
+        .list_incidents(&state.config_home, query.limit.unwrap_or(50).clamp(1, 500))
         .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.incident.list",
@@ -3187,11 +3193,43 @@ async fn mfg_execution_feedback_handler(
 #[cfg(test)]
 mod tests {
     use super::{
-        mfg_api_error, mfg_idempotency_key, resolve_mfg_action_id, resolve_mfg_resource_ref,
-        MfgActionExecutionIntent, MfgCockpitReportDeliveryIntent, MfgCrossPlaneBridgeIntent,
-        MfgExecutionFeedbackRequest,
+        mfg_api_error, mfg_contract_handler, mfg_idempotency_key, resolve_mfg_action_id,
+        resolve_mfg_resource_ref, MfgActionExecutionIntent, MfgCockpitReportDeliveryIntent,
+        MfgCrossPlaneBridgeIntent, MfgExecutionFeedbackRequest,
     };
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
+
+    #[tokio::test]
+    async fn tui_contract_is_read_only_with_the_derived_19_route_inventory() {
+        let contract = mfg_contract_handler().await.0;
+        let surface = contract
+            .surfaces
+            .iter()
+            .find(|surface| surface.surface == app_mfg_contract::MfgSurfaceKind::Tui)
+            .expect("TUI surface");
+        let expected = app_mfg_contract::mfg_tui_p0_read_route_contracts()
+            .into_iter()
+            .map(|route| route.route_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            surface.role,
+            app_mfg_contract::MfgSurfaceRole::ConsoleReadOnly
+        );
+        assert_eq!(surface.routes.len(), 19);
+        assert_eq!(
+            surface
+                .routes
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
+        );
+        assert!(surface.actions.is_empty());
+        assert_eq!(
+            super::mfg_request_schema_component(app_mfg_contract::MfgRouteId::IncidentList),
+            "MfgIncidentListQuery"
+        );
+    }
 
     #[test]
     fn mfg_effect_intents_reject_client_supplied_actor_principals() {

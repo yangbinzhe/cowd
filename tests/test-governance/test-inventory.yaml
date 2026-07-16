@@ -204,6 +204,12 @@ scenario_scripts:
     capability: release.install_smoke
     keep_reason: install artifact smoke.
     planned_change: trim duplicated deep scenario assertions in V3.
+  - path: scripts/scenarios/mfg-surface-acceptance.sh
+    classification: manual
+    default_gate: false
+    capability: mfg.multi_surface_acceptance
+    keep_reason: V543 defines isolated PTY and evidence interfaces without claiming execution.
+    planned_change: V545 completes multi-Surface orchestration; V548 records the final command evidence.
 
 manual_scripts:
   - path: scripts/manual/context-runtime-lean-spike.sh
@@ -259,6 +265,10 @@ interactive_modules:
     classification: manual
     capability: tui.panels
     rationale: broad panel traversal is too expensive for default gates.
+  - path: tests/interactive/src/scenarios/tui_mfg_operations.rs
+    classification: manual
+    capability: tui.mfg_operations
+    rationale: V543 defines read-only responsive PTY evidence; V545 activates the isolated multi-Surface lane.
   - path: tests/interactive/src/scenarios/server_core.rs
     classification: manual
     capability: server.core

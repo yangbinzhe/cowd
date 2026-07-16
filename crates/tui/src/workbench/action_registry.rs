@@ -62,6 +62,16 @@ pub fn registered_actions() -> Vec<WorkbenchAction> {
             action: Action::Execute("/surfaces".into()),
         },
         WorkbenchAction {
+            id: "workbench.open_mfg",
+            domain: "surface",
+            label: "Open MFG Operations",
+            description: "Inspect the manufacturing command center, incidents, alerts, assignments, reports, and reviews",
+            risk: ActionRisk::Low,
+            requires_confirmation: false,
+            receipt_target: "mfg_operations_panel",
+            action: Action::Execute("/mfg".into()),
+        },
+        WorkbenchAction {
             id: "workbench.open_config",
             domain: "config",
             label: "Open Config",
@@ -119,5 +129,12 @@ mod tests {
         assert!(registered_actions()
             .iter()
             .any(|action| action.id == "workbench.open_config"));
+        let mfg = registered_actions()
+            .into_iter()
+            .filter(|action| action.domain == "mfg" || action.receipt_target.contains("mfg"))
+            .collect::<Vec<_>>();
+        assert_eq!(mfg.len(), 1);
+        assert_eq!(mfg[0].id, "workbench.open_mfg");
+        assert!(!mfg[0].requires_confirmation);
     }
 }

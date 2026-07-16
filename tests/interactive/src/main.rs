@@ -1,29 +1,31 @@
-mod tui;
 mod api;
-mod server;
-mod reporter;
 mod llm;
+mod reporter;
 mod scenarios;
+mod server;
+mod tui;
 
 use std::env;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    
+
     // Parse flags
     let list_only = args.iter().any(|a| a == "--list");
     let run_all = args.iter().any(|a| a == "--all" || a == "-a");
-    
+
     // Find scenario filter: --scenarios comma,list or positional
-    let scenario_filter: Option<Vec<String>> = if let Some(pos) = args.iter().position(|a| a == "--scenarios" || a == "-s") {
-        args.get(pos + 1).map(|combo| combo.split(',').map(|s| s.to_string()).collect())
-    } else if args.len() > 1 && !args[1].starts_with("--") {
-        Some(vec![args[1].clone()])
-    } else if run_all {
-        Some(vec!["all".to_string()])
-    } else {
-        None
-    };
+    let scenario_filter: Option<Vec<String>> =
+        if let Some(pos) = args.iter().position(|a| a == "--scenarios" || a == "-s") {
+            args.get(pos + 1)
+                .map(|combo| combo.split(',').map(|s| s.to_string()).collect())
+        } else if args.len() > 1 && !args[1].starts_with("--") {
+            Some(vec![args[1].clone()])
+        } else if run_all {
+            Some(vec!["all".to_string()])
+        } else {
+            None
+        };
 
     if list_only {
         println!("\nAvailable scenarios:");
@@ -46,9 +48,10 @@ fn main() {
     }
 
     let mut runner = reporter::TestRunner::new();
-    scenarios::run_all(&mut runner, filter_name).unwrap_or_else(|e| {
-        eprintln!("Error: {e}");
-    });
+    if let Err(error) = scenarios::run_all(&mut runner, filter_name) {
+        eprintln!("Error: {error}");
+        runner.record_failure("interactive-suite", error.to_string());
+    }
     runner.report();
 
     // LLM-powered analysis (optional — requires ANTHROPIC_API_KEY or local Ollama)
@@ -56,5 +59,12 @@ fn main() {
     let analysis = llm::analyze_results(&results_json);
     if !analysis.is_empty() {
         println!("{}", analysis);
+    }
+    if runner.executed_count() == 0 {
+        eprintln!("No interactive scenario assertions were executed");
+        std::process::exit(1);
+    }
+    if runner.has_failures() {
+        std::process::exit(1);
     }
 }

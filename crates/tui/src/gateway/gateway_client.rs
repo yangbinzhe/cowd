@@ -4,6 +4,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use futures::StreamExt;
+use serde::de::DeserializeOwned;
 
 use crate::{events::CowdEventSender, CowdEvent};
 
@@ -11,6 +12,7 @@ const GATEWAY_READY_RETRY_ATTEMPTS: usize = 20;
 const GATEWAY_READY_RETRY_DELAY: Duration = Duration::from_millis(100);
 const DEFAULT_GATEWAY_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_GATEWAY_URL: &str = "http://127.0.0.1:8642";
+const TUI_SURFACE_ID: &str = "tui";
 
 #[derive(Debug, Clone)]
 pub struct GatewayApiClient {
@@ -23,14 +25,26 @@ pub struct GatewayApiClient {
 pub enum GatewayApiError {
     Http(reqwest::Error),
     Status(reqwest::StatusCode, String),
-    Mfg {
-        status: reqwest::StatusCode,
-        error: app_mfg_contract::MfgApiErrorV1,
-    },
+    Api(app_mfg_contract::MfgApiErrorV1),
     Url(String),
 }
 
 impl GatewayApiClient {
+    fn authorize(&self, mut request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let requested_capabilities = tui_requested_capabilities().join(",");
+        request = request
+            .header("x-cowd-surface-id", TUI_SURFACE_ID)
+            .header("x-cowd-requested-capabilities", requested_capabilities);
+        if let Some(token) = self
+            .auth_token
+            .as_deref()
+            .filter(|token| !token.trim().is_empty())
+        {
+            request = request.bearer_auth(token.trim());
+        }
+        request
+    }
+
     pub fn new(
         base_url: impl Into<String>,
         auth_token: Option<String>,
@@ -257,14 +271,7 @@ impl GatewayApiClient {
             .text("source", "tui")
             .text("session_id", session_id.to_string());
         let url = format!("{}/api/resources", self.base_url);
-        let mut request = self.client.post(url).multipart(form);
-        if let Some(token) = self
-            .auth_token
-            .as_deref()
-            .filter(|token| !token.trim().is_empty())
-        {
-            request = request.bearer_auth(token.trim());
-        }
+        let request = self.authorize(self.client.post(url).multipart(form));
         let response = request.send().await.map_err(GatewayApiError::Http)?;
         let status = response.status();
         let text = response.text().await.map_err(GatewayApiError::Http)?;
@@ -400,14 +407,7 @@ impl GatewayApiClient {
             .text("dir", dir.unwrap_or_default().to_string())
             .text("overwrite", overwrite.to_string());
         let url = format!("{}/api/upload", self.base_url);
-        let mut request = self.client.post(url).multipart(form);
-        if let Some(token) = self
-            .auth_token
-            .as_deref()
-            .filter(|token| !token.trim().is_empty())
-        {
-            request = request.bearer_auth(token.trim());
-        }
+        let request = self.authorize(self.client.post(url).multipart(form));
         let response = request.send().await.map_err(GatewayApiError::Http)?;
         let status = response.status();
         let text = response.text().await.map_err(GatewayApiError::Http)?;
@@ -489,13 +489,7 @@ impl GatewayApiClient {
         if let Some(cursor) = after_commit_cursor {
             request = request.header("Last-Event-ID", cursor.to_string());
         }
-        if let Some(token) = self
-            .auth_token
-            .as_deref()
-            .filter(|token| !token.trim().is_empty())
-        {
-            request = request.bearer_auth(token.trim());
-        }
+        let request = self.authorize(request);
         let response = request.send().await.map_err(GatewayApiError::Http)?;
         let status = response.status();
         if !status.is_success() {
@@ -746,13 +740,7 @@ impl GatewayApiClient {
             .get(url)
             .header("Accept", "text/event-stream")
             .header("Last-Event-ID", after_cursor.to_string());
-        if let Some(token) = self
-            .auth_token
-            .as_deref()
-            .filter(|token| !token.trim().is_empty())
-        {
-            request = request.bearer_auth(token.trim());
-        }
+        let request = self.authorize(request);
         let response = request.send().await.map_err(GatewayApiError::Http)?;
         let status = response.status();
         if !status.is_success() {
@@ -1903,23 +1891,70 @@ impl GatewayApiClient {
         .await
     }
 
+    pub async fn mfg_contract(
+        &self,
+    ) -> Result<app_mfg_contract::MfgFrontendContractV1, GatewayApiError> {
+        let path = mfg_tui_read_path(app_mfg_contract::MfgRouteId::ContractGet, &[])?;
+        self.get_typed(&path).await
+    }
+
+    pub async fn mfg_tui_read(
+        &self,
+        route_id: app_mfg_contract::MfgRouteId,
+        replacements: &[(&str, &str)],
+    ) -> Result<app_mfg_contract::MfgReadResponseV1, GatewayApiError> {
+        self.mfg_tui_read_with_query(route_id, replacements, &[])
+            .await
+    }
+
+    pub async fn mfg_tui_read_with_query(
+        &self,
+        route_id: app_mfg_contract::MfgRouteId,
+        replacements: &[(&str, &str)],
+        query: &[(&str, String)],
+    ) -> Result<app_mfg_contract::MfgReadResponseV1, GatewayApiError> {
+        let path = mfg_tui_read_path(route_id, replacements)?;
+        let path = append_query(path, query);
+        self.get_typed(&path).await
+    }
+
+    pub async fn mfg_report_reviews(
+        &self,
+        limit: usize,
+    ) -> Result<app_mfg_contract::MfgReportDeliveryReviewCollection, GatewayApiError> {
+        let path = append_query(
+            mfg_tui_read_path(app_mfg_contract::MfgRouteId::ReportReviewList, &[])?,
+            &[("limit", limit.to_string())],
+        );
+        self.get_typed(&path).await
+    }
+
+    pub async fn mfg_report_review(
+        &self,
+        review_id: &str,
+    ) -> Result<app_mfg_contract::MfgReportDeliveryReview, GatewayApiError> {
+        let path = mfg_tui_read_path(
+            app_mfg_contract::MfgRouteId::ReportReviewGet,
+            &[("id", review_id)],
+        )?;
+        self.get_typed(&path).await
+    }
+
     async fn get_json(&self, path: &str) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_typed(path).await
+    }
+
+    async fn get_typed<T: DeserializeOwned>(&self, path: &str) -> Result<T, GatewayApiError> {
         let url = format!("{}{}", self.base_url, path);
-        let mut request = self.client.get(url);
-        if let Some(token) = self
-            .auth_token
-            .as_deref()
-            .filter(|token| !token.trim().is_empty())
-        {
-            request = request.bearer_auth(token.trim());
-        }
+        let request = self.authorize(self.client.get(url));
         let response = request.send().await.map_err(GatewayApiError::Http)?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             return Err(gateway_status_error(status, body));
         }
-        response.json().await.map_err(GatewayApiError::Http)
+        let bytes = response.bytes().await.map_err(GatewayApiError::Http)?;
+        decode_gateway_json(&bytes)
     }
 
     async fn post_json(
@@ -1928,14 +1963,7 @@ impl GatewayApiClient {
         body: serde_json::Value,
     ) -> Result<serde_json::Value, GatewayApiError> {
         let url = format!("{}{}", self.base_url, path);
-        let mut request = self.client.post(url).json(&body);
-        if let Some(token) = self
-            .auth_token
-            .as_deref()
-            .filter(|token| !token.trim().is_empty())
-        {
-            request = request.bearer_auth(token.trim());
-        }
+        let request = self.authorize(self.client.post(url).json(&body));
         let response = request.send().await.map_err(GatewayApiError::Http)?;
         let status = response.status();
         if !status.is_success() {
@@ -1951,14 +1979,7 @@ impl GatewayApiClient {
         body: serde_json::Value,
     ) -> Result<serde_json::Value, GatewayApiError> {
         let url = format!("{}{}", self.base_url, path);
-        let mut request = self.client.put(url).json(&body);
-        if let Some(token) = self
-            .auth_token
-            .as_deref()
-            .filter(|token| !token.trim().is_empty())
-        {
-            request = request.bearer_auth(token.trim());
-        }
+        let request = self.authorize(self.client.put(url).json(&body));
         let response = request.send().await.map_err(GatewayApiError::Http)?;
         let status = response.status();
         if !status.is_success() {
@@ -1970,14 +1991,7 @@ impl GatewayApiClient {
 
     async fn delete_json(&self, path: &str) -> Result<serde_json::Value, GatewayApiError> {
         let url = format!("{}{}", self.base_url, path);
-        let mut request = self.client.delete(url);
-        if let Some(token) = self
-            .auth_token
-            .as_deref()
-            .filter(|token| !token.trim().is_empty())
-        {
-            request = request.bearer_auth(token.trim());
-        }
+        let request = self.authorize(self.client.delete(url));
         let response = request.send().await.map_err(GatewayApiError::Http)?;
         let status = response.status();
         if !status.is_success() {
@@ -1989,14 +2003,7 @@ impl GatewayApiClient {
 
     async fn get_bytes(&self, path: &str) -> Result<Vec<u8>, GatewayApiError> {
         let url = format!("{}{}", self.base_url, path);
-        let mut request = self.client.get(url);
-        if let Some(token) = self
-            .auth_token
-            .as_deref()
-            .filter(|token| !token.trim().is_empty())
-        {
-            request = request.bearer_auth(token.trim());
-        }
+        let request = self.authorize(self.client.get(url));
         let response = request.send().await.map_err(GatewayApiError::Http)?;
         let status = response.status();
         if !status.is_success() {
@@ -2009,6 +2016,72 @@ impl GatewayApiClient {
             .map(|bytes| bytes.to_vec())
             .map_err(GatewayApiError::Http)
     }
+}
+
+fn mfg_tui_read_path(
+    route_id: app_mfg_contract::MfgRouteId,
+    replacements: &[(&str, &str)],
+) -> Result<String, GatewayApiError> {
+    let contract = app_mfg_contract::mfg_tui_p0_read_route_contracts()
+        .into_iter()
+        .find(|route| route.route_id == route_id)
+        .ok_or_else(|| {
+            GatewayApiError::Url(format!(
+                "{} is not an active TUI P0 read route",
+                route_id.as_str()
+            ))
+        })?;
+    let mut path = contract.path;
+    for (name, value) in replacements {
+        path = path.replace(&format!(":{name}"), &url_encode(value));
+    }
+    if path.split('/').any(|segment| segment.starts_with(':')) {
+        return Err(GatewayApiError::Url(format!(
+            "{} requires path parameters",
+            route_id.as_str()
+        )));
+    }
+    Ok(path)
+}
+
+fn tui_requested_capabilities() -> Vec<String> {
+    let mut capabilities = app_mfg_contract::core_profile_capabilities(
+        app_mfg_contract::MfgCoreProfileId::CoreManager,
+    )
+    .iter()
+    .map(|capability| (*capability).to_string())
+    .collect::<Vec<_>>();
+    for route in app_mfg_contract::mfg_tui_p0_read_route_contracts() {
+        match route.capability {
+            app_mfg_contract::MfgCapabilityRequirement::One { capability } => {
+                capabilities.push(capability.as_str().to_string());
+            }
+            app_mfg_contract::MfgCapabilityRequirement::All {
+                capabilities: required,
+            } => capabilities.extend(
+                required
+                    .into_iter()
+                    .map(|capability| capability.as_str().to_string()),
+            ),
+            app_mfg_contract::MfgCapabilityRequirement::PerAction => {}
+        }
+    }
+    capabilities.sort();
+    capabilities.dedup();
+    capabilities
+}
+
+fn append_query(mut path: String, query: &[(&str, String)]) -> String {
+    let values = query
+        .iter()
+        .filter(|(key, value)| !key.trim().is_empty() && !value.trim().is_empty())
+        .map(|(key, value)| format!("{}={}", url_encode(key), url_encode(value)))
+        .collect::<Vec<_>>();
+    if !values.is_empty() {
+        path.push('?');
+        path.push_str(&values.join("&"));
+    }
+    path
 }
 
 fn gateway_listener_reachable(base_url: &str) -> bool {
@@ -2082,10 +2155,33 @@ fn url_encode(value: &str) -> String {
 }
 
 fn gateway_status_error(status: reqwest::StatusCode, body: String) -> GatewayApiError {
-    match serde_json::from_str::<app_mfg_contract::MfgApiErrorV1>(&body) {
-        Ok(error) => GatewayApiError::Mfg { status, error },
-        Err(_) => GatewayApiError::Status(status, body),
+    let direct = serde_json::from_str::<app_mfg_contract::MfgApiErrorV1>(&body).ok();
+    let wrapped = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .and_then(|encoded| {
+            encoded
+                .strip_prefix("__mfg_api_error_v1__:")
+                .and_then(|json| serde_json::from_str(json).ok())
+        });
+    match direct.or(wrapped) {
+        Some(mut error) => {
+            error.http_status = status.as_u16();
+            GatewayApiError::Api(error)
+        }
+        None => GatewayApiError::Status(status, body),
     }
+}
+
+fn decode_gateway_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, GatewayApiError> {
+    serde_json::from_slice(bytes).map_err(|error| {
+        GatewayApiError::Url(format!("Gateway API response decode failed: {error}"))
+    })
 }
 
 impl fmt::Display for GatewayApiError {
@@ -2095,8 +2191,28 @@ impl fmt::Display for GatewayApiError {
             Self::Status(status, body) => {
                 write!(f, "Gateway API returned {status}: {body}")
             }
-            Self::Mfg { status, error } => {
-                write!(f, "MFG API returned {status}: {}", error.message)
+            Self::Api(error) => {
+                let recovery = error
+                    .recovery_actions
+                    .iter()
+                    .filter(|action| action.enabled)
+                    .map(|action| action.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "MFG API returned {} ({:?}, contract={}, request_id={}): {}{}",
+                    error.http_status,
+                    error.code,
+                    error.contract_version.0,
+                    error.request_id.as_deref().unwrap_or("none"),
+                    error.message,
+                    if recovery.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; recovery: {recovery}")
+                    }
+                )
             }
             Self::Url(err) => write!(f, "Gateway API URL error: {err}"),
         }
@@ -2382,14 +2498,145 @@ mod tests {
         let error = gateway_status_error(reqwest::StatusCode::FORBIDDEN, body);
         assert!(matches!(
             error,
-            GatewayApiError::Mfg {
-                status: reqwest::StatusCode::FORBIDDEN,
-                error: app_mfg_contract::MfgApiErrorV1 {
-                    code: app_mfg_contract::MfgErrorCode::CapabilityDenied,
-                    ..
-                },
-            }
+            GatewayApiError::Api(app_mfg_contract::MfgApiErrorV1 {
+                http_status: 403,
+                code: app_mfg_contract::MfgErrorCode::CapabilityDenied,
+                ..
+            })
         ));
+    }
+
+    #[test]
+    fn wrapped_mfg_api_errors_preserve_recovery_and_request_id() {
+        let mut api_error = app_mfg_contract::MfgApiErrorV1::capability_denied("mfg.report.review");
+        api_error.request_id = Some("request-1".to_string());
+        let encoded = serde_json::to_string(&api_error).expect("MFG error JSON");
+        let body = serde_json::json!({
+            "error": format!("__mfg_api_error_v1__:{encoded}")
+        })
+        .to_string();
+        let error = gateway_status_error(reqwest::StatusCode::FORBIDDEN, body);
+        assert!(matches!(
+            error,
+            GatewayApiError::Api(app_mfg_contract::MfgApiErrorV1 {
+                    request_id: Some(request_id),
+                    recovery_actions,
+                    ..
+            }) if request_id == "request-1" && !recovery_actions.is_empty()
+        ));
+    }
+
+    #[test]
+    fn typed_mfg_success_payloads_decode_through_the_production_client_decoder() {
+        let read: app_mfg_contract::MfgReadResponseV1 = decode_gateway_json(
+            br#"{"kind":"mfg.incident.list","items":[{"incident_id":"incident-1"}]}"#,
+        )
+        .expect("read response");
+        assert_eq!(read.kind.as_deref(), Some("mfg.incident.list"));
+        assert_eq!(
+            read.payload
+                .get("items")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+
+        let collection: app_mfg_contract::MfgReportDeliveryReviewCollection = decode_gateway_json(
+            br#"{
+                "items":[{
+                    "review_id":"review-1",
+                    "report_id":"report-1",
+                    "report_revision":3,
+                    "delivery_revision":2,
+                    "dead_letter_digest":"digest-1",
+                    "requester_principal":"principal-1",
+                    "approval_id":"approval-1",
+                    "correlation_id":"correlation-1",
+                    "requested_action":"force_retry",
+                    "decision":null,
+                    "reviewer_principal":null,
+                    "reason":"delivery failed",
+                    "evidence_refs":["evidence-1"],
+                    "decision_lease_ref":null,
+                    "effect_key":null,
+                    "effect_payload":null,
+                    "effect_receipt_ref":null,
+                    "effect_error":null,
+                    "status":"pending_approval",
+                    "revision":7,
+                    "created_at":"2026-07-16T00:00:00Z",
+                    "updated_at":"2026-07-16T00:01:00Z"
+                }],
+                "next_cursor":"cursor-2"
+            }"#,
+        )
+        .expect("review collection");
+        assert_eq!(collection.items.len(), 1);
+        assert_eq!(collection.next_cursor.as_deref(), Some("cursor-2"));
+
+        let detail: app_mfg_contract::MfgReportDeliveryReview = decode_gateway_json(
+            serde_json::to_vec(&collection.items[0])
+                .expect("review JSON")
+                .as_slice(),
+        )
+        .expect("review detail");
+        assert_eq!(detail.review_id, "review-1");
+        assert_eq!(detail.approval_id.as_deref(), Some("approval-1"));
+    }
+
+    #[test]
+    fn mfg_tui_paths_are_derived_from_the_19_route_read_contract() {
+        let routes = app_mfg_contract::mfg_tui_p0_read_route_contracts();
+        assert_eq!(routes.len(), 19);
+        for route in routes {
+            if route.path.contains(":id") {
+                let path = mfg_tui_read_path(route.route_id, &[("id", "object/a")])
+                    .expect("parameterized path");
+                assert!(!path.contains(":id"));
+                assert!(path.contains("object%2Fa"));
+            } else {
+                assert_eq!(
+                    mfg_tui_read_path(route.route_id, &[]).expect("static path"),
+                    route.path
+                );
+            }
+        }
+        assert!(mfg_tui_read_path(app_mfg_contract::MfgRouteId::LiveSnapshot, &[]).is_err());
+        assert_eq!(
+            append_query(
+                "/api/example".to_string(),
+                &[
+                    ("limit", "100".to_string()),
+                    ("owner", "line a".to_string())
+                ],
+            ),
+            "/api/example?limit=100&owner=line%20a"
+        );
+    }
+
+    #[test]
+    fn every_gateway_request_uses_the_tui_surface_decorator() {
+        let source = include_str!("gateway_client.rs");
+        assert!(source.contains("x-cowd-surface-id"));
+        assert!(source.contains("x-cowd-requested-capabilities"));
+        assert_eq!(source.matches("bearer_auth").count(), 1);
+        assert_eq!(
+            tui_requested_capabilities(),
+            vec![
+                "approval.respond",
+                "definition.default.set",
+                "definition.manage",
+                "definition.rollback",
+                "evolution.release.manage",
+                "mfg.read",
+                "mfg.report.review",
+                "runtime.maintenance.manage",
+                "runtime.outbox.retry",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+        );
     }
 
     #[test]

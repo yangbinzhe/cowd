@@ -1,17 +1,26 @@
 use crate::reporter::TestRunner;
-use crate::tui::TuiSession;
+use crate::tui::{TuiLaunchConfig, TuiSession};
 
 pub fn has_scenario(name: &str) -> bool {
     matches!(name, "tui_all_panels" | "tui_panel_keybinds" | "" | "all")
 }
 
 pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
-    let tui = TuiSession::new("tui-all-panels")?;
+    let tui = TuiSession::new(TuiLaunchConfig::from_env("tui-all-panels")?)?;
     tui.wait_until_ready(15)?;
     println!("\n── TUI All Panels ──");
 
     // Test all panels by tabbing through them
-    let panels = ["Gateway", "Files", "Memory", "Skills", "Delegates", "Context", "Changes", "Todo"];
+    let panels = [
+        "Gateway",
+        "Files",
+        "Memory",
+        "Skills",
+        "Delegates",
+        "Context",
+        "Changes",
+        "Todo",
+    ];
     for (_i, _panel) in panels.iter().enumerate() {
         let cap = tui.capture()?;
         // Verify some content is visible

@@ -15,6 +15,13 @@ pub struct MfgMutationRequestV1<T> {
 #[serde(deny_unknown_fields)]
 pub struct MfgNoBodyRequestV1 {}
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MfgIncidentListQuery {
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct MfgReadResponseV1 {
     #[serde(default)]

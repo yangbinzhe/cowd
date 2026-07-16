@@ -1,5 +1,1006 @@
 use crate::app::App;
 use crate::gateway_client::GatewayApiClient;
+use app_mfg_contract::{
+    MfgApiErrorV1, MfgFrontendContractV1, MfgReadResponseV1, MfgReceiptV1, MfgRecoveryAction,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+const MFG_DELTA_QUEUE_LIMIT: usize = 256;
+pub(crate) const MFG_ALL_READ_SECTIONS: [&str; 19] = [
+    "contract",
+    "app",
+    "command_center",
+    "decision_trace",
+    "live_stream",
+    "incidents",
+    "incident_detail",
+    "incident_room",
+    "analysis",
+    "execution",
+    "alert_rules",
+    "alerts",
+    "assignments",
+    "assignment_detail",
+    "reports",
+    "report_detail",
+    "delivery_state",
+    "reviews",
+    "review_detail",
+];
+
+#[must_use]
+pub const fn mfg_route_section(route_id: app_mfg_contract::MfgRouteId) -> Option<&'static str> {
+    use app_mfg_contract::MfgRouteId as R;
+    match route_id {
+        R::ContractGet => Some("contract"),
+        R::AppGet => Some("app"),
+        R::CommandCenterGet => Some("command_center"),
+        R::DecisionTraceGet => Some("decision_trace"),
+        R::IncidentList => Some("incidents"),
+        R::IncidentGet => Some("incident_detail"),
+        R::IncidentRoomGet => Some("incident_room"),
+        R::AnalysisGet => Some("analysis"),
+        R::ExecutionGet => Some("execution"),
+        R::AlertRuleList => Some("alert_rules"),
+        R::AlertList => Some("alerts"),
+        R::AssignmentList => Some("assignments"),
+        R::AssignmentGet => Some("assignment_detail"),
+        R::ReportList => Some("reports"),
+        R::ReportGet => Some("report_detail"),
+        R::ReportDeliveryStateGet => Some("delivery_state"),
+        R::ReportReviewList => Some("reviews"),
+        R::ReportReviewGet => Some("review_detail"),
+        R::LiveStream => Some("live_stream"),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MfgViewTab {
+    #[default]
+    Overview,
+    Incidents,
+    Alerts,
+    Assignments,
+    Reports,
+    Reviews,
+}
+
+impl MfgViewTab {
+    pub const ALL: [Self; 6] = [
+        Self::Overview,
+        Self::Incidents,
+        Self::Alerts,
+        Self::Assignments,
+        Self::Reports,
+        Self::Reviews,
+    ];
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Overview => "Overview",
+            Self::Incidents => "Incidents",
+            Self::Alerts => "Alerts",
+            Self::Assignments => "Assignments",
+            Self::Reports => "Reports",
+            Self::Reviews => "Reviews",
+        }
+    }
+
+    #[must_use]
+    pub const fn section_keys(self) -> &'static [&'static str] {
+        match self {
+            Self::Overview => &[
+                "contract",
+                "app",
+                "command_center",
+                "decision_trace",
+                "live_stream",
+            ],
+            Self::Incidents => &[
+                "incidents",
+                "incident_detail",
+                "incident_room",
+                "analysis",
+                "execution",
+            ],
+            Self::Alerts => &["alert_rules", "alerts"],
+            Self::Assignments => &["assignments", "assignment_detail"],
+            Self::Reports => &["reports", "report_detail", "delivery_state"],
+            Self::Reviews => &["reviews", "review_detail"],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MfgViewFocus {
+    #[default]
+    Tabs,
+    List,
+    Detail,
+    Backlinks,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MfgFreshness {
+    #[default]
+    Uninitialized,
+    Refreshing,
+    Fresh,
+    Stale,
+    Degraded,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MfgConnectionStatus {
+    #[default]
+    Disconnected,
+    Loading,
+    ReadOnly,
+    Degraded,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MfgBacklinkKind {
+    Runtime,
+    Evidence,
+    Approval,
+    Surface,
+}
+
+impl MfgBacklinkKind {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Runtime => "Runtime",
+            Self::Evidence => "Evidence",
+            Self::Approval => "Approval",
+            Self::Surface => "Surface",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MfgBacklink {
+    pub kind: MfgBacklinkKind,
+    pub target: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MfgItemSummary {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    pub status: String,
+    pub severity: Option<String>,
+    pub owner: Option<String>,
+    pub sla: Option<String>,
+    pub revision: Option<u64>,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    #[serde(default)]
+    pub backlinks: Vec<MfgBacklink>,
+    #[serde(default)]
+    pub raw: Value,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MfgPaginationState {
+    pub cursor: Option<String>,
+    pub next_cursor: Option<String>,
+    pub loaded_count: usize,
+    pub total_count: Option<usize>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MfgOperationsSnapshot {
+    pub app_descriptor: Option<MfgReadResponseV1>,
+    pub command_center: Option<MfgReadResponseV1>,
+    #[serde(default)]
+    pub incidents: Vec<MfgItemSummary>,
+    pub incident_detail: Option<MfgReadResponseV1>,
+    pub incident_detail_ref: Option<String>,
+    pub incident_room: Option<MfgReadResponseV1>,
+    pub analysis: Option<MfgReadResponseV1>,
+    pub analysis_ref: Option<String>,
+    pub decision_trace: Option<MfgReadResponseV1>,
+    pub execution: Option<MfgReadResponseV1>,
+    pub execution_ref: Option<String>,
+    #[serde(default)]
+    pub alert_rules: Vec<MfgItemSummary>,
+    #[serde(default)]
+    pub alerts: Vec<MfgItemSummary>,
+    #[serde(default)]
+    pub assignments: Vec<MfgItemSummary>,
+    pub assignment_detail: Option<MfgReadResponseV1>,
+    pub assignment_detail_ref: Option<String>,
+    #[serde(default)]
+    pub reports: Vec<MfgItemSummary>,
+    pub report_detail: Option<MfgReadResponseV1>,
+    pub report_detail_ref: Option<String>,
+    pub delivery_state: Option<MfgReadResponseV1>,
+    #[serde(default)]
+    pub reviews: Vec<MfgItemSummary>,
+    pub review_detail: Option<app_mfg_contract::MfgReportDeliveryReview>,
+    pub review_detail_ref: Option<String>,
+    pub live_stream_available: bool,
+    pub fetched_at: String,
+    #[serde(default)]
+    pub degraded_reasons: Vec<String>,
+    #[serde(default)]
+    pub pagination: BTreeMap<String, MfgPaginationState>,
+    pub selection_revision: u64,
+    #[serde(default)]
+    pub granted_capabilities: Vec<String>,
+    #[serde(default)]
+    pub forbidden_sections: BTreeMap<String, String>,
+    #[serde(default)]
+    pub section_errors: BTreeMap<String, MfgApiErrorV1>,
+    pub is_stale: bool,
+    #[serde(default)]
+    pub attempted_routes: BTreeSet<app_mfg_contract::MfgRouteId>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MfgReadDelta {
+    pub epoch: Option<String>,
+    pub cursor: Option<String>,
+    pub base_cursor: Option<String>,
+    pub target_cursor: Option<String>,
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MfgOperationsState {
+    pub contract: Option<MfgFrontendContractV1>,
+    pub command_center: Option<MfgReadResponseV1>,
+    pub app_descriptor: Option<MfgReadResponseV1>,
+    pub incidents: Vec<MfgItemSummary>,
+    pub incident_detail: Option<MfgReadResponseV1>,
+    pub incident_detail_ref: Option<String>,
+    pub incident_room: Option<MfgReadResponseV1>,
+    pub analysis: Option<MfgReadResponseV1>,
+    pub analysis_ref: Option<String>,
+    pub decision_trace: Option<MfgReadResponseV1>,
+    pub executions: Option<MfgReadResponseV1>,
+    pub execution_ref: Option<String>,
+    pub alerts: Vec<MfgItemSummary>,
+    pub alert_rules: Vec<MfgItemSummary>,
+    pub assignments: Vec<MfgItemSummary>,
+    pub assignment_detail: Option<MfgReadResponseV1>,
+    pub assignment_detail_ref: Option<String>,
+    pub reports: Vec<MfgItemSummary>,
+    pub report_detail: Option<MfgReadResponseV1>,
+    pub report_detail_ref: Option<String>,
+    pub delivery_state: Option<MfgReadResponseV1>,
+    pub reviews: Vec<MfgItemSummary>,
+    pub review_detail: Option<app_mfg_contract::MfgReportDeliveryReview>,
+    pub review_detail_ref: Option<String>,
+    pub receipts: Vec<MfgReceiptV1>,
+    pub selected_incident_id: Option<String>,
+    pub selected_alert_id: Option<String>,
+    pub selected_assignment_id: Option<String>,
+    pub selected_report_id: Option<String>,
+    pub selected_review_id: Option<String>,
+    pub pagination: BTreeMap<String, MfgPaginationState>,
+    pub pending_mutations: Vec<String>,
+    pub live_epoch: Option<String>,
+    pub live_cursor: Option<String>,
+    pub freshness: MfgFreshness,
+    pub connection: MfgConnectionStatus,
+    pub last_updated_at: Option<String>,
+    pub last_error: Option<MfgApiErrorV1>,
+    pub recovery_actions: Vec<MfgRecoveryAction>,
+    pub delta_queue: VecDeque<MfgReadDelta>,
+    pub active_tab: MfgViewTab,
+    pub focus: MfgViewFocus,
+    pub list_scroll: usize,
+    pub detail_scroll: usize,
+    pub backlink_index: usize,
+    pub generation: u64,
+    pub applied_generation: u64,
+    pub selection_revision: u64,
+    pub refresh_requested: bool,
+    pub refresh_in_flight: bool,
+    pub live_stream_available: bool,
+    pub degraded_reasons: Vec<String>,
+    pub is_stale: bool,
+    pub granted_capabilities: Vec<String>,
+    pub forbidden_sections: BTreeMap<String, String>,
+    pub section_errors: BTreeMap<String, MfgApiErrorV1>,
+    pub attempted_routes: BTreeSet<app_mfg_contract::MfgRouteId>,
+    pub last_backlink_intent: Option<MfgBacklink>,
+}
+
+impl Default for MfgOperationsState {
+    fn default() -> Self {
+        Self {
+            contract: None,
+            command_center: None,
+            app_descriptor: None,
+            incidents: Vec::new(),
+            incident_detail: None,
+            incident_detail_ref: None,
+            incident_room: None,
+            analysis: None,
+            analysis_ref: None,
+            decision_trace: None,
+            executions: None,
+            execution_ref: None,
+            alerts: Vec::new(),
+            alert_rules: Vec::new(),
+            assignments: Vec::new(),
+            assignment_detail: None,
+            assignment_detail_ref: None,
+            reports: Vec::new(),
+            report_detail: None,
+            report_detail_ref: None,
+            delivery_state: None,
+            reviews: Vec::new(),
+            review_detail: None,
+            review_detail_ref: None,
+            receipts: Vec::new(),
+            selected_incident_id: None,
+            selected_alert_id: None,
+            selected_assignment_id: None,
+            selected_report_id: None,
+            selected_review_id: None,
+            pagination: BTreeMap::new(),
+            pending_mutations: Vec::new(),
+            live_epoch: None,
+            live_cursor: None,
+            freshness: MfgFreshness::Uninitialized,
+            connection: MfgConnectionStatus::Disconnected,
+            last_updated_at: None,
+            last_error: None,
+            recovery_actions: Vec::new(),
+            delta_queue: VecDeque::new(),
+            active_tab: MfgViewTab::Overview,
+            focus: MfgViewFocus::Tabs,
+            list_scroll: 0,
+            detail_scroll: 0,
+            backlink_index: 0,
+            generation: 0,
+            applied_generation: 0,
+            selection_revision: 0,
+            refresh_requested: true,
+            refresh_in_flight: false,
+            live_stream_available: false,
+            degraded_reasons: Vec::new(),
+            is_stale: false,
+            granted_capabilities: Vec::new(),
+            forbidden_sections: BTreeMap::new(),
+            section_errors: BTreeMap::new(),
+            attempted_routes: BTreeSet::new(),
+            last_backlink_intent: None,
+        }
+    }
+}
+
+impl MfgOperationsState {
+    pub fn request_refresh(&mut self) {
+        self.refresh_requested = true;
+    }
+
+    pub fn take_refresh_request(&mut self) -> Option<u64> {
+        if !self.refresh_requested || self.refresh_in_flight {
+            return None;
+        }
+        self.refresh_requested = false;
+        self.refresh_in_flight = true;
+        self.attempted_routes.clear();
+        self.generation = self.generation.saturating_add(1);
+        self.freshness = MfgFreshness::Refreshing;
+        self.connection = MfgConnectionStatus::Loading;
+        Some(self.generation)
+    }
+
+    pub fn apply_contract(&mut self, generation: u64, contract: MfgFrontendContractV1) {
+        if generation < self.generation || generation < self.applied_generation {
+            return;
+        }
+        self.contract = Some(contract);
+        self.attempted_routes
+            .insert(app_mfg_contract::MfgRouteId::ContractGet);
+        self.applied_generation = generation;
+        self.last_error = None;
+        self.recovery_actions.clear();
+        self.is_stale = false;
+    }
+
+    pub fn apply_snapshot(&mut self, generation: u64, snapshot: MfgOperationsSnapshot) {
+        if generation < self.generation || generation < self.applied_generation {
+            return;
+        }
+        if snapshot.selection_revision != self.selection_revision {
+            self.refresh_in_flight = false;
+            return;
+        }
+        let previous_selected = self.selected_id().map(str::to_string);
+        self.app_descriptor = snapshot.app_descriptor;
+        self.command_center = snapshot.command_center;
+        self.incidents = snapshot.incidents;
+        self.incident_detail = snapshot.incident_detail;
+        self.incident_detail_ref = snapshot.incident_detail_ref;
+        self.incident_room = snapshot.incident_room;
+        self.analysis = snapshot.analysis;
+        self.analysis_ref = snapshot.analysis_ref;
+        self.decision_trace = snapshot.decision_trace;
+        self.executions = snapshot.execution;
+        self.execution_ref = snapshot.execution_ref;
+        self.alert_rules = snapshot.alert_rules;
+        self.alerts = snapshot.alerts;
+        self.assignments = snapshot.assignments;
+        self.assignment_detail = snapshot.assignment_detail;
+        self.assignment_detail_ref = snapshot.assignment_detail_ref;
+        self.reports = snapshot.reports;
+        self.report_detail = snapshot.report_detail;
+        self.report_detail_ref = snapshot.report_detail_ref;
+        self.delivery_state = snapshot.delivery_state;
+        self.reviews = snapshot.reviews;
+        self.review_detail = snapshot.review_detail;
+        self.review_detail_ref = snapshot.review_detail_ref;
+        self.live_stream_available = snapshot.live_stream_available;
+        self.last_updated_at = Some(snapshot.fetched_at);
+        self.degraded_reasons = snapshot.degraded_reasons;
+        self.pagination = snapshot.pagination;
+        self.granted_capabilities = snapshot.granted_capabilities;
+        self.forbidden_sections = snapshot.forbidden_sections;
+        self.section_errors = snapshot.section_errors;
+        self.attempted_routes = snapshot.attempted_routes;
+        self.enforce_access_recrop_from_errors();
+        self.selected_incident_id =
+            preserve_or_first(self.selected_incident_id.take(), &self.incidents);
+        self.selected_alert_id = preserve_or_first(self.selected_alert_id.take(), &self.alerts);
+        self.selected_assignment_id =
+            preserve_or_first(self.selected_assignment_id.take(), &self.assignments);
+        self.selected_report_id = preserve_or_first(self.selected_report_id.take(), &self.reports);
+        self.selected_review_id = preserve_or_first(self.selected_review_id.take(), &self.reviews);
+        let selected = self.selected_id().map(str::to_string);
+        let selected_index = selected
+            .as_deref()
+            .and_then(|id| self.current_items().iter().position(|item| item.id == id));
+        self.list_scroll = selected_index.unwrap_or_default();
+        if previous_selected != selected {
+            self.detail_scroll = 0;
+            self.backlink_index = 0;
+        }
+        self.applied_generation = generation;
+        self.refresh_in_flight = false;
+        self.last_error = self.section_errors.values().next().cloned();
+        self.recovery_actions = self
+            .section_errors
+            .values()
+            .flat_map(|error| error.recovery_actions.iter().cloned())
+            .collect();
+        self.is_stale = snapshot.is_stale;
+        if self.degraded_reasons.is_empty() {
+            self.freshness = MfgFreshness::Fresh;
+            self.connection = MfgConnectionStatus::ReadOnly;
+        } else {
+            self.freshness = MfgFreshness::Degraded;
+            self.connection = MfgConnectionStatus::Degraded;
+        }
+    }
+
+    pub fn apply_error(&mut self, generation: u64, section: String, error: MfgApiErrorV1) {
+        if generation < self.generation || generation < self.applied_generation {
+            return;
+        }
+        self.applied_generation = generation;
+        self.refresh_in_flight = false;
+        self.recovery_actions = error.recovery_actions.clone();
+        match error.code {
+            app_mfg_contract::MfgErrorCode::AuthenticationRequired => {
+                self.clear_authorized_mfg_data();
+                self.mark_all_mfg_sections_forbidden(&error.message);
+            }
+            app_mfg_contract::MfgErrorCode::CapabilityDenied => {
+                if let Some(capability) = mfg_required_capability(&error) {
+                    self.revoke_mfg_capability(capability, &error.message);
+                } else {
+                    self.forbidden_sections
+                        .insert(section.clone(), error.message.clone());
+                    self.clear_authorized_mfg_section(&section);
+                }
+            }
+            _ => {}
+        }
+        if let Some(route_id) = mfg_route_for_section(&section) {
+            self.attempted_routes.insert(route_id);
+        }
+        self.last_error = Some(error);
+        if self.last_updated_at.is_some() {
+            self.freshness = MfgFreshness::Stale;
+            self.connection = MfgConnectionStatus::Degraded;
+            self.is_stale = true;
+        } else {
+            self.freshness = MfgFreshness::Error;
+            self.connection = MfgConnectionStatus::Failed;
+            self.is_stale = false;
+        }
+    }
+
+    pub fn enqueue_delta(&mut self, delta: MfgReadDelta) {
+        self.delta_queue.push_back(delta);
+        while self.delta_queue.len() > MFG_DELTA_QUEUE_LIMIT {
+            self.delta_queue.pop_front();
+        }
+    }
+
+    fn clear_authorized_mfg_data(&mut self) {
+        self.contract = None;
+        self.command_center = None;
+        self.app_descriptor = None;
+        self.incidents.clear();
+        self.incident_detail = None;
+        self.incident_detail_ref = None;
+        self.incident_room = None;
+        self.analysis = None;
+        self.analysis_ref = None;
+        self.decision_trace = None;
+        self.executions = None;
+        self.execution_ref = None;
+        self.alerts.clear();
+        self.alert_rules.clear();
+        self.assignments.clear();
+        self.assignment_detail = None;
+        self.assignment_detail_ref = None;
+        self.reports.clear();
+        self.report_detail = None;
+        self.report_detail_ref = None;
+        self.delivery_state = None;
+        self.reviews.clear();
+        self.review_detail = None;
+        self.review_detail_ref = None;
+        self.selected_incident_id = None;
+        self.selected_alert_id = None;
+        self.selected_assignment_id = None;
+        self.selected_report_id = None;
+        self.selected_review_id = None;
+        self.pagination.clear();
+        self.granted_capabilities.clear();
+        self.attempted_routes.clear();
+        self.delta_queue.clear();
+        self.live_epoch = None;
+        self.live_cursor = None;
+        self.live_stream_available = false;
+        self.list_scroll = 0;
+        self.detail_scroll = 0;
+        self.backlink_index = 0;
+        self.last_backlink_intent = None;
+    }
+
+    fn clear_authorized_mfg_section(&mut self, section: &str) {
+        match section {
+            "contract" => self.contract = None,
+            "app" => self.app_descriptor = None,
+            "command_center" => self.command_center = None,
+            "decision_trace" => self.decision_trace = None,
+            "live_stream" => {
+                self.live_stream_available = false;
+                self.live_epoch = None;
+                self.live_cursor = None;
+            }
+            "incidents" => {
+                self.incidents.clear();
+                self.selected_incident_id = None;
+                self.pagination.remove("incidents");
+            }
+            "incident_detail" => {
+                self.incident_detail = None;
+                self.incident_detail_ref = None;
+            }
+            "incident_room" => {
+                self.incident_room = None;
+            }
+            "analysis" => {
+                self.analysis = None;
+                self.analysis_ref = None;
+            }
+            "execution" => {
+                self.executions = None;
+                self.execution_ref = None;
+            }
+            "alert_rules" => {
+                self.alert_rules.clear();
+                self.pagination.remove("alert_rules");
+            }
+            "alerts" => {
+                self.alerts.clear();
+                self.selected_alert_id = None;
+                self.pagination.remove("alerts");
+            }
+            "assignments" => {
+                self.assignments.clear();
+                self.selected_assignment_id = None;
+                self.pagination.remove("assignments");
+            }
+            "assignment_detail" => {
+                self.assignment_detail = None;
+                self.assignment_detail_ref = None;
+            }
+            "reports" => {
+                self.reports.clear();
+                self.selected_report_id = None;
+                self.pagination.remove("reports");
+            }
+            "report_detail" => {
+                self.report_detail = None;
+                self.report_detail_ref = None;
+            }
+            "delivery_state" => {
+                self.delivery_state = None;
+            }
+            "reviews" => {
+                self.reviews.clear();
+                self.selected_review_id = None;
+                self.pagination.remove("reviews");
+            }
+            "review_detail" => {
+                self.review_detail = None;
+                self.review_detail_ref = None;
+            }
+            _ => {}
+        }
+        self.last_backlink_intent = None;
+        self.list_scroll = 0;
+        self.detail_scroll = 0;
+        self.backlink_index = 0;
+    }
+
+    fn mark_all_mfg_sections_forbidden(&mut self, reason: &str) {
+        for section in MFG_ALL_READ_SECTIONS {
+            self.forbidden_sections
+                .insert(section.to_string(), reason.to_string());
+        }
+    }
+
+    fn revoke_mfg_capability(&mut self, capability: &str, reason: &str) {
+        self.granted_capabilities
+            .retain(|granted| granted != capability);
+        for route in app_mfg_contract::mfg_tui_p0_read_route_contracts() {
+            if !mfg_route_requires_capability(&route.capability, capability) {
+                continue;
+            }
+            if let Some(section) = mfg_route_section(route.route_id) {
+                self.forbidden_sections
+                    .insert(section.to_string(), reason.to_string());
+                self.clear_authorized_mfg_section(section);
+            }
+        }
+    }
+
+    fn enforce_access_recrop_from_errors(&mut self) {
+        let errors = self.section_errors.values().cloned().collect::<Vec<_>>();
+        let attempted_routes = self.attempted_routes.clone();
+        for error in errors {
+            match error.code {
+                app_mfg_contract::MfgErrorCode::AuthenticationRequired => {
+                    self.clear_authorized_mfg_data();
+                    self.mark_all_mfg_sections_forbidden(&error.message);
+                }
+                app_mfg_contract::MfgErrorCode::CapabilityDenied => {
+                    if let Some(capability) = mfg_required_capability(&error) {
+                        self.revoke_mfg_capability(capability, &error.message);
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.attempted_routes = attempted_routes;
+    }
+
+    pub fn select_tab(&mut self, tab: MfgViewTab) {
+        self.active_tab = tab;
+        self.list_scroll = 0;
+        self.detail_scroll = 0;
+        self.backlink_index = 0;
+        self.selection_revision = self.selection_revision.saturating_add(1);
+        self.request_refresh();
+    }
+
+    pub fn cycle_tab(&mut self, backwards: bool) {
+        let current = MfgViewTab::ALL
+            .iter()
+            .position(|tab| *tab == self.active_tab)
+            .unwrap_or(0);
+        let next = if backwards {
+            current
+                .checked_sub(1)
+                .unwrap_or(MfgViewTab::ALL.len().saturating_sub(1))
+        } else {
+            (current + 1) % MfgViewTab::ALL.len()
+        };
+        self.select_tab(MfgViewTab::ALL[next]);
+    }
+
+    #[must_use]
+    pub fn current_items(&self) -> &[MfgItemSummary] {
+        match self.active_tab {
+            MfgViewTab::Overview => &[],
+            MfgViewTab::Incidents => &self.incidents,
+            MfgViewTab::Alerts => &self.alerts,
+            MfgViewTab::Assignments => &self.assignments,
+            MfgViewTab::Reports => &self.reports,
+            MfgViewTab::Reviews => &self.reviews,
+        }
+    }
+
+    #[must_use]
+    pub fn selected_id(&self) -> Option<&str> {
+        match self.active_tab {
+            MfgViewTab::Overview => None,
+            MfgViewTab::Incidents => self.selected_incident_id.as_deref(),
+            MfgViewTab::Alerts => self.selected_alert_id.as_deref(),
+            MfgViewTab::Assignments => self.selected_assignment_id.as_deref(),
+            MfgViewTab::Reports => self.selected_report_id.as_deref(),
+            MfgViewTab::Reviews => self.selected_review_id.as_deref(),
+        }
+    }
+
+    #[must_use]
+    pub fn selected_item(&self) -> Option<&MfgItemSummary> {
+        let selected_id = self.selected_id()?;
+        self.current_items()
+            .iter()
+            .find(|item| item.id == selected_id)
+    }
+
+    pub fn move_selection(&mut self, down: bool) {
+        let items = self.current_items();
+        if items.is_empty() {
+            return;
+        }
+        let current = self
+            .selected_id()
+            .and_then(|id| items.iter().position(|item| item.id == id))
+            .unwrap_or(0);
+        let next = if down {
+            (current + 1).min(items.len().saturating_sub(1))
+        } else {
+            current.saturating_sub(1)
+        };
+        let selected = items[next].id.clone();
+        match self.active_tab {
+            MfgViewTab::Overview => {}
+            MfgViewTab::Incidents => self.selected_incident_id = Some(selected),
+            MfgViewTab::Alerts => self.selected_alert_id = Some(selected),
+            MfgViewTab::Assignments => self.selected_assignment_id = Some(selected),
+            MfgViewTab::Reports => self.selected_report_id = Some(selected),
+            MfgViewTab::Reviews => self.selected_review_id = Some(selected),
+        }
+        self.list_scroll = next;
+        self.detail_scroll = 0;
+        self.backlink_index = 0;
+        self.selection_revision = self.selection_revision.saturating_add(1);
+        self.request_refresh();
+    }
+
+    pub fn activate_backlink(&mut self, kind: MfgBacklinkKind) -> Option<MfgBacklink> {
+        let backlink = self
+            .selected_item()?
+            .backlinks
+            .iter()
+            .find(|link| link.kind == kind)
+            .cloned()?;
+        self.last_backlink_intent = Some(backlink.clone());
+        Some(backlink)
+    }
+
+    pub fn adjust_page_limit(&mut self, increase: bool) -> bool {
+        let key = match self.active_tab {
+            MfgViewTab::Overview => return false,
+            MfgViewTab::Incidents => "incidents",
+            MfgViewTab::Alerts => "alerts",
+            MfgViewTab::Assignments => "assignments",
+            MfgViewTab::Reports => "reports",
+            MfgViewTab::Reviews => "reviews",
+        };
+        let pagination = self.pagination.entry(key.to_string()).or_default();
+        let current = pagination.limit.max(50);
+        let next = if increase {
+            current.saturating_add(50).min(500)
+        } else {
+            current.saturating_sub(50).max(50)
+        };
+        if next == current {
+            return false;
+        }
+        pagination.limit = next;
+        self.request_refresh();
+        true
+    }
+
+    #[must_use]
+    pub fn active_tab_forbidden(&self) -> Option<(&'static str, &str)> {
+        self.active_tab.section_keys().iter().find_map(|section| {
+            self.forbidden_sections
+                .get(*section)
+                .map(|reason| (*section, reason.as_str()))
+        })
+    }
+
+    #[must_use]
+    pub fn route_projection_status(
+        &self,
+        route_id: app_mfg_contract::MfgRouteId,
+    ) -> Option<&'static str> {
+        use app_mfg_contract::MfgRouteId as R;
+        let section = mfg_route_section(route_id)?;
+        if self.forbidden_sections.contains_key(section) {
+            return Some("forbidden");
+        }
+        if self.section_errors.contains_key(section) {
+            return Some("error");
+        }
+        if route_id != R::LiveStream && !self.attempted_routes.contains(&route_id) {
+            return Some("not-requested");
+        }
+        let status = |loaded: bool, selected: bool| {
+            if loaded {
+                "visible"
+            } else if !selected {
+                "awaiting-selection"
+            } else {
+                "pending"
+            }
+        };
+        Some(match route_id {
+            R::ContractGet => status(self.contract.is_some(), true),
+            R::AppGet => status(self.app_descriptor.is_some(), true),
+            R::CommandCenterGet => status(self.command_center.is_some(), true),
+            R::DecisionTraceGet => status(self.decision_trace.is_some(), true),
+            R::IncidentList => status(self.pagination.contains_key("incidents"), true),
+            R::IncidentGet => status(
+                self.incident_detail.is_some(),
+                self.selected_incident_id.is_some(),
+            ),
+            R::IncidentRoomGet => status(
+                self.incident_room.is_some(),
+                self.selected_incident_id.is_some(),
+            ),
+            R::AnalysisGet => status(self.analysis.is_some(), self.selected_incident_id.is_some()),
+            R::ExecutionGet => status(
+                self.executions.is_some(),
+                self.selected_incident_id.is_some(),
+            ),
+            R::AlertRuleList => status(self.pagination.contains_key("alert_rules"), true),
+            R::AlertList => status(self.pagination.contains_key("alerts"), true),
+            R::AssignmentList => status(self.pagination.contains_key("assignments"), true),
+            R::AssignmentGet => status(
+                self.assignment_detail.is_some(),
+                self.selected_assignment_id.is_some(),
+            ),
+            R::ReportList => status(self.pagination.contains_key("reports"), true),
+            R::ReportGet => status(
+                self.report_detail.is_some(),
+                self.selected_report_id.is_some(),
+            ),
+            R::ReportDeliveryStateGet => status(
+                self.delivery_state.is_some(),
+                self.selected_report_id.is_some(),
+            ),
+            R::ReportReviewList => status(self.pagination.contains_key("reviews"), true),
+            R::ReportReviewGet => status(
+                self.review_detail.is_some(),
+                self.selected_review_id.is_some(),
+            ),
+            R::LiveStream => {
+                if self.live_stream_available {
+                    "route-declared-not-connected"
+                } else {
+                    "unavailable"
+                }
+            }
+            _ => return None,
+        })
+    }
+
+    #[must_use]
+    pub fn current_detail(&self) -> Option<Value> {
+        match self.active_tab {
+            MfgViewTab::Overview => Some(serde_json::json!({
+                "app": self.app_descriptor.as_ref(),
+                "command_center": self.command_center.as_ref(),
+                "decision_trace": self.decision_trace.as_ref(),
+                "live_stream": {
+                    "available": self.live_stream_available,
+                    "epoch": self.live_epoch.as_deref(),
+                    "cursor": self.live_cursor.as_deref(),
+                    "freshness": self.freshness,
+                    "connection": self.connection,
+                }
+            })),
+            MfgViewTab::Incidents => Some(serde_json::json!({
+                "incident": self.incident_detail.as_ref(),
+                "room": self.incident_room.as_ref(),
+                "analysis": self.analysis.as_ref(),
+                "execution": self.executions.as_ref(),
+            })),
+            MfgViewTab::Alerts => self.selected_item().map(|item| item.raw.clone()),
+            MfgViewTab::Assignments => self
+                .assignment_detail
+                .as_ref()
+                .and_then(|document| serde_json::to_value(document).ok()),
+            MfgViewTab::Reports => Some(serde_json::json!({
+                "report": self.report_detail.as_ref(),
+                "delivery_state": self.delivery_state.as_ref(),
+            })),
+            MfgViewTab::Reviews => self
+                .review_detail
+                .as_ref()
+                .and_then(|review| serde_json::to_value(review).ok()),
+        }
+    }
+}
+
+fn mfg_route_for_section(section: &str) -> Option<app_mfg_contract::MfgRouteId> {
+    use app_mfg_contract::MfgRouteId as R;
+    Some(match section {
+        "contract" => R::ContractGet,
+        "app" => R::AppGet,
+        "command_center" => R::CommandCenterGet,
+        "decision_trace" => R::DecisionTraceGet,
+        "incidents" => R::IncidentList,
+        "incident_detail" => R::IncidentGet,
+        "incident_room" => R::IncidentRoomGet,
+        "analysis" => R::AnalysisGet,
+        "execution" => R::ExecutionGet,
+        "alert_rules" => R::AlertRuleList,
+        "alerts" => R::AlertList,
+        "assignments" => R::AssignmentList,
+        "assignment_detail" => R::AssignmentGet,
+        "reports" => R::ReportList,
+        "report_detail" => R::ReportGet,
+        "delivery_state" => R::ReportDeliveryStateGet,
+        "reviews" => R::ReportReviewList,
+        "review_detail" => R::ReportReviewGet,
+        _ => return None,
+    })
+}
+
+pub(crate) fn mfg_required_capability(error: &MfgApiErrorV1) -> Option<&str> {
+    error
+        .details
+        .get("required_capability")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|capability| !capability.is_empty())
+}
+
+pub(crate) fn mfg_route_requires_capability(
+    requirement: &app_mfg_contract::MfgCapabilityRequirement,
+    capability: &str,
+) -> bool {
+    match requirement {
+        app_mfg_contract::MfgCapabilityRequirement::One {
+            capability: required,
+        } => required.as_str() == capability,
+        app_mfg_contract::MfgCapabilityRequirement::All { capabilities } => capabilities
+            .iter()
+            .any(|required| required.as_str() == capability),
+        app_mfg_contract::MfgCapabilityRequirement::PerAction => false,
+    }
+}
+
+fn preserve_or_first(selected: Option<String>, items: &[MfgItemSummary]) -> Option<String> {
+    selected
+        .filter(|id| items.iter().any(|item| &item.id == id))
+        .or_else(|| items.first().map(|item| item.id.clone()))
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TaskSummary {
@@ -2864,5 +3865,297 @@ mod tests {
         assert!(app.gateway_action_receipts[0]
             .dispatch_status
             .ends_with("..."));
+    }
+
+    #[test]
+    fn mfg_refresh_and_selection_revisions_reject_stale_snapshots() {
+        let mut state = MfgOperationsState::default();
+        let generation = state.take_refresh_request().expect("initial refresh");
+        state.active_tab = MfgViewTab::Incidents;
+        state.incidents = vec![MfgItemSummary {
+            id: "incident-1".to_string(),
+            ..MfgItemSummary::default()
+        }];
+        state.selected_incident_id = Some("incident-1".to_string());
+        state.move_selection(true);
+        let stale = MfgOperationsSnapshot {
+            selection_revision: state.selection_revision.saturating_sub(1),
+            incidents: vec![MfgItemSummary {
+                id: "stale".to_string(),
+                ..MfgItemSummary::default()
+            }],
+            ..MfgOperationsSnapshot::default()
+        };
+        state.apply_snapshot(generation, stale);
+        assert_eq!(state.incidents[0].id, "incident-1");
+        assert!(!state.refresh_in_flight);
+        assert!(state.take_refresh_request().is_some());
+    }
+
+    #[test]
+    fn mfg_refresh_attempt_evidence_is_current_generation_only() {
+        let mut state = MfgOperationsState::default();
+        state
+            .attempted_routes
+            .insert(app_mfg_contract::MfgRouteId::IncidentList);
+        let generation = state.take_refresh_request().expect("refresh");
+        assert!(state.attempted_routes.is_empty());
+
+        state.apply_contract(
+            generation,
+            app_mfg_contract::MfgFrontendContractV1 {
+                kind: "mfg.frontend_contract".to_string(),
+                contract_version: app_mfg_contract::MfgContractVersion::default(),
+                generated_at: chrono::Utc::now(),
+                app_id: "mfg.manufacturing".to_string(),
+                active_route_count: 0,
+                planned_route_count: 0,
+                routes: Vec::new(),
+                actions: Vec::new(),
+                surfaces: Vec::new(),
+            },
+        );
+        assert_eq!(
+            state.attempted_routes,
+            BTreeSet::from([app_mfg_contract::MfgRouteId::ContractGet])
+        );
+
+        state.apply_snapshot(
+            generation,
+            MfgOperationsSnapshot {
+                selection_revision: state.selection_revision,
+                attempted_routes: BTreeSet::from([
+                    app_mfg_contract::MfgRouteId::ContractGet,
+                    app_mfg_contract::MfgRouteId::CommandCenterGet,
+                ]),
+                ..MfgOperationsSnapshot::default()
+            },
+        );
+        assert_eq!(state.attempted_routes.len(), 2);
+        assert!(!state
+            .attempted_routes
+            .contains(&app_mfg_contract::MfgRouteId::IncidentList));
+    }
+
+    #[test]
+    fn mfg_forbidden_refresh_redacts_cached_section_and_exposes_recovery() {
+        let mut state = MfgOperationsState::default();
+        state.reports = vec![MfgItemSummary {
+            id: "report-1".to_string(),
+            ..MfgItemSummary::default()
+        }];
+        state.last_updated_at = Some("2026-07-16T00:00:00Z".to_string());
+        let generation = state.take_refresh_request().expect("refresh");
+        let error = app_mfg_contract::MfgApiErrorV1::capability_denied("mfg.read");
+        state.apply_error(generation, "reports".to_string(), error);
+        assert!(state.reports.is_empty());
+        assert!(state.is_stale);
+        assert!(state.forbidden_sections.contains_key("reports"));
+        assert!(!state.recovery_actions.is_empty());
+    }
+
+    #[test]
+    fn mfg_detail_forbidden_recrops_every_projection_with_the_same_capability() {
+        let mut state = MfgOperationsState::default();
+        state.active_tab = MfgViewTab::Reviews;
+        state
+            .granted_capabilities
+            .push("mfg.report.review".to_string());
+        state.reviews = vec![MfgItemSummary {
+            id: "review-1".to_string(),
+            ..MfgItemSummary::default()
+        }];
+        state.review_detail = Some(app_mfg_contract::MfgReportDeliveryReview {
+            review_id: "review-1".to_string(),
+            report_id: "report-1".to_string(),
+            report_revision: 1,
+            delivery_revision: 1,
+            dead_letter_digest: "digest".to_string(),
+            requester_principal: "principal".to_string(),
+            approval_id: None,
+            correlation_id: "correlation".to_string(),
+            requested_action: None,
+            decision: None,
+            reviewer_principal: None,
+            reason: String::new(),
+            evidence_refs: Vec::new(),
+            decision_lease_ref: None,
+            effect_key: None,
+            effect_payload: Value::Null,
+            effect_receipt_ref: None,
+            effect_error: None,
+            status: app_mfg_contract::MfgReportDeliveryReviewStatus::PendingApproval,
+            revision: 1,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        });
+        let generation = state.take_refresh_request().expect("refresh");
+        state.apply_error(
+            generation,
+            "review_detail".to_string(),
+            app_mfg_contract::MfgApiErrorV1::capability_denied("mfg.report.review"),
+        );
+        assert_eq!(
+            state.active_tab_forbidden().map(|(section, _)| section),
+            Some("reviews")
+        );
+        assert!(state.reviews.is_empty());
+        assert!(state.review_detail.is_none());
+        assert!(state.forbidden_sections.contains_key("reviews"));
+        assert!(state.forbidden_sections.contains_key("review_detail"));
+        assert!(!state
+            .granted_capabilities
+            .iter()
+            .any(|capability| capability == "mfg.report.review"));
+        assert!(state
+            .attempted_routes
+            .contains(&app_mfg_contract::MfgRouteId::ReportReviewGet));
+    }
+
+    #[test]
+    fn mfg_authentication_loss_recrops_all_cached_mfg_data() {
+        let mut state = MfgOperationsState::default();
+        state.incidents.push(MfgItemSummary {
+            id: "incident-1".to_string(),
+            ..MfgItemSummary::default()
+        });
+        state.reviews.push(MfgItemSummary {
+            id: "review-1".to_string(),
+            ..MfgItemSummary::default()
+        });
+        state.granted_capabilities = vec!["mfg.read".to_string(), "mfg.report.review".to_string()];
+        let generation = state.take_refresh_request().expect("refresh");
+        state.apply_error(
+            generation,
+            "incident_detail".to_string(),
+            app_mfg_contract::MfgApiErrorV1::authentication_required("token expired"),
+        );
+        assert!(state.incidents.is_empty());
+        assert!(state.reviews.is_empty());
+        assert!(state.granted_capabilities.is_empty());
+        assert_eq!(state.forbidden_sections.len(), MFG_ALL_READ_SECTIONS.len());
+    }
+
+    #[test]
+    fn mfg_partial_snapshot_keeps_typed_error_request_id_and_stale_flag() {
+        let mut state = MfgOperationsState::default();
+        state.last_updated_at = Some("2026-07-16T00:00:00Z".to_string());
+        let generation = state.take_refresh_request().expect("refresh");
+        let mut error = app_mfg_contract::MfgApiErrorV1::capability_denied("mfg.read");
+        error.request_id = Some("request-403".to_string());
+        let snapshot = MfgOperationsSnapshot {
+            selection_revision: state.selection_revision,
+            fetched_at: "2026-07-16T00:01:00Z".to_string(),
+            degraded_reasons: vec!["reports: denied".to_string()],
+            incidents: vec![MfgItemSummary {
+                id: "incident-1".to_string(),
+                ..MfgItemSummary::default()
+            }],
+            reviews: vec![MfgItemSummary {
+                id: "review-1".to_string(),
+                ..MfgItemSummary::default()
+            }],
+            granted_capabilities: vec!["mfg.read".to_string(), "mfg.report.review".to_string()],
+            section_errors: BTreeMap::from([("reports".to_string(), error)]),
+            attempted_routes: BTreeSet::from([
+                app_mfg_contract::MfgRouteId::ContractGet,
+                app_mfg_contract::MfgRouteId::ReportList,
+            ]),
+            is_stale: true,
+            ..MfgOperationsSnapshot::default()
+        };
+        state.apply_snapshot(generation, snapshot);
+        assert!(state.is_stale);
+        assert_eq!(
+            state
+                .last_error
+                .as_ref()
+                .and_then(|error| error.request_id.as_deref()),
+            Some("request-403")
+        );
+        assert!(!state.recovery_actions.is_empty());
+        assert!(state.incidents.is_empty());
+        assert_eq!(state.reviews.len(), 1);
+        assert_eq!(
+            state.granted_capabilities,
+            vec!["mfg.report.review".to_string()]
+        );
+        assert_eq!(
+            state.forbidden_sections.len(),
+            app_mfg_contract::mfg_tui_p0_read_route_contracts()
+                .into_iter()
+                .filter(|route| mfg_route_requires_capability(
+                    &route.capability,
+                    app_mfg_contract::MfgCapabilityId::Read.as_str()
+                ))
+                .count()
+        );
+        assert_eq!(state.attempted_routes.len(), 2);
+    }
+
+    #[test]
+    fn mfg_read_section_inventory_is_derived_equal_to_the_canonical_route_contract() {
+        let canonical = app_mfg_contract::mfg_tui_p0_read_route_contracts()
+            .into_iter()
+            .filter_map(|route| mfg_route_section(route.route_id))
+            .collect::<BTreeSet<_>>();
+        let guarded = MFG_ALL_READ_SECTIONS.into_iter().collect::<BTreeSet<_>>();
+        assert_eq!(guarded, canonical);
+    }
+
+    #[test]
+    fn mfg_delta_queue_is_bounded() {
+        let mut state = MfgOperationsState::default();
+        for cursor in 0..(MFG_DELTA_QUEUE_LIMIT + 20) {
+            state.enqueue_delta(MfgReadDelta {
+                cursor: Some(cursor.to_string()),
+                ..MfgReadDelta::default()
+            });
+        }
+        assert_eq!(state.delta_queue.len(), MFG_DELTA_QUEUE_LIMIT);
+        assert_eq!(
+            state
+                .delta_queue
+                .front()
+                .and_then(|delta| delta.cursor.as_deref()),
+            Some("20")
+        );
+    }
+
+    #[test]
+    fn mfg_pagination_intent_changes_the_gateway_limit_and_requests_refresh() {
+        let mut state = MfgOperationsState::default();
+        state.refresh_requested = false;
+        state.active_tab = MfgViewTab::Incidents;
+        assert!(state.adjust_page_limit(true));
+        assert_eq!(state.pagination["incidents"].limit, 100);
+        assert!(state.refresh_requested);
+        state.refresh_requested = false;
+        assert!(state.adjust_page_limit(false));
+        assert_eq!(state.pagination["incidents"].limit, 50);
+        assert!(state.refresh_requested);
+    }
+
+    #[test]
+    fn mfg_backlink_intent_never_synthesizes_a_missing_target() {
+        let mut state = MfgOperationsState::default();
+        state.active_tab = MfgViewTab::Incidents;
+        state.incidents = vec![MfgItemSummary {
+            id: "incident-1".to_string(),
+            backlinks: vec![MfgBacklink {
+                kind: MfgBacklinkKind::Evidence,
+                target: "evidence://packet-1".to_string(),
+                label: "Evidence packet".to_string(),
+            }],
+            ..MfgItemSummary::default()
+        }];
+        state.selected_incident_id = Some("incident-1".to_string());
+        assert_eq!(
+            state
+                .activate_backlink(MfgBacklinkKind::Evidence)
+                .map(|link| link.target),
+            Some("evidence://packet-1".to_string())
+        );
+        assert!(state.activate_backlink(MfgBacklinkKind::Runtime).is_none());
     }
 }

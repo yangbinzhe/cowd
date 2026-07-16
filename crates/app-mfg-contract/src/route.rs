@@ -243,3 +243,17 @@ pub fn mfg_route_contract_by_method_path(method: &str, path: &str) -> Option<Mfg
         .into_iter()
         .find(|contract| contract.method == method && contract.path == path)
 }
+
+/// Canonical TUI P0 read surface. Consumers must derive this set from route
+/// semantics instead of maintaining a second hand-written inventory.
+#[must_use]
+pub fn mfg_tui_p0_read_route_contracts() -> Vec<MfgRouteContract> {
+    mfg_route_contracts()
+        .into_iter()
+        .filter(|route| {
+            route.availability == MfgActionAvailability::Active
+                && route.consumers.contains(&MfgConsumer::TuiP0)
+                && route.class == MfgMutationClass::Read
+        })
+        .collect()
+}

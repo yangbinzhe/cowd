@@ -4316,7 +4316,7 @@ pub(crate) mod tests {
         assert_eq!(json["webui_tui_full_parity"], true);
         assert_eq!(json["cli_is_minimal_control"], true);
         assert_eq!(json["webui"]["role"], "enhanced_management");
-        assert_eq!(json["tui"]["role"], "console_unavailable");
+        assert_eq!(json["tui"]["role"], "console_read_only");
         assert_eq!(json["cli"]["role"], "minimal_core_control");
     }
 

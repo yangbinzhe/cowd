@@ -115,8 +115,11 @@ pub fn manufacturing_app_descriptor() -> MfgApplicationDescriptor {
             },
             MfgApplicationSurface {
                 surface: MfgApplicationSurfaceKind::Tui,
-                role: "console_unavailable".to_string(),
-                entrypoints: Vec::new(),
+                role: "console_read_only".to_string(),
+                entrypoints: vec![
+                    "/api/apps/mfg/contract".to_string(),
+                    "/mfg".to_string(),
+                ],
                 actions: Vec::new(),
             },
             MfgApplicationSurface {
@@ -174,5 +177,18 @@ mod tests {
         assert_eq!(cli.role, "minimal_core_control");
         assert!(cli.actions.is_empty());
         assert_eq!(cli.entrypoints, vec!["/api/apps/mfg/app"]);
+    }
+
+    #[test]
+    fn manufacturing_app_descriptor_exposes_tui_as_read_only_without_operations() {
+        let descriptor = manufacturing_app_descriptor();
+        let tui = descriptor
+            .surfaces
+            .iter()
+            .find(|surface| surface.surface == MfgApplicationSurfaceKind::Tui)
+            .expect("TUI surface should be described");
+        assert_eq!(tui.role, "console_read_only");
+        assert!(tui.entrypoints.contains(&"/mfg".to_string()));
+        assert!(tui.actions.is_empty());
     }
 }

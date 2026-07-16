@@ -1,13 +1,23 @@
-use crate::tui::TuiSession;
-use crate::reporter::TestRunner;
 use crate::llm;
+use crate::reporter::TestRunner;
+use crate::tui::{TuiLaunchConfig, TuiSession};
 
 pub fn has_scenario(name: &str) -> bool {
-    matches!(name, "tui_startup" | "tui_chat" | "tui_chat_stream" | "tui_scroll_expand" | "tui_search" | "tui_sidebar_tabs" | "" | "all")
+    matches!(
+        name,
+        "tui_startup"
+            | "tui_chat"
+            | "tui_chat_stream"
+            | "tui_scroll_expand"
+            | "tui_search"
+            | "tui_sidebar_tabs"
+            | ""
+            | "all"
+    )
 }
 
 pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
-    let tui = TuiSession::new("tui-basic")?;
+    let tui = TuiSession::new(TuiLaunchConfig::from_env("tui-basic")?)?;
     tui.wait_until_ready(15)?;
     println!("\n── TUI Basic ──");
 
@@ -62,8 +72,11 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
         tui.send_key("Tab")?;
         std::thread::sleep(std::time::Duration::from_millis(500));
         let after = tui.assert_healthy_capture(120)?;
-        if after == before { Err(anyhow::anyhow!("Tab did not update the TUI")) }
-        else { Ok(()) }
+        if after == before {
+            Err(anyhow::anyhow!("Tab did not update the TUI"))
+        } else {
+            Ok(())
+        }
     });
 
     tui.close()?;

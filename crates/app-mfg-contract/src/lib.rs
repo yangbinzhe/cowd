@@ -32,8 +32,8 @@ pub use mutation::{
     MfgMutationContextV1, MfgMutationSemantics, MfgRevisionSemantics,
 };
 pub use operations::{
-    MfgContractDiagnosticV1, MfgMutationRequestV1, MfgMutationResponseV1, MfgNoBodyRequestV1,
-    MfgReadCollectionV1, MfgReadResourceV1, MfgReadResponseV1,
+    MfgContractDiagnosticV1, MfgIncidentListQuery, MfgMutationRequestV1, MfgMutationResponseV1,
+    MfgNoBodyRequestV1, MfgReadCollectionV1, MfgReadResourceV1, MfgReadResponseV1,
 };
 pub use receipt::{MfgReceiptStatus, MfgReceiptV1};
 pub use review::{
@@ -44,8 +44,8 @@ pub use review::{
     MfgReportDeliveryReviewSummary,
 };
 pub use route::{
-    mfg_route_contract, mfg_route_contracts, MfgCapabilityRequirement, MfgConsumer,
-    MfgRouteContract, MfgRouteId, MfgSchemaOwner,
+    mfg_route_contract, mfg_route_contracts, mfg_tui_p0_read_route_contracts,
+    MfgCapabilityRequirement, MfgConsumer, MfgRouteContract, MfgRouteId, MfgSchemaOwner,
 };
 pub use schema::MfgOpenApiSchemaRegistry;
 pub use surface::{MfgFrontendContractV1, MfgSurfaceContract, MfgSurfaceKind, MfgSurfaceRole};
@@ -91,6 +91,24 @@ mod tests {
         let decoded = serde_json::from_str::<Vec<MfgRouteContract>>(&encoded)
             .expect("route contract roundtrip");
         assert_eq!(decoded, routes);
+    }
+
+    #[test]
+    fn tui_p0_read_inventory_is_semantically_derived_and_excludes_v545_snapshot() {
+        let routes = mfg_tui_p0_read_route_contracts();
+        assert_eq!(routes.len(), 19);
+        assert!(routes
+            .iter()
+            .all(|route| route.class == MfgMutationClass::Read));
+        assert!(routes
+            .iter()
+            .all(|route| route.availability == MfgActionAvailability::Active));
+        assert!(routes
+            .iter()
+            .all(|route| route.consumers.contains(&MfgConsumer::TuiP0)));
+        assert!(!routes
+            .iter()
+            .any(|route| route.route_id == MfgRouteId::LiveSnapshot));
     }
 
     #[test]

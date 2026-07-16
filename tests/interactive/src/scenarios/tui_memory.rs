@@ -1,12 +1,12 @@
-use crate::tui::TuiSession;
 use crate::reporter::TestRunner;
+use crate::tui::{TuiLaunchConfig, TuiSession};
 
 pub fn has_scenario(name: &str) -> bool {
     matches!(name, "tui_memory_panel" | "tui_memory_slash" | "" | "all")
 }
 
 pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
-    let tui = TuiSession::new("tui-memory")?;
+    let tui = TuiSession::new(TuiLaunchConfig::from_env("tui-memory")?)?;
     tui.wait_until_ready(15)?;
     println!("\n── TUI Memory ──");
 
@@ -39,11 +39,15 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
         let mut cap = String::new();
         while std::time::Instant::now() < deadline {
             cap = tui.capture()?;
-            if cap != before && cap.trim().len() > before.trim().len() { break; }
+            if cap != before && cap.trim().len() > before.trim().len() {
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(300));
         }
         if cap == before {
-            return Err(anyhow::anyhow!("/memory slash command did not update the TUI"));
+            return Err(anyhow::anyhow!(
+                "/memory slash command did not update the TUI"
+            ));
         }
         Ok(())
     });
