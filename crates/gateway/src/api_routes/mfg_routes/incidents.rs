@@ -152,6 +152,11 @@ pub(super) async fn mfg_incident_room_handler(
         .open_store(&state.config_home)
         .and_then(|store| store.workflow_graph_for_incident(&id))
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let assignments = state
+        .services
+        .mfg
+        .list_assignments(&state.config_home, None, Some(&id), 100)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.incident_room",
         "incident": incident,
@@ -162,6 +167,8 @@ pub(super) async fn mfg_incident_room_handler(
         "memory_cases": memory_cases,
         "playbooks": playbooks,
         "workflow_graph": workflow_graph,
+        "canonical_task_ref": incident.task_id.as_ref().map(|task_id| format!("task:{task_id}")),
+        "assignments": assignments,
     })))
 }
 

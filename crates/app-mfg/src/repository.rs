@@ -12,11 +12,15 @@ use storage::{SqliteConnectionFactory, StorageHandle};
 use thiserror::Error;
 
 use crate::{
-    mfg_ontology_pack, mfg_seed_plan, MfgActionExecution, MfgActionExecutionRequest,
-    MfgActionFeedback, MfgCasePromotion, MfgCockpitProfile, MfgCockpitProjection,
+    mfg_ontology_pack, mfg_seed_plan, mfg_widget_catalog, MfgActionExecution,
+    MfgActionExecutionRequest, MfgActionFeedback, MfgAlertCommand, MfgAlertCommandInput,
+    MfgAlertOccurrence, MfgAlertRule, MfgAssignment, MfgAssignmentCommand,
+    MfgAssignmentCommandInput, MfgCasePromotion, MfgCockpitProfile, MfgCockpitProjection,
     MfgCockpitReportDeliveryReceipt, MfgCockpitReportRequest, MfgCockpitReportSnapshot,
-    MfgCockpitWidget, MfgCrossPlaneBridgeReceipt, MfgDomainSeedResult, MfgIncident, MfgMemoryCase,
-    MfgOperationalAnalysis, MfgPlaybook, MfgSkillRun, MfgWorkflowGraph, MfgWorkflowGraphError,
+    MfgCockpitWidget, MfgCommandReceipt, MfgCrossPlaneBridgeReceipt, MfgDomainSeedResult,
+    MfgForecastProjection, MfgForecastSignal, MfgIncident, MfgLiveProjection,
+    MfgLiveProjectionEvent, MfgMemoryCase, MfgOperationalAnalysis, MfgPlaybook, MfgSkillRun,
+    MfgWidgetDefinition, MfgWidgetInstance, MfgWorkflowGraph, MfgWorkflowGraphError,
 };
 
 use matrix_core::{
@@ -50,6 +54,17 @@ pub enum MfgRepositoryError {
         expected: Option<u64>,
         actual: Option<u64>,
     },
+    #[error(
+        "MFG {domain} {subject_id} revision conflict: expected {expected:?}, actual {actual:?}"
+    )]
+    RevisionConflict {
+        domain: String,
+        subject_id: String,
+        expected: Option<u64>,
+        actual: Option<u64>,
+    },
+    #[error("MFG command rejected: {0}")]
+    CommandRejected(String),
     #[error("MFG workflow graph error: {0}")]
     Workflow(#[from] MfgWorkflowGraphError),
 }
@@ -84,6 +99,9 @@ pub struct MfgHealth {
     pub metric_snapshot_count: u64,
     pub skill_execution_count: u64,
     pub workflow_graph_count: u64,
+    pub alert_rule_count: u64,
+    pub alert_occurrence_count: u64,
+    pub assignment_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -166,6 +184,9 @@ impl MfgRepository {
             metric_snapshot_count: count_table(&connection, "matrix_metric_snapshot")?,
             skill_execution_count: count_table(&connection, "mfg_skill_execution")?,
             workflow_graph_count: count_table(&connection, "mfg_workflow_graph")?,
+            alert_rule_count: count_table(&connection, "mfg_alert_rule")?,
+            alert_occurrence_count: count_table(&connection, "mfg_alert_occurrence")?,
+            assignment_count: count_table(&connection, "mfg_assignment")?,
         })
     }
 
@@ -214,12 +235,13 @@ impl MfgRepository {
     pub fn upsert_cockpit_profile(
         &self,
         profile: &MfgCockpitProfile,
+        expected_revision: Option<u64>,
     ) -> Result<MfgCockpitProfile, MfgRepositoryError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        upsert_cockpit_profile(&connection, profile)
+        upsert_cockpit_profile(&connection, profile, expected_revision)
     }
 
     pub fn get_cockpit_profile(
@@ -255,7 +277,7 @@ impl MfgRepository {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let profile = find_cockpit_profile(&connection, profile_id)?
             .ok_or_else(|| MfgRepositoryError::NotFound(profile_id.to_string()))?;
-        build_cockpit_projection(&connection, profile)
+        render_cockpit_projection(&connection, profile)
     }
 
     pub fn generate_cockpit_report(
@@ -269,7 +291,7 @@ impl MfgRepository {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let profile = find_cockpit_profile(&connection, profile_id)?
             .ok_or_else(|| MfgRepositoryError::NotFound(profile_id.to_string()))?;
-        let projection = build_cockpit_projection(&connection, profile)?;
+        let projection = render_cockpit_projection(&connection, profile)?;
         let report = MfgCockpitReportSnapshot::from_projection(projection, request);
         insert_cockpit_report(&connection, &report)?;
         Ok(report)
@@ -300,6 +322,194 @@ impl MfgRepository {
         report.attach_delivery_receipt(receipt);
         insert_cockpit_report(&connection, &report)?;
         Ok(report)
+    }
+
+    pub fn delete_cockpit_profile(
+        &self,
+        profile_id: &str,
+        expected_revision: u64,
+    ) -> Result<MfgCockpitProfile, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let profile = find_cockpit_profile(&connection, profile_id)?
+            .ok_or_else(|| MfgRepositoryError::NotFound(profile_id.to_string()))?;
+        ensure_revision(
+            "cockpit_profile",
+            profile_id,
+            expected_revision,
+            profile.revision,
+        )?;
+        connection.execute(
+            "DELETE FROM mfg_cockpit_profile WHERE profile_id = ?1",
+            params![profile_id],
+        )?;
+        append_projection_event(
+            &connection,
+            "cockpit",
+            &format!("mfg:cockpit-profile:{profile_id}"),
+            "profile.deleted",
+            serde_json::to_value(&profile)?,
+        )?;
+        Ok(profile)
+    }
+
+    pub fn upsert_alert_rule(
+        &self,
+        rule: &MfgAlertRule,
+        expected_revision: Option<u64>,
+    ) -> Result<MfgAlertRule, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        upsert_alert_rule(&connection, rule, expected_revision)
+    }
+
+    pub fn list_alert_rules(
+        &self,
+        owner_ref: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MfgAlertRule>, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        list_alert_rules(&connection, owner_ref, limit)
+    }
+
+    pub fn list_alert_occurrences(
+        &self,
+        status: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MfgAlertOccurrence>, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        list_alert_occurrences(&connection, status, limit)
+    }
+
+    pub fn upsert_alert_subscription(
+        &self,
+        subscription: &MfgAlertSubscription,
+        expected_revision: Option<u64>,
+    ) -> Result<MfgAlertSubscription, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        upsert_alert_subscription(&connection, subscription, expected_revision)
+    }
+
+    pub fn list_alert_subscriptions(
+        &self,
+        subscriber_ref: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MfgAlertSubscription>, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        list_alert_subscriptions(&connection, subscriber_ref, limit)
+    }
+
+    pub fn command_alert(
+        &self,
+        occurrence_id: &str,
+        command: MfgAlertCommandInput,
+    ) -> Result<(MfgAlertOccurrence, MfgCommandReceipt), MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        command_alert(&connection, occurrence_id, command)
+    }
+
+    pub fn forecasts(
+        &self,
+        metric_refs: &[String],
+        horizon: &str,
+        limit: usize,
+    ) -> Result<Vec<MfgForecastProjection>, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        build_forecasts(&connection, metric_refs, horizon, limit)
+    }
+
+    pub fn upsert_assignment(
+        &self,
+        assignment: &MfgAssignment,
+        expected_revision: Option<u64>,
+    ) -> Result<MfgAssignment, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        upsert_assignment(&connection, assignment, expected_revision)
+    }
+
+    pub fn get_assignment(
+        &self,
+        assignment_id: &str,
+    ) -> Result<Option<MfgAssignment>, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        find_assignment(&connection, assignment_id)
+    }
+
+    pub fn list_assignments(
+        &self,
+        assignee_ref: Option<&str>,
+        incident_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MfgAssignment>, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        list_assignments(&connection, assignee_ref, incident_id, limit)
+    }
+
+    pub fn command_assignment(
+        &self,
+        assignment_id: &str,
+        command: MfgAssignmentCommandInput,
+    ) -> Result<(MfgAssignment, MfgCommandReceipt), MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        command_assignment(&connection, assignment_id, command)
+    }
+
+    pub fn live_projection(
+        &self,
+        cursor: Option<u64>,
+        limit: usize,
+    ) -> Result<MfgLiveProjection, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        build_live_projection(&connection, cursor, limit)
+    }
+
+    pub fn record_command_notifications(
+        &self,
+        idempotency_key: &str,
+        notification_refs: Vec<String>,
+    ) -> Result<MfgCommandReceipt, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        record_command_notifications(&connection, idempotency_key, notification_refs)
     }
 
     pub fn upsert_entity(&self, entity: &MatrixEntity) -> Result<MatrixEntity, MfgRepositoryError> {
@@ -1607,6 +1817,81 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_mfg_cockpit_report_profile
             ON mfg_cockpit_report(profile_id, created_at DESC);
 
+        CREATE TABLE IF NOT EXISTS mfg_alert_rule (
+            rule_id TEXT PRIMARY KEY,
+            owner_ref TEXT NOT NULL,
+            enabled INTEGER NOT NULL,
+            revision INTEGER NOT NULL,
+            rule_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mfg_alert_rule_owner
+            ON mfg_alert_rule(owner_ref, enabled, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS mfg_alert_occurrence (
+            occurrence_id TEXT PRIMARY KEY,
+            rule_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            occurrence_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mfg_alert_occurrence_status
+            ON mfg_alert_occurrence(status, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS mfg_alert_subscription (
+            subscription_id TEXT PRIMARY KEY,
+            rule_id TEXT NOT NULL,
+            subscriber_ref TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            subscription_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mfg_alert_subscription_rule
+            ON mfg_alert_subscription(rule_id, subscriber_ref);
+
+        CREATE TABLE IF NOT EXISTS mfg_assignment (
+            assignment_id TEXT PRIMARY KEY,
+            task_ref TEXT NOT NULL,
+            workflow_id TEXT,
+            incident_id TEXT,
+            assignee_ref TEXT NOT NULL,
+            status TEXT NOT NULL,
+            visibility TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            assignment_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mfg_assignment_assignee
+            ON mfg_assignment(assignee_ref, status, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_mfg_assignment_incident
+            ON mfg_assignment(incident_id, updated_at DESC) WHERE incident_id IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_mfg_assignment_task_assignee
+            ON mfg_assignment(task_ref, assignee_ref);
+
+        CREATE TABLE IF NOT EXISTS mfg_command_receipt (
+            idempotency_key TEXT PRIMARY KEY,
+            domain TEXT NOT NULL,
+            subject_ref TEXT NOT NULL,
+            receipt_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS mfg_projection_event (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            domain TEXT NOT NULL,
+            subject_ref TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            event_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mfg_projection_event_cursor
+            ON mfg_projection_event(event_id);
+
         CREATE TABLE IF NOT EXISTS matrix_entity (
             entity_id TEXT PRIMARY KEY,
             entity_type TEXT NOT NULL,
@@ -2084,11 +2369,30 @@ fn list_workflow_graphs(
 fn upsert_cockpit_profile(
     connection: &Connection,
     profile: &MfgCockpitProfile,
+    expected_revision: Option<u64>,
 ) -> Result<MfgCockpitProfile, MfgRepositoryError> {
     let mut profile = profile.clone();
     if let Some(existing) = find_cockpit_profile(connection, &profile.profile_id)? {
+        if expected_revision != Some(existing.revision) {
+            return Err(MfgRepositoryError::RevisionConflict {
+                domain: "cockpit_profile".to_string(),
+                subject_id: profile.profile_id.clone(),
+                expected: expected_revision,
+                actual: Some(existing.revision),
+            });
+        }
         profile.created_at = existing.created_at;
+        profile.revision = existing.revision.saturating_add(1);
+    } else if expected_revision.is_some_and(|revision| revision != 0) {
+        return Err(MfgRepositoryError::RevisionConflict {
+            domain: "cockpit_profile".to_string(),
+            subject_id: profile.profile_id.clone(),
+            expected: expected_revision,
+            actual: None,
+        });
     }
+    profile.normalize_legacy();
+    validate_cockpit_profile(&profile)?;
     profile.updated_at = Utc::now();
     connection.execute(
         r"INSERT INTO mfg_cockpit_profile (
@@ -2106,6 +2410,13 @@ fn upsert_cockpit_profile(
             profile.updated_at.to_rfc3339(),
         ],
     )?;
+    append_projection_event(
+        connection,
+        "cockpit",
+        &format!("mfg:cockpit-profile:{}", profile.profile_id),
+        "profile.upserted",
+        serde_json::to_value(&profile)?,
+    )?;
     Ok(profile)
 }
 
@@ -2120,8 +2431,61 @@ fn find_cockpit_profile(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MfgRepositoryError::from))
+        .map(|json| {
+            let mut profile: MfgCockpitProfile = serde_json::from_str(&json)?;
+            profile.normalize_legacy();
+            Ok(profile)
+        })
         .transpose()
+}
+
+fn validate_cockpit_profile(profile: &MfgCockpitProfile) -> Result<(), MfgRepositoryError> {
+    if !(1..=24).contains(&profile.layout.columns)
+        || profile.layout.row_height == 0
+        || profile.layout.gap > 96
+    {
+        return Err(MfgRepositoryError::CommandRejected(
+            "dashboard layout is outside supported bounds".to_string(),
+        ));
+    }
+    let catalog = mfg_widget_catalog()
+        .into_iter()
+        .map(|item| (item.definition_id.clone(), item))
+        .collect::<BTreeMap<_, _>>();
+    let mut instance_ids = BTreeSet::new();
+    for instance in &profile.widget_instances {
+        if !instance_ids.insert(&instance.instance_id) || instance.instance_id.trim().is_empty() {
+            return Err(MfgRepositoryError::CommandRejected(
+                "widget instance ids must be unique and non-empty".to_string(),
+            ));
+        }
+        let definition = catalog.get(&instance.definition_id).ok_or_else(|| {
+            MfgRepositoryError::CommandRejected(format!(
+                "widget definition `{}` is not registered",
+                instance.definition_id
+            ))
+        })?;
+        if !(instance.config.is_null() || instance.config.is_object())
+            || !(instance.query.is_null() || instance.query.is_object())
+        {
+            return Err(MfgRepositoryError::CommandRejected(
+                "widget config and query must be JSON objects".to_string(),
+            ));
+        }
+        let placement = &instance.placement;
+        if placement.width < definition.min_width
+            || placement.width > definition.max_width
+            || placement.height < definition.min_height
+            || placement.height > definition.max_height
+            || placement.x.saturating_add(placement.width) > profile.layout.columns
+        {
+            return Err(MfgRepositoryError::CommandRejected(format!(
+                "widget `{}` placement is outside its definition or dashboard bounds",
+                instance.instance_id
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn list_cockpit_profiles(
@@ -2140,7 +2504,9 @@ fn list_cockpit_profiles(
         .query_map([], |row| row.get::<_, String>(0))?
         .map(|row| {
             let json = row?;
-            serde_json::from_str::<MfgCockpitProfile>(&json).map_err(MfgRepositoryError::from)
+            let mut profile = serde_json::from_str::<MfgCockpitProfile>(&json)?;
+            profile.normalize_legacy();
+            Ok(profile)
         })
         .filter_map(|result| match result {
             Ok(profile)
@@ -2193,137 +2559,43 @@ fn find_cockpit_report(
         .transpose()
 }
 
-fn build_cockpit_projection(
+fn render_cockpit_projection(
     connection: &Connection,
-    profile: MfgCockpitProfile,
+    mut profile: MfgCockpitProfile,
 ) -> Result<MfgCockpitProjection, MfgRepositoryError> {
-    let attention = list_attention(connection, 50)?
+    profile.normalize_legacy();
+    let catalog = mfg_widget_catalog()
         .into_iter()
-        .filter(|item| attention_matches_profile(item, &profile))
-        .take(8)
-        .collect::<Vec<_>>();
-    let quality_gates = list_recent_quality_gates(connection, 20)?;
-    let executions = list_recent_executions(connection, 20)?;
-    let mut widgets = Vec::new();
-
-    let attention_status = if attention
+        .map(|definition| (definition.definition_id.clone(), definition))
+        .collect::<BTreeMap<_, _>>();
+    let widgets = profile
+        .widget_instances
         .iter()
-        .any(|item| matches!(item.severity, MatrixSeverity::Critical))
-    {
-        "critical"
-    } else if attention.is_empty() {
-        "clear"
-    } else {
-        "watch"
-    };
-    let attention_sources = attention
-        .iter()
-        .map(|item| format!("matrix:attention:{}", item.attention_id))
-        .collect::<Vec<_>>();
-    widgets.push(MfgCockpitWidget::new(
-        "attention_queue",
-        "Focused operational attention",
-        attention_status,
-        attention
-            .iter()
-            .map(|item| item.priority_score)
-            .fold(0.0_f32, f32::max),
-        serde_json::json!({
-            "count": attention.len(),
-            "items": attention,
-        }),
-        attention_sources,
-    ));
-
-    let pass_count = quality_gates
-        .iter()
-        .filter(|gate| gate.decision == "pass")
-        .count();
-    let review_count = quality_gates
-        .iter()
-        .filter(|gate| gate.decision == "review")
-        .count();
-    let fail_count = quality_gates
-        .iter()
-        .filter(|gate| gate.decision == "fail")
-        .count();
-    let gate_status = if fail_count > 0 {
-        "fail"
-    } else if review_count > 0 {
-        "review"
-    } else if pass_count > 0 {
-        "pass"
-    } else {
-        "empty"
-    };
-    widgets.push(MfgCockpitWidget::new(
-        "quality_gate_status",
-        "Evidence and insight quality",
-        gate_status,
-        (fail_count as f32 * 1.0 + review_count as f32 * 0.65 + pass_count as f32 * 0.25).min(1.0),
-        serde_json::json!({
-            "pass_count": pass_count,
-            "review_count": review_count,
-            "fail_count": fail_count,
-            "recent": quality_gates,
-        }),
-        Vec::new(),
-    ));
-
-    let active_executions = executions
-        .iter()
-        .filter(|execution| {
-            !matches!(
-                execution.status.as_str(),
-                "feedback_resolved" | "feedback_rejected"
-            )
+        .filter(|instance| instance.visible)
+        .map(|instance| match catalog.get(&instance.definition_id) {
+            Some(definition) => render_cockpit_widget(connection, &profile, instance, definition)
+                .unwrap_or_else(|error| {
+                    MfgCockpitWidget::unavailable(instance, Some(definition), error.to_string())
+                }),
+            None => {
+                MfgCockpitWidget::unavailable(instance, None, "widget definition is not registered")
+            }
         })
+        .collect::<Vec<_>>();
+    let unavailable = widgets
+        .iter()
+        .filter(|widget| widget.status == "unavailable")
         .count();
-    widgets.push(MfgCockpitWidget::new(
-        "action_execution_status",
-        "Governed action execution",
-        if active_executions > 0 {
-            "active"
-        } else {
-            "clear"
-        },
-        (active_executions as f32 / 5.0).min(1.0),
-        serde_json::json!({
-            "active_count": active_executions,
-            "recent": executions,
-        }),
-        Vec::new(),
-    ));
-
-    widgets.push(MfgCockpitWidget::new(
-        "focus_thresholds",
-        "Personal focus and thresholds",
-        if profile.thresholds.is_null() {
-            "empty"
-        } else {
-            "configured"
-        },
-        0.2,
-        serde_json::json!({
-            "focus_refs": profile.focus_refs,
-            "focus_metric_ids": profile.focus_metric_ids,
-            "thresholds": profile.thresholds,
-            "cadence": profile.cadence,
-        }),
-        Vec::new(),
-    ));
-
+    let urgent = widgets
+        .iter()
+        .filter(|widget| matches!(widget.status.as_str(), "critical" | "fail" | "escalated"))
+        .count();
     let summary = format!(
-        "profile={} attention={} quality_gates={} active_executions={}",
+        "profile={} widgets={} urgent={} unavailable={}",
         profile.profile_id,
-        widgets
-            .iter()
-            .find(|widget| widget.widget_type == "attention_queue")
-            .and_then(|widget| widget.data.get("count"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        pass_count + review_count + fail_count,
-        active_executions
+        widgets.len(),
+        urgent,
+        unavailable
     );
     Ok(MfgCockpitProjection {
         projection_id: format!("cockpit-projection-{}", uuid::Uuid::new_v4()),
@@ -2332,6 +2604,234 @@ fn build_cockpit_projection(
         summary,
         generated_at: Utc::now(),
     })
+}
+
+fn render_cockpit_widget(
+    connection: &Connection,
+    profile: &MfgCockpitProfile,
+    instance: &MfgWidgetInstance,
+    definition: &MfgWidgetDefinition,
+) -> Result<MfgCockpitWidget, MfgRepositoryError> {
+    let limit = instance
+        .query
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(20)
+        .clamp(1, 100) as usize;
+    let (status, priority, data, source_refs) = match definition.definition_id.as_str() {
+        "attention.queue" | "risk.matrix" => {
+            let items = list_attention(connection, limit * 2)?
+                .into_iter()
+                .filter(|item| attention_matches_profile(item, profile))
+                .take(limit)
+                .collect::<Vec<_>>();
+            let status = if items
+                .iter()
+                .any(|item| matches!(item.severity, MatrixSeverity::Critical))
+            {
+                "critical"
+            } else if items.is_empty() {
+                "clear"
+            } else {
+                "watch"
+            };
+            let priority = items
+                .iter()
+                .map(|item| item.priority_score)
+                .fold(0.0_f32, f32::max);
+            let refs = items
+                .iter()
+                .map(|item| format!("matrix:attention:{}", item.attention_id))
+                .collect();
+            (
+                status,
+                priority,
+                serde_json::json!({ "count": items.len(), "items": items }),
+                refs,
+            )
+        }
+        "quality.gates" => {
+            let gates = list_recent_quality_gates(connection, limit)?;
+            let pass = gates.iter().filter(|gate| gate.decision == "pass").count();
+            let review = gates
+                .iter()
+                .filter(|gate| gate.decision == "review")
+                .count();
+            let fail = gates.iter().filter(|gate| gate.decision == "fail").count();
+            (
+                if fail > 0 {
+                    "fail"
+                } else if review > 0 {
+                    "review"
+                } else if pass > 0 {
+                    "pass"
+                } else {
+                    "empty"
+                },
+                (fail as f32 + review as f32 * 0.65).min(1.0),
+                serde_json::json!({ "pass_count": pass, "review_count": review, "fail_count": fail, "recent": gates }),
+                Vec::new(),
+            )
+        }
+        "action.executions" => {
+            let executions = list_recent_executions(connection, limit)?;
+            let active = executions
+                .iter()
+                .filter(|execution| {
+                    !matches!(
+                        execution.status.as_str(),
+                        "feedback_resolved" | "feedback_rejected"
+                    )
+                })
+                .count();
+            (
+                if active > 0 { "active" } else { "clear" },
+                (active as f32 / 5.0).min(1.0),
+                serde_json::json!({ "active_count": active, "recent": executions }),
+                Vec::new(),
+            )
+        }
+        "focus.summary" => (
+            if profile.thresholds.is_null() {
+                "empty"
+            } else {
+                "configured"
+            },
+            0.2,
+            serde_json::json!({ "focus_refs": profile.focus_refs, "focus_metric_ids": profile.focus_metric_ids, "thresholds": profile.thresholds, "filters": profile.global_filters, "cadence": profile.cadence }),
+            Vec::new(),
+        ),
+        "incident.queue" => {
+            let incidents = list_incidents(connection, limit)?;
+            let refs = incidents
+                .iter()
+                .map(|item| format!("mfg:incident:{}", item.incident_id))
+                .collect();
+            (
+                if incidents.is_empty() {
+                    "clear"
+                } else {
+                    "active"
+                },
+                (incidents.len() as f32 / 10.0).min(1.0),
+                serde_json::json!({ "count": incidents.len(), "items": incidents }),
+                refs,
+            )
+        }
+        "workflow.progress" => {
+            let graphs = list_workflow_graphs(connection, limit)?;
+            let refs = graphs
+                .iter()
+                .map(|item| format!("mfg:workflow:{}", item.workflow_id))
+                .collect();
+            (
+                if graphs.is_empty() { "empty" } else { "active" },
+                0.4,
+                serde_json::json!({ "count": graphs.len(), "items": graphs }),
+                refs,
+            )
+        }
+        "metric.lineage" => {
+            let metric_id = profile.focus_metric_ids.first().ok_or_else(|| {
+                MfgRepositoryError::CommandRejected(
+                    "metric.lineage requires a focused metric".to_string(),
+                )
+            })?;
+            let lineage = build_metric_lineage(connection, metric_id, 4)?;
+            (
+                "ready",
+                0.3,
+                serde_json::to_value(&lineage)?,
+                vec![format!("matrix:metric:{metric_id}")],
+            )
+        }
+        "entity.impact" => {
+            let entity_ref = profile.focus_refs.first().ok_or_else(|| {
+                MfgRepositoryError::CommandRejected(
+                    "entity.impact requires a focused entity".to_string(),
+                )
+            })?;
+            let trace = build_impact_trace(connection, entity_ref, 4)?;
+            (
+                "ready",
+                0.3,
+                serde_json::to_value(&trace)?,
+                vec![format!("matrix:entity:{entity_ref}")],
+            )
+        }
+        "data.freshness" => {
+            let watermarks = list_data_plane_watermarks(connection, limit)?;
+            (
+                if watermarks.is_empty() {
+                    "unavailable"
+                } else {
+                    "ready"
+                },
+                0.25,
+                serde_json::json!({ "count": watermarks.len(), "items": watermarks }),
+                Vec::new(),
+            )
+        }
+        "kpi.summary" | "trend.metrics" => {
+            let states = list_recent_metric_states(connection, profile, limit)?;
+            let refs = states
+                .iter()
+                .map(|state| format!("matrix:metric-state:{}", state.state_id))
+                .collect();
+            (
+                if states.is_empty() { "empty" } else { "ready" },
+                0.35,
+                serde_json::json!({ "count": states.len(), "items": states }),
+                refs,
+            )
+        }
+        "report.delivery" => (
+            "ready",
+            0.1,
+            serde_json::json!({ "profile_id": profile.profile_id, "cadence": profile.cadence }),
+            vec![format!("mfg:cockpit-profile:{}", profile.profile_id)],
+        ),
+        other => {
+            return Err(MfgRepositoryError::CommandRejected(format!(
+                "renderer is not implemented for {other}"
+            )))
+        }
+    };
+    Ok(MfgCockpitWidget {
+        widget_id: instance.instance_id.clone(),
+        widget_type: definition.renderer.clone(),
+        title: definition.title.clone(),
+        status: status.to_string(),
+        priority_score: priority,
+        data,
+        source_refs,
+        instance_id: instance.instance_id.clone(),
+        definition_id: definition.definition_id.clone(),
+        renderer_version: definition.renderer_version,
+        freshness: serde_json::json!({ "status": "current", "generated_at": Utc::now() }),
+        error: None,
+    })
+}
+
+fn list_recent_metric_states(
+    connection: &Connection,
+    profile: &MfgCockpitProfile,
+    limit: usize,
+) -> Result<Vec<MatrixMetricState>, MfgRepositoryError> {
+    let mut statement = connection
+        .prepare("SELECT state_json FROM matrix_metric_state ORDER BY computed_at DESC LIMIT ?1")?;
+    let rows = statement.query_map(params![(limit * 4).clamp(1, 400) as i64], |row| {
+        row.get::<_, String>(0)
+    })?;
+    rows.map(|row| Ok(serde_json::from_str::<MatrixMetricState>(&row?)?))
+        .filter(|result| {
+            result.as_ref().map_or(true, |state| {
+                profile.focus_metric_ids.is_empty()
+                    || profile.focus_metric_ids.contains(&state.metric_id)
+            })
+        })
+        .take(limit)
+        .collect()
 }
 
 fn attention_matches_profile(item: &MatrixAttentionItem, profile: &MfgCockpitProfile) -> bool {
@@ -2346,10 +2846,796 @@ fn attention_matches_profile(item: &MatrixAttentionItem, profile: &MfgCockpitPro
     }) {
         return true;
     }
-    profile
-        .focus_metric_ids
+    item.metric_refs.iter().any(|metric_ref| {
+        profile
+            .focus_metric_ids
+            .iter()
+            .any(|metric_id| metric_ref == metric_id)
+    })
+}
+
+fn ensure_revision(
+    domain: &str,
+    subject_id: &str,
+    expected: u64,
+    actual: u64,
+) -> Result<(), MfgRepositoryError> {
+    if expected == actual {
+        return Ok(());
+    }
+    Err(MfgRepositoryError::RevisionConflict {
+        domain: domain.to_string(),
+        subject_id: subject_id.to_string(),
+        expected: Some(expected),
+        actual: Some(actual),
+    })
+}
+
+fn append_projection_event(
+    connection: &Connection,
+    domain: &str,
+    subject_ref: &str,
+    event_type: &str,
+    payload: Value,
+) -> Result<u64, MfgRepositoryError> {
+    let event = serde_json::json!({ "domain": domain, "event_type": event_type, "subject_ref": subject_ref, "payload": payload, "created_at": Utc::now() });
+    connection.execute(
+        "INSERT INTO mfg_projection_event (domain, subject_ref, event_type, event_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![domain, subject_ref, event_type, serde_json::to_string(&event)?, Utc::now().to_rfc3339()],
+    )?;
+    Ok(connection.last_insert_rowid() as u64)
+}
+
+fn find_command_receipt(
+    connection: &Connection,
+    key: &str,
+    domain: &str,
+    subject_ref: &str,
+) -> Result<Option<MfgCommandReceipt>, MfgRepositoryError> {
+    let value = connection.query_row(
+        "SELECT domain, subject_ref, receipt_json FROM mfg_command_receipt WHERE idempotency_key = ?1",
+        params![key], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+    ).optional()?;
+    let Some((stored_domain, stored_subject, json)) = value else {
+        return Ok(None);
+    };
+    if stored_domain != domain || stored_subject != subject_ref {
+        return Err(MfgRepositoryError::CommandRejected(
+            "idempotency key is already bound to another command subject".to_string(),
+        ));
+    }
+    let mut receipt: MfgCommandReceipt = serde_json::from_str(&json)?;
+    receipt.idempotent_replay = true;
+    Ok(Some(receipt))
+}
+
+fn insert_command_receipt(
+    connection: &Connection,
+    receipt: &MfgCommandReceipt,
+) -> Result<(), MfgRepositoryError> {
+    connection.execute(
+        "INSERT INTO mfg_command_receipt (idempotency_key, domain, subject_ref, receipt_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![receipt.idempotency_key, receipt.domain, receipt.subject_ref, serde_json::to_string(receipt)?, receipt.created_at.to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+fn record_command_notifications(
+    connection: &Connection,
+    idempotency_key: &str,
+    notification_refs: Vec<String>,
+) -> Result<MfgCommandReceipt, MfgRepositoryError> {
+    let value = connection
+        .query_row(
+            "SELECT receipt_json FROM mfg_command_receipt WHERE idempotency_key = ?1",
+            params![idempotency_key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| MfgRepositoryError::NotFound(idempotency_key.to_string()))?;
+    let mut receipt: MfgCommandReceipt = serde_json::from_str(&value)?;
+    receipt.notification_refs = notification_refs;
+    connection.execute(
+        "UPDATE mfg_command_receipt SET receipt_json = ?2 WHERE idempotency_key = ?1",
+        params![idempotency_key, serde_json::to_string(&receipt)?],
+    )?;
+    append_projection_event(
+        connection,
+        &receipt.domain,
+        &receipt.subject_ref,
+        "notification.delivery_observed",
+        serde_json::to_value(&receipt)?,
+    )?;
+    Ok(receipt)
+}
+
+fn upsert_alert_rule(
+    connection: &Connection,
+    rule: &MfgAlertRule,
+    expected_revision: Option<u64>,
+) -> Result<MfgAlertRule, MfgRepositoryError> {
+    let mut rule = rule.clone();
+    let existing = find_alert_rule(connection, &rule.rule_id)?;
+    match existing {
+        Some(existing) => {
+            if expected_revision != Some(existing.revision) {
+                return Err(MfgRepositoryError::RevisionConflict {
+                    domain: "alert_rule".to_string(),
+                    subject_id: rule.rule_id.clone(),
+                    expected: expected_revision,
+                    actual: Some(existing.revision),
+                });
+            }
+            rule.created_at = existing.created_at;
+            rule.revision = existing.revision.saturating_add(1);
+        }
+        None if expected_revision.is_some_and(|revision| revision != 0) => {
+            return Err(MfgRepositoryError::RevisionConflict {
+                domain: "alert_rule".to_string(),
+                subject_id: rule.rule_id.clone(),
+                expected: expected_revision,
+                actual: None,
+            });
+        }
+        None => {}
+    }
+    rule.updated_at = Utc::now();
+    connection.execute(
+        r"INSERT INTO mfg_alert_rule (rule_id, owner_ref, enabled, revision, rule_json, created_at, updated_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+           ON CONFLICT(rule_id) DO UPDATE SET owner_ref=excluded.owner_ref, enabled=excluded.enabled, revision=excluded.revision, rule_json=excluded.rule_json, updated_at=excluded.updated_at",
+        params![rule.rule_id, rule.owner_ref, rule.enabled, rule.revision as i64, serde_json::to_string(&rule)?, rule.created_at.to_rfc3339(), rule.updated_at.to_rfc3339()],
+    )?;
+    materialize_alert_occurrences(connection, &rule)?;
+    append_projection_event(
+        connection,
+        "alert",
+        &format!("mfg:alert-rule:{}", rule.rule_id),
+        "alert_rule.upserted",
+        serde_json::to_value(&rule)?,
+    )?;
+    Ok(rule)
+}
+
+fn find_alert_rule(
+    connection: &Connection,
+    rule_id: &str,
+) -> Result<Option<MfgAlertRule>, MfgRepositoryError> {
+    connection
+        .query_row(
+            "SELECT rule_json FROM mfg_alert_rule WHERE rule_id = ?1",
+            params![rule_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(MfgRepositoryError::from))
+        .transpose()
+}
+
+fn list_alert_rules(
+    connection: &Connection,
+    owner_ref: Option<&str>,
+    limit: usize,
+) -> Result<Vec<MfgAlertRule>, MfgRepositoryError> {
+    let mut statement = connection
+        .prepare("SELECT rule_json FROM mfg_alert_rule ORDER BY updated_at DESC LIMIT ?1")?;
+    let rows = statement.query_map(params![limit.clamp(1, 500) as i64], |row| {
+        row.get::<_, String>(0)
+    })?;
+    rows.map(|row| Ok(serde_json::from_str::<MfgAlertRule>(&row?)?))
+        .filter(|item| {
+            item.as_ref().map_or(true, |rule| {
+                owner_ref.is_none_or(|owner| rule.owner_ref == owner)
+            })
+        })
+        .collect()
+}
+
+fn upsert_alert_subscription(
+    connection: &Connection,
+    subscription: &MfgAlertSubscription,
+    expected_revision: Option<u64>,
+) -> Result<MfgAlertSubscription, MfgRepositoryError> {
+    if find_alert_rule(connection, &subscription.rule_id)?.is_none() {
+        return Err(MfgRepositoryError::NotFound(subscription.rule_id.clone()));
+    }
+    let mut subscription = subscription.clone();
+    let existing = connection
+        .query_row(
+            "SELECT subscription_json FROM mfg_alert_subscription WHERE subscription_id = ?1",
+            params![subscription.subscription_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str::<MfgAlertSubscription>(&json))
+        .transpose()?;
+    match existing {
+        Some(existing) => {
+            if expected_revision != Some(existing.revision) {
+                return Err(MfgRepositoryError::RevisionConflict {
+                    domain: "alert_subscription".to_string(),
+                    subject_id: subscription.subscription_id.clone(),
+                    expected: expected_revision,
+                    actual: Some(existing.revision),
+                });
+            }
+            subscription.created_at = existing.created_at;
+            subscription.revision = existing.revision.saturating_add(1);
+        }
+        None if expected_revision.is_some_and(|revision| revision != 0) => {
+            return Err(MfgRepositoryError::RevisionConflict {
+                domain: "alert_subscription".to_string(),
+                subject_id: subscription.subscription_id.clone(),
+                expected: expected_revision,
+                actual: None,
+            })
+        }
+        None => {}
+    }
+    subscription.updated_at = Utc::now();
+    connection.execute(r"INSERT INTO mfg_alert_subscription (subscription_id, rule_id, subscriber_ref, revision, subscription_json, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(subscription_id) DO UPDATE SET rule_id=excluded.rule_id, subscriber_ref=excluded.subscriber_ref, revision=excluded.revision, subscription_json=excluded.subscription_json, updated_at=excluded.updated_at",
+        params![subscription.subscription_id, subscription.rule_id, subscription.subscriber_ref, subscription.revision as i64, serde_json::to_string(&subscription)?, subscription.created_at.to_rfc3339(), subscription.updated_at.to_rfc3339()])?;
+    append_projection_event(
+        connection,
+        "alert",
+        &format!("mfg:alert-subscription:{}", subscription.subscription_id),
+        "alert_subscription.upserted",
+        serde_json::to_value(&subscription)?,
+    )?;
+    Ok(subscription)
+}
+
+fn list_alert_subscriptions(
+    connection: &Connection,
+    subscriber_ref: Option<&str>,
+    limit: usize,
+) -> Result<Vec<MfgAlertSubscription>, MfgRepositoryError> {
+    let mut statement = connection.prepare(
+        "SELECT subscription_json FROM mfg_alert_subscription ORDER BY updated_at DESC LIMIT ?1",
+    )?;
+    let rows = statement.query_map(params![limit.clamp(1, 500) as i64], |row| {
+        row.get::<_, String>(0)
+    })?;
+    rows.map(|row| Ok(serde_json::from_str::<MfgAlertSubscription>(&row?)?))
+        .filter(|item| {
+            item.as_ref().map_or(true, |subscription| {
+                subscriber_ref.is_none_or(|filter| subscription.subscriber_ref == filter)
+            })
+        })
+        .collect()
+}
+
+fn materialize_alert_occurrences(
+    connection: &Connection,
+    rule: &MfgAlertRule,
+) -> Result<(), MfgRepositoryError> {
+    if !rule.enabled {
+        return Ok(());
+    }
+    for attention in list_attention(connection, 200)?.into_iter().filter(|item| {
+        (rule.metric_refs.is_empty()
+            || item
+                .metric_refs
+                .iter()
+                .any(|value| rule.metric_refs.contains(value)))
+            && (rule.entity_refs.is_empty()
+                || item
+                    .entity_ref
+                    .as_ref()
+                    .is_some_and(|value| rule.entity_refs.contains(value)))
+    }) {
+        let occurrence_id = format!(
+            "alert-occurrence-{}-{}",
+            rule.rule_id, attention.attention_id
+        );
+        let exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mfg_alert_occurrence WHERE occurrence_id = ?1)",
+            params![occurrence_id],
+            |row| row.get(0),
+        )?;
+        if exists {
+            continue;
+        }
+        let occurrence = MfgAlertOccurrence {
+            occurrence_id,
+            rule_id: rule.rule_id.clone(),
+            attention_ref: Some(format!("matrix:attention:{}", attention.attention_id)),
+            incident_ref: None,
+            status: "open".to_string(),
+            severity: rule.severity.clone(),
+            summary: attention.title,
+            evidence_refs: attention.linked_changes,
+            revision: 1,
+            snoozed_until: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        save_alert_occurrence(connection, &occurrence)?;
+        append_projection_event(
+            connection,
+            "alert",
+            &format!("mfg:alert-occurrence:{}", occurrence.occurrence_id),
+            "alert.opened",
+            serde_json::to_value(&occurrence)?,
+        )?;
+    }
+    Ok(())
+}
+
+fn save_alert_occurrence(
+    connection: &Connection,
+    occurrence: &MfgAlertOccurrence,
+) -> Result<(), MfgRepositoryError> {
+    connection.execute(
+        r"INSERT INTO mfg_alert_occurrence (occurrence_id, rule_id, status, revision, occurrence_json, created_at, updated_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+           ON CONFLICT(occurrence_id) DO UPDATE SET status=excluded.status, revision=excluded.revision, occurrence_json=excluded.occurrence_json, updated_at=excluded.updated_at",
+        params![occurrence.occurrence_id, occurrence.rule_id, occurrence.status, occurrence.revision as i64, serde_json::to_string(occurrence)?, occurrence.created_at.to_rfc3339(), occurrence.updated_at.to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+fn find_alert_occurrence(
+    connection: &Connection,
+    occurrence_id: &str,
+) -> Result<Option<MfgAlertOccurrence>, MfgRepositoryError> {
+    connection
+        .query_row(
+            "SELECT occurrence_json FROM mfg_alert_occurrence WHERE occurrence_id = ?1",
+            params![occurrence_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(MfgRepositoryError::from))
+        .transpose()
+}
+
+fn list_alert_occurrences(
+    connection: &Connection,
+    status: Option<&str>,
+    limit: usize,
+) -> Result<Vec<MfgAlertOccurrence>, MfgRepositoryError> {
+    let mut statement = connection.prepare(
+        "SELECT occurrence_json FROM mfg_alert_occurrence ORDER BY updated_at DESC LIMIT ?1",
+    )?;
+    let rows = statement.query_map(params![limit.clamp(1, 500) as i64], |row| {
+        row.get::<_, String>(0)
+    })?;
+    rows.map(|row| Ok(serde_json::from_str::<MfgAlertOccurrence>(&row?)?))
+        .filter(|item| {
+            item.as_ref().map_or(true, |occurrence| {
+                status.is_none_or(|filter| occurrence.status == filter)
+            })
+        })
+        .collect()
+}
+
+fn command_alert(
+    connection: &Connection,
+    occurrence_id: &str,
+    input: MfgAlertCommandInput,
+) -> Result<(MfgAlertOccurrence, MfgCommandReceipt), MfgRepositoryError> {
+    let subject_ref = format!("mfg:alert-occurrence:{occurrence_id}");
+    if let Some(receipt) =
+        find_command_receipt(connection, &input.idempotency_key, "alert", &subject_ref)?
+    {
+        let occurrence = find_alert_occurrence(connection, occurrence_id)?
+            .ok_or_else(|| MfgRepositoryError::NotFound(occurrence_id.to_string()))?;
+        return Ok((occurrence, receipt));
+    }
+    if input.actor_ref.trim().is_empty() || input.idempotency_key.trim().is_empty() {
+        return Err(MfgRepositoryError::CommandRejected(
+            "actor and idempotency key are required".to_string(),
+        ));
+    }
+    let mut occurrence = find_alert_occurrence(connection, occurrence_id)?
+        .ok_or_else(|| MfgRepositoryError::NotFound(occurrence_id.to_string()))?;
+    ensure_revision(
+        "alert_occurrence",
+        occurrence_id,
+        input.expected_revision,
+        occurrence.revision,
+    )?;
+    let previous_revision = occurrence.revision;
+    occurrence.status = match input.command {
+        MfgAlertCommand::Acknowledge => "acknowledged",
+        MfgAlertCommand::Snooze => "snoozed",
+        MfgAlertCommand::Resolve => "resolved",
+        MfgAlertCommand::Escalate => "escalated",
+    }
+    .to_string();
+    occurrence.snoozed_until = if matches!(input.command, MfgAlertCommand::Snooze) {
+        input.until
+    } else {
+        None
+    };
+    occurrence.revision = occurrence.revision.saturating_add(1);
+    occurrence.updated_at = Utc::now();
+    save_alert_occurrence(connection, &occurrence)?;
+    let command = format!("{:?}", input.command).to_lowercase();
+    let receipt = MfgCommandReceipt {
+        receipt_id: format!("receipt-{}", uuid::Uuid::new_v4()),
+        domain: "alert".to_string(),
+        subject_ref: subject_ref.clone(),
+        command: command.clone(),
+        actor_ref: input.actor_ref,
+        idempotency_key: input.idempotency_key,
+        idempotent_replay: false,
+        previous_revision,
+        current_revision: occurrence.revision,
+        audit_ref: format!("audit://mfg/alert/{occurrence_id}/{}", occurrence.revision),
+        notification_refs: Vec::new(),
+        created_at: Utc::now(),
+    };
+    insert_command_receipt(connection, &receipt)?;
+    append_projection_event(
+        connection,
+        "alert",
+        &subject_ref,
+        &format!("alert.{command}"),
+        serde_json::json!({ "occurrence": occurrence, "receipt": receipt, "reason": input.reason }),
+    )?;
+    Ok((occurrence, receipt))
+}
+
+fn build_forecasts(
+    connection: &Connection,
+    metric_refs: &[String],
+    horizon: &str,
+    limit: usize,
+) -> Result<Vec<MfgForecastProjection>, MfgRepositoryError> {
+    let profile = MfgCockpitProfile {
+        profile_id: "forecast".to_string(),
+        owner_ref: "system".to_string(),
+        display_name: "forecast".to_string(),
+        focus_refs: Vec::new(),
+        focus_metric_ids: metric_refs.to_vec(),
+        thresholds: Value::Null,
+        template_id: "forecast".to_string(),
+        cadence: "on_demand".to_string(),
+        revision: 1,
+        scope: Default::default(),
+        layout: Default::default(),
+        global_filters: Value::Null,
+        widget_instances: Vec::new(),
+        sharing_policy: Default::default(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let states = list_recent_metric_states(connection, &profile, limit)?;
+    let mut forecasts = states.into_iter().map(|state| {
+        let next = state.value + state.delta;
+        MfgForecastProjection { forecast_id: format!("forecast-{}-{}", state.metric_id, state.state_id), metric_ref: state.metric_id.clone(), entity_ref: Some(state.entity_scope.clone()), status: "available".to_string(),
+            horizon: horizon.to_string(), interval: "next_period".to_string(), confidence: Some((state.confidence * 0.85).clamp(0.0, 1.0)), method: "bounded_linear_delta".to_string(), generated_at: Utc::now(), expires_at: Utc::now() + chrono::Duration::hours(6),
+            leading_signals: vec![MfgForecastSignal { signal_ref: format!("matrix:metric-state:{}", state.state_id), label: "latest metric delta".to_string(), direction: if state.delta >= 0.0 { "up" } else { "down" }.to_string(), weight: 1.0 }],
+            evidence_refs: state.input_fact_refs.clone(), points: vec![serde_json::json!({ "period": state.period, "value": state.value, "kind": "observed" }), serde_json::json!({ "period": "next", "value": next, "kind": "forecast" })], unavailable_reason: None }
+    }).collect::<Vec<_>>();
+    for metric_ref in metric_refs
         .iter()
-        .any(|metric_id| item.title.contains(metric_id))
+        .filter(|metric_ref| !forecasts.iter().any(|item| &item.metric_ref == *metric_ref))
+    {
+        forecasts.push(MfgForecastProjection {
+            forecast_id: format!("forecast-unavailable-{metric_ref}"),
+            metric_ref: metric_ref.clone(),
+            entity_ref: None,
+            status: "unavailable".to_string(),
+            horizon: horizon.to_string(),
+            interval: "unknown".to_string(),
+            confidence: None,
+            method: "unavailable".to_string(),
+            generated_at: Utc::now(),
+            expires_at: Utc::now() + chrono::Duration::minutes(15),
+            leading_signals: Vec::new(),
+            evidence_refs: Vec::new(),
+            points: Vec::new(),
+            unavailable_reason: Some(
+                "no metric state is available for the requested scope".to_string(),
+            ),
+        });
+    }
+    Ok(forecasts)
+}
+
+fn upsert_assignment(
+    connection: &Connection,
+    assignment: &MfgAssignment,
+    expected_revision: Option<u64>,
+) -> Result<MfgAssignment, MfgRepositoryError> {
+    if assignment.task_ref.trim().is_empty() {
+        return Err(MfgRepositoryError::CommandRejected(
+            "assignment must reference an existing task".to_string(),
+        ));
+    }
+    if let Some(workflow_id) = &assignment.workflow_id {
+        let graph = find_workflow_graph(connection, "workflow_id", workflow_id)?
+            .ok_or_else(|| MfgRepositoryError::NotFound(workflow_id.clone()))?;
+        if let Some(task_id) = &graph.task_id {
+            let canonical = assignment
+                .task_ref
+                .trim_start_matches("task:")
+                .trim_start_matches("task://");
+            if canonical != task_id {
+                return Err(MfgRepositoryError::CommandRejected(
+                    "assignment task_ref does not match the workflow task".to_string(),
+                ));
+            }
+        }
+    }
+    let mut assignment = assignment.clone();
+    match find_assignment(connection, &assignment.assignment_id)? {
+        Some(existing) => {
+            if expected_revision != Some(existing.revision) {
+                return Err(MfgRepositoryError::RevisionConflict {
+                    domain: "assignment".to_string(),
+                    subject_id: assignment.assignment_id.clone(),
+                    expected: expected_revision,
+                    actual: Some(existing.revision),
+                });
+            }
+            assignment.created_at = existing.created_at;
+            assignment.created_by = existing.created_by;
+            assignment.status = existing.status;
+            assignment.revision = existing.revision.saturating_add(1);
+        }
+        None if expected_revision.is_some_and(|revision| revision != 0) => {
+            return Err(MfgRepositoryError::RevisionConflict {
+                domain: "assignment".to_string(),
+                subject_id: assignment.assignment_id.clone(),
+                expected: expected_revision,
+                actual: None,
+            })
+        }
+        None => {}
+    }
+    assignment.updated_at = Utc::now();
+    save_assignment(connection, &assignment)?;
+    append_projection_event(
+        connection,
+        "assignment",
+        &format!("mfg:assignment:{}", assignment.assignment_id),
+        "assignment.upserted",
+        serde_json::to_value(&assignment)?,
+    )?;
+    Ok(assignment)
+}
+
+fn save_assignment(
+    connection: &Connection,
+    assignment: &MfgAssignment,
+) -> Result<(), MfgRepositoryError> {
+    connection.execute(
+        r"INSERT INTO mfg_assignment (assignment_id, task_ref, workflow_id, incident_id, assignee_ref, status, visibility, revision, assignment_json, created_at, updated_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+           ON CONFLICT(assignment_id) DO UPDATE SET task_ref=excluded.task_ref, workflow_id=excluded.workflow_id, incident_id=excluded.incident_id, assignee_ref=excluded.assignee_ref, status=excluded.status, visibility=excluded.visibility, revision=excluded.revision, assignment_json=excluded.assignment_json, updated_at=excluded.updated_at",
+        params![assignment.assignment_id, assignment.task_ref, assignment.workflow_id, assignment.incident_id, assignment.assignee_ref, assignment.status, assignment.visibility, assignment.revision as i64, serde_json::to_string(assignment)?, assignment.created_at.to_rfc3339(), assignment.updated_at.to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+fn find_assignment(
+    connection: &Connection,
+    assignment_id: &str,
+) -> Result<Option<MfgAssignment>, MfgRepositoryError> {
+    connection
+        .query_row(
+            "SELECT assignment_json FROM mfg_assignment WHERE assignment_id = ?1",
+            params![assignment_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(MfgRepositoryError::from))
+        .transpose()
+}
+
+fn list_assignments(
+    connection: &Connection,
+    assignee_ref: Option<&str>,
+    incident_id: Option<&str>,
+    limit: usize,
+) -> Result<Vec<MfgAssignment>, MfgRepositoryError> {
+    let mut statement = connection
+        .prepare("SELECT assignment_json FROM mfg_assignment ORDER BY updated_at DESC LIMIT ?1")?;
+    let rows = statement.query_map(params![limit.clamp(1, 500) as i64], |row| {
+        row.get::<_, String>(0)
+    })?;
+    rows.map(|row| Ok(serde_json::from_str::<MfgAssignment>(&row?)?))
+        .filter(|item| {
+            item.as_ref().map_or(true, |assignment| {
+                assignee_ref.is_none_or(|filter| assignment.assignee_ref == filter)
+                    && incident_id
+                        .is_none_or(|filter| assignment.incident_id.as_deref() == Some(filter))
+            })
+        })
+        .collect()
+}
+
+fn command_assignment(
+    connection: &Connection,
+    assignment_id: &str,
+    input: MfgAssignmentCommandInput,
+) -> Result<(MfgAssignment, MfgCommandReceipt), MfgRepositoryError> {
+    let subject_ref = format!("mfg:assignment:{assignment_id}");
+    if let Some(receipt) = find_command_receipt(
+        connection,
+        &input.idempotency_key,
+        "assignment",
+        &subject_ref,
+    )? {
+        let assignment = find_assignment(connection, assignment_id)?
+            .ok_or_else(|| MfgRepositoryError::NotFound(assignment_id.to_string()))?;
+        return Ok((assignment, receipt));
+    }
+    let mut assignment = find_assignment(connection, assignment_id)?
+        .ok_or_else(|| MfgRepositoryError::NotFound(assignment_id.to_string()))?;
+    if input.actor_ref.trim().is_empty() || input.idempotency_key.trim().is_empty() {
+        return Err(MfgRepositoryError::CommandRejected(
+            "actor and idempotency key are required".to_string(),
+        ));
+    }
+    if assignment.visibility == "private"
+        && input.actor_ref != assignment.created_by
+        && input.actor_ref != assignment.assignee_ref
+        && !assignment.watcher_refs.contains(&input.actor_ref)
+    {
+        return Err(MfgRepositoryError::CommandRejected(
+            "private assignment is not visible to this actor".to_string(),
+        ));
+    }
+    if matches!(
+        input.command,
+        MfgAssignmentCommand::Assign
+            | MfgAssignmentCommand::Transfer
+            | MfgAssignmentCommand::Unassign
+            | MfgAssignmentCommand::Escalate
+    ) && input.actor_ref != assignment.created_by
+        && input.actor_ref != assignment.assignee_ref
+    {
+        return Err(MfgRepositoryError::CommandRejected(
+            "assignment command requires the owner or current assignee".to_string(),
+        ));
+    }
+    ensure_revision(
+        "assignment",
+        assignment_id,
+        input.expected_revision,
+        assignment.revision,
+    )?;
+    let previous_revision = assignment.revision;
+    match input.command {
+        MfgAssignmentCommand::Assign | MfgAssignmentCommand::Transfer => {
+            assignment.assignee_ref = input
+                .target_ref
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    MfgRepositoryError::CommandRejected("target_ref is required".to_string())
+                })?;
+            assignment.status = "assigned".to_string();
+        }
+        MfgAssignmentCommand::Claim => {
+            assignment.assignee_ref = input.actor_ref.clone();
+            assignment.status = "claimed".to_string();
+        }
+        MfgAssignmentCommand::Unassign => assignment.status = "unassigned".to_string(),
+        MfgAssignmentCommand::Watch => {
+            if !assignment.watcher_refs.contains(&input.actor_ref) {
+                assignment.watcher_refs.push(input.actor_ref.clone());
+            }
+        }
+        MfgAssignmentCommand::RequestUpdate => assignment.status = "update_requested".to_string(),
+        MfgAssignmentCommand::Escalate => {
+            assignment.status = "escalated".to_string();
+            assignment.priority = "urgent".to_string();
+        }
+    }
+    assignment.revision = assignment.revision.saturating_add(1);
+    assignment.updated_at = Utc::now();
+    save_assignment(connection, &assignment)?;
+    let command = format!("{:?}", input.command).to_lowercase();
+    let receipt = MfgCommandReceipt {
+        receipt_id: format!("receipt-{}", uuid::Uuid::new_v4()),
+        domain: "assignment".to_string(),
+        subject_ref: subject_ref.clone(),
+        command: command.clone(),
+        actor_ref: input.actor_ref,
+        idempotency_key: input.idempotency_key,
+        idempotent_replay: false,
+        previous_revision,
+        current_revision: assignment.revision,
+        audit_ref: format!(
+            "audit://mfg/assignment/{assignment_id}/{}",
+            assignment.revision
+        ),
+        notification_refs: Vec::new(),
+        created_at: Utc::now(),
+    };
+    insert_command_receipt(connection, &receipt)?;
+    append_projection_event(
+        connection,
+        "assignment",
+        &subject_ref,
+        &format!("assignment.{command}"),
+        serde_json::json!({ "assignment": assignment, "receipt": receipt, "reason": input.reason }),
+    )?;
+    Ok((assignment, receipt))
+}
+
+fn build_live_projection(
+    connection: &Connection,
+    cursor: Option<u64>,
+    limit: usize,
+) -> Result<MfgLiveProjection, MfgRepositoryError> {
+    let latest = connection.query_row(
+        "SELECT COALESCE(MAX(event_id), 0) FROM mfg_projection_event",
+        [],
+        |row| row.get::<_, u64>(0),
+    )?;
+    let oldest = connection.query_row(
+        "SELECT COALESCE(MIN(event_id), 0) FROM mfg_projection_event",
+        [],
+        |row| row.get::<_, u64>(0),
+    )?;
+    if cursor.is_none() {
+        return Ok(MfgLiveProjection {
+            kind: "snapshot".to_string(),
+            cursor: latest,
+            recoverable: true,
+            snapshot: serde_json::json!({
+                "cockpit_profiles": list_cockpit_profiles(connection, None, 100)?,
+                "alert_rules": list_alert_rules(connection, None, 100)?,
+                "alerts": list_alert_occurrences(connection, None, 100)?,
+                "assignments": list_assignments(connection, None, None, 100)?,
+                "incidents": list_incidents(connection, 100)?,
+                "workflows": list_workflow_graphs(connection, 100)?,
+            }),
+            events: Vec::new(),
+            resync_reason: None,
+        });
+    }
+    let cursor = cursor.unwrap_or(0);
+    if cursor > latest || (oldest > 0 && cursor.saturating_add(1) < oldest) {
+        return Ok(MfgLiveProjection {
+            kind: "resync".to_string(),
+            cursor: latest,
+            recoverable: true,
+            snapshot: Value::Null,
+            events: Vec::new(),
+            resync_reason: Some("cursor is outside the retained event window".to_string()),
+        });
+    }
+    let mut statement = connection.prepare("SELECT event_id, event_type, subject_ref, event_json, created_at FROM mfg_projection_event WHERE event_id > ?1 ORDER BY event_id ASC LIMIT ?2")?;
+    let rows = statement.query_map(params![cursor as i64, limit.clamp(1, 500) as i64], |row| {
+        Ok((
+            row.get::<_, u64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+    let events = rows
+        .map(|row| {
+            let (event_cursor, event_type, subject_ref, json, created_at) = row?;
+            let value: Value = serde_json::from_str(&json)?;
+            Ok(MfgLiveProjectionEvent {
+                cursor: event_cursor,
+                event_type,
+                subject_ref,
+                payload: value.get("payload").cloned().unwrap_or(Value::Null),
+                created_at: parse_rfc3339_utc(&created_at)?,
+            })
+        })
+        .collect::<Result<Vec<_>, MfgRepositoryError>>()?;
+    let next_cursor = events.last().map_or(cursor, |event| event.cursor);
+    Ok(MfgLiveProjection {
+        kind: "delta".to_string(),
+        cursor: next_cursor,
+        recoverable: true,
+        snapshot: Value::Null,
+        events,
+        resync_reason: None,
+    })
 }
 
 fn insert_ontology_pack(
@@ -4212,6 +5498,7 @@ fn attention_from_change(
             .unwrap_or("operations")
             .to_string(),
         entity_ref: Some(state.entity_scope.clone()),
+        metric_refs: vec![state.metric_id.clone()],
         period: Some(state.period.clone()),
         priority_score,
         severity,
@@ -4996,9 +6283,15 @@ mod tests {
             thresholds: serde_json::json!({"material_shortage_risk": {"critical": 100}}),
             template_id: Some("ops.default".to_string()),
             cadence: Some("daily".to_string()),
+            expected_revision: None,
+            scope: None,
+            layout: None,
+            global_filters: Value::Null,
+            widget_instances: Vec::new(),
+            sharing_policy: None,
         });
         let profile = store
-            .upsert_cockpit_profile(&profile)
+            .upsert_cockpit_profile(&profile, None)
             .expect("profile saves");
         assert_eq!(store.health().unwrap().cockpit_profile_count, 1);
         let daily_profiles = store

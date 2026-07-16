@@ -1,32 +1,91 @@
 use axum::extract::Extension;
+use axum::http::{header, HeaderMap, HeaderValue};
 
 use crate::api_routes::{principal_actor_id, AuthenticatedPrincipal};
 
 use super::*;
 
+pub(super) async fn mfg_cockpit_profile_list_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Query(query): Query<MfgCockpitProfileListQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let actor = principal_actor_id(&principal);
+    let profiles = state
+        .services
+        .mfg
+        .list_cockpit_profiles(
+            &state.config_home,
+            query.cadence.as_deref(),
+            query.limit.unwrap_or(100).clamp(1, 500),
+        )
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .into_iter()
+        .filter(|profile| cockpit_profile_visible_to(profile, &actor))
+        .collect::<Vec<_>>();
+    Ok(Json(
+        serde_json::json!({ "kind": "mfg.cockpit.profile_list", "items": profiles }),
+    ))
+}
+
+pub(super) async fn mfg_cockpit_widget_catalog_handler() -> impl IntoResponse {
+    Json(serde_json::json!({ "kind": "mfg.cockpit.widget_catalog", "items": mfg_widget_catalog() }))
+}
+
 pub(super) async fn mfg_cockpit_profile_upsert_handler(
     AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<MfgCockpitProfileUpsertRequest>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Json(mut request): Json<MfgCockpitProfileUpsertRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let expected_revision = request.profile.expected_revision;
+    let actor = principal_actor_id(&principal);
+    if let Some(profile_id) = request
+        .profile
+        .profile_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        if let Some(existing) = state
+            .services
+            .mfg
+            .get_cockpit_profile(&state.config_home, profile_id)
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        {
+            if existing.owner_ref != actor && !existing.sharing_policy.editor_refs.contains(&actor)
+            {
+                return Err(api_error(
+                    StatusCode::FORBIDDEN,
+                    "cockpit profile is not editable by this principal",
+                ));
+            }
+        }
+    }
+    request.profile.owner_ref = actor;
     let profile = state
         .services
         .mfg
         .upsert_cockpit_profile(
             &state.config_home,
             &MfgCockpitProfile::from_input(request.profile),
+            expected_revision,
         )
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.cockpit.profile",
-        "request_id": request.request_id,
-        "session_id": request.session_id,
-        "profile": profile,
-    })))
+        .map_err(mfg_mutation_error)?;
+    let revision = profile.revision;
+    Ok(cockpit_profile_response(
+        serde_json::json!({
+            "kind": "mfg.cockpit.profile",
+            "request_id": request.request_id,
+            "session_id": request.session_id,
+            "profile": profile,
+        }),
+        revision,
+    ))
 }
 
 pub(super) async fn mfg_cockpit_profile_get_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let profile = state
         .services
@@ -34,16 +93,177 @@ pub(super) async fn mfg_cockpit_profile_get_handler(
         .get_cockpit_profile(&state.config_home, &id)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG cockpit profile not found"))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.cockpit.profile",
-        "profile": profile,
-    })))
+    if !cockpit_profile_visible_to(&profile, &principal_actor_id(&principal)) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "cockpit profile is not visible to this principal",
+        ));
+    }
+    let revision = profile.revision;
+    Ok(cockpit_profile_response(
+        serde_json::json!({
+            "kind": "mfg.cockpit.profile",
+            "profile": profile,
+        }),
+        revision,
+    ))
+}
+
+pub(super) async fn mfg_cockpit_profile_delete_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Query(query): Query<MfgCockpitProfileDeleteQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let existing = state
+        .services
+        .mfg
+        .get_cockpit_profile(&state.config_home, &id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG cockpit profile not found"))?;
+    let actor = principal_actor_id(&principal);
+    if existing.owner_ref != actor && !existing.sharing_policy.editor_refs.contains(&actor) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "cockpit profile is not editable by this principal",
+        ));
+    }
+    let profile = state
+        .services
+        .mfg
+        .delete_cockpit_profile(&state.config_home, &id, query.expected_revision)
+        .map_err(mfg_mutation_error)?;
+    let revision = profile.revision;
+    Ok(cockpit_profile_response(
+        serde_json::json!({ "kind": "mfg.cockpit.profile_deleted", "profile": profile }),
+        revision,
+    ))
+}
+
+pub(super) async fn mfg_cockpit_profile_clone_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Json(request): Json<MfgCockpitProfileCloneRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let source = state
+        .services
+        .mfg
+        .get_cockpit_profile(&state.config_home, &id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG cockpit profile not found"))?;
+    let mut clone = source;
+    clone.profile_id = request
+        .profile_id
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| format!("cockpit-profile-{}", uuid::Uuid::new_v4()));
+    clone.owner_ref = principal_actor_id(&principal);
+    clone.display_name = request
+        .display_name
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| format!("{} copy", clone.display_name));
+    clone.revision = 1;
+    clone.created_at = chrono::Utc::now();
+    clone.updated_at = clone.created_at;
+    clone.sharing_policy = Default::default();
+    let clone = state
+        .services
+        .mfg
+        .upsert_cockpit_profile(&state.config_home, &clone, None)
+        .map_err(mfg_mutation_error)?;
+    let revision = clone.revision;
+    Ok(cockpit_profile_response(
+        serde_json::json!({ "kind": "mfg.cockpit.profile_cloned", "source_profile_id": id, "profile": clone }),
+        revision,
+    ))
+}
+
+pub(super) async fn mfg_cockpit_profile_share_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Json(request): Json<MfgCockpitProfileShareRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let mut profile = state
+        .services
+        .mfg
+        .get_cockpit_profile(&state.config_home, &id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG cockpit profile not found"))?;
+    if profile.owner_ref != principal_actor_id(&principal)
+        && !profile
+            .sharing_policy
+            .editor_refs
+            .contains(&principal_actor_id(&principal))
+    {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "cockpit profile is not editable by this principal",
+        ));
+    }
+    profile.sharing_policy = request.sharing_policy;
+    let profile = state
+        .services
+        .mfg
+        .upsert_cockpit_profile(
+            &state.config_home,
+            &profile,
+            Some(request.expected_revision),
+        )
+        .map_err(mfg_mutation_error)?;
+    let revision = profile.revision;
+    Ok(cockpit_profile_response(
+        serde_json::json!({ "kind": "mfg.cockpit.profile_shared", "profile": profile }),
+        revision,
+    ))
+}
+
+fn cockpit_profile_response(
+    value: serde_json::Value,
+    revision: u64,
+) -> (HeaderMap, Json<serde_json::Value>) {
+    let mut headers = HeaderMap::new();
+    if let Ok(value) = HeaderValue::from_str(&format!("\"{revision}\"")) {
+        headers.insert(header::ETAG, value);
+    }
+    (headers, Json(value))
+}
+
+fn cockpit_profile_visible_to(profile: &MfgCockpitProfile, actor: &str) -> bool {
+    profile.owner_ref == actor
+        || profile
+            .sharing_policy
+            .editor_refs
+            .iter()
+            .any(|value| value == actor)
+        || profile
+            .sharing_policy
+            .viewer_refs
+            .iter()
+            .any(|value| value == actor)
+        || matches!(
+            profile.sharing_policy.visibility.as_str(),
+            "team" | "public"
+        )
 }
 
 pub(super) async fn mfg_cockpit_projection_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let profile = state
+        .services
+        .mfg
+        .get_cockpit_profile(&state.config_home, &id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG cockpit profile not found"))?;
+    if !cockpit_profile_visible_to(&profile, &principal_actor_id(&principal)) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "cockpit profile is not visible to this principal",
+        ));
+    }
     let projection = state
         .services
         .mfg

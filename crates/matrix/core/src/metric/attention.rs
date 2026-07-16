@@ -17,6 +17,9 @@ pub struct MatrixAttentionItem {
     pub business_domain: String,
     #[serde(default)]
     pub entity_ref: Option<String>,
+    /// Canonical Matrix metric identifiers that caused this attention item.
+    #[serde(default)]
+    pub metric_refs: Vec<String>,
     #[serde(default)]
     pub period: Option<String>,
     pub priority_score: f32,
@@ -53,6 +56,7 @@ impl MatrixAttentionItem {
             title: format!("New operational fact requires metric evaluation: {fact_type}"),
             business_domain: domain_from_fact_type(fact_type).to_string(),
             entity_ref,
+            metric_refs: Vec::new(),
             period: None,
             priority_score: 0.35,
             severity: MatrixSeverity::Unknown,

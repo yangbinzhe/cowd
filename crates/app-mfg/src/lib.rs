@@ -22,6 +22,7 @@ pub mod execution;
 pub mod incident;
 pub mod memory_case;
 pub mod ontology;
+pub mod operations;
 mod repository;
 pub mod skill;
 mod store;
@@ -35,10 +36,11 @@ pub use app::{
     MfgApplicationSurface, MfgApplicationSurfaceKind,
 };
 pub use cockpit::{
-    MfgCockpitProfile, MfgCockpitProfileInput, MfgCockpitProjection,
-    MfgCockpitReportDeliveryPayload, MfgCockpitReportDeliveryPayloadRequest,
+    default_mfg_widget_instances, mfg_widget_catalog, MfgCockpitProfile, MfgCockpitProfileInput,
+    MfgCockpitProjection, MfgCockpitReportDeliveryPayload, MfgCockpitReportDeliveryPayloadRequest,
     MfgCockpitReportDeliveryReceipt, MfgCockpitReportDeliveryState, MfgCockpitReportRequest,
-    MfgCockpitReportSnapshot, MfgCockpitWidget,
+    MfgCockpitReportSnapshot, MfgCockpitWidget, MfgDashboardLayout, MfgDashboardScope,
+    MfgDashboardSharingPolicy, MfgWidgetDefinition, MfgWidgetInstance, MfgWidgetPlacement,
 };
 pub use domain::{
     server_manufacturing_domain_pack, server_manufacturing_seed_plan, MfgDomainPack,
@@ -50,6 +52,12 @@ pub use execution::{
 pub use incident::MfgIncident;
 pub use memory_case::{MfgCasePromotion, MfgMemoryCase, MfgPlaybook, MfgPlaybookStep};
 pub use ontology::server_manufacturing_ontology_pack;
+pub use operations::{
+    MfgAlertCommand, MfgAlertCommandInput, MfgAlertOccurrence, MfgAlertRule, MfgAlertRuleInput,
+    MfgAlertSubscription, MfgAlertSubscriptionInput, MfgAssignment, MfgAssignmentCommand,
+    MfgAssignmentCommandInput, MfgAssignmentInput, MfgCommandReceipt, MfgForecastProjection,
+    MfgForecastSignal, MfgLiveProjection, MfgLiveProjectionEvent, MfgSurfaceNotificationTarget,
+};
 pub use skill::{
     plan_server_manufacturing_skills, run_server_manufacturing_skill,
     server_manufacturing_skill_pack, skill_agent_node_id, MfgSkillManifest, MfgSkillPlan,

@@ -7,10 +7,12 @@ use matrix_core::{
 };
 
 use crate::{
-    MfgActionExecution, MfgActionExecutionRequest, MfgActionFeedback, MfgCasePromotion,
-    MfgCockpitProfile, MfgCockpitProjection, MfgCockpitReportDeliveryReceipt,
-    MfgCockpitReportRequest, MfgCockpitReportSnapshot, MfgCrossPlaneBridgeReceipt,
-    MfgDomainSeedResult, MfgIncident, MfgMemoryCase, MfgOperationalAnalysis, MfgPlaybook,
+    MfgActionExecution, MfgActionExecutionRequest, MfgActionFeedback, MfgAlertCommandInput,
+    MfgAlertOccurrence, MfgAlertRule, MfgAlertSubscription, MfgAssignment,
+    MfgAssignmentCommandInput, MfgCasePromotion, MfgCockpitProfile, MfgCockpitProjection,
+    MfgCockpitReportDeliveryReceipt, MfgCockpitReportRequest, MfgCockpitReportSnapshot,
+    MfgCommandReceipt, MfgCrossPlaneBridgeReceipt, MfgDomainSeedResult, MfgForecastProjection,
+    MfgIncident, MfgLiveProjection, MfgMemoryCase, MfgOperationalAnalysis, MfgPlaybook,
     MfgSkillRun, MfgWorkflowGraph,
 };
 
@@ -293,8 +295,10 @@ impl MfgStore {
     pub fn upsert_cockpit_profile(
         &self,
         profile: &MfgCockpitProfile,
+        expected_revision: Option<u64>,
     ) -> Result<MfgCockpitProfile, MfgRepositoryError> {
-        self.repository.upsert_cockpit_profile(profile)
+        self.repository
+            .upsert_cockpit_profile(profile, expected_revision)
     }
 
     pub fn get_cockpit_profile(
@@ -341,6 +345,125 @@ impl MfgStore {
     ) -> Result<MfgCockpitReportSnapshot, MfgRepositoryError> {
         self.repository
             .attach_cockpit_report_delivery(report_id, receipt)
+    }
+
+    pub fn delete_cockpit_profile(
+        &self,
+        profile_id: &str,
+        expected_revision: u64,
+    ) -> Result<MfgCockpitProfile, MfgRepositoryError> {
+        self.repository
+            .delete_cockpit_profile(profile_id, expected_revision)
+    }
+
+    pub fn upsert_alert_rule(
+        &self,
+        rule: &MfgAlertRule,
+        expected_revision: Option<u64>,
+    ) -> Result<MfgAlertRule, MfgRepositoryError> {
+        self.repository.upsert_alert_rule(rule, expected_revision)
+    }
+
+    pub fn list_alert_rules(
+        &self,
+        owner_ref: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MfgAlertRule>, MfgRepositoryError> {
+        self.repository.list_alert_rules(owner_ref, limit)
+    }
+
+    pub fn list_alert_occurrences(
+        &self,
+        status: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MfgAlertOccurrence>, MfgRepositoryError> {
+        self.repository.list_alert_occurrences(status, limit)
+    }
+
+    pub fn upsert_alert_subscription(
+        &self,
+        subscription: &MfgAlertSubscription,
+        expected_revision: Option<u64>,
+    ) -> Result<MfgAlertSubscription, MfgRepositoryError> {
+        self.repository
+            .upsert_alert_subscription(subscription, expected_revision)
+    }
+
+    pub fn list_alert_subscriptions(
+        &self,
+        subscriber_ref: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MfgAlertSubscription>, MfgRepositoryError> {
+        self.repository
+            .list_alert_subscriptions(subscriber_ref, limit)
+    }
+
+    pub fn command_alert(
+        &self,
+        occurrence_id: &str,
+        command: MfgAlertCommandInput,
+    ) -> Result<(MfgAlertOccurrence, MfgCommandReceipt), MfgRepositoryError> {
+        self.repository.command_alert(occurrence_id, command)
+    }
+
+    pub fn forecasts(
+        &self,
+        metric_refs: &[String],
+        horizon: &str,
+        limit: usize,
+    ) -> Result<Vec<MfgForecastProjection>, MfgRepositoryError> {
+        self.repository.forecasts(metric_refs, horizon, limit)
+    }
+
+    pub fn upsert_assignment(
+        &self,
+        assignment: &MfgAssignment,
+        expected_revision: Option<u64>,
+    ) -> Result<MfgAssignment, MfgRepositoryError> {
+        self.repository
+            .upsert_assignment(assignment, expected_revision)
+    }
+
+    pub fn get_assignment(
+        &self,
+        assignment_id: &str,
+    ) -> Result<Option<MfgAssignment>, MfgRepositoryError> {
+        self.repository.get_assignment(assignment_id)
+    }
+
+    pub fn list_assignments(
+        &self,
+        assignee_ref: Option<&str>,
+        incident_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MfgAssignment>, MfgRepositoryError> {
+        self.repository
+            .list_assignments(assignee_ref, incident_id, limit)
+    }
+
+    pub fn command_assignment(
+        &self,
+        assignment_id: &str,
+        command: MfgAssignmentCommandInput,
+    ) -> Result<(MfgAssignment, MfgCommandReceipt), MfgRepositoryError> {
+        self.repository.command_assignment(assignment_id, command)
+    }
+
+    pub fn live_projection(
+        &self,
+        cursor: Option<u64>,
+        limit: usize,
+    ) -> Result<MfgLiveProjection, MfgRepositoryError> {
+        self.repository.live_projection(cursor, limit)
+    }
+
+    pub fn record_command_notifications(
+        &self,
+        idempotency_key: &str,
+        notification_refs: Vec<String>,
+    ) -> Result<MfgCommandReceipt, MfgRepositoryError> {
+        self.repository
+            .record_command_notifications(idempotency_key, notification_refs)
     }
 
     pub fn save_workflow_graph(

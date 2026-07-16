@@ -19,6 +19,111 @@ pub struct MfgCockpitProfileInput {
     pub template_id: Option<String>,
     #[serde(default)]
     pub cadence: Option<String>,
+    #[serde(default)]
+    pub expected_revision: Option<u64>,
+    #[serde(default)]
+    pub scope: Option<MfgDashboardScope>,
+    #[serde(default)]
+    pub layout: Option<MfgDashboardLayout>,
+    #[serde(default)]
+    pub global_filters: Value,
+    #[serde(default)]
+    pub widget_instances: Vec<MfgWidgetInstance>,
+    #[serde(default)]
+    pub sharing_policy: Option<MfgDashboardSharingPolicy>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MfgDashboardScope {
+    pub kind: String,
+    #[serde(default)]
+    pub scope_ref: Option<String>,
+}
+
+impl Default for MfgDashboardScope {
+    fn default() -> Self {
+        Self {
+            kind: "personal".to_string(),
+            scope_ref: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MfgDashboardLayout {
+    pub columns: u16,
+    pub row_height: u16,
+    pub gap: u16,
+}
+
+impl Default for MfgDashboardLayout {
+    fn default() -> Self {
+        Self {
+            columns: 12,
+            row_height: 72,
+            gap: 12,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MfgDashboardSharingPolicy {
+    pub visibility: String,
+    #[serde(default)]
+    pub viewer_refs: Vec<String>,
+    #[serde(default)]
+    pub editor_refs: Vec<String>,
+}
+
+impl Default for MfgDashboardSharingPolicy {
+    fn default() -> Self {
+        Self {
+            visibility: "private".to_string(),
+            viewer_refs: Vec::new(),
+            editor_refs: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MfgWidgetPlacement {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MfgWidgetInstance {
+    pub instance_id: String,
+    pub definition_id: String,
+    pub placement: MfgWidgetPlacement,
+    #[serde(default)]
+    pub config: Value,
+    #[serde(default)]
+    pub query: Value,
+    #[serde(default = "default_true")]
+    pub visible: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MfgWidgetDefinition {
+    pub definition_id: String,
+    pub title: String,
+    pub renderer: String,
+    pub renderer_version: u32,
+    pub config_schema: Value,
+    pub query_schema: Value,
+    pub min_width: u16,
+    pub min_height: u16,
+    pub max_width: u16,
+    pub max_height: u16,
+    pub required_capability: String,
+    pub default_placement: MfgWidgetPlacement,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -34,6 +139,18 @@ pub struct MfgCockpitProfile {
     pub thresholds: Value,
     pub template_id: String,
     pub cadence: String,
+    #[serde(default = "default_profile_revision")]
+    pub revision: u64,
+    #[serde(default)]
+    pub scope: MfgDashboardScope,
+    #[serde(default)]
+    pub layout: MfgDashboardLayout,
+    #[serde(default)]
+    pub global_filters: Value,
+    #[serde(default)]
+    pub widget_instances: Vec<MfgWidgetInstance>,
+    #[serde(default)]
+    pub sharing_policy: MfgDashboardSharingPolicy,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -49,6 +166,23 @@ pub struct MfgCockpitWidget {
     pub data: Value,
     #[serde(default)]
     pub source_refs: Vec<String>,
+    #[serde(default)]
+    pub instance_id: String,
+    #[serde(default)]
+    pub definition_id: String,
+    #[serde(default = "default_renderer_version")]
+    pub renderer_version: u32,
+    #[serde(default)]
+    pub freshness: Value,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+const fn default_profile_revision() -> u64 {
+    1
+}
+const fn default_renderer_version() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -177,6 +311,16 @@ impl MfgCockpitProfile {
                 .cadence
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| "daily".to_string()),
+            revision: 1,
+            scope: input.scope.unwrap_or_default(),
+            layout: input.layout.unwrap_or_default(),
+            global_filters: input.global_filters,
+            widget_instances: if input.widget_instances.is_empty() {
+                default_mfg_widget_instances()
+            } else {
+                input.widget_instances
+            },
+            sharing_policy: input.sharing_policy.unwrap_or_default(),
             created_at: now,
             updated_at: now,
         }
@@ -201,8 +345,114 @@ impl MfgCockpitWidget {
             priority_score,
             data,
             source_refs,
+            instance_id: String::new(),
+            definition_id: String::new(),
+            renderer_version: 1,
+            freshness: Value::Null,
+            error: None,
         }
     }
+
+    #[must_use]
+    pub fn unavailable(
+        instance: &MfgWidgetInstance,
+        definition: Option<&MfgWidgetDefinition>,
+        error: impl Into<String>,
+    ) -> Self {
+        let title = definition
+            .map(|item| item.title.clone())
+            .unwrap_or_else(|| instance.definition_id.clone());
+        Self {
+            widget_id: instance.instance_id.clone(),
+            widget_type: instance.definition_id.clone(),
+            title,
+            status: "unavailable".to_string(),
+            priority_score: 0.0,
+            data: Value::Null,
+            source_refs: Vec::new(),
+            instance_id: instance.instance_id.clone(),
+            definition_id: instance.definition_id.clone(),
+            renderer_version: definition.map_or(1, |item| item.renderer_version),
+            freshness: serde_json::json!({ "status": "unavailable" }),
+            error: Some(error.into()),
+        }
+    }
+}
+
+impl MfgCockpitProfile {
+    pub fn normalize_legacy(&mut self) {
+        if self.revision == 0 {
+            self.revision = 1;
+        }
+        if self.widget_instances.is_empty() {
+            self.widget_instances = default_mfg_widget_instances();
+        }
+        if self.scope.kind.trim().is_empty() {
+            self.scope = MfgDashboardScope::default();
+        }
+    }
+}
+
+#[must_use]
+pub fn default_mfg_widget_instances() -> Vec<MfgWidgetInstance> {
+    [
+        ("attention", "attention.queue", 0, 0, 6, 4),
+        ("quality", "quality.gates", 6, 0, 6, 4),
+        ("actions", "action.executions", 0, 4, 6, 4),
+        ("focus", "focus.summary", 6, 4, 6, 4),
+    ]
+    .into_iter()
+    .map(|(id, definition, x, y, width, height)| MfgWidgetInstance {
+        instance_id: format!("default-{id}"),
+        definition_id: definition.to_string(),
+        placement: MfgWidgetPlacement {
+            x,
+            y,
+            width,
+            height,
+        },
+        config: Value::Null,
+        query: Value::Null,
+        visible: true,
+    })
+    .collect()
+}
+
+#[must_use]
+pub fn mfg_widget_catalog() -> Vec<MfgWidgetDefinition> {
+    let definitions = [
+        ("kpi.summary", "KPI summary", "kpi"),
+        ("trend.metrics", "Metric trends", "line"),
+        ("risk.matrix", "Risk matrix", "risk_matrix"),
+        (
+            "attention.queue",
+            "Focused operational attention",
+            "attention",
+        ),
+        ("incident.queue", "Incident queue", "incident"),
+        ("workflow.progress", "Workflow progress", "workflow"),
+        ("entity.impact", "Entity impact", "graph"),
+        ("metric.lineage", "Metric lineage", "graph"),
+        ("quality.gates", "Evidence and insight quality", "quality"),
+        ("action.executions", "Governed action execution", "actions"),
+        ("report.delivery", "Report delivery", "delivery"),
+        ("data.freshness", "Data freshness", "freshness"),
+        ("focus.summary", "Personal focus and thresholds", "focus"),
+    ];
+    definitions.into_iter().enumerate().map(|(index, (id, title, renderer))| MfgWidgetDefinition {
+        definition_id: id.to_string(),
+        title: title.to_string(),
+        renderer: renderer.to_string(),
+        renderer_version: 1,
+        config_schema: serde_json::json!({ "type": "object", "additionalProperties": false }),
+        query_schema: serde_json::json!({ "type": "object", "properties": { "limit": { "type": "integer", "minimum": 1, "maximum": 100 } }, "additionalProperties": true }),
+        min_width: 3,
+        min_height: 2,
+        max_width: 12,
+        max_height: 12,
+        required_capability: "mfg.read".to_string(),
+        default_placement: MfgWidgetPlacement { x: ((index * 3) % 12) as u16, y: ((index * 3) / 12 * 3) as u16, width: 6, height: 4 },
+    }).collect()
 }
 
 impl MfgCockpitReportSnapshot {

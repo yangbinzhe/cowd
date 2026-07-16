@@ -1,9 +1,12 @@
 use std::sync::Arc;
 
 use app_mfg::{
-    MfgActionExecutionRequest, MfgActionFeedback, MfgCockpitProfile, MfgCockpitProfileInput,
-    MfgCockpitReportDeliveryState, MfgCockpitReportRequest, MfgCockpitReportSnapshot, MfgIncident,
-    MfgPlaybook, MfgRepositoryError,
+    mfg_widget_catalog, MfgActionExecutionRequest, MfgActionFeedback, MfgAlertCommand,
+    MfgAlertCommandInput, MfgAlertRule, MfgAlertRuleInput, MfgAlertSubscription,
+    MfgAlertSubscriptionInput, MfgAssignment, MfgAssignmentCommand, MfgAssignmentCommandInput,
+    MfgAssignmentInput, MfgCockpitProfile, MfgCockpitProfileInput, MfgCockpitReportDeliveryState,
+    MfgCockpitReportRequest, MfgCockpitReportSnapshot, MfgIncident, MfgPlaybook,
+    MfgRepositoryError,
 };
 use axum::{
     extract::{Path as AxumPath, Query, State as AxumState},
@@ -35,10 +38,12 @@ use super::mfg_outcomes::{
 mod cockpit;
 mod decision;
 mod incidents;
+mod operations;
 use super::{api_error, AppState, ErrorResponse};
 use cockpit::*;
 use decision::*;
 use incidents::*;
+use operations::*;
 
 /// Public MFG bridge intent. Gateway authentication owns the effective actor;
 /// an actor field in an HTTP body is rejected by this closed schema.
@@ -383,12 +388,28 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             post(mfg_execution_feedback_handler),
         )
         .route(
+            "/api/apps/mfg/cockpit/profiles",
+            get(mfg_cockpit_profile_list_handler),
+        )
+        .route(
             "/api/apps/mfg/cockpit/profiles/upsert",
             post(mfg_cockpit_profile_upsert_handler),
         )
         .route(
             "/api/apps/mfg/cockpit/profiles/:id",
-            get(mfg_cockpit_profile_get_handler),
+            get(mfg_cockpit_profile_get_handler).delete(mfg_cockpit_profile_delete_handler),
+        )
+        .route(
+            "/api/apps/mfg/cockpit/profiles/:id/clone",
+            post(mfg_cockpit_profile_clone_handler),
+        )
+        .route(
+            "/api/apps/mfg/cockpit/profiles/:id/share",
+            post(mfg_cockpit_profile_share_handler),
+        )
+        .route(
+            "/api/apps/mfg/cockpit/widget-catalog",
+            get(mfg_cockpit_widget_catalog_handler),
         )
         .route(
             "/api/apps/mfg/cockpit/profiles/:id/projection",
@@ -418,6 +439,50 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/apps/mfg/cockpit/reports/:id/delivery/retry",
             post(mfg_cockpit_report_delivery_retry_handler),
         )
+        .route(
+            "/api/apps/mfg/focus/alert-rules",
+            get(mfg_alert_rule_list_handler).post(mfg_alert_rule_upsert_handler),
+        )
+        .route(
+            "/api/apps/mfg/focus/alerts",
+            get(mfg_alert_occurrence_list_handler),
+        )
+        .route(
+            "/api/apps/mfg/focus/alert-subscriptions",
+            get(mfg_alert_subscription_list_handler).post(mfg_alert_subscription_upsert_handler),
+        )
+        .route(
+            "/api/apps/mfg/focus/alerts/:id/command",
+            post(mfg_alert_command_handler),
+        )
+        .route(
+            "/api/apps/mfg/focus/forecasts",
+            get(mfg_forecast_list_handler),
+        )
+        .route(
+            "/api/apps/mfg/assignments",
+            get(mfg_assignment_list_handler).post(mfg_assignment_upsert_handler),
+        )
+        .route(
+            "/api/apps/mfg/assignments/:id",
+            get(mfg_assignment_get_handler),
+        )
+        .route(
+            "/api/apps/mfg/assignments/:id/command",
+            post(mfg_assignment_command_handler),
+        )
+        .route("/api/apps/mfg/live", get(mfg_live_projection_handler))
+}
+
+fn mfg_mutation_error(error: MfgRepositoryError) -> (StatusCode, Json<ErrorResponse>) {
+    match error {
+        MfgRepositoryError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+        conflict @ (MfgRepositoryError::RevisionConflict { .. }
+        | MfgRepositoryError::CommandRejected(_)) => {
+            api_error(StatusCode::CONFLICT, conflict.to_string())
+        }
+        other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+    }
 }
 
 async fn mfg_app_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
@@ -431,6 +496,35 @@ struct MfgCockpitProfileUpsertRequest {
     #[serde(default)]
     session_id: Option<String>,
     profile: MfgCockpitProfileInput,
+}
+
+#[derive(Debug, Deserialize)]
+struct MfgCockpitProfileListQuery {
+    #[serde(default)]
+    cadence: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MfgCockpitProfileDeleteQuery {
+    expected_revision: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MfgCockpitProfileCloneRequest {
+    #[serde(default)]
+    profile_id: Option<String>,
+    #[serde(default)]
+    display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MfgCockpitProfileShareRequest {
+    expected_revision: u64,
+    sharing_policy: app_mfg::MfgDashboardSharingPolicy,
 }
 
 #[derive(Debug, Deserialize)]

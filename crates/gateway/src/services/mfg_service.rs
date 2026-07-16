@@ -4,11 +4,13 @@ use super::ServiceEnvelope;
 use app_mfg::{
     plan_server_manufacturing_skills, run_server_manufacturing_skill,
     server_manufacturing_skill_pack, MfgActionExecution, MfgActionExecutionRequest,
-    MfgActionFeedback, MfgCasePromotion, MfgCockpitProfile, MfgCockpitProjection,
-    MfgCockpitReportDeliveryReceipt, MfgCockpitReportRequest, MfgCockpitReportSnapshot,
-    MfgCrossPlaneBridgeReceipt, MfgDomainSeedResult, MfgHealth, MfgIncident, MfgMemoryCase,
-    MfgMetricRecomputeResult, MfgOperationalAnalysis, MfgPlaybook, MfgRepositoryError,
-    MfgSkillManifest, MfgSkillPlan, MfgSkillRun, MfgStore,
+    MfgActionFeedback, MfgAlertCommandInput, MfgAlertOccurrence, MfgAlertRule,
+    MfgAlertSubscription, MfgAssignment, MfgAssignmentCommandInput, MfgCasePromotion,
+    MfgCockpitProfile, MfgCockpitProjection, MfgCockpitReportDeliveryReceipt,
+    MfgCockpitReportRequest, MfgCockpitReportSnapshot, MfgCommandReceipt,
+    MfgCrossPlaneBridgeReceipt, MfgDomainSeedResult, MfgForecastProjection, MfgHealth, MfgIncident,
+    MfgLiveProjection, MfgMemoryCase, MfgMetricRecomputeResult, MfgOperationalAnalysis,
+    MfgPlaybook, MfgRepositoryError, MfgSkillManifest, MfgSkillPlan, MfgSkillRun, MfgStore,
 };
 use connector::{CrossPlaneRisk, DataClassification};
 use matrix_core::{
@@ -518,9 +520,10 @@ impl MfgService {
         &self,
         config_home: impl AsRef<Path>,
         profile: &MfgCockpitProfile,
+        expected_revision: Option<u64>,
     ) -> Result<MfgCockpitProfile, MfgRepositoryError> {
         self.open_store(config_home)?
-            .upsert_cockpit_profile(profile)
+            .upsert_cockpit_profile(profile, expected_revision)
     }
 
     pub(crate) fn get_cockpit_profile(
@@ -576,6 +579,145 @@ impl MfgService {
     ) -> Result<MfgCockpitReportSnapshot, MfgRepositoryError> {
         self.open_store(config_home)?
             .attach_cockpit_report_delivery(report_id, receipt)
+    }
+
+    pub(crate) fn delete_cockpit_profile(
+        &self,
+        config_home: impl AsRef<Path>,
+        profile_id: &str,
+        expected_revision: u64,
+    ) -> Result<MfgCockpitProfile, MfgRepositoryError> {
+        self.open_store(config_home)?
+            .delete_cockpit_profile(profile_id, expected_revision)
+    }
+
+    pub(crate) fn upsert_alert_rule(
+        &self,
+        config_home: impl AsRef<Path>,
+        rule: &MfgAlertRule,
+        expected_revision: Option<u64>,
+    ) -> Result<MfgAlertRule, MfgRepositoryError> {
+        self.open_store(config_home)?
+            .upsert_alert_rule(rule, expected_revision)
+    }
+
+    pub(crate) fn list_alert_rules(
+        &self,
+        config_home: impl AsRef<Path>,
+        owner_ref: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MfgAlertRule>, MfgRepositoryError> {
+        self.open_store(config_home)?
+            .list_alert_rules(owner_ref, limit)
+    }
+
+    pub(crate) fn list_alert_occurrences(
+        &self,
+        config_home: impl AsRef<Path>,
+        status: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MfgAlertOccurrence>, MfgRepositoryError> {
+        self.open_store(config_home)?
+            .list_alert_occurrences(status, limit)
+    }
+
+    pub(crate) fn upsert_alert_subscription(
+        &self,
+        config_home: impl AsRef<Path>,
+        subscription: &MfgAlertSubscription,
+        expected_revision: Option<u64>,
+    ) -> Result<MfgAlertSubscription, MfgRepositoryError> {
+        self.open_store(config_home)?
+            .upsert_alert_subscription(subscription, expected_revision)
+    }
+
+    pub(crate) fn list_alert_subscriptions(
+        &self,
+        config_home: impl AsRef<Path>,
+        subscriber_ref: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MfgAlertSubscription>, MfgRepositoryError> {
+        self.open_store(config_home)?
+            .list_alert_subscriptions(subscriber_ref, limit)
+    }
+
+    pub(crate) fn command_alert(
+        &self,
+        config_home: impl AsRef<Path>,
+        occurrence_id: &str,
+        command: MfgAlertCommandInput,
+    ) -> Result<(MfgAlertOccurrence, MfgCommandReceipt), MfgRepositoryError> {
+        self.open_store(config_home)?
+            .command_alert(occurrence_id, command)
+    }
+
+    pub(crate) fn forecasts(
+        &self,
+        config_home: impl AsRef<Path>,
+        metric_refs: &[String],
+        horizon: &str,
+        limit: usize,
+    ) -> Result<Vec<MfgForecastProjection>, MfgRepositoryError> {
+        self.open_store(config_home)?
+            .forecasts(metric_refs, horizon, limit)
+    }
+
+    pub(crate) fn upsert_assignment(
+        &self,
+        config_home: impl AsRef<Path>,
+        assignment: &MfgAssignment,
+        expected_revision: Option<u64>,
+    ) -> Result<MfgAssignment, MfgRepositoryError> {
+        self.open_store(config_home)?
+            .upsert_assignment(assignment, expected_revision)
+    }
+
+    pub(crate) fn get_assignment(
+        &self,
+        config_home: impl AsRef<Path>,
+        assignment_id: &str,
+    ) -> Result<Option<MfgAssignment>, MfgRepositoryError> {
+        self.open_store(config_home)?.get_assignment(assignment_id)
+    }
+
+    pub(crate) fn list_assignments(
+        &self,
+        config_home: impl AsRef<Path>,
+        assignee_ref: Option<&str>,
+        incident_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MfgAssignment>, MfgRepositoryError> {
+        self.open_store(config_home)?
+            .list_assignments(assignee_ref, incident_id, limit)
+    }
+
+    pub(crate) fn command_assignment(
+        &self,
+        config_home: impl AsRef<Path>,
+        assignment_id: &str,
+        command: MfgAssignmentCommandInput,
+    ) -> Result<(MfgAssignment, MfgCommandReceipt), MfgRepositoryError> {
+        self.open_store(config_home)?
+            .command_assignment(assignment_id, command)
+    }
+
+    pub(crate) fn live_projection(
+        &self,
+        config_home: impl AsRef<Path>,
+        cursor: Option<u64>,
+        limit: usize,
+    ) -> Result<MfgLiveProjection, MfgRepositoryError> {
+        self.open_store(config_home)?.live_projection(cursor, limit)
+    }
+
+    pub(crate) fn record_command_notifications(
+        &self,
+        config_home: impl AsRef<Path>,
+        idempotency_key: &str,
+        notification_refs: Vec<String>,
+    ) -> Result<MfgCommandReceipt, MfgRepositoryError> {
+        self.open_store(config_home)?
+            .record_command_notifications(idempotency_key, notification_refs)
     }
 
     pub(super) fn contracts(&self) -> Vec<ServiceEnvelope> {

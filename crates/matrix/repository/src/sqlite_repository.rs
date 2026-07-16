@@ -3516,6 +3516,7 @@ fn attention_from_change(
             .unwrap_or("operations")
             .to_string(),
         entity_ref: Some(state.entity_scope.clone()),
+        metric_refs: vec![state.metric_id.clone()],
         period: Some(state.period.clone()),
         priority_score,
         severity,
