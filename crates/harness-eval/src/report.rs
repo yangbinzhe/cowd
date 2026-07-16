@@ -6,7 +6,9 @@ use crate::{ComplexHarnessScenarioReport, E2eScenarioMatrixItem, StableAiHealthR
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum HarnessEvalLevel {
+    #[default]
     Quick,
     Full,
     Deep,
@@ -33,11 +35,6 @@ impl HarnessEvalLevel {
     }
 }
 
-impl Default for HarnessEvalLevel {
-    fn default() -> Self {
-        Self::Quick
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

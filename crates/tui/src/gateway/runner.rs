@@ -156,6 +156,13 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                             continue;
                         }
                     }
+                    if let Event::Paste(text) = event {
+                        // Bracketed paste is one canonical composer edit. Do
+                        // not replay it as individual key events, which would
+                        // break undo and can split IME/Unicode transactions.
+                        state.process_paste(&text);
+                        continue;
+                    }
                     if let Event::Key(key) = event {
                         if key.kind == KeyEventKind::Press {
                             // Keyboard input is a render cause even when it
@@ -228,6 +235,41 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                                         continue;
                                     }
                                     if text.starts_with('/') {
+                                        if let Some(input_id) = queue_cancel_command(&text) {
+                                            dispatch_pending_input_cancel(
+                                                &gateway_client,
+                                                &tui_tx,
+                                                &session_id,
+                                                input_id,
+                                            );
+                                            continue;
+                                        }
+                                        if let Some(input_id) = queue_edit_command(&text) {
+                                            if let Some(input) = state
+                                                .app
+                                                .pending_inputs
+                                                .iter()
+                                                .find(|input| input.input_id == input_id)
+                                            {
+                                                state.app.input.set_text(&input.content_preview);
+                                                dispatch_pending_input_cancel(
+                                                    &gateway_client,
+                                                    &tui_tx,
+                                                    &session_id,
+                                                    input_id,
+                                                );
+                                                state.add_system_notice(
+                                                    SystemNoticeKind::Info,
+                                                    "Queued follow-up restored to composer; edit it and submit to replace the canonical input.",
+                                                );
+                                            } else {
+                                                state.add_system_notice(
+                                                    SystemNoticeKind::Warning,
+                                                    "Queued input was not found locally; refresh or use its full input id.",
+                                                );
+                                            }
+                                            continue;
+                                        }
                                         dispatch_gateway_slash(
                                             &gateway_client,
                                             &tui_tx,
@@ -473,6 +515,13 @@ fn attach_gateway_session(
             &format!("Gateway session run projection unavailable: {err}"),
         ),
     }
+    match runtime.block_on(gateway_client.session_input_projection(&config.session_id)) {
+        Ok(projection) => state.app.apply_session_input_projection(projection),
+        Err(err) => state.add_system_notice(
+            SystemNoticeKind::Warning,
+            &format!("Gateway queued-input projection unavailable: {err}"),
+        ),
+    }
     if let Some(readiness) = readiness {
         state.add_system_notice(
             SystemNoticeKind::Info,
@@ -607,6 +656,11 @@ fn dispatch_gateway_message(
             .await
         {
             Ok(value) => {
+                if let Some(projection) = value.get("input_projection") {
+                    let _ = event_tx.send(CowdEvent::SessionInputProjection {
+                        projection: projection.clone(),
+                    });
+                }
                 if !resource_ids.is_empty() {
                     let _ = event_tx.send(CowdEvent::ResourcesCommitted {
                         ids: resource_ids.clone(),
@@ -720,6 +774,59 @@ fn dispatch_gateway_cancel(
             Err(err) => {
                 let _ = cancel_tx.send(CowdEvent::TurnError {
                     error: format!("Gateway cancel request failed: {err}"),
+                });
+            }
+        }
+    });
+}
+
+fn queue_cancel_command(input: &str) -> Option<&str> {
+    let mut parts = input.trim().split_whitespace();
+    matches!(parts.next(), Some("/queue"))
+        .then(|| parts.next())
+        .flatten()
+        .filter(|action| *action == "cancel")
+        .and_then(|_| parts.next())
+}
+
+fn queue_edit_command(input: &str) -> Option<&str> {
+    let mut parts = input.trim().split_whitespace();
+    matches!(parts.next(), Some("/queue"))
+        .then(|| parts.next())
+        .flatten()
+        .filter(|action| *action == "edit")
+        .and_then(|_| parts.next())
+}
+
+fn dispatch_pending_input_cancel(
+    gateway_client: &GatewayApiClient,
+    tx: &crate::events::CowdEventSender,
+    session_id: &str,
+    input_id: &str,
+) {
+    let client = gateway_client.clone();
+    let tx = tx.clone();
+    let task_tx = tx.clone();
+    let session_id = session_id.to_string();
+    let input_id = input_id.to_string();
+    spawn_tui_task(&tx, async move {
+        match client
+            .cancel_session_input(&session_id, &input_id, "cancelled from TUI queue")
+            .await
+        {
+            Ok(receipt) => {
+                if let Some(projection) = receipt.get("input_projection") {
+                    let _ = task_tx.send(CowdEvent::SessionInputProjection {
+                        projection: projection.clone(),
+                    });
+                }
+                let _ = task_tx.send(CowdEvent::Warning {
+                    message: format!("Queued input {input_id} cancelled"),
+                });
+            }
+            Err(error) => {
+                let _ = task_tx.send(CowdEvent::TurnError {
+                    error: format!("Queued input cancellation failed: {error}"),
                 });
             }
         }
@@ -1099,6 +1206,14 @@ mod tests {
         );
         assert_eq!(execution_command_from_input("/status"), None);
         assert_eq!(execution_command_from_input("/execution unknown"), None);
+    }
+
+    #[test]
+    fn queued_input_commands_are_explicit_and_do_not_capture_other_slashes() {
+        assert_eq!(queue_cancel_command("/queue cancel input-1"), Some("input-1"));
+        assert_eq!(queue_edit_command(" /queue edit input-2 "), Some("input-2"));
+        assert_eq!(queue_cancel_command("/queue edit input-1"), None);
+        assert_eq!(queue_edit_command("/status"), None);
     }
 
     #[test]

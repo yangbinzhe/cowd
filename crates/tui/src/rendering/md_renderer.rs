@@ -316,7 +316,7 @@ impl<'a> Renderer<'a> {
                     self.link_depth -= 1;
                     if self.link_depth == 0 {
                         for span in self.current_spans.iter_mut().skip(self.link_saved_len) {
-                            span.style = span.style.clone().fg(self.theme.link_color());
+                            span.style = span.style.fg(self.theme.link_color());
                         }
                     }
                 }

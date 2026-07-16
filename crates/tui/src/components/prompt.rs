@@ -220,7 +220,7 @@ impl AutocompleteEngine {
     /// Add a command to the history (for future free-text matching).
     pub fn add_history(&mut self, input: String) {
         // Avoid consecutive duplicates
-        if self.history.last().map_or(true, |h| h != &input) {
+        if self.history.last() != Some(&input) {
             self.history.push(input);
         }
     }
@@ -2022,8 +2022,8 @@ mod tests {
         if prompt.show_suggestions && !prompt.suggestions.is_empty() {
             // The inline preview should contain the rest of the suggestion
             let first = &prompt.suggestions[0].text;
-            if first.starts_with("/sta") {
-                let expected_preview = &first[4..]; // after "/sta"
+            if let Some(expected_preview) = first.strip_prefix("/sta") {
+                // after "/sta"
                 assert_eq!(
                     prompt.inline_preview, expected_preview,
                     "inline preview should be the rest of the top suggestion"

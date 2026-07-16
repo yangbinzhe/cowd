@@ -112,7 +112,7 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
         let _ = tx.send(result);
     });
     rx.recv()
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "bash thread panicked"))?
+        .map_err(|_| io::Error::other("bash thread panicked"))?
 }
 
 fn resolve_cwd(cwd: Option<&str>) -> io::Result<PathBuf> {

@@ -592,7 +592,7 @@ fn write_lsp_message(writer: &mut dyn Write, payload: &serde_json::Value) -> Res
     write!(
         writer,
         "Content-Length: {}\r\n\r\n{}",
-        body.as_bytes().len(),
+        body.len(),
         body
     )
     .map_err(|error| error.to_string())
@@ -635,7 +635,7 @@ mod tests {
 
     fn framed_json(value: &serde_json::Value) -> String {
         let body = value.to_string();
-        format!("Content-Length: {}\r\n\r\n{}", body.as_bytes().len(), body)
+        format!("Content-Length: {}\r\n\r\n{}", body.len(), body)
     }
 
     fn shell_quote(value: &str) -> String {

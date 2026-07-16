@@ -71,8 +71,10 @@ impl fmt::Display for TaskId {
 /// Task status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum TaskStatus {
     /// Task is pending.
+    #[default]
     Pending,
     /// Task is running.
     Running,
@@ -88,11 +90,6 @@ pub enum TaskStatus {
     Cancelled,
 }
 
-impl Default for TaskStatus {
-    fn default() -> Self {
-        Self::Pending
-    }
-}
 
 /// Task result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,8 +198,10 @@ impl Wave {
 /// Wave status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum WaveStatus {
     /// Wave is waiting for dependencies.
+    #[default]
     Waiting,
     /// Wave is ready to execute.
     Ready,
@@ -216,11 +215,6 @@ pub enum WaveStatus {
     Cancelled,
 }
 
-impl Default for WaveStatus {
-    fn default() -> Self {
-        Self::Waiting
-    }
-}
 
 /// Wave execution result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -240,20 +234,17 @@ pub struct WaveResult {
 /// Error recovery policy for wave execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ErrorPolicy {
     /// Retry failed tasks up to a limit before giving up.
     Retry { max_retries: usize },
     /// Skip failed tasks and continue with remaining waves.
+    #[default]
     Skip,
     /// Abort the entire plan on first failure.
     Abort,
 }
 
-impl Default for ErrorPolicy {
-    fn default() -> Self {
-        ErrorPolicy::Skip
-    }
-}
 
 /// Wave execution configuration.
 #[derive(Debug, Clone)]
@@ -787,7 +778,7 @@ impl WaveOrchestrator {
 
         // Execute tasks in parallel batches
         let mut task_results: Vec<TaskResult> = Vec::new();
-        let tasks: Vec<_> = wave.tasks.iter().cloned().collect();
+        let tasks: Vec<_> = wave.tasks.to_vec();
         let mut failed = false;
 
         // Process in batches of max_parallel

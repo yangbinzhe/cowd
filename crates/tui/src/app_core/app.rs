@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+use crate::components::composer::model::ComposerModel;
 use crate::components::turn_interaction::TurnInteractionState;
 use crate::layout::{build_default_layout, LayoutState, LayoutTree};
 use crate::runtime_control_store::{
@@ -9,10 +10,8 @@ use crate::runtime_control_store::{
     SurfaceHealthSummary, SurfaceSummary, TaskSummary,
 };
 use crate::CowdEvent;
-use ratatui::widgets::{Block, Borders};
 use serde_json::Value;
 use std::collections::VecDeque;
-use tui_textarea::TextArea;
 
 const PAGE_SIZE: usize = 500;
 const SOFT_CAP: usize = 10000;
@@ -161,6 +160,17 @@ pub struct PendingResource {
     pub kind: String,
 }
 
+/// Read-only TUI projection of a Runtime-owned SessionIngress record. Edits,
+/// cancellation and routing still address the canonical `input_id` through
+/// Gateway; this struct is never an executable local queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingInputPreview {
+    pub input_id: String,
+    pub status: String,
+    pub decision: String,
+    pub content_preview: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SystemNoticeKind {
     Info,
@@ -191,7 +201,9 @@ pub struct App {
     pub session_id: String,
     pub yolo_mode: bool,
     pub current_task: Option<CurrentTaskSummary>,
-    pub input: TextArea<'static>,
+    /// Canonical composer bytes and cursor. Visual rows are derived from the
+    /// actual terminal rectangle by `components::composer::layout`.
+    pub input: ComposerModel,
     pub spinner_idx: usize,
     pub should_quit: bool,
 
@@ -215,6 +227,9 @@ pub struct App {
     pub memory_entries: Vec<MemoryEntry>,
     pub skill_list: Vec<SkillSummary>,
     pub pending_resources: Vec<PendingResource>,
+    /// Current visible SessionIngress inputs, decoded from Gateway's
+    /// canonical projection. Kept bounded for the terminal presentation.
+    pub pending_inputs: Vec<PendingInputPreview>,
     pub system_notices: VecDeque<SystemNotice>,
     pub skin: crate::skin::SkinConfig,
     pub memory_status: Option<String>,
@@ -510,20 +525,12 @@ impl Theme {
 
 impl App {
     pub fn new(model: &str, session_id: &str) -> Self {
-        let mut input = TextArea::default();
-        input.set_block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Input (Enter=send, Esc=quit, Alt+Enter/Ctrl+J=newline) "),
-        );
-        input.set_style(ratatui::style::Style::default().fg(ratatui::style::Color::White));
-
         Self {
             model: model.to_string(),
             session_id: session_id.to_string(),
             yolo_mode: false,
             current_task: None,
-            input,
+            input: ComposerModel::default(),
             spinner_idx: 0,
             should_quit: false,
 
@@ -547,6 +554,7 @@ impl App {
             memory_entries: Vec::new(),
             skill_list: Vec::new(),
             pending_resources: Vec::new(),
+            pending_inputs: Vec::new(),
             system_notices: VecDeque::new(),
             skin: crate::skin::SkinConfig::default(),
             memory_status: None,
@@ -724,6 +732,93 @@ impl App {
         self.msg_version = self.msg_version.wrapping_add(1);
     }
 
+    pub fn apply_session_input_projection(&mut self, projection: Value) {
+        // A projection can be replayed after reconnect. Remember which queue
+        // records were already announced so the TUI exposes the canonical id
+        // exactly when it first becomes actionable, without creating a local
+        // execution queue or repeating notices for the same snapshot.
+        let announced_queued_ids = self
+            .pending_inputs
+            .iter()
+            .filter(|input| input.status == "queued_next")
+            .map(|input| input.input_id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let mut inputs = projection
+            .get("inputs")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|input| {
+                let status = input.get("status")?.as_str()?.to_string();
+                let pending = matches!(
+                    status.as_str(),
+                    "received"
+                        | "persisted"
+                        | "classified"
+                        | "attached_to_turn"
+                        | "queued_next"
+                        | "interrupt_requested"
+                        | "control_resolved"
+                );
+                pending.then(|| PendingInputPreview {
+                    input_id: input
+                        .get("input_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    status,
+                    decision: input
+                        .get("decision")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    content_preview: input
+                        .get("content_preview")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                })
+            })
+            .filter(|input| !input.input_id.is_empty())
+            .collect::<Vec<_>>();
+        inputs.sort_by(|left, right| left.input_id.cmp(&right.input_id));
+        inputs.truncate(32);
+        let newly_queued = inputs
+            .iter()
+            .filter(|input| {
+                input.status == "queued_next"
+                    && !announced_queued_ids.contains(input.input_id.as_str())
+            })
+            .map(|input| input.input_id.clone())
+            .collect::<Vec<_>>();
+        self.pending_inputs = inputs;
+        self.mark_dirty();
+        for input_id in newly_queued {
+            self.add_system_notice(
+                SystemNoticeKind::Info,
+                &format!(
+                    "Follow-up queued ({input_id}). Use /queue edit {input_id} to revise it or \
+                     /queue cancel {input_id} to remove it."
+                ),
+            );
+        }
+    }
+
+    #[must_use]
+    pub fn queued_follow_up_count(&self) -> usize {
+        self.pending_inputs
+            .iter()
+            .filter(|input| input.status == "queued_next")
+            .count()
+    }
+
+    #[must_use]
+    pub fn queued_follow_up_preview(&self) -> Option<&PendingInputPreview> {
+        self.pending_inputs
+            .iter()
+            .find(|input| input.status == "queued_next")
+    }
+
     pub fn timeline_len(&self) -> usize {
         self.total_entries
     }
@@ -771,7 +866,7 @@ impl App {
             || self
                 .timeline_pages
                 .back()
-                .map_or(true, |p| p.entries.len() >= PAGE_SIZE)
+                .is_none_or(|p| p.entries.len() >= PAGE_SIZE)
         {
             let start = self
                 .timeline_pages
@@ -983,7 +1078,7 @@ impl App {
                 break;
             }
             idx -= 1;
-            if self.timeline_get(idx).map_or(false, |e| e.is_collapsible()) {
+            if self.timeline_get(idx).is_some_and(|e| e.is_collapsible()) {
                 self.timeline_cursor = idx;
                 self.auto_scroll = false;
                 return true;
@@ -999,7 +1094,7 @@ impl App {
         let mut idx = self.timeline_cursor;
         while idx + 1 < self.timeline_len() {
             idx += 1;
-            if self.timeline_get(idx).map_or(false, |e| e.is_collapsible()) {
+            if self.timeline_get(idx).is_some_and(|e| e.is_collapsible()) {
                 self.timeline_cursor = idx;
                 self.auto_scroll = true;
                 return true;
@@ -1446,6 +1541,10 @@ impl App {
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
 
+            CowdEvent::SessionInputProjection { projection } => {
+                self.apply_session_input_projection(projection);
+            }
+
             CowdEvent::TurnError { error } => {
                 self.add_system_notice(SystemNoticeKind::Error, &format!("Error: {error}"));
             }
@@ -1537,6 +1636,12 @@ fn first_usize_after(value: &str, marker: &str) -> Option<usize> {
         .take_while(|ch| ch.is_ascii_digit())
         .collect::<String>();
     digits.parse().ok()
+}
+
+/// Trait for tool registry integration with SkillsPanel.
+pub trait ToolRegistry: Send + Sync {
+    fn enable_tool(&self, name: &str);
+    fn disable_tool(&self, name: &str);
 }
 
 #[cfg(test)]
@@ -1721,6 +1826,42 @@ mod tests {
     }
 
     #[test]
+    fn session_input_projection_is_a_bounded_runtime_owned_queue_view() {
+        let mut app = App::new("test", "sess");
+        app.apply_session_input_projection(serde_json::json!({
+            "inputs": [
+                {
+                    "input_id": "queued-a",
+                    "status": "queued_next",
+                    "decision": "enqueue_next_step",
+                    "content_preview": "follow up with tests"
+                },
+                {
+                    "input_id": "done-b",
+                    "status": "consumed",
+                    "decision": "start_new_turn",
+                    "content_preview": "already consumed"
+                }
+            ]
+        }));
+
+        assert_eq!(app.queued_follow_up_count(), 1);
+        let preview = app.queued_follow_up_preview().expect("queued preview");
+        assert_eq!(preview.input_id, "queued-a");
+        assert_eq!(preview.content_preview, "follow up with tests");
+        assert!(app.system_notices.iter().any(|notice| {
+            notice
+                .content
+                .contains("/queue edit queued-a")
+                && notice.content.contains("/queue cancel queued-a")
+        }));
+        assert!(app
+            .pending_inputs
+            .iter()
+            .all(|input| input.input_id != "done-b"));
+    }
+
+    #[test]
     fn session_activity_stats_cover_current_conversation() {
         let mut app = App::new("test", "sess");
         app.add_message("user", "hi");
@@ -1797,10 +1938,4 @@ mod tests {
         assert!(moved);
         assert!(app.timeline_cursor < 599);
     }
-}
-
-/// Trait for tool registry integration with SkillsPanel.
-pub trait ToolRegistry: Send + Sync {
-    fn enable_tool(&self, name: &str);
-    fn disable_tool(&self, name: &str);
 }

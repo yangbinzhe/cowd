@@ -90,6 +90,7 @@ pub fn runtime_module_map() -> Vec<RuntimeModuleDescriptor> {
         RuntimeModuleDescriptor::public("runtime_control", Infrastructure, "runtime", true),
         RuntimeModuleDescriptor::public("runtime_harness", Infrastructure, "runtime", true),
         RuntimeModuleDescriptor::public("execution_core", ExecutionCore, "runtime", true),
+        RuntimeModuleDescriptor::public("execution_live", ExecutionCore, "runtime", true),
         RuntimeModuleDescriptor::public("execution_projection", ExecutionCore, "runtime", false),
         RuntimeModuleDescriptor::public("orchestration", ExecutionCore, "runtime", true),
         RuntimeModuleDescriptor::public("provider_runtime_client", Provider, "runtime", true),

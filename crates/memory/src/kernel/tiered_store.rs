@@ -65,16 +65,13 @@ pub enum StorageTier {
 
 /// Supported compression algorithms for the cold tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum CompressionAlgo {
     /// lz4 fast compression via `lz4_flex`.
+    #[default]
     Lz4,
 }
 
-impl Default for CompressionAlgo {
-    fn default() -> Self {
-        Self::Lz4
-    }
-}
 
 // ---------------------------------------------------------------------------
 // TieredSessionStoreConfig
@@ -287,7 +284,7 @@ impl TieredSessionStore {
 
     /// Return the total number of pages for a session given its message count.
     pub fn page_count(&self, message_count: usize) -> usize {
-        (message_count + self.config.page_size - 1) / self.config.page_size
+        message_count.div_ceil(self.config.page_size)
     }
 
     // -----------------------------------------------------------------------

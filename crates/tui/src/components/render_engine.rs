@@ -12,17 +12,11 @@ use crate::{
 
 /// Placeholder state for the TUI render engine.
 /// Will be expanded in future tasks to carry session data, theme overrides, etc.
+#[derive(Default)]
 pub struct TuiState {
     pub theme: SkinConfig,
 }
 
-impl Default for TuiState {
-    fn default() -> Self {
-        Self {
-            theme: SkinConfig::default(),
-        }
-    }
-}
 
 /// Flatten the `LayoutTree` into area+component pairs and render each.
 ///

@@ -68,6 +68,7 @@ pub struct Triple {
 ///
 /// Similar to MemPalace's fact_checker.py ENTITY_FACTS structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct EntityFacts {
     /// Full name of the entity.
     pub full_name: Option<String>,
@@ -85,19 +86,6 @@ pub struct EntityFacts {
     pub relationships: Vec<(String, String)>,
 }
 
-impl Default for EntityFacts {
-    fn default() -> Self {
-        Self {
-            full_name: None,
-            entity_type: None,
-            parent: None,
-            partner: None,
-            birthday: None,
-            interests: Vec::new(),
-            relationships: Vec::new(),
-        }
-    }
-}
 
 // ─── Query Options ────────────────────────────────────────────────────────────
 
@@ -316,7 +304,7 @@ impl KnowledgeGraph {
                             valid_until: triple.valid_until,
                             confidence: triple.confidence,
                             current: triple.valid_until.is_none(),
-                            source_memory_id: triple.source_memory_id.clone(),
+                            source_memory_id: triple.source_memory_id,
                         });
                     }
                 }
@@ -345,7 +333,7 @@ impl KnowledgeGraph {
                         valid_until: triple.valid_until,
                         confidence: triple.confidence,
                         current: triple.valid_until.is_none(),
-                        source_memory_id: triple.source_memory_id.clone(),
+                        source_memory_id: triple.source_memory_id,
                     });
                 }
             }
@@ -394,7 +382,7 @@ impl KnowledgeGraph {
                 valid_until: triple.valid_until,
                 confidence: triple.confidence,
                 current: triple.valid_until.is_none(),
-                source_memory_id: triple.source_memory_id.clone(),
+                source_memory_id: triple.source_memory_id,
             });
         }
 
@@ -455,7 +443,7 @@ impl KnowledgeGraph {
                 valid_until: triple.valid_until,
                 confidence: triple.confidence,
                 current: triple.valid_until.is_none(),
-                source_memory_id: triple.source_memory_id.clone(),
+                source_memory_id: triple.source_memory_id,
             });
         }
 

@@ -236,9 +236,8 @@ async fn terminal_role_transition_commits_team_working_state_with_graph() {
         state.entries[0].summary,
         "completed with evidence reference"
     );
-    assert_eq!(
-        state.entries[0].producer_instance_id.is_empty(),
-        false,
+    assert!(
+        !state.entries[0].producer_instance_id.is_empty(),
         "working state records the immutable producing Agent instance"
     );
     assert!(state.entries[0]

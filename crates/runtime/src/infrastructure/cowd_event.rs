@@ -233,6 +233,12 @@ pub struct CowdExecutionScope {
     context: CowdExecutionContext,
 }
 
+impl Default for CowdEventBus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CowdEventBus {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(4096);

@@ -633,7 +633,7 @@ fn schema_from_rows(table_name: String, headers: &[String], rows: &[Value]) -> S
                 nullable: rows
                     .iter()
                     .filter_map(Value::as_object)
-                    .any(|object| object.get(name).map_or(true, Value::is_null)),
+                    .any(|object| object.get(name).is_none_or(Value::is_null)),
             }
         })
         .collect();

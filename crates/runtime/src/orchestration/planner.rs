@@ -32,7 +32,7 @@ fn collaboration_decision_for_execution(
     intent: &str,
     decision: &RuntimeExecutionDecision,
 ) -> CollaborationDecision {
-    CollaborationTemplateMatcher::default().decide(intent, &decision.strategy)
+    CollaborationTemplateMatcher.decide(intent, &decision.strategy)
 }
 
 #[must_use]

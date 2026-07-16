@@ -131,7 +131,7 @@ mod tests {
         let count = est.estimate("Hello, how are you today?");
         // "Hello," -> 2 (word + punct), "how" -> 1, "are" -> 1, "you" -> 1,
         // "today?" -> 2 (word + punct) = 7 + overhead
-        assert!(count >= 7 && count <= 12, "got {count}");
+        assert!((7..=12).contains(&count), "got {count}");
     }
 
     #[test]

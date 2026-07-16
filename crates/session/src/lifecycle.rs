@@ -8,7 +8,9 @@ use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum SessionLifecycleState {
+    #[default]
     Created,
     Active,
     Attached,
@@ -99,11 +101,6 @@ struct SessionLifecycleEntry {
     updated_at_ms: u64,
 }
 
-impl Default for SessionLifecycleState {
-    fn default() -> Self {
-        Self::Created
-    }
-}
 
 #[derive(Debug, Default)]
 pub struct SessionLifecycleKernel {
@@ -314,7 +311,7 @@ impl SessionLifecycleKernel {
             .filter_map(|event| {
                 serde_json::from_str::<DurableLifecycleEvent>(&event.event_json).ok()
             })
-            .last()
+            .next_back()
             .map(|event| event.snapshot)
         else {
             return Ok(());

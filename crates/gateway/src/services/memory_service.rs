@@ -666,6 +666,48 @@ fn capability_probe_json(
     })
 }
 
+fn context_health_json(alert: RotAlert) -> serde_json::Value {
+    match alert {
+        RotAlert::None => serde_json::json!({
+            "level": "healthy",
+            "message": null,
+        }),
+        RotAlert::Warning(message) => serde_json::json!({
+            "level": "warning",
+            "message": message,
+        }),
+        RotAlert::Critical(message) => serde_json::json!({
+            "level": "critical",
+            "message": message,
+        }),
+    }
+}
+
+fn memory_kernel_health_json(health: memory::MemoryHealth) -> serde_json::Value {
+    let degraded_reasons: Vec<String> = health
+        .degraded
+        .iter()
+        .map(|reason| format!("{reason:?}"))
+        .collect();
+    serde_json::json!({
+        "degraded": health.is_degraded(),
+        "degraded_reasons": degraded_reasons,
+        "orientation_pressure": health.orientation_pressure,
+        "conflict_pressure": health.conflict_pressure,
+        "stale_pressure": health.stale_pressure,
+        "evidence_coverage": health.evidence_coverage,
+        "link_coverage": health.link_coverage,
+        "background_lag_ms": health.background_lag_ms,
+    })
+}
+
+fn empty_memory_layers_json() -> Vec<serde_json::Value> {
+    ["L0", "L1", "L2", "L3", "L4"]
+        .into_iter()
+        .map(|layer| serde_json::json!({ "layer": layer, "entry_count": 0 }))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -773,46 +815,4 @@ mod tests {
         assert!(!is_knowledge_memory_entry(&tool_usage));
         assert!(is_knowledge_memory_entry(&knowledge));
     }
-}
-
-fn context_health_json(alert: RotAlert) -> serde_json::Value {
-    match alert {
-        RotAlert::None => serde_json::json!({
-            "level": "healthy",
-            "message": null,
-        }),
-        RotAlert::Warning(message) => serde_json::json!({
-            "level": "warning",
-            "message": message,
-        }),
-        RotAlert::Critical(message) => serde_json::json!({
-            "level": "critical",
-            "message": message,
-        }),
-    }
-}
-
-fn memory_kernel_health_json(health: memory::MemoryHealth) -> serde_json::Value {
-    let degraded_reasons: Vec<String> = health
-        .degraded
-        .iter()
-        .map(|reason| format!("{reason:?}"))
-        .collect();
-    serde_json::json!({
-        "degraded": health.is_degraded(),
-        "degraded_reasons": degraded_reasons,
-        "orientation_pressure": health.orientation_pressure,
-        "conflict_pressure": health.conflict_pressure,
-        "stale_pressure": health.stale_pressure,
-        "evidence_coverage": health.evidence_coverage,
-        "link_coverage": health.link_coverage,
-        "background_lag_ms": health.background_lag_ms,
-    })
-}
-
-fn empty_memory_layers_json() -> Vec<serde_json::Value> {
-    ["L0", "L1", "L2", "L3", "L4"]
-        .into_iter()
-        .map(|layer| serde_json::json!({ "layer": layer, "entry_count": 0 }))
-        .collect()
 }

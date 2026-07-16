@@ -1514,7 +1514,7 @@ impl RuntimeServices {
             crate::EvolutionCandidateSubject::AgentDefinition { revision_ref } => {
                 self.definition_registry
                     .agents()
-                    .read_revision(&revision_ref)
+                    .read_revision(revision_ref)
                     .map_err(DefinitionRegistryError::Agent)?;
                 if let Some(harness_contract::agent::RevisionSelector::ExactApprovedRevision {
                     revision,
@@ -1534,7 +1534,7 @@ impl RuntimeServices {
             crate::EvolutionCandidateSubject::TeamTemplate { revision_ref } => {
                 self.definition_registry
                     .teams()
-                    .read_revision(&revision_ref)
+                    .read_revision(revision_ref)
                     .map_err(DefinitionRegistryError::Team)?;
                 if let Some(harness_contract::agent::RevisionSelector::ExactApprovedRevision {
                     revision,
@@ -1587,7 +1587,7 @@ impl RuntimeServices {
                 let candidate = self
                     .definition_registry
                     .agents()
-                    .read_revision(&revision_ref)
+                    .read_revision(revision_ref)
                     .map_err(DefinitionRegistryError::Agent)?;
                 let baseline = harness_contract::agent::AgentDefinitionRevisionRef::new(
                     revision_ref.definition_id.clone(),
@@ -1621,7 +1621,7 @@ impl RuntimeServices {
                 let candidate = self
                     .definition_registry
                     .teams()
-                    .read_revision(&revision_ref)
+                    .read_revision(revision_ref)
                     .map_err(DefinitionRegistryError::Team)?;
                 let baseline = harness_contract::team::TeamTemplateRevisionRef::new(
                     revision_ref.template_id.clone(),

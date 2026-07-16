@@ -108,7 +108,7 @@ impl ProfileManager {
         let default = self.get_profile("default");
         if default.is_none() {
             self.create_profile("default")
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                .map_err(std::io::Error::other)?;
         }
         if read_active_profile_id(&self.profiles_dir).is_none() {
             self.persist_active_profile("default")

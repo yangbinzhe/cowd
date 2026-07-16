@@ -90,7 +90,7 @@ impl BudgetManager {
     /// Under high pressure (>80%), critical phases get proportionally reduced budgets.
     #[must_use]
     pub fn allocate(&self, phase: AllocationPhase, used: u64) -> Allocation {
-        let total = self.config.context_window as u64;
+        let total = self.config.context_window;
         let pressure = used as f32 / total as f32;
 
         let base_pct = match phase {

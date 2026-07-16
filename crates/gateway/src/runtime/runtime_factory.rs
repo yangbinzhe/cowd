@@ -133,7 +133,7 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
     let overrides = feature_config.model_context_windows();
-    let model_ctx = runtime::model_context_window_with_overrides(&model, Some(&overrides));
+    let model_ctx = runtime::model_context_window_with_overrides(&model, Some(overrides));
     let workspace_item = workspace_context_item(&session, model_ctx);
     let workspace_root = session
         .workspace_root()
@@ -239,18 +239,6 @@ fn default_runtime_agent_skill_profile() -> AgentSkillProfile {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn runtime_agent_skill_profile_defaults_to_prompt_only() {
-        let profile = default_runtime_agent_skill_profile();
-
-        assert_eq!(profile.adapter_ceiling, vec![SkillAdapterKind::PromptOnly]);
-    }
-}
-
 struct GatewayHookProgressReporter;
 
 impl runtime::HookProgressReporter for GatewayHookProgressReporter {
@@ -281,5 +269,17 @@ impl runtime::HookProgressReporter for GatewayHookProgressReporter {
                 event_name = event.as_str()
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_agent_skill_profile_defaults_to_prompt_only() {
+        let profile = default_runtime_agent_skill_profile();
+
+        assert_eq!(profile.adapter_ceiling, vec![SkillAdapterKind::PromptOnly]);
     }
 }

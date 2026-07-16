@@ -39,7 +39,9 @@ pub struct RuntimeOrchestrationRequest {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum RuntimeOrchestrationAction {
+    #[default]
     PlanOnly,
     RequestTeam,
     RequestSubagent,
@@ -53,11 +55,6 @@ pub enum RuntimeOrchestrationAction {
     DispatchSession,
 }
 
-impl Default for RuntimeOrchestrationAction {
-    fn default() -> Self {
-        Self::PlanOnly
-    }
-}
 
 impl RuntimeOrchestrationAction {
     #[must_use]

@@ -101,6 +101,7 @@ pub struct StartMissionSessionRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 struct MissionRuntimeState {
     active_session_id: Option<String>,
     sessions: BTreeMap<String, MissionSessionSnapshot>,
@@ -117,16 +118,6 @@ struct MissionStateEvent {
     state: MissionRuntimeState,
 }
 
-impl Default for MissionRuntimeState {
-    fn default() -> Self {
-        Self {
-            active_session_id: None,
-            sessions: BTreeMap::new(),
-            events: Vec::new(),
-            next_sequence: 0,
-        }
-    }
-}
 
 #[derive(Debug)]
 pub struct MissionRuntime {

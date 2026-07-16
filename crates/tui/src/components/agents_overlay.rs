@@ -173,7 +173,7 @@ impl Component for AgentsOverlay {
                         .fg(Color::White)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!("{status_icon}"), status_color_style),
+                Span::styled(status_icon.to_string(), status_color_style),
                 Span::styled(
                     if agent.done {
                         format!(" ({}s)", secs)

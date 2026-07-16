@@ -698,7 +698,7 @@ async fn record_upgrade_disposition(
                         receipt
                             .accepted
                             .then_some(())
-                            .ok_or_else(|| receipt.message)
+                            .ok_or(receipt.message)
                     }
                     None => Err(format!("agent not found: {}", request.carrier_id)),
                 }

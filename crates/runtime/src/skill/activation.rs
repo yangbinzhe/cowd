@@ -8,16 +8,13 @@ use super::CowdSkillStructuredDependency;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum RuntimeSkillCandidateSource {
+    #[default]
     Profile,
     CapabilityRefFallback,
 }
 
-impl Default for RuntimeSkillCandidateSource {
-    fn default() -> Self {
-        Self::Profile
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeSkillCandidate {

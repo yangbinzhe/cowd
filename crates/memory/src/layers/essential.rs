@@ -238,7 +238,7 @@ impl LayerManager for EssentialLayer {
 
         // Apply frequency decay to hot symbols and evict cold ones.
         let mut symbols = self.hot_symbols.lock();
-        let hot_decay = (decay * 0.5) as f32; // slower decay for symbols
+        let hot_decay = decay * 0.5; // slower decay for symbols
         symbols.retain_mut(|sym| {
             sym.frequency = (sym.frequency - hot_decay).max(0.0);
             sym.frequency > 0.1

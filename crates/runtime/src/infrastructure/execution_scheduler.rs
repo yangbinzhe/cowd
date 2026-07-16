@@ -1,10 +1,14 @@
 //! Conservative execution scheduler for model-requested tool calls.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    sync::{Arc, OnceLock},
+};
 
 use memory::{SessionDomainEvent, SessionDomainRef, SessionDomainScope};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::execution_core::RuntimeExecutionDecision;
 use crate::tool_dispatch::ToolRequest;
@@ -17,10 +21,32 @@ use crate::tool_orchestrator::ToolSafetyCategory;
 /// large prompt into unbounded process, file-descriptor, or provider load.
 /// Runtime still preserves all eligible parallelism up to this explicit cap.
 pub const MAX_PARALLEL_READ_CONCURRENCY: usize = 32;
-/// Default per-turn fan-out. The maximum is kept as a separately named
-/// contract so a future Runtime configuration can raise it without changing
-/// scheduler semantics or allowing unbounded task creation.
-pub const DEFAULT_PARALLEL_READ_CONCURRENCY: usize = 16;
+/// Default per-turn fan-out for idempotent inspection work.  Thirty-two lets
+/// one instruction fan out across a realistic repository while the explicit
+/// process budget below remains the backpressure boundary.
+pub const DEFAULT_PARALLEL_READ_CONCURRENCY: usize = 32;
+/// Cross-session admission ceiling. A single turn may use all 32 read slots;
+/// the process still admits a bounded second wave instead of multiplying
+/// per-turn limits without bound.
+pub const PROCESS_TOOL_CONCURRENCY_LIMIT: usize = 64;
+
+static PROCESS_TOOL_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+/// Acquire one process-wide tool execution permit.
+///
+/// Every Runtime execution route, including graph-governed batches, uses this
+/// shared admission point. Category and resource scheduling remain separate
+/// per-turn concerns; this guard only prevents concurrent sessions from
+/// turning safe local fan-out into unbounded process load.
+pub async fn acquire_process_tool_permit() -> Result<OwnedSemaphorePermit, String> {
+    Arc::clone(
+        PROCESS_TOOL_SEMAPHORE
+            .get_or_init(|| Arc::new(Semaphore::new(PROCESS_TOOL_CONCURRENCY_LIMIT))),
+    )
+    .acquire_owned()
+    .await
+    .map_err(|error| format!("process tool semaphore closed: {error}"))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -543,8 +569,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thirty_two_ordinary_reads_run_in_two_bounded_waves_and_keep_model_order() {
-        let requests = (0..32)
+    async fn dozens_of_ordinary_reads_run_in_one_bounded_wave_and_keep_model_order() {
+        let requests = (0..40)
             .map(|index| request(&format!("read-{index}"), "read_file", "{}"))
             .collect::<Vec<_>>();
         let decision = decision_with_modifiers(&[]);
@@ -578,8 +604,11 @@ mod tests {
             completed.push(index);
         }
         completed.sort_unstable();
-        assert_eq!(completed, (0..32).collect::<Vec<_>>());
-        assert_eq!(max_running.load(Ordering::SeqCst), 16);
+        assert_eq!(completed, (0..40).collect::<Vec<_>>());
+        assert_eq!(
+            max_running.load(Ordering::SeqCst),
+            DEFAULT_PARALLEL_READ_CONCURRENCY
+        );
         assert!(started.elapsed() < Duration::from_millis(80));
     }
 }

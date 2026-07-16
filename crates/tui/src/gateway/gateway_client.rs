@@ -168,6 +168,23 @@ impl GatewayApiClient {
         .await
     }
 
+    pub async fn cancel_session_input(
+        &self,
+        session_id: &str,
+        input_id: &str,
+        reason: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!(
+                "/api/sessions/{}/inputs/{}/cancel",
+                url_encode(session_id),
+                url_encode(input_id)
+            ),
+            serde_json::json!({ "reason": reason }),
+        )
+        .await
+    }
+
     pub async fn turn_inbox(
         &self,
         session_id: &str,
@@ -2196,6 +2213,11 @@ pub fn gateway_sse_json_to_cowd_event(value: &serde_json::Value) -> Option<CowdE
             })
         }
         "SessionInputReceived" | "session_input_received" => {
+            if let Some(projection) = value.get("input_projection") {
+                return Some(CowdEvent::SessionInputProjection {
+                    projection: projection.clone(),
+                });
+            }
             let decision = value
                 .get("receipt")
                 .or_else(|| value.get("input"))

@@ -119,7 +119,7 @@ impl BackgroundWatcher {
             tracing::debug!(
                 "background_watcher: memory/watch feature disabled; watcher not started"
             );
-            return BackgroundWatcherHandle { _stop: stop_tx };
+            BackgroundWatcherHandle { _stop: stop_tx }
         }
 
         #[cfg(feature = "watch")]

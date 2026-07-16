@@ -20,7 +20,7 @@ fn reality_recall_port_injects_only_fact_and_matrix_evidence_granted_by_the_bind
     std::fs::create_dir_all(matrix_handle.path.parent().expect("matrix parent"))
         .expect("matrix dir");
     let repository =
-        open_matrix_sqlite_repository_handle(&matrix_handle).expect("matrix repository");
+        open_matrix_sqlite_repository_handle(matrix_handle).expect("matrix repository");
     let snapshot = repository
         .create_source_snapshot(MatrixSourceSnapshotInput {
             snapshot_id: Some("recall-port-snapshot".to_string()),

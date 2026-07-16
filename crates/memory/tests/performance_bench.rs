@@ -141,7 +141,7 @@ async fn bench_get_entry_latency() {
         elapsed,
         elapsed / n
     );
-    assert_eq!(found, n as u32, "All entries should be retrievable");
+    assert_eq!(found, n, "All entries should be retrievable");
     assert!(
         elapsed.as_millis() < 30_000,
         "get_entry {} should complete within 30s",

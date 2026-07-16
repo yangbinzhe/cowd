@@ -492,6 +492,15 @@ fn graph_skill_quality_contract_smoke(state: &AppState) -> bool {
             .any(|source| source.reference == "structured-fact:release-gate-smoke")
 }
 
+fn store_error(error: GatewayMatrixRepositoryError) -> (StatusCode, Json<ErrorResponse>) {
+    match error {
+        GatewayMatrixRepositoryError::NotFound(message) => {
+            api_error(StatusCode::NOT_FOUND, message)
+        }
+        other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,14 +596,5 @@ mod tests {
             );
             assert!(is_execution_outcome_event(&event), "missing {kind}");
         }
-    }
-}
-
-fn store_error(error: GatewayMatrixRepositoryError) -> (StatusCode, Json<ErrorResponse>) {
-    match error {
-        GatewayMatrixRepositoryError::NotFound(message) => {
-            api_error(StatusCode::NOT_FOUND, message)
-        }
-        other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
     }
 }

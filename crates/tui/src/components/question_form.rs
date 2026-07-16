@@ -167,12 +167,12 @@ impl QuestionForm {
 
     /// Whether the current question allows custom input.
     fn current_custom_enabled(&self) -> bool {
-        self.current_question().map_or(false, |q| q.custom)
+        self.current_question().is_some_and(|q| q.custom)
     }
 
     /// Whether the current question is multi-select.
     fn current_is_multi(&self) -> bool {
-        self.current_question().map_or(false, |q| q.multiple)
+        self.current_question().is_some_and(|q| q.multiple)
     }
 
     /// Total number of selectable items (options + custom if enabled).
@@ -203,7 +203,7 @@ impl QuestionForm {
         }
         self.answers
             .get(self.tab)
-            .map_or(false, |a| a.iter().any(|x| x == val))
+            .is_some_and(|a| a.iter().any(|x| x == val))
     }
 
     // ── Public Result Access ───────────────────────────────────────
@@ -452,28 +452,28 @@ impl QuestionForm {
                     let prev_tab = (self.tab + self.tab_count() - 1) % self.tab_count();
                     self.select_tab(prev_tab);
                 }
-                return true;
+                true
             }
             KeyCode::Right | KeyCode::Char('l') => {
                 if !self.is_single() {
                     let next_tab = (self.tab + 1) % self.tab_count();
                     self.select_tab(next_tab);
                 }
-                return true;
+                true
             }
             KeyCode::Tab => {
                 if !self.is_single() {
                     let next = (self.tab + 1) % self.tab_count();
                     self.select_tab(next);
                 }
-                return true;
+                true
             }
             KeyCode::BackTab => {
                 if !self.is_single() {
                     let prev = (self.tab + self.tab_count() - 1) % self.tab_count();
                     self.select_tab(prev);
                 }
-                return true;
+                true
             }
 
             // ── Option navigation ─────────────────────────────
@@ -481,13 +481,13 @@ impl QuestionForm {
                 if total > 0 {
                     self.selected = (self.selected + total - 1) % total;
                 }
-                return true;
+                true
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 if total > 0 {
                     self.selected = (self.selected + 1) % total;
                 }
-                return true;
+                true
             }
 
             // ── Number shortcuts: 1-9 → pick option by index ──
@@ -497,13 +497,13 @@ impl QuestionForm {
                     self.move_to(idx);
                     self.select_option();
                 }
-                return true;
+                true
             }
 
             // ── Enter / Space: select / toggle ────────────────
             KeyCode::Enter => {
                 self.select_option();
-                return true;
+                true
             }
             KeyCode::Char(' ') => {
                 // Space toggles in multi-select mode, otherwise same as Enter
@@ -522,13 +522,13 @@ impl QuestionForm {
                 } else {
                     self.select_option();
                 }
-                return true;
+                true
             }
 
             // ── Esc: reject ───────────────────────────────────
             KeyCode::Esc => {
                 self.reject();
-                return true;
+                true
             }
 
             _ => false,
@@ -690,7 +690,7 @@ impl QuestionForm {
         // Question tabs
         for (i, q) in self.questions.iter().enumerate() {
             let is_active = i == self.tab;
-            let is_answered = !self.answers.get(i).map_or(true, |a| a.is_empty());
+            let is_answered = !self.answers.get(i).is_none_or(|a| a.is_empty());
 
             let style = if is_active {
                 Style::default().fg(Color::Black).bg(accent)
@@ -764,7 +764,7 @@ impl QuestionForm {
             let is_picked = self
                 .answers
                 .get(self.tab)
-                .map_or(false, |a| a.iter().any(|x| x == &opt.label));
+                .is_some_and(|a| a.iter().any(|x| x == &opt.label));
 
             // Build option line
             let mut option_spans: Vec<Span> = Vec::new();
@@ -887,7 +887,7 @@ impl QuestionForm {
             if self.editing {
                 // Show editing textarea
                 let edit_text = if self.edit_buffer.is_empty() {
-                    format!(" Type your own answer...")
+                    " Type your own answer...".to_string()
                 } else {
                     format!(" {}▊", self.edit_buffer)
                 };

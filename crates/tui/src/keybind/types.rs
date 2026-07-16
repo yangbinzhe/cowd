@@ -259,7 +259,7 @@ mod tests {
     fn resolve_single_key() {
         let mut map = KeyMap::new();
         let esc = k(KeyCode::Esc, KeyModifiers::NONE);
-        map.add(c(vec![esc.clone()]), Action::Quit, "Quit");
+        map.add(c(vec![esc]), Action::Quit, "Quit");
 
         // Exact match
         assert_eq!(map.resolve(&c(vec![esc])), Some(&Action::Quit));
@@ -301,12 +301,12 @@ mod tests {
         // that the same chord maps to different actions in different maps.
         let mut base = KeyMap::new();
         let j = k(KeyCode::Char('j'), KeyModifiers::NONE);
-        base.add(c(vec![j.clone()]), Action::Scroll(1), "Scroll down");
+        base.add(c(vec![j]), Action::Scroll(1), "Scroll down");
 
         let mut modal = KeyMap::new();
-        modal.add(c(vec![j.clone()]), Action::Noop, "Override in modal");
+        modal.add(c(vec![j]), Action::Noop, "Override in modal");
 
-        assert_eq!(base.resolve(&c(vec![j.clone()])), Some(&Action::Scroll(1)));
+        assert_eq!(base.resolve(&c(vec![j])), Some(&Action::Scroll(1)));
         assert_eq!(modal.resolve(&c(vec![j])), Some(&Action::Noop));
     }
 

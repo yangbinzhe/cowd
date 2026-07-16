@@ -292,27 +292,6 @@ fn cross_plane_commit_error(
         .into_response()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::cross_plane_commit_error;
-    use axum::{body::to_bytes, http::StatusCode};
-
-    #[tokio::test]
-    async fn commit_failures_return_a_structured_internal_error() {
-        let response = cross_plane_commit_error("upsert_identity", "durable store unavailable");
-
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let bytes = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("cross-plane error response body must remain readable");
-        let payload: serde_json::Value =
-            serde_json::from_slice(&bytes).expect("cross-plane error response must be JSON");
-        assert_eq!(payload["kind"], "cross_plane_commit_error");
-        assert_eq!(payload["operation"], "upsert_identity");
-        assert_eq!(payload["error"], "durable store unavailable");
-    }
-}
-
 async fn cross_plane_audit_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> impl IntoResponse {
@@ -936,4 +915,25 @@ fn is_known_cross_plane_operation(operation: &str) -> bool {
         operation,
         "send_text" | "send_image" | "send_file" | "callback" | "qr_login"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cross_plane_commit_error;
+    use axum::{body::to_bytes, http::StatusCode};
+
+    #[tokio::test]
+    async fn commit_failures_return_a_structured_internal_error() {
+        let response = cross_plane_commit_error("upsert_identity", "durable store unavailable");
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("cross-plane error response body must remain readable");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("cross-plane error response must be JSON");
+        assert_eq!(payload["kind"], "cross_plane_commit_error");
+        assert_eq!(payload["operation"], "upsert_identity");
+        assert_eq!(payload["error"], "durable store unavailable");
+    }
 }

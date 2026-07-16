@@ -227,7 +227,8 @@ impl MissionControlRuntime {
             ),
         };
         let (status, message, result) = outcome;
-        let receipt = MissionControlCommandReceipt {
+        
+        MissionControlCommandReceipt {
             kind: "mission_control.command_receipt".to_string(),
             command_id,
             target: command.target,
@@ -237,8 +238,7 @@ impl MissionControlRuntime {
             message,
             result,
             evidence_refs: command.evidence_refs,
-        };
-        receipt
+        }
     }
 }
 

@@ -117,6 +117,12 @@ pub enum CowdEvent {
     ResourcesCommitted {
         ids: Vec<String>,
     },
+    /// Runtime-owned SessionIngress queue snapshot. The payload remains a
+    /// shared-contract JSON value at this boundary so TUI can evolve its
+    /// presentation without creating a second queue authority.
+    SessionInputProjection {
+        projection: Value,
+    },
     TurnError {
         error: String,
     },

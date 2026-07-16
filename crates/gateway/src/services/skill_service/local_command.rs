@@ -251,7 +251,7 @@ pub(super) fn install_skill_into(
     let display_name = parse_skill_frontmatter(&contents).0;
     let invocation_name = derive_skill_install_name(&source, display_name.as_deref())?;
     let installed_path = registry_root.join(&invocation_name);
-    fs::create_dir_all(&registry_root)?;
+    fs::create_dir_all(registry_root)?;
     if installed_path.exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,

@@ -397,6 +397,7 @@ impl Default for LlmSummarizerConfig {
 
 /// Top-level memory system configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct MemoryConfig {
     pub store: StoreConfig,
     pub compression: CompressionConfig,
@@ -487,20 +488,6 @@ impl Default for TuningConfig {
     }
 }
 
-impl Default for MemoryConfig {
-    fn default() -> Self {
-        Self {
-            store: StoreConfig::default(),
-            compression: CompressionConfig::default(),
-            budget: BudgetConfig::default(),
-            extractor: ExtractorConfig::default(),
-            drift: DriftConfig::default(),
-            perf: PerfBudget::default(),
-            tuning: TuningConfig::default(),
-            model: None,
-        }
-    }
-}
 
 /// Storage backend configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -783,7 +770,7 @@ impl MemoryConfig {
 
     /// Get the model name (if set).
     pub fn model_name(&self) -> Option<String> {
-        self.model.as_ref().map(|m| m.clone())
+        self.model.clone()
     }
 
     /// Set the target model name for adaptive compression.
@@ -884,10 +871,10 @@ mod tests {
         assert_eq!(available, 116_480);
 
         let warning = budget.warning_tokens();
-        assert!(warning >= 89500 && warning <= 89700);
+        assert!((89500..=89700).contains(&warning));
 
         let critical = budget.critical_tokens();
-        assert!(critical >= 115000 && critical <= 116000);
+        assert!((115000..=116000).contains(&critical));
     }
 
     #[test]

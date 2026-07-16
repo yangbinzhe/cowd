@@ -3714,10 +3714,10 @@ fn find_command(name: &str) -> Option<PathBuf> {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                return std::fs::metadata(&full_path)
+                std::fs::metadata(&full_path)
                     .map(|m| m.permissions().mode() & 0o111 != 0)
                     .unwrap_or(false)
-                    .then(|| full_path.canonicalize().unwrap_or(full_path));
+                    .then(|| full_path.canonicalize().unwrap_or(full_path))
             }
             #[cfg(not(unix))]
             {
@@ -5070,9 +5070,7 @@ mod tests {
             .iter()
             .filter_map(|checkpoint| checkpoint["label"].as_str())
             .collect::<Vec<_>>();
-        assert!(labels
-            .iter()
-            .any(|label| *label == "auto-before-write_file"));
+        assert!(labels.contains(&"auto-before-write_file"));
 
         match original_auto_checkpoint {
             Some(value) => std::env::set_var("COWD_AUTO_CHECKPOINT", value),

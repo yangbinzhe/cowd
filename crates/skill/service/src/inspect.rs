@@ -516,7 +516,7 @@ fn dependency_array_from_map(
     map: &serde_yaml::Mapping,
     key: &str,
 ) -> Vec<SkillStructuredDependency> {
-    map.get(&serde_yaml::Value::String(key.to_string()))
+    map.get(serde_yaml::Value::String(key.to_string()))
         .and_then(serde_yaml::Value::as_sequence)
         .map(|items| parse_dependency_sequence(items))
         .unwrap_or_default()
@@ -542,7 +542,7 @@ fn parse_dependency_sequence(items: &[serde_yaml::Value]) -> Vec<SkillStructured
 }
 
 fn yaml_string(map: &serde_yaml::Mapping, key: &str) -> Option<String> {
-    map.get(&serde_yaml::Value::String(key.to_string()))
+    map.get(serde_yaml::Value::String(key.to_string()))
         .and_then(serde_yaml::Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -550,7 +550,7 @@ fn yaml_string(map: &serde_yaml::Mapping, key: &str) -> Option<String> {
 }
 
 fn yaml_string_list(map: &serde_yaml::Mapping, key: &str) -> Vec<String> {
-    map.get(&serde_yaml::Value::String(key.to_string()))
+    map.get(serde_yaml::Value::String(key.to_string()))
         .and_then(serde_yaml::Value::as_sequence)
         .into_iter()
         .flatten()

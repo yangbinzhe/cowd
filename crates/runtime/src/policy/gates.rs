@@ -511,11 +511,10 @@ impl PreFlightGate {
                         "api密钥",
                     ];
                     for file in &context.changed_files {
-                        if file.contains("password") || file.contains("secret") {
-                            if !file.ends_with(".example") && !file.ends_with("_test") {
+                        if (file.contains("password") || file.contains("secret"))
+                            && !file.ends_with(".example") && !file.ends_with("_test") {
                                 warnings.push(format!("Potential sensitive file: {}", file));
                             }
-                        }
                     }
                     let content_lower = context.diff.to_lowercase();
                     for pattern in &sensitive_patterns {

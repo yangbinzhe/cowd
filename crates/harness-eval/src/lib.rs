@@ -2754,9 +2754,7 @@ mod tests {
                     .is_some()
             })));
         assert!(reality_context_eval_specs().iter().all(|spec| {
-            expected_patterns
-                .iter()
-                .any(|pattern| *pattern == spec.expected_pattern)
+            expected_patterns.contains(&spec.expected_pattern)
         }));
     }
 

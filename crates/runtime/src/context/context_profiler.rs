@@ -26,6 +26,12 @@ pub struct ContextProfiler {
     seen_hashes: std::collections::HashSet<u64>,
 }
 
+impl Default for ContextProfiler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ContextProfiler {
     pub fn new() -> Self {
         Self {
@@ -178,7 +184,7 @@ mod tests {
     #[test]
     fn t03_confidence_in_range() {
         let conf = attribution_confidence(&Some("cowd".into()));
-        assert!(conf >= 0.0 && conf <= 1.0);
+        assert!((0.0..=1.0).contains(&conf));
     }
 
     #[test]

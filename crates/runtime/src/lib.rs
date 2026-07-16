@@ -185,7 +185,8 @@ pub mod evidence_planner;
 pub mod evolution;
 #[path = "execution_core/mod.rs"]
 pub mod execution_core;
-pub(crate) mod execution_live;
+#[path = "execution_core/execution_live.rs"]
+pub mod execution_live;
 #[path = "projection/mod.rs"]
 pub mod execution_projection;
 #[path = "infrastructure/execution_scheduler.rs"]

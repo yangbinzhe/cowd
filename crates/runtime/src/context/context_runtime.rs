@@ -926,11 +926,8 @@ impl ContextRuntimeKernel {
             .selected
             .iter()
             .flat_map(|item| item.conflict_with.clone())
-            .chain(envelope.omitted.iter().filter_map(|item| {
-                item.reason
-                    .contains("conflict")
-                    .then(|| item.reason.clone())
-            }))
+            .chain(envelope.omitted.iter().filter(|&item| item.reason
+                    .contains("conflict")).map(|item| item.reason.clone()))
             .collect::<Vec<_>>();
         RuntimeContextGovernanceReport {
             report_id: Self::governance_report_id(&envelope.identity.session_id, &envelope.intent),

@@ -296,7 +296,7 @@ fn integration_slash_keeps_input_control_without_opening_palette() {
 
     state.process_raw_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
     assert!(!state.command_palette.is_open());
-    assert_eq!(state.app.input.lines().join("\n"), "/");
+    assert_eq!(state.app.input.text(), "/");
 
     state.process_raw_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
     state.process_raw_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
@@ -305,10 +305,10 @@ fn integration_slash_keeps_input_control_without_opening_palette() {
     state.process_raw_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
 
     assert!(!state.command_palette.is_open());
-    assert_eq!(state.app.input.lines().join("\n"), "/statu");
+    assert_eq!(state.app.input.text(), "/statu");
 
     state.process_raw_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
-    assert_eq!(state.app.input.lines().join("\n"), "/status");
+    assert_eq!(state.app.input.text(), "/status");
 }
 
 #[test]
@@ -328,7 +328,7 @@ fn integration_mid_text_slash_completion_replaces_current_token() {
 
     state.process_raw_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
 
-    assert_eq!(state.app.input.lines().join("\n"), "please run /status now");
+    assert_eq!(state.app.input.text(), "please run /status now");
 }
 
 #[test]
@@ -467,7 +467,7 @@ fn integration_search_flow() {
     state.add_message("assistant", "Hi there, world!");
 
     // Clear input to allow search activation via keybind engine
-    state.input = tui_textarea::TextArea::default();
+    state.input = crate::components::composer::model::ComposerModel::default();
 
     // Use handle_input to route / through keybind engine
     let handled = state.handle_input(key(KeyCode::Char('/')));
@@ -619,7 +619,7 @@ fn integration_high_contrast_wcag_audit() {
 fn integration_spinner_rotation() {
     use crate::animation::AnimationEngine;
 
-    let chars: Vec<&str> = (0..10).map(|i| AnimationEngine::spinner_char(i)).collect();
+    let chars: Vec<&str> = (0..10).map(AnimationEngine::spinner_char).collect();
 
     for c in &chars {
         assert!(!c.is_empty());

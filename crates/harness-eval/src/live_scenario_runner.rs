@@ -343,7 +343,7 @@ impl LiveScenarioRunner {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let model_verified = requested_model.map_or(true, |expected| {
+        let model_verified = requested_model.is_none_or(|expected| {
             !effective_models.is_empty()
                 && effective_models
                     .iter()

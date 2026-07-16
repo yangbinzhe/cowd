@@ -562,7 +562,7 @@ impl GatewayToolExecutor {
         request.capabilities.retain(|capability| {
             capability
                 .strip_prefix("tool:")
-                .map_or(true, |tool| allowed.contains(tool))
+                .is_none_or(|tool| allowed.contains(tool))
         });
         request
             .capabilities

@@ -26,7 +26,7 @@ pub fn compile(request: &ProtocolCompileRequest) -> Result<ExecutionGraph, Proto
     let evidence_logs = builder.add_agent("evidence_logs", 0, std::slice::from_ref(&triage))?;
     let evidence_code = builder.add_agent("evidence_code", 0, std::slice::from_ref(&triage))?;
     let evidence_state = builder.add_agent("evidence_state", 0, std::slice::from_ref(&triage))?;
-    let evidence = vec![evidence_logs, evidence_code, evidence_state];
+    let evidence = [evidence_logs, evidence_code, evidence_state];
     let hypothesis_inputs = std::iter::once(triage)
         .chain(evidence.iter().cloned())
         .collect::<Vec<_>>();

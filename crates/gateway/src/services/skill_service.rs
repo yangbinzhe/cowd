@@ -315,7 +315,7 @@ impl SkillService {
         let surface = normalize_surface(query.surface.as_deref());
         let items = collect_skill_catalog(workspace_root)?;
         let activation = activation_projection(workspace_root, query.query.as_deref())?;
-        Ok(serde_json::to_value(SkillProjection {
+        serde_json::to_value(SkillProjection {
             kind: "skills.projection",
             surface: surface.clone(),
             catalog_count: items.len(),
@@ -336,7 +336,7 @@ impl SkillService {
             activation,
             items,
         })
-        .map_err(|error| SkillServiceError::Internal(error.to_string()))?)
+        .map_err(|error| SkillServiceError::Internal(error.to_string()))
     }
 
     pub(crate) fn maintenance_evaluate(

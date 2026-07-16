@@ -1019,7 +1019,7 @@ fn load_state(
         .rev()
         .find_map(|event| {
             (event.kind.starts_with("managed_agent."))
-                .then(|| event.payload)
+                .then_some(event.payload)
                 .and_then(|payload| serde_json::from_value::<ManagedAgentStateEvent>(payload).ok())
                 .map(|snapshot| snapshot.state)
         })

@@ -36,6 +36,12 @@ pub struct HookRunner {
     pub bus: Option<crate::cowd_event::CowdEventBus>,
 }
 
+impl Default for HookRunner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HookRunner {
     pub fn new() -> Self {
         Self {

@@ -360,6 +360,11 @@ pub struct TuiState {
 
     /// Composer owns the bottom input UI, autocomplete dropdown placement, and submit affordance.
     pub composer: Composer,
+    /// Last actual inner width used to derive composer visual rows. Keyboard
+    /// up/down uses this same geometry rather than logical lines.
+    composer_content_width: u16,
+    /// Preferred visual column retained across repeated up/down movement.
+    composer_desired_column: Option<u16>,
 
     /// File tree browser with git status overlay.
     pub file_tree: FileTree,
@@ -559,6 +564,8 @@ impl TuiState {
             diff_viewer,
             prompt,
             composer,
+            composer_content_width: 78,
+            composer_desired_column: None,
             file_tree,
             session_sidebar,
             memory_panel,
@@ -640,6 +647,7 @@ impl TuiState {
             // Stream terminal events update the timeline only. Runtime
             // projection terminal_ref remains the lifecycle authority.
             CowdEvent::TurnComplete { .. } | CowdEvent::TurnError { .. } => {}
+            CowdEvent::SessionInputProjection { .. } => {}
             CowdEvent::Warning { message } if message.contains("projection stream interrupted") => {
                 self.app.turn_interaction.reconnecting();
             }
@@ -777,6 +785,7 @@ impl TuiState {
             .composer
             .desired_height(&self.app.input, area.width, max_input);
         let frame_areas = TuiFrameAreas::build(area, input_h, self.app.search_active);
+        self.composer_content_width = frame_areas.input.width.saturating_sub(2).max(1);
 
         // ── Main content: one RenderContext for chat, sidebar, status, input ──
         let mut main_ctx: RenderContext = RenderContext::new(frame, &skin);
@@ -1143,11 +1152,16 @@ impl TuiState {
             }
         }
 
-        // 2.5. Render the bottom composer. The text buffer remains app.input for
-        // history/submit compatibility, but input UI ownership is centralized here.
+        // 2.5. Render the bottom composer from its canonical model. Layout is
+        // derived from the current frame and cannot mutate authored bytes.
         {
             self.composer.mode_label = self.app.turn_interaction.label();
             let pending_resources = self.app.pending_resources.len();
+            let queued_follow_ups = self.app.queued_follow_up_count();
+            let queued_preview = self
+                .app
+                .queued_follow_up_preview()
+                .map(|input| input.content_preview.as_str());
             let degraded = {
                 let _guard = self.render_profiler.guard("composer");
                 match error_recovery::catch_render_panic(
@@ -1156,10 +1170,12 @@ impl TuiState {
                         self.composer.render(
                             &mut main_ctx,
                             frame_areas.input,
-                            &mut self.app.input,
+                            &self.app.input,
                             &mut self.prompt,
                             &mut self.context_suggestions,
                             pending_resources,
+                            queued_follow_ups,
+                            queued_preview,
                         );
                     }),
                 ) {
@@ -1718,7 +1734,7 @@ impl TuiState {
 
         // 4. Text-editing keys → direct to textarea (bypass keybind engine)
         if self.is_textarea_key(&key) {
-            self.app.input.input(key);
+            self.handle_composer_edit_key(key);
             self.set_focus_target(FocusTarget::Input);
             // BUG 1 FIX: Refresh suggestions from app.input text, not prompt's stale textarea
             let text = self.input_text();
@@ -1764,10 +1780,7 @@ impl TuiState {
                 }
             }
             // Non-empty input → submit
-            let draft = self.app.input.lines().join("\n");
-            let Some(text) =
-                crate::components::composer::model::ComposerModel::new(draft).submit_snapshot()
-            else {
+            let Some(text) = self.app.input.submit_snapshot() else {
                 return ProcessedKey::Nothing;
             };
             if self.try_open_sidebar_for_panel_command(text.trim()) {
@@ -1785,12 +1798,7 @@ impl TuiState {
                 return ProcessedKey::Nothing;
             }
             self.prompt.add_history(text.clone());
-            self.app.input = tui_textarea::TextArea::default();
-            self.app.input.set_block(
-                ratatui::widgets::Block::default()
-                    .borders(ratatui::widgets::Borders::ALL)
-                    .title(" Input (Enter=send, Esc=quit, Alt+Enter/Ctrl+J=newline) "),
-            );
+            self.app.input = crate::components::composer::model::ComposerModel::default();
             return ProcessedKey::Submit(text);
         }
 
@@ -1894,10 +1902,10 @@ impl TuiState {
         if key.code == KeyCode::Char('v') && key.modifiers.contains(KeyModifiers::CONTROL) {
             match crate::clipboard::read_clipboard() {
                 Some(crate::clipboard::ClipboardContent::Text(text)) => {
-                    self.app.input.insert_str(&text);
+                    self.app.input.insert_paste(&text);
                 }
                 Some(crate::clipboard::ClipboardContent::Image { .. }) => {
-                    self.app.input.insert_str("[Image]");
+                    self.app.input.insert("[Image]");
                 }
                 None => {}
             }
@@ -1930,7 +1938,7 @@ impl TuiState {
             }
             // Ctrl+A/E/W/U/K/Z → textarea for editing
             if event.modifiers == KeyModifiers::CONTROL {
-                return matches!(event.code, KeyCode::Char('a' | 'e' | 'w' | 'u' | 'k' | 'z'));
+                return matches!(event.code, KeyCode::Char('a' | 'e' | 'w' | 'u' | 'k' | 'y' | 'z'));
             }
             return false;
         }
@@ -1949,42 +1957,116 @@ impl TuiState {
         )
     }
 
+    fn handle_composer_edit_key(&mut self, key: KeyEvent) {
+        let extend_selection = key.modifiers.contains(KeyModifiers::SHIFT);
+        if key.modifiers == KeyModifiers::CONTROL {
+            match key.code {
+                KeyCode::Char('a') => self.app.input.select_all(),
+                KeyCode::Char('e') => self.app.input.move_end(false),
+                KeyCode::Char('w') => {
+                    self.app.input.delete_word_backward();
+                }
+                KeyCode::Char('u') => {
+                    self.app.input.delete_to_line_start();
+                }
+                KeyCode::Char('k') => {
+                    self.app.input.delete_to_line_end();
+                }
+                KeyCode::Char('z') => {
+                    self.app.input.undo();
+                }
+                KeyCode::Char('y') => {
+                    self.app.input.redo();
+                }
+                _ => {}
+            }
+            self.composer_desired_column = None;
+            return;
+        }
+
+        match key.code {
+            KeyCode::Char(value) => self.app.input.insert(&value.to_string()),
+            KeyCode::Backspace => {
+                self.app.input.backspace();
+            }
+            KeyCode::Delete => {
+                self.app.input.delete_forward();
+            }
+            KeyCode::Left => self.app.input.move_left(extend_selection),
+            KeyCode::Right => self.app.input.move_right(extend_selection),
+            KeyCode::Home => self.app.input.move_home(extend_selection),
+            KeyCode::End => self.app.input.move_end(extend_selection),
+            KeyCode::Up => {
+                self.move_composer_vertically(true, extend_selection);
+                return;
+            }
+            KeyCode::Down => {
+                self.move_composer_vertically(false, extend_selection);
+                return;
+            }
+            _ => {}
+        }
+        self.composer_desired_column = None;
+    }
+
+    fn move_composer_vertically(&mut self, upward: bool, extend_selection: bool) {
+        let layout = crate::components::composer::layout::ComposerLayout::from_model(
+            &self.app.input,
+            self.composer_content_width,
+        );
+        let current_row = layout.cursor.visual_row;
+        let target_row = if upward {
+            current_row.checked_sub(1)
+        } else {
+            current_row
+                .checked_add(1)
+                .filter(|row| *row < layout.rows.len())
+        };
+        let Some(target_row) = target_row else {
+            return;
+        };
+        let desired_column = self
+            .composer_desired_column
+            .get_or_insert(layout.cursor.column);
+        if let Some(byte) = layout.byte_offset_for_visual(target_row, *desired_column) {
+            self.app
+                .input
+                .set_cursor_byte_with_selection(byte, extend_selection);
+        }
+    }
+
+    /// Insert a terminal paste/IME commit as a single composer transaction.
+    /// The runner calls this for `Event::Paste`; normal key presses keep their
+    /// existing command and shortcut routing.
+    pub fn process_paste(&mut self, text: &str) {
+        self.app.input.insert_paste(text);
+        self.composer_desired_column = None;
+        let input_text = self.input_text();
+        self.prompt.refresh_suggestions_from_text_at_cursor(
+            &input_text,
+            self.input_cursor_byte_offset(),
+        );
+        self.app.mark_dirty();
+    }
+
     fn should_open_slash_command_palette(&self, event: &crossterm::event::KeyEvent) -> bool {
         use crossterm::event::KeyCode;
 
         event.code == KeyCode::Char('/')
             && event.modifiers.is_empty()
-            && self.app.input.lines().join("\n").trim().is_empty()
+            && self.app.input.text().trim().is_empty()
     }
 
     fn input_text(&self) -> String {
-        self.app.input.lines().join("\n")
+        self.app.input.text().to_string()
     }
 
     fn input_cursor_byte_offset(&self) -> usize {
-        let (row, col) = self.app.input.cursor();
-        let mut offset = 0usize;
-        for (idx, line) in self.app.input.lines().iter().enumerate() {
-            if idx == row {
-                return offset + char_col_to_byte_offset(line, col);
-            }
-            offset += line.len() + 1;
-        }
-        self.input_text().len()
+        self.app.input.cursor_byte()
     }
 
     fn replace_input_text(&mut self, text: &str) {
-        let mut input = tui_textarea::TextArea::default();
-        input.set_block(
-            ratatui::widgets::Block::default()
-                .borders(ratatui::widgets::Borders::ALL)
-                .title(" Input (Enter=send, Esc=quit, Alt+Enter/Ctrl+J=newline) "),
-        );
-        input.set_style(ratatui::style::Style::default().fg(ratatui::style::Color::White));
-        if !text.is_empty() {
-            input.insert_str(text);
-        }
-        self.app.input = input;
+        self.app.input.set_text(text);
     }
 
     fn focus_for_current_surface(&self) -> FocusTarget {
@@ -2240,7 +2322,7 @@ impl TuiState {
                 );
                 return true;
             };
-            let objective = self.app.input.lines().join("\n").trim().to_string();
+            let objective = self.app.input.text().trim().to_string();
             if objective.is_empty() {
                 self.agent_team_panel.record_action_result(
                     "team.instantiate",
@@ -3611,17 +3693,7 @@ impl TuiState {
                     self.app.history_next()
                 };
                 if let Some(text) = text {
-                    let mut ta = tui_textarea::TextArea::default();
-                    ta.set_block(
-                        ratatui::widgets::Block::default()
-                            .borders(ratatui::widgets::Borders::ALL)
-                            .title(" Input (Enter=send, Esc=quit, Alt+Enter/Ctrl+J=newline) "),
-                    );
-                    ta.set_style(ratatui::style::Style::default().fg(ratatui::style::Color::White));
-                    if !text.is_empty() {
-                        ta.insert_str(&text);
-                    }
-                    self.app.input = ta;
+                    self.app.input.set_text(text);
                 }
             }
             Action::OpenDialog(name) => {
@@ -3668,15 +3740,7 @@ impl TuiState {
                 if self.try_open_sidebar_for_panel_command(cmd) {
                     return;
                 }
-                let mut input = tui_textarea::TextArea::default();
-                input.set_block(
-                    ratatui::widgets::Block::default()
-                        .borders(ratatui::widgets::Borders::ALL)
-                        .title(" Input (Enter=send, Esc=quit, Alt+Enter/Ctrl+J=newline) "),
-                );
-                input.set_style(ratatui::style::Style::default().fg(ratatui::style::Color::White));
-                input.insert_str(cmd);
-                self.app.input = input;
+                self.app.input.set_text(cmd);
                 self.app
                     .show_notification("Command prepared. Press Enter to run.");
             }
@@ -4052,7 +4116,7 @@ impl TuiState {
         self.goal_workbench_panel.sync_from_app(&self.app);
         self.gateway_panel.sync_from_app(&self.app);
         self.surface_panel.sync_from_app(&self.app);
-        self.command_palette.sync_runtime_actions(&snapshot);
+        self.command_palette.sync_runtime_actions(snapshot);
     }
 
     fn reload_runtime_provider_projection(&mut self) -> bool {
@@ -4925,17 +4989,17 @@ mod tests {
         let mut state = TuiState::new("m", "s");
         state.last_terminal_width = 12;
         state.replace_input_text("abcdefghij klmnopqrstuvwxyz");
-        state.app.input.move_cursor(tui_textarea::CursorMove::Head);
+        state.app.input.set_cursor_byte(0);
         let before = state.input_text();
-        let cursor_before = state.app.input.cursor();
+        let cursor_before = state.app.input.cursor_byte();
 
-        let _layout = crate::components::composer::layout::ComposerLayout::from_textarea(
+        let _layout = crate::components::composer::layout::ComposerLayout::from_model(
             &state.app.input,
             state.last_terminal_width,
         );
 
         assert_eq!(state.input_text(), before);
-        assert_eq!(state.app.input.cursor(), cursor_before);
+        assert_eq!(state.app.input.cursor_byte(), cursor_before);
         assert!(!state.input_text().contains('\n'));
     }
 
@@ -5627,6 +5691,30 @@ mod tests {
     }
 
     #[test]
+    fn composer_uses_visual_rows_for_vertical_movement_and_keeps_bytes() {
+        let mut state = TuiState::new("m", "s");
+        state.composer_content_width = 3;
+        state.replace_input_text("abcdef");
+        let before = state.input_text();
+
+        state.process_raw_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+
+        assert_eq!(state.input_text(), before);
+        assert_eq!(state.app.input.cursor_byte(), 3);
+    }
+
+    #[test]
+    fn composer_paste_is_one_undoable_unicode_transaction() {
+        let mut state = TuiState::new("m", "s");
+        state.replace_input_text("prefix ");
+        state.process_paste("👨‍👩‍👧‍👦\r\n中文");
+        assert_eq!(state.input_text(), "prefix 👨‍👩‍👧‍👦\r\n中文");
+
+        state.process_raw_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        assert_eq!(state.input_text(), "prefix ");
+    }
+
+    #[test]
     fn streaming_snapshot_deltas_replace_instead_of_duplicate() {
         let mut state = TuiState::new("m", "s");
         state.apply_event(CowdEvent::TurnStarted);
@@ -5681,7 +5769,7 @@ mod tests {
             .expect("loading overlay should render");
         let input_row = lines
             .iter()
-            .position(|line| line.contains("Chat Composer"))
+            .position(|line| line.contains("Enter send"))
             .expect("input should render");
 
         assert!(

@@ -328,14 +328,14 @@ fn parse_enhanced_manifest(
     };
 
     // Check for any enhanced fields
-    let has_enhanced = obj.contains_key(&serde_yaml::Value::String("hermes".into()))
-        || obj.contains_key(&serde_yaml::Value::String("conditions".into()))
-        || obj.contains_key(&serde_yaml::Value::String("config".into()))
-        || obj.contains_key(&serde_yaml::Value::String("prerequisites".into()))
-        || obj.contains_key(&serde_yaml::Value::String("platforms".into()))
-        || obj.contains_key(&serde_yaml::Value::String("version".into()))
-        || obj.contains_key(&serde_yaml::Value::String("tags".into()))
-        || obj.contains_key(&serde_yaml::Value::String("related_skills".into()));
+    let has_enhanced = obj.contains_key(serde_yaml::Value::String("hermes".into()))
+        || obj.contains_key(serde_yaml::Value::String("conditions".into()))
+        || obj.contains_key(serde_yaml::Value::String("config".into()))
+        || obj.contains_key(serde_yaml::Value::String("prerequisites".into()))
+        || obj.contains_key(serde_yaml::Value::String("platforms".into()))
+        || obj.contains_key(serde_yaml::Value::String("version".into()))
+        || obj.contains_key(serde_yaml::Value::String("tags".into()))
+        || obj.contains_key(serde_yaml::Value::String("related_skills".into()));
 
     if !has_enhanced {
         return Ok(None);
@@ -356,7 +356,7 @@ fn parse_enhanced_manifest(
 
     // Parse platforms
     let platforms = obj
-        .get(&serde_yaml::Value::String("platforms".into()))
+        .get(serde_yaml::Value::String("platforms".into()))
         .and_then(|v| v.as_sequence())
         .map(|seq| {
             seq.iter()
@@ -380,7 +380,7 @@ fn parse_enhanced_manifest(
 
     // Parse conditions
     let conditions = obj
-        .get(&serde_yaml::Value::String("conditions".into()))
+        .get(serde_yaml::Value::String("conditions".into()))
         .and_then(|v| v.as_mapping())
         .map(|m| SkillConditions {
             fallback_for_tools: get_string_list_from_map(m, "fallback_for_tools"),
@@ -391,7 +391,7 @@ fn parse_enhanced_manifest(
 
     // Parse config
     let config = obj
-        .get(&serde_yaml::Value::String("config".into()))
+        .get(serde_yaml::Value::String("config".into()))
         .and_then(|v| v.as_sequence())
         .map(|seq| {
             seq.iter()
@@ -411,7 +411,7 @@ fn parse_enhanced_manifest(
 
     // Parse prerequisites
     let prerequisites = obj
-        .get(&serde_yaml::Value::String("prerequisites".into()))
+        .get(serde_yaml::Value::String("prerequisites".into()))
         .and_then(|v| v.as_mapping())
         .map(|m| SkillPrerequisites {
             env_vars: get_string_list_from_map(m, "env_vars"),
@@ -420,13 +420,13 @@ fn parse_enhanced_manifest(
 
     // Parse hermes metadata
     let hermes_metadata = obj
-        .get(&serde_yaml::Value::String("hermes".into()))
+        .get(serde_yaml::Value::String("hermes".into()))
         .and_then(|v| v.as_mapping())
         .map(|m| SkillHermesMetadata {
             tags: get_string_list_from_map(m, "tags"),
             related_skills: get_string_list_from_map(m, "related_skills"),
             config: m
-                .get(&serde_yaml::Value::String("config".into()))
+                .get(serde_yaml::Value::String("config".into()))
                 .and_then(|v| v.as_sequence())
                 .map(|seq| {
                     seq.iter()
@@ -444,7 +444,7 @@ fn parse_enhanced_manifest(
                         .collect()
                 }),
             conditions: m
-                .get(&serde_yaml::Value::String("conditions".into()))
+                .get(serde_yaml::Value::String("conditions".into()))
                 .and_then(|v| v.as_mapping())
                 .map(|m| SkillConditions {
                     fallback_for_tools: get_string_list_from_map(m, "fallback_for_tools"),
@@ -500,7 +500,7 @@ fn unquote_value(value: &str) -> String {
 
 /// Get a required string field from YAML mapping
 fn get_required_string(obj: &serde_yaml::Mapping, key: &str) -> Result<String, SkillParseError> {
-    match obj.get(&serde_yaml::Value::String(key.into())) {
+    match obj.get(serde_yaml::Value::String(key.into())) {
         Some(serde_yaml::Value::Null) | None => Err(SkillParseError::MissingField(key.to_string())),
         Some(v) => Ok(v
             .as_str()
@@ -511,14 +511,14 @@ fn get_required_string(obj: &serde_yaml::Mapping, key: &str) -> Result<String, S
 
 /// Get an optional string field from YAML mapping
 fn get_optional_string(obj: &serde_yaml::Mapping, key: &str) -> Option<String> {
-    obj.get(&serde_yaml::Value::String(key.into()))
+    obj.get(serde_yaml::Value::String(key.into()))
         .and_then(|v| v.as_str())
         .map(String::from)
 }
 
 /// Get a string list from YAML mapping
 fn get_string_list(obj: &serde_yaml::Mapping, key: &str) -> Option<Vec<String>> {
-    obj.get(&serde_yaml::Value::String(key.into()))
+    obj.get(serde_yaml::Value::String(key.into()))
         .and_then(|v| v.as_sequence())
         .map(|seq| {
             seq.iter()
@@ -529,21 +529,21 @@ fn get_string_list(obj: &serde_yaml::Mapping, key: &str) -> Option<Vec<String>> 
 
 /// Get a required string from a nested mapping
 fn get_required_string_from_map(obj: &serde_yaml::Mapping, key: &str) -> Option<String> {
-    obj.get(&serde_yaml::Value::String(key.into()))
+    obj.get(serde_yaml::Value::String(key.into()))
         .and_then(|v| v.as_str())
         .map(String::from)
 }
 
 /// Get an optional string from a nested mapping
 fn get_optional_string_from_map(obj: &serde_yaml::Mapping, key: &str) -> Option<String> {
-    obj.get(&serde_yaml::Value::String(key.into()))
+    obj.get(serde_yaml::Value::String(key.into()))
         .and_then(|v| v.as_str())
         .map(String::from)
 }
 
 /// Get a string list from a nested mapping
 fn get_string_list_from_map(obj: &serde_yaml::Mapping, key: &str) -> Option<Vec<String>> {
-    obj.get(&serde_yaml::Value::String(key.into()))
+    obj.get(serde_yaml::Value::String(key.into()))
         .and_then(|v| v.as_sequence())
         .map(|seq| {
             seq.iter()
@@ -575,7 +575,7 @@ pub fn get_skill_name(parsed: &ParsedSkill) -> Option<&str> {
         .manifest
         .as_ref()
         .map(|m| m.name.as_str())
-        .or_else(|| parsed.legacy.name.as_deref())
+        .or(parsed.legacy.name.as_deref())
 }
 
 /// Get the effective description
@@ -584,7 +584,7 @@ pub fn get_skill_description(parsed: &ParsedSkill) -> Option<&str> {
         .manifest
         .as_ref()
         .map(|m| m.description.as_str())
-        .or_else(|| parsed.legacy.description.as_deref())
+        .or(parsed.legacy.description.as_deref())
 }
 
 /// Check if skill matches current platform

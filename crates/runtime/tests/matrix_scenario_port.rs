@@ -23,7 +23,7 @@ fn matrix_scenario_port_requires_the_binding_snapshot_lease_and_emits_candidate_
         .sqlite_handle("matrix")
         .expect("matrix storage handle");
     std::fs::create_dir_all(handle.path.parent().expect("matrix parent")).expect("matrix dir");
-    let repository = open_matrix_sqlite_repository_handle(&handle).expect("matrix repository");
+    let repository = open_matrix_sqlite_repository_handle(handle).expect("matrix repository");
     let source = repository
         .create_source_snapshot(MatrixSourceSnapshotInput {
             snapshot_id: Some("orders-v7".to_string()),

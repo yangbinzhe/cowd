@@ -1295,11 +1295,9 @@ impl GsdStateRebuilder {
                                         || word.ends_with(".yaml")
                                         || word.ends_with(".md")
                                         || word.ends_with(".toml"))
-                                {
-                                    if !files.contains(&word.to_string()) {
+                                    && !files.contains(&word.to_string()) {
                                         files.push(word.to_string());
                                     }
-                                }
                             }
 
                             // Get last user message as task summary

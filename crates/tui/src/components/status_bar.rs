@@ -454,7 +454,7 @@ impl Component for StatusBar {
         // ── Notification overlay ──────────────────────────────────
         if let Some((ref text, ref style)) = self.notification {
             let note_bg = style.bg.unwrap_or(Color::Cyan);
-            let note_line = Line::from(Span::styled(text.clone(), style.clone()));
+            let note_line = Line::from(Span::styled(text.clone(), *style));
             ctx.frame_mut().render_widget(
                 Paragraph::new(note_line).style(Style::default().bg(note_bg)),
                 area,

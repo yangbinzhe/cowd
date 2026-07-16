@@ -224,7 +224,7 @@ fn build_runtime_execution_decision_inner(
             .reasons
             .push("resource health is assumed for detached planning".to_string());
     }
-    let template_decision = CollaborationTemplateMatcher::default().decide(&user_input, &strategy);
+    let template_decision = CollaborationTemplateMatcher.decide(&user_input, &strategy);
     let template_reason = requested_template.map(|requested| {
         if requested == template_decision.template_id.as_str() {
             format!("validated model template proposal: {requested}")

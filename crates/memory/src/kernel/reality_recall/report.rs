@@ -24,6 +24,7 @@ pub struct RecallSourceResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Default)]
 pub struct RecallReport {
     pub selected: Vec<RecallCandidate>,
     pub omitted: Vec<RecallOmission>,
@@ -31,16 +32,6 @@ pub struct RecallReport {
     pub truncated: bool,
 }
 
-impl Default for RecallReport {
-    fn default() -> Self {
-        Self {
-            selected: Vec::new(),
-            omitted: Vec::new(),
-            sources: Vec::new(),
-            truncated: false,
-        }
-    }
-}
 
 impl RecallReport {
     pub fn from_selected_omitted(

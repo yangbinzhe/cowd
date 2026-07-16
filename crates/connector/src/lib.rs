@@ -867,6 +867,7 @@ pub struct ConnectorBulkhead {
 }
 
 #[derive(Debug, Clone)]
+#[derive(Default)]
 struct ConnectorProviderBulkheadState {
     in_flight: usize,
     consecutive_failures: u32,
@@ -923,7 +924,7 @@ impl ConnectorBulkhead {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let state = providers
             .entry(provider.clone())
-            .or_insert_with(ConnectorProviderBulkheadState::default);
+            .or_default();
         if state.cooldown_until.is_some_and(|until| until > now) {
             return Err(ConnectorBulkheadRejection::CoolingDown { provider });
         }
@@ -948,7 +949,7 @@ impl ConnectorBulkhead {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let state = providers
             .entry(provider.to_string())
-            .or_insert_with(ConnectorProviderBulkheadState::default);
+            .or_default();
         state.consecutive_failures = 0;
         state.cooldown_until = None;
     }
@@ -960,7 +961,7 @@ impl ConnectorBulkhead {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let state = providers
             .entry(provider.to_string())
-            .or_insert_with(ConnectorProviderBulkheadState::default);
+            .or_default();
         state.consecutive_failures = state.consecutive_failures.saturating_add(1);
         if state.consecutive_failures >= self.failure_threshold {
             state.cooldown_until = Some(Instant::now() + self.cooldown);
@@ -994,15 +995,6 @@ impl Default for ConnectorBulkhead {
     }
 }
 
-impl Default for ConnectorProviderBulkheadState {
-    fn default() -> Self {
-        Self {
-            in_flight: 0,
-            consecutive_failures: 0,
-            cooldown_until: None,
-        }
-    }
-}
 
 impl Drop for ConnectorBulkheadGuard<'_> {
     fn drop(&mut self) {
@@ -1151,10 +1143,8 @@ fn risk_for_channel_operation(operation: &str) -> CrossPlaneRisk {
     }
 }
 
-fn readonly_required_scopes(provider: &str, operation: &str) -> Vec<String> {
-    match (provider, operation) {
-        _ => Vec::new(),
-    }
+fn readonly_required_scopes(_provider: &str, _operation: &str) -> Vec<String> {
+    Vec::new()
 }
 
 fn stable_hex_hash(value: &str) -> String {

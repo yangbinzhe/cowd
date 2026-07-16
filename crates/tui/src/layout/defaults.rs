@@ -753,15 +753,9 @@ mod tests {
         let mut state = LayoutState::new();
 
         // Switch to tab 3 (goals)
-        match &mut tree.root {
-            LayoutNode::Split(split) => match &mut split.children[1] {
-                LayoutNode::TabGroup(ref mut tg) => {
-                    tg.active = 3;
-                }
-                _ => {}
-            },
-            _ => {}
-        }
+        if let LayoutNode::Split(split) = &mut tree.root { if let LayoutNode::TabGroup(ref mut tg) = &mut split.children[1] {
+            tg.active = 3;
+        } }
 
         state.toggle_sidebar(&mut tree); // hide → ratio 1.0
         state.toggle_sidebar(&mut tree); // show → restore

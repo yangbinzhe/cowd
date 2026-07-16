@@ -252,11 +252,11 @@ pub(super) fn authenticated_human_principal(
         if lifecycle.status != auth_broker::CredentialLifecycleStatus::Active {
             return Err("local human credential is revoked".to_string());
         }
-        return runtime::PrincipalVerifier::from_base64(&envelope.key_id, &public_key)
+        runtime::PrincipalVerifier::from_base64(&envelope.key_id, &public_key)
             .map_err(|error| error.to_string())?
             .requiring_credential_epoch(lifecycle.credential_epoch)
             .verify(&envelope)
-            .map_err(|error| error.to_string());
+            .map_err(|error| error.to_string())
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -298,7 +298,7 @@ pub(super) fn issue_web_session(
             return Err("local human credential is revoked".to_string());
         }
         verify_human_envelope(&envelope, &public_key, lifecycle.credential_epoch)?;
-        return encode_web_session(&envelope);
+        encode_web_session(&envelope)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -348,7 +348,7 @@ pub(super) fn web_session_principal(
         if lifecycle.status != auth_broker::CredentialLifecycleStatus::Active {
             return Err("local_human_credential_revoked".to_string());
         }
-        return verify_human_envelope(&envelope, &public_key, lifecycle.credential_epoch);
+        verify_human_envelope(&envelope, &public_key, lifecycle.credential_epoch)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -418,7 +418,7 @@ pub(super) fn issue_human_decision_lease(
         let client = auth_broker::BrokerClient::new(auth_broker::BrokerClient::default_socket(
             config_home.join("auth-broker"),
         ));
-        return client
+        client
             .issue_decision_lease(
                 credential,
                 review_id,
@@ -427,7 +427,7 @@ pub(super) fn issue_human_decision_lease(
                 evidence_digest,
                 expires_at_ms,
             )
-            .map_err(|error| error.to_string());
+            .map_err(|error| error.to_string())
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -10053,7 +10053,7 @@ providers:
             json["receipt"]["execution_graph_id"],
             json["execution_graph"]["graph_id"]
         );
-        assert_eq!(json["receipt"]["audit_record_id"].as_str().is_some(), true);
+        assert!(json["receipt"]["audit_record_id"].as_str().is_some());
 
         let audit = app
             .clone()

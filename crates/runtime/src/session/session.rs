@@ -956,7 +956,7 @@ impl ConversationMessage {
             token_usage_json: self
                 .usage
                 .as_ref()
-                .map(|u| usage_to_json(u.clone()).render()),
+                .map(|u| usage_to_json(*u).render()),
             created_at_ms: crate::session::current_time_millis(),
         }
     }

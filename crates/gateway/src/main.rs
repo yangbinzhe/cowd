@@ -398,7 +398,7 @@ fn build_memory_config(
     mc.store.vector.model = src.vector.model.clone();
     mc.store.vector.api_url = src.vector.api_url.clone();
     mc.store.vector.api_key = src.vector.api_key.clone();
-    mc.store.vector.dimension = src.vector.dimension as usize;
+    mc.store.vector.dimension = src.vector.dimension;
     mc.store.vector.timeout_secs = src.vector.timeout_secs;
     mc.store.vector.batch_size = src.vector.batch_size;
     Some(mc)
@@ -3536,7 +3536,7 @@ pub(crate) fn runtime_capability_context_item(
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
-    let has_tool = |name: &str| tool_names.iter().any(|tool| *tool == name);
+    let has_tool = |name: &str| tool_names.contains(&name);
     let batch_tools = [
         "workspace_snapshot",
         "read_many",

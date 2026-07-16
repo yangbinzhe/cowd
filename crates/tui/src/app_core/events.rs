@@ -15,6 +15,10 @@ use tokio::sync::mpsc;
 use crate::protocol::CowdEvent;
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
+/// Recovery facts must remain bounded as well. Projection deltas are
+/// cursor-based and can be coalesced; a later snapshot is authoritative when
+/// an older delta has been compacted away.
+const RELIABLE_QUEUE_CAPACITY: usize = 1024;
 
 #[derive(Clone)]
 pub struct CowdEventSender {
@@ -39,7 +43,7 @@ impl CowdEventSender {
                     .reliable
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                queue.push_back(event);
+                retain_reliable_event(&mut queue, event);
                 Ok(())
             }
             Err(error) => Err(error),
@@ -70,9 +74,54 @@ fn is_reliable_event(event: &CowdEvent) -> bool {
         event,
         CowdEvent::TurnComplete { .. }
             | CowdEvent::TurnError { .. }
+            | CowdEvent::ApprovalRequested { .. }
             | CowdEvent::ExecutionProjectionDelta { .. }
             | CowdEvent::ExecutionGraphSummary { .. }
     )
+}
+
+fn retain_reliable_event(queue: &mut VecDeque<CowdEvent>, event: CowdEvent) {
+    match &event {
+        CowdEvent::ExecutionProjectionDelta { delta } => {
+            if let Some(index) = queue.iter().position(|queued| {
+                matches!(queued, CowdEvent::ExecutionProjectionDelta { delta: queued_delta }
+                    if queued_delta.execution_id == delta.execution_id)
+            }) {
+                queue[index] = event;
+                return;
+            }
+        }
+        CowdEvent::ExecutionGraphSummary { summary } => {
+            if let Some(graph_id) = summary.graph_id.as_deref() {
+                if let Some(index) = queue.iter().position(|queued| {
+                    matches!(queued, CowdEvent::ExecutionGraphSummary { summary: queued_summary }
+                        if queued_summary.graph_id.as_deref() == Some(graph_id))
+                }) {
+                    queue[index] = event;
+                    return;
+                }
+            }
+        }
+        _ => {}
+    }
+
+    if queue.len() >= RELIABLE_QUEUE_CAPACITY {
+        // Prefer replacing an update that Gateway can reconstruct from its
+        // durable projection. Only if the queue consists solely of terminal
+        // facts do we discard the oldest one, retaining the newest outcome.
+        if let Some(index) = queue.iter().position(|queued| {
+            matches!(
+                queued,
+                CowdEvent::ExecutionProjectionDelta { .. }
+                    | CowdEvent::ExecutionGraphSummary { .. }
+            )
+        }) {
+            queue.remove(index);
+        } else {
+            queue.pop_front();
+        }
+    }
+    queue.push_back(event);
 }
 
 /// Create a bounded, async-friendly event channel.
@@ -141,5 +190,78 @@ mod tests {
                 text: "overflow".into(),
             })
             .is_err());
+    }
+
+    #[test]
+    fn saturated_projection_stream_is_coalesced_and_bounded() {
+        let (tx, _rx) = cowd_event_channel();
+        for index in 0..EVENT_CHANNEL_CAPACITY {
+            tx.try_send(CowdEvent::TextDelta {
+                text: index.to_string(),
+            })
+            .expect("capacity");
+        }
+        for cursor in 1_u64..=10_000 {
+            tx.send(CowdEvent::ExecutionProjectionDelta {
+                delta: harness_contract::projection::ProjectionDelta {
+                    schema_version: 1,
+                    execution_id: "execution-a".to_string(),
+                    base_cursor: cursor.saturating_sub(1),
+                    target_cursor: cursor,
+                    events: Vec::new(),
+                },
+            })
+            .expect("reliable projection");
+        }
+        let reliable = tx.reliable.lock().expect("reliable queue");
+        assert_eq!(reliable.len(), 1);
+        assert!(matches!(
+            reliable.front(),
+            Some(CowdEvent::ExecutionProjectionDelta { delta }) if delta.target_cursor == 10_000
+        ));
+    }
+
+    #[test]
+    fn reliable_terminal_queue_has_a_hard_cap_and_retains_latest_outcome() {
+        let (tx, _rx) = cowd_event_channel();
+        for index in 0..EVENT_CHANNEL_CAPACITY {
+            tx.try_send(CowdEvent::TextDelta {
+                text: index.to_string(),
+            })
+            .expect("capacity");
+        }
+        for index in 0..(RELIABLE_QUEUE_CAPACITY + 10) {
+            tx.send(CowdEvent::TurnComplete {
+                assistant_text: format!("terminal-{index}"),
+                iterations: 1,
+            })
+            .expect("reliable terminal");
+        }
+        let reliable = tx.reliable.lock().expect("reliable queue");
+        assert_eq!(reliable.len(), RELIABLE_QUEUE_CAPACITY);
+        assert!(matches!(
+            reliable.back(),
+            Some(CowdEvent::TurnComplete { assistant_text, .. })
+                if assistant_text == &format!("terminal-{}", RELIABLE_QUEUE_CAPACITY + 9)
+        ));
+    }
+
+    #[test]
+    fn saturated_channel_retains_approval_requests() {
+        let (tx, mut rx) = cowd_event_channel();
+        for index in 0..EVENT_CHANNEL_CAPACITY {
+            tx.try_send(CowdEvent::TextDelta {
+                text: index.to_string(),
+            })
+            .expect("capacity");
+        }
+        tx.send(CowdEvent::ApprovalRequested {
+            tool: "write_file".to_string(),
+        })
+        .expect("approval retained");
+        assert!(matches!(
+            rx.try_recv().expect("reliable approval"),
+            CowdEvent::ApprovalRequested { tool } if tool == "write_file"
+        ));
     }
 }

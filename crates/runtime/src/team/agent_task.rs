@@ -37,18 +37,15 @@ pub struct AgentTask {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum AgentTaskQualityStatus {
+    #[default]
     Accepted,
     NeedsReview,
     Degraded,
     Failed,
 }
 
-impl Default for AgentTaskQualityStatus {
-    fn default() -> Self {
-        Self::Accepted
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentTaskOutcome {

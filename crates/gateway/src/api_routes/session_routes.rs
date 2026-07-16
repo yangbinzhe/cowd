@@ -2145,8 +2145,7 @@ mod tests {
 
     #[test]
     fn turn_projection_builds_stable_turns_from_journal() {
-        let events = vec![
-            session_event(
+        let events = [session_event(
                 0,
                 "TurnJournal",
                 serde_json::json!({
@@ -2207,8 +2206,7 @@ mod tests {
                     },
                     "created_at": "2026-07-05T00:00:02Z"
                 }),
-            ),
-        ];
+            )];
         let values = events.iter().map(session_event_value).collect::<Vec<_>>();
         let projection = turn_projection_from_event_values("session-v31", &values);
 

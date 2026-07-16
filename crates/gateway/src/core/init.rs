@@ -239,8 +239,7 @@ fn ensure_gitignore_entries(path: &Path) -> Result<InitStatus, std::io::Error> {
 }
 
 pub(crate) fn render_init_user_claude_md() -> String {
-    format!(
-        r#"# User-level Cowd Instructions
+    r#"# User-level Cowd Instructions
 
 This file lives in ~/.cowd/CLAUDE.md and serves as the default instruction
 file for all Cowd sessions.  It is loaded before any project-level
@@ -256,8 +255,7 @@ instructions.
 
 Project-level CLAUDE.md (in the project root) inherits from this file and can
 override any settings here.
-"#,
-    )
+"#.to_string()
 }
 
 pub(crate) fn render_init_cowd_md(cwd: &Path) -> String {

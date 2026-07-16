@@ -101,6 +101,12 @@ pub struct EntityRegistry {
     store: Option<SqliteStore>,
 }
 
+impl Default for EntityRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EntityRegistry {
     pub fn new() -> Self {
         Self {

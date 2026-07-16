@@ -689,12 +689,9 @@ impl Component for AgentTeamPanel {
         }
 
         // Global keys regardless of visibility
-        match key.code {
-            KeyCode::Tab => {
-                self.toggle();
-                return EventResult::Consumed;
-            }
-            _ => {}
+        if key.code == KeyCode::Tab {
+            self.toggle();
+            return EventResult::Consumed;
         }
 
         if !self.visible || self.agents.is_empty() {

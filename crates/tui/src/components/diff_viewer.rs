@@ -1181,10 +1181,10 @@ fn highlight_code_line(code: &str, language: Option<&str>, bg_color: Color) -> V
     #[cfg(not(feature = "code-highlight"))]
     {
         let _ = language;
-        return vec![Span::styled(
+        vec![Span::styled(
             code.to_string(),
             Style::default().fg(Color::White).bg(bg_color),
-        )];
+        )]
     }
 
     #[cfg(feature = "code-highlight")]

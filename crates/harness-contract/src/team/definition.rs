@@ -458,9 +458,11 @@ fn validate_dependencies(
             .entry(dependency.from_role_id.as_str())
             .or_default()
             .push(dependency.to_role_id.as_str());
-        let target = indegree
-            .get_mut(dependency.to_role_id.as_str())
-            .expect("dependency target was validated against declared roles");
+        let Some(target) = indegree.get_mut(dependency.to_role_id.as_str()) else {
+            return Err(ValidationError::InvalidContract {
+                message: "declared team role disappeared while validating dependencies".to_string(),
+            });
+        };
         *target += 1;
     }
 
@@ -472,9 +474,12 @@ fn validate_dependencies(
     while let Some(role_id) = frontier.pop() {
         visited += 1;
         for target in outgoing.get(role_id).into_iter().flatten() {
-            let count = indegree
-                .get_mut(target)
-                .expect("outgoing edges point to declared roles");
+            let Some(count) = indegree.get_mut(target) else {
+                return Err(ValidationError::InvalidContract {
+                    message: "declared team role disappeared while traversing dependencies"
+                        .to_string(),
+                });
+            };
             *count -= 1;
             if *count == 0 {
                 frontier.push(target);
@@ -524,7 +529,7 @@ mod tests {
     use super::*;
 
     fn digest(byte: char) -> String {
-        std::iter::repeat(byte).take(64).collect()
+        std::iter::repeat_n(byte, 64).collect()
     }
 
     fn role(role_id: &str) -> TeamRoleDefinition {

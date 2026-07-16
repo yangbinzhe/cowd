@@ -300,9 +300,9 @@ impl KnowledgeGraph {
         self.triples
             .iter()
             .filter(|t| {
-                subject_id.map_or(true, |s| t.subject_id == s)
-                    && predicate.map_or(true, |p| t.predicate == p)
-                    && object_id.map_or(true, |o| t.object_id == o)
+                subject_id.is_none_or(|s| t.subject_id == s)
+                    && predicate.is_none_or(|p| t.predicate == p)
+                    && object_id.is_none_or(|o| t.object_id == o)
                     && t.valid_to.is_none() // Only return currently valid triples
             })
             .collect()
@@ -413,7 +413,7 @@ impl KnowledgeGraph {
                 .or_default()
                 .push(idx);
         }
-        for (_key, indices) in &groups {
+        for indices in groups.values() {
             if indices.len() < 2 {
                 continue;
             }

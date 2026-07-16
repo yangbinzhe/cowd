@@ -36,7 +36,7 @@ pub fn classify_intent(prompt: &str) -> IntentPlan {
 pub fn classify_understanding(understanding: &TaskUnderstanding) -> IntentPlan {
     let intent = intent_from_domain(understanding.domain);
     let recommended_tools = recommended_tools_for(intent);
-    let reason = reason_for(intent, &understanding);
+    let reason = reason_for(intent, understanding);
 
     IntentPlan {
         intent,

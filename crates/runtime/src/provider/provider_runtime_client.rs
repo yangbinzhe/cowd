@@ -396,8 +396,8 @@ async fn forward_provider_stream(
             }
             ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
                 ContentBlockDelta::TextDelta { text } => {
-                    if !text.is_empty() {
-                        if !forward_event(
+                    if !text.is_empty()
+                        && !forward_event(
                             sender,
                             AssistantEvent::TextDelta(text),
                             emit_output,
@@ -406,7 +406,6 @@ async fn forward_provider_stream(
                         ) {
                             return Ok(ForwardedProviderStream::ConsumerDropped);
                         }
-                    }
                 }
                 ContentBlockDelta::InputJsonDelta { partial_json } => {
                     if let Some((_, _, input)) = pending_tools.get_mut(&delta.index) {

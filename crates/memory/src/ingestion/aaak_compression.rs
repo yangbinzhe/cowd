@@ -240,7 +240,7 @@ impl AaakDictionary {
     /// Add an abbreviation.
     pub fn add_abbreviation(&mut self, full: String, short: String, entity_type: EntityType) {
         let saved = full.len().saturating_sub(short.len());
-        let compression_ratio = if full.len() > 0 {
+        let compression_ratio = if !full.is_empty() {
             1.0 - (short.len() as f32 / full.len() as f32)
         } else {
             0.0
@@ -384,7 +384,7 @@ impl AaakCompressed {
             compressed_length: self.original_length,
             decompressed_length: decompressed.len(),
             final_compressed_size: self.calculate_serialized_size(),
-            compression_ratio: if original.len() > 0 {
+            compression_ratio: if !original.is_empty() {
                 self.original_length as f32 / original.len() as f32
             } else {
                 1.0
@@ -583,7 +583,7 @@ impl AaakCompressor {
                 .insert(token.text.clone(), token.entity_type);
             self.positions
                 .entry(token.text.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(idx);
         }
     }
@@ -821,7 +821,7 @@ impl AaakCompressor {
     fn compress_narrative(&self, text: &str) -> String {
         // 1. Split into sentences
         let sentences: Vec<&str> = text
-            .split_inclusive(|c: char| c == '.' || c == '!' || c == '?' || c == '\n')
+            .split_inclusive(['.', '!', '?', '\n'])
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .collect();
@@ -907,7 +907,7 @@ impl AaakCompressor {
                 .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
                 .filter(|w| {
                     w.len() >= 2
-                        && w.chars().next().map_or(false, |c| c.is_uppercase())
+                        && w.chars().next().is_some_and(|c| c.is_uppercase())
                         && w.chars()
                             .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
                 })
@@ -925,7 +925,7 @@ impl AaakCompressor {
 
         let key_quote = {
             let first_sent = text
-                .split(|c: char| c == '.' || c == '!' || c == '?' || c == '\n')
+                .split(['.', '!', '?', '\n'])
                 .next()
                 .unwrap_or("")
                 .trim();

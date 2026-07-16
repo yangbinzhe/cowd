@@ -1307,8 +1307,7 @@ impl SqliteStore {
 
         let limit_param: Box<dyn rusqlite::ToSql> = Box::new(limit as i64);
         let all_params: Vec<&dyn rusqlite::ToSql> = param_refs
-            .iter()
-            .map(|p| *p)
+            .iter().copied()
             .chain(std::iter::once(limit_param.as_ref()))
             .collect();
 
@@ -1325,19 +1324,17 @@ impl SqliteStore {
             "SELECT COUNT(*) FROM memories m JOIN memories_fts fts ON m.id = fts.id WHERE {}",
             where_clause
         );
-        let count_params: Vec<&dyn rusqlite::ToSql> = param_refs.iter().map(|p| *p).collect();
+        let count_params: Vec<&dyn rusqlite::ToSql> = param_refs.to_vec();
         let total: i64 = conn
             .query_row(&count_sql, count_params.as_slice(), |row| row.get(0))
             .map_err(sql_err)?;
 
         // Generate snippets if requested
         let snippets = if with_snippets {
-            let snippet_sql = format!(
-                r"SELECT snippet(memories_fts, 2, '<mark>', '</mark>', '...', 32)
+            let snippet_sql = r"SELECT snippet(memories_fts, 2, '<mark>', '</mark>', '...', 32)
                   FROM memories_fts
                   WHERE memories_fts MATCH ?1
-                  LIMIT ?2"
-            );
+                  LIMIT ?2".to_string();
             let mut stmt = conn.prepare(&snippet_sql).map_err(sql_err)?;
             let snippet_rows = stmt
                 .query_map(params![query, limit as i64], |row| {
@@ -1716,7 +1713,7 @@ impl SqliteStore {
 
     /// Deserialize a byte blob back into a `Vec<f32>`.
     fn blob_to_vec_f32(blob: &[u8]) -> Result<Vec<f32>> {
-        if blob.len() % 4 != 0 {
+        if !blob.len().is_multiple_of(4) {
             return Err(MemoryError::Store(
                 "invalid BLOB size for f32 vector embedding".into(),
             ));
@@ -2442,7 +2439,7 @@ impl MemoryStore for SqliteStore {
             let (entries, snippets, total) = Self::do_search_fts_advanced(
                 &conn,
                 &sanitized,
-                category_str.as_deref(),
+                category_str,
                 layer_int,
                 limit,
                 with_snippets,
@@ -3464,12 +3461,9 @@ CREATE VIRTUAL TABLE memories_fts USING fts5(
 
         // Search by class kind name (FTS5 case-insensitive)
         let results2 = store.search_symbols("bravoClass", 10).await;
-        match results2 {
-            Ok(r) => {
-                assert_eq!(r.len(), 1, "should find bravoClass");
-                assert_eq!(r[0].name, "bravoClass");
-            }
-            Err(_) => {}
+        if let Ok(r) = results2 {
+            assert_eq!(r.len(), 1, "should find bravoClass");
+            assert_eq!(r[0].name, "bravoClass");
         }
 
         // Verify no match returns empty

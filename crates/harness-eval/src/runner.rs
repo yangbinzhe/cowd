@@ -699,7 +699,7 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
         &harness_contract::strategy::StrategyInput::from_prompt(objective),
     );
     let collaboration =
-        runtime::CollaborationTemplateMatcher::default().decide(objective, &strategy);
+        runtime::CollaborationTemplateMatcher.decide(objective, &strategy);
     let session_id = format!("mission-eval-session-{}", uuid::Uuid::new_v4());
     let mission = runtime::MissionRuntime::new();
     let session = match mission.start_session(runtime::StartMissionSessionRequest {
@@ -815,8 +815,7 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
         runtime_services.mission_evidence(),
         runtime_services.mission_schedules().projection(),
     );
-    let checks = vec![
-        (
+    let checks = [(
             "simple_question_direct",
             simple_decision.pattern() == ExecutionPattern::Direct,
         ),
@@ -862,15 +861,14 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
                         .iter()
                         .any(|contract| contract["runtime_action"] == "use_team_template")
                 }),
-        ),
-    ];
+        )];
     let passed_checks = checks
         .iter()
-        .filter_map(|(name, passed)| passed.then(|| (*name).to_string()))
+        .filter(|&(_name, passed)| *passed).map(|(name, _passed)| (*name).to_string())
         .collect::<Vec<_>>();
     let failed_checks = checks
         .iter()
-        .filter_map(|(name, passed)| (!passed).then(|| (*name).to_string()))
+        .filter(|&(_name, passed)| !passed ).map(|(name, _passed)| (*name).to_string())
         .collect::<Vec<_>>();
     let elapsed_ms = started.elapsed().as_millis();
     json!({
@@ -1407,13 +1405,12 @@ mod tests {
         assert!(report["mission_projection"]["schema_version"]
             .as_u64()
             .is_some_and(|version| version >= 2));
-        assert_eq!(
+        assert!(
             report["selected_strategy"]["runtime_actions"]
                 .as_array()
                 .expect("runtime actions")
                 .iter()
-                .any(|item| item == "use_team_template"),
-            true
+                .any(|item| item == "use_team_template")
         );
         assert!(report["execution_graph"]["is_dag"]
             .as_bool()

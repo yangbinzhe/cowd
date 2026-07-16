@@ -9,11 +9,9 @@ use std::path::PathBuf;
 /// 检查是否需要引导配置
 pub fn needs_bootstrap() -> bool {
     let config_home = default_config_home();
-    let config_paths = vec![
-        config_home.join("config.yaml"),
+    let config_paths = [config_home.join("config.yaml"),
         config_home.join("config.yml"),
-        config_home.join("config.json"),
-    ];
+        config_home.join("config.json")];
 
     // 同时检查 ~/.cc 目录（兼容 CC 配置）
     let cc_path = PathBuf::from(&std::env::var("HOME").unwrap_or_default())

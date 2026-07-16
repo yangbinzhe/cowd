@@ -337,7 +337,7 @@ impl SkillsPanel {
         if let Some(cat_idx) = self.active_category {
             let cat_name = self.categories.get(cat_idx);
             all.into_iter()
-                .filter(|e| cat_name.map_or(false, |c| e.category == *c))
+                .filter(|e| cat_name.is_some_and(|c| e.category == *c))
                 .collect()
         } else {
             all

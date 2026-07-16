@@ -44,17 +44,14 @@ pub enum AgentRole {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Default)]
 pub enum SubAgentToolMode {
+    #[default]
     FullToolSet,
     ReadOnly,
     Custom(Vec<String>),
 }
 
-impl Default for SubAgentToolMode {
-    fn default() -> Self {
-        Self::FullToolSet
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubAgentConfig {

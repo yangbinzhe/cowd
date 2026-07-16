@@ -795,7 +795,7 @@ impl DestructivePatternDetector {
                 patterns.push(DangerPattern {
                     name: format!("file_del_{}", patterns.len()),
                     regex: r,
-                    risk: risk.clone(),
+                    risk: *risk,
                     description: desc.to_string(),
                 });
             }
@@ -821,7 +821,7 @@ impl DestructivePatternDetector {
                 patterns.push(DangerPattern {
                     name: format!("disk_{}", patterns.len()),
                     regex: r,
-                    risk: risk.clone(),
+                    risk: *risk,
                     description: desc.to_string(),
                 });
             }
@@ -849,7 +849,7 @@ impl DestructivePatternDetector {
                 patterns.push(DangerPattern {
                     name: format!("perms_{}", patterns.len()),
                     regex: r,
-                    risk: risk.clone(),
+                    risk: *risk,
                     description: desc.to_string(),
                 });
             }
@@ -895,7 +895,7 @@ impl DestructivePatternDetector {
                 patterns.push(DangerPattern {
                     name: format!("git_{}", patterns.len()),
                     regex: r,
-                    risk: risk.clone(),
+                    risk: *risk,
                     description: desc.to_string(),
                 });
             }
@@ -929,7 +929,7 @@ impl DestructivePatternDetector {
                 patterns.push(DangerPattern {
                     name: format!("pkg_{}", patterns.len()),
                     regex: r,
-                    risk: risk.clone(),
+                    risk: *risk,
                     description: desc.to_string(),
                 });
             }
@@ -961,7 +961,7 @@ impl DestructivePatternDetector {
                 patterns.push(DangerPattern {
                     name: format!("net_{}", patterns.len()),
                     regex: r,
-                    risk: risk.clone(),
+                    risk: *risk,
                     description: desc.to_string(),
                 });
             }
@@ -999,7 +999,7 @@ impl DestructivePatternDetector {
                 patterns.push(DangerPattern {
                     name: format!("sys_{}", patterns.len()),
                     regex: r,
-                    risk: risk.clone(),
+                    risk: *risk,
                     description: desc.to_string(),
                 });
             }
@@ -1039,7 +1039,7 @@ impl DestructivePatternDetector {
                 patterns.push(DangerPattern {
                     name: format!("docker_{}", patterns.len()),
                     regex: r,
-                    risk: risk.clone(),
+                    risk: *risk,
                     description: desc.to_string(),
                 });
             }
@@ -1083,7 +1083,7 @@ impl DestructivePatternDetector {
                 patterns.push(DangerPattern {
                     name: format!("db_{}", patterns.len()),
                     regex: r,
-                    risk: risk.clone(),
+                    risk: *risk,
                     description: desc.to_string(),
                 });
             }

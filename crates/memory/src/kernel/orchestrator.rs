@@ -854,9 +854,7 @@ impl MemoryOrchestrator {
 
     /// Check if the Closet should be rebuilt and return true if it's time.
     pub fn should_rebuild_closet(&self) -> bool {
-        self.closet_rebuild_counter.load(Ordering::Relaxed)
-            % self.config.tuning.closet_rebuild_ticks
-            == 0
+        self.closet_rebuild_counter.load(Ordering::Relaxed).is_multiple_of(self.config.tuning.closet_rebuild_ticks)
     }
 
     /// Force an immediate Closet rebuild.
@@ -899,7 +897,7 @@ impl MemoryOrchestrator {
         F: FnOnce(&mut FactChecker) -> R,
     {
         let mut guard = get_fact_checker().lock();
-        f(&mut *guard)
+        f(&mut guard)
     }
     // -----------------------------------------------------------------------
     // Private helpers
@@ -1221,9 +1219,9 @@ mod tests {
 
         let fixed = orch.load_fixed_layers().await.unwrap();
         let layers: Vec<MemoryLayer> = fixed.iter().map(|e| e.layer).collect();
-        assert!(layers.iter().any(|l| *l == MemoryLayer::L0));
-        assert!(layers.iter().any(|l| *l == MemoryLayer::L1));
-        assert!(!layers.iter().any(|l| *l == MemoryLayer::L2));
+        assert!(layers.contains(&MemoryLayer::L0));
+        assert!(layers.contains(&MemoryLayer::L1));
+        assert!(!layers.contains(&MemoryLayer::L2));
     }
 
     #[tokio::test]

@@ -4,25 +4,12 @@ use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 use fact_kernel::FactExtractionTokenUsage;
 use tokio::sync::{RwLock, Semaphore};
-
-/// Process-wide admission budget. Per-turn/category semaphores protect one
-/// conversation; this guard prevents many sessions from multiplying a 16-way
-/// read batch into unbounded process load.
-const PROCESS_TOOL_CONCURRENCY_LIMIT: usize = 32;
-static PROCESS_TOOL_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
-
-fn process_tool_semaphore() -> Arc<Semaphore> {
-    Arc::clone(
-        PROCESS_TOOL_SEMAPHORE
-            .get_or_init(|| Arc::new(Semaphore::new(PROCESS_TOOL_CONCURRENCY_LIMIT))),
-    )
-}
 
 /// T35: Lightweight cancellation token (tokio-util not available in dep tree).
 #[derive(Clone, Default, Debug)]
@@ -68,7 +55,6 @@ use memory::{MemoryKernel, MemoryTurnContext};
 use model_protocol::telemetry::SessionTracer;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use tracing;
 
 use crate::budget_policy::{clamp_context_budget_ratio_bp, RuntimeBudgetInputs, RuntimeBudgetPlan};
 use crate::compact::{
@@ -4087,11 +4073,11 @@ where
                     output
                 };
                 for msg in pre_hook_result.messages() {
-                    combined.push_str("\n");
+                    combined.push('\n');
                     combined.push_str(msg);
                 }
                 for msg in post_hook_result.messages() {
-                    combined.push_str("\n");
+                    combined.push('\n');
                     combined.push_str(msg);
                 }
                 let completed_record = if is_error {
@@ -4470,10 +4456,9 @@ where
             )));
         };
 
-        let process_semaphore = process_tool_semaphore();
-        let _process_permit = process_semaphore.acquire_owned().await.map_err(|error| {
-            RuntimeError::new(format!("process tool semaphore closed: {error}"))
-        })?;
+        let _process_permit = crate::execution_scheduler::acquire_process_tool_permit()
+            .await
+            .map_err(RuntimeError::new)?;
         let result_msg = if acquire_category_permit {
             let sem = self.tool_category_semaphore(tool_name, input);
             let _permit = sem.acquire().await.map_err(|error| {
@@ -4552,7 +4537,7 @@ where
 
     #[must_use]
     pub fn estimated_tokens(&self) -> usize {
-        estimate_session_tokens(&*self.session.blocking_read())
+        estimate_session_tokens(&self.session.blocking_read())
     }
 
     fn model_candidates_for_turn(&self, user_input: &str) -> Vec<String> {
@@ -6504,7 +6489,7 @@ pub fn build_cc_memory_config_with_budget(
                 model: mem.vector.model.clone(),
                 api_url: mem.vector.api_url.clone(),
                 api_key: mem.vector.api_key.clone(),
-                dimension: mem.vector.dimension as usize,
+                dimension: mem.vector.dimension,
                 timeout_secs: mem.vector.timeout_secs,
                 batch_size: mem.vector.batch_size,
             },
@@ -7033,7 +7018,7 @@ mod tests {
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
     use crate::{
         resolve_context_budget_tokens, PromptAssembly, RealityRecallPort, RuntimeBudgetInputs,
-        RuntimeBudgetPlan,
+        RuntimeBudgetPlan, SystemPromptBuilder, COWD_IDENTITY_CONTRACT_VERSION,
     };
     use futures::stream::Stream;
     use harness_contract::agent::{
@@ -7341,7 +7326,7 @@ mod tests {
             api,
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
-            vec!["builtin policy".to_string()],
+            SystemPromptBuilder::new().build(),
         )
         .without_memory()
         .with_model_context_window(128_000);
@@ -7362,6 +7347,11 @@ mod tests {
             vec!["primary", "fallback"]
         );
         assert!(requests.iter().all(|request| request.budget.executable));
+        assert!(requests.iter().all(|request| {
+            request.prompt.trusted_system.first().is_some_and(|head| {
+                head.contains("You are Cowd") && head.contains(COWD_IDENTITY_CONTRACT_VERSION)
+            })
+        }));
     }
 
     #[derive(Clone)]

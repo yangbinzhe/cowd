@@ -1793,7 +1793,7 @@ impl CognitiveContextManager {
         // ── 5a2. Periodic KG rebuild every 100 ticks (T1) ───────────────────
         {
             let tick = self.kg_rebuild_tick_counter.fetch_add(1, Ordering::Relaxed) + 1;
-            if tick % 100 == 0 {
+            if tick.is_multiple_of(100) {
                 if let Some(proj_path) = self.project_kg_path.lock().as_ref() {
                     tracing::info!(tick, path = %proj_path.display(), "periodic KG rebuild triggered (every 100 ticks)");
                     if let Err(e) = self.load_project_kg(proj_path) {
@@ -1811,7 +1811,7 @@ impl CognitiveContextManager {
                 .cross_store_verify_counter
                 .fetch_add(1, Ordering::Relaxed)
                 + 1;
-            if tick % 50 == 0 {
+            if tick.is_multiple_of(50) {
                 let warnings = self.cross_store_verify().await;
                 for w in &warnings {
                     tracing::warn!("cross-store-verify: {w}");
@@ -1829,7 +1829,7 @@ impl CognitiveContextManager {
         // ── 5a4. Integrity anomaly detection every 50 ticks (T9) ────────────
         {
             let tick = self.integrity_check_counter.fetch_add(1, Ordering::Relaxed) + 1;
-            if tick % 50 == 0 {
+            if tick.is_multiple_of(50) {
                 if let Some(ref checker) = self.integrity_checker {
                     match checker.check_anomalies() {
                         Ok(report) => {
@@ -3099,7 +3099,7 @@ impl CognitiveContextManager {
     pub fn ctx_health(&self) -> RotAlert {
         let monitor = self.context_rot_monitor.lock();
         let ratio = monitor.metrics.context_usage_ratio;
-        let total = self.config.budget.context_window as u64;
+        let total = self.config.budget.context_window;
         let used = (ratio * total as f32) as u64;
 
         if ratio > 0.75 {

@@ -79,9 +79,10 @@ impl AgentDefinitionId {
 
     #[must_use]
     pub fn scope(&self) -> DefinitionScope {
-        // Construction validates the first segment.
+        // Construction validates the first segment. Deserialization remains
+        // defensive: a corrupted persisted value cannot crash a caller.
         DefinitionScope::parse(self.0.split('/').next().unwrap_or_default())
-            .expect("validated AgentDefinitionId has a valid scope")
+            .unwrap_or(DefinitionScope::Workspace)
     }
 }
 
@@ -916,7 +917,7 @@ mod tests {
     use super::*;
 
     fn digest(byte: char) -> String {
-        std::iter::repeat(byte).take(64).collect()
+        std::iter::repeat_n(byte, 64).collect()
     }
 
     fn manifest() -> AgentDefinitionManifest {

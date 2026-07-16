@@ -21,10 +21,7 @@ use crate::theme::ThemeEngine;
 /// saturate because Ratatui rectangles are intrinsically `u16`-bounded.
 #[must_use]
 pub(crate) fn terminal_len(value: usize) -> u16 {
-    match u16::try_from(value) {
-        Ok(value) => value,
-        Err(_) => u16::MAX,
-    }
+    u16::try_from(value).unwrap_or(u16::MAX)
 }
 
 // ── ComponentId ──────────────────────────────────────────────────

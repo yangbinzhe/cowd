@@ -55,7 +55,7 @@ impl WhichKey {
         let selected_group = group_name(engine);
         let filtered: Vec<&super::types::KeyBinding> = if selected_group == GROUP_SYSTEM {
             // Show ALL bindings for the System tab
-            bindings.iter().copied().collect()
+            bindings.to_vec()
         } else {
             bindings
                 .iter()

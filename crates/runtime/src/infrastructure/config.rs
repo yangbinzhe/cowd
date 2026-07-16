@@ -514,6 +514,7 @@ impl Default for CircuitBreakerConfig {
 // ── Compression Config ─────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct CompressionConfig {
     #[serde(default)]
     pub micro: MicroCompactConfig,
@@ -532,17 +533,6 @@ fn default_true_bool() -> bool {
 }
 
 impl Eq for CompressionConfig {}
-impl Default for CompressionConfig {
-    fn default() -> Self {
-        Self {
-            micro: MicroCompactConfig::default(),
-            session: SessionCompactConfig::default(),
-            deep: DeepCompactConfig::default(),
-            circuit_breaker: CircuitBreakerConfig::default(),
-            llm: LlmSummarizerConfig::default(),
-        }
-    }
-}
 
 // ── LLM Summarizer Config ──────────────────────────────────────────────
 
@@ -791,6 +781,7 @@ impl Default for ExtractionConfig {
 
 /// Multi-platform gateway configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub struct GatewayConfig {
     pub enabled: bool,
     pub webui_dir: Option<PathBuf>,
@@ -808,16 +799,6 @@ pub struct PlatformConfig {
     pub extra: BTreeMap<String, JsonValue>,
 }
 
-impl Default for GatewayConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            webui_dir: None,
-            platforms: Vec::new(),
-            session_reset: SessionResetPolicy::default(),
-        }
-    }
-}
 
 /// Configuration for gate auto-fix behavior.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1395,12 +1376,7 @@ fn yaml_to_json(value: serde_yaml::Value) -> Option<JsonValue> {
             // Prefer integer representation; fall back to rounded float.
             if let Some(i) = n.as_i64() {
                 Some(JsonValue::Number(i))
-            } else if let Some(f) = n.as_f64() {
-                #[allow(clippy::cast_possible_truncation)]
-                Some(JsonValue::Number(f as i64))
-            } else {
-                None
-            }
+            } else { n.as_f64().map(|f| JsonValue::Number(f as i64)) }
         }
         serde_yaml::Value::String(s) => Some(JsonValue::String(s)),
         serde_yaml::Value::Sequence(seq) => {
@@ -2033,7 +2009,7 @@ fn parse_optional_memory_config(root: &JsonValue) -> Result<MemoryConfig, Config
     let mem = expect_object(mem_value, "merged settings.memory")?;
     let enabled = optional_bool(mem, "enabled", "merged settings.memory")?;
     let store_path = optional_string_dual(mem, "store_path", "merged settings.memory")?
-        .map(|s| crate::cowd_dirs::expand_tilde(s));
+        .map(crate::cowd_dirs::expand_tilde);
     let store_enable_vector_index = if let Some(store_val) = mem.get("store") {
         let store = expect_object(store_val, "merged settings.memory.store")?;
         optional_bool_dual(store, "enable_vector_index", "merged settings.memory.store")?

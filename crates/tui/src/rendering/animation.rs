@@ -273,7 +273,7 @@ mod tests {
         for i in 0..=100 {
             let t = i as f32 / 100.0;
             let b = AnimationEngine::pulse_brightness(t);
-            assert!(b >= 0.3 && b <= 1.0, "brightness {b} out of range at t={t}");
+            assert!((0.3..=1.0).contains(&b), "brightness {b} out of range at t={t}");
         }
     }
 
