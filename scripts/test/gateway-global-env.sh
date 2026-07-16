@@ -6,16 +6,15 @@ cd "$ROOT"
 
 tests=(
   user_defined_aliases_resolve_before_provider_dispatch
-  yolo_flag_forces_danger_full_access_and_marks_repl_mode
+  yolo_flag_forces_danger_full_access_and_marks_tui_mode
   yolo_mode_creates_and_reuses_durable_task
   yolo_system_prompt_adds_continuous_execution_instruction
   setup_report_and_json_are_redacted_and_actionable
   managed_sessions_default_to_sqlite_and_detect_legacy_imports
-  resolve_repl_model_falls_back_to_anthropic_model_env_when_default
-  resolve_repl_model_returns_default_when_env_unset_and_no_config
+  resolve_tui_model_falls_back_to_anthropic_model_env_when_default
+  resolve_tui_model_returns_default_when_env_unset_and_no_config
   resume_diff_command_renders_report_for_saved_session
   resume_session_switch_updates_outcome_session_and_path
-  tui_sidebar_switch_replaces_live_runtime_session
 )
 
 if [[ "$#" -gt 0 ]]; then

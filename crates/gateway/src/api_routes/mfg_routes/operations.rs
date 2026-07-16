@@ -12,7 +12,7 @@ use surface::SurfaceSendRequest;
 use super::*;
 
 #[derive(Debug, Deserialize)]
-struct MfgAlertListQuery {
+pub(super) struct MfgAlertListQuery {
     #[serde(default)]
     owner_ref: Option<String>,
     #[serde(default)]
@@ -23,7 +23,7 @@ struct MfgAlertListQuery {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct MfgAlertRuleUpsertRequest {
+pub(super) struct MfgAlertRuleUpsertRequest {
     #[serde(default)]
     idempotency_key: Option<String>,
     rule: MfgAlertRuleInput,
@@ -31,7 +31,7 @@ struct MfgAlertRuleUpsertRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct MfgAlertSubscriptionUpsertRequest {
+pub(super) struct MfgAlertSubscriptionUpsertRequest {
     #[serde(default)]
     idempotency_key: Option<String>,
     subscription: MfgAlertSubscriptionInput,
@@ -39,7 +39,7 @@ struct MfgAlertSubscriptionUpsertRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct MfgAlertCommandRequest {
+pub(super) struct MfgAlertCommandRequest {
     command: MfgAlertCommand,
     expected_revision: u64,
     idempotency_key: String,
@@ -50,7 +50,7 @@ struct MfgAlertCommandRequest {
 }
 
 #[derive(Debug, Deserialize)]
-struct MfgForecastQuery {
+pub(super) struct MfgForecastQuery {
     #[serde(default)]
     metric_refs: Option<String>,
     #[serde(default = "default_forecast_horizon")]
@@ -64,7 +64,7 @@ fn default_forecast_horizon() -> String {
 }
 
 #[derive(Debug, Deserialize)]
-struct MfgAssignmentListQuery {
+pub(super) struct MfgAssignmentListQuery {
     #[serde(default)]
     assignee_ref: Option<String>,
     #[serde(default)]
@@ -75,7 +75,7 @@ struct MfgAssignmentListQuery {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct MfgAssignmentUpsertRequest {
+pub(super) struct MfgAssignmentUpsertRequest {
     #[serde(default)]
     idempotency_key: Option<String>,
     assignment: MfgAssignmentInput,
@@ -83,7 +83,7 @@ struct MfgAssignmentUpsertRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct MfgAssignmentCommandRequest {
+pub(super) struct MfgAssignmentCommandRequest {
     command: MfgAssignmentCommand,
     expected_revision: u64,
     idempotency_key: String,
@@ -94,7 +94,7 @@ struct MfgAssignmentCommandRequest {
 }
 
 #[derive(Debug, Deserialize)]
-struct MfgLiveQuery {
+pub(super) struct MfgLiveQuery {
     #[serde(default)]
     cursor: Option<u64>,
     #[serde(default)]
@@ -234,7 +234,14 @@ pub(super) async fn mfg_alert_subscription_upsert_handler(
         .list_alert_subscriptions(&state.config_home, None, 500)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .into_iter()
-        .find(|subscription| subscription.subscription_id == request.subscription.subscription_id.as_deref().unwrap_or_default());
+        .find(|subscription| {
+            subscription.subscription_id
+                == request
+                    .subscription
+                    .subscription_id
+                    .as_deref()
+                    .unwrap_or_default()
+        });
     if existing_subscription.is_some_and(|subscription| subscription.subscriber_ref != actor) {
         return Err(api_error(
             StatusCode::FORBIDDEN,
@@ -364,7 +371,11 @@ pub(super) async fn mfg_assignment_upsert_handler(
         .mfg
         .get_assignment(
             &state.config_home,
-            request.assignment.assignment_id.as_deref().unwrap_or_default(),
+            request
+                .assignment
+                .assignment_id
+                .as_deref()
+                .unwrap_or_default(),
         )
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
     {

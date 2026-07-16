@@ -79,9 +79,12 @@ impl AgentDefinitionId {
 
     #[must_use]
     pub fn scope(&self) -> DefinitionScope {
-        // Construction validates the first segment.
-        DefinitionScope::parse(self.0.split('/').next().unwrap_or_default())
-            .expect("validated AgentDefinitionId has a valid scope")
+        match self.0.split('/').next() {
+            Some("builtin") => DefinitionScope::Builtin,
+            Some("user") => DefinitionScope::User,
+            Some("workspace") => DefinitionScope::Workspace,
+            _ => unreachable!("validated AgentDefinitionId has a valid scope"),
+        }
     }
 }
 
@@ -916,7 +919,7 @@ mod tests {
     use super::*;
 
     fn digest(byte: char) -> String {
-        std::iter::repeat(byte).take(64).collect()
+        std::iter::repeat_n(byte, 64).collect()
     }
 
     fn manifest() -> AgentDefinitionManifest {

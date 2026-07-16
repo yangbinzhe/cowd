@@ -817,7 +817,11 @@ async fn memory_graph_handler(
     entities.sort_by(|left, right| left.id.cmp(&right.id));
     triples.sort_by(|left, right| left.id.cmp(&right.id));
 
-    let focus = query.focus.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    let focus = query
+        .focus
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let depth = query.depth.unwrap_or(2).clamp(1, 6);
     let filter = query
         .filter
@@ -864,7 +868,11 @@ async fn memory_graph_handler(
             && filter.as_ref().map_or(true, |filter| {
                 entity.id.to_ascii_lowercase().contains(filter)
                     || entity.name.to_ascii_lowercase().contains(filter)
-                    || entity.entity_type.to_string().to_ascii_lowercase().contains(filter)
+                    || entity
+                        .entity_type
+                        .to_string()
+                        .to_ascii_lowercase()
+                        .contains(filter)
             })
     });
     let total_entities = entities.len();
@@ -872,12 +880,16 @@ async fn memory_graph_handler(
     let limit = query.limit.unwrap_or(80).clamp(1, 200);
     let end = cursor.saturating_add(limit).min(total_entities);
     let page_entities = &entities[cursor..end];
-    let page_ids: HashSet<&str> = page_entities.iter().map(|entity| entity.id.as_str()).collect();
+    let page_ids: HashSet<&str> = page_entities
+        .iter()
+        .map(|entity| entity.id.as_str())
+        .collect();
     let edge_limit = limit.saturating_mul(4);
     let mut page_triples = triples
         .into_iter()
         .filter(|triple| {
-            page_ids.contains(triple.subject_id.as_str()) && page_ids.contains(triple.object_id.as_str())
+            page_ids.contains(triple.subject_id.as_str())
+                && page_ids.contains(triple.object_id.as_str())
         })
         .collect::<Vec<_>>();
     let edge_truncated = page_triples.len() > edge_limit;
@@ -982,7 +994,11 @@ async fn memory_symbol_links_handler(
         .min(total);
     let end = cursor.saturating_add(limit).min(total);
     let truncated = end < total;
-    let entries = entries.into_iter().skip(cursor).take(limit).collect::<Vec<_>>();
+    let entries = entries
+        .into_iter()
+        .skip(cursor)
+        .take(limit)
+        .collect::<Vec<_>>();
     Ok(Json(serde_json::json!({
         "enabled": true,
         "symbol": symbol,
@@ -1155,11 +1171,7 @@ async fn memory_clusters_handler(
     let limit = query.limit.unwrap_or(24).clamp(1, 100);
     let cursor = query.cursor.unwrap_or(0).min(500);
     let fetch_limit = cursor.saturating_add(limit).saturating_add(1).min(501);
-    let mut projection = state
-        .services
-        .memory
-        .clusters_projection(fetch_limit)
-        .await;
+    let mut projection = state.services.memory.clusters_projection(fetch_limit).await;
     let mut clusters = projection
         .get_mut("clusters")
         .and_then(serde_json::Value::as_array_mut)
@@ -1179,12 +1191,19 @@ async fn memory_clusters_handler(
     let start = cursor.min(available);
     let end = start.saturating_add(limit).min(available);
     let truncated = end < available;
-    let page = clusters.into_iter().skip(start).take(limit).collect::<Vec<_>>();
+    let page = clusters
+        .into_iter()
+        .skip(start)
+        .take(limit)
+        .collect::<Vec<_>>();
     if let Some(object) = projection.as_object_mut() {
         object.insert("clusters".to_string(), serde_json::json!(page));
         object.insert("focus".to_string(), serde_json::json!(query.focus));
         object.insert("filter".to_string(), serde_json::json!(query.filter));
-        object.insert("depth".to_string(), serde_json::json!(query.depth.unwrap_or(1)));
+        object.insert(
+            "depth".to_string(),
+            serde_json::json!(query.depth.unwrap_or(1)),
+        );
         object.insert("limit".to_string(), serde_json::json!(limit));
         object.insert("cursor".to_string(), serde_json::json!(start));
         object.insert("total".to_string(), serde_json::json!(available));

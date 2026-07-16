@@ -192,6 +192,9 @@ mod tests {
 
     #[test]
     fn shell_executes_in_hardened_sandbox() {
+        let _guard = crate::test_process_environment_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = execute_code("bash", "echo hello");
         assert_eq!(result.exit_code, 0, "{}", result.stderr);
         assert!(result.stdout.contains("hello"));
@@ -199,29 +202,44 @@ mod tests {
 
     #[test]
     fn python_executes_in_hardened_sandbox() {
+        let _guard = crate::test_process_environment_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = execute_code("python", "print('hello')");
         assert_eq!(result.exit_code, 0, "{}", result.stderr);
     }
 
     #[test]
     fn unsupported_language_fails() {
+        let _guard = crate::test_process_environment_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_ne!(execute_code("brainfuck", "+.").exit_code, 0);
     }
 
     #[test]
     fn timeout_stops_child() {
+        let _guard = crate::test_process_environment_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = execute_code_with_timeout("bash", "sleep 5", Some(100));
         assert_eq!(result.exit_code, 124);
     }
 
     #[test]
     fn protected_host_config_is_not_visible() {
+        let _guard = crate::test_process_environment_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = execute_code("bash", "test ! -e \"$HOME/.cowd\"");
         assert_eq!(result.exit_code, 0, "{}", result.stderr);
     }
 
     #[test]
     fn large_output_does_not_deadlock_before_truncation() {
+        let _guard = crate::test_process_environment_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = execute_code("python", "print('x' * 200000)");
         assert_eq!(result.exit_code, 0, "{}", result.stderr);
         assert!(result.stdout.contains("output truncated"));

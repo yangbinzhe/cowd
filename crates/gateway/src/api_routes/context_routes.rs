@@ -281,7 +281,7 @@ async fn resolve_evidence_refs_batch_handler(
             Err(error) => items.push(serde_json::json!({
                 "ref": reference,
                 "status": "unavailable",
-                "error": error.to_string(),
+                "error": error.message(),
             })),
         }
     }

@@ -340,14 +340,12 @@ impl ManagedAgentDefinition {
                 }
             }
         }
-        match self.overlap_policy {
-            ManagedAgentOverlapPolicy::AllowParallel { max_concurrent } if max_concurrent == 0 => {
-                return Err(ValidationError::InvalidContract {
-                    message: "managed Agent parallel overlap requires positive max_concurrent"
-                        .to_string(),
-                });
-            }
-            _ => {}
+        if let ManagedAgentOverlapPolicy::AllowParallel { max_concurrent: 0 } = self.overlap_policy
+        {
+            return Err(ValidationError::InvalidContract {
+                message: "managed Agent parallel overlap requires positive max_concurrent"
+                    .to_string(),
+            });
         }
         if self.retry_policy.max_attempts == 0
             || self.retry_policy.initial_backoff_ms == 0

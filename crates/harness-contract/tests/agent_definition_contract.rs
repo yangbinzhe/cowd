@@ -10,7 +10,8 @@ use harness_contract::evaluation::EvaluationContract;
 fn manifest(scope: DefinitionScope) -> AgentDefinitionManifest {
     AgentDefinitionManifest {
         api_version: "cowd.agent/v1".to_string(),
-        definition_id: AgentDefinitionId::new(scope, "quality/researcher").expect("id"),
+        definition_id: AgentDefinitionId::new(scope, "quality/researcher")
+            .unwrap_or_else(|error| panic!("valid test definition id: {error:?}")),
         revision: 1,
         name: "Quality researcher".to_string(),
         description: "Produces bounded evidence for a reviewed task.".to_string(),
@@ -41,7 +42,9 @@ fn manifest(scope: DefinitionScope) -> AgentDefinitionManifest {
 #[test]
 fn qualified_identity_and_release_authority_keep_lifecycle_and_routing_orthogonal() {
     let workspace = manifest(DefinitionScope::Workspace);
-    workspace.validate().expect("valid executable definition");
+    if let Err(error) = workspace.validate() {
+        panic!("valid executable definition: {error:?}");
+    }
 
     let release = ReleaseAssignment {
         scope: DefinitionScope::Workspace,
@@ -53,9 +56,9 @@ fn qualified_identity_and_release_authority_keep_lifecycle_and_routing_orthogona
         },
         content_digest: "b".repeat(64),
     };
-    release
-        .validate()
-        .expect("workspace stable requires human approval");
+    if let Err(error) = release.validate() {
+        panic!("workspace stable requires human approval: {error:?}");
+    }
     assert!(release.is_active_approved_stable());
 
     let pointer = DefaultPointer::latest(
@@ -65,9 +68,9 @@ fn qualified_identity_and_release_authority_keep_lifecycle_and_routing_orthogona
             approval_ref: "approval:quality-researcher-default".to_string(),
         },
     );
-    pointer
-        .validate()
-        .expect("default selector is independently valid");
+    if let Err(error) = pointer.validate() {
+        panic!("default selector is independently valid: {error:?}");
+    }
     assert!(matches!(
         pointer.selector,
         RevisionSelector::LatestApprovedStable

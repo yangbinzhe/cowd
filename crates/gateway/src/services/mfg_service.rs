@@ -535,13 +535,14 @@ impl MfgService {
         actor_ref: &str,
         idempotency_key: &str,
     ) -> Result<(MfgCockpitProfile, MfgCommandReceipt), MfgRepositoryError> {
-        self.open_store(config_home)?.upsert_cockpit_profile_receipted(
-            profile,
-            expected_revision,
-            command,
-            actor_ref,
-            idempotency_key,
-        )
+        self.open_store(config_home)?
+            .upsert_cockpit_profile_receipted(
+                profile,
+                expected_revision,
+                command,
+                actor_ref,
+                idempotency_key,
+            )
     }
 
     pub(crate) fn get_cockpit_profile(
@@ -617,12 +618,13 @@ impl MfgService {
         actor_ref: &str,
         idempotency_key: &str,
     ) -> Result<(Option<MfgCockpitProfile>, MfgCommandReceipt), MfgRepositoryError> {
-        self.open_store(config_home)?.delete_cockpit_profile_receipted(
-            profile_id,
-            expected_revision,
-            actor_ref,
-            idempotency_key,
-        )
+        self.open_store(config_home)?
+            .delete_cockpit_profile_receipted(
+                profile_id,
+                expected_revision,
+                actor_ref,
+                idempotency_key,
+            )
     }
 
     pub(crate) fn upsert_alert_rule(
@@ -689,12 +691,13 @@ impl MfgService {
         actor_ref: &str,
         idempotency_key: &str,
     ) -> Result<(MfgAlertSubscription, MfgCommandReceipt), MfgRepositoryError> {
-        self.open_store(config_home)?.upsert_alert_subscription_receipted(
-            subscription,
-            expected_revision,
-            actor_ref,
-            idempotency_key,
-        )
+        self.open_store(config_home)?
+            .upsert_alert_subscription_receipted(
+                subscription,
+                expected_revision,
+                actor_ref,
+                idempotency_key,
+            )
     }
 
     pub(crate) fn list_alert_subscriptions(

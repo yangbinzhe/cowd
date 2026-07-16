@@ -971,7 +971,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         config_home: approval_dir.clone(),
         profile_id,
         profile_manager,
-        services: services,
+        services,
         session_lease_registry: Some(lease_registry.clone()),
     });
     let mission_schedule_timer = spawn_runtime_schedule_timer(runtime_service.runtime_services());

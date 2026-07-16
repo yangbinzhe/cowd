@@ -14,7 +14,7 @@ use thiserror::Error;
 use crate::{
     mfg_ontology_pack, mfg_seed_plan, mfg_widget_catalog, MfgActionExecution,
     MfgActionExecutionRequest, MfgActionFeedback, MfgAlertCommand, MfgAlertCommandInput,
-    MfgAlertOccurrence, MfgAlertRule, MfgAssignment, MfgAssignmentCommand,
+    MfgAlertOccurrence, MfgAlertRule, MfgAlertSubscription, MfgAssignment, MfgAssignmentCommand,
     MfgAssignmentCommandInput, MfgCasePromotion, MfgCockpitProfile, MfgCockpitProjection,
     MfgCockpitReportDeliveryReceipt, MfgCockpitReportRequest, MfgCockpitReportSnapshot,
     MfgCockpitWidget, MfgCommandReceipt, MfgCrossPlaneBridgeReceipt, MfgDomainSeedResult,
@@ -2536,7 +2536,7 @@ fn find_cockpit_profile(
         .map(|json| {
             let mut profile: MfgCockpitProfile = serde_json::from_str(&json)?;
             profile.normalize_legacy();
-            Ok(profile)
+            Ok::<MfgCockpitProfile, MfgRepositoryError>(profile)
         })
         .transpose()
 }
@@ -2622,7 +2622,7 @@ fn list_cockpit_profiles(
             Err(error) => Some(Err(error)),
         })
         .take(limit.max(1))
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, MfgRepositoryError>>()?;
     Ok(profiles)
 }
 
@@ -3046,7 +3046,11 @@ fn mutation_receipt(
         idempotent_replay: false,
         previous_revision,
         current_revision,
-        audit_ref: format!("audit://mfg/{domain}/{}/{}", subject_ref.rsplit(':').next().unwrap_or("unknown"), current_revision),
+        audit_ref: format!(
+            "audit://mfg/{domain}/{}/{}",
+            subject_ref.rsplit(':').next().unwrap_or("unknown"),
+            current_revision
+        ),
         notification_refs: Vec::new(),
         created_at: Utc::now(),
     })
@@ -3061,7 +3065,9 @@ fn upsert_cockpit_profile_receipted(
     idempotency_key: &str,
 ) -> Result<(MfgCockpitProfile, MfgCommandReceipt), MfgRepositoryError> {
     let subject_ref = format!("mfg:cockpit-profile:{}", profile.profile_id);
-    if let Some(receipt) = find_command_receipt(connection, idempotency_key, "cockpit", &subject_ref)? {
+    if let Some(receipt) =
+        find_command_receipt(connection, idempotency_key, "cockpit", &subject_ref)?
+    {
         if receipt.actor_ref != actor_ref {
             return Err(MfgRepositoryError::CommandRejected(
                 "idempotency key is bound to another actor".to_string(),
@@ -3085,7 +3091,13 @@ fn upsert_cockpit_profile_receipted(
         profile.revision,
     )?;
     insert_command_receipt(connection, &receipt)?;
-    append_projection_event(connection, "cockpit", &subject_ref, "profile.receipted", serde_json::json!({ "profile": profile, "receipt": receipt }))?;
+    append_projection_event(
+        connection,
+        "cockpit",
+        &subject_ref,
+        "profile.receipted",
+        serde_json::json!({ "profile": profile, "receipt": receipt }),
+    )?;
     Ok((profile, receipt))
 }
 
@@ -3097,7 +3109,9 @@ fn delete_cockpit_profile_receipted(
     idempotency_key: &str,
 ) -> Result<(Option<MfgCockpitProfile>, MfgCommandReceipt), MfgRepositoryError> {
     let subject_ref = format!("mfg:cockpit-profile:{profile_id}");
-    if let Some(receipt) = find_command_receipt(connection, idempotency_key, "cockpit", &subject_ref)? {
+    if let Some(receipt) =
+        find_command_receipt(connection, idempotency_key, "cockpit", &subject_ref)?
+    {
         if receipt.actor_ref != actor_ref {
             return Err(MfgRepositoryError::CommandRejected(
                 "idempotency key is bound to another actor".to_string(),
@@ -3107,8 +3121,16 @@ fn delete_cockpit_profile_receipted(
     }
     let profile = find_cockpit_profile(connection, profile_id)?
         .ok_or_else(|| MfgRepositoryError::NotFound(profile_id.to_string()))?;
-    ensure_revision("cockpit_profile", profile_id, expected_revision, profile.revision)?;
-    connection.execute("DELETE FROM mfg_cockpit_profile WHERE profile_id = ?1", params![profile_id])?;
+    ensure_revision(
+        "cockpit_profile",
+        profile_id,
+        expected_revision,
+        profile.revision,
+    )?;
+    connection.execute(
+        "DELETE FROM mfg_cockpit_profile WHERE profile_id = ?1",
+        params![profile_id],
+    )?;
     let receipt = mutation_receipt(
         "cockpit",
         subject_ref.clone(),
@@ -3119,7 +3141,13 @@ fn delete_cockpit_profile_receipted(
         profile.revision,
     )?;
     insert_command_receipt(connection, &receipt)?;
-    append_projection_event(connection, "cockpit", &subject_ref, "profile.deleted", serde_json::json!({ "profile": profile, "receipt": receipt }))?;
+    append_projection_event(
+        connection,
+        "cockpit",
+        &subject_ref,
+        "profile.deleted",
+        serde_json::json!({ "profile": profile, "receipt": receipt }),
+    )?;
     Ok((Some(profile), receipt))
 }
 
@@ -3131,7 +3159,8 @@ fn upsert_alert_rule_receipted(
     idempotency_key: &str,
 ) -> Result<(MfgAlertRule, MfgCommandReceipt), MfgRepositoryError> {
     let subject_ref = format!("mfg:alert-rule:{}", rule.rule_id);
-    if let Some(receipt) = find_command_receipt(connection, idempotency_key, "alert", &subject_ref)? {
+    if let Some(receipt) = find_command_receipt(connection, idempotency_key, "alert", &subject_ref)?
+    {
         if receipt.actor_ref != actor_ref {
             return Err(MfgRepositoryError::CommandRejected(
                 "idempotency key is bound to another actor".to_string(),
@@ -3155,7 +3184,13 @@ fn upsert_alert_rule_receipted(
         rule.revision,
     )?;
     insert_command_receipt(connection, &receipt)?;
-    append_projection_event(connection, "alert", &subject_ref, "alert_rule.receipted", serde_json::json!({ "rule": rule, "receipt": receipt }))?;
+    append_projection_event(
+        connection,
+        "alert",
+        &subject_ref,
+        "alert_rule.receipted",
+        serde_json::json!({ "rule": rule, "receipt": receipt }),
+    )?;
     Ok((rule, receipt))
 }
 
@@ -3167,7 +3202,8 @@ fn upsert_alert_subscription_receipted(
     idempotency_key: &str,
 ) -> Result<(MfgAlertSubscription, MfgCommandReceipt), MfgRepositoryError> {
     let subject_ref = format!("mfg:alert-subscription:{}", subscription.subscription_id);
-    if let Some(receipt) = find_command_receipt(connection, idempotency_key, "alert", &subject_ref)? {
+    if let Some(receipt) = find_command_receipt(connection, idempotency_key, "alert", &subject_ref)?
+    {
         if receipt.actor_ref != actor_ref {
             return Err(MfgRepositoryError::CommandRejected(
                 "idempotency key is bound to another actor".to_string(),
@@ -3191,7 +3227,13 @@ fn upsert_alert_subscription_receipted(
         subscription.revision,
     )?;
     insert_command_receipt(connection, &receipt)?;
-    append_projection_event(connection, "alert", &subject_ref, "alert_subscription.receipted", serde_json::json!({ "subscription": subscription, "receipt": receipt }))?;
+    append_projection_event(
+        connection,
+        "alert",
+        &subject_ref,
+        "alert_subscription.receipted",
+        serde_json::json!({ "subscription": subscription, "receipt": receipt }),
+    )?;
     Ok((subscription, receipt))
 }
 
@@ -3203,7 +3245,9 @@ fn upsert_assignment_receipted(
     idempotency_key: &str,
 ) -> Result<(MfgAssignment, MfgCommandReceipt), MfgRepositoryError> {
     let subject_ref = format!("mfg:assignment:{}", assignment.assignment_id);
-    if let Some(receipt) = find_command_receipt(connection, idempotency_key, "assignment", &subject_ref)? {
+    if let Some(receipt) =
+        find_command_receipt(connection, idempotency_key, "assignment", &subject_ref)?
+    {
         if receipt.actor_ref != actor_ref {
             return Err(MfgRepositoryError::CommandRejected(
                 "idempotency key is bound to another actor".to_string(),
@@ -3227,7 +3271,13 @@ fn upsert_assignment_receipted(
         assignment.revision,
     )?;
     insert_command_receipt(connection, &receipt)?;
-    append_projection_event(connection, "assignment", &subject_ref, "assignment.receipted", serde_json::json!({ "assignment": assignment, "receipt": receipt }))?;
+    append_projection_event(
+        connection,
+        "assignment",
+        &subject_ref,
+        "assignment.receipted",
+        serde_json::json!({ "assignment": assignment, "receipt": receipt }),
+    )?;
     Ok((assignment, receipt))
 }
 
@@ -3415,13 +3465,15 @@ fn list_alert_subscriptions(
     let rows = statement.query_map(params![limit.clamp(1, 500) as i64], |row| {
         row.get::<_, String>(0)
     })?;
-    rows.map(|row| Ok(serde_json::from_str::<MfgAlertSubscription>(&row?)?))
-        .filter(|item| {
-            item.as_ref().map_or(true, |subscription| {
-                subscriber_ref.is_none_or(|filter| subscription.subscriber_ref == filter)
-            })
+    rows.map(|row| -> Result<MfgAlertSubscription, MfgRepositoryError> {
+        Ok(serde_json::from_str::<MfgAlertSubscription>(&row?)?)
+    })
+    .filter(|item| {
+        item.as_ref().map_or(true, |subscription| {
+            subscriber_ref.is_none_or(|filter| subscription.subscriber_ref == filter)
         })
-        .collect()
+    })
+    .collect::<Result<Vec<_>, MfgRepositoryError>>()
 }
 
 fn materialize_alert_occurrences(
@@ -3634,10 +3686,10 @@ fn build_forecasts(
             leading_signals: vec![MfgForecastSignal { signal_ref: format!("matrix:metric-state:{}", state.state_id), label: "latest metric delta".to_string(), direction: if state.delta >= 0.0 { "up" } else { "down" }.to_string(), weight: 1.0 }],
             evidence_refs: state.input_fact_refs.clone(), points: vec![serde_json::json!({ "period": state.period, "value": state.value, "kind": "observed" }), serde_json::json!({ "period": "next", "value": next, "kind": "forecast" })], unavailable_reason: None }
     }).collect::<Vec<_>>();
-    for metric_ref in metric_refs
-        .iter()
-        .filter(|metric_ref| !forecasts.iter().any(|item| &item.metric_ref == *metric_ref))
-    {
+    for metric_ref in metric_refs {
+        if forecasts.iter().any(|item| item.metric_ref == *metric_ref) {
+            continue;
+        }
         forecasts.push(MfgForecastProjection {
             forecast_id: format!("forecast-unavailable-{metric_ref}"),
             metric_ref: metric_ref.clone(),
@@ -6635,26 +6687,26 @@ mod tests {
         let attention_widget = projection
             .widgets
             .iter()
-            .find(|widget| widget.widget_type == "attention_queue")
+            .find(|widget| widget.definition_id == "attention.queue")
             .expect("attention widget exists");
         assert!(attention_widget.data["count"].as_u64().unwrap_or(0) >= 1);
         assert!(!attention_widget.source_refs.is_empty());
         let quality_widget = projection
             .widgets
             .iter()
-            .find(|widget| widget.widget_type == "quality_gate_status")
+            .find(|widget| widget.definition_id == "quality.gates")
             .expect("quality widget exists");
         assert_eq!(quality_widget.data["pass_count"], 1);
         let action_widget = projection
             .widgets
             .iter()
-            .find(|widget| widget.widget_type == "action_execution_status")
+            .find(|widget| widget.definition_id == "action.executions")
             .expect("action widget exists");
         assert_eq!(action_widget.data["active_count"], 1);
         let threshold_widget = projection
             .widgets
             .iter()
-            .find(|widget| widget.widget_type == "focus_thresholds")
+            .find(|widget| widget.definition_id == "focus.summary")
             .expect("threshold widget exists");
         assert_eq!(threshold_widget.status, "configured");
 
@@ -6791,7 +6843,10 @@ mod tests {
                 "cockpit-delete-key",
             )
             .expect("profile deletion replays");
-        assert_eq!(deleted.expect("first deletion returns profile").profile_id, saved.profile_id);
+        assert_eq!(
+            deleted.expect("first deletion returns profile").profile_id,
+            saved.profile_id
+        );
         assert!(deleted_replay.is_none());
         assert_eq!(deletion_replay.receipt_id, deletion_receipt.receipt_id);
         assert!(deletion_replay.idempotent_replay);

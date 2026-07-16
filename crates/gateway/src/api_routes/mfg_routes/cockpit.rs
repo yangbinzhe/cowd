@@ -163,7 +163,8 @@ pub(super) async fn mfg_cockpit_profile_clone_handler(
     Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(request): Json<MfgCockpitProfileCloneRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let idempotency_key = mfg_idempotency_key(request.idempotency_key.clone(), "cockpit-profile-clone");
+    let idempotency_key =
+        mfg_idempotency_key(request.idempotency_key.clone(), "cockpit-profile-clone");
     let source = state
         .services
         .mfg
@@ -229,7 +230,8 @@ pub(super) async fn mfg_cockpit_profile_share_handler(
     Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(request): Json<MfgCockpitProfileShareRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let idempotency_key = mfg_idempotency_key(request.idempotency_key.clone(), "cockpit-profile-share");
+    let idempotency_key =
+        mfg_idempotency_key(request.idempotency_key.clone(), "cockpit-profile-share");
     let mut profile = state
         .services
         .mfg
