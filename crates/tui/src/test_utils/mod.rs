@@ -539,7 +539,7 @@ mod tests {
     #[test]
     fn fixture_app_streaming_is_active() {
         let app = app_streaming();
-        assert!(app.turn_active);
+        assert!(app.turn_is_active());
         // Should have 1 TextDelta message in timeline
         let msg = app
             .timeline_iter()

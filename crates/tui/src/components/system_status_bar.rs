@@ -37,7 +37,7 @@ impl SystemStatusBar {
 
     pub fn sync_from_app(&mut self, app: &App) {
         self.runtime = runtime_health(app).to_string();
-        self.turn = if app.turn_active {
+        self.turn = if app.turn_is_active() {
             if app.timeline_iter().any(|(_, entry)| {
                 matches!(
                     entry,

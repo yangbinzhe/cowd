@@ -565,8 +565,9 @@ pub use policy_engine::{
 };
 pub use profile::{Profile, ProfileManager, ProfileMeta};
 pub use prompt::{
-    load_system_prompt, prepend_bullets, ContextFile, ProjectContext, PromptBuildError,
-    SystemPromptBuilder, COWD_IDENTITY_CONTRACT_VERSION, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+    load_system_prompt, prepend_bullets, ContextFile, CowdIdentityContract, ProjectContext,
+    PromptBuildError, SystemPromptBuilder, COWD_IDENTITY_CONTRACT_VERSION,
+    SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
 pub use prompt_assembly::{PromptAssembly, PromptContextPacket};
 pub use provider::{detect_provider_kind, model_context_window_with_overrides, ProviderKind};

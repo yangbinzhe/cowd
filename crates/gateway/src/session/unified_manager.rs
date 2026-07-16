@@ -33,24 +33,29 @@ impl SessionSource {
         }
     }
 
-    fn system_prompt(&self) -> Vec<String> {
-        // Every activation path must receive the same Cowd identity and
-        // capability contract.  Previously WebUI/TUI/CLI/Socket sessions
-        // returned an empty prompt here, allowing a provider's default
-        // persona (often Claude) to leak into replies after a cold start.
-        let mut builder = runtime::SystemPromptBuilder::new().append_section(format!(
+    fn source_guidance(&self) -> Vec<String> {
+        let mut guidance = vec![format!(
             "# Active surface\nYou are serving this turn through `{}`. The surface changes presentation only; your identity, governed Runtime tools, execution planning, and evidence rules remain Cowd-owned.",
             self.platform()
-        ));
+        )];
         if let Self::Surface(surface) = self {
-            builder = builder.append_section(format!(
+            guidance.push(format!(
                 "你正在通过 `{surface}` 外部 surface 回复用户。必须优先给出可见、简洁、可执行的阶段性结果。\
                 如果任务需要读代码、检查 README、调研或测试，只检查足以支撑结论的关键证据；不要进行无边界穷举。\
                 如果当前 turn 的信息或时间不足，直接说明已检查内容、当前判断、剩余风险和建议下一步，而不是持续调用工具直到超时。\
                 外部 surface 的用户体验要求：宁可给出有证据的阶段性结论，也不能让用户长时间没有任何回复。"
             ));
         }
-        builder.build()
+        guidance
+    }
+
+    fn system_prompt(&self) -> Vec<String> {
+        self.source_guidance()
+            .into_iter()
+            .fold(runtime::SystemPromptBuilder::new(), |builder, guidance| {
+                builder.with_source_guidance(guidance)
+            })
+            .build()
     }
 }
 

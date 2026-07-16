@@ -200,7 +200,7 @@ impl ChatView {
         self.scroll_state.offset = app.scroll_offset;
         self.scroll_state.auto_scroll = app.auto_scroll;
         self.scroll_state.viewport_height = app.viewport_height;
-        self.turn_active = app.turn_active;
+        self.turn_active = app.turn_is_active();
         self.turn_input_tokens = app.turn_input_tokens;
         self.turn_output_tokens = app.turn_output_tokens;
         self.session_input_tokens = app.input_tokens;

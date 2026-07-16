@@ -22,6 +22,7 @@ pub struct ExecutionViewState {
     pub status: Option<ExecutionLiveStatus>,
     pub status_detail: Option<String>,
     pub terminal_ref: Option<String>,
+    pub started_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -36,7 +37,44 @@ pub struct TurnInteractionState {
     pub presentation: PresentationState,
 }
 
+/// Every mutation of the active-turn presentation state.  Keeping this
+/// explicit makes stream prose incapable of becoming a hidden lifecycle
+/// transition and gives reconnect/resync paths a small, testable reducer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnInteractionAction {
+    SubmitStarted,
+    IngressAccepted { execution_id: String },
+    ProjectionSnapshot(ExecutionProjection),
+    RevisionGap,
+    ReconnectStarted,
+    Disconnected,
+    TerminalObserved,
+    Reset,
+}
+
 impl TurnInteractionState {
+    pub fn reduce(&mut self, action: TurnInteractionAction) {
+        match action {
+            TurnInteractionAction::SubmitStarted => self.submit_started(),
+            TurnInteractionAction::IngressAccepted { execution_id } => {
+                self.ingress_accepted(execution_id);
+            }
+            TurnInteractionAction::ProjectionSnapshot(projection) => {
+                self.projection_snapshot(&projection);
+            }
+            TurnInteractionAction::RevisionGap => {
+                if !matches!(self.transport, TransportState::Idle) {
+                    self.presentation.stale = true;
+                    self.transport = TransportState::Reconnecting;
+                }
+            }
+            TurnInteractionAction::ReconnectStarted => self.reconnecting(),
+            TurnInteractionAction::Disconnected => self.disconnected(),
+            TurnInteractionAction::TerminalObserved => self.terminal_observed(),
+            TurnInteractionAction::Reset => *self = Self::default(),
+        }
+    }
+
     pub fn submit_started(&mut self) {
         self.transport = TransportState::Submitting;
         self.presentation.stale = false;
@@ -61,6 +99,7 @@ impl TurnInteractionState {
             self.execution.status = Some(live.status);
             self.execution.status_detail = live.status_detail.clone();
             self.execution.terminal_ref = live.terminal_ref.clone();
+            self.execution.started_at_ms = Some(live.started_at_ms);
             self.transport = if live.status.is_terminal() {
                 TransportState::Idle
             } else {
@@ -106,7 +145,7 @@ impl TurnInteractionState {
             TransportState::Accepted => self
                 .execution
                 .status
-                .map(|status| format!("Runtime: {status:?}"))
+                .map(status_label)
                 .or_else(|| {
                     self.execution
                         .execution_id
@@ -118,10 +157,26 @@ impl TurnInteractionState {
                 .execution
                 .status
                 .filter(|status| status.is_terminal())
-                .map(|status| format!("Runtime: {status:?}"))
+                .map(status_label)
                 .unwrap_or_else(|| "Chat".to_string()),
         }
     }
+}
+
+fn status_label(status: ExecutionLiveStatus) -> String {
+    let label = match status {
+        ExecutionLiveStatus::Queued => "Queued",
+        ExecutionLiveStatus::PreparingContext => "Preparing context",
+        ExecutionLiveStatus::CallingModel => "Thinking",
+        ExecutionLiveStatus::Thinking => "Thinking",
+        ExecutionLiveStatus::CallingTool => "Running tools",
+        ExecutionLiveStatus::WaitingApproval => "Waiting for approval",
+        ExecutionLiveStatus::Finalizing => "Finalizing",
+        ExecutionLiveStatus::Complete => "Completed",
+        ExecutionLiveStatus::Error => "Failed",
+        ExecutionLiveStatus::Cancelled => "Cancelled",
+    };
+    format!("Runtime: {label}")
 }
 
 #[cfg(test)]
@@ -185,5 +240,24 @@ mod tests {
         state.projection_snapshot(&projection(5, ExecutionLiveStatus::Complete));
         assert!(!state.is_active());
         assert_eq!(state.execution.terminal_ref.as_deref(), Some("terminal-a"));
+    }
+
+    #[test]
+    fn revision_gap_is_visible_until_a_projection_snapshot_repairs_it() {
+        let mut state = TurnInteractionState::default();
+        state.reduce(TurnInteractionAction::SubmitStarted);
+        state.reduce(TurnInteractionAction::IngressAccepted {
+            execution_id: "execution-a".to_string(),
+        });
+        state.reduce(TurnInteractionAction::RevisionGap);
+        assert_eq!(state.transport, TransportState::Reconnecting);
+        assert!(state.presentation.stale);
+
+        state.reduce(TurnInteractionAction::ProjectionSnapshot(projection(
+            8,
+            ExecutionLiveStatus::CallingModel,
+        )));
+        assert_eq!(state.transport, TransportState::Accepted);
+        assert!(!state.presentation.stale);
     }
 }

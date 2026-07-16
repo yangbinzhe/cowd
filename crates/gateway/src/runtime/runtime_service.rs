@@ -218,10 +218,13 @@ impl RuntimeTurnOwner {
 
     fn runtime_mut(
         &mut self,
-    ) -> &mut runtime::StandardRuntimeHost<crate::gateway_tool_executor::GatewayToolExecutor> {
+    ) -> Result<
+        &mut runtime::StandardRuntimeHost<crate::gateway_tool_executor::GatewayToolExecutor>,
+        String,
+    > {
         self.runtime
             .as_mut()
-            .expect("RuntimeTurnOwner always owns a host until it is restored")
+            .ok_or_else(|| "Runtime host was already restored before turn execution".to_string())
     }
 
     async fn restore(&mut self) {
@@ -666,7 +669,7 @@ impl RuntimeService {
             }
         };
         let summary_result = owned_runtime
-            .runtime_mut()
+            .runtime_mut()?
             .submit_ingress_turn(
                 content,
                 &runtime::permissions::SharedPrompter::none(),
@@ -1818,6 +1821,7 @@ impl RuntimeService {
         // the receipt, so the next turn still observes a single owner.
         let turn_result = owned_runtime
             .runtime_mut()
+            .map_err(RuntimeTurnExecutionError::Runtime)?
             .submit_turn(&content, &runtime::permissions::SharedPrompter::none())
             .await;
         owned_runtime.restore().await;

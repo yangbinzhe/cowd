@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+use crate::components::turn_interaction::TurnInteractionState;
 use crate::layout::{build_default_layout, LayoutState, LayoutTree};
 use crate::runtime_control_store::{
     ApprovalSummary, ConnectorAccountSummary, ConnectorCapabilitySummary, ConnectorResourceSummary,
@@ -191,7 +192,6 @@ pub struct App {
     pub yolo_mode: bool,
     pub current_task: Option<CurrentTaskSummary>,
     pub input: TextArea<'static>,
-    pub is_loading: bool,
     pub spinner_idx: usize,
     pub should_quit: bool,
 
@@ -307,7 +307,10 @@ pub struct App {
     pub scroll_offset: usize,
     pub auto_scroll: bool,
 
-    pub turn_active: bool,
+    /// Canonical TUI transport/execution presentation state.  Timeline text
+    /// and legacy stream events may decorate a turn but cannot decide whether
+    /// a Runtime execution is active.
+    pub turn_interaction: TurnInteractionState,
     streaming_received: bool,
 
     pub msg_version: u64,
@@ -521,7 +524,6 @@ impl App {
             yolo_mode: false,
             current_task: None,
             input,
-            is_loading: false,
             spinner_idx: 0,
             should_quit: false,
 
@@ -598,7 +600,7 @@ impl App {
             scroll_offset: 0,
             auto_scroll: true,
 
-            turn_active: false,
+            turn_interaction: TurnInteractionState::default(),
             streaming_received: false,
 
             msg_version: 0,
@@ -902,6 +904,11 @@ impl App {
                 self.notification = None;
             }
         }
+    }
+
+    #[must_use]
+    pub fn turn_is_active(&self) -> bool {
+        self.turn_interaction.is_active()
     }
 
     pub fn next_model(&mut self) -> Option<String> {
@@ -1386,8 +1393,7 @@ impl App {
             }
 
             CowdEvent::TurnStarted => {
-                self.is_loading = true;
-                self.turn_active = true;
+                self.turn_interaction.submit_started();
                 self.streaming_received = false;
                 self.latest_context_envelope = None;
                 self.latest_runtime_policy = None;
@@ -1406,8 +1412,6 @@ impl App {
                 assistant_text,
                 iterations: _,
             } => {
-                self.is_loading = false;
-                self.turn_active = false;
                 for entry in self.timeline_iter_mut() {
                     match entry {
                         TimelineEntry::Thinking { expanded, .. } => *expanded = false,
@@ -1443,8 +1447,6 @@ impl App {
             }
 
             CowdEvent::TurnError { error } => {
-                self.is_loading = false;
-                self.turn_active = false;
                 self.add_system_notice(SystemNoticeKind::Error, &format!("Error: {error}"));
             }
 

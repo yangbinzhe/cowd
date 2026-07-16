@@ -139,27 +139,28 @@ pub(crate) fn initialize_repo(cwd: &Path) -> Result<InitReport, Box<dyn std::err
         status: ensure_gitignore_entries(&gitignore)?,
     });
 
-    // Project-level CLAUDE.md (instructions)
+    // Project-level Cowd guidance.  `CLAUDE.md` remains a read-compatible
+    // project instruction file, but initialization must not rename a user's
+    // Cowd-native file into provider-branded guidance.
+    let cowd_md_path = cwd.join("COWD.md");
     let claude_md_path = cwd.join("CLAUDE.md");
-    let legacy_cowd_md = cwd.join("COWD.md");
-    // Migration: if legacy COWD.md exists, rename to CLAUDE.md
-    if legacy_cowd_md.is_file() && !claude_md_path.exists() {
-        fs::rename(&legacy_cowd_md, &claude_md_path)?;
+    if cowd_md_path.is_file() {
         artifacts.push(InitArtifact {
-            name: "CLAUDE.md (migrated from COWD.md)",
-            status: InitStatus::Created,
-        });
-    } else if claude_md_path.is_file() {
-        artifacts.push(InitArtifact {
-            name: "CLAUDE.md",
+            name: "COWD.md",
             status: InitStatus::Skipped,
         });
     } else {
-        let content = render_init_claude_md(cwd);
-        fs::write(&claude_md_path, &content)?;
+        let content = render_init_cowd_md(cwd);
+        fs::write(&cowd_md_path, &content)?;
         artifacts.push(InitArtifact {
-            name: "CLAUDE.md",
+            name: "COWD.md",
             status: InitStatus::Created,
+        });
+    }
+    if claude_md_path.is_file() {
+        artifacts.push(InitArtifact {
+            name: "CLAUDE.md (compatible guidance)",
+            status: InitStatus::Skipped,
         });
     }
 
@@ -259,10 +260,10 @@ override any settings here.
     )
 }
 
-pub(crate) fn render_init_claude_md(cwd: &Path) -> String {
+pub(crate) fn render_init_cowd_md(cwd: &Path) -> String {
     let detection = detect_repo(cwd);
     let mut lines = vec![
-        "# CLAUDE.md".to_string(),
+        "# COWD.md".to_string(),
         String::new(),
         "This file provides guidance to Cowd (cowd.dev) when working with code in this repository."
             .to_string(),
@@ -311,7 +312,7 @@ pub(crate) fn render_init_claude_md(cwd: &Path) -> String {
     lines.push("## Working agreement".to_string());
     lines.push("- Prefer small, reviewable changes and keep generated bootstrap files aligned with actual repo workflows.".to_string());
     lines.push("- Use `config.yaml` for shared project config; reserve `config.local.yaml` for machine-local overrides.".to_string());
-    lines.push("- Do not overwrite existing `CLAUDE.md` content automatically; update it intentionally when repo workflows change.".to_string());
+    lines.push("- Do not overwrite existing `COWD.md`, `CLAUDE.md`, or `CLAUDE.local.md` content automatically; update it intentionally when repo workflows change.".to_string());
     lines.push(String::new());
 
     lines.join("\n")
@@ -434,7 +435,7 @@ fn framework_notes(detection: &RepoDetection) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{initialize_repo, render_init_claude_md};
+    use super::{initialize_repo, render_init_cowd_md};
     use std::fs;
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -456,17 +457,17 @@ mod tests {
         let report = initialize_repo(&root).expect("init should succeed");
         let rendered = report.render();
         assert!(rendered.contains(".cowd/"));
-        assert!(rendered.contains("CLAUDE.md"));
+        assert!(rendered.contains("COWD.md"));
         assert!(rendered.contains("created"));
         assert!(rendered.contains(".gitignore       created"));
-        assert!(rendered.contains("CLAUDE.md"));
+        assert!(rendered.contains("COWD.md"));
         assert!(root.join(".cowd").is_dir());
-        assert!(root.join("CLAUDE.md").is_file());
+        assert!(root.join("COWD.md").is_file());
         let gitignore = fs::read_to_string(root.join(".gitignore")).expect("read gitignore");
         assert!(gitignore.contains(".cowd/config.local.yaml"));
-        let claude_md = fs::read_to_string(root.join("CLAUDE.md")).expect("read claude md");
-        assert!(claude_md.contains("Languages: Rust."));
-        assert!(claude_md.contains("cargo clippy --workspace --all-targets -- -D warnings"));
+        let cowd_md = fs::read_to_string(root.join("COWD.md")).expect("read cowd md");
+        assert!(cowd_md.contains("Languages: Rust."));
+        assert!(cowd_md.contains("cargo clippy --workspace --all-targets -- -D warnings"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -475,23 +476,23 @@ mod tests {
     fn initialize_repo_is_idempotent_and_preserves_existing_files() {
         let root = temp_dir();
         fs::create_dir_all(&root).expect("create root");
-        fs::write(root.join("CLAUDE.md"), "custom guidance\n").expect("write existing claude md");
+        fs::write(root.join("COWD.md"), "custom guidance\n").expect("write existing cowd md");
         fs::write(root.join(".gitignore"), ".cowd/config.local.yaml\n").expect("write gitignore");
 
         let first = initialize_repo(&root).expect("first init should succeed");
         assert!(
-            first.render().contains("CLAUDE.md")
+            first.render().contains("COWD.md")
                 && first.render().contains("skipped (already exists)")
         );
         let second = initialize_repo(&root).expect("second init should succeed");
         let second_rendered = second.render();
         assert!(second_rendered.contains(".cowd/"));
-        assert!(second_rendered.contains("CLAUDE.md"));
+        assert!(second_rendered.contains("COWD.md"));
         assert!(second_rendered.contains("skipped (already exists)"));
         assert!(second_rendered.contains(".gitignore       skipped (already exists)"));
-        assert!(second_rendered.contains("CLAUDE.md"));
+        assert!(second_rendered.contains("COWD.md"));
         assert_eq!(
-            fs::read_to_string(root.join("CLAUDE.md")).expect("read existing claude md"),
+            fs::read_to_string(root.join("COWD.md")).expect("read existing cowd md"),
             "custom guidance\n"
         );
         let gitignore = fs::read_to_string(root.join(".gitignore")).expect("read gitignore");
@@ -512,7 +513,7 @@ mod tests {
         )
         .expect("write package json");
 
-        let rendered = render_init_claude_md(Path::new(&root));
+        let rendered = render_init_cowd_md(Path::new(&root));
         assert!(rendered.contains("Languages: Python, TypeScript."));
         assert!(rendered.contains("Frameworks/tooling markers: Next.js, React."));
         assert!(rendered.contains("pyproject.toml"));

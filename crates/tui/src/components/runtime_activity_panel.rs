@@ -341,7 +341,7 @@ impl RuntimeActivityPanel {
         self.recent_tools.clear();
         self.recent_process.clear();
         self.turn_activity = TurnActivity::default();
-        self.turn_activity.active = app.turn_active;
+        self.turn_activity.active = app.turn_is_active();
         let mut turn_index = 0usize;
         for entry in &timeline {
             match entry {

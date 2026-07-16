@@ -55,8 +55,8 @@ impl ThinkingPanel {
     }
 
     pub fn sync_from_app(&mut self, app: &App) {
-        self.visible = app.turn_active;
-        if !app.turn_active {
+        self.visible = app.turn_is_active();
+        if !app.turn_is_active() {
             self.collapsed = true;
         }
 
@@ -356,7 +356,7 @@ mod tests {
     #[test]
     fn sync_from_app_turn_complete_hides() {
         let mut app = App::new("m", "s");
-        app.turn_active = false;
+        app.turn_interaction.terminal_observed();
 
         let mut panel = ThinkingPanel::new();
         panel.visible = true;

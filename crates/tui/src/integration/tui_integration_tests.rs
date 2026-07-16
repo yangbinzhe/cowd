@@ -55,8 +55,7 @@ fn integration_launch_type_stream() {
 
     state.add_message("user", "Hello");
     state.apply_event(CowdEvent::TurnStarted);
-    assert!(state.turn_active);
-    assert!(state.is_loading);
+    assert!(state.turn_is_active());
 
     state.apply_event(CowdEvent::TextDelta {
         text: "Hi there!".into(),
@@ -66,8 +65,10 @@ fn integration_launch_type_stream() {
         iterations: 1,
     });
 
-    assert!(!state.turn_active);
-    assert!(!state.is_loading);
+    // A legacy stream terminal updates the transcript but is deliberately
+    // not allowed to forge Runtime lifecycle completion. The projection
+    // stream supplies the authoritative terminal_ref.
+    assert!(state.turn_is_active());
     assert!(state.timeline_len() >= 2);
 }
 

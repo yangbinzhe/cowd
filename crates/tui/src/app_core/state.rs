@@ -58,12 +58,11 @@ use crate::components::thinking_panel::ThinkingPanel;
 use crate::components::toast::{ToastManager, ToastVariant};
 use crate::components::todo_panel::TodoPanel;
 use crate::components::tool_ops_panel::{ToolOpsMode, ToolOpsPanel};
-use crate::components::turn_interaction::TurnInteractionState;
 use crate::components::{Component, RenderContext};
 use crate::context_tokens::{validate_context_tokens_against_entries, ContextWorkspaceEntry};
 use crate::error_recovery::{self, RenderResult};
 use crate::event::dispatcher::EventDispatcher;
-use crate::event::{ComponentId as EventComponentId, EventBus, EventPriority};
+use crate::event::{ComponentId as EventComponentId, EventBus};
 use crate::keybind::types::Action;
 use crate::keybind::which_key::WhichKey;
 use crate::keybind::{default_bindings, KeybindEngine};
@@ -361,9 +360,6 @@ pub struct TuiState {
 
     /// Composer owns the bottom input UI, autocomplete dropdown placement, and submit affordance.
     pub composer: Composer,
-    /// Canonical transport/execution/presentation state for the active TUI
-    /// turn. Text/tool events decorate the timeline but cannot overwrite it.
-    pub turn_interaction: TurnInteractionState,
 
     /// File tree browser with git status overlay.
     pub file_tree: FileTree,
@@ -563,7 +559,6 @@ impl TuiState {
             diff_viewer,
             prompt,
             composer,
-            turn_interaction: TurnInteractionState::default(),
             file_tree,
             session_sidebar,
             memory_panel,
@@ -631,26 +626,22 @@ impl TuiState {
     /// **Preserves existing behavior**: delegates to `App::apply_event()`
     /// for all timeline updates, token tracking, and state transitions.
     ///
-    /// **Bridges to new EventBus**: after updating the App, sends a
-    /// synthetic state-change notification via `EventBus` so that new
-    /// engine components can react (e.g., re-sync their view-models).
-    ///
-    /// The synthetic event uses `Resize(0, 0)` as a signal since
-    /// crossterm has no custom event type. Components should check
-    /// for this and re-sync from App state as needed.
+    /// **Bridges to new EventBus**: after updating the App, emits a typed
+    /// internal state-change notification. It is intentionally not encoded
+    /// as a fake terminal event.
     pub fn apply_event(&mut self, event: CowdEvent) {
         match &event {
-            CowdEvent::TurnStarted => self.turn_interaction.submit_started(),
+            CowdEvent::TurnStarted => self.app.turn_interaction.submit_started(),
             CowdEvent::ExecutionGraphSummary { summary } => {
                 if let Some(execution_id) = summary.graph_id.as_deref() {
-                    self.turn_interaction.ingress_accepted(execution_id);
+                    self.app.turn_interaction.ingress_accepted(execution_id);
                 }
             }
-            CowdEvent::TurnComplete { .. } | CowdEvent::TurnError { .. } => {
-                self.turn_interaction.terminal_observed();
-            }
+            // Stream terminal events update the timeline only. Runtime
+            // projection terminal_ref remains the lifecycle authority.
+            CowdEvent::TurnComplete { .. } | CowdEvent::TurnError { .. } => {}
             CowdEvent::Warning { message } if message.contains("projection stream interrupted") => {
-                self.turn_interaction.reconnecting();
+                self.app.turn_interaction.reconnecting();
             }
             _ => {}
         }
@@ -667,11 +658,9 @@ impl TuiState {
         // Preserve ALL existing App behavior
         self.app.apply_event(event);
 
-        // Bridge: notify new components that state has changed.
-        // Using Resize(0,0) as a sentinel — real resize events always
-        // have non-zero dimensions, so this is unambiguous.
-        self.event_bus
-            .send(crossterm::event::Event::Resize(0, 0), EventPriority::Normal);
+        // Bridge: notify new components that state has changed without
+        // overloading an operating-system input event.
+        self.event_bus.notify_state_changed();
 
         // Drain and dispatch to registered components.
         self.event_dispatcher.dispatch(&self.event_bus);
@@ -681,7 +670,7 @@ impl TuiState {
     /// state from its live revision.  Gateway transport may reconnect or
     /// replay, but older snapshots cannot move this state backward.
     pub fn apply_execution_projection(&mut self, projection: crate::protocol::ExecutionProjection) {
-        self.turn_interaction.projection_snapshot(&projection);
+        self.app.turn_interaction.projection_snapshot(&projection);
         self.app.apply_execution_projection(projection);
     }
 
@@ -765,7 +754,7 @@ impl TuiState {
         // BUG 5 FIX: Real-time token count update.
         // During active turns, ensure token_count reflects cumulative usage.
         // This acts as a fallback if background TokenUsage events are delayed.
-        if self.turn_interaction.is_active() {
+        if self.app.turn_is_active() {
             let turn_total = self.app.turn_input_tokens + self.app.turn_output_tokens;
             let base_total = self.app.input_tokens + self.app.output_tokens;
             // token_count should reflect the highest known total
@@ -1157,7 +1146,7 @@ impl TuiState {
         // 2.5. Render the bottom composer. The text buffer remains app.input for
         // history/submit compatibility, but input UI ownership is centralized here.
         {
-            self.composer.mode_label = self.turn_interaction.label();
+            self.composer.mode_label = self.app.turn_interaction.label();
             let pending_resources = self.app.pending_resources.len();
             let degraded = {
                 let _guard = self.render_profiler.guard("composer");
@@ -1730,7 +1719,6 @@ impl TuiState {
         // 4. Text-editing keys → direct to textarea (bypass keybind engine)
         if self.is_textarea_key(&key) {
             self.app.input.input(key);
-            self.wrap_input_to_width();
             self.set_focus_target(FocusTarget::Input);
             // BUG 1 FIX: Refresh suggestions from app.input text, not prompt's stale textarea
             let text = self.input_text();
@@ -1749,7 +1737,6 @@ impl TuiState {
                 || key.modifiers.contains(KeyModifiers::ALT)
             {
                 self.app.input.insert_newline();
-                self.wrap_input_to_width();
                 return ProcessedKey::Nothing;
             }
             if self.prompt.suggestions_visible() {
@@ -1777,10 +1764,12 @@ impl TuiState {
                 }
             }
             // Non-empty input → submit
-            let text = self.app.input.lines().join("\n");
-            if text.trim().is_empty() {
+            let draft = self.app.input.lines().join("\n");
+            let Some(text) =
+                crate::components::composer::model::ComposerModel::new(draft).submit_snapshot()
+            else {
                 return ProcessedKey::Nothing;
-            }
+            };
             if self.try_open_sidebar_for_panel_command(text.trim()) {
                 self.replace_input_text("");
                 return ProcessedKey::Nothing;
@@ -1808,7 +1797,6 @@ impl TuiState {
         // 5.5 Ctrl+J: insert newline (Ctrl+Enter maps to Ctrl+J on Linux terminals)
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('j') {
             self.app.input.insert_newline();
-            self.wrap_input_to_width();
             return ProcessedKey::Nothing;
         }
 
@@ -1829,7 +1817,7 @@ impl TuiState {
                 self.pending_quit = false;
                 return ProcessedKey::Nothing;
             }
-            if self.turn_interaction.is_active() {
+            if self.app.turn_is_active() {
                 if self.pending_cancel {
                     self.pending_cancel = false;
                     return ProcessedKey::Cancel;
@@ -1870,7 +1858,7 @@ impl TuiState {
             return ProcessedKey::Nothing;
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            if self.turn_interaction.is_active() {
+            if self.app.turn_is_active() {
                 // Ctrl+C during active turn: cancel
                 if self.pending_cancel {
                     self.pending_cancel = false;
@@ -1913,7 +1901,6 @@ impl TuiState {
                 }
                 None => {}
             }
-            self.wrap_input_to_width();
             return ProcessedKey::Nothing;
         }
 
@@ -2000,19 +1987,6 @@ impl TuiState {
         self.app.input = input;
     }
 
-    /// Keep user-authored input structurally intact.
-    ///
-    /// `tui-textarea` owns cursor/viewport rendering.  The old implementation
-    /// rewrote a long visual line into literal `\n` bytes and moved the cursor
-    /// to the end after every edit; that corrupted pasted prompts and made
-    /// mid-line editing unpredictable.  Visual layout must never mutate the
-    /// submitted payload.
-    fn wrap_input_to_width(&mut self) {
-        // Intentionally empty; see the contract above.  Keeping the helper
-        // lets all edit paths document that they considered layout without
-        // reintroducing payload rewriting.
-    }
-
     fn focus_for_current_surface(&self) -> FocusTarget {
         if self.command_palette.is_open() {
             FocusTarget::CommandPalette
@@ -2024,7 +1998,7 @@ impl TuiState {
             FocusTarget::TopicPanel(topic)
         } else if self.layout_state.sidebar_visible {
             FocusTarget::Sidebar
-        } else if self.activity_panel_visible || self.turn_interaction.is_active() {
+        } else if self.activity_panel_visible || self.app.turn_is_active() {
             FocusTarget::Activity
         } else if !self.app.input.is_empty() {
             FocusTarget::Input
@@ -4721,8 +4695,8 @@ mod tests {
         assert_eq!(state.timeline_len(), 2);
 
         // DerefMut works for direct field access
-        state.is_loading = true;
-        assert!(state.is_loading);
+        state.apply_event(CowdEvent::TurnStarted);
+        assert!(state.app.turn_is_active());
     }
 
     #[test]
@@ -4955,7 +4929,10 @@ mod tests {
         let before = state.input_text();
         let cursor_before = state.app.input.cursor();
 
-        state.wrap_input_to_width();
+        let _layout = crate::components::composer::layout::ComposerLayout::from_textarea(
+            &state.app.input,
+            state.last_terminal_width,
+        );
 
         assert_eq!(state.input_text(), before);
         assert_eq!(state.app.input.cursor(), cursor_before);

@@ -67,6 +67,35 @@ pub struct ProjectContext {
     pub instruction_files: Vec<ContextFile>,
 }
 
+/// Immutable product identity placed at the beginning of every Runtime-owned
+/// system prompt.  It is deliberately a value, rather than an incidental
+/// string assembled by individual entry points, so a surface/provider cannot
+/// accidentally replace Cowd's identity with its own branding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CowdIdentityContract {
+    version: &'static str,
+}
+
+impl Default for CowdIdentityContract {
+    fn default() -> Self {
+        Self {
+            version: COWD_IDENTITY_CONTRACT_VERSION,
+        }
+    }
+}
+
+impl CowdIdentityContract {
+    #[must_use]
+    pub const fn version(&self) -> &'static str {
+        self.version
+    }
+
+    #[must_use]
+    pub fn stable_head(&self, has_output_style: bool) -> String {
+        get_simple_intro_section_with_contract(self, has_output_style)
+    }
+}
+
 impl ProjectContext {
     pub fn discover(
         cwd: impl Into<PathBuf>,
@@ -101,6 +130,7 @@ impl ProjectContext {
 /// the context runtime as labelled, non-system packets.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SystemPromptBuilder {
+    identity_contract: CowdIdentityContract,
     output_style_name: Option<String>,
     output_style_prompt: Option<String>,
     os_name: Option<String>,
@@ -114,6 +144,23 @@ impl SystemPromptBuilder {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Replaces the versioned Cowd identity only with another explicit Cowd
+    /// contract.  Source guidance and project context intentionally have no
+    /// API that can occupy this stable-head position.
+    #[must_use]
+    pub fn with_identity_contract(mut self, identity_contract: CowdIdentityContract) -> Self {
+        self.identity_contract = identity_contract;
+        self
+    }
+
+    /// Adds surface-specific guidance after the immutable product/system
+    /// sections.  This is presentation guidance, not an alternative system
+    /// identity.
+    #[must_use]
+    pub fn with_source_guidance(self, guidance: impl Into<String>) -> Self {
+        self.append_section(guidance)
     }
 
     #[must_use]
@@ -151,7 +198,10 @@ impl SystemPromptBuilder {
     #[must_use]
     pub fn build(&self) -> Vec<String> {
         let mut sections = Vec::new();
-        sections.push(get_simple_intro_section(self.output_style_name.is_some()));
+        sections.push(
+            self.identity_contract
+                .stable_head(self.output_style_name.is_some()),
+        );
         if let (Some(name), Some(prompt)) = (&self.output_style_name, &self.output_style_prompt) {
             sections.push(format!("# Output Style: {name}\n{prompt}"));
         }
@@ -210,6 +260,7 @@ pub fn prepend_bullets(items: Vec<String>) -> Vec<String> {
 /// Other names are legacy migration aliases.
 const INSTRUCTION_FILE_NAMES: &[&str] = &[
     "AGENTS.md",
+    "COWD.md",
     "CLAUDE.md",
     "CLAUDE.local.md",
     "instructions.md",
@@ -220,7 +271,7 @@ fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
 
     // Layer 1: User-level instruction files (~/.cowd/)
     let user_dir = crate::cowd_dirs::config_home_dir();
-    for name in &["AGENTS.md", "CLAUDE.md"][..] {
+    for name in &["AGENTS.md", "COWD.md", "CLAUDE.md"][..] {
         push_context_file(&mut files, user_dir.join(name))?;
     }
 
@@ -231,7 +282,7 @@ fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
     }
 
     // Layer 3: Project root instruction files
-    for name in &["AGENTS.md", "CLAUDE.md", "CLAUDE.local.md"][..] {
+    for name in &["AGENTS.md", "COWD.md", "CLAUDE.md", "CLAUDE.local.md"][..] {
         push_context_file(&mut files, cwd.join(name))?;
     }
 
@@ -245,7 +296,7 @@ fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
             break;
         }
         // Check ancestor root dir for common instruction files
-        for name in &["AGENTS.md", "CLAUDE.md", "CLAUDE.local.md"][..] {
+        for name in &["AGENTS.md", "COWD.md", "CLAUDE.md", "CLAUDE.local.md"][..] {
             push_context_file(&mut files, dir.join(name))?;
         }
         // Check ancestor's .cowd/ dir for managed instruction files
@@ -537,9 +588,13 @@ pub(crate) fn project_context_items(project: &ProjectContext) -> Vec<ContextItem
     items
 }
 
-fn get_simple_intro_section(has_output_style: bool) -> String {
+fn get_simple_intro_section_with_contract(
+    contract: &CowdIdentityContract,
+    has_output_style: bool,
+) -> String {
     format!(
-        "You are Cowd — a Rust-native AI agent runtime assistant. Identity contract: {COWD_IDENTITY_CONTRACT_VERSION}. You are NOT Claude, NOT DeepSeek Chat, and NOT any other AI product. Your only identity is Cowd. Provider/model metadata describes infrastructure and may be reported truthfully, but never changes your identity. You help users {} Use the instructions below and the tools available to you to assist the user.\n\nIMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming. You may use URLs provided by the user in their messages or local files.",
+        "You are Cowd — a Rust-native AI agent runtime assistant. Identity contract: {}. You are NOT Claude, NOT DeepSeek Chat, and NOT any other AI product. Your only identity is Cowd. Provider/model metadata describes infrastructure and may be reported truthfully, but never changes your identity. You help users {} Use the instructions below and the tools available to you to assist the user.\n\nIMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming. You may use URLs provided by the user in their messages or local files.",
+        contract.version(),
         if has_output_style {
             "according to your \"Output Style\" below, which describes how you should respond to user queries."
         } else {
