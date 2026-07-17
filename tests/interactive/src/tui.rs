@@ -335,6 +335,18 @@ impl TuiSession {
             "{sequence:04}-{timestamp}-{}.json",
             sanitize(step_id)
         ));
+        let request_id = facts.get("request_id").cloned().unwrap_or(Value::Null);
+        let method = facts.get("method").cloned().unwrap_or(Value::Null);
+        let request_path = facts.get("path").cloned().unwrap_or(Value::Null);
+        let receipt_id = facts.get("receipt_id").cloned().unwrap_or(Value::Null);
+        let receipt_status = facts.get("receipt_status").cloned().unwrap_or(Value::Null);
+        let replayed = facts.get("replayed").cloned().unwrap_or(Value::Null);
+        let revision_before = facts.get("revision_before").cloned().unwrap_or(Value::Null);
+        let revision_after = facts.get("revision_after").cloned().unwrap_or(Value::Null);
+        let view_epoch = facts.get("view_epoch").cloned().unwrap_or(Value::Null);
+        let cursor = facts.get("cursor").cloned().unwrap_or(Value::Null);
+        let base_cursor = facts.get("base_cursor").cloned().unwrap_or(Value::Null);
+        let target_cursor = facts.get("target_cursor").cloned().unwrap_or(Value::Null);
         let document = json!({
             "schema_version": 1,
             "scenario": self.session,
@@ -346,18 +358,18 @@ impl TuiSession {
                 "height": self.height.get()
             },
             "acceptance_ids": acceptance_ids,
-            "request_id": Value::Null,
-            "method": Value::Null,
-            "path": Value::Null,
-            "receipt_id": Value::Null,
-            "receipt_status": Value::Null,
-            "replayed": Value::Null,
-            "revision_before": Value::Null,
-            "revision_after": Value::Null,
-            "view_epoch": Value::Null,
-            "cursor": Value::Null,
-            "base_cursor": Value::Null,
-            "target_cursor": Value::Null,
+            "request_id": request_id,
+            "method": method,
+            "path": request_path,
+            "receipt_id": receipt_id,
+            "receipt_status": receipt_status,
+            "replayed": replayed,
+            "revision_before": revision_before,
+            "revision_after": revision_after,
+            "view_epoch": view_epoch,
+            "cursor": cursor,
+            "base_cursor": base_cursor,
+            "target_cursor": target_cursor,
             "facts": facts
         });
         std::fs::write(&path, serde_json::to_vec_pretty(&document)?)?;

@@ -227,7 +227,7 @@ mfg_route_contracts! {
     AssignmentGet, "mfg.assignment.get", "GET", "/api/apps/mfg/assignments/:id", Contract, Read, MfgCapabilityRequirement::One { capability: C::Read }, Low, None, false, [Webui, TuiP0], Active;
     AssignmentCommand, "mfg.assignment.command", "POST", "/api/apps/mfg/assignments/:id/command", Contract, UpdateOrEffect, MfgCapabilityRequirement::PerAction, High, TargetAndConfirm, true, [Webui, TuiP0], Active;
     LiveStream, "mfg.live.stream", "GET", "/api/apps/mfg/live", Contract, Read, MfgCapabilityRequirement::One { capability: C::Read }, Low, None, false, [Webui, TuiP0], Active;
-    LiveSnapshot, "mfg.live.snapshot", "GET", "/api/apps/mfg/live/snapshot", Contract, Read, MfgCapabilityRequirement::One { capability: C::Read }, Low, None, false, [Webui, TuiP0], PlannedV545;
+    LiveSnapshot, "mfg.live.snapshot", "GET", "/api/apps/mfg/live/snapshot", Contract, Read, MfgCapabilityRequirement::One { capability: C::Read }, Low, None, false, [Webui, TuiP0], Active;
 }
 
 #[must_use]
@@ -276,4 +276,29 @@ pub fn mfg_tui_read_route_contracts() -> Vec<MfgRouteContract> {
         .into_iter()
         .filter(|route| route.class == MfgMutationClass::Read)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_event_flag_matches_successful_state_change_semantics() {
+        for route in mfg_route_contracts()
+            .into_iter()
+            .filter(|route| route.availability == MfgActionAvailability::Active)
+        {
+            let changes_state = !matches!(
+                route.class,
+                MfgMutationClass::Read | MfgMutationClass::Preview
+            );
+            assert_eq!(
+                route.emits_live_event,
+                changes_state,
+                "{} has inconsistent live-event metadata for {:?}",
+                route.route_id.as_str(),
+                route.class,
+            );
+        }
+    }
 }

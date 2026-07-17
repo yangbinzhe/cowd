@@ -1480,7 +1480,7 @@ mod tests {
             .into_iter()
             .filter(|route| route.availability == app_mfg_contract::MfgActionAvailability::Active)
             .collect::<Vec<_>>();
-        assert_eq!(active.len(), 103);
+        assert_eq!(active.len(), 104);
 
         for route in active {
             let path = openapi_path(&route.path);

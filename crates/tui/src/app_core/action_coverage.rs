@@ -290,9 +290,12 @@ mod tests {
         let panel = crate::components::mfg_operations_panel::MFG_PANEL_READ_ROUTE_IDS
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(routes.len(), 33);
+        assert_eq!(routes.len(), 34);
         assert_eq!(expected.len(), routes.len());
-        assert!(!routes.contains(&app_mfg_contract::MfgRouteId::LiveSnapshot));
+        assert!(routes.contains(&app_mfg_contract::MfgRouteId::LiveSnapshot));
+        assert!(GATEWAY_CLIENT.contains("mfg_live_snapshot"));
+        assert!(GATEWAY_CLIENT.contains("subscribe_mfg_live"));
+        assert!(MFG_STATE.contains("apply_live_envelope"));
         assert_eq!(panel, p0_expected);
         assert!(routes
             .iter()

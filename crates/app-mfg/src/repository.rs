@@ -19,14 +19,16 @@ use crate::{
     MfgAssignmentCommandInput, MfgCasePromotion, MfgCockpitProfile, MfgCockpitProjection,
     MfgCockpitReportDeliveryReceipt, MfgCockpitReportRequest, MfgCockpitReportSnapshot,
     MfgCockpitWidget, MfgCockpitWidgetProjection, MfgCommandReceipt, MfgCrossPlaneBridgeReceipt,
-    MfgDomainSeedResult, MfgForecastProjection, MfgForecastSignal, MfgIncident, MfgLiveProjection,
-    MfgLiveProjectionEvent, MfgMemoryCase, MfgOperationalAnalysis, MfgPlaybook, MfgSkillRun,
-    MfgWidgetDefinition, MfgWidgetInstance, MfgWorkflowGraph, MfgWorkflowGraphError,
+    MfgDomainSeedResult, MfgForecastProjection, MfgForecastSignal, MfgIncident, MfgLiveDeltaRead,
+    MfgLiveEpoch, MfgLiveProjectionEvent, MfgLiveSnapshotRead, MfgMemoryCase,
+    MfgOperationalAnalysis, MfgPlaybook, MfgSkillRun, MfgWidgetDefinition, MfgWidgetInstance,
+    MfgWorkflowGraph, MfgWorkflowGraphError,
 };
 
 use app_mfg_contract::{
-    MfgReportDeliveryReview, MfgReportDeliveryReviewDecision, MfgReportDeliveryReviewEffect,
-    MfgReportDeliveryReviewRerouteTarget, MfgReportDeliveryReviewStatus,
+    MfgLiveSnapshotStateV1, MfgReportDeliveryReview, MfgReportDeliveryReviewDecision,
+    MfgReportDeliveryReviewEffect, MfgReportDeliveryReviewRerouteTarget,
+    MfgReportDeliveryReviewStatus,
 };
 use matrix_core::{
     build_metric_compute_jobs, MatrixAttentionItem, MatrixChangeEvent, MatrixComputeJob,
@@ -728,7 +730,7 @@ impl MfgRepository {
             "cockpit",
             &format!("mfg:cockpit-profile:{profile_id}"),
             "profile.deleted",
-            serde_json::to_value(&profile)?,
+            serde_json::json!({"profile": profile}),
         )?;
         Ok(profile)
     }
@@ -987,16 +989,50 @@ impl MfgRepository {
         Ok(result)
     }
 
-    pub fn live_projection(
-        &self,
-        cursor: Option<u64>,
-        limit: usize,
-    ) -> Result<MfgLiveProjection, MfgRepositoryError> {
+    pub fn live_epoch(&self) -> Result<MfgLiveEpoch, MfgRepositoryError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        build_live_projection(&connection, cursor, limit)
+        load_live_epoch(&connection)
+    }
+
+    pub fn rotate_live_epoch(&self, reason: &str) -> Result<MfgLiveEpoch, MfgRepositoryError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        rotate_live_epoch(&transaction, reason)?;
+        let epoch = load_live_epoch(&transaction)?;
+        transaction.commit()?;
+        Ok(epoch)
+    }
+
+    pub fn live_snapshot_read(&self) -> Result<MfgLiveSnapshotRead, MfgRepositoryError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let snapshot = build_live_snapshot_read(&transaction)?;
+        transaction.commit()?;
+        Ok(snapshot)
+    }
+
+    pub fn live_delta_read(
+        &self,
+        cursor: u64,
+        limit: usize,
+    ) -> Result<MfgLiveDeltaRead, MfgRepositoryError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let delta = build_live_delta_read(&transaction, cursor, limit)?;
+        transaction.commit()?;
+        Ok(delta)
     }
 
     pub fn record_command_notifications(
@@ -1131,12 +1167,13 @@ impl MfgRepository {
         payload_digest: &str,
         response: &serde_json::Value,
     ) -> Result<app_mfg_contract::MfgReceiptV1, MfgRepositoryError> {
-        let connection = self
+        let mut connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        record_mutation_receipt(
-            &connection,
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let receipt = record_mutation_receipt(
+            &transaction,
             idempotency_key,
             actor_principal,
             action_id,
@@ -1145,7 +1182,9 @@ impl MfgRepository {
             result_revision,
             payload_digest,
             response,
-        )
+        )?;
+        transaction.commit()?;
+        Ok(receipt)
     }
 
     pub fn upsert_entity(&self, entity: &MatrixEntity) -> Result<MatrixEntity, MfgRepositoryError> {
@@ -1554,6 +1593,13 @@ impl MfgRepository {
             ],
         )?;
         upsert_attention(&connection, &attention)?;
+        append_projection_event(
+            &connection,
+            "data_compute",
+            &format!("matrix:fact:{}", fact.fact_id),
+            "fact.ingested",
+            serde_json::json!({"fact": fact}),
+        )?;
         Ok(attention)
     }
 
@@ -2822,6 +2868,19 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_mfg_projection_event_cursor
             ON mfg_projection_event(event_id);
 
+        CREATE TABLE IF NOT EXISTS mfg_live_epoch (
+            singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+            epoch_id TEXT NOT NULL,
+            contract_version TEXT NOT NULL,
+            schema_version INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            rotation_reason TEXT NOT NULL,
+            retention_low_cursor INTEGER NOT NULL,
+            retention_high_cursor INTEGER NOT NULL,
+            last_sweep_high_cursor INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS matrix_entity (
             entity_id TEXT PRIMARY KEY,
             entity_type TEXT NOT NULL,
@@ -3162,7 +3221,10 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
     )?;
     migrate_mfg_incident_workflow_column(connection)?;
     recover_interrupted_report_delivery_review_effects(connection)?;
-    migrate_mfg_command_receipts(connection)
+    migrate_mfg_command_receipts(connection)?;
+    migrate_mfg_live_epoch_sweep_cursor(connection)?;
+    ensure_live_epoch(connection)?;
+    Ok(())
 }
 
 fn recover_interrupted_report_delivery_review_effects(
@@ -3189,6 +3251,23 @@ fn migrate_mfg_incident_workflow_column(connection: &Connection) -> rusqlite::Re
     {
         connection.execute_batch(
             "ALTER TABLE mfg_incident RENAME COLUMN agent_graph_id TO workflow_graph_id;",
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_mfg_live_epoch_sweep_cursor(connection: &Connection) -> rusqlite::Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(mfg_live_epoch)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns
+        .iter()
+        .any(|column| column == "last_sweep_high_cursor")
+    {
+        connection.execute_batch(
+            "ALTER TABLE mfg_live_epoch
+             ADD COLUMN last_sweep_high_cursor INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
     Ok(())
@@ -3464,6 +3543,13 @@ fn persist_workflow_graph(
         )?
     };
     if changed == 1 {
+        append_projection_event(
+            connection,
+            "workflow",
+            &format!("mfg:workflow:{}", graph.workflow_id),
+            "workflow.updated",
+            serde_json::json!({"workflow": graph}),
+        )?;
         return Ok(());
     }
     Err(MfgRepositoryError::WorkflowRevisionConflict {
@@ -3555,7 +3641,7 @@ fn upsert_cockpit_profile(
         "cockpit",
         &format!("mfg:cockpit-profile:{}", profile.profile_id),
         "profile.upserted",
-        serde_json::to_value(&profile)?,
+        serde_json::json!({"profile": profile}),
     )?;
     Ok(profile)
 }
@@ -3824,6 +3910,16 @@ fn insert_cockpit_report(
             report.created_at.to_rfc3339(),
         ],
     )?;
+    append_projection_event(
+        connection,
+        "report",
+        &format!("mfg:cockpit-report:{}", report.report_id),
+        "report.updated",
+        serde_json::json!({
+            "report": report,
+            "profile": find_cockpit_profile(connection, &report.profile_id)?,
+        }),
+    )?;
     Ok(())
 }
 
@@ -3978,7 +4074,11 @@ fn create_report_delivery_review(
         "review",
         &format!("mfg:report-review:{}", review.review_id),
         "report_review.requested",
-        serde_json::to_value(&review)?,
+        serde_json::json!({
+            "review": review,
+            "report": report,
+            "profile": find_cockpit_profile(&transaction, &report.profile_id)?,
+        }),
     )?;
     transaction.commit()?;
     Ok(review)
@@ -4322,6 +4422,12 @@ fn activate_report_delivery_review_decision(
                     now.to_rfc3339(),
                 ],
             )?;
+            let report = find_cockpit_report(&transaction, &current.report_id)?;
+            let profile = report
+                .as_ref()
+                .map(|report| find_cockpit_profile(&transaction, &report.profile_id))
+                .transpose()?
+                .flatten();
             append_projection_event(
                 &transaction,
                 "review",
@@ -4329,6 +4435,9 @@ fn activate_report_delivery_review_decision(
                 "report_review.effect_queued",
                 serde_json::json!({
                     "review_id": current.review_id,
+                    "review": current,
+                    "report": report,
+                    "profile": profile,
                     "decision": decision,
                     "effect_key": current.effect_key,
                 }),
@@ -4625,6 +4734,12 @@ fn persist_report_delivery_review_transition_in_transaction(
         idempotency_key,
         detail,
     )?;
+    let report = find_cockpit_report(connection, &current.report_id)?;
+    let profile = report
+        .as_ref()
+        .map(|report| find_cockpit_profile(connection, &report.profile_id))
+        .transpose()?
+        .flatten();
     append_projection_event(
         connection,
         "review",
@@ -4632,6 +4747,9 @@ fn persist_report_delivery_review_transition_in_transaction(
         "report_review.transitioned",
         serde_json::json!({
             "review_id": current.review_id,
+            "review": next,
+            "report": report,
+            "profile": profile,
             "from_status": current.status,
             "to_status": next.status,
             "action": action,
@@ -5243,7 +5361,219 @@ fn append_projection_event(
         "INSERT INTO mfg_projection_event (domain, subject_ref, event_type, event_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![domain, subject_ref, event_type, serde_json::to_string(&event)?, Utc::now().to_rfc3339()],
     )?;
-    Ok(connection.last_insert_rowid() as u64)
+    let cursor = connection.last_insert_rowid() as u64;
+    connection.execute(
+        "UPDATE mfg_live_epoch
+         SET retention_high_cursor = ?1
+         WHERE singleton_id = 1",
+        params![cursor],
+    )?;
+    compact_live_events_if_due(connection)?;
+    Ok(cursor)
+}
+
+fn ensure_live_epoch(connection: &Connection) -> rusqlite::Result<()> {
+    let high = connection.query_row(
+        "SELECT COALESCE(MAX(event_id), 0) FROM mfg_projection_event",
+        [],
+        |row| row.get::<_, u64>(0),
+    )?;
+    let oldest = connection.query_row(
+        "SELECT COALESCE(MIN(event_id), 0) FROM mfg_projection_event",
+        [],
+        |row| row.get::<_, u64>(0),
+    )?;
+    let now = Utc::now().to_rfc3339();
+    connection.execute(
+        "INSERT OR IGNORE INTO mfg_live_epoch (
+            singleton_id, epoch_id, contract_version, schema_version,
+            created_at, rotation_reason, retention_low_cursor,
+            retention_high_cursor, updated_at
+         ) VALUES (1, ?1, ?2, 1, ?3, 'initial', ?4, ?5, ?3)",
+        params![
+            format!("mfg-live-epoch-{}", uuid::Uuid::new_v4()),
+            app_mfg_contract::MFG_CONTRACT_VERSION,
+            now,
+            oldest.saturating_sub(1),
+            high,
+        ],
+    )?;
+    let stored = connection.query_row(
+        "SELECT contract_version, schema_version, retention_high_cursor
+         FROM mfg_live_epoch WHERE singleton_id = 1",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, u64>(2)?,
+            ))
+        },
+    )?;
+    let rotation_reason = if stored.0 != app_mfg_contract::MFG_CONTRACT_VERSION || stored.1 != 1 {
+        Some("incompatible_contract_or_schema")
+    } else if stored.2 > high {
+        Some("event_log_rewritten")
+    } else {
+        None
+    };
+    if let Some(reason) = rotation_reason {
+        connection.execute(
+            "UPDATE mfg_live_epoch
+             SET epoch_id = ?1, contract_version = ?2, schema_version = 1,
+                 created_at = ?3, rotation_reason = ?4,
+                 retention_low_cursor = ?5, retention_high_cursor = ?6,
+                 last_sweep_high_cursor = 0,
+                 updated_at = ?3
+             WHERE singleton_id = 1",
+            params![
+                format!("mfg-live-epoch-{}", uuid::Uuid::new_v4()),
+                app_mfg_contract::MFG_CONTRACT_VERSION,
+                now,
+                reason,
+                oldest.saturating_sub(1),
+                high,
+            ],
+        )?;
+        return Ok(());
+    }
+    connection.execute(
+        "UPDATE mfg_live_epoch
+         SET retention_high_cursor = CASE
+             WHEN retention_high_cursor < ?1 THEN ?1
+             ELSE retention_high_cursor
+         END
+         WHERE singleton_id = 1",
+        params![high],
+    )?;
+    Ok(())
+}
+
+fn rotate_live_epoch(connection: &Connection, reason: &str) -> Result<(), MfgRepositoryError> {
+    let high = connection.query_row(
+        "SELECT COALESCE(MAX(event_id), 0) FROM mfg_projection_event",
+        [],
+        |row| row.get::<_, u64>(0),
+    )?;
+    let oldest = connection.query_row(
+        "SELECT COALESCE(MIN(event_id), 0) FROM mfg_projection_event",
+        [],
+        |row| row.get::<_, u64>(0),
+    )?;
+    let now = Utc::now().to_rfc3339();
+    connection.execute(
+        "UPDATE mfg_live_epoch
+         SET epoch_id = ?1, contract_version = ?2, schema_version = 1,
+             created_at = ?3, rotation_reason = ?4,
+             retention_low_cursor = ?5, retention_high_cursor = ?6,
+             last_sweep_high_cursor = 0,
+             updated_at = ?3
+         WHERE singleton_id = 1",
+        params![
+            format!("mfg-live-epoch-{}", uuid::Uuid::new_v4()),
+            app_mfg_contract::MFG_CONTRACT_VERSION,
+            now,
+            reason,
+            oldest.saturating_sub(1),
+            high,
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_live_epoch(connection: &Connection) -> Result<MfgLiveEpoch, MfgRepositoryError> {
+    connection
+        .query_row(
+            "SELECT epoch_id, contract_version, schema_version, created_at,
+                    rotation_reason, retention_low_cursor,
+                    retention_high_cursor, updated_at
+             FROM mfg_live_epoch WHERE singleton_id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u32>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, u64>(5)?,
+                    row.get::<_, u64>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            },
+        )
+        .map_err(MfgRepositoryError::from)
+        .and_then(
+            |(
+                epoch_id,
+                contract_version,
+                schema_version,
+                created_at,
+                rotation_reason,
+                retention_low_cursor,
+                retention_high_cursor,
+                updated_at,
+            )| {
+                Ok(MfgLiveEpoch {
+                    epoch_id,
+                    contract_version,
+                    schema_version,
+                    created_at: parse_rfc3339_utc(&created_at)?,
+                    rotation_reason,
+                    retention_low_cursor,
+                    retention_high_cursor,
+                    updated_at: parse_rfc3339_utc(&updated_at)?,
+                })
+            },
+        )
+}
+
+fn compact_live_events_if_due(connection: &Connection) -> Result<(), MfgRepositoryError> {
+    let (events_since_sweep, due) = connection.query_row(
+        "SELECT retention_high_cursor - last_sweep_high_cursor,
+                julianday('now') - julianday(updated_at) >= (5.0 / 1440.0)
+         FROM mfg_live_epoch WHERE singleton_id = 1",
+        [],
+        |row| Ok((row.get::<_, u64>(0)?, row.get::<_, bool>(1)?)),
+    )?;
+    if events_since_sweep <= 60_000 && !due {
+        return Ok(());
+    }
+    let keep_from = connection
+        .query_row(
+            "SELECT event_id FROM mfg_projection_event
+             ORDER BY event_id DESC LIMIT 1 OFFSET 49999",
+            [],
+            |row| row.get::<_, u64>(0),
+        )
+        .optional()?;
+    if let Some(keep_from) = keep_from {
+        connection.execute(
+            "DELETE FROM mfg_projection_event
+             WHERE event_id < ?1
+               AND julianday(created_at) < julianday('now', '-7 days')",
+            params![keep_from],
+        )?;
+    }
+    let high = connection.query_row(
+        "SELECT COALESCE(MAX(event_id), 0) FROM mfg_projection_event",
+        [],
+        |row| row.get::<_, u64>(0),
+    )?;
+    let oldest = connection.query_row(
+        "SELECT COALESCE(MIN(event_id), 0) FROM mfg_projection_event",
+        [],
+        |row| row.get::<_, u64>(0),
+    )?;
+    connection.execute(
+        "UPDATE mfg_live_epoch
+         SET retention_low_cursor = ?1, retention_high_cursor = ?2,
+             last_sweep_high_cursor = ?2,
+             updated_at = ?3
+         WHERE singleton_id = 1",
+        params![oldest.saturating_sub(1), high, Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
 }
 
 fn find_command_receipt(
@@ -5823,6 +6153,13 @@ fn record_mutation_receipt(
             now.to_rfc3339(),
         ],
     )?;
+    append_projection_event(
+        connection,
+        "receipt",
+        &format!("mfg:receipt:{}", receipt.receipt_id),
+        "receipt.completed",
+        serde_json::json!({"receipt": receipt}),
+    )?;
     Ok(receipt)
 }
 
@@ -6172,7 +6509,7 @@ fn record_command_notifications(
         &receipt.domain,
         &receipt.subject_ref,
         "notification.delivery_observed",
-        serde_json::to_value(&receipt)?,
+        serde_json::json!({"receipt": receipt}),
     )?;
     Ok(receipt)
 }
@@ -6269,7 +6606,7 @@ fn upsert_alert_rule(
         "alert",
         &format!("mfg:alert-rule:{}", rule.rule_id),
         "alert_rule.upserted",
-        serde_json::to_value(&rule)?,
+        serde_json::json!({"rule": rule}),
     )?;
     Ok(rule)
 }
@@ -6350,7 +6687,7 @@ fn upsert_alert_subscription(
         "alert",
         &format!("mfg:alert-subscription:{}", subscription.subscription_id),
         "alert_subscription.upserted",
-        serde_json::to_value(&subscription)?,
+        serde_json::json!({"subscription": subscription}),
     )?;
     Ok(subscription)
 }
@@ -6444,7 +6781,10 @@ fn materialize_alert_occurrences(
             "alert",
             &format!("mfg:alert-occurrence:{}", occurrence.occurrence_id),
             "alert.opened",
-            serde_json::to_value(&occurrence)?,
+            serde_json::json!({
+                "occurrence": occurrence,
+                "owner_ref": rule.owner_ref,
+            }),
         )?;
     }
     Ok(())
@@ -6834,7 +7174,7 @@ fn upsert_assignment(
         "assignment",
         &format!("mfg:assignment:{}", assignment.assignment_id),
         "assignment.upserted",
-        serde_json::to_value(&assignment)?,
+        serde_json::json!({"assignment": assignment}),
     )?;
     Ok(assignment)
 }
@@ -7213,81 +7553,301 @@ fn assignment_kind_from_ref(reference: &str) -> Option<&'static str> {
         .find(|kind| reference.starts_with(&format!("{kind}:")))
 }
 
-fn build_live_projection(
+fn build_live_snapshot_read(
     connection: &Connection,
-    cursor: Option<u64>,
-    limit: usize,
-) -> Result<MfgLiveProjection, MfgRepositoryError> {
-    let latest = connection.query_row(
+) -> Result<MfgLiveSnapshotRead, MfgRepositoryError> {
+    let epoch = load_live_epoch(connection)?;
+    let high_cursor = connection.query_row(
         "SELECT COALESCE(MAX(event_id), 0) FROM mfg_projection_event",
         [],
         |row| row.get::<_, u64>(0),
     )?;
-    let oldest = connection.query_row(
-        "SELECT COALESCE(MIN(event_id), 0) FROM mfg_projection_event",
+    let state = MfgLiveSnapshotStateV1 {
+        cockpit: serde_json::json!({
+            "profiles": json_column_rows(
+                connection,
+                "SELECT profile_json FROM mfg_cockpit_profile ORDER BY updated_at DESC",
+            )?,
+        }),
+        alerts: serde_json::json!({
+            "rules": json_column_rows(
+                connection,
+                "SELECT rule_json FROM mfg_alert_rule ORDER BY updated_at DESC",
+            )?,
+            "subscriptions": json_column_rows(
+                connection,
+                "SELECT subscription_json FROM mfg_alert_subscription ORDER BY updated_at DESC",
+            )?,
+            "occurrences": json_column_rows(
+                connection,
+                "SELECT occurrence_json FROM mfg_alert_occurrence ORDER BY updated_at DESC",
+            )?,
+        }),
+        assignments: serde_json::json!({
+            "items": json_column_rows(
+                connection,
+                "SELECT assignment_json FROM mfg_assignment ORDER BY updated_at DESC",
+            )?,
+        }),
+        incidents: serde_json::json!({
+            "items": json_column_rows(
+                connection,
+                "SELECT incident_json FROM mfg_incident ORDER BY updated_at DESC",
+            )?,
+            "workflows": json_column_rows(
+                connection,
+                "SELECT graph_json FROM mfg_workflow_graph ORDER BY updated_at DESC",
+            )?,
+            "analyses": json_column_rows(
+                connection,
+                "SELECT analysis_json FROM mfg_operational_analysis ORDER BY created_at DESC",
+            )?,
+            "memory_cases": json_column_rows(
+                connection,
+                "SELECT memory_case_json FROM mfg_memory_case ORDER BY created_at DESC",
+            )?,
+            "playbooks": json_column_rows(
+                connection,
+                "SELECT playbook_json FROM mfg_playbook ORDER BY updated_at DESC",
+            )?,
+        }),
+        executions: serde_json::json!({
+            "actions": json_column_rows(
+                connection,
+                "SELECT execution_json FROM mfg_action_execution ORDER BY updated_at DESC",
+            )?,
+            "skills": json_column_rows(
+                connection,
+                "SELECT execution_json FROM mfg_skill_execution ORDER BY updated_at DESC",
+            )?,
+        }),
+        reports: serde_json::json!({
+            "items": json_column_rows(
+                connection,
+                "SELECT report_json FROM mfg_cockpit_report ORDER BY created_at DESC",
+            )?,
+        }),
+        reviews: serde_json::json!({
+            "items": json_column_rows(
+                connection,
+                "SELECT review_json FROM mfg_report_delivery_review ORDER BY updated_at DESC",
+            )?,
+        }),
+        receipts: serde_json::json!({
+            "commands": json_column_rows(
+                connection,
+                "SELECT receipt_json FROM mfg_command_receipt ORDER BY created_at DESC",
+            )?,
+            "mutations": mutation_receipt_rows(connection)?,
+        }),
+        data_compute: serde_json::json!({
+            "entities": json_column_rows(
+                connection,
+                "SELECT entity_json FROM matrix_entity ORDER BY updated_at DESC",
+            )?,
+            "relations": json_column_rows(
+                connection,
+                "SELECT relation_json FROM matrix_relation ORDER BY updated_at DESC",
+            )?,
+            "facts": serde_json::to_value(list_facts(connection, i64::MAX as usize)?)?,
+            "attention": json_column_rows(
+                connection,
+                "SELECT attention_json FROM matrix_attention_item ORDER BY updated_at DESC",
+            )?,
+            "evidence": json_column_rows(
+                connection,
+                "SELECT packet_json FROM matrix_evidence_packet ORDER BY created_at DESC",
+            )?,
+            "quality_gates": json_column_rows(
+                connection,
+                "SELECT gate_json FROM matrix_quality_gate ORDER BY created_at DESC",
+            )?,
+            "metric_definitions": json_column_rows(
+                connection,
+                "SELECT definition_json FROM matrix_metric_definition ORDER BY updated_at DESC",
+            )?,
+            "metric_dependencies": json_column_rows(
+                connection,
+                "SELECT dependency_json FROM matrix_metric_dependency ORDER BY updated_at DESC",
+            )?,
+            "metric_states": json_column_rows(
+                connection,
+                "SELECT state_json FROM matrix_metric_state ORDER BY computed_at DESC",
+            )?,
+            "metric_snapshots": json_column_rows(
+                connection,
+                "SELECT snapshot_json FROM matrix_metric_snapshot ORDER BY created_at DESC",
+            )?,
+            "watermarks": json_column_rows(
+                connection,
+                "SELECT watermark_json FROM matrix_data_plane_watermark ORDER BY updated_at DESC",
+            )?,
+            "jobs": json_column_rows(
+                connection,
+                "SELECT job_json FROM matrix_compute_job ORDER BY updated_at DESC",
+            )?,
+            "changes": json_column_rows(
+                connection,
+                "SELECT change_json FROM matrix_change_event ORDER BY detected_at DESC",
+            )?,
+            "source_packs": json_column_rows(
+                connection,
+                "SELECT source_pack_json FROM matrix_source_pack ORDER BY updated_at DESC",
+            )?,
+            "connector_runs": json_column_rows(
+                connection,
+                "SELECT run_json FROM matrix_connector_run ORDER BY updated_at DESC",
+            )?,
+            "ontology_packs": json_column_rows(
+                connection,
+                "SELECT pack_json FROM matrix_ontology_pack ORDER BY updated_at DESC",
+            )?,
+            "entity_match_candidates": json_column_rows(
+                connection,
+                "SELECT candidate_json FROM matrix_entity_match_candidate ORDER BY created_at DESC",
+            )?,
+            "entity_conflict_decisions": json_column_rows(
+                connection,
+                "SELECT decision_json FROM matrix_entity_conflict_decision ORDER BY decided_at DESC",
+            )?,
+        }),
+    };
+    Ok(MfgLiveSnapshotRead {
+        epoch,
+        high_cursor,
+        state,
+    })
+}
+
+fn build_live_delta_read(
+    connection: &Connection,
+    cursor: u64,
+    limit: usize,
+) -> Result<MfgLiveDeltaRead, MfgRepositoryError> {
+    let epoch = load_live_epoch(connection)?;
+    let high_cursor = connection.query_row(
+        "SELECT COALESCE(MAX(event_id), 0) FROM mfg_projection_event",
         [],
         |row| row.get::<_, u64>(0),
     )?;
-    if cursor.is_none() {
-        return Ok(MfgLiveProjection {
-            kind: "snapshot".to_string(),
-            cursor: latest,
-            recoverable: true,
-            snapshot: serde_json::json!({
-                "cockpit_profiles": list_cockpit_profiles(connection, None, 100)?,
-                "alert_rules": list_alert_rules(connection, None, 100)?,
-                "alerts": list_alert_occurrences(connection, None, 100)?,
-                "assignments": list_assignments(connection, None, None, 100)?,
-                "incidents": list_incidents(connection, 100)?,
-                "workflows": list_workflow_graphs(connection, 100)?,
-            }),
-            events: Vec::new(),
-            resync_reason: None,
-        });
-    }
-    let cursor = cursor.unwrap_or(0);
-    if cursor > latest || (oldest > 0 && cursor.saturating_add(1) < oldest) {
-        return Ok(MfgLiveProjection {
-            kind: "resync".to_string(),
-            cursor: latest,
-            recoverable: true,
-            snapshot: Value::Null,
-            events: Vec::new(),
-            resync_reason: Some("cursor is outside the retained event window".to_string()),
-        });
-    }
-    let mut statement = connection.prepare("SELECT event_id, event_type, subject_ref, event_json, created_at FROM mfg_projection_event WHERE event_id > ?1 ORDER BY event_id ASC LIMIT ?2")?;
-    let rows = statement.query_map(params![cursor as i64, limit.clamp(1, 500) as i64], |row| {
-        Ok((
-            row.get::<_, u64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-        ))
-    })?;
-    let events = rows
-        .map(|row| {
-            let (event_cursor, event_type, subject_ref, json, created_at) = row?;
-            let value: Value = serde_json::from_str(&json)?;
-            Ok(MfgLiveProjectionEvent {
-                cursor: event_cursor,
-                event_type,
-                subject_ref,
-                payload: value.get("payload").cloned().unwrap_or(Value::Null),
-                created_at: parse_rfc3339_utc(&created_at)?,
+    let resync_reason = if cursor > high_cursor {
+        Some("cursor_ahead_of_retained_log".to_string())
+    } else if cursor < epoch.retention_low_cursor {
+        Some("cursor_below_retention_low_watermark".to_string())
+    } else {
+        None
+    };
+    let events = if resync_reason.is_some() {
+        Vec::new()
+    } else {
+        let mut statement = connection.prepare(
+            "SELECT event_id, event_type, subject_ref, event_json, created_at
+             FROM mfg_projection_event
+             WHERE event_id > ?1
+             ORDER BY event_id ASC
+             LIMIT ?2",
+        )?;
+        statement
+            .query_map(params![cursor, limit.clamp(1, 500)], |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .map(|row| {
+                let (cursor, event_type, subject_ref, event_json, created_at) = row?;
+                let event_json: Value = serde_json::from_str(&event_json)?;
+                Ok(MfgLiveProjectionEvent {
+                    cursor,
+                    event_type,
+                    subject_ref,
+                    payload: event_json.get("payload").cloned().unwrap_or(Value::Null),
+                    created_at: parse_rfc3339_utc(&created_at)?,
+                })
             })
-        })
-        .collect::<Result<Vec<_>, MfgRepositoryError>>()?;
-    let next_cursor = events.last().map_or(cursor, |event| event.cursor);
-    Ok(MfgLiveProjection {
-        kind: "delta".to_string(),
-        cursor: next_cursor,
-        recoverable: true,
-        snapshot: Value::Null,
+            .collect::<Result<Vec<_>, MfgRepositoryError>>()?
+    };
+    Ok(MfgLiveDeltaRead {
+        epoch,
+        base_cursor: cursor,
+        high_cursor,
         events,
-        resync_reason: None,
+        resync_reason,
     })
+}
+
+fn json_column_rows(connection: &Connection, sql: &str) -> Result<Vec<Value>, MfgRepositoryError> {
+    let mut statement = connection.prepare(sql)?;
+    statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .map(|row| {
+            let json = row?;
+            serde_json::from_str(&json).map_err(MfgRepositoryError::from)
+        })
+        .collect()
+}
+
+fn mutation_receipt_rows(connection: &Connection) -> Result<Vec<Value>, MfgRepositoryError> {
+    let mut statement = connection.prepare(
+        "SELECT receipt_id, idempotency_key, actor_principal, action_id,
+                resource_ref, expected_revision, result_revision, payload_digest,
+                status, response_json, contract_version, created_at, updated_at
+         FROM mfg_mutation_receipt ORDER BY updated_at DESC",
+    )?;
+    statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<u64>>(5)?,
+                row.get::<_, Option<u64>>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
+                row.get::<_, String>(11)?,
+                row.get::<_, String>(12)?,
+            ))
+        })?
+        .map(|row| {
+            let (
+                receipt_id,
+                idempotency_key,
+                actor_principal,
+                action_id,
+                resource_ref,
+                expected_revision,
+                result_revision,
+                payload_digest,
+                status,
+                response_json,
+                contract_version,
+                created_at,
+                updated_at,
+            ) = row?;
+            Ok(serde_json::json!({
+                "receipt_id": receipt_id,
+                "idempotency_key": idempotency_key,
+                "actor_principal": actor_principal,
+                "action_id": action_id,
+                "resource_ref": resource_ref,
+                "expected_revision": expected_revision,
+                "result_revision": result_revision,
+                "payload_digest": payload_digest,
+                "status": status,
+                "response": serde_json::from_str::<Value>(&response_json)?,
+                "contract_version": contract_version,
+                "created_at": created_at,
+                "updated_at": updated_at,
+            }))
+        })
+        .collect()
 }
 
 fn insert_ontology_pack(
@@ -7305,6 +7865,13 @@ fn insert_ontology_pack(
             serde_json::to_string(pack)?,
             Utc::now().to_rfc3339(),
         ],
+    )?;
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!("matrix:ontology:{}", pack.ontology_id),
+        "ontology.updated",
+        serde_json::json!({"ontology": pack}),
     )?;
     Ok(())
 }
@@ -7343,6 +7910,13 @@ fn insert_entity_match_candidate(
             candidate.created_at.to_rfc3339(),
         ],
     )?;
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!("matrix:entity-match:{}", candidate.candidate_id),
+        "entity.match_candidate_updated",
+        serde_json::json!({"entity_match_candidate": candidate}),
+    )?;
     Ok(())
 }
 
@@ -7378,6 +7952,13 @@ fn insert_entity_conflict_decision(
             serde_json::to_string(decision)?,
             decision.decided_at.to_rfc3339(),
         ],
+    )?;
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!("matrix:entity-conflict:{}", decision.decision_id),
+        "entity.conflict_decided",
+        serde_json::json!({"entity_conflict_decision": decision}),
     )?;
     Ok(())
 }
@@ -7443,6 +8024,13 @@ fn upsert_entity(
             ],
         )?;
     }
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!("matrix:entity:{}", entity.entity_id),
+        "entity.updated",
+        serde_json::json!({"entity": entity}),
+    )?;
     Ok(entity)
 }
 
@@ -7580,6 +8168,13 @@ fn upsert_relation(
             relation.updated_at.to_rfc3339(),
         ],
     )?;
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!("matrix:relation:{}", relation.relation_id),
+        "relation.updated",
+        serde_json::json!({"relation": relation}),
+    )?;
     Ok(relation)
 }
 
@@ -7701,6 +8296,13 @@ fn upsert_attention(
     for rule in list_alert_rules(connection, None, 500)? {
         materialize_alert_occurrences(connection, &rule)?;
     }
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!("matrix:attention:{}", item.attention_id),
+        "attention.updated",
+        serde_json::json!({"attention": item}),
+    )?;
     Ok(())
 }
 
@@ -7828,6 +8430,13 @@ fn insert_evidence_packet(
             packet.created_at.to_rfc3339(),
         ],
     )?;
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!("matrix:evidence:{}", packet.packet_id),
+        "evidence.updated",
+        serde_json::json!({"evidence": packet}),
+    )?;
     Ok(())
 }
 
@@ -7878,6 +8487,13 @@ fn insert_quality_gate(
             serde_json::to_string(gate)?,
             gate.created_at.to_rfc3339(),
         ],
+    )?;
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!("matrix:quality-gate:{}", gate.gate_id),
+        "quality_gate.updated",
+        serde_json::json!({"quality_gate": gate}),
     )?;
     Ok(())
 }
@@ -8116,6 +8732,13 @@ fn upsert_metric_definition(
             definition.updated_at.to_rfc3339(),
         ],
     )?;
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!("matrix:metric-definition:{}", definition.metric_id),
+        "metric_definition.updated",
+        serde_json::json!({"metric_definition": definition}),
+    )?;
     Ok(())
 }
 
@@ -8171,6 +8794,13 @@ fn upsert_metric_dependency(
             dependency.created_at.to_rfc3339(),
             dependency.updated_at.to_rfc3339(),
         ],
+    )?;
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!("matrix:metric-dependency:{}", dependency.dependency_id),
+        "metric_dependency.updated",
+        serde_json::json!({"metric_dependency": dependency}),
     )?;
     Ok(dependency)
 }
@@ -8411,6 +9041,13 @@ fn insert_metric_snapshot(
             snapshot.created_at.to_rfc3339(),
         ],
     )?;
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!("matrix:metric-snapshot:{}", snapshot.snapshot_id),
+        "metric_snapshot.updated",
+        serde_json::json!({"metric_snapshot": snapshot}),
+    )?;
     Ok(())
 }
 
@@ -8453,6 +9090,13 @@ fn insert_skill_execution(
             created_at.to_rfc3339(),
             updated_at.to_rfc3339(),
         ],
+    )?;
+    append_projection_event(
+        connection,
+        "execution",
+        &format!("mfg:skill-execution:{execution_id}"),
+        "skill_run.updated",
+        serde_json::json!({"skill_run": run}),
     )?;
     Ok(run)
 }
@@ -8527,6 +9171,13 @@ fn upsert_compute_job(
             job.updated_at.to_rfc3339(),
         ],
     )?;
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!("matrix:compute-job:{}", job.job_id),
+        "compute_job.updated",
+        serde_json::json!({"job": job}),
+    )?;
     Ok(job.clone())
 }
 
@@ -8588,6 +9239,13 @@ fn insert_metric_state(
             state.computed_at.to_rfc3339(),
         ],
     )?;
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!("matrix:metric-state:{}", state.state_id),
+        "metric_state.updated",
+        serde_json::json!({"metric_state": state}),
+    )?;
     Ok(())
 }
 
@@ -8610,6 +9268,13 @@ fn insert_change_event(
             serde_json::to_string(change)?,
             change.detected_at.to_rfc3339(),
         ],
+    )?;
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!("matrix:change:{}", change.change_id),
+        "metric_change.detected",
+        serde_json::json!({"change": change}),
     )?;
     Ok(())
 }
@@ -8668,6 +9333,13 @@ fn upsert_incident(
             incident.created_at.to_rfc3339(),
             incident.updated_at.to_rfc3339(),
         ],
+    )?;
+    append_projection_event(
+        connection,
+        "incident",
+        &format!("mfg:incident:{}", incident.incident_id),
+        "incident.updated",
+        serde_json::json!({"incident": incident}),
     )?;
     Ok(())
 }
@@ -8733,6 +9405,13 @@ fn insert_analysis(
             serde_json::to_string(analysis)?,
             analysis.created_at.to_rfc3339(),
         ],
+    )?;
+    append_projection_event(
+        connection,
+        "incident",
+        &format!("mfg:analysis:{}", analysis.analysis_id),
+        "analysis.updated",
+        serde_json::json!({"analysis": analysis}),
     )?;
     Ok(())
 }
@@ -8832,6 +9511,13 @@ fn insert_execution(
             execution.updated_at.to_rfc3339(),
         ],
     )?;
+    append_projection_event(
+        connection,
+        "execution",
+        &format!("mfg:execution:{}", execution.execution_id),
+        "execution.updated",
+        serde_json::json!({"execution": execution}),
+    )?;
     Ok(())
 }
 
@@ -8913,6 +9599,13 @@ fn insert_memory_case(
             memory_case.created_at.to_rfc3339(),
         ],
     )?;
+    append_projection_event(
+        connection,
+        "incident",
+        &format!("mfg:memory-case:{}", memory_case.case_id),
+        "memory_case.updated",
+        serde_json::json!({"memory_case": memory_case}),
+    )?;
     Ok(())
 }
 
@@ -8980,6 +9673,13 @@ fn insert_playbook(
             playbook.created_at.to_rfc3339(),
             playbook.updated_at.to_rfc3339(),
         ],
+    )?;
+    append_projection_event(
+        connection,
+        "incident",
+        &format!("mfg:playbook:{}", playbook.playbook_id),
+        "playbook.updated",
+        serde_json::json!({"playbook": playbook}),
     )?;
     Ok(())
 }
@@ -9060,6 +9760,13 @@ fn insert_source_pack(
             source_pack.created_at.to_rfc3339(),
             source_pack.updated_at.to_rfc3339(),
         ],
+    )?;
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!("matrix:source-pack:{}", source_pack.source_pack_id),
+        "source_pack.updated",
+        serde_json::json!({"source_pack": source_pack}),
     )?;
     Ok(())
 }
@@ -9144,6 +9851,13 @@ fn insert_connector_run(
             run.updated_at.to_rfc3339(),
         ],
     )?;
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!("matrix:connector-run:{}", run.run_id),
+        "connector_run.updated",
+        serde_json::json!({"connector_run": run}),
+    )?;
     Ok(())
 }
 
@@ -9180,6 +9894,16 @@ fn upsert_data_plane_watermark(
             serde_json::to_string(watermark)?,
             watermark.updated_at.to_rfc3339(),
         ],
+    )?;
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!(
+            "matrix:watermark:{}:{}:{}",
+            watermark.source_ref, watermark.fact_type, watermark.partition_ref
+        ),
+        "data_watermark.updated",
+        serde_json::json!({"watermark": watermark}),
     )?;
     Ok(())
 }
@@ -9290,6 +10014,536 @@ mod tests {
         MatrixRelationInput, MatrixSourceKey,
     };
     use std::sync::{Arc, Barrier};
+
+    fn insert_live_snapshot_sentinel(
+        connection: &Connection,
+        table: &str,
+        json_column: &str,
+        marker: &str,
+    ) {
+        connection
+            .execute_batch("PRAGMA foreign_keys = OFF; PRAGMA ignore_check_constraints = ON;")
+            .unwrap();
+        let mut statement = connection
+            .prepare(&format!("PRAGMA table_info(\"{table}\")"))
+            .unwrap();
+        let columns = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?.to_ascii_uppercase(),
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let names = columns
+            .iter()
+            .map(|(name, _)| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let placeholders = (1..=columns.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let now = Utc::now().to_rfc3339();
+        let values = columns
+            .iter()
+            .map(|(name, data_type)| {
+                if name == json_column {
+                    rusqlite::types::Value::Text(
+                        serde_json::json!({"_live_snapshot_sentinel": marker}).to_string(),
+                    )
+                } else if name.ends_with("_json") {
+                    rusqlite::types::Value::Text("{}".to_string())
+                } else if data_type.contains("INT") {
+                    rusqlite::types::Value::Integer(1)
+                } else if data_type.contains("REAL")
+                    || data_type.contains("FLOAT")
+                    || data_type.contains("DOUBLE")
+                {
+                    rusqlite::types::Value::Real(1.0)
+                } else if data_type.contains("BLOB") {
+                    rusqlite::types::Value::Blob(vec![1])
+                } else if name.ends_with("_at") {
+                    rusqlite::types::Value::Text(now.clone())
+                } else {
+                    rusqlite::types::Value::Text(format!("{marker}:{name}"))
+                }
+            })
+            .collect::<Vec<_>>();
+        connection
+            .execute(
+                &format!("INSERT INTO \"{table}\" ({names}) VALUES ({placeholders})"),
+                rusqlite::params_from_iter(values),
+            )
+            .unwrap_or_else(|error| panic!("insert live sentinel into {table}: {error}"));
+    }
+
+    #[test]
+    fn live_epoch_survives_restart_and_rotates_only_for_identity_change() {
+        let path = std::env::temp_dir().join(format!(
+            "cowd-mfg-live-epoch-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let repository = MfgRepository::open(&path).unwrap();
+        let initial = repository.live_epoch().unwrap();
+        drop(repository);
+
+        let reopened = MfgRepository::open(&path).unwrap();
+        let stable = reopened.live_epoch().unwrap();
+        assert_eq!(stable.epoch_id, initial.epoch_id);
+        let rotated = reopened.rotate_live_epoch("cursor_key_recreated").unwrap();
+        assert_ne!(rotated.epoch_id, initial.epoch_id);
+        assert_eq!(rotated.rotation_reason, "cursor_key_recreated");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn live_epoch_rotates_when_the_event_log_is_rewritten() {
+        let path = std::env::temp_dir().join(format!(
+            "cowd-mfg-live-rewrite-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let repository = MfgRepository::open(&path).unwrap();
+        {
+            let connection = repository.connection.lock().unwrap();
+            append_projection_event(
+                &connection,
+                "assignment",
+                "mfg:assignment:before-rewrite",
+                "assignment.receipted",
+                serde_json::json!({"revision": 1}),
+            )
+            .unwrap();
+        }
+        let initial = repository.live_epoch().unwrap();
+        drop(repository);
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute("DELETE FROM mfg_projection_event", [])
+                .unwrap();
+        }
+        let reopened = MfgRepository::open(&path).unwrap();
+        let rotated = reopened.live_epoch().unwrap();
+        assert_ne!(rotated.epoch_id, initial.epoch_id);
+        assert_eq!(rotated.rotation_reason, "event_log_rewritten");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn live_snapshot_and_delta_share_high_watermark_and_cover_every_domain() {
+        let repository = MfgRepository::in_memory().unwrap();
+        repository.seed_mfg_domain().unwrap();
+        let snapshot_fields = [
+            ("cockpit", "profiles", "mfg_cockpit_profile", "profile_json"),
+            ("alerts", "rules", "mfg_alert_rule", "rule_json"),
+            (
+                "alerts",
+                "subscriptions",
+                "mfg_alert_subscription",
+                "subscription_json",
+            ),
+            (
+                "alerts",
+                "occurrences",
+                "mfg_alert_occurrence",
+                "occurrence_json",
+            ),
+            ("assignments", "items", "mfg_assignment", "assignment_json"),
+            ("incidents", "items", "mfg_incident", "incident_json"),
+            ("incidents", "workflows", "mfg_workflow_graph", "graph_json"),
+            (
+                "incidents",
+                "analyses",
+                "mfg_operational_analysis",
+                "analysis_json",
+            ),
+            (
+                "incidents",
+                "memory_cases",
+                "mfg_memory_case",
+                "memory_case_json",
+            ),
+            ("incidents", "playbooks", "mfg_playbook", "playbook_json"),
+            (
+                "executions",
+                "actions",
+                "mfg_action_execution",
+                "execution_json",
+            ),
+            (
+                "executions",
+                "skills",
+                "mfg_skill_execution",
+                "execution_json",
+            ),
+            ("reports", "items", "mfg_cockpit_report", "report_json"),
+            (
+                "reviews",
+                "items",
+                "mfg_report_delivery_review",
+                "review_json",
+            ),
+            (
+                "receipts",
+                "commands",
+                "mfg_command_receipt",
+                "receipt_json",
+            ),
+            ("data_compute", "entities", "matrix_entity", "entity_json"),
+            (
+                "data_compute",
+                "relations",
+                "matrix_relation",
+                "relation_json",
+            ),
+            (
+                "data_compute",
+                "attention",
+                "matrix_attention_item",
+                "attention_json",
+            ),
+            (
+                "data_compute",
+                "evidence",
+                "matrix_evidence_packet",
+                "packet_json",
+            ),
+            (
+                "data_compute",
+                "quality_gates",
+                "matrix_quality_gate",
+                "gate_json",
+            ),
+            (
+                "data_compute",
+                "metric_definitions",
+                "matrix_metric_definition",
+                "definition_json",
+            ),
+            (
+                "data_compute",
+                "metric_dependencies",
+                "matrix_metric_dependency",
+                "dependency_json",
+            ),
+            (
+                "data_compute",
+                "metric_states",
+                "matrix_metric_state",
+                "state_json",
+            ),
+            (
+                "data_compute",
+                "metric_snapshots",
+                "matrix_metric_snapshot",
+                "snapshot_json",
+            ),
+            (
+                "data_compute",
+                "watermarks",
+                "matrix_data_plane_watermark",
+                "watermark_json",
+            ),
+            ("data_compute", "jobs", "matrix_compute_job", "job_json"),
+            (
+                "data_compute",
+                "changes",
+                "matrix_change_event",
+                "change_json",
+            ),
+            (
+                "data_compute",
+                "source_packs",
+                "matrix_source_pack",
+                "source_pack_json",
+            ),
+            (
+                "data_compute",
+                "connector_runs",
+                "matrix_connector_run",
+                "run_json",
+            ),
+            (
+                "data_compute",
+                "ontology_packs",
+                "matrix_ontology_pack",
+                "pack_json",
+            ),
+            (
+                "data_compute",
+                "entity_match_candidates",
+                "matrix_entity_match_candidate",
+                "candidate_json",
+            ),
+            (
+                "data_compute",
+                "entity_conflict_decisions",
+                "matrix_entity_conflict_decision",
+                "decision_json",
+            ),
+        ];
+        {
+            let connection = repository.connection.lock().unwrap();
+            for (domain, field, table, json_column) in snapshot_fields {
+                insert_live_snapshot_sentinel(
+                    &connection,
+                    table,
+                    json_column,
+                    &format!("{domain}.{field}"),
+                );
+            }
+            insert_live_snapshot_sentinel(
+                &connection,
+                "mfg_mutation_receipt",
+                "response_json",
+                "receipts.mutations",
+            );
+        }
+        let event_cursor = {
+            let connection = repository.connection.lock().unwrap();
+            append_projection_event(
+                &connection,
+                "assignment",
+                "mfg:assignment:assignment-live-1",
+                "assignment.receipted",
+                serde_json::json!({
+                    "assignment": {
+                        "assignment_id": "assignment-live-1",
+                        "status": "assigned",
+                        "revision": 1
+                    }
+                }),
+            )
+            .unwrap()
+        };
+        let snapshot = repository.live_snapshot_read().unwrap();
+        assert_eq!(snapshot.high_cursor, event_cursor);
+        let state = serde_json::to_value(&snapshot.state).unwrap();
+        for (domain, field, _, _) in snapshot_fields {
+            let marker = format!("{domain}.{field}");
+            assert!(
+                state[domain][field].as_array().is_some_and(|items| {
+                    items.iter().any(|item| {
+                        item["_live_snapshot_sentinel"].as_str() == Some(marker.as_str())
+                    })
+                }),
+                "snapshot field {marker} is not wired to its durable table"
+            );
+        }
+        assert!(!state["data_compute"]["facts"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(state["receipts"]["mutations"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| {
+                item["response"]["_live_snapshot_sentinel"].as_str() == Some("receipts.mutations")
+            })));
+        let delta = repository
+            .live_delta_read(event_cursor.saturating_sub(1), 100)
+            .unwrap();
+        assert_eq!(delta.high_cursor, snapshot.high_cursor);
+        assert_eq!(delta.events.len(), 1);
+        assert_eq!(delta.events[0].cursor, event_cursor);
+        assert_eq!(delta.events[0].event_type, "assignment.receipted");
+    }
+
+    #[test]
+    fn live_delta_below_retention_watermark_requires_resync_without_rotating_epoch() {
+        let repository = MfgRepository::in_memory().unwrap();
+        let epoch = repository.live_epoch().unwrap();
+        {
+            let connection = repository.connection.lock().unwrap();
+            connection
+                .execute(
+                    "UPDATE mfg_live_epoch
+                     SET retention_low_cursor = 50, retention_high_cursor = 75
+                     WHERE singleton_id = 1",
+                    [],
+                )
+                .unwrap();
+        }
+        let delta = repository.live_delta_read(49, 100).unwrap();
+        assert_eq!(
+            delta.resync_reason.as_deref(),
+            Some("cursor_below_retention_low_watermark")
+        );
+        assert_eq!(delta.epoch.epoch_id, epoch.epoch_id);
+    }
+
+    #[test]
+    fn every_completed_gateway_mutation_produces_one_durable_receipt_event() {
+        let repository = MfgRepository::in_memory().unwrap();
+        let claim = repository
+            .claim_mutation_receipt(
+                "live-receipt-key",
+                "principal:operator",
+                "mfg.incident.create",
+                "mfg:incident:live-receipt",
+                None,
+                "sha256:live-receipt",
+                "correlation:live-receipt",
+            )
+            .unwrap();
+        assert!(matches!(claim, MfgMutationClaim::Acquired(_)));
+        let before = repository.live_epoch().unwrap().retention_high_cursor;
+        let receipt = repository
+            .record_mutation_receipt(
+                "live-receipt-key",
+                "principal:operator",
+                "mfg.incident.create",
+                "mfg:incident:live-receipt",
+                None,
+                Some(1),
+                "sha256:live-receipt",
+                &serde_json::json!({"revision": 1}),
+            )
+            .unwrap();
+        let delta = repository.live_delta_read(before, 10).unwrap();
+        assert_eq!(delta.events.len(), 1);
+        assert_eq!(delta.events[0].event_type, "receipt.completed");
+        assert_eq!(
+            delta.events[0].payload["receipt"]["receipt_id"],
+            receipt.receipt_id
+        );
+        let after = delta.high_cursor;
+
+        let replay = repository
+            .record_mutation_receipt(
+                "live-receipt-key",
+                "principal:operator",
+                "mfg.incident.create",
+                "mfg:incident:live-receipt",
+                None,
+                Some(1),
+                "sha256:live-receipt",
+                &serde_json::json!({"revision": 1}),
+            )
+            .unwrap();
+        assert_eq!(replay.status, app_mfg_contract::MfgReceiptStatus::Replayed);
+        assert_eq!(
+            repository.live_delta_read(after, 10).unwrap().events.len(),
+            0
+        );
+    }
+
+    #[test]
+    fn completed_gateway_receipt_rolls_back_when_its_live_event_cannot_commit() {
+        let repository = MfgRepository::in_memory().unwrap();
+        repository
+            .claim_mutation_receipt(
+                "live-atomicity-key",
+                "principal:operator",
+                "mfg.incident.create",
+                "mfg:incident:live-atomicity",
+                None,
+                "sha256:live-atomicity",
+                "correlation:live-atomicity",
+            )
+            .unwrap();
+        {
+            let connection = repository.connection.lock().unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TRIGGER reject_live_receipt_event
+                     BEFORE INSERT ON mfg_projection_event
+                     BEGIN
+                         SELECT RAISE(ABORT, 'live event unavailable');
+                     END;",
+                )
+                .unwrap();
+        }
+
+        assert!(repository
+            .record_mutation_receipt(
+                "live-atomicity-key",
+                "principal:operator",
+                "mfg.incident.create",
+                "mfg:incident:live-atomicity",
+                None,
+                Some(1),
+                "sha256:live-atomicity",
+                &serde_json::json!({"revision": 1}),
+            )
+            .is_err());
+
+        let connection = repository.connection.lock().unwrap();
+        let status = connection
+            .query_row(
+                "SELECT status FROM mfg_mutation_receipt
+                 WHERE idempotency_key = 'live-atomicity-key'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(status, "accepted");
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM mfg_projection_event", [], |row| {
+                    row.get::<_, u64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn live_retention_deletes_only_old_events_outside_the_latest_fifty_thousand() {
+        let repository = MfgRepository::in_memory().unwrap();
+        {
+            let connection = repository.connection.lock().unwrap();
+            connection
+                .execute_batch(
+                    "WITH RECURSIVE seq(value) AS (
+                         VALUES(1)
+                         UNION ALL
+                         SELECT value + 1 FROM seq WHERE value < 50001
+                     )
+                     INSERT INTO mfg_projection_event (
+                         domain, subject_ref, event_type, event_json, created_at
+                     )
+                     SELECT
+                         'retention',
+                         'mfg:retention:' || value,
+                         'retention.test',
+                         '{\"payload\":{}}',
+                         CASE WHEN value = 1
+                              THEN datetime('now', '-8 days')
+                              ELSE datetime('now')
+                         END
+                     FROM seq;
+                     UPDATE mfg_live_epoch
+                     SET retention_low_cursor = 0,
+                         retention_high_cursor = 50001,
+                         updated_at = datetime('now', '-6 minutes')
+                     WHERE singleton_id = 1;",
+                )
+                .unwrap();
+            compact_live_events_if_due(&connection).unwrap();
+            let count = connection
+                .query_row("SELECT COUNT(*) FROM mfg_projection_event", [], |row| {
+                    row.get::<_, u64>(0)
+                })
+                .unwrap();
+            assert_eq!(count, 50_000);
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT MIN(event_id) FROM mfg_projection_event",
+                        [],
+                        |row| row.get::<_, u64>(0),
+                    )
+                    .unwrap(),
+                2
+            );
+        }
+        let epoch = repository.live_epoch().unwrap();
+        assert_eq!(epoch.retention_low_cursor, 1);
+        assert_eq!(epoch.retention_high_cursor, 50_001);
+    }
 
     #[test]
     fn gateway_governance_receipt_upgrades_the_business_recovery_row_in_place() {

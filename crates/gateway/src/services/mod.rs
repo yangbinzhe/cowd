@@ -56,7 +56,7 @@ pub(crate) use matrix_service::MatrixService;
 pub(crate) use memory_service::MemoryService;
 pub(crate) use mfg_service::{
     MfgCockpitReportDeliveryOutcome, MfgCockpitReportDeliveryRequest, MfgCrossPlaneBridgeRequest,
-    MfgReviewReconcilerLifecycle, MfgService,
+    MfgLivePrincipalContext, MfgLiveServiceError, MfgReviewReconcilerLifecycle, MfgService,
 };
 pub(crate) use mfg_skill_executor::{GatewayMfgSkillExecutor, MfgSkillExecutionPayload};
 pub(crate) use mission_service::{

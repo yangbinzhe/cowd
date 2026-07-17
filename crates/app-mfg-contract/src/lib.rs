@@ -23,8 +23,8 @@ pub use capability::{
 pub use cockpit::{MfgContractFreshnessV1, MfgSurfaceStatusV1};
 pub use error::{MfgApiErrorV1, MfgErrorCode, MfgRecoveryAction, MfgRecoveryActionKind};
 pub use live::{
-    MfgLiveDeltaV1, MfgLiveEnvelopeV1, MfgLiveEventV1, MfgLiveHeartbeatV1, MfgLiveResyncV1,
-    MfgLiveSnapshotStateV1, MfgLiveSnapshotV1,
+    mfg_live_event_priority, MfgLiveDeltaV1, MfgLiveEnvelopeV1, MfgLiveEventV1, MfgLiveHeartbeatV1,
+    MfgLiveResyncV1, MfgLiveSnapshotStateV1, MfgLiveSnapshotV1,
 };
 pub use mutation::{
     mfg_action_contracts, mfg_tui_action_contracts, MfgActionAvailability, MfgActionContract,
@@ -60,7 +60,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn route_inventory_has_v541_and_v545_boundaries() {
+    fn route_inventory_has_all_v545_routes_active() {
         let routes = mfg_route_contracts();
         assert_eq!(routes.len(), 104);
         assert_eq!(
@@ -68,7 +68,7 @@ mod tests {
                 .iter()
                 .filter(|route| route.availability == MfgActionAvailability::Active)
                 .count(),
-            103
+            104
         );
         assert_eq!(
             routes
@@ -82,7 +82,7 @@ mod tests {
                 .iter()
                 .filter(|route| route.availability == MfgActionAvailability::PlannedV545)
                 .count(),
-            1
+            0
         );
         let method_paths = routes
             .iter()
@@ -96,9 +96,9 @@ mod tests {
     }
 
     #[test]
-    fn tui_p0_read_inventory_is_semantically_derived_and_excludes_v545_snapshot() {
+    fn tui_p0_read_inventory_is_semantically_derived_and_includes_live_snapshot() {
         let routes = mfg_tui_p0_read_route_contracts();
-        assert_eq!(routes.len(), 19);
+        assert_eq!(routes.len(), 20);
         assert!(routes
             .iter()
             .all(|route| route.class == MfgMutationClass::Read));
@@ -108,7 +108,7 @@ mod tests {
         assert!(routes
             .iter()
             .all(|route| route.consumers.contains(&MfgConsumer::TuiP0)));
-        assert!(!routes
+        assert!(routes
             .iter()
             .any(|route| route.route_id == MfgRouteId::LiveSnapshot));
     }
@@ -121,7 +121,7 @@ mod tests {
                 && (route.consumers.contains(&MfgConsumer::TuiP0)
                     || route.consumers.contains(&MfgConsumer::TuiP1))
         }));
-        assert!(!routes
+        assert!(routes
             .iter()
             .any(|route| route.route_id == MfgRouteId::LiveSnapshot));
         let route_ids = routes

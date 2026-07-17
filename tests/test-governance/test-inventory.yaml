@@ -208,8 +208,7 @@ scenario_scripts:
     classification: manual
     default_gate: false
     capability: mfg.multi_surface_acceptance
-    keep_reason: V544 defines isolated governed-action PTY evidence without claiming multi-Surface execution.
-    planned_change: V545 completes multi-Surface orchestration; V548 records the final command evidence.
+    keep_reason: V545 executable three-observer, slow-consumer, burst and restart scenario; V548 records the final command evidence.
 
 manual_scripts:
   - path: scripts/manual/context-runtime-lean-spike.sh

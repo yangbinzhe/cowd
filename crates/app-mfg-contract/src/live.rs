@@ -77,3 +77,124 @@ pub enum MfgLiveEnvelopeV1 {
     Resync(MfgLiveResyncV1),
     Heartbeat(MfgLiveHeartbeatV1),
 }
+
+/// Canonical observer-queue priority shared by Gateway and TUI.
+///
+/// Lower values have stronger retention guarantees:
+/// P0 terminal/review/auth, P1 receipt/conflict/recovery, P2 domain state,
+/// and P3 metric/heartbeat.
+#[must_use]
+pub fn mfg_live_event_priority(event_type: &str, payload: &serde_json::Value) -> u8 {
+    if event_type.starts_with("report_review.")
+        || event_type.contains("resync")
+        || event_type.contains("auth")
+    {
+        return 0;
+    }
+    if event_type.contains("receipt")
+        || event_type.contains("conflict")
+        || event_type.contains("recovery")
+    {
+        return 1;
+    }
+    let terminal_family = [
+        "assignment.",
+        "alert.",
+        "incident.",
+        "workflow.",
+        "execution.",
+        "skill_run.",
+        "report.",
+        "compute_job.",
+    ]
+    .iter()
+    .any(|prefix| event_type.starts_with(prefix));
+    if terminal_family
+        && (event_type.ends_with(".complete")
+            || event_type.ends_with(".completed")
+            || event_type.ends_with(".resolve")
+            || event_type.ends_with(".resolved")
+            || event_type.ends_with(".unassign")
+            || event_type.ends_with(".cancel")
+            || event_type.ends_with(".failed")
+            || event_type.ends_with(".closed")
+            || payload_has_terminal_status(payload))
+    {
+        return 0;
+    }
+    if event_type.starts_with("metric_")
+        || event_type.starts_with("metric.")
+        || event_type.contains("heartbeat")
+    {
+        3
+    } else {
+        2
+    }
+}
+
+fn payload_has_terminal_status(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            let terminal = ["status", "state", "lifecycle"]
+                .into_iter()
+                .filter_map(|field| object.get(field))
+                .filter_map(serde_json::Value::as_str)
+                .any(|status| {
+                    matches!(
+                        status,
+                        "complete"
+                            | "completed"
+                            | "resolved"
+                            | "closed"
+                            | "failed"
+                            | "rejected"
+                            | "cancelled"
+                            | "canceled"
+                            | "abandoned"
+                            | "unassigned"
+                            | "dead_lettered"
+                            | "blocked"
+                            | "terminal"
+                            | "succeeded"
+                    )
+                });
+            terminal || object.values().any(payload_has_terminal_status)
+        }
+        serde_json::Value::Array(values) => values.iter().any(payload_has_terminal_status),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod priority_tests {
+    use super::mfg_live_event_priority;
+
+    #[test]
+    fn terminal_business_state_is_p0_without_relying_on_event_name_substrings() {
+        assert_eq!(
+            mfg_live_event_priority(
+                "assignment.unassign",
+                &serde_json::json!({"assignment": {"status": "unassigned"}}),
+            ),
+            0
+        );
+        assert_eq!(
+            mfg_live_event_priority(
+                "execution.updated",
+                &serde_json::json!({"execution": {"status": "completed"}}),
+            ),
+            0
+        );
+        assert_eq!(
+            mfg_live_event_priority(
+                "receipt.completed",
+                &serde_json::json!({"status": "completed"})
+            ),
+            1
+        );
+        assert_eq!(
+            mfg_live_event_priority("metric_state.updated", &serde_json::json!({})),
+            3
+        );
+    }
+}

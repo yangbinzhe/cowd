@@ -227,6 +227,17 @@ pub enum CowdEvent {
         section: String,
         error: app_mfg_contract::MfgApiErrorV1,
     },
+    MfgLiveEnvelope {
+        generation: u64,
+        envelope: app_mfg_contract::MfgLiveEnvelopeV1,
+    },
+    MfgLiveFailed {
+        generation: u64,
+        error: app_mfg_contract::MfgApiErrorV1,
+    },
+    MfgLiveStopped {
+        generation: u64,
+    },
     MfgActionAccepted {
         intent_id: String,
         response: app_mfg_contract::MfgMutationResponseV1,

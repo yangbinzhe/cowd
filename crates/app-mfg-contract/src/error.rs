@@ -43,6 +43,9 @@ pub enum MfgErrorCode {
     ContractMismatch,
     ResyncRequired,
     ReviewRequired,
+    #[serde(rename = "mfg_live_cursor_key_invalid")]
+    #[schemars(rename = "mfg_live_cursor_key_invalid")]
+    MfgLiveCursorKeyInvalid,
     #[serde(rename = "mfg_assignment_task_transition_required")]
     #[schemars(rename = "mfg_assignment_task_transition_required")]
     AssignmentTaskTransitionRequired,

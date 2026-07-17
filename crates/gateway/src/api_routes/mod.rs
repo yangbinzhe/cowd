@@ -5377,6 +5377,185 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn mfg_live_snapshot_and_stream_use_distinct_authenticated_transports() {
+        let workspace = test_temp_dir("mfg-live-transport");
+        let config_home = test_temp_dir("mfg-live-transport-config");
+        let broker_root = config_home.join("auth-broker");
+        std::fs::create_dir_all(&broker_root).unwrap();
+        let broker_socket = auth_broker::BrokerClient::default_socket(&broker_root);
+        let broker_socket_for_worker = broker_socket.clone();
+        let broker_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let broker_shutdown_for_worker = Arc::clone(&broker_shutdown);
+        let broker_worker = std::thread::spawn(move || {
+            auth_broker::serve_local_until(
+                broker_root,
+                "mfg-live-auth-token",
+                broker_socket_for_worker,
+                || broker_shutdown_for_worker.load(std::sync::atomic::Ordering::Acquire),
+            )
+            .expect("test auth broker");
+        });
+        for _ in 0..100 {
+            if broker_socket.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(broker_socket.exists(), "test auth broker did not start");
+        let mut state = test_state_with_workspace(workspace.clone(), config_home.clone());
+        Arc::get_mut(&mut state).unwrap().auth_token = Some("mfg-live-auth-token".to_string());
+        let app = api_router(state);
+
+        let bearer_snapshot = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/mfg/live/snapshot")
+                    .header("authorization", "Bearer mfg-live-auth-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bearer_snapshot.status(), StatusCode::OK);
+        assert_eq!(
+            bearer_snapshot
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        let bearer_snapshot: serde_json::Value = serde_json::from_slice(
+            &to_bytes(bearer_snapshot.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(bearer_snapshot["kind"], "snapshot");
+        assert!(bearer_snapshot["cursor"].as_str().is_some());
+        assert!(bearer_snapshot["view_epoch"].as_str().is_some());
+
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "token": "mfg-live-auth-token",
+                            "surface_id": "webui",
+                            "requested_capabilities": ["mfg.read"],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let cookie = login
+            .headers()
+            .get("set-cookie")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .expect("login must return the broker-signed browser cookie")
+            .to_string();
+        let cookie_snapshot = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/mfg/live/snapshot")
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cookie_snapshot.status(), StatusCode::OK);
+        let cookie_snapshot: serde_json::Value = serde_json::from_slice(
+            &to_bytes(cookie_snapshot.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cookie_snapshot["kind"], "snapshot");
+        assert_ne!(
+            cookie_snapshot["view_epoch"], bearer_snapshot["view_epoch"],
+            "public live epoch must change when the WebUI requests a narrower capability view"
+        );
+
+        let stream = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/mfg/live")
+                    .header("accept", "application/json")
+                    .header("authorization", "Bearer mfg-live-auth-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stream.status(), StatusCode::OK);
+        assert!(stream
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/event-stream")));
+        broker_shutdown.store(true, std::sync::atomic::Ordering::Release);
+        broker_worker.join().expect("test auth broker shutdown");
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[tokio::test]
+    async fn mfg_live_snapshot_without_verified_principal_returns_typed_401() {
+        let workspace = test_temp_dir("mfg-live-auth");
+        let config_home = test_temp_dir("mfg-live-auth-config");
+        let mut state = test_state_with_workspace(workspace.clone(), config_home);
+        Arc::get_mut(&mut state).unwrap().auth_token = Some("mfg-live-auth-token".to_string());
+        let app = api_router(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/mfg/live/snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(
+            body["code"] == "authentication_required"
+                || body["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("authentication_required"))
+        );
+        let forbidden = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/mfg/live/snapshot")
+                    .header("authorization", "Bearer mfg-live-auth-token")
+                    .header("x-cowd-requested-capabilities", "approval.respond")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+        let forbidden: serde_json::Value =
+            serde_json::from_slice(&to_bytes(forbidden.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(forbidden["code"], "capability_denied");
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
     async fn matrix_metric_recompute_projects_changes_and_attention() {
         let workspace = test_temp_dir("matrix-metric");
         let config_home = test_temp_dir("matrix-metric-config");

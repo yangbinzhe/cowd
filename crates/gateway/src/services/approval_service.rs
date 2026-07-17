@@ -463,6 +463,7 @@ mod tests {
             expires_at_ms: None,
             credential_fingerprint: "test".to_string(),
             credential_epoch: 1,
+            profile_revision: 1,
         })
     }
 

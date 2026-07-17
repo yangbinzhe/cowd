@@ -18,7 +18,15 @@ const TUI_SURFACE_ID: &str = "tui";
 pub struct GatewayApiClient {
     base_url: String,
     auth_token: Option<String>,
+    observer_id: String,
     client: reqwest::Client,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MfgLiveSubscriptionOutcome {
+    pub(crate) cursor: String,
+    pub(crate) view_epoch: String,
+    pub(crate) resync_required: bool,
 }
 
 #[derive(Debug)]
@@ -34,6 +42,7 @@ impl GatewayApiClient {
         let requested_capabilities = tui_requested_capabilities().join(",");
         request = request
             .header("x-cowd-surface-id", TUI_SURFACE_ID)
+            .header("x-cowd-observer-id", &self.observer_id)
             .header("x-cowd-requested-capabilities", requested_capabilities);
         if let Some(token) = self
             .auth_token
@@ -56,6 +65,10 @@ impl GatewayApiClient {
         Ok(Self {
             base_url: normalize_base_url(base_url.into())?,
             auth_token,
+            observer_id: std::env::var("COWD_MFG_OBSERVER_ID")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| format!("tui:{}", uuid::Uuid::new_v4())),
             client,
         })
     }
@@ -1969,6 +1982,108 @@ impl GatewayApiClient {
         self.get_typed(&path).await
     }
 
+    pub async fn mfg_live_snapshot(
+        &self,
+    ) -> Result<app_mfg_contract::MfgLiveEnvelopeV1, GatewayApiError> {
+        let path = mfg_tui_route_path(app_mfg_contract::MfgRouteId::LiveSnapshot, &[])?;
+        self.get_typed(&path).await
+    }
+
+    pub async fn subscribe_mfg_live(
+        &self,
+        generation: u64,
+        cursor: &str,
+        view_epoch: &str,
+        tx: CowdEventSender,
+    ) -> Result<MfgLiveSubscriptionOutcome, GatewayApiError> {
+        let path = mfg_tui_route_path(app_mfg_contract::MfgRouteId::LiveStream, &[])?;
+        let url = format!("{}{}", self.base_url, path);
+        let stream_client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .map_err(GatewayApiError::Http)?;
+        let request = self.authorize(
+            stream_client
+                .get(url)
+                .header("Accept", "text/event-stream")
+                .header("Last-Event-ID", cursor)
+                .header("x-mfg-view-epoch", view_epoch),
+        );
+        let response = request.send().await.map_err(GatewayApiError::Http)?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(gateway_status_error(status, body));
+        }
+        let mut buffer = Vec::new();
+        let mut stream = response.bytes_stream();
+        let mut latest_cursor = cursor.to_string();
+        let mut latest_epoch = view_epoch.to_string();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(GatewayApiError::Http)?;
+            buffer.extend_from_slice(&chunk);
+            while let Some(frame) = take_gateway_sse_frame(&mut buffer)? {
+                if gateway_sse_frame_event_name(&frame) == Some("mfg_live_error") {
+                    let data = gateway_sse_frame_data(&frame)
+                        .unwrap_or_else(|| "MFG live stream failed".to_string());
+                    return Err(gateway_mfg_live_stream_error(data));
+                }
+                if gateway_sse_frame_event_name(&frame) != Some("mfg_live") {
+                    continue;
+                }
+                let Some(envelope) = gateway_sse_frame_data(&frame).and_then(|data| {
+                    serde_json::from_str::<app_mfg_contract::MfgLiveEnvelopeV1>(&data).ok()
+                }) else {
+                    return Err(GatewayApiError::Url(
+                        "MFG live stream emitted an invalid envelope".to_string(),
+                    ));
+                };
+                let resync_required =
+                    matches!(envelope, app_mfg_contract::MfgLiveEnvelopeV1::Resync(_));
+                match &envelope {
+                    app_mfg_contract::MfgLiveEnvelopeV1::Snapshot(snapshot) => {
+                        latest_cursor.clone_from(&snapshot.cursor);
+                        latest_epoch.clone_from(&snapshot.view_epoch);
+                    }
+                    app_mfg_contract::MfgLiveEnvelopeV1::Delta(delta) => {
+                        latest_cursor.clone_from(&delta.target_cursor);
+                        latest_epoch.clone_from(&delta.view_epoch);
+                    }
+                    app_mfg_contract::MfgLiveEnvelopeV1::Heartbeat(heartbeat) => {
+                        latest_cursor.clone_from(&heartbeat.cursor);
+                        latest_epoch.clone_from(&heartbeat.view_epoch);
+                    }
+                    app_mfg_contract::MfgLiveEnvelopeV1::Resync(resync) => {
+                        latest_cursor.clone_from(&resync.latest_cursor);
+                        latest_epoch.clear();
+                    }
+                }
+                tx.send_wait(CowdEvent::MfgLiveEnvelope {
+                    generation,
+                    envelope,
+                })
+                .await
+                .map_err(|_| {
+                    GatewayApiError::Url(
+                        "MFG live consumer stopped before accepting the envelope".to_string(),
+                    )
+                })?;
+                if resync_required {
+                    return Ok(MfgLiveSubscriptionOutcome {
+                        cursor: latest_cursor,
+                        view_epoch: latest_epoch,
+                        resync_required: true,
+                    });
+                }
+            }
+        }
+        Ok(MfgLiveSubscriptionOutcome {
+            cursor: latest_cursor,
+            view_epoch: latest_epoch,
+            resync_required: false,
+        })
+    }
+
     pub async fn mfg_action(
         &self,
         action_id: app_mfg_contract::MfgActionId,
@@ -2108,6 +2223,25 @@ impl GatewayApiClient {
             .map(|bytes| bytes.to_vec())
             .map_err(GatewayApiError::Http)
     }
+}
+
+fn take_gateway_sse_frame(buffer: &mut Vec<u8>) -> Result<Option<String>, GatewayApiError> {
+    let lf = buffer.windows(2).position(|window| window == b"\n\n");
+    let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
+    let Some((index, delimiter_len)) = (match (lf, crlf) {
+        (Some(lf), Some(crlf)) if lf <= crlf => Some((lf, 2)),
+        (Some(_), Some(crlf)) => Some((crlf, 4)),
+        (Some(lf), None) => Some((lf, 2)),
+        (None, Some(crlf)) => Some((crlf, 4)),
+        (None, None) => None,
+    }) else {
+        return Ok(None);
+    };
+    let frame = buffer[..index].to_vec();
+    buffer.drain(..index + delimiter_len);
+    String::from_utf8(frame)
+        .map(Some)
+        .map_err(|_| GatewayApiError::Url("MFG live stream emitted invalid UTF-8".to_string()))
 }
 
 pub(crate) fn mfg_tui_route_path(
@@ -2268,6 +2402,12 @@ fn gateway_status_error(status: reqwest::StatusCode, body: String) -> GatewayApi
         }
         None => GatewayApiError::Status(status, body),
     }
+}
+
+fn gateway_mfg_live_stream_error(data: String) -> GatewayApiError {
+    serde_json::from_str::<app_mfg_contract::MfgApiErrorV1>(&data)
+        .map(GatewayApiError::Api)
+        .unwrap_or_else(|_| GatewayApiError::Url(data))
 }
 
 fn decode_gateway_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, GatewayApiError> {
@@ -2545,6 +2685,17 @@ fn gateway_sse_frame_event_name(frame: &str) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+fn gateway_sse_frame_data(frame: &str) -> Option<String> {
+    let data = frame
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!data.is_empty()).then_some(data)
+}
+
 fn gateway_sse_frame_projection_delta(
     frame: &str,
 ) -> Option<harness_contract::projection::ProjectionDelta> {
@@ -2619,6 +2770,21 @@ mod tests {
             "http://127.0.0.1:8642"
         );
         assert!(normalize_base_url("127.0.0.1:8642".to_string()).is_err());
+    }
+
+    #[test]
+    fn live_stream_typed_authorization_error_remains_structured() {
+        let error =
+            app_mfg_contract::MfgApiErrorV1::authentication_required("profile revision changed");
+        let encoded = serde_json::to_string(&error).expect("typed live error");
+        assert!(matches!(
+            gateway_mfg_live_stream_error(encoded),
+            GatewayApiError::Api(app_mfg_contract::MfgApiErrorV1 {
+                code: app_mfg_contract::MfgErrorCode::AuthenticationRequired,
+                http_status: 401,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2869,6 +3035,7 @@ mod tests {
             let timeout_client = GatewayApiClient {
                 base_url: format!("http://{addr}"),
                 auth_token: None,
+                observer_id: "test-timeout".to_string(),
                 client: reqwest::Client::builder()
                     .timeout(Duration::from_millis(20))
                     .build()
@@ -3034,7 +3201,11 @@ mod tests {
                 );
             }
         }
-        assert!(mfg_tui_route_path(app_mfg_contract::MfgRouteId::LiveSnapshot, &[]).is_err());
+        assert_eq!(
+            mfg_tui_route_path(app_mfg_contract::MfgRouteId::LiveSnapshot, &[])
+                .expect("active live snapshot route"),
+            "/api/apps/mfg/live/snapshot"
+        );
         assert_eq!(
             append_query(
                 "/api/example".to_string(),

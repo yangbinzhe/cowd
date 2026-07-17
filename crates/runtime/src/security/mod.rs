@@ -284,6 +284,7 @@ pub(crate) fn test_human_interactive_principal() -> VerifiedPrincipal {
             expires_at_ms: None,
             credential_fingerprint: "test".to_string(),
             credential_epoch: 1,
+            profile_revision: 1,
         },
     }
 }
@@ -339,6 +340,7 @@ mod tests {
             expires_at_ms: None,
             credential_fingerprint: "test".to_string(),
             credential_epoch: 1,
+            profile_revision: 1,
         };
         let payload = serde_json::to_vec(&claims).expect("payload");
         let mut envelope = SignedPrincipalEnvelope {
@@ -376,6 +378,7 @@ mod tests {
             expires_at_ms: None,
             credential_fingerprint: "test".to_string(),
             credential_epoch: 7,
+            profile_revision: 1,
         };
         let principal_payload = serde_json::to_vec(&claims).expect("principal payload");
         let principal = SignedPrincipalEnvelope {
@@ -445,6 +448,7 @@ mod tests {
             expires_at_ms: Some(now_ms().saturating_add(60_000)),
             credential_fingerprint: "test".to_string(),
             credential_epoch: 3,
+            profile_revision: 1,
         };
         let payload = serde_json::to_vec(&claims).expect("payload");
         let envelope = SignedPrincipalEnvelope {

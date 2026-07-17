@@ -1,8 +1,8 @@
-use std::convert::Infallible;
+use std::{convert::Infallible, time::Instant};
 
 use axum::{
     extract::Extension,
-    http::{header, HeaderMap},
+    http::HeaderMap,
     response::{sse::Event, Response, Sse},
 };
 
@@ -95,8 +95,6 @@ pub(super) struct MfgAssignmentCommandRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(super) struct MfgLiveQuery {
-    #[serde(default)]
-    cursor: Option<u64>,
     #[serde(default)]
     limit: Option<usize>,
 }
@@ -951,67 +949,811 @@ async fn deliver_assignment_notifications(
         .map_err(mfg_mutation_error)
 }
 
+const MFG_LIVE_OBSERVER_QUEUE_CAPACITY: usize = 64;
+const MFG_LIVE_OBSERVER_EVENT_CAPACITY: usize = 512;
+
+enum MfgLiveQueuedItem {
+    Envelope(app_mfg_contract::MfgLiveEnvelopeV1),
+    Error(app_mfg_contract::MfgApiErrorV1),
+}
+
+struct MfgLiveObserverQueue {
+    connection_id: String,
+    observer_id: String,
+    surface_id: String,
+    items: tokio::sync::Mutex<std::collections::VecDeque<MfgLiveQueuedItem>>,
+    notify: tokio::sync::Notify,
+    receiver_closed: std::sync::atomic::AtomicBool,
+    producer_done: std::sync::atomic::AtomicBool,
+    peak: std::sync::atomic::AtomicUsize,
+    peak_events: std::sync::atomic::AtomicUsize,
+    coalesced: std::sync::atomic::AtomicUsize,
+}
+
+impl Drop for MfgLiveObserverQueue {
+    fn drop(&mut self) {
+        tracing::info!(
+            connection_id = %self.connection_id,
+            observer_id = %self.observer_id,
+            surface_id = %self.surface_id,
+            queue_capacity = MFG_LIVE_OBSERVER_QUEUE_CAPACITY,
+            event_capacity = MFG_LIVE_OBSERVER_EVENT_CAPACITY,
+            queue_peak = self.peak.load(std::sync::atomic::Ordering::Relaxed),
+            event_peak = self.peak_events.load(std::sync::atomic::Ordering::Relaxed),
+            coalesced = self.coalesced.load(std::sync::atomic::Ordering::Relaxed),
+            receiver_closed = self
+                .receiver_closed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            producer_done = self
+                .producer_done
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "MFG live observer telemetry"
+        );
+    }
+}
+
+impl MfgLiveObserverQueue {
+    fn new(observer_id: impl Into<String>, surface_id: impl Into<String>) -> Arc<Self> {
+        Arc::new(Self {
+            connection_id: uuid::Uuid::new_v4().to_string(),
+            observer_id: observer_id.into(),
+            surface_id: surface_id.into(),
+            items: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
+            notify: tokio::sync::Notify::new(),
+            receiver_closed: std::sync::atomic::AtomicBool::new(false),
+            producer_done: std::sync::atomic::AtomicBool::new(false),
+            peak: std::sync::atomic::AtomicUsize::new(0),
+            peak_events: std::sync::atomic::AtomicUsize::new(0),
+            coalesced: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    async fn push_envelope(&self, envelope: app_mfg_contract::MfgLiveEnvelopeV1) -> bool {
+        let mut items = self.items.lock().await;
+        if let Some(MfgLiveQueuedItem::Envelope(existing)) = items.back_mut() {
+            match merge_mfg_live_envelope(existing, &envelope) {
+                MfgLiveMergeResult::Merged => {
+                    self.coalesced
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.peak_events.fetch_max(
+                        queued_mfg_live_event_count(&items),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    return true;
+                }
+                MfgLiveMergeResult::CapacityExceeded => return false,
+                MfgLiveMergeResult::NotMergeable => {}
+            }
+        }
+        if items.len() >= MFG_LIVE_OBSERVER_QUEUE_CAPACITY {
+            return false;
+        }
+        items.push_back(MfgLiveQueuedItem::Envelope(envelope));
+        self.peak
+            .fetch_max(items.len(), std::sync::atomic::Ordering::Relaxed);
+        self.peak_events.fetch_max(
+            queued_mfg_live_event_count(&items),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        drop(items);
+        self.notify.notify_one();
+        true
+    }
+
+    async fn finish_with(&self, item: MfgLiveQueuedItem) {
+        let mut items = self.items.lock().await;
+        items.clear();
+        items.push_back(item);
+        self.producer_done
+            .store(true, std::sync::atomic::Ordering::Release);
+        drop(items);
+        self.notify.notify_waiters();
+    }
+
+    async fn pop(&self) -> Option<MfgLiveQueuedItem> {
+        loop {
+            let notified = self.notify.notified();
+            if let Some(item) = self.items.lock().await.pop_front() {
+                return Some(item);
+            }
+            if self
+                .producer_done
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return None;
+            }
+            notified.await;
+        }
+    }
+
+    fn close_receiver(&self) {
+        self.receiver_closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    fn receiver_is_closed(&self) -> bool {
+        self.receiver_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MfgLiveMergeResult {
+    Merged,
+    NotMergeable,
+    CapacityExceeded,
+}
+
+fn merge_mfg_live_envelope(
+    existing: &mut app_mfg_contract::MfgLiveEnvelopeV1,
+    incoming: &app_mfg_contract::MfgLiveEnvelopeV1,
+) -> MfgLiveMergeResult {
+    match (existing, incoming) {
+        (
+            app_mfg_contract::MfgLiveEnvelopeV1::Delta(existing),
+            app_mfg_contract::MfgLiveEnvelopeV1::Delta(incoming),
+        ) if existing.view_epoch == incoming.view_epoch
+            && existing.target_cursor == incoming.base_cursor =>
+        {
+            let mut merged = existing.events.clone();
+            for event in &incoming.events {
+                if app_mfg_contract::mfg_live_event_priority(&event.event_type, &event.payload) >= 2
+                {
+                    merged.retain(|queued| {
+                        queued.event_type != event.event_type
+                            || queued.subject_ref != event.subject_ref
+                    });
+                }
+                merged.push(event.clone());
+                if merged.len() > MFG_LIVE_OBSERVER_EVENT_CAPACITY {
+                    return MfgLiveMergeResult::CapacityExceeded;
+                }
+            }
+            existing.events = merged;
+            existing.target_cursor.clone_from(&incoming.target_cursor);
+            MfgLiveMergeResult::Merged
+        }
+        (
+            app_mfg_contract::MfgLiveEnvelopeV1::Heartbeat(existing),
+            app_mfg_contract::MfgLiveEnvelopeV1::Heartbeat(incoming),
+        ) if existing.view_epoch == incoming.view_epoch => {
+            *existing = incoming.clone();
+            MfgLiveMergeResult::Merged
+        }
+        _ => MfgLiveMergeResult::NotMergeable,
+    }
+}
+
+fn queued_mfg_live_event_count(items: &std::collections::VecDeque<MfgLiveQueuedItem>) -> usize {
+    items
+        .iter()
+        .map(|item| match item {
+            MfgLiveQueuedItem::Envelope(app_mfg_contract::MfgLiveEnvelopeV1::Delta(delta)) => {
+                delta.events.len()
+            }
+            MfgLiveQueuedItem::Envelope(_) | MfgLiveQueuedItem::Error(_) => 1,
+        })
+        .sum()
+}
+
+struct MfgLiveObserverReceiver {
+    queue: Arc<MfgLiveObserverQueue>,
+    close_after_emit: bool,
+}
+
+struct MfgLiveProducerGuard(Arc<MfgLiveObserverQueue>);
+
+impl Drop for MfgLiveProducerGuard {
+    fn drop(&mut self) {
+        self.0
+            .producer_done
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.0.notify.notify_waiters();
+    }
+}
+
+impl Drop for MfgLiveObserverReceiver {
+    fn drop(&mut self) {
+        self.queue.close_receiver();
+    }
+}
+
+pub(super) async fn mfg_live_snapshot_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let principal = mfg_live_principal_context(&principal);
+    if state.auth_token.is_some() {
+        if let Some(error) = state
+            .services
+            .mfg
+            .live_authorization_error_async(state.config_home.clone(), principal.clone())
+            .await
+        {
+            return Err(mfg_typed_api_error(error));
+        }
+    }
+    state
+        .services
+        .mfg
+        .live_snapshot_envelope_async(state.config_home.clone(), principal)
+        .await
+        .map(Json)
+        .map_err(mfg_live_service_error)
+}
+
 pub(super) async fn mfg_live_projection_handler(
     AxumState(state): AxumState<Arc<AppState>>,
-    Extension(_principal): Extension<AuthenticatedPrincipal>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Query(query): Query<MfgLiveQuery>,
     headers: HeaderMap,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
-    let cursor = headers
-        .get("last-event-id")
+    let surface_id = headers
+        .get("x-cowd-surface-id")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .or(query.cursor);
-    let limit = query.limit.unwrap_or(100).clamp(1, 500);
-    let wants_sse = headers
-        .get(header::ACCEPT)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown")
+        .chars()
+        .take(64)
+        .collect::<String>();
+    let observer_id = headers
+        .get("x-cowd-observer-id")
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.contains("text/event-stream"));
-    if !wants_sse {
-        let projection = state
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(128).collect::<String>())
+        .unwrap_or_else(|| format!("{surface_id}:{}", uuid::Uuid::new_v4()));
+    let principal = mfg_live_principal_context(&principal);
+    let validate_authorization = state.auth_token.is_some();
+    if validate_authorization {
+        if let Some(error) = state
             .services
             .mfg
-            .live_projection(&state.config_home, cursor, limit)
-            .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-        return Ok(Json(projection).into_response());
+            .live_authorization_error_async(state.config_home.clone(), principal.clone())
+            .await
+        {
+            return Err(mfg_typed_api_error(error));
+        }
     }
+    let supplied_cursor = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let supplied_epoch = headers
+        .get("x-mfg-view-epoch")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    let pending = if let Some(cursor) = supplied_cursor.as_deref() {
+        state
+            .services
+            .mfg
+            .live_delta_envelope_async(
+                state.config_home.clone(),
+                principal.clone(),
+                supplied_epoch.clone().unwrap_or_default(),
+                cursor.to_string(),
+                limit,
+            )
+            .await
+            .map_err(mfg_live_service_error)?
+    } else {
+        Some(
+            state
+                .services
+                .mfg
+                .live_snapshot_envelope_async(state.config_home.clone(), principal.clone())
+                .await
+                .map_err(mfg_live_service_error)?,
+        )
+    };
+    let (cursor, view_epoch) = if let Some(seed) = pending.as_ref() {
+        mfg_live_envelope_position(seed)
+    } else {
+        state
+            .services
+            .mfg
+            .live_heartbeat_envelope_async(
+                state.config_home.clone(),
+                principal.clone(),
+                supplied_cursor.clone().unwrap_or_default(),
+            )
+            .await
+            .map_err(mfg_live_service_error)?;
+        (
+            supplied_cursor.clone().unwrap_or_default(),
+            supplied_epoch.clone().unwrap_or_default(),
+        )
+    };
+    let queue = MfgLiveObserverQueue::new(observer_id, surface_id);
+    tokio::spawn(run_mfg_live_observer_producer(
+        Arc::clone(&state),
+        principal,
+        cursor,
+        view_epoch,
+        limit,
+        pending,
+        validate_authorization,
+        Arc::clone(&queue),
+    ));
     let stream = futures::stream::unfold(
-        (state, cursor, limit),
-        |(state, mut cursor, limit)| async move {
-            loop {
-                match state
-                    .services
-                    .mfg
-                    .live_projection(&state.config_home, cursor, limit)
-                {
-                    Ok(projection)
-                        if projection.kind == "snapshot"
-                            || projection.kind == "resync"
-                            || !projection.events.is_empty() =>
-                    {
-                        cursor = Some(projection.cursor);
-                        let event_type = match projection.kind.as_str() {
-                            "snapshot" => "mfg_snapshot",
-                            "resync" => "mfg_resync",
-                            _ => "mfg_delta",
-                        };
-                        let event = Event::default()
-                            .id(projection.cursor.to_string())
-                            .event(event_type)
-                            .json_data(projection)
-                            .unwrap_or_else(|_| Event::default().event("mfg_projection_error"));
-                        return Some((Ok::<Event, Infallible>(event), (state, cursor, limit)));
-                    }
-                    Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(500)).await,
-                    Err(error) => {
-                        let event = Event::default().event("mfg_resync").data(serde_json::json!({ "reason": error.to_string(), "snapshot_url": "/api/apps/mfg/live" }).to_string());
-                        return Some((Ok(event), (state, None, limit)));
-                    }
-                }
+        MfgLiveObserverReceiver {
+            queue,
+            close_after_emit: false,
+        },
+        |mut receiver| async move {
+            if receiver.close_after_emit {
+                return None;
             }
+            let item = receiver.queue.pop().await?;
+            let (event, terminal) = match item {
+                MfgLiveQueuedItem::Envelope(envelope) => {
+                    let terminal =
+                        matches!(envelope, app_mfg_contract::MfgLiveEnvelopeV1::Resync(_));
+                    let (cursor, _) = mfg_live_envelope_position(&envelope);
+                    let event = Event::default()
+                        .id(cursor)
+                        .event("mfg_live")
+                        .json_data(envelope)
+                        .unwrap_or_else(|_| Event::default().event("mfg_live_error"));
+                    (event, terminal)
+                }
+                MfgLiveQueuedItem::Error(error) => {
+                    let event = Event::default()
+                        .event("mfg_live_error")
+                        .json_data(error)
+                        .unwrap_or_else(|_| Event::default().event("mfg_live_error"));
+                    (event, true)
+                }
+            };
+            receiver.close_after_emit = terminal;
+            Some((Ok::<Event, Infallible>(event), receiver))
         },
     );
     Ok(Sse::new(stream)
-        .keep_alive(axum::response::sse::KeepAlive::default())
+        .keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .text("keepalive"),
+        )
         .into_response())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_mfg_live_observer_producer(
+    app: Arc<AppState>,
+    principal: crate::services::MfgLivePrincipalContext,
+    mut cursor: String,
+    mut view_epoch: String,
+    limit: usize,
+    mut pending: Option<app_mfg_contract::MfgLiveEnvelopeV1>,
+    validate_authorization: bool,
+    queue: Arc<MfgLiveObserverQueue>,
+) {
+    let _producer_guard = MfgLiveProducerGuard(Arc::clone(&queue));
+    let mut last_heartbeat = Instant::now();
+    let mut last_authorization_check = Instant::now();
+    let mut last_telemetry = (usize::MAX, usize::MAX, usize::MAX);
+    loop {
+        let telemetry = (
+            queue.peak.load(std::sync::atomic::Ordering::Relaxed),
+            queue.peak_events.load(std::sync::atomic::Ordering::Relaxed),
+            queue.coalesced.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        if telemetry != last_telemetry {
+            tracing::info!(
+                connection_id = %queue.connection_id,
+                observer_id = %queue.observer_id,
+                surface_id = %queue.surface_id,
+                queue_capacity = MFG_LIVE_OBSERVER_QUEUE_CAPACITY,
+                event_capacity = MFG_LIVE_OBSERVER_EVENT_CAPACITY,
+                queue_peak = telemetry.0,
+                event_peak = telemetry.1,
+                coalesced = telemetry.2,
+                "MFG live observer telemetry sample"
+            );
+            last_telemetry = telemetry;
+        }
+        if queue.receiver_is_closed() {
+            tracing::debug!(
+                connection_id = %queue.connection_id,
+                observer_id = %queue.observer_id,
+                surface_id = %queue.surface_id,
+                queue_peak = queue.peak.load(std::sync::atomic::Ordering::Relaxed),
+                event_peak = queue.peak_events.load(std::sync::atomic::Ordering::Relaxed),
+                coalesced = queue.coalesced.load(std::sync::atomic::Ordering::Relaxed),
+                "MFG live observer released"
+            );
+            return;
+        }
+        if validate_authorization && last_authorization_check.elapsed().as_secs() >= 2 {
+            if let Some(error) = app
+                .services
+                .mfg
+                .live_authorization_error_async(app.config_home.clone(), principal.clone())
+                .await
+            {
+                queue.finish_with(MfgLiveQueuedItem::Error(error)).await;
+                return;
+            }
+            last_authorization_check = Instant::now();
+        }
+        let envelope = if let Some(pending) = pending.take() {
+            Some(pending)
+        } else {
+            match app
+                .services
+                .mfg
+                .live_delta_envelope_async(
+                    app.config_home.clone(),
+                    principal.clone(),
+                    view_epoch.clone(),
+                    cursor.clone(),
+                    limit,
+                )
+                .await
+            {
+                Ok(Some(envelope)) => Some(envelope),
+                Ok(None) if last_heartbeat.elapsed().as_secs() >= 5 => {
+                    match app
+                        .services
+                        .mfg
+                        .live_heartbeat_envelope_async(
+                            app.config_home.clone(),
+                            principal.clone(),
+                            cursor.clone(),
+                        )
+                        .await
+                    {
+                        Ok(envelope) => Some(envelope),
+                        Err(error) => {
+                            queue
+                                .finish_with(MfgLiveQueuedItem::Error(
+                                    mfg_live_service_contract_error(error),
+                                ))
+                                .await;
+                            return;
+                        }
+                    }
+                }
+                Ok(None) => None,
+                Err(error) => {
+                    queue
+                        .finish_with(MfgLiveQueuedItem::Error(mfg_live_service_contract_error(
+                            error,
+                        )))
+                        .await;
+                    return;
+                }
+            }
+        };
+        let Some(envelope) = envelope else {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            continue;
+        };
+        let terminal = matches!(envelope, app_mfg_contract::MfgLiveEnvelopeV1::Resync(_));
+        let (next_cursor, next_epoch) = mfg_live_envelope_position(&envelope);
+        if terminal {
+            queue
+                .finish_with(MfgLiveQueuedItem::Envelope(envelope))
+                .await;
+            return;
+        }
+        if !queue.push_envelope(envelope).await {
+            let reason = "observer_queue_capacity_exceeded";
+            match app
+                .services
+                .mfg
+                .live_resync_envelope_async(
+                    app.config_home.clone(),
+                    principal.clone(),
+                    view_epoch.clone(),
+                    reason.to_string(),
+                )
+                .await
+            {
+                Ok(resync) => {
+                    tracing::warn!(
+                        connection_id = %queue.connection_id,
+                        observer_id = %queue.observer_id,
+                        surface_id = %queue.surface_id,
+                        queue_capacity = MFG_LIVE_OBSERVER_QUEUE_CAPACITY,
+                        event_capacity = MFG_LIVE_OBSERVER_EVENT_CAPACITY,
+                        queue_peak = queue.peak.load(std::sync::atomic::Ordering::Relaxed),
+                        event_peak = queue.peak_events.load(std::sync::atomic::Ordering::Relaxed),
+                        coalesced = queue.coalesced.load(std::sync::atomic::Ordering::Relaxed),
+                        reason,
+                        "MFG live slow observer disconnected with typed resync"
+                    );
+                    queue.finish_with(MfgLiveQueuedItem::Envelope(resync)).await;
+                }
+                Err(error) => {
+                    queue
+                        .finish_with(MfgLiveQueuedItem::Error(mfg_live_service_contract_error(
+                            error,
+                        )))
+                        .await;
+                }
+            }
+            return;
+        }
+        cursor = next_cursor;
+        view_epoch = next_epoch;
+        last_heartbeat = Instant::now();
+    }
+}
+
+fn mfg_live_principal_context(
+    principal: &AuthenticatedPrincipal,
+) -> crate::services::MfgLivePrincipalContext {
+    crate::services::MfgLivePrincipalContext {
+        principal_id: principal.0.claims().principal_id.clone(),
+        profile_revision: principal.0.claims().profile_revision,
+        scopes: principal.0.claims().scopes.clone(),
+        capabilities: principal.0.claims().capabilities.clone(),
+        credential_epoch: principal.0.claims().credential_epoch,
+        expires_at_ms: principal.0.claims().expires_at_ms,
+    }
+}
+
+fn mfg_live_envelope_position(envelope: &app_mfg_contract::MfgLiveEnvelopeV1) -> (String, String) {
+    match envelope {
+        app_mfg_contract::MfgLiveEnvelopeV1::Snapshot(snapshot) => {
+            (snapshot.cursor.clone(), snapshot.view_epoch.clone())
+        }
+        app_mfg_contract::MfgLiveEnvelopeV1::Delta(delta) => {
+            (delta.target_cursor.clone(), delta.view_epoch.clone())
+        }
+        app_mfg_contract::MfgLiveEnvelopeV1::Heartbeat(heartbeat) => {
+            (heartbeat.cursor.clone(), heartbeat.view_epoch.clone())
+        }
+        app_mfg_contract::MfgLiveEnvelopeV1::Resync(resync) => {
+            (resync.latest_cursor.clone(), String::new())
+        }
+    }
+}
+
+fn mfg_live_service_contract_error(
+    error: crate::services::MfgLiveServiceError,
+) -> app_mfg_contract::MfgApiErrorV1 {
+    match error {
+        crate::services::MfgLiveServiceError::InvalidCursorKey(message) => {
+            app_mfg_contract::MfgApiErrorV1 {
+                code: app_mfg_contract::MfgErrorCode::MfgLiveCursorKeyInvalid,
+                message,
+                http_status: StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                details: serde_json::json!({
+                    "key_file": "mfg-live-cursor.key",
+                    "required_mode": "0600",
+                    "required_bytes": 32,
+                }),
+                retryable: false,
+                contract_version: app_mfg_contract::MfgContractVersion::default(),
+                recovery_actions: vec![app_mfg_contract::MfgRecoveryAction {
+                    kind: app_mfg_contract::MfgRecoveryActionKind::RequestManualReview,
+                    label: "Repair the live cursor key securely".to_string(),
+                    target: None,
+                    enabled: true,
+                }],
+                request_id: None,
+                receipt_ref: None,
+            }
+        }
+        crate::services::MfgLiveServiceError::CursorKeyIo(message) => {
+            app_mfg_contract::MfgApiErrorV1 {
+                code: app_mfg_contract::MfgErrorCode::Internal,
+                message,
+                http_status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                details: serde_json::Value::Null,
+                retryable: true,
+                contract_version: app_mfg_contract::MfgContractVersion::default(),
+                recovery_actions: vec![app_mfg_contract::MfgRecoveryAction {
+                    kind: app_mfg_contract::MfgRecoveryActionKind::RetrySameIntent,
+                    label: "Reconnect MFG live updates".to_string(),
+                    target: Some("/api/apps/mfg/live/snapshot".to_string()),
+                    enabled: true,
+                }],
+                request_id: None,
+                receipt_ref: None,
+            }
+        }
+        crate::services::MfgLiveServiceError::Repository(error) => {
+            app_mfg_contract::MfgApiErrorV1 {
+                code: app_mfg_contract::MfgErrorCode::Internal,
+                message: error.to_string(),
+                http_status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                details: serde_json::Value::Null,
+                retryable: true,
+                contract_version: app_mfg_contract::MfgContractVersion::default(),
+                recovery_actions: Vec::new(),
+                request_id: None,
+                receipt_ref: None,
+            }
+        }
+    }
+}
+
+fn mfg_live_service_error(
+    error: crate::services::MfgLiveServiceError,
+) -> (StatusCode, Json<ErrorResponse>) {
+    match error {
+        crate::services::MfgLiveServiceError::InvalidCursorKey(message) => {
+            mfg_typed_api_error(app_mfg_contract::MfgApiErrorV1 {
+                code: app_mfg_contract::MfgErrorCode::MfgLiveCursorKeyInvalid,
+                message,
+                http_status: StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                details: serde_json::json!({
+                    "key_file": "mfg-live-cursor.key",
+                    "required_mode": "0600",
+                    "required_bytes": 32,
+                }),
+                retryable: false,
+                contract_version: app_mfg_contract::MfgContractVersion::default(),
+                recovery_actions: vec![app_mfg_contract::MfgRecoveryAction {
+                    kind: app_mfg_contract::MfgRecoveryActionKind::RequestManualReview,
+                    label: "Repair the live cursor key securely".to_string(),
+                    target: None,
+                    enabled: true,
+                }],
+                request_id: None,
+                receipt_ref: None,
+            })
+        }
+        crate::services::MfgLiveServiceError::CursorKeyIo(message) => {
+            mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, message)
+        }
+        crate::services::MfgLiveServiceError::Repository(error) => {
+            mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+        }
+    }
+}
+
+#[cfg(test)]
+mod live_observer_queue_tests {
+    use super::*;
+
+    fn event(event_type: &str, subject_ref: &str) -> app_mfg_contract::MfgLiveEventV1 {
+        app_mfg_contract::MfgLiveEventV1 {
+            event_type: event_type.to_string(),
+            subject_ref: subject_ref.to_string(),
+            revision: 1,
+            occurred_at: chrono::Utc::now(),
+            payload: serde_json::json!({"subject_ref": subject_ref}),
+        }
+    }
+
+    fn delta(
+        base: impl Into<String>,
+        target: impl Into<String>,
+        events: Vec<app_mfg_contract::MfgLiveEventV1>,
+    ) -> app_mfg_contract::MfgLiveEnvelopeV1 {
+        app_mfg_contract::MfgLiveEnvelopeV1::Delta(app_mfg_contract::MfgLiveDeltaV1 {
+            view_epoch: "view-1".to_string(),
+            base_cursor: base.into(),
+            target_cursor: target.into(),
+            events,
+        })
+    }
+
+    fn resync(index: usize) -> app_mfg_contract::MfgLiveEnvelopeV1 {
+        app_mfg_contract::MfgLiveEnvelopeV1::Resync(app_mfg_contract::MfgLiveResyncV1 {
+            previous_view_epoch: "view-1".to_string(),
+            reason: "test".to_string(),
+            snapshot_url: "/api/apps/mfg/live/snapshot".to_string(),
+            latest_cursor: format!("cursor-{index}"),
+        })
+    }
+
+    #[test]
+    fn coalescing_preserves_p0_and_p1_and_replaces_only_same_subject_domain_events() {
+        let mut queued = delta(
+            "cursor-0",
+            "cursor-1",
+            vec![
+                event("report_review.decided", "review:1"),
+                event("receipt.recorded", "receipt:1"),
+                event("entity.updated", "entity:1"),
+            ],
+        );
+        let incoming = delta(
+            "cursor-1",
+            "cursor-2",
+            vec![
+                event("entity.updated", "entity:1"),
+                event("metric.snapshot", "metric:1"),
+            ],
+        );
+        assert_eq!(
+            merge_mfg_live_envelope(&mut queued, &incoming),
+            MfgLiveMergeResult::Merged
+        );
+        let app_mfg_contract::MfgLiveEnvelopeV1::Delta(queued) = queued else {
+            panic!("delta")
+        };
+        assert_eq!(queued.target_cursor, "cursor-2");
+        assert_eq!(
+            queued
+                .events
+                .iter()
+                .filter(|event| event.event_type == "report_review.decided")
+                .count(),
+            1
+        );
+        assert_eq!(
+            queued
+                .events
+                .iter()
+                .filter(|event| event.event_type == "receipt.recorded")
+                .count(),
+            1
+        );
+        assert_eq!(
+            queued
+                .events
+                .iter()
+                .filter(|event| {
+                    event.event_type == "entity.updated" && event.subject_ref == "entity:1"
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn merged_delta_has_a_hard_event_bound_and_is_not_partially_mutated_on_overflow() {
+        let events = (0..MFG_LIVE_OBSERVER_EVENT_CAPACITY)
+            .map(|index| event("entity.updated", &format!("entity:{index}")))
+            .collect::<Vec<_>>();
+        let mut queued = delta("cursor-0", "cursor-1", events);
+        let original = queued.clone();
+        let incoming = delta(
+            "cursor-1",
+            "cursor-2",
+            vec![event("entity.updated", "entity:overflow")],
+        );
+        assert_eq!(
+            merge_mfg_live_envelope(&mut queued, &incoming),
+            MfgLiveMergeResult::CapacityExceeded
+        );
+        assert_eq!(queued, original);
+    }
+
+    #[tokio::test]
+    async fn observer_queue_is_bounded_and_closes_only_the_slow_receiver() {
+        let queue = MfgLiveObserverQueue::new("test-slow", "test");
+        for index in 0..MFG_LIVE_OBSERVER_QUEUE_CAPACITY {
+            assert!(queue.push_envelope(resync(index)).await);
+        }
+        assert!(
+            !queue
+                .push_envelope(resync(MFG_LIVE_OBSERVER_QUEUE_CAPACITY))
+                .await
+        );
+        assert_eq!(
+            queue.peak.load(std::sync::atomic::Ordering::Relaxed),
+            MFG_LIVE_OBSERVER_QUEUE_CAPACITY
+        );
+        assert!(!queue.receiver_is_closed());
+        queue.close_receiver();
+        assert!(queue.receiver_is_closed());
+
+        let independent = MfgLiveObserverQueue::new("test-independent", "test");
+        assert!(independent.push_envelope(resync(1)).await);
+        assert!(!independent.receiver_is_closed());
+    }
+
+    #[tokio::test]
+    async fn producer_drop_wakes_the_receiver_instead_of_leaving_a_zombie_stream() {
+        let queue = MfgLiveObserverQueue::new("test-producer", "test");
+        {
+            let _guard = MfgLiveProducerGuard(Arc::clone(&queue));
+        }
+        assert!(queue.pop().await.is_none());
+    }
 }

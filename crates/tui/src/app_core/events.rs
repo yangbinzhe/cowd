@@ -53,6 +53,15 @@ impl CowdEventSender {
     pub fn try_send(&self, event: CowdEvent) -> Result<(), mpsc::error::TrySendError<CowdEvent>> {
         self.send(event)
     }
+
+    /// Backpressured delivery for durable projection streams. The producer
+    /// must not advance its cursor until the UI has accepted the envelope.
+    pub async fn send_wait(
+        &self,
+        event: CowdEvent,
+    ) -> Result<(), mpsc::error::SendError<CowdEvent>> {
+        self.inner.send(event).await
+    }
 }
 
 impl CowdEventReceiver {
@@ -262,6 +271,28 @@ mod tests {
                 text: "overflow".into(),
             })
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn durable_stream_delivery_waits_for_capacity_instead_of_dropping() {
+        let (tx, mut rx) = cowd_event_channel();
+        for index in 0..EVENT_CHANNEL_CAPACITY {
+            tx.try_send(CowdEvent::TextDelta {
+                text: index.to_string(),
+            })
+            .expect("capacity");
+        }
+        let pending = tokio::spawn({
+            let tx = tx.clone();
+            async move {
+                tx.send_wait(CowdEvent::MfgLiveStopped { generation: 7 })
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(!pending.is_finished());
+        let _ = rx.try_recv().expect("free one event slot");
+        assert!(pending.await.expect("sender task").is_ok());
     }
 
     #[test]

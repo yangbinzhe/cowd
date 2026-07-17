@@ -695,6 +695,10 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             "/api/apps/mfg/assignments/:id/command",
             post(mfg_assignment_command_handler),
         )
+        .route(
+            "/api/apps/mfg/live/snapshot",
+            get(mfg_live_snapshot_handler),
+        )
         .route("/api/apps/mfg/live", get(mfg_live_projection_handler))
         .route_layer(axum::middleware::from_fn_with_state(
             state,

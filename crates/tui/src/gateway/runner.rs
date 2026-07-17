@@ -115,6 +115,14 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
     )?;
     start_pending_mfg_refresh(&mut state, &gateway_client, &tui_tx);
     start_pending_mfg_action(&mut state, &gateway_client, &tui_tx);
+    let mfg_live_generation = state.app.mfg_operations.begin_live_consumer();
+    let (mfg_live_contract_tx, mfg_live_contract_rx) = tokio::sync::watch::channel(false);
+    let mfg_live_task = runtime.spawn(run_mfg_live_consumer(
+        gateway_client.clone(),
+        tui_tx.clone(),
+        mfg_live_generation,
+        mfg_live_contract_rx,
+    ));
 
     terminal.draw(|frame| state.render(frame))?;
 
@@ -147,9 +155,12 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
     send_session_list(&tui_tx, gateway_session_ids, &session_id);
 
     let startup_ready = true;
+    let mfg_live_artifact_path = std::env::var_os("COWD_TUI_MFG_STATE_ARTIFACT").map(PathBuf::from);
     let res = runtime.block_on(async {
         let mut reader = crossterm::event::EventStream::new();
         let mut execution_projection_stream = None;
+        let mut mfg_contract_was_active = false;
+        let mut last_mfg_artifact_fingerprint = None;
         loop {
             tokio::select! {
                 Some(Ok(event)) = reader.next() => {
@@ -328,6 +339,27 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                         &tui_tx,
                         &mut execution_projection_stream,
                     ).await;
+                    let mfg_contract_is_active = state.app.mfg_operations.contract.is_some();
+                    if mfg_contract_is_active {
+                        mfg_contract_was_active = true;
+                    }
+                    if mfg_contract_is_active
+                        != *mfg_live_contract_tx.borrow()
+                        && (mfg_contract_is_active || mfg_contract_was_active)
+                    {
+                        let _ = mfg_live_contract_tx.send(mfg_contract_is_active);
+                    }
+                    if let Some(path) = mfg_live_artifact_path.as_deref() {
+                        let fingerprint = (
+                            state.app.mfg_operations.live_cursor.clone(),
+                            state.app.mfg_operations.live_generation,
+                            state.app.mfg_operations.live_stream_available,
+                        );
+                        if last_mfg_artifact_fingerprint.as_ref() != Some(&fingerprint) {
+                            record_mfg_live_state_artifact(path, &state.app.mfg_operations)?;
+                            last_mfg_artifact_fingerprint = Some(fingerprint);
+                        }
+                    }
                     start_pending_mfg_refresh(&mut state, &gateway_client, &tui_tx);
                     start_pending_mfg_action(&mut state, &gateway_client, &tui_tx);
                     start_pending_mfg_backlink_resolution(&mut state, &gateway_client, &tui_tx);
@@ -347,6 +379,10 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
         Ok::<(), Box<dyn std::error::Error>>(())
     });
 
+    mfg_live_task.abort();
+    let _ = runtime.block_on(mfg_live_task);
+    let live_generation = state.app.mfg_operations.live_generation;
+    state.app.mfg_operations.stop_live_consumer(live_generation);
     if gateway_lease_owner.is_some() {
         let _ = runtime.block_on(gateway_client.release_runtime_session_lease(&session_id));
     }
@@ -360,6 +396,333 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     res
+}
+
+async fn run_mfg_live_consumer(
+    client: GatewayApiClient,
+    tx: CowdEventSender,
+    mut generation: u64,
+    mut contract_active: tokio::sync::watch::Receiver<bool>,
+) {
+    if wait_for_mfg_live_contract(&mut contract_active)
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let mut reconnect_attempt = 0_u32;
+    'snapshot: loop {
+        let snapshot_result = tokio::select! {
+            _ = wait_for_mfg_live_contract_loss(&mut contract_active) => {
+                let Some(next) = reactivate_mfg_live_after_contract_loss(
+                    &tx, generation, &mut contract_active,
+                ).await else {
+                    return;
+                };
+                generation = next;
+                continue 'snapshot;
+            }
+            result = client.mfg_live_snapshot() => result,
+        };
+        let snapshot = match snapshot_result {
+            Ok(app_mfg_contract::MfgLiveEnvelopeV1::Snapshot(snapshot))
+                if snapshot.contract_version.0 == app_mfg_contract::MFG_CONTRACT_VERSION =>
+            {
+                snapshot
+            }
+            Ok(app_mfg_contract::MfgLiveEnvelopeV1::Snapshot(snapshot)) => {
+                let _ = tx
+                    .send_wait(CowdEvent::MfgLiveFailed {
+                        generation,
+                        error: mfg_contract_error(format!(
+                            "MFG live contract mismatch: expected {}, received {}",
+                            app_mfg_contract::MFG_CONTRACT_VERSION,
+                            snapshot.contract_version.0,
+                        )),
+                    })
+                    .await;
+                return;
+            }
+            Ok(_) => {
+                let _ = tx
+                    .send_wait(CowdEvent::MfgLiveFailed {
+                        generation,
+                        error: mfg_contract_error(
+                            "MFG live snapshot endpoint returned a non-snapshot envelope"
+                                .to_string(),
+                        ),
+                    })
+                    .await;
+                return;
+            }
+            Err(error) => {
+                let error = mfg_api_error_from_gateway(&error);
+                let terminal = matches!(
+                    error.code,
+                    app_mfg_contract::MfgErrorCode::AuthenticationRequired
+                        | app_mfg_contract::MfgErrorCode::CapabilityDenied
+                        | app_mfg_contract::MfgErrorCode::MfgLiveCursorKeyInvalid
+                );
+                if tx
+                    .send_wait(CowdEvent::MfgLiveFailed { generation, error })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                if terminal {
+                    return;
+                }
+                if mfg_live_reconnect_wait(
+                    mfg_live_reconnect_delay(reconnect_attempt),
+                    &mut contract_active,
+                )
+                .await
+                {
+                    let Some(next) = reactivate_mfg_live_after_contract_loss(
+                        &tx,
+                        generation,
+                        &mut contract_active,
+                    )
+                    .await
+                    else {
+                        return;
+                    };
+                    generation = next;
+                    continue 'snapshot;
+                }
+                reconnect_attempt = reconnect_attempt.saturating_add(1);
+                continue;
+            }
+        };
+        let cursor = snapshot.cursor.clone();
+        let view_epoch = snapshot.view_epoch.clone();
+        if tx
+            .send_wait(CowdEvent::MfgLiveEnvelope {
+                generation,
+                envelope: app_mfg_contract::MfgLiveEnvelopeV1::Snapshot(snapshot),
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+        reconnect_attempt = 0;
+        loop {
+            let subscription = tokio::select! {
+                _ = wait_for_mfg_live_contract_loss(&mut contract_active) => {
+                    let Some(next) = reactivate_mfg_live_after_contract_loss(
+                        &tx, generation, &mut contract_active,
+                    ).await else {
+                        return;
+                    };
+                    generation = next;
+                    continue 'snapshot;
+                }
+                result = client.subscribe_mfg_live(generation, &cursor, &view_epoch, tx.clone()) => result,
+            };
+            match subscription {
+                Ok(outcome) if outcome.resync_required => {
+                    generation = generation.saturating_add(1);
+                    break;
+                }
+                Ok(_) => {
+                    if mfg_live_reconnect_wait(
+                        mfg_live_reconnect_delay(reconnect_attempt),
+                        &mut contract_active,
+                    )
+                    .await
+                    {
+                        let Some(next) = reactivate_mfg_live_after_contract_loss(
+                            &tx,
+                            generation,
+                            &mut contract_active,
+                        )
+                        .await
+                        else {
+                            return;
+                        };
+                        generation = next;
+                        continue 'snapshot;
+                    }
+                    // A completed SSE response is a transport boundary, not a
+                    // durable state proof. Install a fresh transactional
+                    // snapshot under a new generation before consuming again.
+                    generation = generation.saturating_add(1);
+                    break;
+                }
+                Err(error) => {
+                    let error = mfg_api_error_from_gateway(&error);
+                    let reauthenticate = mfg_live_reauthentication_allowed(&error);
+                    let terminal = matches!(
+                        error.code,
+                        app_mfg_contract::MfgErrorCode::AuthenticationRequired
+                            | app_mfg_contract::MfgErrorCode::CapabilityDenied
+                            | app_mfg_contract::MfgErrorCode::MfgLiveCursorKeyInvalid
+                    );
+                    if tx
+                        .send_wait(CowdEvent::MfgLiveFailed { generation, error })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    if terminal {
+                        if reauthenticate {
+                            generation = generation.saturating_add(1);
+                            break;
+                        }
+                        return;
+                    }
+                    if mfg_live_reconnect_wait(
+                        mfg_live_reconnect_delay(reconnect_attempt),
+                        &mut contract_active,
+                    )
+                    .await
+                    {
+                        let Some(next) = reactivate_mfg_live_after_contract_loss(
+                            &tx,
+                            generation,
+                            &mut contract_active,
+                        )
+                        .await
+                        else {
+                            return;
+                        };
+                        generation = next;
+                        continue 'snapshot;
+                    }
+                    generation = generation.saturating_add(1);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn reactivate_mfg_live_after_contract_loss(
+    tx: &CowdEventSender,
+    generation: u64,
+    contract_active: &mut tokio::sync::watch::Receiver<bool>,
+) -> Option<u64> {
+    let _ = tx.send_wait(CowdEvent::MfgLiveStopped { generation }).await;
+    wait_for_mfg_live_contract(contract_active)
+        .await
+        .ok()
+        .map(|()| generation.saturating_add(1))
+}
+
+async fn wait_for_mfg_live_contract(
+    contract_active: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<(), ()> {
+    loop {
+        if *contract_active.borrow() {
+            return Ok(());
+        }
+        contract_active.changed().await.map_err(|_| ())?;
+    }
+}
+
+async fn wait_for_mfg_live_contract_loss(contract_active: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if !*contract_active.borrow() {
+            return;
+        }
+        if contract_active.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn mfg_live_reconnect_wait(
+    duration: Duration,
+    contract_active: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    tokio::select! {
+        () = wait_for_mfg_live_contract_loss(contract_active) => true,
+        () = tokio::time::sleep(duration) => false,
+    }
+}
+
+fn mfg_live_reconnect_delay(attempt: u32) -> Duration {
+    let exponent = attempt.min(5);
+    let base_ms = 250_u64.saturating_mul(1_u64 << exponent);
+    let jitter_ms = u64::from(attempt.wrapping_mul(73) % 251);
+    Duration::from_millis((base_ms + jitter_ms).min(8_000))
+}
+
+fn mfg_live_reauthentication_allowed(error: &app_mfg_contract::MfgApiErrorV1) -> bool {
+    matches!(
+        error
+            .details
+            .get("reason")
+            .and_then(serde_json::Value::as_str),
+        Some("profile_revision_changed" | "credential_epoch_changed")
+    )
+}
+
+fn record_mfg_live_state_artifact(
+    path: &Path,
+    state: &MfgOperationsState,
+) -> Result<(), std::io::Error> {
+    fn summaries(items: &[MfgItemSummary]) -> Vec<serde_json::Value> {
+        items
+            .iter()
+            .map(|item| {
+                serde_json::json!({
+                    "id": item.id,
+                    "kind": item.kind,
+                    "status": item.status,
+                    "revision": item.revision,
+                    "report_id": item.raw.get("report_id"),
+                    "delivery_receipt_ids": item.raw
+                        .get("delivery_receipts")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|receipt| receipt.get("delivery_id"))
+                        .filter_map(serde_json::Value::as_str)
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect()
+    }
+
+    let value = serde_json::json!({
+        "surface": "tui",
+        "recorded_at": chrono::Utc::now(),
+        "live": {
+            "view_epoch": state.live_epoch,
+            "cursor": state.live_cursor,
+            "generation": state.live_generation,
+            "reauthentication_count": state.live_reauthentication_count,
+            "available": state.live_stream_available,
+            "resync_url": state.live_resync_url,
+        },
+        "assignments": summaries(&state.assignments),
+        "alerts": summaries(&state.alerts),
+        "incidents": summaries(&state.incidents),
+        "reports": summaries(&state.reports),
+        "reviews": summaries(&state.reviews),
+        "receipts": state.live_receipts.iter().map(|receipt| serde_json::json!({
+            "id": receipt.receipt_id.as_str(),
+            "action_id": receipt.action_id.as_str(),
+            "resource_ref": receipt.resource_ref.as_str(),
+            "status": receipt.status,
+            "revision": receipt.result_revision,
+        })).collect::<Vec<_>>(),
+        "insights": summaries(&state.insights),
+        "last_error": state.last_error,
+    });
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(
+        &temporary,
+        serde_json::to_vec_pretty(&value).map_err(std::io::Error::other)?,
+    )?;
+    std::fs::rename(temporary, path)
 }
 
 fn attach_gateway_session(
@@ -2890,6 +3253,63 @@ mod tests {
         capabilities.sort();
         capabilities.dedup();
         capabilities
+    }
+
+    #[tokio::test]
+    async fn mfg_live_contract_gate_starts_once_and_cancels_blocked_work_on_loss() {
+        let (contract_tx, mut contract_rx) = tokio::sync::watch::channel(false);
+        let mut start_rx = contract_rx.clone();
+        let waiting = tokio::spawn(async move { wait_for_mfg_live_contract(&mut start_rx).await });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        contract_tx.send(true).unwrap();
+        assert!(waiting.await.unwrap().is_ok());
+
+        let blocked = tokio::spawn(async move {
+            mfg_live_reconnect_wait(Duration::from_secs(60), &mut contract_rx).await
+        });
+        tokio::task::yield_now().await;
+        assert!(!blocked.is_finished());
+        contract_tx.send(false).unwrap();
+        assert!(blocked.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn mfg_live_contract_recovery_restarts_with_a_new_generation() {
+        let (event_tx, mut event_rx) = crate::cowd_event_channel();
+        let (contract_tx, mut contract_rx) = tokio::sync::watch::channel(false);
+        let reactivation = tokio::spawn(async move {
+            reactivate_mfg_live_after_contract_loss(&event_tx, 7, &mut contract_rx).await
+        });
+        let mut stopped = false;
+        for _ in 0..16 {
+            if matches!(
+                event_rx.try_recv(),
+                Ok(CowdEvent::MfgLiveStopped { generation: 7 })
+            ) {
+                stopped = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(stopped);
+        assert!(!reactivation.is_finished());
+        contract_tx.send(true).unwrap();
+        assert_eq!(reactivation.await.unwrap(), Some(8));
+    }
+
+    #[test]
+    fn mfg_live_reauth_is_limited_to_rotated_valid_credentials() {
+        let mut rotated =
+            app_mfg_contract::MfgApiErrorV1::authentication_required("profile changed");
+        rotated.details = serde_json::json!({"reason": "profile_revision_changed"});
+        assert!(mfg_live_reauthentication_allowed(&rotated));
+        rotated.details = serde_json::json!({"reason": "credential_epoch_changed"});
+        assert!(mfg_live_reauthentication_allowed(&rotated));
+        rotated.details = serde_json::json!({"reason": "credential_inactive"});
+        assert!(!mfg_live_reauthentication_allowed(&rotated));
+        rotated.details = serde_json::json!({"reason": "authority_unavailable"});
+        assert!(!mfg_live_reauthentication_allowed(&rotated));
     }
 
     #[test]

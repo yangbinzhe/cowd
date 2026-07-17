@@ -54,7 +54,7 @@ pub const fn mfg_route_section(route_id: app_mfg_contract::MfgRouteId) -> Option
         R::ReportDeliveryStateGet => Some("delivery_state"),
         R::ReportReviewList => Some("reviews"),
         R::ReportReviewGet => Some("review_detail"),
-        R::LiveStream => Some("live_stream"),
+        R::LiveStream | R::LiveSnapshot => Some("live_stream"),
         R::RealityHealthGet
         | R::RealityDataPlaneHealthGet
         | R::RealityMetricList
@@ -279,13 +279,27 @@ pub struct MfgOperationsSnapshot {
     pub attempted_routes: BTreeSet<app_mfg_contract::MfgRouteId>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MfgReadDelta {
     pub epoch: Option<String>,
     pub cursor: Option<String>,
     pub base_cursor: Option<String>,
     pub target_cursor: Option<String>,
+    pub priority: u8,
     pub payload: Value,
+}
+
+impl Default for MfgReadDelta {
+    fn default() -> Self {
+        Self {
+            epoch: None,
+            cursor: None,
+            base_cursor: None,
+            target_cursor: None,
+            priority: 3,
+            payload: Value::Null,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -375,6 +389,8 @@ pub struct MfgOperationsState {
     pub insights: Vec<MfgItemSummary>,
     pub receipts: Vec<MfgReceiptV1>,
     #[serde(default)]
+    pub live_receipts: Vec<MfgReceiptV1>,
+    #[serde(default)]
     pub latest_action_result: Option<Value>,
     pub selected_incident_id: Option<String>,
     pub selected_alert_id: Option<String>,
@@ -391,6 +407,12 @@ pub struct MfgOperationsState {
     pub selected_action_index: usize,
     pub live_epoch: Option<String>,
     pub live_cursor: Option<String>,
+    #[serde(default)]
+    pub live_generation: u64,
+    #[serde(default)]
+    pub live_reauthentication_count: u64,
+    #[serde(default)]
+    pub live_resync_url: Option<String>,
     pub freshness: MfgFreshness,
     pub connection: MfgConnectionStatus,
     pub last_updated_at: Option<String>,
@@ -453,6 +475,7 @@ impl Default for MfgOperationsState {
             p1_documents: BTreeMap::new(),
             insights: Vec::new(),
             receipts: Vec::new(),
+            live_receipts: Vec::new(),
             latest_action_result: None,
             selected_incident_id: None,
             selected_alert_id: None,
@@ -467,6 +490,9 @@ impl Default for MfgOperationsState {
             selected_action_index: 0,
             live_epoch: None,
             live_cursor: None,
+            live_generation: 0,
+            live_reauthentication_count: 0,
+            live_resync_url: None,
             freshness: MfgFreshness::Uninitialized,
             connection: MfgConnectionStatus::Disconnected,
             last_updated_at: None,
@@ -620,6 +646,11 @@ impl MfgOperationsState {
         self.applied_generation = generation;
         self.refresh_in_flight = false;
         self.recovery_actions = error.recovery_actions.clone();
+        if section == "contract" {
+            self.contract = None;
+            self.live_generation = self.live_generation.saturating_add(1);
+            self.live_stream_available = false;
+        }
         match error.code {
             app_mfg_contract::MfgErrorCode::AuthenticationRequired => {
                 self.clear_authorized_mfg_data();
@@ -651,11 +682,336 @@ impl MfgOperationsState {
         }
     }
 
+    pub fn begin_live_consumer(&mut self) -> u64 {
+        self.live_generation = self.live_generation.saturating_add(1);
+        self.live_stream_available = true;
+        self.live_resync_url = None;
+        self.live_generation
+    }
+
+    pub fn apply_live_envelope(
+        &mut self,
+        generation: u64,
+        envelope: app_mfg_contract::MfgLiveEnvelopeV1,
+    ) {
+        if generation < self.live_generation {
+            return;
+        }
+        self.live_generation = generation;
+        match envelope {
+            app_mfg_contract::MfgLiveEnvelopeV1::Snapshot(snapshot) => {
+                self.attempted_routes
+                    .insert(app_mfg_contract::MfgRouteId::LiveSnapshot);
+                self.attempted_routes
+                    .insert(app_mfg_contract::MfgRouteId::LiveStream);
+                self.live_epoch = Some(snapshot.view_epoch);
+                self.live_cursor = Some(snapshot.cursor);
+                self.live_resync_url = None;
+                self.delta_queue.clear();
+                self.apply_live_snapshot_state(snapshot.state);
+                self.live_stream_available = true;
+                self.last_error = None;
+                self.recovery_actions.clear();
+                self.connection = if self.action_contracts().is_empty() {
+                    MfgConnectionStatus::ReadOnly
+                } else {
+                    MfgConnectionStatus::Operational
+                };
+                self.freshness = MfgFreshness::Fresh;
+                self.last_updated_at = Some(snapshot.generated_at.to_rfc3339());
+            }
+            app_mfg_contract::MfgLiveEnvelopeV1::Delta(delta) => {
+                self.attempted_routes
+                    .insert(app_mfg_contract::MfgRouteId::LiveStream);
+                if self.live_epoch.as_deref() != Some(delta.view_epoch.as_str())
+                    || self.live_cursor.as_deref() != Some(delta.base_cursor.as_str())
+                {
+                    self.live_resync_url = Some("/api/apps/mfg/live/snapshot".to_string());
+                    self.connection = MfgConnectionStatus::Degraded;
+                    self.freshness = MfgFreshness::Stale;
+                    return;
+                }
+                let priority = delta
+                    .events
+                    .iter()
+                    .map(|event| {
+                        app_mfg_contract::mfg_live_event_priority(&event.event_type, &event.payload)
+                    })
+                    .min()
+                    .unwrap_or(3);
+                for event in &delta.events {
+                    self.apply_live_event(event);
+                }
+                self.live_cursor = Some(delta.target_cursor.clone());
+                self.enqueue_delta(MfgReadDelta {
+                    epoch: Some(delta.view_epoch),
+                    cursor: Some(delta.target_cursor.clone()),
+                    base_cursor: Some(delta.base_cursor),
+                    target_cursor: Some(delta.target_cursor),
+                    priority,
+                    payload: serde_json::to_value(delta.events).unwrap_or_default(),
+                });
+                self.last_updated_at = Some(chrono::Utc::now().to_rfc3339());
+                self.live_stream_available = true;
+            }
+            app_mfg_contract::MfgLiveEnvelopeV1::Heartbeat(heartbeat) => {
+                if self.live_epoch.as_deref() != Some(heartbeat.view_epoch.as_str()) {
+                    self.live_resync_url = Some("/api/apps/mfg/live/snapshot".to_string());
+                    self.connection = MfgConnectionStatus::Degraded;
+                    return;
+                }
+                self.live_cursor = Some(heartbeat.cursor);
+                self.last_updated_at = Some(heartbeat.generated_at.to_rfc3339());
+                self.live_stream_available = true;
+            }
+            app_mfg_contract::MfgLiveEnvelopeV1::Resync(resync) => {
+                self.live_resync_url = Some(resync.snapshot_url);
+                self.live_cursor = Some(resync.latest_cursor);
+                self.live_epoch = None;
+                self.connection = MfgConnectionStatus::Loading;
+                self.freshness = MfgFreshness::Refreshing;
+            }
+        }
+    }
+
+    pub fn apply_live_error(&mut self, generation: u64, error: MfgApiErrorV1) {
+        if generation < self.live_generation {
+            return;
+        }
+        self.live_generation = generation;
+        self.live_stream_available = false;
+        let authorization_view_changed = matches!(
+            error.details.get("reason").and_then(Value::as_str),
+            Some("profile_revision_changed" | "credential_epoch_changed")
+        );
+        let authorization_data_invalid = matches!(
+            error.code,
+            app_mfg_contract::MfgErrorCode::AuthenticationRequired
+                | app_mfg_contract::MfgErrorCode::CapabilityDenied
+        );
+        if authorization_data_invalid {
+            // Never retain a projection cropped under an authorization view
+            // that the live authority has rejected. The runner's next safe
+            // reauthentication snapshot uses this incremented generation.
+            self.clear_authorized_mfg_data();
+        }
+        if authorization_view_changed {
+            self.live_reauthentication_count = self.live_reauthentication_count.saturating_add(1);
+            // A fresh live snapshot recrops data, while the canonical contract
+            // refresh recrops visible actions and capabilities on the same
+            // authorization revision.
+            self.request_refresh();
+        }
+        self.connection = MfgConnectionStatus::Degraded;
+        self.freshness = MfgFreshness::Stale;
+        self.recovery_actions = error.recovery_actions.clone();
+        self.last_error = Some(error);
+    }
+
+    pub fn stop_live_consumer(&mut self, generation: u64) {
+        if generation < self.live_generation {
+            return;
+        }
+        self.live_generation = generation;
+        self.live_stream_available = false;
+    }
+
     pub fn enqueue_delta(&mut self, delta: MfgReadDelta) {
+        if self.delta_queue.len() >= MFG_DELTA_QUEUE_LIMIT {
+            if let Some(index) = self
+                .delta_queue
+                .iter()
+                .position(|queued| queued.priority > delta.priority)
+            {
+                self.delta_queue.remove(index);
+            } else if delta.priority <= 1 {
+                self.delta_queue.clear();
+                self.live_resync_url = Some("/api/apps/mfg/live/snapshot".to_string());
+                self.connection = MfgConnectionStatus::Degraded;
+                self.freshness = MfgFreshness::Stale;
+            } else {
+                self.delta_queue.pop_front();
+            }
+        }
         self.delta_queue.push_back(delta);
         while self.delta_queue.len() > MFG_DELTA_QUEUE_LIMIT {
             self.delta_queue.pop_front();
         }
+    }
+
+    fn apply_live_snapshot_state(&mut self, state: app_mfg_contract::MfgLiveSnapshotStateV1) {
+        self.alert_rules = live_summary_list(&state.alerts, "rules", "alert_rule");
+        self.alerts = live_summary_list(&state.alerts, "occurrences", "alert");
+        self.assignments = live_summary_list(&state.assignments, "items", "assignment");
+        self.incidents = live_summary_list(&state.incidents, "items", "incident");
+        self.reports = live_summary_list(&state.reports, "items", "report");
+        self.reviews = live_summary_list(&state.reviews, "items", "review");
+        let mut executions = live_summary_list(&state.executions, "actions", "execution");
+        executions.extend(live_summary_list(
+            &state.cockpit,
+            "profiles",
+            "cockpit_profile",
+        ));
+        executions.extend(live_summary_list(
+            &state.alerts,
+            "subscriptions",
+            "alert_subscription",
+        ));
+        executions.extend(live_summary_list(&state.executions, "skills", "skill_run"));
+        executions.extend(live_summary_list(&state.incidents, "workflows", "workflow"));
+        executions.extend(live_summary_list(&state.incidents, "analyses", "analysis"));
+        executions.extend(live_summary_list(
+            &state.incidents,
+            "memory_cases",
+            "memory_case",
+        ));
+        executions.extend(live_summary_list(&state.incidents, "playbooks", "playbook"));
+        self.live_receipts = live_receipt_list(&state.receipts, "mutations");
+        for (field, kind) in [
+            ("entities", "entity"),
+            ("relations", "relation"),
+            ("facts", "fact"),
+            ("attention", "attention"),
+            ("evidence", "evidence"),
+            ("quality_gates", "quality_gate"),
+            ("metric_definitions", "metric_definition"),
+            ("metric_dependencies", "metric_dependency"),
+            ("metric_states", "metric_state"),
+            ("metric_snapshots", "metric_snapshot"),
+            ("watermarks", "watermark"),
+            ("jobs", "compute_job"),
+            ("changes", "metric_change"),
+            ("source_packs", "source_pack"),
+            ("connector_runs", "connector_run"),
+            ("ontology_packs", "ontology"),
+            ("entity_match_candidates", "entity_match_candidate"),
+            ("entity_conflict_decisions", "entity_conflict_decision"),
+        ] {
+            executions.extend(live_summary_list(&state.data_compute, field, kind));
+        }
+        self.insights.retain(|item| {
+            ![
+                "execution",
+                "cockpit_profile",
+                "alert_subscription",
+                "skill_run",
+                "workflow",
+                "analysis",
+                "memory_case",
+                "playbook",
+                "receipt",
+                "business_receipt",
+                "entity",
+                "relation",
+                "fact",
+                "attention",
+                "evidence",
+                "quality_gate",
+                "metric_definition",
+                "metric_dependency",
+                "metric_state",
+                "metric_snapshot",
+                "watermark",
+                "compute_job",
+                "metric_change",
+                "source_pack",
+                "connector_run",
+                "ontology",
+                "entity_match_candidate",
+                "entity_conflict_decision",
+            ]
+            .contains(&item.kind.as_str())
+        });
+        self.insights.extend(executions);
+        self.preserve_live_selections();
+    }
+
+    fn apply_live_event(&mut self, event: &app_mfg_contract::MfgLiveEventV1) {
+        for (field, kind) in [
+            ("assignment", "assignment"),
+            ("profile", "cockpit_profile"),
+            ("occurrence", "alert"),
+            ("rule", "alert_rule"),
+            ("subscription", "alert_subscription"),
+            ("incident", "incident"),
+            ("report", "report"),
+            ("review", "review"),
+            ("execution", "execution"),
+            ("skill_run", "skill_run"),
+            ("workflow", "workflow"),
+            ("analysis", "analysis"),
+            ("memory_case", "memory_case"),
+            ("playbook", "playbook"),
+            ("receipt", "receipt"),
+            ("entity", "entity"),
+            ("relation", "relation"),
+            ("fact", "fact"),
+            ("attention", "attention"),
+            ("evidence", "evidence"),
+            ("quality_gate", "quality_gate"),
+            ("metric_definition", "metric_definition"),
+            ("metric_dependency", "metric_dependency"),
+            ("metric_state", "metric_state"),
+            ("metric_snapshot", "metric_snapshot"),
+            ("watermark", "watermark"),
+            ("job", "compute_job"),
+            ("change", "metric_change"),
+            ("source_pack", "source_pack"),
+            ("connector_run", "connector_run"),
+            ("ontology", "ontology"),
+            ("entity_match_candidate", "entity_match_candidate"),
+            ("entity_conflict_decision", "entity_conflict_decision"),
+        ] {
+            let Some(value) = exact_nested_value(&event.payload, field) else {
+                continue;
+            };
+            if kind == "receipt" {
+                if let Ok(receipt) =
+                    serde_json::from_value::<app_mfg_contract::MfgReceiptV1>(value.clone())
+                {
+                    upsert_live_receipt(&mut self.live_receipts, receipt);
+                }
+                continue;
+            }
+            if let Some(summary) = live_item_summary(value, kind) {
+                match kind {
+                    "assignment" => upsert_live_summary(&mut self.assignments, summary),
+                    "alert" => upsert_live_summary(&mut self.alerts, summary),
+                    "alert_rule" => upsert_live_summary(&mut self.alert_rules, summary),
+                    "incident" => upsert_live_summary(&mut self.incidents, summary),
+                    "report" => upsert_live_summary(&mut self.reports, summary),
+                    "review" => upsert_live_summary(&mut self.reviews, summary),
+                    _ => upsert_live_summary(&mut self.insights, summary),
+                }
+            }
+        }
+        if event.event_type.ends_with(".deleted") {
+            let id = event.subject_ref.rsplit(':').next().unwrap_or_default();
+            for items in [
+                &mut self.alert_rules,
+                &mut self.alerts,
+                &mut self.assignments,
+                &mut self.incidents,
+                &mut self.reports,
+                &mut self.reviews,
+                &mut self.insights,
+            ] {
+                items.retain(|item| item.id != id);
+            }
+        }
+        self.preserve_live_selections();
+    }
+
+    fn preserve_live_selections(&mut self) {
+        self.selected_incident_id =
+            preserve_or_first(self.selected_incident_id.take(), &self.incidents);
+        self.selected_alert_id = preserve_or_first(self.selected_alert_id.take(), &self.alerts);
+        self.selected_assignment_id =
+            preserve_or_first(self.selected_assignment_id.take(), &self.assignments);
+        self.selected_report_id = preserve_or_first(self.selected_report_id.take(), &self.reports);
+        self.selected_review_id = preserve_or_first(self.selected_review_id.take(), &self.reviews);
+        self.selected_insight_id =
+            preserve_or_first(self.selected_insight_id.take(), &self.insights);
     }
 
     fn clear_authorized_mfg_data(&mut self) {
@@ -685,7 +1041,11 @@ impl MfgOperationsState {
         self.review_detail_ref = None;
         self.p1_documents.clear();
         self.insights.clear();
+        self.receipts.clear();
+        self.live_receipts.clear();
         self.latest_action_result = None;
+        self.action_intents.clear();
+        self.selected_action_index = 0;
         self.selected_incident_id = None;
         self.selected_alert_id = None;
         self.selected_assignment_id = None;
@@ -700,13 +1060,19 @@ impl MfgOperationsState {
         self.delta_queue.clear();
         self.live_epoch = None;
         self.live_cursor = None;
+        self.live_generation = self.live_generation.saturating_add(1);
+        self.live_resync_url = None;
         self.live_stream_available = false;
         self.list_scroll = 0;
         self.detail_scroll = 0;
         self.backlink_index = 0;
         self.last_backlink_intent = None;
         self.pending_runtime_backlink = None;
+        self.pending_approval_backlink = None;
         self.pending_surface_receipt = None;
+        self.degraded_reasons.clear();
+        self.forbidden_sections.clear();
+        self.section_errors.clear();
     }
 
     fn clear_authorized_mfg_section(&mut self, section: &str) {
@@ -719,6 +1085,8 @@ impl MfgOperationsState {
                 self.live_stream_available = false;
                 self.live_epoch = None;
                 self.live_cursor = None;
+                self.live_generation = self.live_generation.saturating_add(1);
+                self.live_resync_url = None;
             }
             "incidents" => {
                 self.incidents.clear();
@@ -1613,7 +1981,9 @@ impl MfgOperationsState {
         if self.section_errors.contains_key(section) {
             return Some("error");
         }
-        if route_id != R::LiveStream && !self.attempted_routes.contains(&route_id) {
+        if !matches!(route_id, R::LiveStream | R::LiveSnapshot)
+            && !self.attempted_routes.contains(&route_id)
+        {
             return Some("not-requested");
         }
         let status = |loaded: bool, selected: bool| {
@@ -1665,9 +2035,14 @@ impl MfgOperationsState {
                 self.review_detail.is_some(),
                 self.selected_review_id.is_some(),
             ),
-            R::LiveStream => {
-                if self.live_stream_available {
-                    "route-declared-not-connected"
+            R::LiveStream | R::LiveSnapshot => {
+                if self.live_stream_available
+                    && self.live_epoch.is_some()
+                    && self.live_cursor.is_some()
+                {
+                    "visible"
+                } else if self.live_stream_available {
+                    "connecting"
                 } else {
                     "unavailable"
                 }
@@ -2700,6 +3075,163 @@ pub(crate) fn mfg_route_requires_capability(
             .any(|required| required.as_str() == capability),
         app_mfg_contract::MfgCapabilityRequirement::PerAction => false,
     }
+}
+
+fn live_summary_list(value: &Value, field: &str, kind: &str) -> Vec<MfgItemSummary> {
+    value
+        .get(field)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|value| live_item_summary(value, kind))
+        .collect()
+}
+
+fn live_receipt_list(value: &Value, field: &str) -> Vec<MfgReceiptV1> {
+    value
+        .get(field)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|value| serde_json::from_value(value.clone()).ok())
+        .collect()
+}
+
+fn exact_nested_value<'a>(value: &'a Value, field: &str) -> Option<&'a Value> {
+    value
+        .get(field)
+        .or_else(|| value.get("payload").and_then(|payload| payload.get(field)))
+}
+
+fn live_item_summary(value: &Value, kind: &str) -> Option<MfgItemSummary> {
+    let id_fields: &[&str] = match kind {
+        "skill_run" => &["execution_id"],
+        "cockpit_profile" => &["profile_id"],
+        "alert_subscription" => &["subscription_id"],
+        "assignment" => &["assignment_id"],
+        "alert" => &["occurrence_id", "alert_id"],
+        "alert_rule" => &["rule_id"],
+        "incident" => &["incident_id"],
+        "report" => &["report_id"],
+        "review" => &["review_id"],
+        "execution" => &["execution_id"],
+        "workflow" => &["workflow_id"],
+        "analysis" => &["analysis_id"],
+        "memory_case" => &["case_id"],
+        "playbook" => &["playbook_id"],
+        "receipt" => &["receipt_id"],
+        "entity" => &["entity_id"],
+        "relation" => &["relation_id"],
+        "fact" => &["fact_id"],
+        "attention" => &["attention_id"],
+        "evidence" => &["packet_id"],
+        "quality_gate" => &["gate_id"],
+        "metric_definition" => &["metric_id"],
+        "metric_dependency" => &["dependency_id"],
+        "metric_state" => &["state_id"],
+        "metric_snapshot" => &["snapshot_id"],
+        "watermark" => &["source_ref"],
+        "compute_job" => &["job_id"],
+        "metric_change" => &["change_id"],
+        "source_pack" => &["source_pack_id"],
+        "connector_run" => &["run_id"],
+        "ontology" => &["ontology_id"],
+        "entity_match_candidate" => &["candidate_id"],
+        "entity_conflict_decision" => &["decision_id"],
+        _ => &["id"],
+    };
+    let id = id_fields
+        .iter()
+        .find_map(|field| value.get(field).and_then(Value::as_str))?
+        .to_string();
+    let title = ["title", "display_name", "summary", "objective"]
+        .into_iter()
+        .find_map(|field| value.get(field).and_then(Value::as_str))
+        .unwrap_or(&id)
+        .to_string();
+    let status = ["status", "state", "lifecycle"]
+        .into_iter()
+        .find_map(|field| value.get(field).and_then(Value::as_str))
+        .unwrap_or("unknown")
+        .to_string();
+    let evidence_refs = value
+        .get("evidence_refs")
+        .or_else(|| value.pointer("/execution_context/evidence_refs"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let mut backlinks = Vec::new();
+    if let Some(reference) = value
+        .get("runtime_execution_ref")
+        .and_then(Value::as_str)
+        .filter(|reference| reference.starts_with("runtime-execution://"))
+    {
+        backlinks.push(MfgBacklink {
+            kind: MfgBacklinkKind::Runtime,
+            target: reference.to_string(),
+            label: format!("Runtime execution {reference}"),
+        });
+    }
+    if let Some(packet_id) = value
+        .get("evidence_packet_id")
+        .or_else(|| value.pointer("/execution_context/evidence_packet_id"))
+        .and_then(Value::as_str)
+    {
+        backlinks.push(MfgBacklink {
+            kind: MfgBacklinkKind::Evidence,
+            target: format!("evidence://matrix/{packet_id}"),
+            label: format!("Evidence {packet_id}"),
+        });
+    }
+    Some(MfgItemSummary {
+        id,
+        kind: kind.to_string(),
+        title,
+        status,
+        severity: ["severity", "priority", "risk"]
+            .into_iter()
+            .find_map(|field| value.get(field).and_then(Value::as_str))
+            .map(str::to_string),
+        owner: [
+            "owner_ref",
+            "assignee_ref",
+            "reviewer_principal",
+            "requester_principal",
+        ]
+        .into_iter()
+        .find_map(|field| value.get(field).and_then(Value::as_str))
+        .map(str::to_string),
+        sla: None,
+        revision: value.get("revision").and_then(Value::as_u64),
+        evidence_refs,
+        backlinks,
+        raw: value.clone(),
+    })
+}
+
+fn upsert_live_summary(items: &mut Vec<MfgItemSummary>, mut summary: MfgItemSummary) {
+    if let Some(existing) = items.iter_mut().find(|item| item.id == summary.id) {
+        if summary.backlinks.is_empty() {
+            summary.backlinks.clone_from(&existing.backlinks);
+        }
+        *existing = summary;
+    } else {
+        items.push(summary);
+    }
+}
+
+fn upsert_live_receipt(receipts: &mut Vec<MfgReceiptV1>, receipt: MfgReceiptV1) {
+    if let Some(index) = receipts
+        .iter()
+        .position(|existing| existing.receipt_id == receipt.receipt_id)
+    {
+        receipts.remove(index);
+    }
+    receipts.insert(0, receipt);
+    receipts.truncate(50_000);
 }
 
 fn preserve_or_first(selected: Option<String>, items: &[MfgItemSummary]) -> Option<String> {
@@ -6761,20 +7293,416 @@ pub(crate) mod tests {
     #[test]
     fn mfg_delta_queue_is_bounded() {
         let mut state = MfgOperationsState::default();
-        for cursor in 0..(MFG_DELTA_QUEUE_LIMIT + 20) {
+        for cursor in 0..1000 {
             state.enqueue_delta(MfgReadDelta {
                 cursor: Some(cursor.to_string()),
                 ..MfgReadDelta::default()
             });
         }
         assert_eq!(state.delta_queue.len(), MFG_DELTA_QUEUE_LIMIT);
+        let expected_front = (1000 - MFG_DELTA_QUEUE_LIMIT).to_string();
         assert_eq!(
             state
                 .delta_queue
                 .front()
                 .and_then(|delta| delta.cursor.as_deref()),
-            Some("20")
+            Some(expected_front.as_str())
         );
+    }
+
+    #[test]
+    fn mfg_live_snapshot_delta_and_generation_guard_update_canonical_state() {
+        let mut state = MfgOperationsState::default();
+        let generation = state.begin_live_consumer();
+        let mut snapshot_state = app_mfg_contract::MfgLiveSnapshotStateV1::default();
+        snapshot_state.assignments = serde_json::json!({
+            "items": [{
+                "assignment_id": "assignment-live-1",
+                "assignee_ref": "principal:operator",
+                "status": "assigned",
+                "revision": 1
+            }]
+        });
+        state.apply_live_envelope(
+            generation,
+            app_mfg_contract::MfgLiveEnvelopeV1::Snapshot(app_mfg_contract::MfgLiveSnapshotV1 {
+                view_epoch: "epoch-1".to_string(),
+                cursor: "cursor-1".to_string(),
+                generated_at: chrono::Utc::now(),
+                contract_version: app_mfg_contract::MfgContractVersion::default(),
+                state: snapshot_state,
+            }),
+        );
+        assert_eq!(state.assignments[0].id, "assignment-live-1");
+        state.apply_live_envelope(
+            generation,
+            app_mfg_contract::MfgLiveEnvelopeV1::Delta(app_mfg_contract::MfgLiveDeltaV1 {
+                view_epoch: "epoch-1".to_string(),
+                base_cursor: "cursor-1".to_string(),
+                target_cursor: "cursor-2".to_string(),
+                events: vec![app_mfg_contract::MfgLiveEventV1 {
+                    event_type: "assignment.receipted".to_string(),
+                    subject_ref: "mfg:assignment:assignment-live-1".to_string(),
+                    revision: 2,
+                    occurred_at: chrono::Utc::now(),
+                    payload: serde_json::json!({
+                        "assignment": {
+                            "assignment_id": "assignment-live-1",
+                            "assignee_ref": "principal:operator",
+                            "status": "in_progress",
+                            "revision": 2
+                        }
+                    }),
+                }],
+            }),
+        );
+        assert_eq!(state.assignments[0].status, "in_progress");
+        assert_eq!(state.live_cursor.as_deref(), Some("cursor-2"));
+        state.apply_live_envelope(
+            generation.saturating_sub(1),
+            app_mfg_contract::MfgLiveEnvelopeV1::Heartbeat(app_mfg_contract::MfgLiveHeartbeatV1 {
+                view_epoch: "stale-epoch".to_string(),
+                cursor: "stale-cursor".to_string(),
+                generated_at: chrono::Utc::now(),
+            }),
+        );
+        assert_eq!(state.live_cursor.as_deref(), Some("cursor-2"));
+    }
+
+    #[test]
+    fn mfg_live_snapshot_and_delta_wire_every_contract_collection_into_tui_state() {
+        let mut state = MfgOperationsState::default();
+        let generation = state.begin_live_consumer();
+        let snapshot_state = app_mfg_contract::MfgLiveSnapshotStateV1 {
+            cockpit: serde_json::json!({"profiles": [{"profile_id": "profile-1"}]}),
+            alerts: serde_json::json!({
+                "rules": [{"rule_id": "rule-1"}],
+                "subscriptions": [{"subscription_id": "subscription-1"}],
+                "occurrences": [{"occurrence_id": "alert-1"}]
+            }),
+            assignments: serde_json::json!({"items": [{"assignment_id": "assignment-1"}]}),
+            incidents: serde_json::json!({
+                "items": [{"incident_id": "incident-1"}],
+                "workflows": [{"workflow_id": "workflow-1"}],
+                "analyses": [{"analysis_id": "analysis-1"}],
+                "memory_cases": [{"case_id": "case-1"}],
+                "playbooks": [{"playbook_id": "playbook-1"}]
+            }),
+            executions: serde_json::json!({
+                "actions": [{"execution_id": "execution-1"}],
+                "skills": [{"execution_id": "skill-1"}]
+            }),
+            reports: serde_json::json!({"items": [{"report_id": "report-1"}]}),
+            reviews: serde_json::json!({"items": [{"review_id": "review-1"}]}),
+            receipts: serde_json::json!({
+                "commands": [{"receipt_id": "command-receipt-1"}],
+                "mutations": [{
+                    "receipt_id": "mutation-receipt-1",
+                    "idempotency_key": "mutation-key-1",
+                    "actor_principal": "principal:operator",
+                    "action_id": "mfg.incident.create",
+                    "resource_ref": "mfg:incident:incident-1",
+                    "expected_revision": null,
+                    "result_revision": 1,
+                    "payload_digest": "sha256:mutation-1",
+                    "correlation_id": "correlation:mutation-1",
+                    "status": "completed",
+                    "response": {"revision": 1},
+                    "contract_version": "mfg.frontend.v1",
+                    "created_at": "2026-07-16T00:00:00Z",
+                    "updated_at": "2026-07-16T00:00:00Z"
+                }]
+            }),
+            data_compute: serde_json::json!({
+                "entities": [{"entity_id": "entity-1"}],
+                "relations": [{"relation_id": "relation-1"}],
+                "facts": [{"fact_id": "fact-1"}],
+                "attention": [{"attention_id": "attention-1"}],
+                "evidence": [{"packet_id": "evidence-1"}],
+                "quality_gates": [{"gate_id": "gate-1"}],
+                "metric_definitions": [{"metric_id": "metric-definition-1"}],
+                "metric_dependencies": [{"dependency_id": "dependency-1"}],
+                "metric_states": [{"state_id": "metric-state-1"}],
+                "metric_snapshots": [{"snapshot_id": "metric-snapshot-1"}],
+                "watermarks": [{"source_ref": "watermark-1"}],
+                "jobs": [{"job_id": "job-1"}],
+                "changes": [{"change_id": "change-1"}],
+                "source_packs": [{"source_pack_id": "source-pack-1"}],
+                "connector_runs": [{"run_id": "connector-1"}],
+                "ontology_packs": [{"ontology_id": "ontology-1"}],
+                "entity_match_candidates": [{"candidate_id": "candidate-1"}],
+                "entity_conflict_decisions": [{"decision_id": "decision-1"}]
+            }),
+        };
+        state.apply_live_envelope(
+            generation,
+            app_mfg_contract::MfgLiveEnvelopeV1::Snapshot(app_mfg_contract::MfgLiveSnapshotV1 {
+                view_epoch: "epoch-all".to_string(),
+                cursor: "cursor-all-1".to_string(),
+                generated_at: chrono::Utc::now(),
+                contract_version: app_mfg_contract::MfgContractVersion::default(),
+                state: snapshot_state,
+            }),
+        );
+        assert_eq!(state.alert_rules[0].id, "rule-1");
+        assert_eq!(state.alerts[0].id, "alert-1");
+        assert_eq!(state.assignments[0].id, "assignment-1");
+        assert_eq!(state.incidents[0].id, "incident-1");
+        assert_eq!(state.reports[0].id, "report-1");
+        assert_eq!(state.reviews[0].id, "review-1");
+        let kinds = state
+            .insights
+            .iter()
+            .map(|item| item.kind.as_str())
+            .collect::<BTreeSet<_>>();
+        for kind in [
+            "cockpit_profile",
+            "alert_subscription",
+            "execution",
+            "skill_run",
+            "workflow",
+            "analysis",
+            "memory_case",
+            "playbook",
+            "entity",
+            "relation",
+            "fact",
+            "attention",
+            "evidence",
+            "quality_gate",
+            "metric_definition",
+            "metric_dependency",
+            "metric_state",
+            "metric_snapshot",
+            "watermark",
+            "compute_job",
+            "metric_change",
+            "source_pack",
+            "connector_run",
+            "ontology",
+            "entity_match_candidate",
+            "entity_conflict_decision",
+        ] {
+            assert!(kinds.contains(kind), "TUI snapshot reducer omitted {kind}");
+        }
+        assert_eq!(state.live_receipts[0].receipt_id, "mutation-receipt-1");
+
+        state.apply_live_envelope(
+            generation,
+            app_mfg_contract::MfgLiveEnvelopeV1::Delta(app_mfg_contract::MfgLiveDeltaV1 {
+                view_epoch: "epoch-all".to_string(),
+                base_cursor: "cursor-all-1".to_string(),
+                target_cursor: "cursor-all-2".to_string(),
+                events: vec![
+                    app_mfg_contract::MfgLiveEventV1 {
+                        event_type: "profile.upserted".to_string(),
+                        subject_ref: "mfg:cockpit-profile:profile-2".to_string(),
+                        revision: 2,
+                        occurred_at: chrono::Utc::now(),
+                        payload: serde_json::json!({"profile": {"profile_id": "profile-2"}}),
+                    },
+                    app_mfg_contract::MfgLiveEventV1 {
+                        event_type: "alert_subscription.upserted".to_string(),
+                        subject_ref: "mfg:alert-subscription:subscription-2".to_string(),
+                        revision: 2,
+                        occurred_at: chrono::Utc::now(),
+                        payload: serde_json::json!({
+                            "subscription": {"subscription_id": "subscription-2"}
+                        }),
+                    },
+                    app_mfg_contract::MfgLiveEventV1 {
+                        event_type: "receipt.completed".to_string(),
+                        subject_ref: "mfg:receipt:receipt-2".to_string(),
+                        revision: 2,
+                        occurred_at: chrono::Utc::now(),
+                        payload: serde_json::json!({"receipt": {
+                            "receipt_id": "receipt-2",
+                            "idempotency_key": "mutation-key-2",
+                            "actor_principal": "principal:operator",
+                            "action_id": "mfg.incident.create",
+                            "resource_ref": "mfg:incident:incident-2",
+                            "expected_revision": null,
+                            "result_revision": 2,
+                            "payload_digest": "sha256:mutation-2",
+                            "correlation_id": "correlation:mutation-2",
+                            "status": "completed",
+                            "response": {"revision": 2},
+                            "contract_version": "mfg.frontend.v1",
+                            "created_at": "2026-07-16T00:00:01Z",
+                            "updated_at": "2026-07-16T00:00:01Z"
+                        }}),
+                    },
+                ],
+            }),
+        );
+        for id in ["profile-2", "subscription-2"] {
+            assert!(
+                state.insights.iter().any(|item| item.id == id),
+                "TUI delta reducer omitted {id}"
+            );
+        }
+        assert!(state
+            .live_receipts
+            .iter()
+            .any(|receipt| receipt.receipt_id == "receipt-2"));
+    }
+
+    #[test]
+    fn mfg_live_cursor_gap_requires_snapshot_and_critical_overflow_is_fail_closed() {
+        let mut state = MfgOperationsState::default();
+        state.live_generation = 3;
+        state.live_epoch = Some("epoch-1".to_string());
+        state.live_cursor = Some("cursor-1".to_string());
+        state.apply_live_envelope(
+            3,
+            app_mfg_contract::MfgLiveEnvelopeV1::Delta(app_mfg_contract::MfgLiveDeltaV1 {
+                view_epoch: "epoch-1".to_string(),
+                base_cursor: "wrong-base".to_string(),
+                target_cursor: "cursor-2".to_string(),
+                events: Vec::new(),
+            }),
+        );
+        assert_eq!(
+            state.live_resync_url.as_deref(),
+            Some("/api/apps/mfg/live/snapshot")
+        );
+
+        state.live_resync_url = None;
+        for cursor in 0..MFG_DELTA_QUEUE_LIMIT {
+            state.enqueue_delta(MfgReadDelta {
+                cursor: Some(cursor.to_string()),
+                priority: 0,
+                ..MfgReadDelta::default()
+            });
+        }
+        state.enqueue_delta(MfgReadDelta {
+            cursor: Some("overflow".to_string()),
+            priority: 0,
+            ..MfgReadDelta::default()
+        });
+        assert!(state.delta_queue.len() <= MFG_DELTA_QUEUE_LIMIT);
+        assert_eq!(
+            state.live_resync_url.as_deref(),
+            Some("/api/apps/mfg/live/snapshot")
+        );
+    }
+
+    #[test]
+    fn mfg_live_reauthentication_count_survives_the_new_generation_snapshot() {
+        let mut state = MfgOperationsState::default();
+        state.live_generation = 4;
+        state.apply_live_envelope(
+            4,
+            app_mfg_contract::MfgLiveEnvelopeV1::Snapshot(app_mfg_contract::MfgLiveSnapshotV1 {
+                view_epoch: "authorized".to_string(),
+                cursor: "cursor-authorized".to_string(),
+                generated_at: chrono::Utc::now(),
+                contract_version: app_mfg_contract::MfgContractVersion::default(),
+                state: app_mfg_contract::MfgLiveSnapshotStateV1 {
+                    assignments: serde_json::json!({
+                        "items": [{"assignment_id": "private-assignment", "status": "assigned"}],
+                    }),
+                    reports: serde_json::json!({
+                        "items": [{"report_id": "private-report", "status": "generated"}],
+                    }),
+                    ..app_mfg_contract::MfgLiveSnapshotStateV1::default()
+                },
+            }),
+        );
+        assert_eq!(state.assignments.len(), 1);
+        assert_eq!(state.reports.len(), 1);
+        let mut error = app_mfg_contract::MfgApiErrorV1::authentication_required("profile changed");
+        error.details = serde_json::json!({"reason": "profile_revision_changed"});
+        state.apply_live_error(4, error);
+        assert_eq!(state.live_reauthentication_count, 1);
+        assert!(!state.live_stream_available);
+        assert!(state.assignments.is_empty());
+        assert!(state.reports.is_empty());
+        assert!(state.live_epoch.is_none());
+        assert!(state.live_cursor.is_none());
+        assert!(state.refresh_requested);
+        state.apply_live_envelope(
+            5,
+            app_mfg_contract::MfgLiveEnvelopeV1::Snapshot(app_mfg_contract::MfgLiveSnapshotV1 {
+                view_epoch: "recropped".to_string(),
+                cursor: "cursor-recropped".to_string(),
+                generated_at: chrono::Utc::now(),
+                contract_version: app_mfg_contract::MfgContractVersion::default(),
+                state: app_mfg_contract::MfgLiveSnapshotStateV1::default(),
+            }),
+        );
+        assert_eq!(state.live_reauthentication_count, 1);
+        assert!(state.live_stream_available);
+        assert!(state.last_error.is_none());
+        assert_eq!(state.live_epoch.as_deref(), Some("recropped"));
+    }
+
+    #[test]
+    fn mfg_live_capability_denial_clears_the_old_authorized_projection() {
+        let mut state = MfgOperationsState::default();
+        state.live_generation = 8;
+        state.assignments.push(MfgItemSummary {
+            id: "private-assignment".to_string(),
+            kind: "assignment".to_string(),
+            title: "private".to_string(),
+            status: "assigned".to_string(),
+            severity: None,
+            owner: None,
+            sla: None,
+            revision: Some(1),
+            evidence_refs: Vec::new(),
+            backlinks: Vec::new(),
+            raw: serde_json::json!({"assignment_id": "private-assignment"}),
+        });
+        let now = chrono::Utc::now();
+        state.action_intents.push(MfgActionIntent {
+            intent_id: "private-preview-intent".to_string(),
+            action_id: app_mfg_contract::MfgActionId::Multi(
+                app_mfg_contract::MfgMultiActionId::AlertResolve,
+            ),
+            route_id: app_mfg_contract::MfgRouteId::AlertCommand,
+            resource_ref: "mfg:alert-occurrence:private-alert".to_string(),
+            path_replacements: BTreeMap::new(),
+            expected_revision: Some(1),
+            idempotency_key: "private-preview-key".to_string(),
+            correlation_id: "private-preview-correlation".to_string(),
+            payload_digest: "sha256:private".to_string(),
+            request_body: serde_json::json!({"private": true}),
+            risk: app_mfg_contract::MfgActionRisk::Medium,
+            confirmation: app_mfg_contract::MfgConfirmationKind::Target,
+            created_at: now.to_rfc3339(),
+            status: MfgIntentStatus::Accepted,
+            retryable: false,
+            last_error: None,
+            receipt: Some(app_mfg_contract::MfgReceiptV1 {
+                receipt_id: "private-preview-receipt".to_string(),
+                idempotency_key: "private-preview-key".to_string(),
+                actor_principal: "principal:tui".to_string(),
+                action_id: app_mfg_contract::MfgActionId::Multi(
+                    app_mfg_contract::MfgMultiActionId::AlertResolve,
+                ),
+                resource_ref: "mfg:alert-occurrence:private-alert".to_string(),
+                expected_revision: Some(1),
+                result_revision: None,
+                payload_digest: "sha256:private".to_string(),
+                correlation_id: Some("private-preview-correlation".to_string()),
+                status: app_mfg_contract::MfgReceiptStatus::Preview,
+                response: serde_json::json!({"private_payload": "must-disappear"}),
+                contract_version: app_mfg_contract::MfgContractVersion::default(),
+                created_at: now,
+                updated_at: now,
+            }),
+        });
+        state.apply_live_error(
+            8,
+            app_mfg_contract::MfgApiErrorV1::capability_denied("mfg.read"),
+        );
+        assert!(state.assignments.is_empty());
+        assert!(state.action_intents.is_empty());
+        assert!(state.granted_capabilities.is_empty());
+        assert_eq!(state.live_generation, 9);
+        assert_eq!(state.live_reauthentication_count, 0);
+        assert!(!state.live_stream_available);
     }
 
     #[test]

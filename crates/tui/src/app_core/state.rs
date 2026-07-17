@@ -650,6 +650,9 @@ impl TuiState {
             CowdEvent::MfgContract { .. }
                 | CowdEvent::MfgSnapshot { .. }
                 | CowdEvent::MfgReadFailed { .. }
+                | CowdEvent::MfgLiveEnvelope { .. }
+                | CowdEvent::MfgLiveFailed { .. }
+                | CowdEvent::MfgLiveStopped { .. }
                 | CowdEvent::MfgActionAccepted { .. }
                 | CowdEvent::MfgActionFailed { .. }
         );

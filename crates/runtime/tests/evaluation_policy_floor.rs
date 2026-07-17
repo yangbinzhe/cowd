@@ -45,6 +45,7 @@ fn signed_human_lease(
         expires_at_ms: Some(now + 60_000),
         credential_fingerprint: "fixture".to_string(),
         credential_epoch: 1,
+        profile_revision: 1,
     };
     let verifier =
         PrincipalVerifier::from_base64(key_id, &BASE64.encode(key.public_key().as_ref()))

@@ -1895,6 +1895,7 @@ mod tests {
                 expires_at_ms: None,
                 credential_fingerprint: format!("fixture:{id}"),
                 credential_epoch: 1,
+                profile_revision: 1,
             },
         ))
     }

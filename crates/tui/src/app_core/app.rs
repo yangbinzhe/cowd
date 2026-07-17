@@ -1624,6 +1624,22 @@ impl App {
                 self.mfg_operations.apply_error(generation, section, error);
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
+            CowdEvent::MfgLiveEnvelope {
+                generation,
+                envelope,
+            } => {
+                self.mfg_operations
+                    .apply_live_envelope(generation, envelope);
+                self.msg_version = self.msg_version.wrapping_add(1);
+            }
+            CowdEvent::MfgLiveFailed { generation, error } => {
+                self.mfg_operations.apply_live_error(generation, error);
+                self.msg_version = self.msg_version.wrapping_add(1);
+            }
+            CowdEvent::MfgLiveStopped { generation } => {
+                self.mfg_operations.stop_live_consumer(generation);
+                self.msg_version = self.msg_version.wrapping_add(1);
+            }
             CowdEvent::MfgActionAccepted {
                 intent_id,
                 response,

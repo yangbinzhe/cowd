@@ -1,5 +1,7 @@
 use std::{
+    collections::BTreeMap,
     path::Path,
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, Weak,
@@ -15,9 +17,8 @@ use app_mfg::{
     MfgCockpitProfile, MfgCockpitProjection, MfgCockpitReportDeliveryReceipt,
     MfgCockpitReportRequest, MfgCockpitReportSnapshot, MfgCockpitWidgetProjection,
     MfgCommandReceipt, MfgCrossPlaneBridgeReceipt, MfgDomainSeedResult, MfgForecastProjection,
-    MfgHealth, MfgIncident, MfgLiveProjection, MfgMemoryCase, MfgMetricRecomputeResult,
-    MfgOperationalAnalysis, MfgPlaybook, MfgRepositoryError, MfgSkillManifest, MfgSkillPlan,
-    MfgSkillRun, MfgStore,
+    MfgHealth, MfgIncident, MfgMemoryCase, MfgMetricRecomputeResult, MfgOperationalAnalysis,
+    MfgPlaybook, MfgRepositoryError, MfgSkillManifest, MfgSkillPlan, MfgSkillRun, MfgStore,
 };
 use app_mfg_contract::{
     MfgReportDeliveryReview, MfgReportDeliveryReviewDecision, MfgReportDeliveryReviewEffect,
@@ -33,6 +34,9 @@ use serde::Serialize;
 
 mod cross_plane;
 mod delivery;
+mod live;
+
+pub(crate) use live::{MfgLivePrincipalContext, MfgLiveServiceError};
 
 /// Internal execution request. Gateway API handlers construct this only after
 /// deriving the audit principal from authenticated middleware.
@@ -86,6 +90,8 @@ pub(crate) struct MfgService {
     pub(crate) label: &'static str,
     pub(crate) owner: &'static str,
     review_reconciler: Arc<MfgReviewReconcilerLifecycle>,
+    live_stores: Arc<Mutex<BTreeMap<PathBuf, Arc<MfgStore>>>>,
+    live_key_lock: Arc<Mutex<()>>,
 }
 
 pub(crate) struct MfgReviewReconcilerLifecycle {
@@ -161,6 +167,8 @@ impl MfgService {
                 cancelled: AtomicBool::new(false),
                 handle: Mutex::new(None),
             }),
+            live_stores: Arc::new(Mutex::new(BTreeMap::new())),
+            live_key_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -241,6 +249,39 @@ impl MfgService {
             .sqlite_handle("mfg")
             .map_err(to_mfg_storage_error)?;
         MfgStore::open_storage_handle(handle)
+    }
+
+    fn open_live_store(
+        &self,
+        config_home: impl AsRef<Path>,
+    ) -> Result<Arc<MfgStore>, MfgRepositoryError> {
+        let config_home = config_home.as_ref().to_path_buf();
+        if let Some(store) = self
+            .live_stores
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&config_home)
+            .cloned()
+        {
+            return Ok(store);
+        }
+        let registry = storage::StorageRegistry::default_for_config_home(&config_home);
+        registry
+            .layout
+            .ensure_directories()
+            .map_err(to_mfg_storage_error)?;
+        let handle = registry
+            .sqlite_handle("mfg")
+            .map_err(to_mfg_storage_error)?;
+        let store = Arc::new(MfgStore::open_storage_handle(handle)?);
+        let mut stores = self
+            .live_stores
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(stores
+            .entry(config_home)
+            .or_insert_with(|| Arc::clone(&store))
+            .clone())
     }
 
     pub(crate) fn incident_context(
@@ -1123,13 +1164,36 @@ impl MfgService {
         )
     }
 
-    pub(crate) fn live_projection(
+    pub(crate) fn live_epoch(
         &self,
         config_home: impl AsRef<Path>,
-        cursor: Option<u64>,
+    ) -> Result<app_mfg::MfgLiveEpoch, MfgRepositoryError> {
+        self.open_live_store(config_home)?.live_epoch()
+    }
+
+    pub(crate) fn rotate_live_epoch(
+        &self,
+        config_home: impl AsRef<Path>,
+        reason: &str,
+    ) -> Result<app_mfg::MfgLiveEpoch, MfgRepositoryError> {
+        self.open_live_store(config_home)?.rotate_live_epoch(reason)
+    }
+
+    pub(crate) fn live_snapshot_read(
+        &self,
+        config_home: impl AsRef<Path>,
+    ) -> Result<app_mfg::MfgLiveSnapshotRead, MfgRepositoryError> {
+        self.open_live_store(config_home)?.live_snapshot_read()
+    }
+
+    pub(crate) fn live_delta_read(
+        &self,
+        config_home: impl AsRef<Path>,
+        cursor: u64,
         limit: usize,
-    ) -> Result<MfgLiveProjection, MfgRepositoryError> {
-        self.open_store(config_home)?.live_projection(cursor, limit)
+    ) -> Result<app_mfg::MfgLiveDeltaRead, MfgRepositoryError> {
+        self.open_live_store(config_home)?
+            .live_delta_read(cursor, limit)
     }
 
     pub(crate) fn record_command_notifications(

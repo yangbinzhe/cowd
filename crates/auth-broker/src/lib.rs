@@ -103,9 +103,15 @@ pub enum CredentialLifecycleStatus {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CredentialLifecycleMetadata {
     pub credential_epoch: u64,
+    #[serde(default = "default_profile_revision")]
+    pub profile_revision: u64,
     pub status: CredentialLifecycleStatus,
     pub enrolled_at_ms: u64,
     pub updated_at_ms: u64,
+}
+
+const fn default_profile_revision() -> u64 {
+    1
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -542,6 +548,7 @@ impl PersistedCredentialState {
     fn lifecycle(&self) -> CredentialLifecycleMetadata {
         CredentialLifecycleMetadata {
             credential_epoch: self.credential_epoch,
+            profile_revision: self.profile_revision,
             status: self.status,
             enrolled_at_ms: self.enrolled_at_ms,
             updated_at_ms: self.updated_at_ms,
@@ -722,6 +729,7 @@ impl LocalAuthority {
             expires_at_ms: ttl_ms.map(|ttl| now.saturating_add(ttl)),
             credential_fingerprint: format!("sha256:{}", self.credential_state.credential_digest),
             credential_epoch: self.credential_state.credential_epoch,
+            profile_revision: self.credential_state.profile_revision,
         };
         let signature_base64 = self.sign(&claims)?;
         Ok((
@@ -1052,11 +1060,61 @@ pub fn serve_local(
     Ok(())
 }
 
+/// Serve the broker until the supplied shutdown predicate becomes true.
+///
+/// Production uses [`serve_local`]; the explicit lifecycle hook lets embedded
+/// test fixtures release their listener, socket, and authority deterministically.
+#[cfg(unix)]
+pub fn serve_local_until(
+    root: impl AsRef<Path>,
+    human_credential: &str,
+    socket_path: impl AsRef<Path>,
+    should_shutdown: impl Fn() -> bool,
+) -> Result<(), AuthBrokerError> {
+    use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+
+    let mut authority = LocalAuthority::open_or_initialize(root, human_credential)?;
+    let socket_path = socket_path.as_ref();
+    if socket_path.exists() {
+        fs::remove_file(socket_path).map_err(storage_error)?;
+    }
+    let listener = UnixListener::bind(socket_path).map_err(storage_error)?;
+    fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600)).map_err(storage_error)?;
+    listener.set_nonblocking(true).map_err(storage_error)?;
+    while !should_shutdown() {
+        match listener.accept() {
+            Ok((stream, _address)) => {
+                if let Err(error) = handle_client(&mut authority, stream) {
+                    eprintln!("auth broker request failed: {error}");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) => return Err(storage_error(error)),
+        }
+    }
+    let _ = fs::remove_file(socket_path);
+    Ok(())
+}
+
 #[cfg(not(unix))]
 pub fn serve_local(
     _root: impl AsRef<Path>,
     _human_credential: &str,
     _socket_path: impl AsRef<Path>,
+) -> Result<(), AuthBrokerError> {
+    Err(AuthBrokerError::Protocol(
+        "local auth broker requires Unix domain sockets".to_string(),
+    ))
+}
+
+#[cfg(not(unix))]
+pub fn serve_local_until(
+    _root: impl AsRef<Path>,
+    _human_credential: &str,
+    _socket_path: impl AsRef<Path>,
+    _should_shutdown: impl Fn() -> bool,
 ) -> Result<(), AuthBrokerError> {
     Err(AuthBrokerError::Protocol(
         "local auth broker requires Unix domain sockets".to_string(),

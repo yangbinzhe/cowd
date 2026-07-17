@@ -12,7 +12,7 @@ use crate::runtime_control_store::{
     MfgConnectionStatus, MfgFreshness, MfgOperationsState, MfgViewFocus, MfgViewTab,
 };
 
-pub const MFG_PANEL_READ_ROUTE_IDS: [app_mfg_contract::MfgRouteId; 19] = [
+pub const MFG_PANEL_READ_ROUTE_IDS: [app_mfg_contract::MfgRouteId; 20] = [
     app_mfg_contract::MfgRouteId::ContractGet,
     app_mfg_contract::MfgRouteId::AppGet,
     app_mfg_contract::MfgRouteId::CommandCenterGet,
@@ -32,6 +32,7 @@ pub const MFG_PANEL_READ_ROUTE_IDS: [app_mfg_contract::MfgRouteId; 19] = [
     app_mfg_contract::MfgRouteId::AssignmentList,
     app_mfg_contract::MfgRouteId::AssignmentGet,
     app_mfg_contract::MfgRouteId::LiveStream,
+    app_mfg_contract::MfgRouteId::LiveSnapshot,
 ];
 
 pub struct MfgOperationsPanel;
@@ -236,6 +237,7 @@ impl MfgOperationsPanel {
                 metric_line("Assignments", state.assignments.len()),
                 metric_line("Reports", state.reports.len()),
                 metric_line("Reviews", state.reviews.len()),
+                metric_line("Live receipts", state.live_receipts.len()),
                 metric_line("Insights", state.insights.len()),
             ]);
             if state.command_center.is_none() {
@@ -639,9 +641,10 @@ impl MfgOperationsPanel {
             })
             .unwrap_or_else(|| {
                 format!(
-                    "{:?} · receipts={} · pending-mutations={} · live-cursor={}",
+                    "{:?} · action-receipts={} · live-receipts={} · pending-mutations={} · live-cursor={}",
                     state.connection,
                     state.receipts.len(),
+                    state.live_receipts.len(),
                     state.pending_mutation_count(),
                     state.live_cursor.as_deref().unwrap_or("not-started")
                 )

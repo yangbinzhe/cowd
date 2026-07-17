@@ -163,6 +163,7 @@ impl HumanAuthority {
             expires_at_ms: Some(now_ms().saturating_add(60_000)),
             credential_fingerprint: "test-human-evolution-operator".to_string(),
             credential_epoch: 1,
+            profile_revision: 1,
         };
         let principal = verifier
             .verify(&SignedPrincipalEnvelope {

@@ -58,7 +58,8 @@ pub use operations::{
     MfgAlertCommand, MfgAlertCommandInput, MfgAlertOccurrence, MfgAlertRule, MfgAlertRuleInput,
     MfgAlertSubscription, MfgAlertSubscriptionInput, MfgAssignment, MfgAssignmentCommand,
     MfgAssignmentCommandInput, MfgAssignmentInput, MfgCommandReceipt, MfgForecastProjection,
-    MfgForecastSignal, MfgLiveProjection, MfgLiveProjectionEvent, MfgSurfaceNotificationTarget,
+    MfgForecastSignal, MfgLiveDeltaRead, MfgLiveEpoch, MfgLiveProjectionEvent, MfgLiveSnapshotRead,
+    MfgSurfaceNotificationTarget,
 };
 pub use skill::{
     plan_server_manufacturing_skills, run_server_manufacturing_skill,

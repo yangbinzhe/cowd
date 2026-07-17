@@ -213,7 +213,7 @@ mod tests {
             .filter(|route| route.availability == app_mfg_contract::MfgActionAvailability::Active)
             .map(|route| (route.method, route.path))
             .collect::<BTreeSet<_>>();
-        assert_eq!(contract.len(), 103);
+        assert_eq!(contract.len(), 104);
         assert_eq!(manifest, contract);
     }
 }

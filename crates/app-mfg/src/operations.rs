@@ -406,13 +406,30 @@ pub struct MfgLiveProjectionEvent {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MfgLiveEpoch {
+    pub epoch_id: String,
+    pub contract_version: String,
+    pub schema_version: u32,
+    pub created_at: DateTime<Utc>,
+    pub rotation_reason: String,
+    pub retention_low_cursor: u64,
+    pub retention_high_cursor: u64,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct MfgLiveProjection {
-    pub kind: String,
-    pub cursor: u64,
-    pub recoverable: bool,
-    #[serde(default)]
-    pub snapshot: Value,
+pub struct MfgLiveSnapshotRead {
+    pub epoch: MfgLiveEpoch,
+    pub high_cursor: u64,
+    pub state: app_mfg_contract::MfgLiveSnapshotStateV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MfgLiveDeltaRead {
+    pub epoch: MfgLiveEpoch,
+    pub base_cursor: u64,
+    pub high_cursor: u64,
     #[serde(default)]
     pub events: Vec<MfgLiveProjectionEvent>,
     #[serde(default)]

@@ -16,8 +16,8 @@ use crate::{
     MfgAssignmentCommandInput, MfgCasePromotion, MfgCockpitProfile, MfgCockpitProjection,
     MfgCockpitReportDeliveryReceipt, MfgCockpitReportRequest, MfgCockpitReportSnapshot,
     MfgCockpitWidgetProjection, MfgCommandReceipt, MfgCrossPlaneBridgeReceipt, MfgDomainSeedResult,
-    MfgForecastProjection, MfgIncident, MfgLiveProjection, MfgMemoryCase, MfgOperationalAnalysis,
-    MfgPlaybook, MfgSkillRun, MfgWorkflowGraph,
+    MfgForecastProjection, MfgIncident, MfgLiveDeltaRead, MfgLiveEpoch, MfgLiveSnapshotRead,
+    MfgMemoryCase, MfgOperationalAnalysis, MfgPlaybook, MfgSkillRun, MfgWorkflowGraph,
 };
 
 /// Application-layer store facade for MFG.
@@ -768,12 +768,24 @@ impl MfgStore {
         )
     }
 
-    pub fn live_projection(
+    pub fn live_epoch(&self) -> Result<MfgLiveEpoch, MfgRepositoryError> {
+        self.repository.live_epoch()
+    }
+
+    pub fn rotate_live_epoch(&self, reason: &str) -> Result<MfgLiveEpoch, MfgRepositoryError> {
+        self.repository.rotate_live_epoch(reason)
+    }
+
+    pub fn live_snapshot_read(&self) -> Result<MfgLiveSnapshotRead, MfgRepositoryError> {
+        self.repository.live_snapshot_read()
+    }
+
+    pub fn live_delta_read(
         &self,
-        cursor: Option<u64>,
+        cursor: u64,
         limit: usize,
-    ) -> Result<MfgLiveProjection, MfgRepositoryError> {
-        self.repository.live_projection(cursor, limit)
+    ) -> Result<MfgLiveDeltaRead, MfgRepositoryError> {
+        self.repository.live_delta_read(cursor, limit)
     }
 
     pub fn record_command_notifications(

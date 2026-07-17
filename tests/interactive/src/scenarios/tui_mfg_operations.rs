@@ -196,6 +196,21 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
                 "accepted action did not expose canonical receipt evidence"
             ));
         }
+        let accepted_receipt = mfg_any_fact(&accepted, "receipt")
+            .ok_or_else(|| anyhow!("accepted action receipt ID was not parseable"))?;
+        let accepted_revision = mfg_any_fact(&accepted, "result-revision")
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| anyhow!("accepted action result revision was not parseable"))?;
+        let accepted_receipt_status = mfg_receipt_status(&accepted)
+            .ok_or_else(|| anyhow!("accepted action receipt status was not parseable"))?;
+        if accepted_receipt_status != "completed" {
+            return Err(anyhow!(
+                "accepted action canonical receipt was not completed: {accepted_receipt_status}"
+            ));
+        }
+        let expected_revision = stale_revision
+            .parse::<u64>()
+            .map_err(|_| anyhow!("prepared action expected revision was not numeric"))?;
         tui.resize(80, 24)?;
         let accepted_compact = tui.capture_step("action-accepted-80x24", &[])?;
         if !accepted_compact.contains("receipt=") || !accepted_compact.contains("Recovery") {
@@ -246,6 +261,13 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
                 "status": "v544_governed_action_producer_observed",
                 "target_acceptance_ids": ["TUI-01", "TUI-02", "TUI-03", "TUI-04", "TUI-05"],
                 "deferred_acceptance_ids": ["TUI-01", "TUI-02", "TUI-03", "TUI-04", "TUI-05", "TUI-06", "TUI-07", "TUI-08"],
+                "method": "POST",
+                "path": "/api/apps/mfg/focus/alerts/:id/command",
+                "receipt_id": accepted_receipt,
+                "receipt_status": accepted_receipt_status,
+                "replayed": false,
+                "revision_before": expected_revision,
+                "revision_after": accepted_revision,
                 "receipt": mfg_any_fact(&accepted, "receipt"),
                 "cursor": null,
                 "pending_mutation": mfg_any_fact(&conflict, "mutations")
@@ -349,6 +371,16 @@ fn mfg_any_fact(capture: &str, key: &str) -> Option<String> {
                 .trim_end_matches(',')
                 .to_string()
         })
+}
+
+fn mfg_receipt_status(capture: &str) -> Option<String> {
+    capture
+        .lines()
+        .find(|line| line.contains("receipt=") && line.contains("correlation="))
+        .and_then(|line| line.split('·').nth(1))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
 }
 
 fn mfg_action_fact(capture: &str, key: &str) -> Option<String> {
