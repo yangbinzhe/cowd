@@ -539,12 +539,7 @@ async fn run_mfg_live_consumer(
             }
             Err(error) => {
                 let error = mfg_api_error_from_gateway(&error);
-                let terminal = matches!(
-                    error.code,
-                    app_mfg_contract::MfgErrorCode::AuthenticationRequired
-                        | app_mfg_contract::MfgErrorCode::CapabilityDenied
-                        | app_mfg_contract::MfgErrorCode::MfgLiveCursorKeyInvalid
-                );
+                let terminal = mfg_live_failure_is_terminal(&error);
                 if tx
                     .send_wait(CowdEvent::MfgLiveFailed { generation, error })
                     .await
@@ -635,12 +630,7 @@ async fn run_mfg_live_consumer(
             Err(error) => {
                 let error = mfg_api_error_from_gateway(&error);
                 let reauthenticate = mfg_live_reauthentication_allowed(&error);
-                let terminal = matches!(
-                    error.code,
-                    app_mfg_contract::MfgErrorCode::AuthenticationRequired
-                        | app_mfg_contract::MfgErrorCode::CapabilityDenied
-                        | app_mfg_contract::MfgErrorCode::MfgLiveCursorKeyInvalid
-                );
+                let terminal = mfg_live_failure_is_terminal(&error);
                 if tx
                     .send_wait(CowdEvent::MfgLiveFailed { generation, error })
                     .await
@@ -739,6 +729,26 @@ fn mfg_live_reauthentication_allowed(error: &app_mfg_contract::MfgApiErrorV1) ->
             .and_then(serde_json::Value::as_str),
         Some("profile_revision_changed" | "credential_epoch_changed")
     )
+}
+
+fn mfg_live_failure_is_terminal(error: &app_mfg_contract::MfgApiErrorV1) -> bool {
+    match error.code {
+        // The Gateway checks the local auth Broker for every live request.
+        // During a normal Gateway restart that Unix socket can be briefly
+        // unavailable even though the credential remains valid.  Treat that
+        // particular 401-shaped response as transport recovery, not a user
+        // authentication failure; the next snapshot revalidates it.
+        app_mfg_contract::MfgErrorCode::AuthenticationRequired => {
+            error
+                .details
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                != Some("authority_unavailable")
+        }
+        app_mfg_contract::MfgErrorCode::CapabilityDenied
+        | app_mfg_contract::MfgErrorCode::MfgLiveCursorKeyInvalid => true,
+        _ => false,
+    }
 }
 
 fn record_mfg_live_state_artifact(
@@ -3513,6 +3523,23 @@ mod tests {
         assert!(!mfg_live_reauthentication_allowed(&rotated));
         rotated.details = serde_json::json!({"reason": "authority_unavailable"});
         assert!(!mfg_live_reauthentication_allowed(&rotated));
+    }
+
+    #[test]
+    fn mfg_live_authority_restart_is_reconnectable_but_real_auth_failures_stop() {
+        let mut authority_unavailable =
+            app_mfg_contract::MfgApiErrorV1::authentication_required("broker restarting");
+        authority_unavailable.details = serde_json::json!({"reason": "authority_unavailable"});
+        assert!(!mfg_live_failure_is_terminal(&authority_unavailable));
+
+        let mut credential_inactive =
+            app_mfg_contract::MfgApiErrorV1::authentication_required("credential inactive");
+        credential_inactive.details = serde_json::json!({"reason": "credential_inactive"});
+        assert!(mfg_live_failure_is_terminal(&credential_inactive));
+
+        assert!(mfg_live_failure_is_terminal(
+            &app_mfg_contract::MfgApiErrorV1::capability_denied("mfg.read")
+        ));
     }
 
     #[test]

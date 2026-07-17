@@ -885,11 +885,15 @@ impl MfgOperationsState {
             error.details.get("reason").and_then(Value::as_str),
             Some("profile_revision_changed" | "credential_epoch_changed")
         );
+        let authority_unavailable = matches!(
+            error.details.get("reason").and_then(Value::as_str),
+            Some("authority_unavailable")
+        );
         let authorization_data_invalid = matches!(
             error.code,
             app_mfg_contract::MfgErrorCode::AuthenticationRequired
                 | app_mfg_contract::MfgErrorCode::CapabilityDenied
-        );
+        ) && !authority_unavailable;
         if authorization_data_invalid {
             // Never retain a projection cropped under an authorization view
             // that the live authority has rejected. The runner's next safe
@@ -7810,6 +7814,42 @@ pub(crate) mod tests {
         assert!(state.live_stream_available);
         assert!(state.last_error.is_none());
         assert_eq!(state.live_epoch.as_deref(), Some("recropped"));
+    }
+
+    #[test]
+    fn mfg_live_authority_restart_keeps_the_last_authorized_projection_visible() {
+        let mut state = MfgOperationsState::default();
+        state.live_generation = 4;
+        state.apply_live_envelope(
+            4,
+            app_mfg_contract::MfgLiveEnvelopeV1::Snapshot(app_mfg_contract::MfgLiveSnapshotV1 {
+                view_epoch: "authorized".to_string(),
+                cursor: "cursor-authorized".to_string(),
+                generated_at: chrono::Utc::now(),
+                contract_version: app_mfg_contract::MfgContractVersion::default(),
+                state: app_mfg_contract::MfgLiveSnapshotStateV1 {
+                    assignments: serde_json::json!({
+                        "items": [{"assignment_id": "private-assignment", "status": "assigned"}],
+                    }),
+                    reports: serde_json::json!({
+                        "items": [{"report_id": "private-report", "status": "generated"}],
+                    }),
+                    ..app_mfg_contract::MfgLiveSnapshotStateV1::default()
+                },
+            }),
+        );
+        let mut error =
+            app_mfg_contract::MfgApiErrorV1::authentication_required("broker restarting");
+        error.details = serde_json::json!({"reason": "authority_unavailable"});
+        state.apply_live_error(4, error);
+
+        assert!(!state.live_stream_available);
+        assert_eq!(state.assignments.len(), 1);
+        assert_eq!(state.reports.len(), 1);
+        assert_eq!(state.live_epoch.as_deref(), Some("authorized"));
+        assert_eq!(state.live_cursor.as_deref(), Some("cursor-authorized"));
+        assert_eq!(state.live_reauthentication_count, 0);
+        assert!(state.last_error.is_some());
     }
 
     #[test]
