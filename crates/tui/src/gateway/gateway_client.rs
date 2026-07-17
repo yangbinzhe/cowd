@@ -6,7 +6,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use serde::de::DeserializeOwned;
 
-use crate::{events::CowdEventSender, CowdEvent};
+use crate::{CowdEvent, events::CowdEventSender};
 
 const GATEWAY_READY_RETRY_ATTEMPTS: usize = 20;
 const GATEWAY_READY_RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -716,7 +716,12 @@ impl GatewayApiClient {
                 url_encode(execution_id)
             ))
             .await?;
-        serde_json::from_value(value).map_err(|error| GatewayApiError::Url(error.to_string()))
+        let projection: harness_contract::projection::ExecutionProjection =
+            serde_json::from_value(value)
+                .map_err(|error| GatewayApiError::Url(error.to_string()))?;
+        crate::protocol::validate_execution_projection_schema(&projection)
+            .map_err(GatewayApiError::Url)?;
+        Ok(projection)
     }
 
     pub async fn execution_projection_delta(
@@ -732,7 +737,10 @@ impl GatewayApiClient {
                 url_encode(execution_id)
             ))
             .await?;
-        serde_json::from_value(value).map_err(|error| GatewayApiError::Url(error.to_string()))
+        let delta: harness_contract::projection::ProjectionDelta = serde_json::from_value(value)
+            .map_err(|error| GatewayApiError::Url(error.to_string()))?;
+        crate::protocol::validate_projection_delta_schema(&delta).map_err(GatewayApiError::Url)?;
+        Ok(delta)
     }
 
     pub async fn subscribe_execution_projection_events(
@@ -740,6 +748,7 @@ impl GatewayApiClient {
         execution_id: &str,
         after_cursor: u64,
         full: bool,
+        generation: u64,
         tx: CowdEventSender,
     ) -> Result<u64, GatewayApiError> {
         let scope = if full { "full" } else { "summary" };
@@ -773,15 +782,29 @@ impl GatewayApiClient {
                 if let Some(cursor) = gateway_sse_frame_commit_cursor(&frame) {
                     latest_cursor = latest_cursor.max(cursor);
                 }
+                if gateway_sse_frame_projection_authorization_revoked(&frame) {
+                    return Err(GatewayApiError::Status(
+                        reqwest::StatusCode::FORBIDDEN,
+                        "Gateway revoked the execution projection stream".to_string(),
+                    ));
+                }
                 if let Some(delta) = gateway_sse_frame_projection_delta(&frame) {
+                    crate::protocol::validate_projection_delta_schema(&delta)
+                        .map_err(GatewayApiError::Url)?;
                     latest_cursor = latest_cursor.max(delta.target_cursor);
-                    let _ = tx.send(CowdEvent::ExecutionProjectionDelta { delta });
+                    let _ = tx.send(CowdEvent::ExecutionProjectionDelta { generation, delta });
                 } else if gateway_sse_frame_event_name(&frame) == Some("projection_resync") {
-                    let _ = tx.send(CowdEvent::Warning {
-                        message: format!(
-                            "Execution projection requires snapshot resync for {execution_id}"
-                        ),
+                    // A resync frame is terminal on the Gateway.  Fetch the
+                    // canonical snapshot before reconnecting; merely warning
+                    // and reusing the old cursor can leave the TUI frozen on
+                    // an invalid delta base forever.
+                    let snapshot = self.execution_projection(execution_id, full).await?;
+                    latest_cursor = latest_cursor.max(snapshot.cursor);
+                    let _ = tx.send(CowdEvent::ExecutionProjectionLoaded {
+                        generation,
+                        projection: snapshot,
                     });
+                    return Ok(latest_cursor);
                 }
             }
         }
@@ -862,6 +885,10 @@ impl GatewayApiClient {
     pub async fn approval_history(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/approval/history?limit=200&offset=0")
             .await
+    }
+
+    pub async fn approval_exact(&self, approval_id: &str) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!("/api/approval/{}", url_encode(approval_id))).await
     }
 
     pub async fn mission_projection(&self) -> Result<serde_json::Value, GatewayApiError> {
@@ -1276,6 +1303,19 @@ impl GatewayApiClient {
     pub async fn surface_deliveries(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json(&format!("/api/surfaces/{}/deliveries", url_encode(id)))
             .await
+    }
+
+    pub async fn surface_outbox_delivery(
+        &self,
+        id: &str,
+        delivery_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!(
+            "/api/surfaces/{}/outbox/{}",
+            url_encode(id),
+            url_encode(delivery_id)
+        ))
+        .await
     }
 
     pub async fn surface_replay_inbox(
@@ -2712,6 +2752,10 @@ fn gateway_sse_frame_projection_delta(
     serde_json::from_str(&data).ok()
 }
 
+fn gateway_sse_frame_projection_authorization_revoked(frame: &str) -> bool {
+    gateway_sse_frame_event_name(frame) == Some("projection_authorization_revoked")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3336,6 +3380,16 @@ mod tests {
     }
 
     #[test]
+    fn projection_stream_revocation_is_typed_as_forbidden_before_any_delta_is_applied() {
+        assert!(gateway_sse_frame_projection_authorization_revoked(
+            "event: projection_authorization_revoked\ndata: {\"reason\":\"credential epoch changed\"}"
+        ));
+        assert!(!gateway_sse_frame_projection_authorization_revoked(
+            "event: projection_delta\ndata: {}"
+        ));
+    }
+
+    #[test]
     fn gateway_sse_frame_maps_data_json() {
         assert!(matches!(
             gateway_sse_frame_to_cowd_event(
@@ -3529,9 +3583,11 @@ mod tests {
             "evolution_evaluation_policy_review_decision",
         ];
         assert_eq!(evolution_methods.len(), 22);
-        assert!(evolution_methods
-            .iter()
-            .all(|method| method.starts_with("evolution_")));
+        assert!(
+            evolution_methods
+                .iter()
+                .all(|method| method.starts_with("evolution_"))
+        );
     }
 
     #[test]
@@ -3543,9 +3599,11 @@ mod tests {
             "reset_managed_agent_health",
         ];
         assert_eq!(managed_agent_methods.len(), 4);
-        assert!(managed_agent_methods
-            .iter()
-            .all(|method| method.contains("managed_agent")));
+        assert!(
+            managed_agent_methods
+                .iter()
+                .all(|method| method.contains("managed_agent"))
+        );
     }
 
     #[tokio::test]

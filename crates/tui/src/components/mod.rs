@@ -35,6 +35,7 @@ pub mod runtime_activity_panel;
 pub mod session_sidebar;
 pub mod skills_panel;
 pub mod status_bar;
+pub mod strategy_decision;
 pub mod surface_panel;
 pub mod system_status_bar;
 pub mod task_decomposition_view;

@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use axum::{
+    Json, Router,
     extract::{Extension, Path, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
 
 use crate::services::{
@@ -16,7 +16,7 @@ use crate::services::{
 };
 use memory::SessionMissionOutboxOperation;
 
-use super::{api_error, AppState, AuthenticatedPrincipal, ErrorResponse};
+use super::{AppState, AuthenticatedPrincipal, ErrorResponse, api_error};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -434,6 +434,7 @@ async fn upsert_mission_proxy_handler(
 
 async fn start_mission_session_handler(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(mut body): Json<StartMissionSessionHttpRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let session_id = body
@@ -454,6 +455,7 @@ async fn start_mission_session_handler(
         crate::unified_session_manager::SessionSource::MissionControl,
     );
     request.title = Some(body.title.clone());
+    request.owner_principal_id = Some(principal.0.claims().principal_id.clone());
     request.metadata = serde_json::json!({"source": "mission_control"});
     request.mission_operation = SessionMissionOutboxOperation::Start;
     state

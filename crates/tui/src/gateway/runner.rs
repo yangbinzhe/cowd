@@ -7,23 +7,23 @@ use std::time::Duration;
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use futures::StreamExt;
 use harness_contract::projection::{ExecutionCommandKind, ExecutionCommandRequest};
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 
 use crate::app::{PendingResource, SystemNoticeKind};
 use crate::context_tokens::ContextWorkspaceEntry;
 use crate::events::CowdEventSender;
-use crate::gateway_client::{default_auth_token, GatewayApiClient};
+use crate::gateway_client::{GatewayApiClient, default_auth_token};
 use crate::runtime_control_store::{
     MfgBacklink, MfgBacklinkKind, MfgItemSummary, MfgOperationsSnapshot, MfgOperationsState,
     MfgPaginationState,
 };
 use crate::state::{ProcessedKey, TuiState};
-use crate::{config_migration, cowd_event_channel, error_recovery, CowdEvent, FileEntry};
+use crate::{CowdEvent, FileEntry, config_migration, cowd_event_channel, error_recovery};
 
 static SHARED_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
@@ -34,6 +34,88 @@ pub struct GatewayTuiConfig {
     pub yolo_mode: bool,
     pub startup_banner: String,
     pub connected_line: String,
+}
+
+#[derive(Debug, Default)]
+struct ExecutionProjectionStreamController {
+    next_generation: u64,
+    active: Option<ActiveExecutionProjectionStream>,
+}
+
+#[derive(Debug)]
+struct ActiveExecutionProjectionStream {
+    execution_id: String,
+    generation: u64,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ExecutionProjectionStreamController {
+    /// End a prior selection before the next execution has a usable snapshot.
+    /// This raises the generation even when the new snapshot temporarily
+    /// returns 404/403, so a late delta from the old execution cannot revive
+    /// it in the new turn's UI.
+    fn begin_selection(&mut self, execution_id: &str) -> bool {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.execution_id == execution_id)
+        {
+            return false;
+        }
+        self.stop();
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
+        true
+    }
+
+    fn switch(
+        &mut self,
+        gateway_client: GatewayApiClient,
+        execution_id: String,
+        initial_cursor: u64,
+        event_tx: CowdEventSender,
+    ) {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.execution_id == execution_id)
+        {
+            return;
+        }
+        self.stop();
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
+        let generation = self.next_generation;
+        if let Some(task) = spawn_execution_projection_stream(
+            gateway_client,
+            execution_id.clone(),
+            initial_cursor,
+            generation,
+            event_tx,
+        ) {
+            self.active = Some(ActiveExecutionProjectionStream {
+                execution_id,
+                generation,
+                task,
+            });
+        }
+    }
+
+    fn accepts(&self, generation: u64, execution_id: &str) -> bool {
+        self.active.as_ref().is_some_and(|active| {
+            active.generation == generation && active.execution_id == execution_id
+        })
+    }
+
+    fn stop(&mut self) {
+        if let Some(active) = self.active.take() {
+            active.task.abort();
+        }
+    }
+}
+
+impl Drop for ExecutionProjectionStreamController {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 impl GatewayTuiConfig {
@@ -158,7 +240,7 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
     let mfg_live_artifact_path = std::env::var_os("COWD_TUI_MFG_STATE_ARTIFACT").map(PathBuf::from);
     let res = runtime.block_on(async {
         let mut reader = crossterm::event::EventStream::new();
-        let mut execution_projection_stream = None;
+        let mut execution_projection_stream = ExecutionProjectionStreamController::default();
         let mut mfg_contract_was_active = false;
         let mut last_mfg_artifact_fingerprint = None;
         loop {
@@ -1365,6 +1447,11 @@ fn start_pending_mfg_backlink_resolution(
     event_tx: &CowdEventSender,
 ) {
     if let Some(target) = state.app.mfg_operations.take_runtime_backlink_request() {
+        let mfg_generation = state.app.mfg_operations.generation;
+        let selection_revision = state.app.mfg_operations.selection_revision;
+        let live_generation = state.app.mfg_operations.live_generation;
+        let live_epoch = state.app.mfg_operations.live_epoch.clone();
+        let live_reauthentication_count = state.app.mfg_operations.live_reauthentication_count;
         let client = gateway_client.clone();
         let tx = event_tx.clone();
         spawn_tui_task(event_tx, async move {
@@ -1387,7 +1474,7 @@ fn start_pending_mfg_backlink_resolution(
                     canonical_backlink_id(&target, "runtime-execution://")
                 {
                     client
-                        .execution_projection(execution_id, false)
+                        .execution_projection(execution_id, true)
                         .await
                         .and_then(|projection| {
                             serde_json::to_value(projection).map_err(|error| {
@@ -1415,12 +1502,22 @@ fn start_pending_mfg_backlink_resolution(
                     let _ = tx.send(CowdEvent::RuntimeBacklinkResolved {
                         target: target.clone(),
                         object,
+                        mfg_generation,
+                        selection_revision,
+                        live_generation,
+                        live_epoch,
+                        live_reauthentication_count,
                     });
                 }
                 Err(error) => {
                     let _ = tx.send(CowdEvent::RuntimeBacklinkFailed {
                         target: target.clone(),
                         message: error.to_string(),
+                        mfg_generation,
+                        selection_revision,
+                        live_generation,
+                        live_epoch,
+                        live_reauthentication_count,
                     });
                 }
             }
@@ -1432,31 +1529,7 @@ fn start_pending_mfg_backlink_resolution(
         spawn_tui_task(event_tx, async move {
             let approval_id = canonical_backlink_id(&target, "approval://");
             let resolved = match approval_id {
-                Some(approval_id) => match client.pending_approvals().await {
-                    Ok(pending) => {
-                        if let Some(approval) = find_json_object_by_identity(
-                            &pending,
-                            &["id", "approval_id"],
-                            approval_id,
-                        ) {
-                            Ok(approval)
-                        } else {
-                            client.approval_history().await.and_then(|history| {
-                                find_json_object_by_identity(
-                                    &history,
-                                    &["id", "approval_id"],
-                                    approval_id,
-                                )
-                                .ok_or_else(|| {
-                                    crate::gateway_client::GatewayApiError::Url(format!(
-                                        "approval {approval_id} was not found in pending or history"
-                                    ))
-                                })
-                            })
-                        }
-                    }
-                    Err(error) => Err(error),
-                },
+                Some(approval_id) => client.approval_exact(approval_id).await,
                 None => Err(crate::gateway_client::GatewayApiError::Url(format!(
                     "unsupported Approval backlink {target}"
                 ))),
@@ -1502,27 +1575,26 @@ fn start_pending_mfg_backlink_resolution(
                         "Surface backlink {target} has no object identity"
                     )))
                 } else {
-                    let (objects, identity_fields) = if object_kind == "delivery" {
-                        (
-                            client.surface_deliveries(surface_id).await,
-                            &["delivery_id"][..],
-                        )
+                    if object_kind == "delivery" {
+                        client
+                            .surface_outbox_delivery(surface_id, object_id)
+                            .await
+                            .and_then(|value| {
+                                value.get("delivery").cloned().ok_or_else(|| {
+                                    crate::gateway_client::GatewayApiError::Url(format!(
+                                        "Surface outbox delivery {object_id} did not contain its canonical record"
+                                    ))
+                                })
+                            })
                     } else {
-                        (
-                            client.surface_messages(surface_id).await,
-                            &["message_id", "id"][..],
-                        )
-                    };
-                    match objects {
-                        Ok(objects) => {
-                            find_json_object_by_identity(&objects, identity_fields, object_id)
+                        client.surface_messages(surface_id).await.and_then(|objects| {
+                            find_json_object_by_identity(&objects, &["message_id", "id"], object_id)
                                 .ok_or_else(|| {
                                     crate::gateway_client::GatewayApiError::Url(format!(
                                         "Surface object {object_id} was not found on {surface_id}"
                                     ))
                                 })
-                        }
-                        Err(error) => Err(error),
+                        })
                     }
                 }
             } else {
@@ -2921,7 +2993,7 @@ async fn drain_cowd_events_state(
     state: &mut TuiState,
     gateway_client: &GatewayApiClient,
     event_tx: &CowdEventSender,
-    execution_projection_stream: &mut Option<String>,
+    execution_projection_stream: &mut ExecutionProjectionStreamController,
 ) {
     let mut count = 0;
     let limit = if state.app.turn_is_active() { 64 } else { 256 };
@@ -2930,20 +3002,41 @@ async fn drain_cowd_events_state(
             CowdEvent::ExecutionGraphSummary { summary } => summary.graph_id.clone(),
             _ => None,
         };
-        if let CowdEvent::ExecutionProjectionDelta { delta } = &event {
-            apply_execution_projection_delta(gateway_client, state, delta).await;
+        if let CowdEvent::ExecutionProjectionDelta { generation, delta } = &event {
+            if execution_projection_stream.accepts(*generation, &delta.execution_id) {
+                apply_execution_projection_delta(gateway_client, state, delta).await;
+            }
             count += 1;
             if count >= limit {
                 break;
             }
             continue;
         }
-        if let CowdEvent::ExecutionProjectionLoaded { projection } = &event {
+        if let CowdEvent::ExecutionProjectionAccessRevoked {
+            generation,
+            execution_id,
+            message,
+        } = &event
+        {
+            if execution_projection_stream.accepts(*generation, execution_id) {
+                execution_projection_stream.stop();
+                state.invalidate_execution_projection(execution_id, message);
+            }
+            count += 1;
+            if count >= limit {
+                break;
+            }
+            continue;
+        }
+        if let CowdEvent::ExecutionProjectionLoaded {
+            generation,
+            projection,
+        } = &event
+        {
             let execution_id = projection.execution_id.clone();
-            state.apply_execution_projection(projection.clone());
-            if execution_projection_stream.as_deref() != Some(execution_id.as_str()) {
-                *execution_projection_stream = Some(execution_id.clone());
-                spawn_execution_projection_stream(
+            if execution_projection_stream.accepts(*generation, &execution_id) {
+                state.apply_execution_projection(projection.clone());
+                execution_projection_stream.switch(
                     gateway_client.clone(),
                     execution_id,
                     projection.cursor,
@@ -2956,24 +3049,44 @@ async fn drain_cowd_events_state(
             }
             continue;
         }
+        if let Some(next_execution_id) = execution_id.as_deref() {
+            let previous_execution_id = execution_projection_stream
+                .active
+                .as_ref()
+                .map(|active| active.execution_id.clone())
+                .or_else(|| {
+                    state
+                        .app
+                        .latest_execution_projection
+                        .as_ref()
+                        .map(|projection| projection.execution_id.clone())
+                });
+            if execution_projection_stream.begin_selection(next_execution_id) {
+                if let Some(previous_execution_id) = previous_execution_id
+                    .filter(|previous_execution_id| previous_execution_id != next_execution_id)
+                {
+                    state.invalidate_execution_projection(
+                        &previous_execution_id,
+                        "Runtime selected a new execution; loading its canonical projection",
+                    );
+                }
+            }
+        }
         state.apply_event(event);
         if let Some(execution_id) = execution_id {
             match gateway_client
-                .execution_projection(&execution_id, false)
+                .execution_projection(&execution_id, true)
                 .await
             {
                 Ok(projection) => {
                     let cursor = projection.cursor;
                     state.apply_execution_projection(projection);
-                    if execution_projection_stream.as_deref() != Some(execution_id.as_str()) {
-                        *execution_projection_stream = Some(execution_id.clone());
-                        spawn_execution_projection_stream(
-                            gateway_client.clone(),
-                            execution_id,
-                            cursor,
-                            event_tx.clone(),
-                        );
-                    }
+                    execution_projection_stream.switch(
+                        gateway_client.clone(),
+                        execution_id,
+                        cursor,
+                        event_tx.clone(),
+                    );
                 }
                 Err(error) => state.add_system_notice(
                     SystemNoticeKind::Warning,
@@ -2996,8 +3109,16 @@ async fn apply_execution_projection_delta(
     let Some(projection) = state.app.latest_execution_projection.as_ref() else {
         return;
     };
+    if projection.execution_id != delta.execution_id {
+        return;
+    }
     let mut reducer = crate::protocol::ExecutionProjectionReducer::default();
-    reducer.install_snapshot(projection);
+    if matches!(
+        reducer.install_snapshot(projection),
+        crate::protocol::ProjectionDeltaApply::ResyncRequired
+    ) {
+        return;
+    }
     let should_refresh = !delta.events.is_empty()
         || matches!(
             reducer.apply_delta(delta),
@@ -3005,10 +3126,16 @@ async fn apply_execution_projection_delta(
         );
     if should_refresh {
         match gateway_client
-            .execution_projection(&delta.execution_id, false)
+            .execution_projection(&delta.execution_id, true)
             .await
         {
             Ok(snapshot) => state.apply_execution_projection(snapshot),
+            Err(error) if projection_access_or_contract_error(&error) => {
+                state.invalidate_execution_projection(
+                    &delta.execution_id,
+                    &format!("Execution projection authorization or contract changed: {error}"),
+                );
+            }
             Err(error) => state.add_system_notice(
                 SystemNoticeKind::Warning,
                 &format!("Execution projection resync failed: {error}"),
@@ -3021,10 +3148,17 @@ fn spawn_execution_projection_stream(
     gateway_client: GatewayApiClient,
     execution_id: String,
     initial_cursor: u64,
+    generation: u64,
     event_tx: CowdEventSender,
-) {
+) -> Option<tokio::task::JoinHandle<()>> {
     let failure_tx = event_tx.clone();
-    spawn_tui_task(&failure_tx, async move {
+    let Some(runtime) = shared_rt() else {
+        let _ = failure_tx.send(CowdEvent::TurnError {
+            error: "TUI async runtime is unavailable; restart the terminal session".to_string(),
+        });
+        return None;
+    };
+    Some(runtime.spawn(async move {
         let mut cursor = initial_cursor;
         let mut retry_delay = Duration::from_millis(250);
         loop {
@@ -3032,7 +3166,8 @@ fn spawn_execution_projection_stream(
                 .subscribe_execution_projection_events(
                     &execution_id,
                     cursor,
-                    false,
+                    true,
+                    generation,
                     event_tx.clone(),
                 )
                 .await
@@ -3042,6 +3177,16 @@ fn spawn_execution_projection_stream(
                     retry_delay = Duration::from_millis(250);
                 }
                 Err(error) => {
+                    if projection_access_or_contract_error(&error) {
+                        let _ = event_tx.send(CowdEvent::ExecutionProjectionAccessRevoked {
+                            generation,
+                            execution_id: execution_id.clone(),
+                            message: format!(
+                                "Execution projection stream authorization or contract changed: {error}"
+                            ),
+                        });
+                        break;
+                    }
                     let _ = event_tx.send(CowdEvent::Warning {
                         message: format!(
                             "Execution projection stream interrupted for {execution_id}: {error}; retrying"
@@ -3052,7 +3197,17 @@ fn spawn_execution_projection_stream(
             tokio::time::sleep(retry_delay).await;
             retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
         }
-    });
+    }))
+}
+
+fn projection_access_or_contract_error(error: &crate::gateway_client::GatewayApiError) -> bool {
+    matches!(
+        error,
+        crate::gateway_client::GatewayApiError::Status(
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN,
+            _
+        ) | crate::gateway_client::GatewayApiError::Url(_)
+    )
 }
 
 fn list_workspace_files(
@@ -3208,6 +3363,44 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn execution_projection_stream_generation_rejects_zombie_and_replayed_events() {
+        let mut controller = ExecutionProjectionStreamController::default();
+        let first_task = tokio::spawn(std::future::pending::<()>());
+        let first_abort = first_task.abort_handle();
+        controller.active = Some(ActiveExecutionProjectionStream {
+            execution_id: "execution-a".to_string(),
+            generation: 1,
+            task: first_task,
+        });
+        assert!(controller.accepts(1, "execution-a"));
+
+        controller.stop();
+        tokio::task::yield_now().await;
+        assert!(first_abort.is_finished());
+        let second_task = tokio::spawn(std::future::pending::<()>());
+        controller.active = Some(ActiveExecutionProjectionStream {
+            execution_id: "execution-b".to_string(),
+            generation: 2,
+            task: second_task,
+        });
+        assert!(!controller.accepts(1, "execution-a"));
+        assert!(controller.accepts(2, "execution-b"));
+
+        controller.stop();
+        let third_task = tokio::spawn(std::future::pending::<()>());
+        controller.active = Some(ActiveExecutionProjectionStream {
+            execution_id: "execution-a".to_string(),
+            generation: 3,
+            task: third_task,
+        });
+        assert!(
+            !controller.accepts(1, "execution-a"),
+            "a queued delta from the first A stream must not revive after A→B→A"
+        );
+        assert!(controller.accepts(3, "execution-a"));
+    }
 
     fn valid_mfg_tui_contract() -> app_mfg_contract::MfgFrontendContractV1 {
         let routes = app_mfg_contract::mfg_route_contracts();
@@ -3384,10 +3577,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![MfgBacklinkKind::Evidence, MfgBacklinkKind::Runtime]
         );
-        assert!(!summaries[0]
-            .backlinks
-            .iter()
-            .any(|backlink| backlink.kind == MfgBacklinkKind::Surface));
+        assert!(
+            !summaries[0]
+                .backlinks
+                .iter()
+                .any(|backlink| backlink.kind == MfgBacklinkKind::Surface)
+        );
     }
 
     #[test]
@@ -3473,10 +3668,12 @@ mod tests {
             "assignment",
         )
         .expect("assignment summary");
-        assert!(!assignment
-            .backlinks
-            .iter()
-            .any(|backlink| backlink.target.contains("chat-1")));
+        assert!(
+            !assignment
+                .backlinks
+                .iter()
+                .any(|backlink| backlink.target.contains("chat-1"))
+        );
         assert!(assignment.backlinks.iter().any(|backlink| {
             backlink.kind == MfgBacklinkKind::Surface
                 && backlink.target == "surface://feishu/delivery/surface-delivery-42"
@@ -3496,10 +3693,12 @@ mod tests {
             "report",
         )
         .expect("report summary");
-        assert!(!report
-            .backlinks
-            .iter()
-            .any(|backlink| backlink.target == "surface://email/report-1"));
+        assert!(
+            !report
+                .backlinks
+                .iter()
+                .any(|backlink| backlink.target == "surface://email/report-1")
+        );
         assert!(report.backlinks.iter().any(|backlink| {
             backlink.kind == MfgBacklinkKind::Surface
                 && backlink.target == "receipt://cross-plane/cross-plane-1"
@@ -3542,10 +3741,12 @@ mod tests {
             backlink.kind == MfgBacklinkKind::Approval && backlink.target == "approval://approval-1"
         }));
         assert_eq!(summary.evidence_refs, vec!["evidence-1".to_string()]);
-        assert!(!summary
-            .backlinks
-            .iter()
-            .any(|backlink| backlink.kind == MfgBacklinkKind::Evidence));
+        assert!(
+            !summary
+                .backlinks
+                .iter()
+                .any(|backlink| backlink.kind == MfgBacklinkKind::Evidence)
+        );
     }
 
     #[test]
@@ -3668,9 +3869,11 @@ mod tests {
         let files = parse_workspace_files_projection(&projection).unwrap();
 
         assert!(files.iter().any(|entry| entry.name == ".env"));
-        assert!(files
-            .iter()
-            .any(|entry| entry.name == "src" && entry.is_dir));
+        assert!(
+            files
+                .iter()
+                .any(|entry| entry.name == "src" && entry.is_dir)
+        );
     }
 
     #[test]

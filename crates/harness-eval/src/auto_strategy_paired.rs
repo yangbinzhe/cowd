@@ -1277,9 +1277,8 @@ fn projection_is_terminal_sample(
     let exact_outcome = projection
         .strategy
         .as_ref()
-        .and_then(|entity| entity.detail.as_ref())
-        .and_then(|detail| detail.get("outcome"))
-        .is_some_and(serde_json::Value::is_object);
+        .and_then(|strategy| strategy.actual.as_ref())
+        .is_some();
     graph_terminal && exact_outcome
 }
 
@@ -1298,18 +1297,16 @@ fn apply_projection_metrics(
     sample: &mut Sample,
     projection: &harness_contract::projection::ExecutionProjection,
 ) {
-    let strategy = projection
-        .strategy
-        .as_ref()
-        .and_then(|entity| entity.detail.as_ref())
-        .unwrap_or(&Value::Null);
+    let Some(strategy) = projection.strategy.as_ref() else {
+        return;
+    };
     sample.selected_candidate = strategy
-        .get("selected_candidate")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+        .selected_candidate
+        .map(|candidate| candidate.as_str().to_string());
     let sample_source = strategy
-        .pointer("/resource_snapshot/sample_source")
-        .and_then(Value::as_str)
+        .resource_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.sample_source.as_str())
         .unwrap_or_default();
     sample.evaluation_control_observed = sample_source
         .contains(&format!("workspace_fixture={}", sample.workspace_fixture))
@@ -1333,56 +1330,34 @@ fn apply_projection_metrics(
             .map(str::to_string)
     }));
     sample.models_used = models.into_iter().collect();
-    let outcome = strategy.get("outcome").unwrap_or(&Value::Null);
-    sample.duplicate_tool_calls = value_u64(outcome, &["duplicate_tool_calls"]);
-    sample.write_attempt_paths = outcome
-        .get("write_attempt_paths")
-        .and_then(Value::as_array)
-        .map(|paths| {
-            let mut paths = paths
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect::<Vec<_>>();
-            paths.sort();
-            paths.dedup();
-            paths
-        })
-        .unwrap_or_default();
-    sample.tool_calls = value_u64(outcome, &["tool_calls"]);
-    sample.max_tool_concurrency_observed = value_u64(outcome, &["max_tool_concurrency_observed"]);
-    sample.parallel_tool_batches = value_u64(outcome, &["parallel_tool_batches"]);
-    sample.evidence_overlap_bp =
-        u16::try_from(value_u64(outcome, &["evidence_overlap_bp"])).unwrap_or(u16::MAX);
-    sample.evidence_overlap_observed = outcome
-        .get("evidence_overlap_observed")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    sample.working_state_verified = outcome
-        .get("working_state_verified")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    sample.merge_cost_ms = value_u64(outcome, &["merge_cost_ms"]);
-    sample.critical_path_ms = value_u64(outcome, &["duration_ms"]);
-    let strategy_input_tokens = value_u64(outcome, &["input_tokens"]);
-    let strategy_output_tokens = value_u64(outcome, &["output_tokens"]);
-    sample.cached_tokens = value_u64(outcome, &["cached_tokens"]);
+    let Some(outcome) = strategy.actual.as_ref() else {
+        return;
+    };
+    sample.duplicate_tool_calls = outcome.duplicate_tool_calls;
+    sample.write_attempt_paths = outcome.write_attempt_refs.clone();
+    sample.write_attempt_paths.sort();
+    sample.write_attempt_paths.dedup();
+    sample.tool_calls = outcome.tool_calls;
+    sample.max_tool_concurrency_observed = outcome.max_tool_concurrency_observed;
+    sample.parallel_tool_batches = outcome.parallel_tool_batches;
+    sample.evidence_overlap_bp = outcome.evidence_overlap_bp;
+    sample.evidence_overlap_observed = outcome.evidence_overlap_observed;
+    sample.working_state_verified = outcome.working_state_verified;
+    sample.merge_cost_ms = outcome.merge_cost_ms;
+    sample.critical_path_ms = outcome.duration_ms;
+    let strategy_input_tokens = outcome.input_tokens;
+    let strategy_output_tokens = outcome.output_tokens;
+    sample.cached_tokens = outcome.cached_tokens;
     if strategy_input_tokens > 0 || strategy_output_tokens > 0 {
         sample.input_tokens = strategy_input_tokens;
         sample.output_tokens = strategy_output_tokens;
         sample.usage_observed = true;
     }
-    sample.parent_merge_count = value_u64(outcome, &["parent_merge_count"]);
-    sample.evaluation_token_limit = value_u64(outcome, &["evaluation_token_limit"]);
-    sample.evaluation_tokens_consumed = value_u64(outcome, &["evaluation_tokens_consumed"]);
-    sample.evaluation_budget_observed = outcome
-        .get("evaluation_budget_observed")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    sample.evaluation_budget_breached = outcome
-        .get("evaluation_budget_breached")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
+    sample.parent_merge_count = u64::from(outcome.parent_merge_count);
+    sample.evaluation_token_limit = outcome.evaluation_token_limit;
+    sample.evaluation_tokens_consumed = outcome.evaluation_tokens_consumed;
+    sample.evaluation_budget_observed = outcome.evaluation_budget_observed;
+    sample.evaluation_budget_breached = outcome.evaluation_budget_breached;
     sample.team_child_count = projection.child_executions.len();
     sample.team_agent_count = projection.agents.len();
     let child_terminal = !projection.child_executions.is_empty()

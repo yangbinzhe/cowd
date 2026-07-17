@@ -295,8 +295,8 @@ fn assert_backlink(tui: &TuiSession, key: &str, label: &str, context: &str) -> a
         capture = tui.capture_step(&format!("backlink-{}", label.to_ascii_lowercase()), &[])?;
         let resolved = if label == "Evidence" {
             capture.contains("focused_evidence_ref")
-                && capture.contains("evidence_context")
-                && !capture.contains("section error")
+                && capture.contains(&identity)
+                && capture.contains("\"evidence_backlink_resolved\": true")
         } else {
             capture
                 .lines()
@@ -316,6 +316,9 @@ fn assert_backlink(tui: &TuiSession, key: &str, label: &str, context: &str) -> a
     if capture.contains(&format!("No {label} backlink"))
         || !capture.contains(&format!("{label} backlink"))
         || !capture.contains(&target)
+        || (label == "Evidence"
+            && (!capture.contains(&identity)
+                || !capture.contains("\"evidence_backlink_resolved\": true")))
         || (label != "Evidence"
             && !capture.lines().any(|line| {
                 line.contains("Resolved object:")

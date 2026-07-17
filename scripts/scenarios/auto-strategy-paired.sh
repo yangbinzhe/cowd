@@ -14,6 +14,7 @@ SCENARIO_ID="auto-strategy-paired-$$-$(date +%s)"
 SCENARIO_ROOT="${TMPDIR:-/tmp}/${SCENARIO_ID}"
 ARTIFACT_DIR="${COWD_AUTO_STRATEGY_ARTIFACT_DIR:-${ROOT}/target/acceptance/${SCENARIO_ID}}"
 REPORT="${ARTIFACT_DIR}/auto-strategy-paired.json"
+POINTER="${ROOT}/target/acceptance/latest-auto-strategy.json"
 BIN_SHA256=""
 WORKSPACE_REVISION=""
 FRONTEND_WORKSPACE_REVISION=""
@@ -216,4 +217,19 @@ jq -e '
   and .gate.routing_gate == true
   and .gate.judge_isolation_gate == true
 ' "${REPORT}" >/dev/null
+jq -n \
+  --arg scenario_id "${SCENARIO_ID}" \
+  --arg artifact_dir "${ARTIFACT_DIR}" \
+  --arg report "${REPORT}" \
+  --arg backend_commit "${WORKSPACE_REVISION}" \
+  --arg frontend_commit "${FRONTEND_WORKSPACE_REVISION}" \
+  '{
+    schema_version: 1,
+    producer: "auto-strategy-paired.v1",
+    scenario_id: $scenario_id,
+    artifact_dir: $artifact_dir,
+    report: $report,
+    backend_commit: $backend_commit,
+    frontend_commit: $frontend_commit
+  }' >"${POINTER}"
 echo "auto-strategy-paired-report: ${REPORT}"

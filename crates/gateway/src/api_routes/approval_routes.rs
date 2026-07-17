@@ -23,6 +23,7 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         )
         .route("/api/approval/solo", post(toggle_solo_handler))
         .route("/api/approval/history", get(approval_history_handler))
+        .route("/api/approval/:id", get(approval_exact_handler))
 }
 
 #[derive(Deserialize)]
@@ -91,6 +92,27 @@ async fn approval_history_handler(
             .history(limit, offset, &principal.0)
             .await,
     )
+}
+
+async fn approval_exact_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .approval
+        .exact(&id, &principal.0)
+        .await
+        .map(Json)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("approval {id} not found or outside the authenticated principal scope"),
+                }),
+            )
+        })
 }
 
 async fn approval_respond_handler(

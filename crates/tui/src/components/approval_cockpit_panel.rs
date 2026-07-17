@@ -69,22 +69,29 @@ impl ApprovalCockpitPanel {
         self.focused_backlink_resolution = None;
     }
 
+    #[must_use]
+    pub fn accepts_backlink_result(&self, target: &str) -> bool {
+        self.focused_backlink_target.as_deref() == Some(target)
+    }
+
     pub fn record_backlink_object(
         &mut self,
         target: impl Into<String>,
         object: &serde_json::Value,
     ) {
         let target = target.into();
+        if !self.accepts_backlink_result(&target) {
+            return;
+        }
         let id = object
             .get("id")
             .or_else(|| object.get("approval_id"))
             .and_then(serde_json::Value::as_str)
-            .unwrap_or(target.as_str());
+            .unwrap_or("canonical approval");
         let status = object
             .get("status")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("loaded");
-        self.focused_backlink_target = Some(target);
         self.focused_backlink_resolution = Some(format!("{id} status {status}"));
     }
 
@@ -93,7 +100,10 @@ impl ApprovalCockpitPanel {
         target: impl Into<String>,
         message: impl Into<String>,
     ) {
-        self.focused_backlink_target = Some(target.into());
+        let target = target.into();
+        if !self.accepts_backlink_result(&target) {
+            return;
+        }
         self.focused_backlink_resolution = Some(format!("Resolution failed: {}", message.into()));
     }
 

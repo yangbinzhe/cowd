@@ -1,7 +1,8 @@
 #![allow(dead_code)]
+use crate::CowdEvent;
 use crate::components::composer::model::ComposerModel;
 use crate::components::turn_interaction::TurnInteractionState;
-use crate::layout::{build_default_layout, LayoutState, LayoutTree};
+use crate::layout::{LayoutState, LayoutTree, build_default_layout};
 use crate::runtime_control_store::{
     ApprovalSummary, ConnectorAccountSummary, ConnectorCapabilitySummary, ConnectorResourceSummary,
     CowdKernelSummary, FactFlowSummary, GatewayCapabilityContractSummary, MessageBindingSummary,
@@ -9,7 +10,6 @@ use crate::runtime_control_store::{
     RealityCoreSummary, RuntimeActionReceiptSummary, StructuredDataSummary, SurfaceEventSummary,
     SurfaceHealthSummary, SurfaceSummary, TaskSummary,
 };
-use crate::CowdEvent;
 use serde_json::Value;
 use std::collections::VecDeque;
 
@@ -683,7 +683,24 @@ impl App {
         self.msg_version = self.msg_version.wrapping_add(1);
     }
 
-    pub fn apply_execution_projection(&mut self, projection: crate::protocol::ExecutionProjection) {
+    /// Install the canonical execution snapshot if it is not an older replay
+    /// for the same execution.  All derived TUI views read this owner, so this
+    /// is the single monotonicity gate rather than allowing one panel to keep
+    /// a newer revision while another is overwritten by delayed SSE data.
+    pub fn apply_execution_projection(
+        &mut self,
+        projection: crate::protocol::ExecutionProjection,
+    ) -> bool {
+        if self
+            .latest_execution_projection
+            .as_ref()
+            .is_some_and(|current| {
+                current.execution_id == projection.execution_id
+                    && projection.revision < current.revision
+            })
+        {
+            return false;
+        }
         let total_nodes = projection.graph.nodes.len();
         let terminal_nodes = projection
             .graph
@@ -729,6 +746,37 @@ impl App {
         });
         self.latest_execution_projection = Some(projection);
         self.msg_version = self.msg_version.wrapping_add(1);
+        true
+    }
+
+    /// Drop an execution projection as soon as Gateway revokes the caller or
+    /// rejects its contract.  Retaining the last full snapshot would keep
+    /// strategy, agent and evidence detail visible after the authority that
+    /// produced it has expired.
+    pub fn invalidate_execution_projection(&mut self, execution_id: &str) -> bool {
+        let matches_projection = self
+            .latest_execution_projection
+            .as_ref()
+            .is_some_and(|projection| projection.execution_id == execution_id);
+        let matches_interaction =
+            self.turn_interaction.execution.execution_id.as_deref() == Some(execution_id);
+        if !matches_projection && !matches_interaction {
+            return false;
+        }
+        if matches_projection {
+            self.latest_execution_projection = None;
+        }
+        if self
+            .latest_execution_graph_summary
+            .as_ref()
+            .is_some_and(|summary| summary.graph_id.as_deref() == Some(execution_id))
+        {
+            self.latest_execution_graph_summary = None;
+        }
+        self.turn_interaction
+            .clear_execution_if_matches(execution_id);
+        self.msg_version = self.msg_version.wrapping_add(1);
+        true
     }
 
     pub fn mark_dirty(&mut self) {
@@ -1831,6 +1879,64 @@ mod tests {
     }
 
     #[test]
+    fn execution_projection_owner_rejects_lower_revision_for_same_execution() {
+        use harness_contract::execution_graph::ExecutionGraph;
+        use harness_contract::projection::{ExecutionProjection, ProjectionCommandAvailability};
+
+        let projection = |revision: u64, objective: &str| ExecutionProjection {
+            schema_version: 1,
+            execution_id: "execution-monotonic".to_string(),
+            revision,
+            cursor: revision,
+            session_id: Some("session-monotonic".to_string()),
+            mission_id: None,
+            strategy: None,
+            graph: harness_contract::execution_graph::project_execution_graph(
+                &ExecutionGraph::new(objective),
+            ),
+            child_executions: Vec::new(),
+            goals: Vec::new(),
+            agents: Vec::new(),
+            teams: Vec::new(),
+            relations: Vec::new(),
+            approvals: Vec::new(),
+            interventions: Vec::new(),
+            usage: Vec::new(),
+            context: Vec::new(),
+            evidence: Vec::new(),
+            health: Vec::new(),
+            recovery: Vec::new(),
+            live: None,
+            available_commands: Vec::<ProjectionCommandAvailability>::new(),
+        };
+
+        let mut app = App::new("test", "session-monotonic");
+        assert!(app.apply_execution_projection(projection(5, "revision five")));
+        let graph_summary_id = app
+            .latest_execution_graph_summary
+            .as_ref()
+            .and_then(|summary| summary.graph_id.clone());
+        assert!(!app.apply_execution_projection(projection(4, "stale revision four")));
+
+        assert_eq!(
+            app.latest_execution_projection
+                .as_ref()
+                .map(|current| current.revision),
+            Some(5)
+        );
+        assert_eq!(
+            app.latest_execution_graph_summary
+                .as_ref()
+                .and_then(|summary| summary.graph_id.clone()),
+            graph_summary_id
+        );
+        assert!(app
+            .latest_execution_projection
+            .as_ref()
+            .is_some_and(|current| current.graph.objective == "revision five"));
+    }
+
+    #[test]
     fn page_boundary_seamless() {
         let mut app = App::new("test", "sess");
         for i in 0..PAGE_SIZE {
@@ -1844,16 +1950,18 @@ mod tests {
         assert_eq!(app.timeline_pages.len(), 2);
 
         assert!(app.timeline_get(0).unwrap().full_text().contains("msg 0"));
-        assert!(app
-            .timeline_get(PAGE_SIZE - 1)
-            .unwrap()
-            .full_text()
-            .contains(&format!("msg {}", PAGE_SIZE - 1)));
-        assert!(app
-            .timeline_get(PAGE_SIZE)
-            .unwrap()
-            .full_text()
-            .contains("overflow"));
+        assert!(
+            app.timeline_get(PAGE_SIZE - 1)
+                .unwrap()
+                .full_text()
+                .contains(&format!("msg {}", PAGE_SIZE - 1))
+        );
+        assert!(
+            app.timeline_get(PAGE_SIZE)
+                .unwrap()
+                .full_text()
+                .contains("overflow")
+        );
 
         let count = app.timeline_iter().count();
         assert_eq!(count, PAGE_SIZE + 1);
@@ -1907,10 +2015,11 @@ mod tests {
             notice.content.contains("/queue edit queued-a")
                 && notice.content.contains("/queue cancel queued-a")
         }));
-        assert!(app
-            .pending_inputs
-            .iter()
-            .all(|input| input.input_id != "done-b"));
+        assert!(
+            app.pending_inputs
+                .iter()
+                .all(|input| input.input_id != "done-b")
+        );
     }
 
     #[test]
@@ -1962,16 +2071,18 @@ mod tests {
         }
         assert_eq!(app.timeline_len(), PAGE_SIZE * 3 + 200);
         assert!(app.timeline_get(0).unwrap().full_text().contains("entry 0"));
-        assert!(app
-            .timeline_get(PAGE_SIZE)
-            .unwrap()
-            .full_text()
-            .contains(&format!("entry {}", PAGE_SIZE)));
-        assert!(app
-            .timeline_get(PAGE_SIZE * 2 + 50)
-            .unwrap()
-            .full_text()
-            .contains(&format!("entry {}", PAGE_SIZE * 2 + 50)));
+        assert!(
+            app.timeline_get(PAGE_SIZE)
+                .unwrap()
+                .full_text()
+                .contains(&format!("entry {}", PAGE_SIZE))
+        );
+        assert!(
+            app.timeline_get(PAGE_SIZE * 2 + 50)
+                .unwrap()
+                .full_text()
+                .contains(&format!("entry {}", PAGE_SIZE * 2 + 50))
+        );
     }
 
     #[test]

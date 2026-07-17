@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 
+use crate::CowdEvent;
 use crate::accessibility::AccessibilityMode;
 use crate::animation::{AnimationEngine, AnimationKind};
 use crate::app::{App, SystemNoticeKind};
@@ -60,19 +61,18 @@ use crate::components::toast::{ToastManager, ToastVariant};
 use crate::components::todo_panel::TodoPanel;
 use crate::components::tool_ops_panel::{ToolOpsMode, ToolOpsPanel};
 use crate::components::{Component, RenderContext};
-use crate::context_tokens::{validate_context_tokens_against_entries, ContextWorkspaceEntry};
+use crate::context_tokens::{ContextWorkspaceEntry, validate_context_tokens_against_entries};
 use crate::error_recovery::{self, RenderResult};
 use crate::event::dispatcher::EventDispatcher;
 use crate::event::{ComponentId as EventComponentId, EventBus};
 use crate::keybind::types::Action;
 use crate::keybind::which_key::WhichKey;
-use crate::keybind::{default_bindings, KeybindEngine};
+use crate::keybind::{KeybindEngine, default_bindings};
 use crate::layout::{LayoutState, LayoutTree};
 use crate::profiler::{FrameTimer, RenderProfiler};
 use crate::runtime_control_store::{MfgBacklinkKind, MfgIntentStatus, MfgViewFocus};
 use crate::theme::ThemeEngine;
 use crate::workbench::panel_registry;
-use crate::CowdEvent;
 
 /// Result of processing a key event through the TUI input pipeline.
 #[derive(Debug, Clone)]
@@ -663,13 +663,93 @@ impl TuiState {
                     self.app.turn_interaction.ingress_accepted(execution_id);
                 }
             }
-            CowdEvent::RuntimeBacklinkResolved { target, object } => {
-                self.runtime_activity_panel
-                    .record_backlink_object(target.clone(), object);
+            CowdEvent::RuntimeBacklinkResolved {
+                target,
+                object,
+                mfg_generation,
+                selection_revision,
+                live_generation,
+                live_epoch,
+                live_reauthentication_count,
+            } => {
+                let accepted = self.app.mfg_operations.accepts_runtime_backlink_result(
+                    target,
+                    *mfg_generation,
+                    *selection_revision,
+                    *live_generation,
+                    live_epoch.as_deref(),
+                    *live_reauthentication_count,
+                );
+                if !accepted {
+                    // A selection, generation, or reauthentication changed
+                    // while this request was in flight.  Do not let stale
+                    // success reclaim the Runtime panel or strategy cache.
+                } else if !runtime_backlink_object_matches_target(target, object) {
+                    self.app.mfg_operations.invalidate_runtime_strategy_target(target);
+                    self.runtime_activity_panel.record_backlink_failure(
+                        target.clone(),
+                        "Gateway returned an object whose canonical identity does not match the backlink",
+                    );
+                } else if target.starts_with("runtime-execution://") {
+                    if let Ok(projection) = serde_json::from_value::<
+                        crate::protocol::ExecutionProjection,
+                    >(object.clone())
+                    {
+                        if crate::protocol::validate_execution_projection_schema(&projection)
+                            .is_ok()
+                        {
+                            self.app.mfg_operations.record_runtime_strategy_projection(
+                                &projection,
+                                *mfg_generation,
+                                *selection_revision,
+                                *live_generation,
+                                live_epoch.clone(),
+                                *live_reauthentication_count,
+                            );
+                            self.runtime_activity_panel
+                                .record_backlink_object(target.clone(), object);
+                        } else {
+                            self.app.mfg_operations.invalidate_runtime_strategy_target(target);
+                            self.runtime_activity_panel.record_backlink_failure(
+                                target.clone(),
+                                "Gateway returned an unsupported execution projection schema",
+                            );
+                        }
+                    } else {
+                        self.app.mfg_operations.invalidate_runtime_strategy_target(target);
+                        self.runtime_activity_panel.record_backlink_failure(
+                            target.clone(),
+                            "Gateway returned an invalid execution projection contract",
+                        );
+                    }
+                } else {
+                    self.runtime_activity_panel
+                        .record_backlink_object(target.clone(), object);
+                }
             }
-            CowdEvent::RuntimeBacklinkFailed { target, message } => {
-                self.runtime_activity_panel
-                    .record_backlink_failure(target.clone(), message.clone());
+            CowdEvent::RuntimeBacklinkFailed {
+                target,
+                message,
+                mfg_generation,
+                selection_revision,
+                live_generation,
+                live_epoch,
+                live_reauthentication_count,
+            } => {
+                if self.app.mfg_operations.accepts_runtime_backlink_result(
+                    target,
+                    *mfg_generation,
+                    *selection_revision,
+                    *live_generation,
+                    live_epoch.as_deref(),
+                    *live_reauthentication_count,
+                ) {
+                    self.app
+                        .mfg_operations
+                        .invalidate_runtime_strategy_target(target);
+                    self.runtime_activity_panel
+                        .record_backlink_failure(target.clone(), message.clone());
+                }
             }
             CowdEvent::ApprovalBacklinkResolved { target, object } => {
                 self.approval_cockpit_panel
@@ -725,8 +805,19 @@ impl TuiState {
     /// state from its live revision.  Gateway transport may reconnect or
     /// replay, but older snapshots cannot move this state backward.
     pub fn apply_execution_projection(&mut self, projection: crate::protocol::ExecutionProjection) {
-        self.app.turn_interaction.projection_snapshot(&projection);
-        self.app.apply_execution_projection(projection);
+        if self.app.apply_execution_projection(projection.clone()) {
+            self.app.turn_interaction.projection_snapshot(&projection);
+        }
+    }
+
+    /// Fail closed for a currently selected projection.  The caller performs
+    /// the generation check before invoking this method so a delayed revoke
+    /// from an old stream cannot erase a newer selection.
+    pub fn invalidate_execution_projection(&mut self, execution_id: &str, reason: &str) {
+        if self.app.invalidate_execution_projection(execution_id) {
+            self.add_system_notice(SystemNoticeKind::Warning, reason);
+            self.runtime_activity_panel.sync_from_app(&self.app);
+        }
     }
 
     // ── Rendering ───────────────────────────────────────────────
@@ -1178,6 +1269,14 @@ impl TuiState {
                                         &mut main_ctx,
                                         panel_area,
                                         &self.app.mfg_operations,
+                                        self.app
+                                            .latest_execution_projection
+                                            .as_ref()
+                                            .and_then(|projection| projection.strategy.as_ref()),
+                                        self.app
+                                            .latest_execution_projection
+                                            .as_ref()
+                                            .map_or(&[], |projection| projection.agents.as_slice()),
                                     );
                                 }),
                             );
@@ -4853,6 +4952,23 @@ impl TuiState {
     }
 }
 
+fn runtime_backlink_object_matches_target(target: &str, object: &serde_json::Value) -> bool {
+    let expected = target
+        .split_once("://")
+        .map(|(_, value)| value.split(['/', '?', '#']).next().unwrap_or_default())
+        .unwrap_or_default();
+    if expected.is_empty() {
+        return false;
+    }
+    let observed = object
+        .get("execution_id")
+        .or_else(|| object.get("task_id"))
+        .or_else(|| object.get("id"))
+        .or_else(|| object.get("execution").and_then(|value| value.get("execution_id")))
+        .and_then(serde_json::Value::as_str);
+    observed == Some(expected)
+}
+
 // ── Delegation to App via Deref ─────────────────────────────────
 
 impl std::ops::Deref for TuiState {
@@ -5183,18 +5299,22 @@ mod tests {
         state.app.available_models = vec!["tui-reload-model".to_string(), "tui-fast".to_string()];
 
         assert!(state.reload_runtime_provider_projection());
-        assert!(state
-            .app
-            .notification
-            .as_deref()
-            .unwrap_or_default()
-            .contains("Provider projection refreshed"));
-        assert!(!state
-            .app
-            .notification
-            .as_deref()
-            .unwrap_or_default()
-            .contains("tui-secret-key"));
+        assert!(
+            state
+                .app
+                .notification
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Provider projection refreshed")
+        );
+        assert!(
+            !state
+                .app
+                .notification
+                .as_deref()
+                .unwrap_or_default()
+                .contains("tui-secret-key")
+        );
     }
 
     #[test]

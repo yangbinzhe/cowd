@@ -56,7 +56,10 @@ use harness_contract::{
     core::KernelRef,
     knowledge::KnowledgeTurnReport,
     skill::{AgentSkillProfile, SkillCapabilityProfile},
-    strategy::{StrategyExperienceRecord, StrategyExperienceStore, StrategyInput},
+    strategy::{
+        ExecutionCandidateKind, StrategyCandidateCostSummary, StrategyExperienceRecord,
+        StrategyExperienceStore, StrategyInput,
+    },
     turn::{
         SessionInputEnvelope, SessionInputProjection, SessionInputReceipt, TurnId,
         TurnInboxSnapshot, TurnInputCheckpoint,
@@ -74,7 +77,7 @@ use model_protocol::telemetry::SessionTracer;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::budget_policy::{clamp_context_budget_ratio_bp, RuntimeBudgetInputs, RuntimeBudgetPlan};
+use crate::budget_policy::{RuntimeBudgetInputs, RuntimeBudgetPlan, clamp_context_budget_ratio_bp};
 
 static STRATEGY_EXPERIENCE_IO_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
 static EVALUATION_PROVIDER_TOKEN_LEASE: OnceLock<
@@ -130,8 +133,8 @@ pub(crate) fn install_evaluation_provider_token_lease(
     Ok(())
 }
 
-pub(crate) fn evaluation_provider_token_lease_snapshot(
-) -> Option<EvaluationProviderTokenLeaseSnapshot> {
+pub(crate) fn evaluation_provider_token_lease_snapshot()
+-> Option<EvaluationProviderTokenLeaseSnapshot> {
     EVALUATION_PROVIDER_TOKEN_LEASE
         .get()
         .and_then(|lease| lease.lock().ok())
@@ -254,8 +257,9 @@ impl Drop for EvaluationProviderTokenReservation {
         }
     }
 }
+use crate::PromptAssembly;
 use crate::compact::{
-    apply_compaction_summary, estimate_session_tokens, plan_session_compaction, CompactionConfig,
+    CompactionConfig, apply_compaction_summary, estimate_session_tokens, plan_session_compaction,
 };
 use crate::config::{RuntimeFeatureConfig, SessionCompactConfig as RuntimeSessionCompactConfig};
 use crate::context_runtime::{
@@ -277,15 +281,14 @@ use crate::runtime_control::RuntimeControlPolicy;
 use crate::runtime_harness::{RuntimeAiKernel, RuntimeAiKernelTrace};
 use crate::session::{ContentBlock, ConversationMessage, MessageEvent, Session, SessionEventLog};
 use crate::skill::{
-    memory_candidate_from_skill_activation, skill_memory_candidate_session_event,
     RuntimeSkillPromptAsset, SkillActivationEngine, SkillActivationInput, SkillMemoryPolicy,
+    memory_candidate_from_skill_activation, skill_memory_candidate_session_event,
 };
 use crate::tool_execution_plan::{ToolExecutionPlan, ToolExecutionPolicyValidationReport};
 use crate::tool_invocation::{
-    now_ms, ToolFailureKind, ToolInvocationRecord, DEFAULT_OUTPUT_REF_MIN_LINES,
+    DEFAULT_OUTPUT_REF_MIN_LINES, ToolFailureKind, ToolInvocationRecord, now_ms,
 };
 use crate::usage::{ModelPerformanceRegistry, ModelRouteIntent, UsageTracker};
-use crate::PromptAssembly;
 use crate::{RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore};
 use model_protocol::usage::TokenUsage;
 
@@ -3916,12 +3919,10 @@ where
                 } else {
                     harness_contract::strategy::ExecutionCandidateKind::Direct
                 };
-            decision = self.revise_active_turn_strategy(
+            decision = self.retarget_active_turn_strategy(
                 selected_candidate,
                 target_pattern,
-                crate::execution_core::TurnStrategyDecisionStatus::Running,
                 "provider tool batch retained the admitted decision lease",
-                Some("runtime.strategy.retargeted"),
             )?;
             if target_pattern == harness_contract::core::ExecutionPattern::Collaborate
                 && !decision
@@ -6940,6 +6941,7 @@ where
         if let Some(resource_snapshot) = resource_snapshot {
             strategy_input = strategy_input.with_resource_snapshot(resource_snapshot);
         }
+        apply_e2e_strategy_fixture(&mut strategy_input, user_input)?;
         let mut decision = crate::execution_core::StrategyDecisionEngine.decide_with_input(
             strategy_input,
             Some(self.context_profile()),
@@ -7077,7 +7079,15 @@ where
         events
             .into_iter()
             .rev()
-            .filter(|event| event.kind.starts_with("runtime.strategy."))
+            .filter(|event| {
+                matches!(
+                    event.kind.as_str(),
+                    "runtime.strategy.selected"
+                        | "runtime.strategy.downgraded"
+                        | "runtime.strategy.early_stopped"
+                        | "runtime.strategy.outcome"
+                )
+            })
             .find_map(|event| {
                 let payload = event.payload;
                 if payload.get("turn_ref").and_then(serde_json::Value::as_str) != Some(turn_ref)
@@ -7171,6 +7181,25 @@ where
             }
         }
         Ok(state.decision)
+    }
+
+    fn retarget_active_turn_strategy(
+        &self,
+        selected_candidate: harness_contract::strategy::ExecutionCandidateKind,
+        pattern: harness_contract::core::ExecutionPattern,
+        reason: &str,
+    ) -> Result<crate::execution_core::RuntimeExecutionDecision, RuntimeError> {
+        // A provider ToolBatch can change the selected candidate in either
+        // direction. It is therefore a new revision of the allowed
+        // `selected` fact, not an invented fifth transition kind and not
+        // necessarily a downgrade.
+        self.revise_active_turn_strategy(
+            selected_candidate,
+            pattern,
+            crate::execution_core::TurnStrategyDecisionStatus::Running,
+            reason,
+            Some("runtime.strategy.selected"),
+        )
     }
 
     pub(crate) fn downgrade_turn_strategy(
@@ -7353,6 +7382,11 @@ where
         state: &crate::execution_core::TurnStrategyDecisionState,
         reason: &str,
     ) -> Result<(), RuntimeError> {
+        if !turn_strategy_event_kind_allowed(kind) {
+            return Err(RuntimeError::new(format!(
+                "unsupported durable turn strategy event kind `{kind}`"
+            )));
+        }
         let mut refs = vec![
             RuntimeEventRef {
                 kind: "strategy_decision".to_string(),
@@ -7386,7 +7420,7 @@ where
                 stream_id: format!("session:{}", state.session_ref),
                 scope: RuntimeEventScope::ExecutionGraph,
                 kind: kind.to_string(),
-                status: Some(format!("{:?}", state.status).to_ascii_lowercase()),
+                status: Some(turn_strategy_status_name(state.status).to_string()),
                 actor: Some("conversation_runtime.strategy_owner".to_string()),
                 refs,
                 payload: serde_json::json!({
@@ -7394,9 +7428,12 @@ where
                     "decision_lease": state.decision_lease,
                     "decision_revision": state.revision,
                     "policy_version": state.policy_version,
+                    "decision_source": state.decision.strategy.source,
+                    "confidence": state.decision.strategy.confidence,
                     "selected_candidate": state.selected_candidate,
                     "selected_pattern": state.decision.pattern().as_str(),
                     "candidate_estimates": state.decision.strategy.candidate_estimates,
+                    "selection_reasons": state.decision.strategy.reasons,
                     "resource_snapshot": state.resource_snapshot,
                     "execution_graph_ref": state.execution_graph_ref,
                     "session_ref": state.session_ref,
@@ -7585,6 +7622,31 @@ where
             }
         });
     }
+}
+
+fn turn_strategy_status_name(
+    status: crate::execution_core::TurnStrategyDecisionStatus,
+) -> &'static str {
+    use crate::execution_core::TurnStrategyDecisionStatus;
+    match status {
+        TurnStrategyDecisionStatus::Selected => "selected",
+        TurnStrategyDecisionStatus::Running => "running",
+        TurnStrategyDecisionStatus::Downgraded => "downgraded",
+        TurnStrategyDecisionStatus::EarlyStopped => "early_stopped",
+        TurnStrategyDecisionStatus::Completed => "completed",
+        TurnStrategyDecisionStatus::Cancelled => "cancelled",
+        TurnStrategyDecisionStatus::Failed => "failed",
+    }
+}
+
+fn turn_strategy_event_kind_allowed(kind: &str) -> bool {
+    matches!(
+        kind,
+        "runtime.strategy.selected"
+            | "runtime.strategy.downgraded"
+            | "runtime.strategy.early_stopped"
+            | "runtime.strategy.outcome"
+    )
 }
 
 fn message_appended_session_event(
@@ -8013,6 +8075,61 @@ fn apply_eval_strategy_override(
     Ok(())
 }
 
+/// Install a deterministic, marker-scoped cost fixture only for the isolated
+/// browser acceptance harness.  The fixture is deliberately unavailable in a
+/// normal Gateway process and does not accept data from the HTTP request: the
+/// test process selects a fixed name and the submitted prompt must carry the
+/// matching marker.  This lets STR-07 exercise the real admission,
+/// persistence, projection and surface path without pretending that prose in
+/// a prompt can alter the strategy cost model.
+fn apply_e2e_strategy_fixture(
+    input: &mut StrategyInput,
+    prompt: &str,
+) -> Result<(), RuntimeError> {
+    if std::env::var("COWD_E2E_HARNESS").as_deref() != Ok("1") {
+        return Ok(());
+    }
+    let Ok(fixture) = std::env::var("COWD_E2E_STRATEGY_FIXTURE") else {
+        return Ok(());
+    };
+    apply_named_e2e_strategy_fixture(input, prompt, fixture.trim())
+}
+
+fn apply_named_e2e_strategy_fixture(
+    input: &mut StrategyInput,
+    prompt: &str,
+    fixture: &str,
+) -> Result<(), RuntimeError> {
+    match fixture {
+        "" => Ok(()),
+        "explicit-team-negative" => {
+            if !prompt.contains("[cowd-e2e:explicit-team-negative]") {
+                return Ok(());
+            }
+            input.candidate_costs.insert(
+                ExecutionCandidateKind::Team,
+                StrategyCandidateCostSummary {
+                    sample_count: 3,
+                    average_critical_path_ms: 200_000,
+                    average_total_tokens: 50_000,
+                    average_coordination_cost_ms: 20_000,
+                    calibration_source: "e2e:explicit-team-negative".to_string(),
+                },
+            );
+            input.resource_snapshot.provider_concurrency_penalty_bp = 10_000;
+            input.resource_snapshot.sample_source = format!(
+                "{};e2e-fixture=explicit-team-negative",
+                input.resource_snapshot.sample_source
+            );
+            input.resource_snapshot.assumed = false;
+            Ok(())
+        }
+        unknown => Err(RuntimeError::new(format!(
+            "unsupported e2e-only strategy fixture `{unknown}`"
+        ))),
+    }
+}
+
 fn strategy_experience_record(trace: &RuntimeAiKernelTrace) -> StrategyExperienceRecord {
     let context_pressure = !trace.context_epoch.omitted.is_empty()
         || trace
@@ -8243,14 +8360,15 @@ impl ToolExecutor for StaticToolExecutor {
 mod tests {
 
     use super::{
-        apply_explicit_team_requirement, build_cc_memory_config_with_budget,
+        ApiClient, ApiRequest, AssistantEvent, CognitiveContextManager, ConversationRuntime,
+        ModelStepIntent, ModelToolCall, RuntimeError, StaticToolExecutor, ToolExposureState,
+        apply_explicit_team_requirement, apply_named_e2e_strategy_fixture,
+        build_cc_memory_config_with_budget,
         deterministic_checkpoint_id, enforce_explicit_team_requirement,
         image_user_message_from_path, is_runtime_team_orchestration_call,
         memory_project_id_for_session, model_team_request_conflicts_with_admission,
         prepared_vision_payload, preview_chars, provider_transport_policy, rate_per_second,
-        required_team_orchestration_call, tool_batch_pattern, vision_user_message, ApiClient,
-        ApiRequest, AssistantEvent, CognitiveContextManager, ConversationRuntime, ModelStepIntent,
-        ModelToolCall, RuntimeError, StaticToolExecutor, ToolExposureState,
+        required_team_orchestration_call, tool_batch_pattern, vision_user_message,
     };
     use crate::config::RuntimeFeatureConfig;
     use crate::context_runtime::{
@@ -8261,8 +8379,8 @@ mod tests {
     use crate::permissions::{PermissionMode, PermissionPolicy};
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
     use crate::{
-        resolve_context_budget_tokens, PromptAssembly, RealityRecallPort, RuntimeBudgetInputs,
-        RuntimeBudgetPlan, SystemPromptBuilder, COWD_IDENTITY_CONTRACT_VERSION,
+        COWD_IDENTITY_CONTRACT_VERSION, PromptAssembly, RealityRecallPort, RuntimeBudgetInputs,
+        RuntimeBudgetPlan, SystemPromptBuilder, resolve_context_budget_tokens,
     };
     use futures::stream::Stream;
     use harness_contract::agent::{
@@ -8274,11 +8392,12 @@ mod tests {
         AgentSkillProfile, SkillAdapterKind, SkillCapabilityProfile, SkillDetectedRuntime,
         SkillEntrypoint, SkillKind, SkillLifecycleStatus, SkillRiskLevel,
     };
+    use harness_contract::team::{FocusPartitionPlan, FocusPartitionSlot};
     use model_protocol::usage::TokenUsage;
     use std::fs;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use storage::{SqliteConnectionFactory, StorageRegistry};
 
     fn rendered_prompt(prompt: &PromptAssembly) -> String {
@@ -8306,6 +8425,39 @@ mod tests {
         assert_eq!(calls[0].name, "runtime_orchestrate");
         let input: serde_json::Value = serde_json::from_str(&calls[0].input).unwrap();
         assert_eq!(input["action"], "request_team");
+    }
+
+    #[test]
+    fn e2e_negative_team_fixture_is_marker_scoped_and_produces_real_cost_warning() {
+        let prompt = "must start a Team for runtime gateway frontend [cowd-e2e:explicit-team-negative]";
+        let mut input = harness_contract::strategy::StrategyInput::from_prompt(prompt);
+        apply_named_e2e_strategy_fixture(&mut input, prompt, "explicit-team-negative")
+            .expect("known fixture is accepted");
+        let decision = harness_contract::strategy::decide_strategy(&input);
+        let team = decision
+            .candidate_estimates
+            .iter()
+            .find(|estimate| {
+                estimate.candidate == harness_contract::strategy::ExecutionCandidateKind::Team
+            })
+            .expect("fixture retains Team estimate");
+
+        assert_eq!(
+            decision.selected_candidate,
+            harness_contract::strategy::ExecutionCandidateKind::Team
+        );
+        assert!(team.net_benefit_score < 0);
+        assert!(decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("negative estimated lift")));
+
+        let mut unmarked = harness_contract::strategy::StrategyInput::from_prompt(
+            "must start a Team for runtime gateway frontend",
+        );
+        apply_named_e2e_strategy_fixture(&mut unmarked, &unmarked.prompt.clone(), "explicit-team-negative")
+            .expect("known fixture is inert without its marker");
+        assert!(unmarked.candidate_costs.is_empty());
     }
 
     #[test]
@@ -8952,6 +9104,13 @@ mod tests {
         assert_eq!(bound.decision_id, first.decision_id);
         assert_eq!(bound.execution_graph_ref.as_deref(), Some("graph-one"));
         runtime
+            .retarget_active_turn_strategy(
+                harness_contract::strategy::ExecutionCandidateKind::Direct,
+                harness_contract::core::ExecutionPattern::Execute,
+                "provider tool batch retained the admitted decision lease",
+            )
+            .expect("running ToolBatch retarget is a selected revision");
+        runtime
             .finish_turn_strategy(
                 "turn-one",
                 crate::execution_core::TurnStrategyDecisionStatus::Completed,
@@ -8969,15 +9128,38 @@ mod tests {
             .expect("strategy events");
         let strategy_events = events
             .iter()
-            .filter(|event| event.kind.starts_with("runtime.strategy."))
+            .filter(|event| {
+                matches!(
+                    event.kind.as_str(),
+                    "runtime.strategy.selected"
+                        | "runtime.strategy.downgraded"
+                        | "runtime.strategy.early_stopped"
+                        | "runtime.strategy.outcome"
+                )
+            })
             .collect::<Vec<_>>();
         assert_eq!(
             strategy_events
                 .iter()
                 .map(|event| event.kind.as_str())
                 .collect::<Vec<_>>(),
-            vec!["runtime.strategy.selected", "runtime.strategy.outcome"]
+            vec![
+                "runtime.strategy.selected",
+                "runtime.strategy.selected",
+                "runtime.strategy.outcome"
+            ]
         );
+        assert_eq!(strategy_events[1].status.as_deref(), Some("running"));
+        assert_eq!(
+            strategy_events[1].payload["selected_pattern"].as_str(),
+            Some("execute")
+        );
+        assert!(turn_strategy_event_kind_allowed(
+            "runtime.strategy.selected"
+        ));
+        assert!(!turn_strategy_event_kind_allowed(
+            "runtime.strategy.retargeted"
+        ));
         assert!(strategy_events.iter().all(|event| {
             event.payload["decision_id"].as_str() == Some(first.decision_id.as_str())
                 && event.payload["decision_lease"].as_str() == Some(first.decision_lease.as_str())
@@ -8986,6 +9168,188 @@ mod tests {
                     == Some(runtime.session().session_id.as_str())
                 && event.payload["turn_ref"].as_str() == Some("turn-one")
         }));
+    }
+
+    #[test]
+    fn high_overlap_publishes_downgrade_with_visible_reason() {
+        let store = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory()
+        .with_runtime_event_store(Arc::clone(&store));
+        runtime
+            .begin_turn_strategy("overlap-turn", "必须启动 Team 分别审查三个独立域并综合")
+            .expect("admit team strategy");
+        runtime
+            .bind_turn_strategy_execution("overlap-turn", "overlap-graph")
+            .expect("bind strategy graph");
+        let selected = runtime.active_turn_strategy().expect("selected state");
+
+        runtime
+            .downgrade_turn_strategy(
+                harness_contract::strategy::ExecutionCandidateKind::Direct,
+                "measured evidence overlap 9100 bp exceeded the 800 bp Team budget; continue with one owner",
+            )
+            .expect("downgrade must be durable");
+
+        let events = store
+            .list_stream(&format!("session:{}", runtime.session().session_id))
+            .expect("strategy events");
+        let downgraded = events
+            .iter()
+            .find(|event| event.kind == "runtime.strategy.downgraded")
+            .expect("overlap downgrade event");
+        assert!(downgraded.sequence > 0);
+        assert_eq!(
+            downgraded.payload["decision_id"].as_str(),
+            Some(selected.decision_id.as_str())
+        );
+        assert!(
+            downgraded.payload["decision_revision"]
+                .as_u64()
+                .expect("downgrade revision")
+                > selected.revision
+        );
+        assert_eq!(downgraded.payload["selected_candidate"], "direct");
+        assert!(
+            downgraded.payload["reason"]
+                .as_str()
+                .expect("visible reason")
+                .contains("overlap 9100 bp")
+        );
+    }
+
+    #[test]
+    fn provider_constraint_publishes_monotonic_downgrade_and_retains_scope() {
+        let store = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory()
+        .with_runtime_event_store(Arc::clone(&store));
+        runtime
+            .begin_turn_strategy("provider-turn", "必须启动 Team 分别审查三个独立域并综合")
+            .expect("admit team strategy");
+        runtime
+            .bind_turn_strategy_execution("provider-turn", "provider-graph")
+            .expect("bind strategy graph");
+        runtime
+            .set_turn_strategy_focus_partitions(vec![FocusPartitionPlan {
+                role_id: "reviewer".to_string(),
+                shared_baseline: vec!["evidence:baseline".to_string()],
+                slots: vec![FocusPartitionSlot {
+                    focus_id: "runtime".to_string(),
+                    boundary: "crates/runtime".to_string(),
+                    evidence_responsibility: "Review the runtime boundary".to_string(),
+                    capability_cropped_refs: vec!["read:crates/runtime".to_string()],
+                    scope_hash: "sha256:provider-constraint-scope".to_string(),
+                    overlap_budget_bp: 800,
+                    novelty_target_bp: 6_000,
+                    output_contract: Vec::new(),
+                    output_acceptance: Vec::new(),
+                }],
+            }])
+            .expect("set evidence scope");
+        let selected = runtime.active_turn_strategy().expect("selected state");
+        {
+            let mut guard = runtime
+                .active_turn_strategy
+                .lock()
+                .expect("strategy owner lock");
+            let state = guard.as_mut().expect("active strategy state");
+            state.resource_snapshot.provider_concurrency_penalty_bp = 9_000;
+        }
+
+        runtime
+            .downgrade_turn_strategy(
+                harness_contract::strategy::ExecutionCandidateKind::Direct,
+                "provider concurrency constraint 9000 bp removed the Team execution slot",
+            )
+            .expect("provider downgrade must be durable");
+
+        let events = store
+            .list_stream(&format!("session:{}", runtime.session().session_id))
+            .expect("strategy events");
+        let downgraded = events
+            .iter()
+            .find(|event| event.kind == "runtime.strategy.downgraded")
+            .expect("provider downgrade event");
+        assert!(
+            downgraded.payload["decision_revision"]
+                .as_u64()
+                .expect("downgrade revision")
+                > selected.revision
+        );
+        assert_eq!(downgraded.payload["selected_candidate"], "direct");
+        assert_eq!(
+            downgraded.payload["resource_snapshot"]["provider_concurrency_penalty_bp"],
+            9_000
+        );
+        assert_eq!(
+            downgraded.payload["evidence_scopes"][0]["slots"][0]["capability_cropped_refs"][0],
+            "read:crates/runtime"
+        );
+    }
+
+    #[test]
+    fn low_novelty_publishes_bounded_early_stop() {
+        let store = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory()
+        .with_runtime_event_store(Arc::clone(&store));
+        runtime
+            .begin_turn_strategy("novelty-turn", "必须启动 Team 分别审查三个独立域并综合")
+            .expect("admit team strategy");
+        runtime
+            .bind_turn_strategy_execution("novelty-turn", "novelty-graph")
+            .expect("bind strategy graph");
+        let selected = runtime.active_turn_strategy().expect("selected state");
+
+        runtime
+            .record_turn_strategy_early_stop(
+                "low novelty: observed contribution 300 bp is below the 6000 bp target; stop further delegation",
+            )
+            .expect("early stop must be durable");
+
+        let events = store
+            .list_stream(&format!("session:{}", runtime.session().session_id))
+            .expect("strategy events");
+        let early_stops = events
+            .iter()
+            .filter(|event| event.kind == "runtime.strategy.early_stopped")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            early_stops.len(),
+            1,
+            "early stop is a single bounded transition"
+        );
+        let early_stop = early_stops[0];
+        assert_eq!(
+            early_stop.payload["decision_revision"].as_u64(),
+            Some(selected.revision.saturating_add(1))
+        );
+        assert_eq!(early_stop.status.as_deref(), Some("early_stopped"));
+        assert!(
+            early_stop.payload["reason"]
+                .as_str()
+                .expect("visible early-stop reason")
+                .contains("low novelty")
+        );
     }
 
     #[test]
@@ -9247,10 +9611,12 @@ mod tests {
             .await;
         assert!(!critical_validation.allowed);
         assert!(!critical_validation.checkpoint_created);
-        assert!(critical_validation
-            .findings
-            .iter()
-            .any(|finding| finding == "critical_mutation_missing_approval_runtime"));
+        assert!(
+            critical_validation
+                .findings
+                .iter()
+                .any(|finding| finding == "critical_mutation_missing_approval_runtime")
+        );
         assert_eq!(checkpoint_calls.load(Ordering::SeqCst), 1);
         assert_eq!(mutation_calls.load(Ordering::SeqCst), 0);
     }
@@ -9510,8 +9876,10 @@ mod tests {
         }));
         let requests = requests.lock().expect("request recorder");
         assert_eq!(requests.len(), 1);
-        assert!(rendered_prompt(&requests[0].prompt)
-            .contains("Require release evidence before accepting completion."));
+        assert!(
+            rendered_prompt(&requests[0].prompt)
+                .contains("Require release evidence before accepting completion.")
+        );
     }
 
     struct RuntimeAwareApi(Arc<std::sync::atomic::AtomicBool>);
@@ -9685,9 +10053,11 @@ mod tests {
         assert!(projections[0].active_ids.is_empty());
         assert_eq!(projections[0].deferred_ids.len(), 3);
         assert_eq!(projections[1].active_ids, vec!["ToolSearch"]);
-        assert!(projections[1]
-            .deferred_ids
-            .contains(&"custom_reader".to_string()));
+        assert!(
+            projections[1]
+                .deferred_ids
+                .contains(&"custom_reader".to_string())
+        );
     }
 
     #[derive(Clone)]
@@ -9818,9 +10188,11 @@ mod tests {
         assert_eq!(projections[0].catalog_revision, 0);
         assert_eq!(projections[0].active_ids, vec!["ToolSearch"]);
         assert_eq!(projections[0].deferred_ids, vec!["custom_reader"]);
-        assert!(projections[1]
-            .active_ids
-            .contains(&"custom_reader".to_string()));
+        assert!(
+            projections[1]
+                .active_ids
+                .contains(&"custom_reader".to_string())
+        );
         assert!(projections[1].exposure_revision > projections[0].exposure_revision);
     }
 
@@ -10023,9 +10395,11 @@ mod tests {
             .remember_context_turn_report(report)
             .await
             .expect_err("a foreign-key persistence failure must fail the terminal report path");
-        assert!(error
-            .to_string()
-            .contains("context governance persistence failed"));
+        assert!(
+            error
+                .to_string()
+                .contains("context governance persistence failed")
+        );
         assert_eq!(runtime.last_context_turn_report(), None);
     }
 
@@ -10090,9 +10464,11 @@ mod tests {
             )
             .await
             .expect_err("missing session carrier must reject canonical compaction persistence");
-        assert!(error
-            .to_string()
-            .contains("atomic compaction persistence failed"));
+        assert!(
+            error
+                .to_string()
+                .contains("atomic compaction persistence failed")
+        );
     }
 
     #[test]
@@ -10210,20 +10586,24 @@ mod tests {
 
         assert_eq!(prompt.trusted_system[0], "stable system");
         assert!(prompt.trusted_system[1].contains("profile:MainTurn"));
-        assert!(prompt
-            .trusted_system
-            .iter()
-            .any(|segment| segment.contains("context_governance_report_id:")));
+        assert!(
+            prompt
+                .trusted_system
+                .iter()
+                .any(|segment| segment.contains("context_governance_report_id:"))
+        );
         assert_eq!(envelope.intent, "remember this");
         assert_eq!(envelope.assembled.stable_head, vec!["stable system"]);
         assert_eq!(
             envelope.diagnostics.degraded_sources,
             vec![ContextSourceKind::Memory]
         );
-        assert!(envelope
-            .selected
-            .iter()
-            .all(|item| item.source != ContextSourceKind::Memory));
+        assert!(
+            envelope
+                .selected
+                .iter()
+                .all(|item| item.source != ContextSourceKind::Memory)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -10253,10 +10633,12 @@ mod tests {
             .last_context_envelope()
             .expect("context envelope should be recorded");
 
-        assert!(prompt
-            .contextual_packets
-            .iter()
-            .any(|packet| packet.content.contains("continue v0.8.13 context work")));
+        assert!(
+            prompt
+                .contextual_packets
+                .iter()
+                .any(|packet| packet.content.contains("continue v0.8.13 context work"))
+        );
         let handoff = envelope
             .selected
             .iter()
@@ -10291,14 +10673,18 @@ mod tests {
             .last_context_envelope()
             .expect("context envelope should be recorded");
 
-        assert!(prompt
-            .contextual_packets
-            .iter()
-            .any(|packet| packet.content.contains("cargo test passed")));
-        assert!(envelope
-            .selected
-            .iter()
-            .any(|item| item.source == ContextSourceKind::ToolTrace));
+        assert!(
+            prompt
+                .contextual_packets
+                .iter()
+                .any(|packet| packet.content.contains("cargo test passed"))
+        );
+        assert!(
+            envelope
+                .selected
+                .iter()
+                .any(|item| item.source == ContextSourceKind::ToolTrace)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -10409,9 +10795,11 @@ mod tests {
             .list_layer_full_entries(memory::types::MemoryLayer::L1)
             .await
             .unwrap();
-        assert!(loaded_l1
-            .iter()
-            .any(|entry| entry.title == "User preference: 不要使用工具或编排"));
+        assert!(
+            loaded_l1
+                .iter()
+                .any(|entry| entry.title == "User preference: 不要使用工具或编排")
+        );
         let memory_turn = memory::MemoryTurnContext::new("test-session", "primary")
             .with_project_id(Some(project_id));
         let prepared = mgr
@@ -10452,10 +10840,12 @@ mod tests {
             .last_context_envelope()
             .expect("context envelope should be recorded");
 
-        assert!(envelope
-            .omitted
-            .iter()
-            .any(|omission| omission.reason.contains("suppressed_for_current_turn")));
+        assert!(
+            envelope
+                .omitted
+                .iter()
+                .any(|omission| omission.reason.contains("suppressed_for_current_turn"))
+        );
         assert!(!prompt.contains("<title>User preference: 不要使用工具或编排</title>"));
         assert!(!prompt.contains("<knowledge_compliance>"));
     }
@@ -10512,10 +10902,12 @@ mod tests {
         // runtime governance context. Attachment/resource guidance may add more
         // bounded sections, so this must remain a semantic budget assertion.
         assert_eq!(prompt.trusted_system[0], "system prompt");
-        assert!(prompt
-            .trusted_system
-            .iter()
-            .any(|segment| segment.contains("profile:MainTurn")));
+        assert!(
+            prompt
+                .trusted_system
+                .iter()
+                .any(|segment| segment.contains("profile:MainTurn"))
+        );
         assert!(!rendered_prompt(&prompt).contains("<memory_context>"));
         let total_prompt_chars = prompt.estimated_chars();
         assert!(
@@ -10642,10 +11034,12 @@ mod tests {
         let rendered = rendered_prompt(&prompt);
         assert!(rendered.contains("east allocation requires expedited approval"));
         let envelope = runtime.last_context_envelope().expect("context envelope");
-        assert!(envelope
-            .selected
-            .iter()
-            .any(|item| item.source == ContextSourceKind::Fact));
+        assert!(
+            envelope
+                .selected
+                .iter()
+                .any(|item| item.source == ContextSourceKind::Fact)
+        );
         let report = runtime
             .last_reality_recall_report()
             .expect("reality recall report");

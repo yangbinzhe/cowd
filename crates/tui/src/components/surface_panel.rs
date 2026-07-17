@@ -142,13 +142,20 @@ impl SurfacePanel {
         self.focused_backlink_resolution = None;
     }
 
+    #[must_use]
+    pub fn accepts_backlink_result(&self, target: &str) -> bool {
+        self.focused_backlink_target.as_deref() == Some(target)
+    }
+
     pub fn record_backlink_receipt(
         &mut self,
         target: impl Into<String>,
         receipt: serde_json::Value,
     ) {
         let target = target.into();
-        self.focus_backlink_target(target.clone());
+        if !self.accepts_backlink_result(&target) {
+            return;
+        }
         self.last_status = Some(format!("Resolved exact Surface receipt {target}"));
         let status = receipt
             .get("cross_plane_dispatch_status")
@@ -166,7 +173,10 @@ impl SurfacePanel {
         target: impl Into<String>,
         message: impl Into<String>,
     ) {
-        self.focused_backlink_target = Some(target.into());
+        let target = target.into();
+        if !self.accepts_backlink_result(&target) {
+            return;
+        }
         self.focused_backlink_resolution = Some(format!("Resolution failed: {}", message.into()));
     }
 

@@ -7,9 +7,15 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
+use harness_contract::projection::{ProjectionEntity, StrategyDecisionProjection};
+
+use crate::components::strategy_decision::{
+    strategy_agent_ids, strategy_matches_target, strategy_summary_lines,
+};
 use crate::components::{Component, EventResult, RenderContext};
 use crate::runtime_control_store::{
-    MfgConnectionStatus, MfgFreshness, MfgOperationsState, MfgViewFocus, MfgViewTab,
+    MfgBacklinkKind, MfgConnectionStatus, MfgFreshness, MfgOperationsState, MfgViewFocus,
+    MfgViewTab,
 };
 
 pub const MFG_PANEL_READ_ROUTE_IDS: [app_mfg_contract::MfgRouteId; 20] = [
@@ -48,10 +54,17 @@ impl MfgOperationsPanel {
         ctx: &mut RenderContext,
         area: Rect,
         state: &MfgOperationsState,
+        strategy: Option<&StrategyDecisionProjection>,
+        agents: &[ProjectionEntity],
     ) {
         if area.width == 0 || area.height == 0 {
             return;
         }
+        let cached = state.selected_runtime_strategy_projection();
+        let strategy = cached.map(|projection| &projection.strategy).or(strategy);
+        let agents = cached
+            .map(|projection| projection.agents.as_slice())
+            .unwrap_or(agents);
         let regions = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -63,7 +76,7 @@ impl MfgOperationsPanel {
             .split(area);
         self.render_header(ctx, regions[0], state);
         self.render_tabs(ctx, regions[1], state);
-        self.render_body(ctx, regions[2], state);
+        self.render_body(ctx, regions[2], state, strategy, agents);
         self.render_footer(ctx, regions[3], state);
     }
 
@@ -179,11 +192,18 @@ impl MfgOperationsPanel {
             .render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
-    fn render_body(&self, ctx: &mut RenderContext, area: Rect, state: &MfgOperationsState) {
+    fn render_body(
+        &self,
+        ctx: &mut RenderContext,
+        area: Rect,
+        state: &MfgOperationsState,
+        strategy: Option<&StrategyDecisionProjection>,
+        agents: &[ProjectionEntity],
+    ) {
         if area.width < 96 {
             match state.focus {
                 MfgViewFocus::Detail | MfgViewFocus::Backlinks => {
-                    self.render_detail(ctx, area, state);
+                    self.render_detail(ctx, area, state, strategy, agents);
                 }
                 MfgViewFocus::Actions => {
                     self.render_links_and_recovery(ctx, area, state);
@@ -211,7 +231,7 @@ impl MfgOperationsPanel {
         if columns.len() == 2 && state.focus == MfgViewFocus::Actions {
             self.render_links_and_recovery(ctx, columns[1], state);
         } else {
-            self.render_detail(ctx, columns[1], state);
+            self.render_detail(ctx, columns[1], state, strategy, agents);
         }
         if columns.len() == 3 {
             self.render_links_and_recovery(ctx, columns[2], state);
@@ -372,7 +392,14 @@ impl MfgOperationsPanel {
         );
     }
 
-    fn render_detail(&self, ctx: &mut RenderContext, area: Rect, state: &MfgOperationsState) {
+    fn render_detail(
+        &self,
+        ctx: &mut RenderContext,
+        area: Rect,
+        state: &MfgOperationsState,
+        strategy: Option<&StrategyDecisionProjection>,
+        agents: &[ProjectionEntity],
+    ) {
         let title = state
             .selected_item()
             .map(|item| format!(" Detail · {} ", item.id))
@@ -387,8 +414,25 @@ impl MfgOperationsPanel {
                     "Select a record to inspect its canonical detail.".to_string()
                 }
             });
+        let mut lines = Vec::new();
+        if let Some(strategy) = strategy.filter(|strategy| {
+            state.selected_item().is_some_and(|item| {
+                item.backlinks.iter().any(|backlink| {
+                    backlink.kind == MfgBacklinkKind::Runtime
+                        && strategy_matches_target(strategy, &backlink.target)
+                })
+            })
+        }) {
+            lines.extend(strategy_summary_lines(
+                strategy,
+                usize::from(area.width.saturating_sub(2)),
+                &strategy_agent_ids(strategy, agents),
+            ));
+            lines.push(Line::raw(""));
+        }
+        lines.extend(content.lines().map(|line| Line::from(line.to_string())));
         ctx.frame_mut().render_widget(
-            Paragraph::new(content)
+            Paragraph::new(lines)
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
@@ -720,11 +764,20 @@ fn focus_style(focused: bool) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_control_store::{MfgBacklink, MfgBacklinkKind, MfgItemSummary};
+    use crate::runtime_control_store::{MfgBacklink, MfgItemSummary};
     use crate::skin::SkinConfig;
     use ratatui::{backend::TestBackend, Terminal};
 
     fn render(width: u16, height: u16, state: &MfgOperationsState) -> String {
+        render_with_strategy(width, height, state, None)
+    }
+
+    fn render_with_strategy(
+        width: u16,
+        height: u16,
+        state: &MfgOperationsState,
+        strategy: Option<&StrategyDecisionProjection>,
+    ) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let mut panel = MfgOperationsPanel::new();
@@ -733,7 +786,7 @@ mod tests {
                 let skin = SkinConfig::default();
                 let area = frame.area();
                 let mut context = RenderContext::new(frame, &skin);
-                panel.render_state(&mut context, area, state);
+                panel.render_state(&mut context, area, state, strategy, &[]);
             })
             .expect("draw");
         let buffer = terminal.backend().buffer();
@@ -765,6 +818,38 @@ mod tests {
         }];
         state.selected_incident_id = Some("incident-1".to_string());
         state
+    }
+
+    fn execution_projection(
+        execution_id: &str,
+        strategy: StrategyDecisionProjection,
+    ) -> harness_contract::projection::ExecutionProjection {
+        harness_contract::projection::ExecutionProjection {
+            schema_version: harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION,
+            execution_id: execution_id.to_string(),
+            revision: 4,
+            cursor: 4,
+            session_id: Some("session-mfg-history".to_string()),
+            mission_id: Some("mission-mfg-history".to_string()),
+            strategy: Some(strategy),
+            graph: harness_contract::execution_graph::project_execution_graph(
+                &harness_contract::execution_graph::ExecutionGraph::new("MFG linked execution"),
+            ),
+            child_executions: Vec::new(),
+            goals: Vec::new(),
+            agents: Vec::new(),
+            teams: Vec::new(),
+            relations: Vec::new(),
+            approvals: Vec::new(),
+            interventions: Vec::new(),
+            usage: Vec::new(),
+            context: Vec::new(),
+            evidence: Vec::new(),
+            health: Vec::new(),
+            recovery: Vec::new(),
+            live: None,
+            available_commands: Vec::new(),
+        }
     }
 
     #[test]
@@ -808,6 +893,102 @@ mod tests {
         assert!(output.contains("FORBIDDEN"));
         assert!(output.contains("mfg.read was recropped"));
         assert!(output.contains("cursor-2"));
+    }
+
+    #[test]
+    fn matching_runtime_backlink_reuses_the_shared_strategy_projection_summary() {
+        let mut state = populated_state();
+        state
+            .incidents
+            .first_mut()
+            .expect("incident")
+            .backlinks
+            .extend([
+                MfgBacklink {
+                    kind: MfgBacklinkKind::Runtime,
+                    target: "mfg-execution://execution-547".to_string(),
+                    label: "MFG execution".to_string(),
+                },
+                MfgBacklink {
+                kind: MfgBacklinkKind::Runtime,
+                target: "runtime-execution://execution-547".to_string(),
+                label: "Runtime".to_string(),
+                },
+            ]);
+        state.focus = MfgViewFocus::Detail;
+        state.request_selected_runtime_strategy_projection();
+        assert_eq!(
+            state.take_runtime_backlink_request().as_deref(),
+            Some("runtime-execution://execution-547"),
+            "selection must automatically request the canonical Runtime graph, not its MFG-local execution"
+        );
+        assert_eq!(
+            state
+                .activate_backlink(MfgBacklinkKind::Runtime)
+                .as_ref()
+                .map(|backlink| backlink.target.as_str()),
+            Some("runtime-execution://execution-547"),
+            "manual runtime navigation must prefer the same canonical graph"
+        );
+        let strategy: StrategyDecisionProjection = serde_json::from_str(include_str!(
+            "../../../harness-contract/tests/fixtures/strategy-projection-v1.json"
+        ))
+        .expect("shared strategy fixture");
+        state.record_runtime_strategy_projection(
+            &execution_projection("execution-547", strategy),
+            state.generation,
+            state.selection_revision,
+            state.live_generation,
+            state.live_epoch.clone(),
+            state.live_reauthentication_count,
+        );
+
+        let output = render_with_strategy(120, 40, &state, None);
+
+        assert!(output.contains("Strategy"));
+        assert!(output.contains("team / collaborate"));
+        assert!(output.contains("Estimate: 48000ms"));
+        assert!(output.contains("Actual: 51000ms"));
+        assert_eq!(
+            state
+                .selected_runtime_strategy_projection()
+                .map(|projection| projection.execution_id.as_str()),
+            Some("execution-547"),
+            "historical MFG projection remains keyed and does not replace the active chat projection"
+        );
+
+        state.live_reauthentication_count =
+            state.live_reauthentication_count.saturating_add(1);
+        assert!(state.selected_runtime_strategy_projection().is_none());
+        let recropped = render_with_strategy(120, 40, &state, None);
+        assert!(!recropped.contains("team / collaborate"));
+        assert!(!recropped.contains("evidence-strategy-547"));
+    }
+
+    #[test]
+    fn coincident_mfg_execution_id_never_selects_a_runtime_strategy() {
+        let mut state = populated_state();
+        state.execution_ref = Some("execution-547".to_string());
+        state
+            .incidents
+            .first_mut()
+            .expect("incident")
+            .backlinks
+            .push(MfgBacklink {
+                kind: MfgBacklinkKind::Runtime,
+                target: "mfg-execution://execution-547".to_string(),
+                label: "MFG execution".to_string(),
+            });
+        state.focus = MfgViewFocus::Detail;
+        let strategy: StrategyDecisionProjection = serde_json::from_str(include_str!(
+            "../../../harness-contract/tests/fixtures/strategy-projection-v1.json"
+        ))
+        .expect("shared strategy fixture");
+
+        let output = render_with_strategy(120, 40, &state, Some(&strategy));
+
+        assert!(!output.contains("team / collaborate"));
+        assert!(!output.contains("Estimate: 48000ms"));
     }
 
     #[test]

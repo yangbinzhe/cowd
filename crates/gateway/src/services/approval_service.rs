@@ -195,6 +195,46 @@ impl ApprovalService {
         serde_json::Value::Array(combined.into_iter().skip(offset).take(limit).collect())
     }
 
+    /// Resolve one approval by canonical id without imposing the UI history
+    /// page size.  Backlinks are durable identities, not a request to inspect
+    /// only the most recent 200 records.
+    pub(crate) async fn exact(
+        &self,
+        id: &str,
+        principal: &runtime::VerifiedPrincipal,
+    ) -> Option<serde_json::Value> {
+        if let Some(services) = self.runtime_services.as_deref() {
+            services.approval_queue().refresh();
+            if let Some(request) = services
+                .approval_queue()
+                .list()
+                .into_iter()
+                .filter(|request| approval_visible_to(request, principal))
+                .find(|request| request.id == id)
+            {
+                return serde_json::to_value(request).ok();
+            }
+        }
+        if let Some(repository) = &self.repository {
+            if let Ok((history, _)) = repository.list_history(usize::MAX, 0) {
+                if let Some(entry) = history
+                    .into_iter()
+                    .find(|entry| entry.id == id || entry.request_id == id)
+                {
+                    return serde_json::to_value(entry).ok();
+                }
+            }
+        }
+        if let Some(gate) = &self.gate {
+            let (history, _) = gate.history().list_history(usize::MAX, 0).await;
+            return history
+                .into_iter()
+                .find(|entry| entry.id == id || entry.request_id == id)
+                .and_then(|entry| serde_json::to_value(entry).ok());
+        }
+        None
+    }
+
     pub(crate) async fn respond(
         &self,
         id: &str,

@@ -1,18 +1,18 @@
 use std::{sync::Arc, time::Instant};
 
 use axum::{
-    extract::{Extension, Path, Query, State as AxumState},
-    http::{header, HeaderMap, StatusCode},
-    response::{sse::Event, IntoResponse, Response, Sse},
-    routing::{get, post},
     Json, Router,
+    extract::{Extension, Path, Query, State as AxumState},
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response, Sse, sse::Event},
+    routing::{get, post},
 };
 use serde::Deserialize;
 use serde_json::Value;
 use std::convert::Infallible;
 
 mod control;
-use super::{connector_routes, AppState, AuthenticatedPrincipal, ErrorResponse};
+use super::{AppState, AuthenticatedPrincipal, ErrorResponse, connector_routes};
 pub(super) use control::{
     agent_value_summary, execution_graph_summary, get_runtime_control_plane, health_summary,
     session_lease_projection, value_loop_summary,
@@ -230,8 +230,10 @@ pub(super) struct ExecutionProjectionQuery {
     detail_scope: harness_contract::projection::ProjectionDetailScope,
 }
 
-fn execution_projection_context(
+pub(super) async fn execution_projection_context(
     state: &AppState,
+    principal: &AuthenticatedPrincipal,
+    execution_id: &str,
     detail_scope: harness_contract::projection::ProjectionDetailScope,
 ) -> Result<harness_contract::projection::ProjectionQueryContext, (StatusCode, Json<ErrorResponse>)>
 {
@@ -241,15 +243,112 @@ fn execution_projection_context(
             "runtime service unavailable",
         )
     })?;
+    let runtime_services = runtime.runtime_services();
+    let workspace_id = runtime_services.workspace_key().to_string();
+    let claims = principal.0.claims();
+    let scope = runtime::execution_projection::authorization_scope(&runtime_services, execution_id)
+        .map_err(projection_error)?;
+    let explicit_session = scope.session_id.as_ref().is_some_and(|session_id| {
+        claims
+            .scopes
+            .iter()
+            .any(|claim| claim == &format!("session:{session_id}"))
+    });
+    let explicit_mission = scope.mission_id.as_ref().is_some_and(|mission_id| {
+        claims
+            .scopes
+            .iter()
+            .any(|claim| claim == &format!("mission:{mission_id}"))
+    });
+    let owns_session = if let Some(session_id) = scope.session_id.as_deref() {
+        state
+            .services
+            .session
+            .stored_session(session_id)
+            .await
+            .map_err(|error| {
+                runtime_event_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to resolve execution session owner: {error}"),
+                )
+            })?
+            .and_then(|record| {
+                record
+                    .metadata_json
+                    .as_deref()
+                    .and_then(|metadata| serde_json::from_str::<Value>(metadata).ok())
+                    .and_then(|metadata| {
+                        metadata
+                            .get("owner_principal_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+            })
+            .is_some_and(|owner| owner == claims.principal_id)
+    } else {
+        false
+    };
+    if !projection_read_authorized(principal, owns_session, explicit_session, explicit_mission) {
+        return Err(runtime_event_error(
+            StatusCode::FORBIDDEN,
+            "execution projection is outside the authenticated principal scope",
+        ));
+    }
+    // Being allowed to inspect an execution is not the same authority as being
+    // allowed to see every resource that happened to be granted to its worker
+    // graph.  In particular, a shared `session:` or `mission:` observer must
+    // not inherit the graph's read/write/worktree grants.  Only the verified
+    // principal's own resource claims can make a resource reference visible;
+    // Runtime still crops every emitted reference against this list.
+    let mut visibility_grants = projection_visibility_grants(&claims.scopes);
+    visibility_grants.push(format!("principal:{}", claims.principal_id));
+    visibility_grants.sort();
+    visibility_grants.dedup();
     Ok(harness_contract::projection::ProjectionQueryContext {
-        principal: "gateway-local".to_string(),
-        workspace_id: runtime.runtime_services().workspace_key().to_string(),
-        session_scopes: Vec::new(),
-        mission_scopes: Vec::new(),
-        visibility_grants: vec!["gateway-local".to_string()],
+        principal: claims.principal_id.clone(),
+        workspace_id,
+        session_scopes: scope.session_id.into_iter().collect(),
+        mission_scopes: scope.mission_id.into_iter().collect(),
+        visibility_grants,
         detail_scope,
-        authorization_revision: 1,
+        authorization_revision: claims
+            .credential_epoch
+            .saturating_mul(1_000_000)
+            .saturating_add(claims.profile_revision),
     })
+}
+
+fn projection_visibility_grants(claims: &[String]) -> Vec<String> {
+    let mut grants = claims
+        .iter()
+        .filter_map(|claim| {
+            if claim == "resource:*" {
+                return Some(claim.clone());
+            }
+            let candidate = claim.strip_prefix("resource:").unwrap_or(claim);
+            let (mode, path) = candidate.split_once(':')?;
+            if !matches!(mode, "read" | "write" | "worktree") || path.trim().is_empty() {
+                return None;
+            }
+            Some(candidate.to_string())
+        })
+        .collect::<Vec<_>>();
+    grants.sort();
+    grants.dedup();
+    grants
+}
+
+fn projection_read_authorized(
+    principal: &AuthenticatedPrincipal,
+    owns_session: bool,
+    explicit_session: bool,
+    explicit_mission: bool,
+) -> bool {
+    owns_session
+        || explicit_session
+        || explicit_mission
+        || (principal.0.is_human_interactive()
+            && principal.0.has_capability("runtime.maintenance.manage"))
 }
 
 fn execution_runtime(
@@ -279,13 +378,15 @@ fn projection_error(error: runtime::RuntimeServicesError) -> (StatusCode, Json<E
 
 pub(super) async fn get_execution_projection(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Path(execution_id): Path<String>,
     Query(query): Query<ExecutionProjectionQuery>,
 ) -> Result<
     Json<harness_contract::projection::ExecutionProjection>,
     (StatusCode, Json<ErrorResponse>),
 > {
-    let context = execution_projection_context(&state, query.detail_scope)?;
+    let context =
+        execution_projection_context(&state, &principal, &execution_id, query.detail_scope).await?;
     let runtime = execution_runtime(&state)?;
     let projection = runtime::execution_projection::snapshot(&runtime, &execution_id, &context)
         .await
@@ -295,6 +396,7 @@ pub(super) async fn get_execution_projection(
 
 pub(super) async fn get_execution_projection_events(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Path(execution_id): Path<String>,
     Query(query): Query<ExecutionProjectionQuery>,
     headers: HeaderMap,
@@ -305,7 +407,8 @@ pub(super) async fn get_execution_projection_events(
         .and_then(|value| value.parse::<u64>().ok())
         .or(query.cursor)
         .unwrap_or_default();
-    let context = execution_projection_context(&state, query.detail_scope)?;
+    let context =
+        execution_projection_context(&state, &principal, &execution_id, query.detail_scope).await?;
     let runtime = execution_runtime(&state)?;
     let wants_sse = headers
         .get(header::ACCEPT)
@@ -317,9 +420,130 @@ pub(super) async fn get_execution_projection_events(
         return Ok(Json(delta).into_response());
     }
     let stream = futures::stream::unfold(
-        (runtime, execution_id, context, cursor),
-        |(runtime, execution_id, context, mut cursor)| async move {
+        (
+            state,
+            runtime,
+            execution_id,
+            principal,
+            query.detail_scope,
+            cursor,
+            false,
+            None::<std::time::Instant>,
+        ),
+        |(
+            state,
+            runtime,
+            execution_id,
+            principal,
+            detail_scope,
+            mut cursor,
+            ended,
+            mut auth_checked_at,
+        )| async move {
+            if ended {
+                return None;
+            }
             loop {
+                if auth_checked_at.is_none_or(|checked_at| {
+                    checked_at.elapsed() >= std::time::Duration::from_secs(1)
+                }) {
+                    let config_home = state.config_home.clone();
+                    let principal_for_check = principal.clone();
+                    let check = tokio::task::spawn_blocking(move || {
+                        super::projection_stream_principal_current(&config_home, &principal_for_check)
+                    })
+                    .await;
+                    auth_checked_at = Some(std::time::Instant::now());
+                    let reason = match check {
+                        Ok(Ok(())) => None,
+                        Ok(Err(reason)) => Some(reason),
+                        Err(error) => Some(format!("projection authorization check aborted: {error}")),
+                    };
+                    if let Some(reason) = reason {
+                    let event = Event::default()
+                        .event("projection_authorization_revoked")
+                        .data(
+                            serde_json::json!({
+                                "reason": reason,
+                                "execution_id": execution_id.clone(),
+                            })
+                            .to_string(),
+                        );
+                    return Some((
+                        Ok::<Event, Infallible>(event),
+                        (
+                            state,
+                            runtime,
+                            execution_id,
+                            principal,
+                            detail_scope,
+                            cursor,
+                            true,
+                            auth_checked_at,
+                        ),
+                    ));
+                    }
+                }
+                let context = match execution_projection_context(
+                    &state,
+                    &principal,
+                    &execution_id,
+                    detail_scope,
+                )
+                .await
+                {
+                    Ok(context) => context,
+                    Err((status, _))
+                        if status == StatusCode::UNAUTHORIZED
+                            || status == StatusCode::FORBIDDEN =>
+                    {
+                        let event = Event::default()
+                            .event("projection_authorization_revoked")
+                            .data(
+                                serde_json::json!({
+                                    "reason": "projection scope is no longer authorized",
+                                    "execution_id": execution_id.clone(),
+                                })
+                                .to_string(),
+                            );
+                        return Some((
+                            Ok(event),
+                            (
+                                state,
+                                runtime,
+                                execution_id,
+                                principal,
+                                detail_scope,
+                                cursor,
+                                true,
+                                auth_checked_at,
+                            ),
+                        ));
+                    }
+                    Err((_, error)) => {
+                        let event = Event::default().event("projection_resync").data(
+                            serde_json::json!({
+                                "reason": error.error,
+                                "snapshot_url": format!("/api/runtime/executions/{execution_id}"),
+                                "base_cursor": cursor,
+                            })
+                            .to_string(),
+                        );
+                        return Some((
+                            Ok(event),
+                            (
+                                state,
+                                runtime,
+                                execution_id,
+                                principal,
+                                detail_scope,
+                                cursor,
+                                true,
+                                auth_checked_at,
+                            ),
+                        ));
+                    }
+                };
                 match runtime::execution_projection::delta(
                     &runtime,
                     &execution_id,
@@ -335,7 +559,16 @@ pub(super) async fn get_execution_projection_events(
                             .unwrap_or_else(|_| Event::default().event("projection_error"));
                         return Some((
                             Ok::<Event, Infallible>(event),
-                            (runtime, execution_id, context, cursor),
+                            (
+                                state,
+                                runtime,
+                                execution_id,
+                                principal,
+                                detail_scope,
+                                cursor,
+                                false,
+                                auth_checked_at,
+                            ),
                         ));
                     }
                     Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(500)).await,
@@ -348,7 +581,19 @@ pub(super) async fn get_execution_projection_events(
                             })
                             .to_string(),
                         );
-                        return Some((Ok(event), (runtime, execution_id, context, cursor)));
+                        return Some((
+                            Ok(event),
+                            (
+                                state,
+                                runtime,
+                                execution_id,
+                                principal,
+                                detail_scope,
+                                cursor,
+                                true,
+                                auth_checked_at,
+                            ),
+                        ));
                     }
                 }
             }
@@ -361,21 +606,35 @@ pub(super) async fn get_execution_projection_events(
 
 pub(super) async fn execute_projection_command(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Path(execution_id): Path<String>,
     Json(request): Json<harness_contract::projection::ExecutionCommandRequest>,
 ) -> Result<
     Json<harness_contract::projection::ExecutionCommandReceipt>,
     (StatusCode, Json<ErrorResponse>),
 > {
+    if !projection_command_authorized(&principal) {
+        return Err(runtime_event_error(
+            StatusCode::FORBIDDEN,
+            "runtime.maintenance.manage capability is required for execution commands",
+        ));
+    }
     let context = execution_projection_context(
         &state,
+        &principal,
+        &execution_id,
         harness_contract::projection::ProjectionDetailScope::Full,
-    )?;
+    )
+    .await?;
     let runtime = execution_runtime(&state)?;
     runtime::execution_projection::command(&runtime, &execution_id, &context, request)
         .await
         .map(Json)
         .map_err(projection_error)
+}
+
+fn projection_command_authorized(principal: &AuthenticatedPrincipal) -> bool {
+    principal.0.is_human_interactive() && principal.0.has_capability("runtime.maintenance.manage")
 }
 
 #[derive(Debug, Deserialize)]
@@ -921,7 +1180,12 @@ fn upgrade_cross_plane_status(status: &str) -> runtime::UpgradeCarrierStatus {
 
 #[cfg(test)]
 mod v2_upgrade_tests {
-    use super::upgrade_cross_plane_status;
+    use super::{
+        projection_command_authorized, projection_read_authorized, projection_visibility_grants,
+        upgrade_cross_plane_status,
+    };
+    use crate::api_routes::AuthenticatedPrincipal;
+    use harness_contract::security::{PrincipalAssurance, PrincipalClaims, PrincipalKind};
 
     #[test]
     fn cross_plane_inventory_distinguishes_active_and_terminal_executions() {
@@ -937,6 +1201,74 @@ mod v2_upgrade_tests {
             upgrade_cross_plane_status("sent"),
             runtime::UpgradeCarrierStatus::Completed
         );
+    }
+
+    #[test]
+    fn execution_commands_require_interactive_control_capability() {
+        let principal = |assurance, capabilities: Vec<&str>| {
+            AuthenticatedPrincipal(runtime::VerifiedPrincipal::from_test_claims(
+                PrincipalClaims {
+                    principal_id: "route-test".to_string(),
+                    kind: PrincipalKind::Human,
+                    scopes: vec!["gateway".to_string()],
+                    capabilities: capabilities.into_iter().map(str::to_string).collect(),
+                    assurance,
+                    issuer: "route-test".to_string(),
+                    issued_at_ms: 1,
+                    expires_at_ms: None,
+                    credential_fingerprint: "route-test".to_string(),
+                    credential_epoch: 1,
+                    profile_revision: 1,
+                },
+            ))
+        };
+
+        assert!(!projection_command_authorized(&principal(
+            PrincipalAssurance::HumanInteractive,
+            Vec::new(),
+        )));
+        assert!(!projection_command_authorized(&principal(
+            PrincipalAssurance::Normal,
+            vec!["runtime.maintenance.manage"],
+        )));
+        assert!(projection_command_authorized(&principal(
+            PrincipalAssurance::HumanInteractive,
+            vec!["runtime.maintenance.manage"],
+        )));
+        let observer = principal(PrincipalAssurance::HumanInteractive, Vec::new());
+        let manager = principal(
+            PrincipalAssurance::HumanInteractive,
+            vec!["runtime.maintenance.manage"],
+        );
+        assert!(projection_read_authorized(&observer, true, false, false));
+        assert!(!projection_read_authorized(&observer, false, false, false));
+        assert!(projection_read_authorized(&manager, false, false, false));
+        assert!(projection_read_authorized(&observer, false, false, true));
+    }
+
+    #[test]
+    fn execution_read_scope_does_not_inherit_graph_resource_grants() {
+        let grants = projection_visibility_grants(&[
+            "gateway".to_string(),
+            "session:shared-session".to_string(),
+            "mission:shared-mission".to_string(),
+            "resource:read:crates/runtime".to_string(),
+            "write:surfaces/webui".to_string(),
+            "resource:*".to_string(),
+            "resource:session:must-not-be-a-resource-grant".to_string(),
+        ]);
+
+        assert_eq!(
+            grants,
+            vec![
+                "read:crates/runtime".to_string(),
+                "resource:*".to_string(),
+                "write:surfaces/webui".to_string(),
+            ]
+        );
+        // A graph's resource scope is intentionally absent: it may be used by
+        // the worker, but is never promoted into a viewer's claims.
+        assert!(!grants.contains(&"read:private/worker-only".to_string()));
     }
 }
 

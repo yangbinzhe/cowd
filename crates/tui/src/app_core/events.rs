@@ -85,6 +85,8 @@ fn is_reliable_event(event: &CowdEvent) -> bool {
             | CowdEvent::TurnError { .. }
             | CowdEvent::ApprovalRequested { .. }
             | CowdEvent::ExecutionProjectionDelta { .. }
+            | CowdEvent::ExecutionProjectionLoaded { .. }
+            | CowdEvent::ExecutionProjectionAccessRevoked { .. }
             | CowdEvent::ExecutionGraphSummary { .. }
             | CowdEvent::MfgContract { .. }
             | CowdEvent::MfgSnapshot { .. }
@@ -96,13 +98,46 @@ fn is_reliable_event(event: &CowdEvent) -> bool {
 
 fn retain_reliable_event(queue: &mut VecDeque<CowdEvent>, event: CowdEvent) {
     match &event {
-        CowdEvent::ExecutionProjectionDelta { delta } => {
+        CowdEvent::ExecutionProjectionDelta { generation, delta } => {
             if let Some(index) = queue.iter().position(|queued| {
-                matches!(queued, CowdEvent::ExecutionProjectionDelta { delta: queued_delta }
-                    if queued_delta.execution_id == delta.execution_id)
+                matches!(queued, CowdEvent::ExecutionProjectionDelta {
+                    generation: queued_generation,
+                    delta: queued_delta,
+                } if queued_generation == generation
+                    && queued_delta.execution_id == delta.execution_id)
             }) {
                 queue[index] = event;
                 return;
+            }
+        }
+        CowdEvent::ExecutionProjectionLoaded {
+            generation,
+            projection,
+        } => {
+            if let Some(index) = queue.iter().position(|queued| {
+                matches!(queued, CowdEvent::ExecutionProjectionLoaded {
+                    generation: queued_generation,
+                    projection: queued_projection,
+                } if queued_generation == generation
+                    && queued_projection.execution_id == projection.execution_id)
+            }) {
+                queue[index] = event;
+                return;
+            }
+        }
+        CowdEvent::ExecutionProjectionAccessRevoked {
+            generation,
+            execution_id,
+            ..
+        } => {
+            if let Some(index) = queue.iter().position(|queued| {
+                matches!(queued, CowdEvent::ExecutionProjectionAccessRevoked {
+                    generation: queued_generation,
+                    execution_id: queued_execution_id,
+                    ..
+                } if queued_generation == generation && queued_execution_id == execution_id)
+            }) {
+                queue.remove(index);
             }
         }
         CowdEvent::ExecutionGraphSummary { summary } => {
@@ -189,6 +224,7 @@ fn retain_reliable_event(queue: &mut VecDeque<CowdEvent>, event: CowdEvent) {
             matches!(
                 queued,
                 CowdEvent::ExecutionProjectionDelta { .. }
+                    | CowdEvent::ExecutionProjectionAccessRevoked { .. }
                     | CowdEvent::ExecutionGraphSummary { .. }
                     | CowdEvent::MfgContract { .. }
                     | CowdEvent::MfgSnapshot { .. }
@@ -266,11 +302,12 @@ mod tests {
             })
             .expect("capacity");
         }
-        assert!(tx
-            .try_send(CowdEvent::TextDelta {
+        assert!(
+            tx.try_send(CowdEvent::TextDelta {
                 text: "overflow".into(),
             })
-            .is_err());
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -306,6 +343,7 @@ mod tests {
         }
         for cursor in 1_u64..=10_000 {
             tx.send(CowdEvent::ExecutionProjectionDelta {
+                generation: 7,
                 delta: harness_contract::projection::ProjectionDelta {
                     schema_version: 1,
                     execution_id: "execution-a".to_string(),
@@ -320,7 +358,8 @@ mod tests {
         assert_eq!(reliable.len(), 1);
         assert!(matches!(
             reliable.front(),
-            Some(CowdEvent::ExecutionProjectionDelta { delta }) if delta.target_cursor == 10_000
+            Some(CowdEvent::ExecutionProjectionDelta { generation: 7, delta })
+                if delta.target_cursor == 10_000
         ));
     }
 

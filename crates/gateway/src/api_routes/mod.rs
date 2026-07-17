@@ -131,6 +131,53 @@ pub(crate) fn surface_actor_id(principal: &AuthenticatedPrincipal, surface: &str
     )
 }
 
+/// Revalidate a long-lived projection stream against the same broker
+/// lifecycle authority used when its request was authenticated. Axum's
+/// middleware can authenticate only the opening HTTP request; without this
+/// check an already-open SSE response would retain revoked or re-profiled
+/// access indefinitely.
+pub(super) fn projection_stream_principal_current(
+    config_home: &std::path::Path,
+    principal: &AuthenticatedPrincipal,
+) -> Result<(), String> {
+    let claims = principal.0.claims();
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(u64::MAX, |duration| duration.as_millis() as u64);
+    if claims
+        .expires_at_ms
+        .is_some_and(|expires_at| expires_at <= now_ms)
+    {
+        return Err("projection stream principal expired".to_string());
+    }
+
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        let client = auth_broker::BrokerClient::new(auth_broker::BrokerClient::default_socket(
+            config_home.join("auth-broker"),
+        ));
+        let lifecycle = client
+            .credential_lifecycle()
+            .map_err(|error| format!("projection authorization authority unavailable: {error}"))?;
+        if lifecycle.status != auth_broker::CredentialLifecycleStatus::Active {
+            return Err("projection stream credential is no longer active".to_string());
+        }
+        if lifecycle.credential_epoch != claims.credential_epoch {
+            return Err("projection stream credential epoch changed".to_string());
+        }
+        if lifecycle.profile_revision != claims.profile_revision {
+            return Err("projection stream authorization profile changed".to_string());
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        let _ = config_home;
+    }
+
+    Ok(())
+}
+
 impl AppState {
     pub(crate) fn startup_config_snapshot(&self) -> Option<&serde_json::Value> {
         self.config.as_ref()

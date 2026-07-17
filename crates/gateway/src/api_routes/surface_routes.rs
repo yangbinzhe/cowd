@@ -39,6 +39,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route("/api/surfaces/:id/inbox", get(get_surface_inbox_handler))
         .route("/api/surfaces/:id/outbox", get(get_surface_outbox_handler))
         .route(
+            "/api/surfaces/:id/outbox/:delivery_id",
+            get(get_surface_outbox_delivery_handler),
+        )
+        .route(
             "/api/surfaces/:id/messages",
             get(get_surface_messages_handler),
         )
@@ -437,6 +441,35 @@ async fn get_surface_outbox_handler(
         "surface": surface,
         "outbox": state.services.surface.outbox(&id),
         "dead_letters": state.services.surface.message_snapshot(&id).dead_letters,
+    })))
+}
+
+async fn get_surface_outbox_delivery_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path((id, delivery_id)): Path<(String, String)>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    if !state.services.surface.has_surface(&id) {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            format!("surface `{id}` not found"),
+        ));
+    }
+    let record = state
+        .services
+        .surface
+        .outbox(&id)
+        .into_iter()
+        .find(|record| record.delivery_id == delivery_id)
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                format!("surface delivery `{id}/{delivery_id}` not found"),
+            )
+        })?;
+    Ok(Json(serde_json::json!({
+        "kind": "surface.outbox.delivery",
+        "surface": surface::normalize_surface_id(&id),
+        "delivery": record,
     })))
 }
 

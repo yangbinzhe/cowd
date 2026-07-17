@@ -875,6 +875,21 @@ impl UnifiedSessionStore {
             .await
             .search_messages(query, session_id, limit)
     }
+
+    /// Search a pre-authorized set of sessions in one FTS query.  The caller
+    /// owns the authority decision; this store preserves the resulting scope
+    /// in SQL so result ranking cannot be distorted by other tenants.
+    pub async fn search_messages_in_sessions(
+        &self,
+        query: &str,
+        session_ids: &[String],
+        limit: usize,
+    ) -> Result<Vec<SessionMessage>> {
+        self.inner
+            .lock()
+            .await
+            .search_messages_in_sessions(query, session_ids, limit)
+    }
 }
 
 fn clamp_event_page_limit(limit: usize) -> usize {

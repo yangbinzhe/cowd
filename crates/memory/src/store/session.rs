@@ -3138,6 +3138,44 @@ impl SqliteSessionStore {
         }
     }
 
+    /// Search only the supplied session authority set.  Gateway resolves that
+    /// set before issuing the query so an unauthorised high-ranked FTS row can
+    /// neither displace an authorised result nor be exposed to the caller.
+    pub fn search_messages_in_sessions(
+        &self,
+        query: &str,
+        session_ids: &[String],
+        limit: usize,
+    ) -> Result<Vec<SessionMessage>> {
+        if session_ids.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn()?;
+        let scope_json = serde_json::to_string(session_ids)
+            .map_err(|error| MemoryError::Store(format!("encode search session scope: {error}")))?;
+        let mut stmt = conn
+            .prepare(
+                r"SELECT m.stable_message_id, m.session_id, m.sequence, m.role, m.content_json,
+                          m.blocks_count, m.tool_use_id, m.tool_name,
+                          m.token_usage_json, m.created_at_ms
+                     FROM messages m
+                     JOIN messages_fts fts ON m.id = fts.rowid
+                    WHERE messages_fts MATCH ?1
+                      AND m.session_id IN (SELECT value FROM json_each(?2))
+                    ORDER BY rank
+                    LIMIT ?3",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![query, scope_json, limit as i64], row_to_message)
+            .map_err(sql_err)?;
+        let mut messages = Vec::new();
+        for row in rows {
+            messages.push(row.map_err(sql_err)?);
+        }
+        Ok(messages)
+    }
+
     // -----------------------------------------------------------------------
     // Event log
     // -----------------------------------------------------------------------
@@ -3877,6 +3915,40 @@ mod tests {
         store.create_session(&make_record("s2")).unwrap();
         let list = store.list_sessions().unwrap();
         assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn scoped_message_search_preserves_authorized_results_when_other_sessions_rank_first() {
+        let (store, _dir) = make_store();
+        for session_id in ["foreign", "authorized"] {
+            store.create_session(&make_record(session_id)).unwrap();
+        }
+        for (session_id, sequence) in [("foreign", 0), ("authorized", 0)] {
+            store
+                .insert_message(&SessionMessage {
+                    stable_message_id: format!("{session_id}:{sequence}"),
+                    session_id: session_id.to_string(),
+                    sequence,
+                    role: "user".to_string(),
+                    content_json: r#"[{"type":"text","text":"tenant ranked search phrase"}]"#.to_string(),
+                    blocks_count: 1,
+                    tool_use_id: None,
+                    tool_name: None,
+                    token_usage_json: None,
+                    created_at_ms: 1,
+                })
+                .unwrap();
+        }
+
+        let results = store
+            .search_messages_in_sessions(
+                "tenant",
+                &["authorized".to_string()],
+                1,
+            )
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].session_id, "authorized");
     }
 
     #[test]

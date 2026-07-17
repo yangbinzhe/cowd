@@ -437,6 +437,8 @@ pub struct MfgOperationsState {
     pub section_errors: BTreeMap<String, MfgApiErrorV1>,
     pub attempted_routes: BTreeSet<app_mfg_contract::MfgRouteId>,
     pub last_backlink_intent: Option<MfgBacklink>,
+    #[serde(skip)]
+    pub runtime_strategy_cache: BTreeMap<String, MfgRuntimeStrategyProjection>,
     #[serde(default)]
     pending_runtime_backlink: Option<String>,
     #[serde(default)]
@@ -517,6 +519,7 @@ impl Default for MfgOperationsState {
             section_errors: BTreeMap::new(),
             attempted_routes: BTreeSet::new(),
             last_backlink_intent: None,
+            runtime_strategy_cache: BTreeMap::new(),
             pending_runtime_backlink: None,
             pending_approval_backlink: None,
             pending_surface_receipt: None,
@@ -524,7 +527,103 @@ impl Default for MfgOperationsState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct MfgRuntimeStrategyProjection {
+    pub execution_id: String,
+    pub strategy: harness_contract::projection::StrategyDecisionProjection,
+    pub agents: Vec<harness_contract::projection::ProjectionEntity>,
+    pub mfg_generation: u64,
+    pub selection_revision: u64,
+    pub live_generation: u64,
+    pub live_epoch: Option<String>,
+    pub live_reauthentication_count: u64,
+}
+
 impl MfgOperationsState {
+    pub fn record_runtime_strategy_projection(
+        &mut self,
+        projection: &harness_contract::projection::ExecutionProjection,
+        mfg_generation: u64,
+        selection_revision: u64,
+        live_generation: u64,
+        live_epoch: Option<String>,
+        live_reauthentication_count: u64,
+    ) {
+        self.runtime_strategy_cache.remove(&projection.execution_id);
+        let Some(strategy) = projection.strategy.clone() else {
+            return;
+        };
+        self.runtime_strategy_cache.insert(
+            projection.execution_id.clone(),
+            MfgRuntimeStrategyProjection {
+                execution_id: projection.execution_id.clone(),
+                strategy,
+                agents: projection.agents.clone(),
+                mfg_generation,
+                selection_revision,
+                live_generation,
+                live_epoch,
+                live_reauthentication_count,
+            },
+        );
+    }
+
+    pub fn invalidate_runtime_strategy_target(&mut self, target: &str) {
+        if let Some(execution_id) = target
+            .strip_prefix("runtime-execution://")
+            .and_then(|target| target.split(['/', '?', '#']).next())
+        {
+            self.runtime_strategy_cache.remove(execution_id);
+        }
+    }
+
+    #[must_use]
+    pub fn accepts_runtime_backlink_result(
+        &self,
+        target: &str,
+        mfg_generation: u64,
+        selection_revision: u64,
+        live_generation: u64,
+        live_epoch: Option<&str>,
+        live_reauthentication_count: u64,
+    ) -> bool {
+        self.generation == mfg_generation
+            && self.selection_revision == selection_revision
+            && self.live_generation == live_generation
+            && self.live_epoch.as_deref() == live_epoch
+            && self.live_reauthentication_count == live_reauthentication_count
+            && self.selected_item().is_some_and(|item| {
+                item.backlinks.iter().any(|backlink| {
+                    backlink.kind == MfgBacklinkKind::Runtime && backlink.target == target
+                })
+            })
+    }
+
+    #[must_use]
+    pub fn selected_runtime_strategy_projection(
+        &self,
+    ) -> Option<&MfgRuntimeStrategyProjection> {
+        let execution_id = self
+            .selected_item()?
+            .backlinks
+            .iter()
+            .find(|backlink| {
+                backlink.kind == MfgBacklinkKind::Runtime
+                    && backlink.target.starts_with("runtime-execution://")
+            })?
+            .target
+            .strip_prefix("runtime-execution://")?
+            .split(['/', '?', '#'])
+            .next()?;
+        self.runtime_strategy_cache.get(execution_id).filter(|projection| {
+            projection.mfg_generation == self.generation
+                && projection.selection_revision == self.selection_revision
+                && projection.live_generation == self.live_generation
+                && projection.live_epoch == self.live_epoch
+                && projection.live_reauthentication_count == self.live_reauthentication_count
+        })
+    }
+
     pub fn request_refresh(&mut self) {
         self.refresh_requested = true;
     }
@@ -536,6 +635,7 @@ impl MfgOperationsState {
         self.refresh_requested = false;
         self.refresh_in_flight = true;
         self.attempted_routes.clear();
+        self.runtime_strategy_cache.clear();
         self.generation = self.generation.saturating_add(1);
         self.freshness = MfgFreshness::Refreshing;
         self.connection = MfgConnectionStatus::Loading;
@@ -626,6 +726,7 @@ impl MfgOperationsState {
             .flat_map(|error| error.recovery_actions.iter().cloned())
             .collect();
         self.is_stale = snapshot.is_stale;
+        self.request_selected_runtime_strategy_projection();
         if self.degraded_reasons.is_empty() {
             self.freshness = MfgFreshness::Fresh;
             self.connection = if self.action_contracts().is_empty() {
@@ -1015,6 +1116,7 @@ impl MfgOperationsState {
     }
 
     fn clear_authorized_mfg_data(&mut self) {
+        self.runtime_strategy_cache.clear();
         self.contract = None;
         self.command_center = None;
         self.app_descriptor = None;
@@ -1170,6 +1272,7 @@ impl MfgOperationsState {
     }
 
     fn revoke_mfg_capability(&mut self, capability: &str, reason: &str) {
+        self.runtime_strategy_cache.clear();
         self.granted_capabilities
             .retain(|granted| granted != capability);
         let affected_actions = self
@@ -1255,6 +1358,7 @@ impl MfgOperationsState {
         self.detail_scroll = 0;
         self.backlink_index = 0;
         self.selection_revision = self.selection_revision.saturating_add(1);
+        self.request_selected_runtime_strategy_projection();
         self.request_refresh();
     }
 
@@ -1335,16 +1439,24 @@ impl MfgOperationsState {
         self.detail_scroll = 0;
         self.backlink_index = 0;
         self.selection_revision = self.selection_revision.saturating_add(1);
+        self.request_selected_runtime_strategy_projection();
         self.request_refresh();
     }
 
     pub fn activate_backlink(&mut self, kind: MfgBacklinkKind) -> Option<MfgBacklink> {
-        let backlink = self
-            .selected_item()?
-            .backlinks
-            .iter()
-            .find(|link| link.kind == kind)
-            .cloned()?;
+        let links = &self.selected_item()?.backlinks;
+        let backlink = if kind == MfgBacklinkKind::Runtime {
+            links
+                .iter()
+                .find(|link| {
+                    link.kind == MfgBacklinkKind::Runtime
+                        && link.target.starts_with("runtime-execution://")
+                })
+                .or_else(|| links.iter().find(|link| link.kind == kind))
+                .cloned()?
+        } else {
+            links.iter().find(|link| link.kind == kind).cloned()?
+        };
         self.last_backlink_intent = Some(backlink.clone());
         Some(backlink)
     }
@@ -1378,6 +1490,38 @@ impl MfgOperationsState {
             || target.starts_with("task://")
         {
             self.pending_runtime_backlink = Some(target.to_string());
+        }
+    }
+
+    /// Selecting an MFG object that owns a canonical Runtime graph must fetch
+    /// that graph without requiring an extra keyboard action.  MFG-local
+    /// execution and task backlinks remain available for drill-down, but they
+    /// are not strategy projections and therefore never populate this cache.
+    pub fn request_selected_runtime_strategy_projection(&mut self) {
+        let Some(target) = self.selected_item().and_then(|item| {
+            item.backlinks
+                .iter()
+                .find(|backlink| {
+                    backlink.kind == MfgBacklinkKind::Runtime
+                        && backlink.target.starts_with("runtime-execution://")
+                })
+                .map(|backlink| backlink.target.clone())
+        }) else {
+            return;
+        };
+        let cached = target
+            .strip_prefix("runtime-execution://")
+            .and_then(|target| target.split(['/', '?', '#']).next())
+            .and_then(|execution_id| self.runtime_strategy_cache.get(execution_id))
+            .is_some_and(|projection| {
+                projection.mfg_generation == self.generation
+                    && projection.selection_revision == self.selection_revision
+                    && projection.live_generation == self.live_generation
+                    && projection.live_epoch == self.live_epoch
+                    && projection.live_reauthentication_count == self.live_reauthentication_count
+            });
+        if !cached {
+            self.pending_runtime_backlink = Some(target);
         }
     }
 
@@ -2090,6 +2234,15 @@ impl MfgOperationsState {
                 .and_then(|review| serde_json::to_value(review).ok()),
             MfgViewTab::Insights => Some(serde_json::json!({
                 "focused_evidence_ref": self.focused_evidence_ref,
+                "evidence_backlink_resolved": self.focused_evidence_ref.is_some()
+                    && self.p1_documents.contains_key(
+                        &app_mfg_contract::MfgRouteId::RealityEvidenceGet
+                    )
+                    && self.p1_documents.contains_key(
+                        &app_mfg_contract::MfgRouteId::RealityEvidenceContext
+                    )
+                    && !self.section_errors.contains_key("evidence")
+                    && !self.section_errors.contains_key("evidence_context"),
                 "focused_quality_gate_id": self.focused_quality_gate_id,
                 "selected": self.selected_item().map(|item| item.raw.clone()),
                 "reality_health": self.p1_documents.get(

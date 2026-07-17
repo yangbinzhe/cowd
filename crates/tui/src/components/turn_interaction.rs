@@ -82,8 +82,15 @@ impl TurnInteractionState {
     }
 
     pub fn ingress_accepted(&mut self, execution_id: impl Into<String>) {
+        let execution_id = execution_id.into();
+        // A newly admitted execution must never inherit the previous turn's
+        // revision, live status or terminal reference while its first
+        // projection snapshot is still loading.
+        if self.execution.execution_id.as_deref() != Some(execution_id.as_str()) {
+            self.execution = ExecutionViewState::default();
+        }
         self.transport = TransportState::Accepted;
-        self.execution.execution_id = Some(execution_id.into());
+        self.execution.execution_id = Some(execution_id);
     }
 
     pub fn projection_snapshot(&mut self, projection: &ExecutionProjection) {
@@ -125,6 +132,17 @@ impl TurnInteractionState {
     pub fn terminal_observed(&mut self) {
         self.transport = TransportState::Idle;
         self.presentation.stale = false;
+    }
+
+    /// Remove every display-derived fact for a projection that Gateway no
+    /// longer authorizes.  Returning false makes a delayed revoke for an old
+    /// selection harmless.
+    pub fn clear_execution_if_matches(&mut self, execution_id: &str) -> bool {
+        if self.execution.execution_id.as_deref() != Some(execution_id) {
+            return false;
+        }
+        self.reduce(TurnInteractionAction::Reset);
+        true
     }
 
     #[must_use]
@@ -259,5 +277,40 @@ mod tests {
         )));
         assert_eq!(state.transport, TransportState::Accepted);
         assert!(!state.presentation.stale);
+    }
+
+    #[test]
+    fn authorization_revoke_clears_all_execution_presentation_facts() {
+        let mut state = TurnInteractionState::default();
+        state.reduce(TurnInteractionAction::IngressAccepted {
+            execution_id: "execution-a".to_string(),
+        });
+        state.reduce(TurnInteractionAction::ProjectionSnapshot(projection(
+            8,
+            ExecutionLiveStatus::CallingModel,
+        )));
+
+        assert!(state.clear_execution_if_matches("execution-a"));
+        assert_eq!(state, TurnInteractionState::default());
+        assert_eq!(state.label(), "Chat");
+        assert!(!state.clear_execution_if_matches("execution-a"));
+    }
+
+    #[test]
+    fn new_ingress_does_not_reuse_prior_execution_detail_while_loading() {
+        let mut state = TurnInteractionState::default();
+        state.reduce(TurnInteractionAction::ProjectionSnapshot(projection(
+            8,
+            ExecutionLiveStatus::CallingModel,
+        )));
+        state.reduce(TurnInteractionAction::IngressAccepted {
+            execution_id: "execution-b".to_string(),
+        });
+
+        assert_eq!(state.execution.execution_id.as_deref(), Some("execution-b"));
+        assert_eq!(state.execution.revision, None);
+        assert_eq!(state.execution.status_detail, None);
+        assert_eq!(state.execution.terminal_ref, None);
+        assert_eq!(state.label(), "Accepted by Runtime");
     }
 }

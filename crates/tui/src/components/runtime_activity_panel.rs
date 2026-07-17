@@ -1,4 +1,5 @@
 use crossterm::event::{Event, KeyCode, KeyEventKind, MouseEventKind};
+use harness_contract::projection::StrategyDecisionProjection;
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style, Stylize},
@@ -8,6 +9,9 @@ use ratatui::{
 
 use crate::app::{App, TimelineEntry};
 use crate::components::panel_scroll::PanelScrollState;
+use crate::components::strategy_decision::{
+    strategy_agent_ids, strategy_runtime_backlink_targets, strategy_summary_lines,
+};
 use crate::components::{Component, EventResult, RenderContext};
 
 /// Turn-level activity summary for "what's happening now" display.
@@ -86,6 +90,10 @@ pub struct RuntimeActivityPanel {
     control_plane_reason: String,
     focused_backlink_target: Option<String>,
     focused_backlink_resolution: Option<String>,
+    strategy: Option<StrategyDecisionProjection>,
+    strategy_agent_ids: Vec<String>,
+    strategy_backlink_targets: Vec<String>,
+    strategy_backlink_index: usize,
     yolo_mode: bool,
 
     // ── Runtime counters ─────────────────────────────────────────
@@ -115,6 +123,28 @@ impl RuntimeActivityPanel {
         self.yolo_mode = app.yolo_mode;
         self.session_id = app.session_id.clone();
         self.model = app.model.clone();
+        self.strategy = app
+            .latest_execution_projection
+            .as_ref()
+            .and_then(|projection| projection.strategy.clone());
+        self.strategy_agent_ids = app
+            .latest_execution_projection
+            .as_ref()
+            .and_then(|projection| {
+                projection
+                    .strategy
+                    .as_ref()
+                    .map(|strategy| strategy_agent_ids(strategy, &projection.agents))
+            })
+            .unwrap_or_default();
+        self.strategy_backlink_targets = self
+            .strategy
+            .as_ref()
+            .map(|strategy| strategy_runtime_backlink_targets(strategy, &self.strategy_agent_ids))
+            .unwrap_or_default();
+        self.strategy_backlink_index = self
+            .strategy_backlink_index
+            .min(self.strategy_backlink_targets.len().saturating_sub(1));
         if let Some(resolution) = self
             .focused_backlink_target
             .as_deref()
@@ -470,13 +500,20 @@ impl RuntimeActivityPanel {
         self.focused_backlink_resolution = None;
     }
 
+    #[must_use]
+    pub fn accepts_backlink_result(&self, target: &str) -> bool {
+        self.focused_backlink_target.as_deref() == Some(target)
+    }
+
     pub fn record_backlink_object(
         &mut self,
         target: impl Into<String>,
         object: &serde_json::Value,
     ) {
         let target = target.into();
-        self.focused_backlink_target = Some(target.clone());
+        if !self.accepts_backlink_result(&target) {
+            return;
+        }
         self.focused_backlink_resolution = Some(format!(
             "{} status {}",
             object
@@ -484,7 +521,7 @@ impl RuntimeActivityPanel {
                 .or_else(|| object.get("task_id"))
                 .or_else(|| object.get("execution_id"))
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or(target.as_str()),
+                .unwrap_or("canonical object"),
             object
                 .get("status")
                 .and_then(serde_json::Value::as_str)
@@ -498,7 +535,10 @@ impl RuntimeActivityPanel {
         target: impl Into<String>,
         message: impl Into<String>,
     ) {
-        self.focused_backlink_target = Some(target.into());
+        let target = target.into();
+        if !self.accepts_backlink_result(&target) {
+            return;
+        }
         self.focused_backlink_resolution = Some(format!("Resolution failed: {}", message.into()));
         self.scroll.top();
     }
@@ -507,6 +547,28 @@ impl RuntimeActivityPanel {
 impl Component for RuntimeActivityPanel {
     fn render(&mut self, ctx: &mut RenderContext, area: Rect) {
         let mut lines: Vec<Line> = Vec::new();
+        if let Some(strategy) = self.strategy.as_ref() {
+            lines.extend(strategy_summary_lines(
+                strategy,
+                usize::from(area.width.saturating_sub(2)),
+                &self.strategy_agent_ids,
+            ));
+            if !self.strategy_backlink_targets.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "Strategy links · [/] select · Enter resolve",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                for (index, target) in self.strategy_backlink_targets.iter().enumerate() {
+                    let marker = if index == self.strategy_backlink_index {
+                        "›"
+                    } else {
+                        " "
+                    };
+                    lines.push(Line::from(format!("{marker} {}", preview(target, 76))));
+                }
+            }
+            lines.push(Line::raw(""));
+        }
         if let Some(target) = self.focused_backlink_target.as_deref() {
             lines.push(Line::from(vec![
                 Span::styled(
@@ -645,6 +707,22 @@ impl Component for RuntimeActivityPanel {
                 KeyCode::PageUp => self.scroll.page_up(),
                 KeyCode::Home => self.scroll.top(),
                 KeyCode::End => self.scroll.bottom(),
+                KeyCode::Char('[') if !self.strategy_backlink_targets.is_empty() => {
+                    self.strategy_backlink_index =
+                        self.strategy_backlink_index.saturating_sub(1);
+                }
+                KeyCode::Char(']') if !self.strategy_backlink_targets.is_empty() => {
+                    self.strategy_backlink_index = (self.strategy_backlink_index + 1)
+                        .min(self.strategy_backlink_targets.len().saturating_sub(1));
+                }
+                KeyCode::Enter if !self.strategy_backlink_targets.is_empty() => {
+                    self.focused_backlink_target = self
+                        .strategy_backlink_targets
+                        .get(self.strategy_backlink_index)
+                        .cloned();
+                    self.focused_backlink_resolution = None;
+                    self.scroll.top();
+                }
                 _ => return EventResult::NotConsumed,
             },
             Event::Mouse(mouse) => match mouse.kind {
@@ -789,8 +867,11 @@ fn short_id(id: &str) -> String {
 }
 
 fn resolve_runtime_backlink(app: &App, target: &str) -> Option<String> {
+    let target = target.trim();
+    let query = target.split_once('?').map(|(_, query)| query);
     let target_id = target
-        .trim()
+        .strip_prefix("runtime-execution://")
+        .unwrap_or(target)
         .trim_start_matches("execution://")
         .trim_start_matches("mfg:execution:")
         .trim_start_matches("execution:")
@@ -807,6 +888,19 @@ fn resolve_runtime_backlink(app: &App, target: &str) -> Option<String> {
         .as_ref()
         .filter(|projection| projection.execution_id == target_id)
     {
+        if let Some(agent_id) = query.and_then(|query| {
+            query
+                .split('&')
+                .find_map(|item| item.strip_prefix("agent_id="))
+        }) {
+            let agent = projection.agents.iter().find(|agent| agent.id == agent_id)?;
+            return Some(format!(
+                "execution {} agent {} status {}",
+                projection.execution_id,
+                agent.id,
+                agent.status.as_deref().unwrap_or("unknown")
+            ));
+        }
         return Some(format!(
             "execution {} revision {} cursor {} nodes {}",
             projection.execution_id,
@@ -845,6 +939,47 @@ mod tests {
             panel.render(&mut ctx, Rect::new(0, 0, width, height));
         });
         terminal.buffer_lines().join("\n")
+    }
+
+    fn strategy_projection() -> crate::protocol::ExecutionProjection {
+        let strategy: StrategyDecisionProjection = serde_json::from_str(include_str!(
+            "../../../harness-contract/tests/fixtures/strategy-projection-v1.json"
+        ))
+        .expect("shared strategy fixture");
+        crate::protocol::ExecutionProjection {
+            schema_version: harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION,
+            execution_id: "execution-547".to_string(),
+            revision: 4,
+            cursor: 4,
+            session_id: Some("session-547".to_string()),
+            mission_id: Some("mission-547".to_string()),
+            strategy: Some(strategy),
+            graph: harness_contract::execution_graph::project_execution_graph(
+                &harness_contract::execution_graph::ExecutionGraph::new("strategy"),
+            ),
+            child_executions: Vec::new(),
+            goals: Vec::new(),
+            agents: vec![harness_contract::projection::ProjectionEntity {
+                id: "agent-547".to_string(),
+                kind: "agent".to_string(),
+                revision: 1,
+                status: Some("running".to_string()),
+                summary: None,
+                evidence_refs: Vec::new(),
+                detail: Some(serde_json::json!({"graph_id": "execution-547"})),
+            }],
+            teams: Vec::new(),
+            relations: Vec::new(),
+            approvals: Vec::new(),
+            interventions: Vec::new(),
+            usage: Vec::new(),
+            context: Vec::new(),
+            evidence: Vec::new(),
+            health: Vec::new(),
+            recovery: Vec::new(),
+            live: None,
+            available_commands: Vec::new(),
+        }
     }
 
     #[test]
@@ -964,6 +1099,70 @@ mod tests {
 
         assert_eq!(panel.handle_event(&event), EventResult::Consumed);
         assert!(!panel.focusable());
+    }
+
+    #[test]
+    fn strategy_agent_backlink_keyboard_activation_resolves_canonical_focus() {
+        let mut app = App::new("m", "session-547");
+        app.latest_execution_projection = Some(strategy_projection());
+        let mut panel = RuntimeActivityPanel::new();
+        panel.sync_from_app(&app);
+        assert_eq!(
+            panel.strategy_backlink_targets,
+            vec![
+                "runtime-execution://execution-547".to_string(),
+                "runtime-execution://execution-547?agent_id=agent-547".to_string()
+            ]
+        );
+
+        let next = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char(']'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let activate = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(panel.handle_event(&next), EventResult::Consumed);
+        assert_eq!(panel.handle_event(&activate), EventResult::Consumed);
+        panel.sync_from_app(&app);
+
+        assert_eq!(
+            panel.focused_backlink_target.as_deref(),
+            Some("runtime-execution://execution-547?agent_id=agent-547")
+        );
+        assert!(panel
+            .focused_backlink_resolution
+            .as_deref()
+            .is_some_and(|resolution| resolution.contains("agent agent-547 status running")));
+    }
+
+    #[test]
+    fn strategy_runtime_links_never_render_or_activate_unsafe_legacy_identity() {
+        let corpus: Vec<String> = serde_json::from_str(include_str!(
+            "../../../harness-contract/tests/fixtures/strategy-public-redaction-corpus.json"
+        ))
+        .expect("shared redaction corpus");
+        let activate = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        for secret in corpus {
+            let mut projection = strategy_projection();
+            let strategy = projection.strategy.as_mut().expect("strategy fixture");
+            strategy.team_execution_id = Some(secret.clone());
+            projection.agents[0].id = format!("agent-{secret}");
+            projection.agents[0].detail = Some(serde_json::json!({"graph_id": secret}));
+            let mut app = App::new("m", "session-safe-links");
+            app.latest_execution_projection = Some(projection);
+            let mut panel = RuntimeActivityPanel::new();
+            panel.sync_from_app(&app);
+
+            assert!(panel.strategy_backlink_targets.is_empty(), "unsafe target {secret}");
+            assert_eq!(panel.handle_event(&activate), EventResult::NotConsumed);
+            assert!(panel.focused_backlink_target.is_none());
+            assert!(!render_panel(&mut panel, 96, 27).contains(&secret));
+        }
     }
 
     #[test]
