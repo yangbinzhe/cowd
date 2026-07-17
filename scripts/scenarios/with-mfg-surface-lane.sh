@@ -151,7 +151,7 @@ curl -fsS -H "Authorization: Bearer ${TOKEN}" "${BASE_URL}/api/apps/mfg/contract
 (
   cd "${WEBUI_ROOT}"
   exec env COWD_VITE_GATEWAY_URL="${BASE_URL}" \
-    npm exec -- vite --host 127.0.0.1 --port "${WEBUI_PORT}" --strictPort
+    node ./node_modules/vite/bin/vite.js --host 127.0.0.1 --port "${WEBUI_PORT}" --strictPort
 ) >"${SCENARIO_ROOT}/webui.log" 2>&1 &
 WEBUI_PID=$!
 for _ in {1..160}; do

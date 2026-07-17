@@ -271,7 +271,7 @@ fn strategy_entity(
             .get("collaboration_receipt")
             .filter(|receipt| !receipt.is_null())
     });
-    let team_id = latest_receipt
+    let receipt_team_id = latest_receipt
         .and_then(|receipt| {
             receipt
                 .get("team_id")
@@ -279,7 +279,7 @@ fn strategy_entity(
         })
         .and_then(serde_json::Value::as_str)
         .and_then(safe_public_ref);
-    let team_execution_id = latest_receipt
+    let receipt_team_execution_id = latest_receipt
         .and_then(|receipt| {
             receipt
                 .pointer("/execution/graph_id")
@@ -287,6 +287,17 @@ fn strategy_entity(
         })
         .and_then(serde_json::Value::as_str)
         .and_then(safe_public_ref);
+    // A Team graph becomes durable before its terminal collaboration receipt
+    // is available.  Expose that already-authoritative topology while it is
+    // running, so every surface can distinguish live delegated work from a
+    // stalled turn instead of waiting for the parent merge to complete.
+    let live_team = (selected_candidate == Some(ExecutionCandidateKind::Team))
+        .then(|| live_team_topology(scope))
+        .flatten();
+    let team_id =
+        receipt_team_id.or_else(|| live_team.as_ref().map(|(team_id, _)| team_id.clone()));
+    let team_execution_id =
+        receipt_team_execution_id.or_else(|| live_team.map(|(_, execution_id)| execution_id));
     let source = payload_value::<StrategyDecisionSource>(latest, "decision_source")
         .or_else(|| payload_value(selected, "decision_source"));
     let confidence = latest
@@ -369,6 +380,22 @@ fn strategy_entity(
         proof_status,
         team_id,
         team_execution_id,
+    })
+}
+
+fn live_team_topology(scope: &ExecutionProjectionScope) -> Option<(String, String)> {
+    scope.teams.iter().find_map(|team| {
+        let graph_id = team
+            .detail
+            .as_ref()
+            .and_then(|detail| detail.get("graph_id"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(safe_public_ref)?;
+        scope
+            .child_executions
+            .iter()
+            .any(|child| child.execution_id == graph_id)
+            .then(|| (team.id.clone(), graph_id))
     })
 }
 
@@ -1704,6 +1731,44 @@ mod tests {
                 .as_ref()
                 .is_some_and(|entity| entity.summary.as_deref() == Some(child_id.as_str()))
         }));
+    }
+
+    #[test]
+    fn running_team_topology_supplies_strategy_identity_before_terminal_receipt() {
+        let team_id = "runtime-team:live".to_string();
+        let team_graph_id = "team-graph:runtime-team:live".to_string();
+        let scope = ExecutionProjectionScope {
+            session_id: Some("session-live-team".to_string()),
+            mission_id: None,
+            execution_ids: BTreeSet::from(["parent-execution".to_string(), team_graph_id.clone()]),
+            node_ids: BTreeSet::new(),
+            entity_ids: BTreeSet::from([team_id.clone()]),
+            goals: Vec::new(),
+            agents: Vec::new(),
+            teams: vec![ProjectionEntity {
+                id: team_id.clone(),
+                kind: "team".to_string(),
+                revision: 1,
+                status: Some("running".to_string()),
+                summary: Some("live team".to_string()),
+                evidence_refs: Vec::new(),
+                detail: Some(serde_json::json!({"graph_id": team_graph_id})),
+            }],
+            relations: Vec::new(),
+            approvals: Vec::new(),
+            interventions: Vec::new(),
+            child_executions: vec![ChildExecutionProjection {
+                execution_id: team_graph_id.clone(),
+                parent_execution_id: "parent-execution".to_string(),
+                parent_node_id: "parent-node".to_string(),
+                revision: 1,
+                cursor: 3,
+                status: "running".to_string(),
+                objective: "live delegated work".to_string(),
+            }],
+        };
+
+        assert_eq!(live_team_topology(&scope), Some((team_id, team_graph_id)));
     }
 
     #[tokio::test]

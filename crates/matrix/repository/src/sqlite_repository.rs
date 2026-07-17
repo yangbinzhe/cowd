@@ -175,6 +175,7 @@ impl MatrixSqliteRepository {
         &self,
         input: MatrixDataPlaneIngestPlanInput,
     ) -> Result<MatrixDataPlaneIngestPlan, MatrixSqliteRepositoryError> {
+        let source_ref = input.source_ref.clone();
         let mut plan = MatrixSqliteDataPlane::new(self.health()?.data_plane_watermark_count)
             .plan_ingest(input);
         if plan.affected_metric_ids.is_empty() {
@@ -184,6 +185,25 @@ impl MatrixSqliteRepository {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut affected = metrics_affected_by_fact_type(&connection, &plan.fact_type)?;
             affected.extend(metric_ids_for_fact_type(&connection, &plan.fact_type)?);
+            // A source-pack is the canonical declaration of the metrics that
+            // its facts materialize. A newly saved pack need not already have
+            // persisted metric dependencies, so fact-type lookup alone would
+            // incorrectly return an empty first-use ingest plan.
+            if let Some(source_pack_id) = source_ref
+                .strip_prefix("source-pack://")
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                if let Some(source_pack) = find_source_pack(&connection, source_pack_id)? {
+                    affected.extend(
+                        source_pack
+                            .fact_mappings
+                            .iter()
+                            .filter(|mapping| mapping.fact_type == plan.fact_type)
+                            .map(|mapping| mapping.metric_key.clone()),
+                    );
+                }
+            }
             affected.sort();
             affected.dedup();
             plan.compute_jobs = affected
@@ -3935,6 +3955,49 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn data_plane_ingest_plan_includes_metric_declared_by_source_pack() {
+        let repository = MatrixSqliteRepository::in_memory().expect("repository opens");
+        let source_pack_id = "source-pack-ingest-metric";
+        let mut source_pack = minimal_source_pack(source_pack_id);
+        source_pack.fact_mappings = vec![MatrixSourceFactMapping {
+            source_table: "manufacturing_events".to_string(),
+            fact_type: "manufacturing.event".to_string(),
+            metric_key: "manufacturing_event_count".to_string(),
+            entity_ref_fields: vec!["asset_id".to_string()],
+            measure_fields: Vec::new(),
+            event_time_field: None,
+            dedup_key: "event_id".to_string(),
+            delta_signature: "updated_at".to_string(),
+        }];
+        repository
+            .upsert_source_pack(source_pack)
+            .expect("source pack saves");
+
+        let plan = repository
+            .plan_data_plane_ingest(MatrixDataPlaneIngestPlanInput {
+                source_ref: format!("source-pack://{source_pack_id}"),
+                fact_type: "manufacturing.event".to_string(),
+                partition_ref: None,
+                high_watermark: None,
+                estimated_rows: None,
+                raw_checksum: None,
+                metric_ids: Vec::new(),
+            })
+            .expect("ingest plan builds");
+
+        assert!(
+            plan.affected_metric_ids
+                .iter()
+                .any(|metric_id| metric_id == "manufacturing_event_count")
+        );
+        assert!(plan.compute_jobs.iter().any(|job| {
+            job.metric_ids
+                .iter()
+                .any(|metric_id| metric_id == "manufacturing_event_count")
+        }));
     }
 
     #[test]
