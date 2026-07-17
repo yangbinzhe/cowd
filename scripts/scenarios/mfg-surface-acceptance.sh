@@ -62,7 +62,10 @@ if ss -ltnp | rg -q ":${PORT}\\b"; then
   exit 1
 fi
 if [[ "${COWD_SCENARIO_SKIP_BUILD:-0}" != "1" ]]; then
-  (cd "${ROOT}" && cargo build -p cli -p auth-broker)
+  # This acceptance lane drives both WebUI and the real TUI /mfg surface.
+  # The default CLI build excludes TUI, so build the feature-complete binary
+  # instead of depending on whichever artifact happened to be built earlier.
+  (cd "${ROOT}" && cargo build -p cli --features full -p auth-broker)
 fi
 [[ -x "${BIN}" ]] || { echo "missing cowd binary at ${BIN}" >&2; exit 1; }
 [[ -x "${AUTH_BROKER_BIN}" ]] || {
