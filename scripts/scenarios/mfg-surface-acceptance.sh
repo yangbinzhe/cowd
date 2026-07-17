@@ -128,7 +128,7 @@ set_profile() {
     echo "profile confirmation probe unexpectedly succeeded" >&2
     return 1
   fi
-  confirmation="$(sed -n 's/.*confirmation=\\([^[:space:]]*\\).*/\\1/p' \
+  confirmation="$(sed -n 's/.*confirmation=\([^[:space:]]*\).*/\1/p' \
     "${PROFILE_SET_STDERR}" | head -1)"
   [[ -n "${confirmation}" ]] || {
     echo "profile confirmation digest was not emitted" >&2
