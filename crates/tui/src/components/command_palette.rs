@@ -13,11 +13,11 @@
 #![allow(dead_code)]
 
 use crossterm::event::{Event, KeyCode, KeyEventKind};
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
-use ratatui::Frame;
 
 use crate::components::base::{Component, EventResult, RenderContext};
 use crate::keybind::Action;
@@ -116,11 +116,7 @@ fn fuzzy_match_score(query: &str, text: &str) -> usize {
         }
     }
 
-    if matched == q.len() {
-        matched * 25
-    } else {
-        0
-    }
+    if matched == q.len() { matched * 25 } else { 0 }
 }
 
 /// Compute the combined score for a command entry against a query.
@@ -322,22 +318,39 @@ impl CommandPalette {
         self.all_commands.extend(
             action_registry::registered_mfg_actions()
                 .into_iter()
-                .filter(|registered| {
-                    state.action_contracts().iter().any(|contract| {
-                        contract.action_id.as_str() == registered.id
-                            && state.action_is_capability_enabled(contract)
-                            && state.action_usability_label(contract) != "blocked"
-                    })
-                })
-                .map(|action| {
-                    CommandEntry::static_entry(
-                        action.label,
+                .filter_map(|action| {
+                    let contract = state
+                        .action_contracts()
+                        .into_iter()
+                        .find(|contract| contract.action_id.as_str() == action.id)?;
+                    if !state.action_is_capability_enabled(&contract) {
+                        return None;
+                    }
+                    let blocked = state.action_usability_label(&contract) == "blocked";
+                    let description = if blocked {
+                        format!(
+                            "{} · domain:mfg · risk:{:?} · receipt:{} · select a canonical target in MFG before dispatch",
+                            action.description, action.risk, action.receipt_target
+                        )
+                    } else {
                         format!(
                             "{} · domain:mfg · risk:{:?} · receipt:{}",
                             action.description, action.risk, action.receipt_target
-                        ),
-                        action.action,
-                    )
+                        )
+                    };
+                    Some(CommandEntry::static_entry(
+                        action.label,
+                        description,
+                        if blocked {
+                            // A capability-authorized action without the
+                            // current resource/CAS context remains discoverable
+                            // in the palette, but opens the operational panel
+                            // instead of issuing an invalid mutation.
+                            Action::Execute("/mfg".into())
+                        } else {
+                            action.action
+                        },
+                    ))
                 }),
         );
         self.run_search();
@@ -717,11 +730,7 @@ impl CommandPalette {
                 .enumerate()
                 .filter_map(|(i, entry)| {
                     let score = score_entry(query, entry);
-                    if score > 0 {
-                        Some((i, score))
-                    } else {
-                        None
-                    }
+                    if score > 0 { Some((i, score)) } else { None }
                 })
                 .collect();
 
@@ -1205,7 +1214,7 @@ mod tests {
     use super::*;
     use crate::components::RenderContext;
     use crate::skin::SkinConfig;
-    use crate::test_utils::{gateway_command_projection_fixture, MockTerminal};
+    use crate::test_utils::{MockTerminal, gateway_command_projection_fixture};
     use crossterm::event::KeyModifiers;
 
     // ── Helpers ───────────────────────────────────────────────────
@@ -1384,14 +1393,16 @@ mod tests {
         p.sync_runtime_actions(&snapshot);
 
         assert!(p.command_count() > before);
-        assert!(p
-            .all_commands
-            .iter()
-            .any(|entry| { entry.dynamic && entry.name == "Inspect Runtime" }));
-        assert!(p
-            .all_commands
-            .iter()
-            .any(|entry| { entry.dynamic && entry.action == Action::Execute("/tasks".into()) }));
+        assert!(
+            p.all_commands
+                .iter()
+                .any(|entry| { entry.dynamic && entry.name == "Inspect Runtime" })
+        );
+        assert!(
+            p.all_commands
+                .iter()
+                .any(|entry| { entry.dynamic && entry.action == Action::Execute("/tasks".into()) })
+        );
         assert!(p.all_commands.iter().any(|entry| {
             entry.dynamic && entry.action == Action::Execute("/approvals".into())
         }));
@@ -1426,6 +1437,7 @@ mod tests {
     fn typed_mfg_approval_never_exposes_generic_boolean_response_actions() {
         let mut palette = setup_palette();
         let snapshot = RuntimeControlSnapshot {
+            gateway_running: true,
             pending_approvals: Some(1),
             approval_items: vec![crate::runtime_control_store::ApprovalSummary {
                 id: "mfg-approval:review-1".to_string(),
@@ -1447,12 +1459,15 @@ mod tests {
                     Action::Execute(command) if command == "/mfg review review-1"
                 )
         }));
-        assert!(!palette
-            .all_commands
-            .iter()
-            .any(|entry| matches!(&entry.action, Action::RespondGatewayApproval { .. })));
+        assert!(
+            !palette
+                .all_commands
+                .iter()
+                .any(|entry| matches!(&entry.action, Action::RespondGatewayApproval { .. }))
+        );
 
         let malformed = RuntimeControlSnapshot {
+            gateway_running: true,
             pending_approvals: Some(1),
             approval_items: vec![crate::runtime_control_store::ApprovalSummary {
                 id: "mfg-approval:invalid".to_string(),
@@ -1462,14 +1477,18 @@ mod tests {
             ..RuntimeControlSnapshot::default()
         };
         palette.sync_runtime_actions(&malformed);
-        assert!(palette
-            .all_commands
-            .iter()
-            .any(|entry| entry.name == "Inspect Invalid MFG Approval"));
-        assert!(!palette
-            .all_commands
-            .iter()
-            .any(|entry| matches!(&entry.action, Action::RespondGatewayApproval { .. })));
+        assert!(
+            palette
+                .all_commands
+                .iter()
+                .any(|entry| entry.name == "Inspect Invalid MFG Approval")
+        );
+        assert!(
+            !palette
+                .all_commands
+                .iter()
+                .any(|entry| matches!(&entry.action, Action::RespondGatewayApproval { .. }))
+        );
     }
 
     #[test]
@@ -1502,21 +1521,27 @@ mod tests {
         });
         state.granted_capabilities = vec!["mfg.read".to_string(), "mfg.alert.respond".to_string()];
         palette.sync_mfg_actions(&state);
-        assert!(palette
-            .all_commands
-            .iter()
-            .any(|entry| entry.name == "mfg.alert.resolve"));
-        assert!(!palette
-            .all_commands
-            .iter()
-            .any(|entry| entry.name == "mfg.assignment.complete"));
+        assert!(
+            palette
+                .all_commands
+                .iter()
+                .any(|entry| entry.name == "mfg.alert.resolve")
+        );
+        assert!(
+            !palette
+                .all_commands
+                .iter()
+                .any(|entry| entry.name == "mfg.assignment.complete")
+        );
 
         state.granted_capabilities = vec!["mfg.read".to_string()];
         palette.sync_mfg_actions(&state);
-        assert!(!palette
-            .all_commands
-            .iter()
-            .any(|entry| entry.name == "mfg.alert.resolve"));
+        assert!(
+            !palette
+                .all_commands
+                .iter()
+                .any(|entry| entry.name == "mfg.alert.resolve")
+        );
     }
 
     #[test]
@@ -1648,10 +1673,11 @@ mod tests {
 
         assert_eq!(first_dynamic, 1);
         assert!(second_dynamic >= 3);
-        assert!(!p
-            .all_commands
-            .iter()
-            .any(|entry| entry.dynamic && entry.name == "Start Gateway"));
+        assert!(
+            !p.all_commands
+                .iter()
+                .any(|entry| entry.dynamic && entry.name == "Start Gateway")
+        );
     }
 
     // ── Search scoring ────────────────────────────────────────────

@@ -102,9 +102,31 @@ impl ExecutionGraphStateStore {
     }
 
     pub fn graph_ids(&self) -> Result<Vec<String>, ExecutionStateStoreError> {
-        self.event_store
+        let stream_ids = self
+            .event_store
             .stream_ids_for_scope(RuntimeEventScope::ExecutionGraph)
-            .map_err(ExecutionStateStoreError::EventStore)
+            .map_err(ExecutionStateStoreError::EventStore)?;
+        let mut graph_ids = Vec::new();
+        for stream_id in stream_ids {
+            let events = self.event_store.list_stream(&stream_id).map_err(|reason| {
+                ExecutionStateStoreError::Corrupt {
+                    graph_id: stream_id.clone(),
+                    reason,
+                }
+            })?;
+            // Older releases incorrectly wrote Session strategy and live-state
+            // evidence with `ExecutionGraph` scope. A canonical graph stream
+            // always starts with its planned snapshot, so retain malformed
+            // graph streams for corruption reporting while excluding those
+            // legacy non-graph streams from graph enumeration.
+            if events.first().is_some_and(|event| {
+                event.scope == RuntimeEventScope::ExecutionGraph
+                    && event.kind == "execution_graph.planned"
+            }) {
+                graph_ids.push(stream_id);
+            }
+        }
+        Ok(graph_ids)
     }
 
     pub async fn graph_ids_async(&self) -> Result<Vec<String>, ExecutionStateStoreError> {

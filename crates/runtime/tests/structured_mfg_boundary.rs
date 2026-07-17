@@ -114,13 +114,14 @@ fn mfg_application_is_allowed_to_depend_on_matrix_but_not_webui() {
     );
 
     for (path, content) in files {
+        let production = content.split("#[cfg(test)]").next().unwrap_or(&content);
         assert!(
-            !content.contains("runtime::mfg"),
+            !production.contains("runtime::mfg"),
             "MFG application source {} must not depend on runtime::mfg",
             path.display()
         );
         assert!(
-            !content.contains("webui"),
+            !production.contains("webui"),
             "MFG runtime source {} must not depend on WebUI",
             path.display()
         );

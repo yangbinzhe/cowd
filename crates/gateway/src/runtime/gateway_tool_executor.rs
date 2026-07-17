@@ -6,7 +6,7 @@ use tools::permissions::PermissionMode as ToolPermissionMode;
 use tools::{ToolHost, ToolHostSnapshot};
 
 use crate::runtime_bootstrap::{GatewayToolRegistry, RuntimeMcpState};
-use crate::{format_tool_result, AllowedToolSet};
+use crate::{AllowedToolSet, format_tool_result};
 
 #[derive(Debug, Deserialize)]
 struct ToolSearchRequest {
@@ -998,8 +998,8 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
 mod tests {
     use super::*;
     use serde_json::json;
-    use tools::permissions::PermissionMode as ToolPermissionMode;
     use tools::RuntimeToolDefinition;
+    use tools::permissions::PermissionMode as ToolPermissionMode;
 
     #[test]
     fn runtime_capabilities_executes_without_mcp_state() {
@@ -1032,9 +1032,11 @@ mod tests {
         assert!(output.contains("tool_batch_readonly"));
         let response: serde_json::Value = serde_json::from_str(&output).expect("capability json");
         assert_eq!(response["runtime_orchestrate"]["available"], false);
-        assert!(response["strategy"]["model_callable_tools"]
-            .as_array()
-            .is_some_and(|tools| tools.iter().all(|tool| tool != "runtime_orchestrate")));
+        assert!(
+            response["strategy"]["model_callable_tools"]
+                .as_array()
+                .is_some_and(|tools| tools.iter().all(|tool| tool != "runtime_orchestrate"))
+        );
     }
 
     #[test]
@@ -1079,12 +1081,16 @@ mod tests {
             .expect("resource capability query");
         let value: serde_json::Value = serde_json::from_str(&output).expect("resource json");
         assert_eq!(value["kind"], "runtime.resource_capabilities");
-        assert!(value["candidate_tools"]
-            .as_array()
-            .is_some_and(|tools| tools.len() <= 3));
-        assert!(value["installed_skills"]
-            .as_array()
-            .is_some_and(|items| items.len() <= 4));
+        assert!(
+            value["candidate_tools"]
+                .as_array()
+                .is_some_and(|tools| tools.len() <= 3)
+        );
+        assert!(
+            value["installed_skills"]
+                .as_array()
+                .is_some_and(|items| items.len() <= 4)
+        );
     }
 
     #[test]
@@ -1236,10 +1242,17 @@ mod tests {
             )
             .expect_err("unavailable team orchestration must not be reported as a successful tool");
 
-        assert!(error.to_string().contains("runtime orchestration blocked"));
-        assert!(!error
-            .to_string()
-            .contains("missing_session_id_for_team_runtime"));
+        assert!(
+            error
+                .to_string()
+                .contains("runtime orchestration unavailable"),
+            "{error}"
+        );
+        assert!(
+            !error
+                .to_string()
+                .contains("missing_session_id_for_team_runtime")
+        );
     }
 
     #[test]
@@ -1320,9 +1333,11 @@ mod tests {
         assert!(delegated.iter().all(|tool| {
             executor.tool_permission_mode(tool) == Some(ToolPermissionMode::ReadOnly)
         }));
-        assert!(request
-            .capabilities
-            .contains(&"backend:process_jsonl".to_string()));
+        assert!(
+            request
+                .capabilities
+                .contains(&"backend:process_jsonl".to_string())
+        );
     }
 
     #[test]

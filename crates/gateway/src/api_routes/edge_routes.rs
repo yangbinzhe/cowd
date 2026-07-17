@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use axum::{
+    Json, Router,
     extract::State as AxumState,
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
 use connector::builtin_source_adapter_manifests;
 use serde::Serialize;
@@ -370,23 +370,31 @@ mod tests {
         let projection = edge_registry_projection(&state);
 
         assert_eq!(projection.kind, "edge.registry");
-        assert!(projection
-            .surfaces
-            .iter()
-            .any(|surface| surface.id == "tui"));
-        assert!(projection
-            .surfaces
-            .iter()
-            .any(|surface| surface.id == "webui"));
-        assert!(projection
-            .source_connectors
-            .iter()
-            .any(|connector| connector.adapter_id.as_deref() == Some("feishu_bitable")));
-        assert!(projection
-            .source_connectors
-            .iter()
-            .any(|connector| connector.adapter_id.as_deref() == Some("csv")
-                && !connector.requires_sidecar));
+        assert!(
+            projection
+                .surfaces
+                .iter()
+                .any(|surface| surface.id == "tui")
+        );
+        assert!(
+            projection
+                .surfaces
+                .iter()
+                .any(|surface| surface.id == "webui")
+        );
+        assert!(
+            projection
+                .source_connectors
+                .iter()
+                .any(|connector| connector.adapter_id.as_deref() == Some("feishu_bitable"))
+        );
+        assert!(
+            projection
+                .source_connectors
+                .iter()
+                .any(|connector| connector.adapter_id.as_deref() == Some("csv")
+                    && !connector.requires_sidecar)
+        );
     }
 
     #[test]
@@ -418,10 +426,12 @@ mod tests {
 
         assert_eq!(descriptor.descriptor_version, 1);
         assert!(descriptor.max_message_length > 0);
-        assert!(descriptor
-            .supported_actions
-            .iter()
-            .any(|action| action == "message.send.text"));
+        assert!(
+            descriptor
+                .supported_actions
+                .iter()
+                .any(|action| action == "message.send.text")
+        );
         assert!(!descriptor.markdown_dialect.is_empty());
     }
 }

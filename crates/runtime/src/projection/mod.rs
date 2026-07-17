@@ -704,7 +704,9 @@ fn strategy_ref_visible(
     let (_, raw_path) = reference
         .split_once(':')
         .filter(|(mode, _)| matches!(*mode, "read" | "write" | "worktree"))
-        .map_or((required_mode, reference), |(mode, path)| (Some(mode), path));
+        .map_or((required_mode, reference), |(mode, path)| {
+            (Some(mode), path)
+        });
     if !safe_workspace_relative_path(raw_path) {
         return false;
     }
@@ -788,15 +790,25 @@ fn contains_absolute_path(value: &str) -> bool {
             value.is_ascii_whitespace()
                 || matches!(
                     *value,
-                    b'(' | b'[' | b'{' | b':' | b'=' | b',' | b'\'' | b'"' | b'`'
-                        | b'>' | b'<' | b';' | b'|' | b'&' | b'-' | b'_'
+                    b'(' | b'['
+                        | b'{'
+                        | b':'
+                        | b'='
+                        | b','
+                        | b'\''
+                        | b'"'
+                        | b'`'
+                        | b'>'
+                        | b'<'
+                        | b';'
+                        | b'|'
+                        | b'&'
+                        | b'-'
+                        | b'_'
                 )
         });
         if *byte == b'/' {
-            return boundary
-                && bytes
-                    .get(index + 1)
-                    .is_some_and(|next| *next != b'/');
+            return boundary && bytes.get(index + 1).is_some_and(|next| *next != b'/');
         }
         byte.is_ascii_alphabetic()
             && bytes.get(index + 1) == Some(&b':')
@@ -1701,7 +1713,7 @@ mod tests {
             let mut graph = ExecutionGraph::new(objective);
             let mut node = ExecutionNodeSpec::new(
                 ExecutionNodeKind::InlineModel,
-                "projection-test",
+                "inline_model",
                 serde_json::json!({
                     "session_id": "strategy-projection",
                     "kind": "projection_test",
@@ -1719,27 +1731,27 @@ mod tests {
         let graph_id = graph.id.clone();
         services
             .graph_runner()
-            .start(graph)
+            .register(graph)
             .await
-            .expect("graph starts");
+            .expect("graph registers");
         let sibling = session_graph("same-session sibling strategy");
         let sibling_id = sibling.id.clone();
         services
             .graph_runner()
-            .start(sibling)
+            .register(sibling)
             .await
-            .expect("sibling graph starts");
+            .expect("sibling graph registers");
         let child = session_graph("same-session child strategy");
         let child_id = child.id.clone();
         services
             .graph_runner()
-            .start(child)
+            .register(child)
             .await
-            .expect("child graph starts");
+            .expect("child graph registers");
         let strategy_event = |execution_id: &str, decision_id: &str, kind: &str, revision: u64| {
             crate::RuntimeEventInput {
                 stream_id: "session:strategy-projection".to_string(),
-                scope: crate::RuntimeEventScope::ExecutionGraph,
+                scope: crate::RuntimeEventScope::Session,
                 kind: kind.to_string(),
                 status: Some("completed".to_string()),
                 actor: Some("test".to_string()),
@@ -1813,7 +1825,7 @@ mod tests {
                 .event_store()
                 .append(crate::RuntimeEventInput {
                     stream_id: "session:strategy-projection".to_string(),
-                    scope: crate::RuntimeEventScope::ExecutionGraph,
+                    scope: crate::RuntimeEventScope::Session,
                     kind: "runtime.noise".to_string(),
                     status: Some("completed".to_string()),
                     actor: Some("test".to_string()),
@@ -2287,8 +2299,14 @@ mod tests {
         .expect("shared redaction corpus");
         for secret in corpus {
             let rendered = safe_public_text(&format!("strategy detail {secret}"), 512);
-            assert_eq!(rendered, "redacted by strategy projection policy", "{secret}");
-            assert!(safe_public_ref(&secret).is_none(), "unsafe reference {secret}");
+            assert_eq!(
+                rendered, "redacted by strategy projection policy",
+                "{secret}"
+            );
+            assert!(
+                safe_public_ref(&secret).is_none(),
+                "unsafe reference {secret}"
+            );
         }
     }
 }

@@ -10,13 +10,13 @@ pub mod request;
 pub mod result;
 pub mod validator;
 
-use crate::execution_core::{graph::ExecutionRunReport, RuntimeExecutionDecision};
 use crate::RuntimeServices;
+use crate::execution_core::{RuntimeExecutionDecision, graph::ExecutionRunReport};
 use harness_contract::agent::{AgentTaskIntent, AgentTaskPacket};
 use harness_contract::execution_graph::{
     ExecutionGraph, ExecutionGraphProjection, ExecutionNodeKind, ExecutionNodeStatus,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub use compiler::CompiledOrchestration;
 pub use planner::RuntimeOrchestrationPlan;
@@ -258,7 +258,7 @@ pub(crate) async fn submit_runtime_orchestration_request_controlled(
                 });
                 result.evidence["accepted"] = Value::Bool(result.status == "completed");
                 result.evidence["executed"] = Value::Bool(true);
-                result.evidence["graph_id"] = Value::String(graph_id);
+                result.evidence["graph_id"] = Value::String(graph_id.clone());
                 if compiled_team && result.status == "completed" {
                     match compiled_team_id.as_deref().map(|team_id| {
                         services
@@ -1076,12 +1076,14 @@ mod tests {
 
         assert_eq!(result.status, "compiled", "{result:?}");
         assert_eq!(result.evidence["accepted"], false);
-        assert!(!services
-            .event_store()
-            .all_events(100)
-            .expect("runtime events")
-            .iter()
-            .any(|event| event.kind == "execution_graph.planned"));
+        assert!(
+            !services
+                .event_store()
+                .all_events(100)
+                .expect("runtime events")
+                .iter()
+                .any(|event| event.kind == "execution_graph.planned")
+        );
     }
 
     #[tokio::test]
@@ -1180,24 +1182,30 @@ mod tests {
         assert_eq!(result.status, "completed", "{result:?}");
         assert!(result.execution.get("protocol").is_none());
         assert_eq!(result.execution["type"], "execution_graph_run");
-        assert!(result.execution["terminal_result_ref"]
-            .as_str()
-            .is_some_and(|value| value.starts_with("assistant_json:")));
+        assert!(
+            result.execution["terminal_result_ref"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("assistant_json:"))
+        );
         assert_eq!(result.evidence["accepted"], true);
-        assert!(services
-            .event_store()
-            .all_events(200)
-            .expect("runtime events")
-            .iter()
-            .any(|event| event.kind == "agent.terminal"));
-        assert!(objectives
-            .lock()
-            .expect("objectives")
-            .iter()
-            .any(|objective| {
-                objective.contains("## Canonical upstream results")
-                    && objective.contains("### Upstream proposer")
-            }));
+        assert!(
+            services
+                .event_store()
+                .all_events(200)
+                .expect("runtime events")
+                .iter()
+                .any(|event| event.kind == "agent.terminal")
+        );
+        assert!(
+            objectives
+                .lock()
+                .expect("objectives")
+                .iter()
+                .any(|objective| {
+                    objective.contains("## Canonical upstream results")
+                        && objective.contains("### Upstream proposer")
+                })
+        );
     }
 
     #[tokio::test]

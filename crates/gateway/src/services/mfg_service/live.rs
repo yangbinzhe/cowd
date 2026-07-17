@@ -11,7 +11,7 @@ use app_mfg_contract::{
     MfgContractVersion, MfgLiveDeltaV1, MfgLiveEnvelopeV1, MfgLiveEventV1, MfgLiveHeartbeatV1,
     MfgLiveResyncV1, MfgLiveSnapshotStateV1, MfgLiveSnapshotV1,
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -197,7 +197,7 @@ impl MfgService {
                     principal,
                     previous_view_epoch,
                     "view_scope_changed",
-                )?))
+                )?));
             }
             Err(_) => {
                 return Ok(Some(resync_envelope(
@@ -206,7 +206,7 @@ impl MfgService {
                     principal,
                     previous_view_epoch,
                     "cursor_invalid",
-                )?))
+                )?));
             }
         };
         let mut scan_cursor = payload.internal_cursor;
@@ -357,7 +357,7 @@ fn live_authorization_error(
             return Some(live_authentication_required(
                 format!("MFG live authorization authority is unavailable: {error}"),
                 "authority_unavailable",
-            ))
+            ));
         }
     };
     if lifecycle.status != auth_broker::CredentialLifecycleStatus::Active {
@@ -956,7 +956,7 @@ fn read_cursor_key(path: &Path) -> Result<[u8; CURSOR_KEY_BYTES], CursorKeyReadE
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(CursorKeyReadError::Missing)
+            return Err(CursorKeyReadError::Missing);
         }
         Err(error) => return Err(CursorKeyReadError::Io(error.to_string())),
     };
@@ -1395,16 +1395,18 @@ mod tests {
                 &serde_json::json!({"revision": 1}),
             )
             .unwrap();
-        assert!(service
-            .live_delta_envelope(
-                config_home.path(),
-                &observer,
-                &snapshot.view_epoch,
-                &snapshot.cursor,
-                100,
-            )
-            .unwrap()
-            .is_none());
+        assert!(
+            service
+                .live_delta_envelope(
+                    config_home.path(),
+                    &observer,
+                    &snapshot.view_epoch,
+                    &snapshot.cursor,
+                    100,
+                )
+                .unwrap()
+                .is_none()
+        );
         let MfgLiveEnvelopeV1::Heartbeat(heartbeat) = service
             .live_heartbeat_envelope(config_home.path(), &observer, &snapshot.cursor)
             .unwrap()
@@ -1606,16 +1608,20 @@ mod tests {
 
     #[test]
     fn nested_business_revision_is_projected_into_the_contract_event() {
-        let event = contract_event(MfgLiveProjectionEvent {
-            cursor: 9,
-            event_type: "assignment.receipted".to_string(),
-            subject_ref: "mfg:assignment:revision-7".to_string(),
-            payload: serde_json::json!({
-                "assignment": {"assignment_id": "revision-7", "revision": 7},
-                "receipt": {"current_revision": 7, "result_revision": 6}
-            }),
-            created_at: Utc::now(),
-        });
+        let principal = principal("operator", 1, &[]);
+        let event = contract_event(
+            MfgLiveProjectionEvent {
+                cursor: 9,
+                event_type: "assignment.receipted".to_string(),
+                subject_ref: "mfg:assignment:revision-7".to_string(),
+                payload: serde_json::json!({
+                    "assignment": {"assignment_id": "revision-7", "revision": 7},
+                    "receipt": {"current_revision": 7, "result_revision": 6}
+                }),
+                created_at: Utc::now(),
+            },
+            &principal,
+        );
         assert_eq!(event.revision, 7);
     }
 

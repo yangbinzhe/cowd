@@ -685,7 +685,9 @@ impl TuiState {
                     // while this request was in flight.  Do not let stale
                     // success reclaim the Runtime panel or strategy cache.
                 } else if !runtime_backlink_object_matches_target(target, object) {
-                    self.app.mfg_operations.invalidate_runtime_strategy_target(target);
+                    self.app
+                        .mfg_operations
+                        .invalidate_runtime_strategy_target(target);
                     self.runtime_activity_panel.record_backlink_failure(
                         target.clone(),
                         "Gateway returned an object whose canonical identity does not match the backlink",
@@ -709,14 +711,18 @@ impl TuiState {
                             self.runtime_activity_panel
                                 .record_backlink_object(target.clone(), object);
                         } else {
-                            self.app.mfg_operations.invalidate_runtime_strategy_target(target);
+                            self.app
+                                .mfg_operations
+                                .invalidate_runtime_strategy_target(target);
                             self.runtime_activity_panel.record_backlink_failure(
                                 target.clone(),
                                 "Gateway returned an unsupported execution projection schema",
                             );
                         }
                     } else {
-                        self.app.mfg_operations.invalidate_runtime_strategy_target(target);
+                        self.app
+                            .mfg_operations
+                            .invalidate_runtime_strategy_target(target);
                         self.runtime_activity_panel.record_backlink_failure(
                             target.clone(),
                             "Gateway returned an invalid execution projection contract",
@@ -752,16 +758,30 @@ impl TuiState {
                 }
             }
             CowdEvent::ApprovalBacklinkResolved { target, object } => {
-                self.approval_cockpit_panel
-                    .record_backlink_object(target.clone(), object);
+                if approval_backlink_object_matches_target(target, object) {
+                    self.approval_cockpit_panel
+                        .record_backlink_object(target.clone(), object);
+                } else {
+                    self.approval_cockpit_panel.record_backlink_failure(
+                        target.clone(),
+                        "Gateway returned an approval whose canonical identity does not match the backlink",
+                    );
+                }
             }
             CowdEvent::ApprovalBacklinkFailed { target, message } => {
                 self.approval_cockpit_panel
                     .record_backlink_failure(target.clone(), message.clone());
             }
             CowdEvent::SurfaceBacklinkResolved { target, receipt } => {
-                self.surface_panel
-                    .record_backlink_receipt(target.clone(), receipt.clone());
+                if surface_backlink_receipt_matches_target(target, receipt) {
+                    self.surface_panel
+                        .record_backlink_receipt(target.clone(), receipt.clone());
+                } else {
+                    self.surface_panel.record_backlink_failure(
+                        target.clone(),
+                        "Gateway returned a Surface receipt whose canonical identity does not match the backlink",
+                    );
+                }
             }
             CowdEvent::SurfaceBacklinkFailed { target, message } => {
                 self.surface_panel
@@ -2461,7 +2481,11 @@ impl TuiState {
             return false;
         }
         match key.code {
-            KeyCode::Tab => {
+            // Plain Tab/Shift+Tab are reserved for the global sidebar.  The
+            // MFG workbench still has a local focus ring, but it must not
+            // strand users in the panel or make the documented global switch
+            // appear unresponsive.
+            KeyCode::Tab if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.app.mfg_operations.focus = match self.app.mfg_operations.focus {
                     MfgViewFocus::Tabs => MfgViewFocus::List,
                     MfgViewFocus::List => MfgViewFocus::Detail,
@@ -2471,7 +2495,7 @@ impl TuiState {
                 };
                 true
             }
-            KeyCode::BackTab => {
+            KeyCode::BackTab if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.app.mfg_operations.focus = match self.app.mfg_operations.focus {
                     MfgViewFocus::Tabs => MfgViewFocus::Actions,
                     MfgViewFocus::List => MfgViewFocus::Tabs,
@@ -4964,9 +4988,86 @@ fn runtime_backlink_object_matches_target(target: &str, object: &serde_json::Val
         .get("execution_id")
         .or_else(|| object.get("task_id"))
         .or_else(|| object.get("id"))
-        .or_else(|| object.get("execution").and_then(|value| value.get("execution_id")))
+        .or_else(|| {
+            object
+                .get("execution")
+                .and_then(|value| value.get("execution_id"))
+        })
         .and_then(serde_json::Value::as_str);
     observed == Some(expected)
+}
+
+/// Exact approval routes may return either a live runtime request
+/// (`approval_id`) or a persisted history record (`id`/`request_id`).  A
+/// backlink is an object identity, not a request to render whichever approval
+/// happened to arrive first, so accept only records that name the target.
+fn approval_backlink_object_matches_target(target: &str, object: &serde_json::Value) -> bool {
+    let expected = canonical_backlink_target_id(target, "approval://");
+    let Some(expected) = expected else {
+        return false;
+    };
+    ["approval_id", "id", "request_id"]
+        .into_iter()
+        .any(|field| {
+            object
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value == expected)
+        })
+}
+
+/// Surface backlinks span two exact object planes: cross-plane receipts and
+/// per-surface outbox/message records.  Validate both the object identity and
+/// the surface namespace before allowing a response to replace the focused
+/// panel state.
+fn surface_backlink_receipt_matches_target(target: &str, receipt: &serde_json::Value) -> bool {
+    if let Some(expected) = canonical_backlink_target_id(target, "receipt://cross-plane/") {
+        return receipt
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| value == expected);
+    }
+
+    let Some(surface_target) = target.strip_prefix("surface://") else {
+        return false;
+    };
+    let mut parts = surface_target.splitn(3, '/');
+    let surface_id = parts.next().unwrap_or_default();
+    let object_kind = parts.next().unwrap_or_default();
+    let object_id = parts
+        .next()
+        .unwrap_or(object_kind)
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default();
+    if surface_id.is_empty() || object_id.is_empty() {
+        return false;
+    }
+    let surface_matches = receipt
+        .get("surface")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|value| value == surface_id);
+    if !surface_matches {
+        return false;
+    }
+    let id_fields: &[&str] = if object_kind == "delivery" {
+        &["delivery_id"]
+    } else {
+        &["message_id", "id"]
+    };
+    id_fields.iter().any(|field| {
+        receipt
+            .get(*field)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| value == object_id)
+    })
+}
+
+fn canonical_backlink_target_id<'a>(target: &'a str, prefix: &str) -> Option<&'a str> {
+    target
+        .strip_prefix(prefix)
+        .map(|value| value.split(['/', '?', '#']).next().unwrap_or_default())
+        .filter(|value| !value.is_empty())
 }
 
 // ── Delegation to App via Deref ─────────────────────────────────
@@ -5261,6 +5362,43 @@ mod tests {
 
         // Theme engine dark by default
         assert_eq!(state.theme_engine.theme.name, "dark");
+    }
+
+    #[test]
+    fn mfg_backlink_identity_guards_accept_only_the_canonical_approval_and_surface_object() {
+        assert!(approval_backlink_object_matches_target(
+            "approval://approval-1",
+            &serde_json::json!({"approval_id": "approval-1", "status": "pending"}),
+        ));
+        assert!(approval_backlink_object_matches_target(
+            "approval://approval-1",
+            &serde_json::json!({"id": "history-1", "request_id": "approval-1"}),
+        ));
+        assert!(!approval_backlink_object_matches_target(
+            "approval://approval-1",
+            &serde_json::json!({"approval_id": "approval-2"}),
+        ));
+
+        assert!(surface_backlink_receipt_matches_target(
+            "surface://webui/delivery/delivery-1",
+            &serde_json::json!({"surface": "webui", "delivery_id": "delivery-1"}),
+        ));
+        assert!(surface_backlink_receipt_matches_target(
+            "surface://webui/message-1",
+            &serde_json::json!({"surface": "webui", "message_id": "message-1"}),
+        ));
+        assert!(surface_backlink_receipt_matches_target(
+            "receipt://cross-plane/cpx-1",
+            &serde_json::json!({"id": "cpx-1"}),
+        ));
+        assert!(!surface_backlink_receipt_matches_target(
+            "surface://webui/delivery/delivery-1",
+            &serde_json::json!({"surface": "webui", "delivery_id": "delivery-2"}),
+        ));
+        assert!(!surface_backlink_receipt_matches_target(
+            "surface://webui/message-1",
+            &serde_json::json!({"surface": "slack", "message_id": "message-1"}),
+        ));
     }
 
     #[test]
@@ -5963,17 +6101,28 @@ mod tests {
     }
 
     #[test]
-    fn mfg_focus_chain_consumes_tab_before_global_sidebar_rotation() {
+    fn mfg_focus_chain_uses_ctrl_tab_without_blocking_global_sidebar_rotation() {
         let mut state = TuiState::new("m", "s");
         state.dispatch_action(Action::Execute("/mfg".into()));
         assert_eq!(state.sidebar_active_tab, TAB_MFG);
         assert_eq!(state.app.mfg_operations.focus, MfgViewFocus::Tabs);
 
         state.process_raw_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(state.sidebar_active_tab, TAB_GATEWAY);
+        assert_eq!(state.app.mfg_operations.focus, MfgViewFocus::Tabs);
+
+        state.process_raw_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(state.sidebar_active_tab, TAB_MFG);
+        assert_eq!(state.app.mfg_operations.focus, MfgViewFocus::Tabs);
+
+        state.process_raw_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL));
         assert_eq!(state.sidebar_active_tab, TAB_MFG);
         assert_eq!(state.app.mfg_operations.focus, MfgViewFocus::List);
 
-        state.process_raw_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        state.process_raw_key(KeyEvent::new(
+            KeyCode::BackTab,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
         assert_eq!(state.sidebar_active_tab, TAB_MFG);
         assert_eq!(state.app.mfg_operations.focus, MfgViewFocus::Tabs);
 

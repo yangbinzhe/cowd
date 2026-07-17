@@ -362,7 +362,7 @@ fn entity_refs_from_value(value: &Value) -> Vec<String> {
                         .filter_map(Value::as_str)
                         .map(str::to_string)
                         .collect::<Vec<_>>()
-                } else if key == "entity_id" {
+                } else if matches!(key.as_str(), "entity_id" | "entity_ref") {
                     value.as_str().map(str::to_string).into_iter().collect()
                 } else {
                     entity_refs_from_value(value)
@@ -507,5 +507,19 @@ mod tests {
         assert!(run.telemetry.is_none());
         assert!(run.runtime_execution_ref.is_none());
         assert!(run.runtime_commit_cursor.is_none());
+    }
+
+    #[test]
+    fn execution_context_extracts_singular_and_plural_entity_references() {
+        let evidence = serde_json::json!({
+            "entity_ref": "component:gpu-agent",
+            "nested": {"entity_refs": ["supplier:acme"]},
+            "entity_id": "line-7",
+        });
+
+        let refs = entity_refs_from_value(&evidence);
+        assert!(refs.contains(&"component:gpu-agent".to_string()));
+        assert!(refs.contains(&"supplier:acme".to_string()));
+        assert!(refs.contains(&"line-7".to_string()));
     }
 }

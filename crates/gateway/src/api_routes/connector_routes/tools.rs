@@ -1,6 +1,6 @@
 use super::*;
-use crate::api_routes::{principal_actor_id, AuthenticatedPrincipal};
-use axum::{http::StatusCode, Extension};
+use crate::api_routes::{AuthenticatedPrincipal, principal_actor_id};
+use axum::{Extension, http::StatusCode};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Deserialize)]

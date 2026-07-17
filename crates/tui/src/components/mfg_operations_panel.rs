@@ -563,6 +563,7 @@ impl MfgOperationsPanel {
         lines.extend([
             Line::from("a actions · Enter prepare/confirm"),
             Line::from("c cancel · y confirm · R retry same key"),
+            Line::from("Ctrl+Tab focus · Tab switches sidebar"),
             Line::from(""),
             Line::from(Span::styled(
                 "Governed actions",
@@ -766,7 +767,7 @@ mod tests {
     use super::*;
     use crate::runtime_control_store::{MfgBacklink, MfgItemSummary};
     use crate::skin::SkinConfig;
-    use ratatui::{backend::TestBackend, Terminal};
+    use ratatui::{Terminal, backend::TestBackend};
 
     fn render(width: u16, height: u16, state: &MfgOperationsState) -> String {
         render_with_strategy(width, height, state, None)
@@ -910,9 +911,9 @@ mod tests {
                     label: "MFG execution".to_string(),
                 },
                 MfgBacklink {
-                kind: MfgBacklinkKind::Runtime,
-                target: "runtime-execution://execution-547".to_string(),
-                label: "Runtime".to_string(),
+                    kind: MfgBacklinkKind::Runtime,
+                    target: "runtime-execution://execution-547".to_string(),
+                    label: "Runtime".to_string(),
                 },
             ]);
         state.focus = MfgViewFocus::Detail;
@@ -957,8 +958,7 @@ mod tests {
             "historical MFG projection remains keyed and does not replace the active chat projection"
         );
 
-        state.live_reauthentication_count =
-            state.live_reauthentication_count.saturating_add(1);
+        state.live_reauthentication_count = state.live_reauthentication_count.saturating_add(1);
         assert!(state.selected_runtime_strategy_projection().is_none());
         let recropped = render_with_strategy(120, 40, &state, None);
         assert!(!recropped.contains("team / collaborate"));
@@ -1002,9 +1002,11 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(visible, expected);
         let state = MfgOperationsState::default();
-        assert!(MFG_PANEL_READ_ROUTE_IDS
-            .iter()
-            .all(|route| state.route_projection_status(*route).is_some()));
+        assert!(
+            MFG_PANEL_READ_ROUTE_IDS
+                .iter()
+                .all(|route| state.route_projection_status(*route).is_some())
+        );
         assert_eq!(
             MFG_PANEL_READ_ROUTE_IDS
                 .iter()

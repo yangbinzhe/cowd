@@ -14,7 +14,8 @@ use harness_contract::growth::{
     GrowthSignalKind, LearningRecord,
 };
 use harness_contract::strategy::{
-    decide_strategy, understand, StrategyExperienceRecord, StrategyExperienceStore, StrategyInput,
+    ExecutionCandidateKind, StrategyExperienceRecord, StrategyExperienceStore, StrategyInput,
+    decide_strategy, understand,
 };
 use matrix_core::{MatrixEvidencePacket, MatrixQualityGateDecision};
 use runtime::eval_gate::{
@@ -160,7 +161,7 @@ fn complex_task_builds_execution_execution_graph() {
         "complex_execution_graph",
         "全面规划 runtime gateway service crate 的复杂架构演进",
     )
-    .expect_mode(ExecutionPattern::Execute)
+    .expect_mode(ExecutionPattern::Collaborate)
     .require(ScenarioCheck::bool(
         "execution_graph.present",
         ScenarioCheckKind::ExecutionGraphPresent,
@@ -190,6 +191,11 @@ fn complex_task_builds_execution_execution_graph() {
     );
 
     let trace = kernel.finalize("planned", 0, 0);
+    assert_eq!(
+        trace.execution_decision.strategy.selected_candidate,
+        ExecutionCandidateKind::Team,
+        "the independent runtime and gateway architecture workstreams must use the governed Team topology"
+    );
     let observation = HarnessObservation::from_trace("complex_execution_graph", &trace, "planned")
         .into_scenario_observation();
     let report = ScenarioSuite::new(vec![spec]).evaluate(&[observation]);
@@ -383,10 +389,12 @@ fn matrix_quality_failure_becomes_growth_signal() {
         )],
     });
 
-    assert!(event
-        .signals
-        .iter()
-        .any(|item| item.kind == GrowthSignalKind::MatrixQualityGate));
+    assert!(
+        event
+            .signals
+            .iter()
+            .any(|item| item.kind == GrowthSignalKind::MatrixQualityGate)
+    );
     let observation = ScenarioObservation {
         scenario_id: "matrix_quality_failure".to_string(),
         strategy_pattern: event.strategy_pattern,
@@ -426,15 +434,19 @@ fn underspecified_complex_trace_exposes_improvement_signal() {
         bench_passed: true,
     });
 
-    assert!(record
-        .signals
-        .iter()
-        .any(|signal| signal.kind == GrowthSignalKind::StrategyFit
-            && signal.severity == GrowthSeverity::Improve));
-    assert!(record
-        .next_strategy_hints
-        .iter()
-        .any(|hint| hint.contains("execute")));
+    assert!(
+        record
+            .signals
+            .iter()
+            .any(|signal| signal.kind == GrowthSignalKind::StrategyFit
+                && signal.severity == GrowthSeverity::Improve)
+    );
+    assert!(
+        record
+            .next_strategy_hints
+            .iter()
+            .any(|hint| hint.contains("execute"))
+    );
 }
 
 #[derive(Clone)]

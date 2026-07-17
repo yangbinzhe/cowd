@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::{extract::State as AxumState, response::IntoResponse, routing::get, Json, Router};
+use axum::{Json, Router, extract::State as AxumState, response::IntoResponse, routing::get};
 
 use super::AppState;
 

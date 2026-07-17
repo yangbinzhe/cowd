@@ -8,8 +8,9 @@ use crate::components::chat_view::ChatView;
 #[cfg(test)]
 use ratatui::layout::Rect;
 
-use super::types::{LayoutNode, PanelDef, Split, SplitDirection, TabDef, TabGroup};
 use super::LayoutTree;
+use super::types::{LayoutNode, PanelDef, Split, SplitDirection, TabDef, TabGroup};
+use crate::components::Component;
 use crate::components::agent_team_panel::AgentTeamPanel;
 use crate::components::approval_cockpit_panel::ApprovalCockpitPanel;
 use crate::components::diff_viewer::DiffViewer;
@@ -24,7 +25,6 @@ use crate::components::session_sidebar::SessionSidebar;
 use crate::components::surface_panel::SurfacePanel;
 use crate::components::todo_panel::TodoPanel;
 use crate::components::tool_ops_panel::ToolOpsPanel;
-use crate::components::Component;
 #[cfg(test)]
 use crate::components::{EventResult, RenderContext};
 use crate::workbench::panel_registry;
@@ -375,6 +375,7 @@ mod tests {
                             ("files", "Files"),
                             ("sessions", "Sessions"),
                             ("surfaces", "Surfaces"),
+                            ("mfg", "MFG"),
                             ("gateway", "Gateway"),
                         ];
                         for (i, (id, label)) in expected.iter().enumerate() {
@@ -670,6 +671,10 @@ mod tests {
 
                         tg.next_tab();
                         assert_eq!(tg.active, 9);
+                        assert_eq!(tg.active_tab().unwrap().id, "mfg");
+
+                        tg.next_tab();
+                        assert_eq!(tg.active, 10);
                         assert_eq!(tg.active_tab().unwrap().id, "gateway");
 
                         // Wrap around
@@ -678,7 +683,7 @@ mod tests {
 
                         // Wrap around with prev
                         tg.prev_tab();
-                        assert_eq!(tg.active, 9);
+                        assert_eq!(tg.active, 10);
                     }
                     _ => panic!("expected TabGroup as second child"),
                 }
@@ -704,7 +709,8 @@ mod tests {
                     assert_eq!(tg.tabs[6].icon.as_deref(), Some("📁"));
                     assert_eq!(tg.tabs[7].icon.as_deref(), Some("◫"));
                     assert_eq!(tg.tabs[8].icon.as_deref(), Some("S"));
-                    assert_eq!(tg.tabs[9].icon.as_deref(), Some("🌐"));
+                    assert_eq!(tg.tabs[9].icon.as_deref(), Some("M"));
+                    assert_eq!(tg.tabs[10].icon.as_deref(), Some("🌐"));
                 }
                 _ => panic!("expected TabGroup as second child"),
             },

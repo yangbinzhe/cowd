@@ -1,8 +1,8 @@
 use axum::extract::Extension;
-use axum::http::{header, HeaderMap, HeaderValue};
+use axum::http::{HeaderMap, HeaderValue, header};
 use sha2::{Digest, Sha256};
 
-use crate::api_routes::{principal_actor_id, AuthenticatedPrincipal};
+use crate::api_routes::{AuthenticatedPrincipal, principal_actor_id};
 
 use super::*;
 
@@ -253,7 +253,7 @@ pub(super) async fn mfg_cockpit_profile_upsert_handler(
     let revision = profile.revision;
     let receipt = receipt
         .canonical_receipt()
-        .map_err(cockpit_internal_error)?;
+        .map_err(|error| cockpit_internal_error(error.message))?;
     let profile = cockpit_profile_cropped_for(profile, &principal);
     Ok(cockpit_profile_response(
         serde_json::json!({
@@ -334,7 +334,7 @@ pub(super) async fn mfg_cockpit_profile_delete_handler(
     let revision = receipt.current_revision;
     let receipt = receipt
         .canonical_receipt()
-        .map_err(cockpit_internal_error)?;
+        .map_err(|error| cockpit_internal_error(error.message))?;
     Ok(cockpit_profile_response(
         serde_json::json!({ "kind": "mfg.cockpit.profile_deleted", "profile": profile, "business_receipt": receipt }),
         revision,
@@ -410,7 +410,7 @@ pub(super) async fn mfg_cockpit_profile_clone_handler(
     let revision = clone.revision;
     let receipt = receipt
         .canonical_receipt()
-        .map_err(cockpit_internal_error)?;
+        .map_err(|error| cockpit_internal_error(error.message))?;
     let clone = cockpit_profile_cropped_for(clone, &principal);
     Ok(cockpit_profile_response(
         serde_json::json!({ "kind": "mfg.cockpit.profile_cloned", "source_profile_id": id, "profile": clone, "business_receipt": receipt }),
@@ -465,7 +465,7 @@ pub(super) async fn mfg_cockpit_profile_share_handler(
     let revision = profile.revision;
     let receipt = receipt
         .canonical_receipt()
-        .map_err(cockpit_internal_error)?;
+        .map_err(|error| cockpit_internal_error(error.message))?;
     let profile = cockpit_profile_cropped_for(profile, &principal);
     Ok(cockpit_profile_response(
         serde_json::json!({ "kind": "mfg.cockpit.profile_shared", "profile": profile, "business_receipt": receipt }),
@@ -1470,7 +1470,7 @@ async fn reconcile_mfg_report_review_effects(
                     .map_err(mfg_mutation_error)?;
             }
             Err(error) => {
-                let message = format!("{}:{:?}", error.0, error.1 .0);
+                let message = format!("{}:{:?}", error.0, error.1.0);
                 state
                     .services
                     .mfg
@@ -1979,9 +1979,11 @@ mod tests {
                 .len(),
             shared.widget_instances.len()
         );
-        assert!(cockpit_profile_cropped_for(shared.clone(), &denied)
-            .widget_instances
-            .is_empty());
+        assert!(
+            cockpit_profile_cropped_for(shared.clone(), &denied)
+                .widget_instances
+                .is_empty()
+        );
         assert!(cockpit_profile_report_allowed(&shared, &allowed));
         assert!(!cockpit_profile_report_allowed(&shared, &denied));
     }

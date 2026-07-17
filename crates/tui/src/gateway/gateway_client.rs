@@ -887,8 +887,12 @@ impl GatewayApiClient {
             .await
     }
 
-    pub async fn approval_exact(&self, approval_id: &str) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!("/api/approval/{}", url_encode(approval_id))).await
+    pub async fn approval_exact(
+        &self,
+        approval_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!("/api/approval/{}", url_encode(approval_id)))
+            .await
     }
 
     pub async fn mission_projection(&self) -> Result<serde_json::Value, GatewayApiError> {
@@ -3265,9 +3269,13 @@ mod tests {
     #[test]
     fn every_gateway_request_uses_the_tui_surface_decorator() {
         let source = include_str!("gateway_client.rs");
+        let production_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("source has a production section");
         assert!(source.contains("x-cowd-surface-id"));
         assert!(source.contains("x-cowd-requested-capabilities"));
-        assert_eq!(source.matches("bearer_auth").count(), 1);
+        assert_eq!(production_source.matches(".bearer_auth(").count(), 1);
         let capabilities = tui_requested_capabilities();
         assert!(capabilities.windows(2).all(|pair| pair[0] < pair[1]));
         for required in app_mfg_contract::core_profile_capabilities(

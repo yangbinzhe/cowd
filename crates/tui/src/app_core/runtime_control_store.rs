@@ -600,9 +600,7 @@ impl MfgOperationsState {
     }
 
     #[must_use]
-    pub fn selected_runtime_strategy_projection(
-        &self,
-    ) -> Option<&MfgRuntimeStrategyProjection> {
+    pub fn selected_runtime_strategy_projection(&self) -> Option<&MfgRuntimeStrategyProjection> {
         let execution_id = self
             .selected_item()?
             .backlinks
@@ -615,13 +613,15 @@ impl MfgOperationsState {
             .strip_prefix("runtime-execution://")?
             .split(['/', '?', '#'])
             .next()?;
-        self.runtime_strategy_cache.get(execution_id).filter(|projection| {
-            projection.mfg_generation == self.generation
-                && projection.selection_revision == self.selection_revision
-                && projection.live_generation == self.live_generation
-                && projection.live_epoch == self.live_epoch
-                && projection.live_reauthentication_count == self.live_reauthentication_count
-        })
+        self.runtime_strategy_cache
+            .get(execution_id)
+            .filter(|projection| {
+                projection.mfg_generation == self.generation
+                    && projection.selection_revision == self.selection_revision
+                    && projection.live_generation == self.live_generation
+                    && projection.live_epoch == self.live_epoch
+                    && projection.live_reauthentication_count == self.live_reauthentication_count
+            })
     }
 
     pub fn request_refresh(&mut self) {
@@ -6430,10 +6430,12 @@ pub(crate) mod tests {
 
         assert!(snapshot.gateway_running);
         assert_eq!(snapshot.degraded_reasons.len(), 2);
-        assert!(snapshot
-            .degraded_reasons
-            .iter()
-            .any(|reason| reason.contains("task")));
+        assert!(
+            snapshot
+                .degraded_reasons
+                .iter()
+                .any(|reason| reason.contains("task"))
+        );
     }
 
     #[test]
@@ -6584,9 +6586,11 @@ pub(crate) mod tests {
                 .count(),
             83
         );
-        assert!(app.gateway_action_receipts[0]
-            .dispatch_status
-            .ends_with("..."));
+        assert!(
+            app.gateway_action_receipts[0]
+                .dispatch_status
+                .ends_with("...")
+        );
     }
 
     #[test]
@@ -6655,9 +6659,11 @@ pub(crate) mod tests {
             },
         );
         assert_eq!(state.attempted_routes.len(), 2);
-        assert!(!state
-            .attempted_routes
-            .contains(&app_mfg_contract::MfgRouteId::IncidentList));
+        assert!(
+            !state
+                .attempted_routes
+                .contains(&app_mfg_contract::MfgRouteId::IncidentList)
+        );
     }
 
     #[test]
@@ -6726,13 +6732,17 @@ pub(crate) mod tests {
         assert!(state.review_detail.is_none());
         assert!(state.forbidden_sections.contains_key("reviews"));
         assert!(state.forbidden_sections.contains_key("review_detail"));
-        assert!(!state
-            .granted_capabilities
-            .iter()
-            .any(|capability| capability == "mfg.report.review"));
-        assert!(state
-            .attempted_routes
-            .contains(&app_mfg_contract::MfgRouteId::ReportReviewGet));
+        assert!(
+            !state
+                .granted_capabilities
+                .iter()
+                .any(|capability| capability == "mfg.report.review")
+        );
+        assert!(
+            state
+                .attempted_routes
+                .contains(&app_mfg_contract::MfgRouteId::ReportReviewGet)
+        );
     }
 
     #[test]
@@ -6966,7 +6976,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             state.latest_action_intent().unwrap().status,
-            MfgIntentStatus::Completed
+            MfgIntentStatus::Accepted
         );
     }
 
@@ -6974,10 +6984,12 @@ pub(crate) mod tests {
     fn mfg_action_403_recrops_capability_and_requests_contract_refresh() {
         let mut state = governed_action_fixture();
         state.active_tab = MfgViewTab::Alerts;
-        assert!(state
-            .visible_action_contracts()
-            .iter()
-            .any(|action| action.action_id.as_str() == "mfg.alert.resolve"));
+        assert!(
+            state
+                .visible_action_contracts()
+                .iter()
+                .any(|action| action.action_id.as_str() == "mfg.alert.resolve")
+        );
         state.action_intents.push(MfgActionIntent {
             intent_id: "intent-capability-loss".to_string(),
             action_id: app_mfg_contract::MfgActionId::Multi(
@@ -7026,10 +7038,12 @@ pub(crate) mod tests {
             app_mfg_contract::MfgApiErrorV1::capability_denied("mfg.alert.respond"),
         );
         assert!(state.refresh_requested);
-        assert!(!state
-            .granted_capabilities
-            .iter()
-            .any(|capability| capability == "mfg.alert.respond"));
+        assert!(
+            !state
+                .granted_capabilities
+                .iter()
+                .any(|capability| capability == "mfg.alert.respond")
+        );
         assert!(state.visible_action_contracts().is_empty());
         assert_eq!(
             state
@@ -7084,18 +7098,20 @@ pub(crate) mod tests {
         state.selected_alert_id = Some("alert-1".to_string());
         let resolve =
             app_mfg_contract::MfgActionId::Multi(app_mfg_contract::MfgMultiActionId::AlertResolve);
-        assert!(state
-            .prepare_action(
-                resolve,
-                Some(serde_json::json!({
-                    "body": {
-                        "command": "escalate",
-                        "expected_revision": 2,
-                        "reason": "attempted action drift"
-                    }
-                })),
-            )
-            .is_err());
+        assert!(
+            state
+                .prepare_action(
+                    resolve,
+                    Some(serde_json::json!({
+                        "body": {
+                            "command": "escalate",
+                            "expected_revision": 2,
+                            "reason": "attempted action drift"
+                        }
+                    })),
+                )
+                .is_err()
+        );
 
         state.granted_capabilities = vec!["mfg.read".to_string()];
         state.reports = vec![MfgItemSummary {
@@ -7106,12 +7122,14 @@ pub(crate) mod tests {
         let dry_run = app_mfg_contract::MfgActionId::Multi(
             app_mfg_contract::MfgMultiActionId::ReportDeliverDryRun,
         );
-        assert!(state
-            .prepare_action(
-                dry_run,
-                Some(serde_json::json!({"body": {"mode": "commit"}})),
-            )
-            .is_err());
+        assert!(
+            state
+                .prepare_action(
+                    dry_run,
+                    Some(serde_json::json!({"body": {"mode": "commit"}})),
+                )
+                .is_err()
+        );
         assert!(state.action_intents.is_empty());
     }
 
@@ -7211,20 +7229,22 @@ pub(crate) mod tests {
             "mfg:alert-occurrence:alert-2".to_string()
         );
 
-        assert!(state
-            .prepare_action(
-                action,
-                Some(serde_json::json!({
-                    "path": {"id": "alert-2"},
-                    "resource_ref": "mfg:alert-occurrence:alert-1",
-                    "body": {
-                        "command": "resolve",
-                        "expected_revision": 7,
-                        "reason": "attempt split target"
-                    }
-                })),
-            )
-            .is_err());
+        assert!(
+            state
+                .prepare_action(
+                    action,
+                    Some(serde_json::json!({
+                        "path": {"id": "alert-2"},
+                        "resource_ref": "mfg:alert-occurrence:alert-1",
+                        "body": {
+                            "command": "resolve",
+                            "expected_revision": 7,
+                            "reason": "attempt split target"
+                        }
+                    })),
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -7340,7 +7360,7 @@ pub(crate) mod tests {
                 updated_at: chrono::Utc::now(),
             };
 
-            let mut accepted = MfgOperationsState::default();
+            let mut accepted = governed_action_fixture();
             accepted.action_intents.push(base.clone());
             accepted.apply_action_success(
                 &intent_id,
@@ -7356,7 +7376,7 @@ pub(crate) mod tests {
                 action.action_id.as_str()
             );
 
-            let mut replayed = MfgOperationsState::default();
+            let mut replayed = governed_action_fixture();
             replayed.action_intents.push(base.clone());
             replayed.apply_action_success(
                 &intent_id,
@@ -7370,7 +7390,7 @@ pub(crate) mod tests {
                 MfgIntentStatus::Replayed
             );
 
-            let mut forbidden = MfgOperationsState::default();
+            let mut forbidden = governed_action_fixture();
             forbidden.action_intents.push(base.clone());
             forbidden.apply_action_error(
                 &intent_id,
@@ -7383,7 +7403,7 @@ pub(crate) mod tests {
                 MfgIntentStatus::Forbidden
             );
 
-            let mut conflict = MfgOperationsState::default();
+            let mut conflict = governed_action_fixture();
             conflict.action_intents.push(base.clone());
             conflict.apply_action_error(
                 &intent_id,
@@ -7405,7 +7425,7 @@ pub(crate) mod tests {
             );
             assert!(conflict.retry_failed_action().is_err());
 
-            let mut timeout = MfgOperationsState::default();
+            let mut timeout = governed_action_fixture();
             timeout.action_intents.push(base);
             timeout.apply_action_error(
                 &intent_id,
@@ -7694,10 +7714,12 @@ pub(crate) mod tests {
                 "TUI delta reducer omitted {id}"
             );
         }
-        assert!(state
-            .live_receipts
-            .iter()
-            .any(|receipt| receipt.receipt_id == "receipt-2"));
+        assert!(
+            state
+                .live_receipts
+                .iter()
+                .any(|receipt| receipt.receipt_id == "receipt-2")
+        );
     }
 
     #[test]

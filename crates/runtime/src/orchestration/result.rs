@@ -1,6 +1,6 @@
 use harness_contract::core::{ExecutionPattern, ExecutionPolicyGate};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeOrchestrationApprovalRequirement {
@@ -122,7 +122,9 @@ fn truncate_chars(value: &str, limit: usize) -> String {
         return value.to_string();
     }
     let kept = chars.into_iter().take(limit).collect::<String>();
-    format!("{kept}\n...[terminal synthesis truncated; retrieve durable execution evidence for full detail]")
+    format!(
+        "{kept}\n...[terminal synthesis truncated; retrieve durable execution evidence for full detail]"
+    )
 }
 
 #[cfg(test)]
@@ -167,9 +169,11 @@ mod tests {
         assert_eq!(receipt["execution"]["type"], "execution_graph_run");
         assert!(receipt["execution"].get("projection").is_none());
         assert!(receipt["execution"].get("terminal_result_ref").is_none());
-        assert!(receipt["terminal_summary"]
-            .as_str()
-            .is_some_and(|value| value.contains("terminal synthesis truncated")));
+        assert!(
+            receipt["terminal_summary"]
+                .as_str()
+                .is_some_and(|value| value.contains("terminal synthesis truncated"))
+        );
         assert!(serde_json::to_string(&receipt).unwrap().len() < 20_000);
     }
 }

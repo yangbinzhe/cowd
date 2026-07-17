@@ -641,6 +641,25 @@ mod tests {
     use crate::gateway::ActiveSessions;
     use crate::session_kernel::SessionKernel;
     use crate::session_lifecycle_kernel::SessionLifecycleKernel;
+    use model_protocol::provider_config::{ProviderConfig, ProvidersConfig};
+
+    fn test_provider_registry() -> Arc<runtime::ProviderRegistry> {
+        Arc::new(
+            runtime::ProviderRegistry::new(ProvidersConfig {
+                providers: HashMap::from([(
+                    "test".to_string(),
+                    ProviderConfig {
+                        name: "test".to_string(),
+                        base_url: "http://127.0.0.1:9/v1".to_string(),
+                        api_key: "test".to_string(),
+                        models: vec![crate::DEFAULT_MODEL.to_string(), "test-model".to_string()],
+                        protocol: Some("completions".to_string()),
+                    },
+                )]),
+            })
+            .expect("valid inert test provider registry"),
+        )
+    }
 
     fn test_manager(
         max_active_sessions: usize,
@@ -684,7 +703,7 @@ mod tests {
                 session_kernel,
                 lifecycle_kernel,
                 std::time::Instant::now(),
-                Arc::new(runtime::ProviderRegistry::empty()),
+                test_provider_registry(),
                 Arc::new(runtime::UpgradeCoordinator::new()),
                 runtime_services,
             )

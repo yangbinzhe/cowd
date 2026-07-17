@@ -450,38 +450,43 @@ pub(super) async fn get_execution_projection_events(
                     let config_home = state.config_home.clone();
                     let principal_for_check = principal.clone();
                     let check = tokio::task::spawn_blocking(move || {
-                        super::projection_stream_principal_current(&config_home, &principal_for_check)
+                        super::projection_stream_principal_current(
+                            &config_home,
+                            &principal_for_check,
+                        )
                     })
                     .await;
                     auth_checked_at = Some(std::time::Instant::now());
                     let reason = match check {
                         Ok(Ok(())) => None,
                         Ok(Err(reason)) => Some(reason),
-                        Err(error) => Some(format!("projection authorization check aborted: {error}")),
+                        Err(error) => {
+                            Some(format!("projection authorization check aborted: {error}"))
+                        }
                     };
                     if let Some(reason) = reason {
-                    let event = Event::default()
-                        .event("projection_authorization_revoked")
-                        .data(
-                            serde_json::json!({
-                                "reason": reason,
-                                "execution_id": execution_id.clone(),
-                            })
-                            .to_string(),
-                        );
-                    return Some((
-                        Ok::<Event, Infallible>(event),
-                        (
-                            state,
-                            runtime,
-                            execution_id,
-                            principal,
-                            detail_scope,
-                            cursor,
-                            true,
-                            auth_checked_at,
-                        ),
-                    ));
+                        let event = Event::default()
+                            .event("projection_authorization_revoked")
+                            .data(
+                                serde_json::json!({
+                                    "reason": reason,
+                                    "execution_id": execution_id.clone(),
+                                })
+                                .to_string(),
+                            );
+                        return Some((
+                            Ok::<Event, Infallible>(event),
+                            (
+                                state,
+                                runtime,
+                                execution_id,
+                                principal,
+                                detail_scope,
+                                cursor,
+                                true,
+                                auth_checked_at,
+                            ),
+                        ));
                     }
                 }
                 let context = match execution_projection_context(

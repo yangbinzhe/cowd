@@ -8,8 +8,8 @@
 use std::{marker::PhantomData, sync::Arc};
 
 use axum::{
-    routing::{get, post},
     Router,
+    routing::{get, post},
 };
 use harness_contract::projection::{
     ExecutionCommandReceipt, ExecutionCommandRequest, ExecutionProjection, ProjectionDelta,
@@ -17,7 +17,7 @@ use harness_contract::projection::{
     TurnEvidenceProjection,
 };
 
-use super::{runtime_routes, AppState};
+use super::{AppState, runtime_routes};
 
 /// Build-generated metadata for literal Axum route registrations. The build
 /// script watches every route source and emits this registry once; runtime
@@ -87,8 +87,8 @@ pub(crate) struct StableRouteMetadata {
     pub(crate) streaming: bool,
 }
 
-fn execution_projection_snapshot_spec(
-) -> TypedRouteSpec<(), runtime_routes::ExecutionProjectionQuery, ExecutionProjection> {
+fn execution_projection_snapshot_spec()
+-> TypedRouteSpec<(), runtime_routes::ExecutionProjectionQuery, ExecutionProjection> {
     TypedRouteSpec::new(
         "GET",
         "/api/runtime/executions/:id",
@@ -96,8 +96,8 @@ fn execution_projection_snapshot_spec(
     )
 }
 
-fn execution_projection_events_spec(
-) -> TypedRouteSpec<(), runtime_routes::ExecutionProjectionQuery, ProjectionDelta> {
+fn execution_projection_events_spec()
+-> TypedRouteSpec<(), runtime_routes::ExecutionProjectionQuery, ProjectionDelta> {
     TypedRouteSpec::new(
         "GET",
         "/api/runtime/executions/:id/events",
@@ -105,8 +105,8 @@ fn execution_projection_events_spec(
     )
 }
 
-fn execution_projection_command_spec(
-) -> TypedRouteSpec<ExecutionCommandRequest, (), ExecutionCommandReceipt> {
+fn execution_projection_command_spec()
+-> TypedRouteSpec<ExecutionCommandRequest, (), ExecutionCommandReceipt> {
     TypedRouteSpec::new(
         "POST",
         "/api/runtime/executions/:id/commands",
@@ -218,7 +218,10 @@ mod tests {
         assert_eq!(specs[1].path, "/api/runtime/executions/:id/events");
         assert!(specs[1].streaming);
         assert_eq!(specs[1].response_schema, "ProjectionDelta");
-        assert_eq!(specs[2].request_schema, Some("ExecutionCommandRequest"));
+        assert_eq!(
+            specs[2].request_schema,
+            Some("ExecutionCommandRequest".to_string())
+        );
         assert_eq!(specs[2].response_schema, "ExecutionCommandReceipt");
         assert_eq!(
             specs[3].response_schema,

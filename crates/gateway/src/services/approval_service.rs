@@ -3,7 +3,7 @@ use std::sync::Arc;
 use approval::{ApprovalRepository, FileApprovalRepository};
 use harness_contract::execution_graph::{ExecutionGraphCommand, ExecutionNodeStatus};
 use harness_contract::policy::RiskGateReceipt;
-use runtime::{approval_gate::SmartApprovalGate, ApprovalConfig};
+use runtime::{ApprovalConfig, approval_gate::SmartApprovalGate};
 
 use super::ServiceEnvelope;
 
@@ -210,7 +210,7 @@ impl ApprovalService {
                 .list()
                 .into_iter()
                 .filter(|request| approval_visible_to(request, principal))
-                .find(|request| request.id == id)
+                .find(|request| request.approval_id == id)
             {
                 return serde_json::to_value(request).ok();
             }
@@ -460,12 +460,16 @@ mod tests {
             .event_reader()
             .list_scope(runtime::RuntimeEventScope::Approval, 20)
             .unwrap();
-        assert!(approval_events
-            .iter()
-            .any(|event| event.kind == "approval.submitted"));
-        assert!(approval_events
-            .iter()
-            .any(|event| event.kind == "approval.decided"));
+        assert!(
+            approval_events
+                .iter()
+                .any(|event| event.kind == "approval.submitted")
+        );
+        assert!(
+            approval_events
+                .iter()
+                .any(|event| event.kind == "approval.decided")
+        );
         assert_eq!(
             services
                 .approval_queue()

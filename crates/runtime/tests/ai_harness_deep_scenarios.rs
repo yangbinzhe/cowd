@@ -7,14 +7,15 @@
 
 use harness_contract::core::ExecutionPattern;
 use harness_contract::execution_graph::{
-    apply_node_transition, validate_execution_graph, ExecutionEdge, ExecutionEdgeKind,
-    ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec, ExecutionNodeStatus,
+    ExecutionEdge, ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec,
+    ExecutionNodeStatus, apply_node_transition, validate_execution_graph,
 };
 use harness_contract::strategy::{
-    decide_strategy, understand, StrategyExperienceRecord, StrategyExperienceStore, StrategyInput,
+    ExecutionCandidateKind, StrategyExperienceRecord, StrategyExperienceStore, StrategyInput,
+    decide_strategy, understand,
 };
-use runtime::eval_gate::{ScenarioCheck, ScenarioCheckKind, ScenarioSpec, ScenarioSuite};
 use runtime::RuntimeAiKernel;
+use runtime::eval_gate::{ScenarioCheck, ScenarioCheckKind, ScenarioSpec, ScenarioSuite};
 
 fn node(id: &str, kind: ExecutionNodeKind) -> ExecutionNodeSpec {
     let mut node = ExecutionNodeSpec::new(kind, "scenario-executor", format!("payload:{id}"));
@@ -46,7 +47,12 @@ fn deep_task_closure_links_strategy_execution_graph_memory_matrix_and_final_gate
         .expect("complex closure should produce execution_graph quality");
     assert_eq!(
         trace.execution_decision.strategy.pattern,
-        ExecutionPattern::Execute
+        ExecutionPattern::Collaborate
+    );
+    assert_eq!(
+        trace.execution_decision.strategy.selected_candidate,
+        ExecutionCandidateKind::Team,
+        "the independent migration, evidence, regression, and review workstreams must use the governed Team topology"
     );
     assert!(
         trace.execution_graph.is_some(),
@@ -75,7 +81,7 @@ fn deep_task_closure_links_strategy_execution_graph_memory_matrix_and_final_gate
     );
 
     let spec = ScenarioSpec::new("deep_task_closure", "complex closure")
-        .expect_mode(ExecutionPattern::Execute)
+        .expect_mode(ExecutionPattern::Collaborate)
         .require(ScenarioCheck::bool(
             "execution_graph.present",
             ScenarioCheckKind::ExecutionGraphPresent,
@@ -229,10 +235,12 @@ fn agent_parallel_research_scenario_keeps_independent_nodes_ready_for_merge() {
         graph.node_statuses["merge-review"],
         ExecutionNodeStatus::Planned
     );
-    assert!(graph
-        .edges
-        .iter()
-        .all(|edge| graph.node_statuses[&edge.from] == ExecutionNodeStatus::Completed));
+    assert!(
+        graph
+            .edges
+            .iter()
+            .all(|edge| graph.node_statuses[&edge.from] == ExecutionNodeStatus::Completed)
+    );
 }
 
 #[test]
@@ -291,8 +299,10 @@ fn agent_untrusted_low_lift_cannot_change_multi_agent_path() {
         adapted.pattern,
         harness_contract::core::ExecutionPattern::Collaborate
     );
-    assert!(!adapted
-        .reasons
-        .iter()
-        .any(|reason| reason.contains("low multi-agent lift")));
+    assert!(
+        !adapted
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("low multi-agent lift"))
+    );
 }

@@ -2,8 +2,8 @@ use harness_contract::core::{
     ExecutionModifier, ExecutionPattern, ExecutionPolicyGate, TaskComplexity, TaskRisk,
 };
 use harness_contract::strategy::{
-    decide_strategy, CollaborationLiftEstimate, ExecutionCandidateKind, StrategyDecision,
-    StrategyInput, StrategyResourceSnapshot,
+    CollaborationLiftEstimate, ExecutionCandidateKind, StrategyDecision, StrategyInput,
+    StrategyResourceSnapshot, decide_strategy,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -361,7 +361,9 @@ fn build_runtime_execution_decision_inner(
         .and_then(|proposal| proposal.template.clone());
     let mut strategy = decide_strategy(&input);
     let mut blocked_reasons = Vec::new();
-    if strategy.pattern == ExecutionPattern::Collaborate && !resource_health.collaboration_available
+    if (strategy.pattern == ExecutionPattern::Collaborate
+        || strategy.understanding.requests_multi_agent)
+        && !resource_health.collaboration_available
     {
         if let Err(error) = strategy.retarget(
             ExecutionPattern::Execute,
@@ -692,14 +694,18 @@ mod tests {
             decision.compile_target,
             RuntimeCompileTarget::ExecutionGraph
         );
-        assert!(decision
-            .modifiers()
-            .iter()
-            .all(|modifier| ExecutionPattern::Execute.supports_modifier(*modifier)));
-        assert!(decision
-            .gates()
-            .iter()
-            .all(|gate| ExecutionPattern::Execute.supports_gate(*gate)));
+        assert!(
+            decision
+                .modifiers()
+                .iter()
+                .all(|modifier| ExecutionPattern::Execute.supports_modifier(*modifier))
+        );
+        assert!(
+            decision
+                .gates()
+                .iter()
+                .all(|gate| ExecutionPattern::Execute.supports_gate(*gate))
+        );
         assert!(decision.executable);
     }
 
@@ -723,10 +729,12 @@ mod tests {
         assert!(decision.gates().contains(&ExecutionPolicyGate::Permission));
         assert!(decision.gates().contains(&ExecutionPolicyGate::Risk));
         assert!(decision.gates().contains(&ExecutionPolicyGate::Approval));
-        assert!(decision
-            .blocked_reasons
-            .iter()
-            .any(|reason| reason.contains("tool runtime unavailable")));
+        assert!(
+            decision
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("tool runtime unavailable"))
+        );
         let report = action_selection_report_for_decision(&decision, None);
         assert_eq!(report.selected_action, "blocked");
         assert_eq!(report.fallback_action, "blocked");
@@ -767,11 +775,13 @@ mod tests {
 
         assert!(decision.executable);
         assert_eq!(decision.pattern(), ExecutionPattern::Execute);
-        assert!(decision
-            .strategy
-            .reasons
-            .iter()
-            .any(|reason| reason.contains("intentionally prohibited")));
+        assert!(
+            decision
+                .strategy
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("intentionally prohibited"))
+        );
     }
 
     #[test]

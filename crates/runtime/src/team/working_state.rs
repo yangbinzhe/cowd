@@ -321,6 +321,8 @@ pub(crate) fn terminal_working_state_event(
     if status == ExecutionNodeStatus::Completed && refs.is_empty() {
         return None;
     }
+    let focus_boundary = packet_constraint(&packet, "focus_boundary:")
+        .unwrap_or_else(|| "role-local semantic result".to_string());
     let entry = TeamWorkingStateEntry {
         entry_id: format!("{}:{}:{}", graph.id, node_id, graph.revision),
         team_id: team_id.to_string(),
@@ -350,9 +352,9 @@ pub(crate) fn terminal_working_state_event(
         kind,
         summary,
         refs,
-        boundary: packet_constraint(&packet, "focus_boundary:").unwrap_or_else(|| {
-            "runtime-terminal-projection; no raw chain-of-thought or raw tool output".to_string()
-        }),
+        boundary: format!(
+            "{focus_boundary}; runtime-terminal-projection; no raw chain-of-thought or raw tool output"
+        ),
         confidence_milli,
         graph_revision: graph.revision,
     };

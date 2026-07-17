@@ -590,93 +590,91 @@ async fn run_mfg_live_consumer(
             return;
         }
         reconnect_attempt = 0;
-        loop {
-            let subscription = tokio::select! {
-                _ = wait_for_mfg_live_contract_loss(&mut contract_active) => {
+        let subscription = tokio::select! {
+            _ = wait_for_mfg_live_contract_loss(&mut contract_active) => {
+                let Some(next) = reactivate_mfg_live_after_contract_loss(
+                    &tx, generation, &mut contract_active,
+                ).await else {
+                    return;
+                };
+                generation = next;
+                continue 'snapshot;
+            }
+            result = client.subscribe_mfg_live(generation, &cursor, &view_epoch, tx.clone()) => result,
+        };
+        match subscription {
+            Ok(outcome) if outcome.resync_required => {
+                generation = generation.saturating_add(1);
+                continue 'snapshot;
+            }
+            Ok(_) => {
+                if mfg_live_reconnect_wait(
+                    mfg_live_reconnect_delay(reconnect_attempt),
+                    &mut contract_active,
+                )
+                .await
+                {
                     let Some(next) = reactivate_mfg_live_after_contract_loss(
-                        &tx, generation, &mut contract_active,
-                    ).await else {
+                        &tx,
+                        generation,
+                        &mut contract_active,
+                    )
+                    .await
+                    else {
                         return;
                     };
                     generation = next;
                     continue 'snapshot;
                 }
-                result = client.subscribe_mfg_live(generation, &cursor, &view_epoch, tx.clone()) => result,
-            };
-            match subscription {
-                Ok(outcome) if outcome.resync_required => {
-                    generation = generation.saturating_add(1);
-                    break;
+                // A completed SSE response is a transport boundary, not a
+                // durable state proof. Install a fresh transactional
+                // snapshot under a new generation before consuming again.
+                generation = generation.saturating_add(1);
+                continue 'snapshot;
+            }
+            Err(error) => {
+                let error = mfg_api_error_from_gateway(&error);
+                let reauthenticate = mfg_live_reauthentication_allowed(&error);
+                let terminal = matches!(
+                    error.code,
+                    app_mfg_contract::MfgErrorCode::AuthenticationRequired
+                        | app_mfg_contract::MfgErrorCode::CapabilityDenied
+                        | app_mfg_contract::MfgErrorCode::MfgLiveCursorKeyInvalid
+                );
+                if tx
+                    .send_wait(CowdEvent::MfgLiveFailed { generation, error })
+                    .await
+                    .is_err()
+                {
+                    return;
                 }
-                Ok(_) => {
-                    if mfg_live_reconnect_wait(
-                        mfg_live_reconnect_delay(reconnect_attempt),
+                if terminal {
+                    if reauthenticate {
+                        generation = generation.saturating_add(1);
+                        continue 'snapshot;
+                    }
+                    return;
+                }
+                if mfg_live_reconnect_wait(
+                    mfg_live_reconnect_delay(reconnect_attempt),
+                    &mut contract_active,
+                )
+                .await
+                {
+                    let Some(next) = reactivate_mfg_live_after_contract_loss(
+                        &tx,
+                        generation,
                         &mut contract_active,
                     )
                     .await
-                    {
-                        let Some(next) = reactivate_mfg_live_after_contract_loss(
-                            &tx,
-                            generation,
-                            &mut contract_active,
-                        )
-                        .await
-                        else {
-                            return;
-                        };
-                        generation = next;
-                        continue 'snapshot;
-                    }
-                    // A completed SSE response is a transport boundary, not a
-                    // durable state proof. Install a fresh transactional
-                    // snapshot under a new generation before consuming again.
-                    generation = generation.saturating_add(1);
-                    break;
-                }
-                Err(error) => {
-                    let error = mfg_api_error_from_gateway(&error);
-                    let reauthenticate = mfg_live_reauthentication_allowed(&error);
-                    let terminal = matches!(
-                        error.code,
-                        app_mfg_contract::MfgErrorCode::AuthenticationRequired
-                            | app_mfg_contract::MfgErrorCode::CapabilityDenied
-                            | app_mfg_contract::MfgErrorCode::MfgLiveCursorKeyInvalid
-                    );
-                    if tx
-                        .send_wait(CowdEvent::MfgLiveFailed { generation, error })
-                        .await
-                        .is_err()
-                    {
+                    else {
                         return;
-                    }
-                    if terminal {
-                        if reauthenticate {
-                            generation = generation.saturating_add(1);
-                            break;
-                        }
-                        return;
-                    }
-                    if mfg_live_reconnect_wait(
-                        mfg_live_reconnect_delay(reconnect_attempt),
-                        &mut contract_active,
-                    )
-                    .await
-                    {
-                        let Some(next) = reactivate_mfg_live_after_contract_loss(
-                            &tx,
-                            generation,
-                            &mut contract_active,
-                        )
-                        .await
-                        else {
-                            return;
-                        };
-                        generation = next;
-                        continue 'snapshot;
-                    }
-                    generation = generation.saturating_add(1);
-                    break;
+                    };
+                    generation = next;
+                    continue 'snapshot;
                 }
+                generation = generation.saturating_add(1);
+                continue 'snapshot;
             }
         }
     }
@@ -1587,14 +1585,21 @@ fn start_pending_mfg_backlink_resolution(
                                 })
                             })
                     } else {
-                        client.surface_messages(surface_id).await.and_then(|objects| {
-                            find_json_object_by_identity(&objects, &["message_id", "id"], object_id)
+                        client
+                            .surface_messages(surface_id)
+                            .await
+                            .and_then(|objects| {
+                                find_json_object_by_identity(
+                                    &objects,
+                                    &["message_id", "id"],
+                                    object_id,
+                                )
                                 .ok_or_else(|| {
                                     crate::gateway_client::GatewayApiError::Url(format!(
                                         "Surface object {object_id} was not found on {surface_id}"
                                     ))
                                 })
-                        })
+                            })
                     }
                 }
             } else {
@@ -2910,16 +2915,21 @@ fn collect_surface_receipt_backlinks(value: &serde_json::Value, backlinks: &mut 
 
 fn mfg_review_summary(review: &app_mfg_contract::MfgReportDeliveryReview) -> MfgItemSummary {
     let raw = serde_json::to_value(review).unwrap_or(serde_json::Value::Null);
-    mfg_item_summary(&raw, "review").unwrap_or_else(|| MfgItemSummary {
-        id: review.review_id.clone(),
-        kind: "review".to_string(),
-        title: format!("Report review {}", review.report_id),
-        status: format!("{:?}", review.status),
-        revision: Some(review.revision),
-        evidence_refs: review.evidence_refs.clone(),
+    let mut summary = mfg_item_summary(&raw, "review").unwrap_or_else(|| MfgItemSummary {
         raw,
         ..MfgItemSummary::default()
-    })
+    });
+    // Report reviews are identified by `review_id`, not the report identifier.
+    // Keep the generic projection for canonical backlinks, then overwrite the
+    // review-owned fields so selection and governed actions target the review.
+    summary.id = review.review_id.clone();
+    summary.kind = "review".to_string();
+    summary.title = format!("Report review {}", review.report_id);
+    summary.status = format!("{:?}", review.status);
+    summary.owner = Some(review.requester_principal.clone());
+    summary.revision = Some(review.revision);
+    summary.evidence_refs = review.evidence_refs.clone();
+    summary
 }
 
 fn mfg_document_pagination(

@@ -329,7 +329,13 @@ pub(super) async fn authorize_session_access(
     });
     let manager = principal.0.is_human_interactive()
         && principal.0.has_capability("runtime.maintenance.manage");
-    if session_access_authorized(access, owner_matches, explicit_session, explicit_mission, manager) {
+    if session_access_authorized(
+        access,
+        owner_matches,
+        explicit_session,
+        explicit_mission,
+        manager,
+    ) {
         return Ok(());
     }
     Err((
@@ -369,7 +375,13 @@ async fn session_record_access_authorized(
     });
     let manager = principal.0.is_human_interactive()
         && principal.0.has_capability("runtime.maintenance.manage");
-    session_access_authorized(access, owner_matches, explicit_session, explicit_mission, manager)
+    session_access_authorized(
+        access,
+        owner_matches,
+        explicit_session,
+        explicit_mission,
+        manager,
+    )
 }
 
 /// Keep the authorization decision independent from projection/outbox lookup:
@@ -405,7 +417,10 @@ pub(super) async fn list_running_session_execution_indices(
         )
     })?;
     let mut items = Vec::new();
-    for index in runtime.recoverable_running_session_execution_indices().await {
+    for index in runtime
+        .recoverable_running_session_execution_indices()
+        .await
+    {
         if authorize_session_access(&state, &principal, &index.session_id, SessionAccess::Read)
             .await
             .is_ok()
@@ -2167,7 +2182,10 @@ fn search_message_preview(blocks: &[serde_json::Value]) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     if content_preview.chars().count() > 200 {
-        format!("{}...", content_preview.chars().take(200).collect::<String>())
+        format!(
+            "{}...",
+            content_preview.chars().take(200).collect::<String>()
+        )
     } else {
         content_preview
     }

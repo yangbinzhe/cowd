@@ -263,6 +263,7 @@ impl NodeExecutor for AgentTaskExecutor {
                 retryable: false,
                 evidence_refs: returned.evidence_refs.clone(),
             });
+        let usage = agent_execution_usage(&returned);
         let mut evidence_refs = returned.evidence_refs;
         evidence_refs.extend(returned.acceptance.iter().map(|criterion| {
             harness_contract::context::EvidenceAccessRef::unavailable(
@@ -304,7 +305,7 @@ impl NodeExecutor for AgentTaskExecutor {
                 .then(|| bounded_semantic_summary(&returned.outcome)),
             evidence_refs,
             failure,
-            usage: agent_execution_usage(&returned),
+            usage,
             finished_at_ms: crate::tool_invocation::now_ms(),
         }))
     }

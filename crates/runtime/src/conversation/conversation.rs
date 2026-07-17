@@ -6989,6 +6989,7 @@ where
         execution_graph_ref: &str,
     ) -> Result<crate::execution_core::TurnStrategyDecisionState, RuntimeError> {
         let recovered = self.recover_turn_strategy_identity(turn_ref, execution_graph_ref);
+        let recovered_identity = recovered.is_some();
         let (state, should_emit, previous) = {
             let mut guard = self
                 .active_turn_strategy
@@ -6999,7 +7000,7 @@ where
                 .as_mut()
                 .filter(|state| state.turn_ref == turn_ref)
                 .ok_or_else(|| RuntimeError::new("turn strategy binding scope mismatch"))?;
-            let should_emit = state.execution_graph_ref.is_none() && recovered.is_none();
+            let should_emit = state.execution_graph_ref.is_none() && !recovered_identity;
             if let Some(recovered) = recovered {
                 state.decision_id = recovered.decision_id.clone();
                 state.decision_lease = recovered.decision_lease.clone();
@@ -7035,13 +7036,24 @@ where
                             |spec| spec.compile_target,
                         );
             }
-            if state.execution_graph_ref.as_deref() != Some(execution_graph_ref) {
-                if !should_emit {
+            match state.execution_graph_ref.as_deref() {
+                Some(graph_id) if graph_id == execution_graph_ref => {}
+                Some(_) => {
                     return Err(RuntimeError::new(
                         "turn strategy cannot be rebound to another execution graph",
                     ));
                 }
-                state.bind_execution_graph(execution_graph_ref);
+                None if should_emit || recovered_identity => {
+                    // A recovered identity was filtered by this exact graph
+                    // reference above.  Rehydrate that durable binding without
+                    // producing a second selected event.
+                    state.bind_execution_graph(execution_graph_ref);
+                }
+                None => {
+                    return Err(RuntimeError::new(
+                        "turn strategy cannot be rebound to another execution graph",
+                    ));
+                }
             }
             (state.clone(), should_emit, previous)
         };
@@ -7418,7 +7430,10 @@ where
         store
             .append(RuntimeEventInput {
                 stream_id: format!("session:{}", state.session_ref),
-                scope: RuntimeEventScope::ExecutionGraph,
+                // Turn-level strategy evidence belongs to the Session stream.
+                // Treating it as an ExecutionGraph event makes graph discovery
+                // attempt to deserialize this non-graph payload as a graph.
+                scope: RuntimeEventScope::Session,
                 kind: kind.to_string(),
                 status: Some(turn_strategy_status_name(state.status).to_string()),
                 actor: Some("conversation_runtime.strategy_owner".to_string()),
@@ -8082,10 +8097,7 @@ fn apply_eval_strategy_override(
 /// matching marker.  This lets STR-07 exercise the real admission,
 /// persistence, projection and surface path without pretending that prose in
 /// a prompt can alter the strategy cost model.
-fn apply_e2e_strategy_fixture(
-    input: &mut StrategyInput,
-    prompt: &str,
-) -> Result<(), RuntimeError> {
+fn apply_e2e_strategy_fixture(input: &mut StrategyInput, prompt: &str) -> Result<(), RuntimeError> {
     if std::env::var("COWD_E2E_HARNESS").as_deref() != Ok("1") {
         return Ok(());
     }
@@ -8363,12 +8375,12 @@ mod tests {
         ApiClient, ApiRequest, AssistantEvent, CognitiveContextManager, ConversationRuntime,
         ModelStepIntent, ModelToolCall, RuntimeError, StaticToolExecutor, ToolExposureState,
         apply_explicit_team_requirement, apply_named_e2e_strategy_fixture,
-        build_cc_memory_config_with_budget,
-        deterministic_checkpoint_id, enforce_explicit_team_requirement,
-        image_user_message_from_path, is_runtime_team_orchestration_call,
-        memory_project_id_for_session, model_team_request_conflicts_with_admission,
-        prepared_vision_payload, preview_chars, provider_transport_policy, rate_per_second,
-        required_team_orchestration_call, tool_batch_pattern, vision_user_message,
+        build_cc_memory_config_with_budget, deterministic_checkpoint_id,
+        enforce_explicit_team_requirement, image_user_message_from_path,
+        is_runtime_team_orchestration_call, memory_project_id_for_session,
+        model_team_request_conflicts_with_admission, prepared_vision_payload, preview_chars,
+        provider_transport_policy, rate_per_second, required_team_orchestration_call,
+        tool_batch_pattern, turn_strategy_event_kind_allowed, vision_user_message,
     };
     use crate::config::RuntimeFeatureConfig;
     use crate::context_runtime::{
@@ -8377,6 +8389,7 @@ mod tests {
     };
     use crate::execution_core::build_runtime_execution_decision;
     use crate::permissions::{PermissionMode, PermissionPolicy};
+    use crate::runtime_event_store::{RuntimeEventScope, RuntimeEventStore};
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
     use crate::{
         COWD_IDENTITY_CONTRACT_VERSION, PromptAssembly, RealityRecallPort, RuntimeBudgetInputs,
@@ -8429,7 +8442,8 @@ mod tests {
 
     #[test]
     fn e2e_negative_team_fixture_is_marker_scoped_and_produces_real_cost_warning() {
-        let prompt = "must start a Team for runtime gateway frontend [cowd-e2e:explicit-team-negative]";
+        let prompt =
+            "must start a Team for runtime gateway frontend [cowd-e2e:explicit-team-negative]";
         let mut input = harness_contract::strategy::StrategyInput::from_prompt(prompt);
         apply_named_e2e_strategy_fixture(&mut input, prompt, "explicit-team-negative")
             .expect("known fixture is accepted");
@@ -8447,15 +8461,18 @@ mod tests {
             harness_contract::strategy::ExecutionCandidateKind::Team
         );
         assert!(team.net_benefit_score < 0);
-        assert!(decision
-            .reasons
-            .iter()
-            .any(|reason| reason.contains("negative estimated lift")));
+        assert!(
+            decision
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("negative estimated lift"))
+        );
 
         let mut unmarked = harness_contract::strategy::StrategyInput::from_prompt(
             "must start a Team for runtime gateway frontend",
         );
-        apply_named_e2e_strategy_fixture(&mut unmarked, &unmarked.prompt.clone(), "explicit-team-negative")
+        let unmarked_prompt = unmarked.prompt.clone();
+        apply_named_e2e_strategy_fixture(&mut unmarked, &unmarked_prompt, "explicit-team-negative")
             .expect("known fixture is inert without its marker");
         assert!(unmarked.candidate_costs.is_empty());
     }
@@ -9161,7 +9178,8 @@ mod tests {
             "runtime.strategy.retargeted"
         ));
         assert!(strategy_events.iter().all(|event| {
-            event.payload["decision_id"].as_str() == Some(first.decision_id.as_str())
+            event.scope == RuntimeEventScope::Session
+                && event.payload["decision_id"].as_str() == Some(first.decision_id.as_str())
                 && event.payload["decision_lease"].as_str() == Some(first.decision_lease.as_str())
                 && event.payload["execution_graph_ref"].as_str() == Some("graph-one")
                 && event.payload["session_ref"].as_str()

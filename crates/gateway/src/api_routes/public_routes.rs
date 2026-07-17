@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use axum::{
+    Json, Router,
     extract::State as AxumState,
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
 use serde::Deserialize;
 
@@ -14,9 +14,9 @@ use super::capability_contract::{
 };
 use super::route_manifest::gateway_route_manifest;
 use super::{
-    authenticated_human_principal_for_surface, cookie_value, issue_web_session,
-    surface_capability_inventory, validate_surface_capability_request, web_session_principal,
-    AppState, ErrorResponse, WEB_SESSION_COOKIE,
+    AppState, ErrorResponse, WEB_SESSION_COOKIE, authenticated_human_principal_for_surface,
+    cookie_value, issue_web_session, surface_capability_inventory,
+    validate_surface_capability_request, web_session_principal,
 };
 
 pub(super) fn router() -> Router<Arc<AppState>> {

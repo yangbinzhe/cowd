@@ -5,10 +5,10 @@ use harness_contract::execution_graph::{
 use harness_contract::turn::{SessionDispatchAction, SessionDispatchCommand, SessionHandoff};
 use thiserror::Error;
 
+use crate::TeamRuntime;
 use crate::execution_core::{
     ExecutionCompileError, ExecutionCompileRequest, ExecutionGraphCompiler,
 };
-use crate::TeamRuntime;
 
 use super::{RuntimeOrchestrationAction, RuntimeOrchestrationPlan, RuntimeOrchestrationRequest};
 
@@ -63,6 +63,19 @@ pub fn compile_orchestration(
                 } else {
                     "cowd/parallel-research-synthesis"
                 }
+            } else if request.action == RuntimeOrchestrationAction::RequestTeam
+                && request
+                    .template_hint
+                    .as_deref()
+                    .is_none_or(|template| template.trim().is_empty())
+                && request.constraints.requires_write != Some(true)
+            {
+                // A model-assisted read-only Team request must not inherit the
+                // generic planner/executor/verifier fallback: that template
+                // has an implementation role and correctly requires a write
+                // lease.  Select the published read-only research protocol
+                // unless the caller explicitly chose another template.
+                "cowd/parallel-research-synthesis"
             } else {
                 requested_template_path(request, fallback_template_path)
             };
@@ -420,7 +433,10 @@ mod tests {
             reason: Some("test explicit template constraint ownership".to_string()),
             template_hint: Some("cowd/parallel-research-synthesis".to_string()),
             focus_partition_plans: Vec::new(),
-            capabilities: vec!["tool:read_file".to_string()],
+            capabilities: vec![
+                "tool:read_file".to_string(),
+                "resource:read:crates/runtime".to_string(),
+            ],
             evidence_refs: Vec::new(),
             constraints: crate::RuntimeOrchestrationConstraints {
                 max_parallel_agents: Some(3),

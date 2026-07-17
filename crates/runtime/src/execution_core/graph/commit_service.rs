@@ -2,9 +2,8 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use harness_contract::execution_graph::{
-    apply_node_transition, validate_execution_graph, ExecutionEdge, ExecutionGraph,
-    ExecutionGraphCommand, ExecutionNodeResult, ExecutionNodeSpec, ExecutionNodeStatus,
-    ExecutionTransitionError,
+    ExecutionEdge, ExecutionGraph, ExecutionGraphCommand, ExecutionNodeResult, ExecutionNodeSpec,
+    ExecutionNodeStatus, ExecutionTransitionError, apply_node_transition, validate_execution_graph,
 };
 use serde_json::json;
 use thiserror::Error;
@@ -25,9 +24,7 @@ pub enum ExecutionCommitError {
     Transition(#[from] ExecutionTransitionError),
     #[error("execution graph commit serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
-    #[error(
-        "execution graph `{graph_id}` revision mismatch: expected {expected}, actual {actual}"
-    )]
+    #[error("execution graph `{graph_id}` revision mismatch: expected {expected}, actual {actual}")]
     StaleRevision {
         graph_id: String,
         expected: u64,
@@ -530,8 +527,9 @@ impl ExecutionCommitService {
             .iter()
             .map(|node| node.id.clone())
             .collect();
+        let replacement_snapshot = replacement.clone();
         self.append_graph_event(
-            &replacement,
+            &replacement_snapshot,
             graph.revision,
             format!("{}:strategy-retarget:{}", graph.id, replacement.revision),
             ExecutionGraphEvent::Replanned {

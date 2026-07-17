@@ -2,18 +2,18 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::{
+    Json, Router,
     extract::{Path, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
 use serde::Deserialize;
 use serde::Serialize;
-use surface::message::{message_connector_required_fields, MessageConnectorContract};
 use surface::SurfaceActionRequest;
+use surface::message::{MessageConnectorContract, message_connector_required_fields};
 
-use super::{api_error, AppState, ErrorResponse};
+use super::{AppState, ErrorResponse, api_error};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()

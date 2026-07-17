@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{skill_agent_node_id, MfgIncident, MfgSkillPlan, MfgSkillRun};
+use crate::{MfgIncident, MfgSkillPlan, MfgSkillRun, skill_agent_node_id};
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum MfgWorkflowGraphError {
@@ -813,9 +813,11 @@ mod tests {
         let revision = graph.revision;
         graph.set_node_terminal_result("worker", "done").unwrap();
         assert_eq!(graph.revision, revision);
-        assert!(graph
-            .set_node_terminal_result("worker", "different")
-            .is_err());
+        assert!(
+            graph
+                .set_node_terminal_result("worker", "different")
+                .is_err()
+        );
     }
 
     #[test]
@@ -867,10 +869,12 @@ mod tests {
         graph.complete_skill(&run).unwrap();
 
         let skill_node_id = skill_agent_node_id(&skill.skill_id);
-        assert!(graph
-            .nodes
-            .iter()
-            .any(|node| node.node_id == "mfg_researcher"));
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.node_id == "mfg_researcher")
+        );
         assert_eq!(
             graph
                 .nodes
@@ -880,9 +884,11 @@ mod tests {
                 .status,
             MfgWorkflowNodeStatus::Completed
         );
-        assert!(graph
-            .evidence
-            .iter()
-            .any(|item| item.kind == "mfg_skill_run"));
+        assert!(
+            graph
+                .evidence
+                .iter()
+                .any(|item| item.kind == "mfg_skill_run")
+        );
     }
 }

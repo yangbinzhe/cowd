@@ -4,12 +4,12 @@ use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::Duration;
 
 use harness_contract::execution_graph::{
-    validate_execution_graph, ExecutionEdgeKind, ExecutionGraph, ExecutionGraphCommand,
-    ExecutionGraphValidationError, ExecutionNodeResult, ExecutionNodeStatus,
+    ExecutionEdgeKind, ExecutionGraph, ExecutionGraphCommand, ExecutionGraphValidationError,
+    ExecutionNodeResult, ExecutionNodeStatus, validate_execution_graph,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::{Mutex, Notify, OwnedMutexGuard, OwnedNotified};
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard, futures::OwnedNotified};
 use tokio::task::JoinSet;
 
 use super::commit_service::{ExecutionCommitError, ExecutionCommitService, ExecutionEffectState};
@@ -338,6 +338,14 @@ impl ExecutionGraphRunner {
                     }
                     Ok(value) => value,
                     Err(ExecutionRunnerError::Executor(error)) => {
+                        // `start` failed before a durable Running transition
+                        // or effect intent exists. Keeping the node Ready lets
+                        // an explicit caller decide whether to retry; treating
+                        // it as a completed wave would immediately schedule it
+                        // again and spin forever.
+                        if matches!(error, NodeExecutorError::Start { .. }) {
+                            return Err(ExecutionRunnerError::Executor(error));
+                        }
                         let node_id = executor_error_node_id(&error).to_string();
                         if let Some(waiter) = self.command_intent_waiter(graph_id) {
                             waiter.await;

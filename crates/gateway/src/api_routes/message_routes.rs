@@ -7,16 +7,16 @@ use std::{
 };
 
 use axum::{
+    Json, Router,
     extract::{Extension, Path, Query, State as AxumState},
     http::{HeaderMap, StatusCode},
     response::{
-        sse::{Event, KeepAlive, Sse},
         IntoResponse,
+        sse::{Event, KeepAlive, Sse},
     },
     routing::{get, post},
-    Json, Router,
 };
-use futures::{stream::Stream, StreamExt};
+use futures::{StreamExt, stream::Stream};
 use harness_contract::turn::{
     InputRoutingDecision, InputSourceKind, SessionInputEnvelope, SessionInputId, TurnId,
 };

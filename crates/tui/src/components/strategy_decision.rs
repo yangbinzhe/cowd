@@ -409,15 +409,25 @@ fn contains_absolute_path(value: &str) -> bool {
             value.is_ascii_whitespace()
                 || matches!(
                     *value,
-                    b'(' | b'[' | b'{' | b':' | b'=' | b',' | b'\'' | b'"' | b'`'
-                        | b'>' | b'<' | b';' | b'|' | b'&' | b'-' | b'_'
+                    b'(' | b'['
+                        | b'{'
+                        | b':'
+                        | b'='
+                        | b','
+                        | b'\''
+                        | b'"'
+                        | b'`'
+                        | b'>'
+                        | b'<'
+                        | b';'
+                        | b'|'
+                        | b'&'
+                        | b'-'
+                        | b'_'
                 )
         });
         if *byte == b'/' {
-            return boundary
-                && bytes
-                    .get(index + 1)
-                    .is_some_and(|next| *next != b'/');
+            return boundary && bytes.get(index + 1).is_some_and(|next| *next != b'/');
         }
         byte.is_ascii_alphabetic()
             && bytes.get(index + 1) == Some(&b':')
@@ -614,6 +624,7 @@ mod tests {
         let rendered = rendered_text(&strategy);
         for secret in [
             "/etc/shadow",
+            "/etc/passwd",
             "file:///srv/private-output",
             "../private/strategy-state",
             "/var/lib/private",
@@ -624,7 +635,7 @@ mod tests {
         }
         assert!(rendered.contains("redacted by strategy surface policy"));
         assert!(rendered.contains("evidence-safe"));
-        assert!(rendered.contains("1 cropped refs"));
+        assert!(rendered.contains("2 cropped refs"));
     }
 
     #[test]

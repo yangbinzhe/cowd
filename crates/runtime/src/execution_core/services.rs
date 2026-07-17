@@ -23,14 +23,14 @@ use thiserror::Error;
 use super::cross_plane::{CrossPlaneRuntimeError, CrossPlaneRuntimeService};
 use super::goal::GoalStore;
 use super::graph::{
-    executors::{
-        AgentTaskExecutor, ApprovalNodeExecutor, CompileTargetGuardExecutor, ScopedNodeExecutor,
-        SynthesizeNodeExecutor, VerifyNodeExecutor,
-    },
     ExecutionCommitService, ExecutionGraphRunner, ExecutionGraphStateStore, ExecutionRecoveryError,
     ExecutionResourceKind, ExecutionResourceManager, ExecutionRunnerError,
     ExecutionStateStoreError, NodeExecutor, NodeExecutorError, NodeExecutorRegistry, ResourceQuota,
     ScopeLockError, ScopeLockManager, WorktreeLeaseError, WorktreeLeaseManager,
+    executors::{
+        AgentTaskExecutor, ApprovalNodeExecutor, CompileTargetGuardExecutor, ScopedNodeExecutor,
+        SynthesizeNodeExecutor, VerifyNodeExecutor,
+    },
 };
 use super::protocols::ProtocolResultReducer;
 use crate::agent::binding::request_for_intent;
@@ -1189,7 +1189,7 @@ impl RuntimeServices {
         event: TaskLifecycleEvent,
         idempotency_key: &str,
     ) -> Result<DurableRuntimeEvent, String> {
-        use crate::{
+        use crate::runtime_event_store::{
             AppendTransactionRequest, ExpectedStreamRevision, RuntimeTransactionEventInput,
         };
 
@@ -3641,22 +3641,26 @@ mod tests {
             left.executor_registry().available_kinds(),
             right.executor_registry().available_kinds()
         );
-        assert!(left
-            .executor_registry()
-            .available_kinds()
-            .contains("inline_model"));
-        assert!(left
-            .executor_registry()
-            .available_kinds()
-            .contains("tool_batch"));
-        assert!(left
-            .executor_registry()
-            .available_kinds()
-            .contains("session_dispatch"));
-        assert!(left
-            .executor_registry()
-            .available_kinds()
-            .contains("cross_plane_connector"));
+        assert!(
+            left.executor_registry()
+                .available_kinds()
+                .contains("inline_model")
+        );
+        assert!(
+            left.executor_registry()
+                .available_kinds()
+                .contains("tool_batch")
+        );
+        assert!(
+            left.executor_registry()
+                .available_kinds()
+                .contains("session_dispatch")
+        );
+        assert!(
+            left.executor_registry()
+                .available_kinds()
+                .contains("cross_plane_connector")
+        );
         assert!(!Arc::ptr_eq(
             left.cross_plane_connector_executor(),
             right.cross_plane_connector_executor()
@@ -3757,11 +3761,13 @@ mod tests {
         services
             .refresh_definition_catalog()
             .expect("catalog refresh");
-        assert!(services
-            .agent_runtime()
-            .catalog()
-            .get(definition_id.as_str())
-            .is_none());
+        assert!(
+            services
+                .agent_runtime()
+                .catalog()
+                .get(definition_id.as_str())
+                .is_none()
+        );
     }
 
     #[test]
@@ -3880,14 +3886,18 @@ mod tests {
             .agents()
             .read_revision(&revision_ref)
             .expect("candidate revision");
-        assert!(revision
-            .agent_markdown
-            .contains("repeated evidence validation failure"));
+        assert!(
+            revision
+                .agent_markdown
+                .contains("repeated evidence validation failure")
+        );
         assert!(services.evolution_release_reviews().unwrap().is_empty());
-        assert!(services
-            .consider_agent_evolution(&trigger)
-            .expect("idempotent planner")
-            .is_none());
+        assert!(
+            services
+                .consider_agent_evolution(&trigger)
+                .expect("idempotent planner")
+                .is_none()
+        );
     }
 
     #[test]
@@ -4138,11 +4148,13 @@ mod tests {
         services
             .refresh_definition_catalog()
             .expect("catalog refresh");
-        assert!(services
-            .agent_runtime()
-            .catalog()
-            .get("workspace/external/reviewer")
-            .is_none());
+        assert!(
+            services
+                .agent_runtime()
+                .catalog()
+                .get("workspace/external/reviewer")
+                .is_none()
+        );
     }
 
     #[test]
@@ -4256,10 +4268,12 @@ mod tests {
             .clone()
             .expect("stable graph id");
         let graph = services.graph_state_store().load(&graph_id).unwrap();
-        assert!(graph
-            .node_statuses
-            .values()
-            .all(|status| *status == ExecutionNodeStatus::WaitingExternal));
+        assert!(
+            graph
+                .node_statuses
+                .values()
+                .all(|status| *status == ExecutionNodeStatus::WaitingExternal)
+        );
 
         let target_outbox = store
             .claim_session_runtime_outbox(
@@ -4383,9 +4397,11 @@ mod tests {
             services.workspace_root(),
             "0.9.472",
         );
-        assert!(importer
-            .import_receipt_file(temp.path().join("missing-receipt.json"))
-            .is_err());
+        assert!(
+            importer
+                .import_receipt_file(temp.path().join("missing-receipt.json"))
+                .is_err()
+        );
 
         let graph = harness_contract::execution_graph::ExecutionGraph::new("blocked");
         let graph_id = graph.id.clone();
@@ -4644,7 +4660,7 @@ mod tests {
             let agent_id = format!("researcher-slot-{index}");
             let node_id = format!("binding-agent-node-{index}");
             let intent = AgentTaskIntent {
-                selected_agent_id: None,
+                selected_agent_id: Some("builtin/cowd/direct".to_string()),
                 definition_ref: None,
                 granted_capabilities: Vec::new(),
                 run_id: format!("binding-run-{index}"),
@@ -4658,11 +4674,26 @@ mod tests {
                 expected_graph_revision: 0,
                 objective: format!("research isolated domain {index}"),
                 acceptance: vec!["evidence".to_string()],
-                constraints: vec![format!("role_slot:researcher-{index}")],
+                constraints: vec![
+                    format!("role_slot:researcher-{index}"),
+                    format!(
+                        "team_acceptance_contract:{}",
+                        serde_json::to_string(&vec![
+                            harness_contract::team::TeamAcceptanceRequirement {
+                                criterion: "evidence".to_string(),
+                                check:
+                                    harness_contract::team::TeamAcceptanceCheck::ScopedEvidence {
+                                        scopes: vec![format!("read:binding-domain-{index}")],
+                                    },
+                            },
+                        ])
+                        .expect("team acceptance contract")
+                    ),
+                ],
                 context_refs: Vec::new(),
                 evidence_refs: Vec::new(),
-                resource_scopes: Vec::new(),
-                allowed_tools: Vec::new(),
+                resource_scopes: vec![format!("read:binding-domain-{index}")],
+                allowed_tools: vec!["read_file".to_string()],
                 allowed_skills: Vec::new(),
                 permission_lease: "read_only".to_string(),
                 model_lease: "fast".to_string(),
@@ -4690,13 +4721,23 @@ mod tests {
         let graph = services
             .compile_graph_agent_intents(graph)
             .expect("bind graph");
+        assert!(graph.nodes.iter().all(|node| {
+            serde_json::from_str::<AgentTaskPacket>(&node.payload_ref)
+                .ok()
+                .is_some_and(|packet| {
+                    packet
+                        .constraints
+                        .iter()
+                        .any(|constraint| constraint.starts_with("team_acceptance_contract:"))
+                })
+        }));
 
         let report = services
             .graph_runner()
             .start(graph)
             .await
             .expect("run graph");
-        assert_eq!(report.completed, 8);
+        assert_eq!(report.completed, 8, "parallel agent report: {report:?}");
         let snapshots = services
             .agent_runtime()
             .list()
@@ -4771,10 +4812,12 @@ mod tests {
             .graph_state_store()
             .load(&projection.graph_id)
             .expect("canonical graph");
-        assert!(graph
-            .node_statuses
-            .values()
-            .all(|status| *status == ExecutionNodeStatus::Completed));
+        assert!(
+            graph
+                .node_statuses
+                .values()
+                .all(|status| *status == ExecutionNodeStatus::Completed)
+        );
         let team_bindings = graph
             .nodes
             .iter()
@@ -4797,9 +4840,11 @@ mod tests {
         assert!(team_bindings.iter().all(|binding| {
             binding.data_lease.team_id.as_deref() == Some("team-runtime-integration")
         }));
-        assert!(services.team_runtime().projection_json()["teams"]
-            .as_array()
-            .is_some_and(|teams| teams.len() == 1));
+        assert!(
+            services.team_runtime().projection_json()["teams"]
+                .as_array()
+                .is_some_and(|teams| teams.len() == 1)
+        );
     }
 
     #[tokio::test]

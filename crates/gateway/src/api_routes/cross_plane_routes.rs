@@ -1,11 +1,11 @@
 use std::{collections::HashSet, path::Path as FsPath, sync::Arc};
 
 use axum::{
+    Json, Router,
     extract::{Extension, Path, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, post},
-    Json, Router,
 };
 use runtime::{
     CrossPlaneAction, CrossPlaneDecisionEvidence, CrossPlaneDispatchTarget, CrossPlaneGrant,
@@ -13,7 +13,7 @@ use runtime::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::{message_connector_routes, principal_actor_id, AppState, AuthenticatedPrincipal};
+use super::{AppState, AuthenticatedPrincipal, message_connector_routes, principal_actor_id};
 use crate::services::{CrossPlaneExecutionRecord, GatewayCrossPlaneExecutor};
 
 pub(super) fn router() -> Router<Arc<AppState>> {

@@ -1,16 +1,16 @@
 use std::{collections::HashMap, sync::Arc};
 
 use axum::{
+    Json, Router,
     extract::{Extension, Query, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
 use runtime::ApprovalConfig;
 use serde::Deserialize;
 
-use super::{api_error, AppState, AuthenticatedPrincipal, ErrorResponse};
+use super::{AppState, AuthenticatedPrincipal, ErrorResponse, api_error};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -109,7 +109,9 @@ async fn approval_exact_handler(
             (
                 StatusCode::NOT_FOUND,
                 Json(ErrorResponse {
-                    error: format!("approval {id} not found or outside the authenticated principal scope"),
+                    error: format!(
+                        "approval {id} not found or outside the authenticated principal scope"
+                    ),
                 }),
             )
         })

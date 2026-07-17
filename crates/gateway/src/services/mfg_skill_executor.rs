@@ -54,9 +54,24 @@ impl GatewayMfgSkillExecutor {
                     .metric_keys
                     .iter()
                     .map(|metric_id| {
-                        self.matrix
-                            .metric_lineage(&self.config_home, metric_id, 4)
-                            .map_err(|error| error.to_string())
+                        match self.matrix.metric_lineage(&self.config_home, metric_id, 4) {
+                            Ok(lineage) => Ok(serde_json::json!({
+                                "metric_id": metric_id,
+                                "status": "resolved",
+                                "lineage": lineage,
+                            })),
+                            // The skill's declared metric scope can be broader
+                            // than the current incident's materialized Matrix
+                            // metrics.  This is a completed, auditable absence,
+                            // not a Runtime transport failure.
+                            Err(super::GatewayMatrixRepositoryError::NotFound(_)) => {
+                                Ok(serde_json::json!({
+                                    "metric_id": metric_id,
+                                    "status": "not_found",
+                                }))
+                            }
+                            Err(error) => Err(error.to_string()),
+                        }
                     })
                     .collect::<Result<Vec<_>, _>>();
                 tool_result(

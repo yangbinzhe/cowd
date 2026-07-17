@@ -1,7 +1,7 @@
 use axum::extract::Extension;
 use sha2::{Digest, Sha256};
 
-use crate::api_routes::{principal_actor_id, AuthenticatedPrincipal};
+use crate::api_routes::{AuthenticatedPrincipal, principal_actor_id};
 
 use super::*;
 
@@ -719,7 +719,7 @@ pub(super) async fn mfg_incident_skill_run_handler(
         .nodes
         .iter()
         .find(|node| {
-            node.id == tool_node_id
+            node.node_id == tool_node_id
                 && node.kind == harness_contract::execution_graph::ExecutionNodeKind::ToolBatch
                 && node.executor_kind == "cross_plane_connector"
         })

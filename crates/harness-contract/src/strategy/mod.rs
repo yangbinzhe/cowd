@@ -1427,9 +1427,11 @@ impl StrategyRouter {
 
         let mut pattern = select_pattern(&understanding, &self.policy, &mut reasons);
         let mut source = StrategyDecisionSource::Deterministic;
+        let mut proposed_candidate = None;
         if let Some(proposal) = &input.proposal {
             if proposal_is_executable(proposal, &understanding) {
                 pattern = proposal.pattern;
+                proposed_candidate = candidate_for_pattern(proposal.pattern);
                 modifiers.extend(proposal.modifiers.iter().copied());
                 reasons.push(format!("validated model proposal: {}", proposal.rationale));
                 source = StrategyDecisionSource::ModelValidated;
@@ -1453,15 +1455,45 @@ impl StrategyRouter {
             &input.candidate_costs,
             &input.resource_snapshot,
         );
-        let selected_candidate = select_execution_candidate(
-            &understanding,
-            &candidate_estimates,
-            &input.resource_snapshot,
-        );
+        let selected_candidate = if matches!(source, StrategyDecisionSource::ExperienceAdapted) {
+            candidate_for_pattern(pattern).unwrap_or_else(|| {
+                select_execution_candidate(
+                    &understanding,
+                    &candidate_estimates,
+                    &input.resource_snapshot,
+                )
+            })
+        } else if let Some(candidate) = proposed_candidate {
+            candidate_estimates
+                .iter()
+                .find(|estimate| estimate.candidate == candidate && estimate.eligible)
+                .map_or_else(
+                    || {
+                        select_execution_candidate(
+                            &understanding,
+                            &candidate_estimates,
+                            &input.resource_snapshot,
+                        )
+                    },
+                    |estimate| estimate.candidate,
+                )
+        } else {
+            select_execution_candidate(
+                &understanding,
+                &candidate_estimates,
+                &input.resource_snapshot,
+            )
+        };
         if !matches!(
             pattern,
             ExecutionPattern::Deliberate | ExecutionPattern::Supervise
-        ) {
+        ) && (!matches!(pattern, ExecutionPattern::Execute)
+            || selected_candidate == ExecutionCandidateKind::Team)
+            && !matches!(
+                source,
+                StrategyDecisionSource::ModelValidated | StrategyDecisionSource::ExperienceAdapted
+            )
+        {
             pattern = pattern_for_candidate(selected_candidate, &understanding);
             reasons.push(format!(
                 "integer cost model selected {}",
@@ -1568,15 +1600,15 @@ fn estimate_execution_candidates(
     let team_eligible = team_resource_eligible
         && (understanding.requests_multi_agent
             || (workstreams >= 2
-                && matches!(
+                && (matches!(
                     understanding.complexity,
                     TaskComplexity::Complex | TaskComplexity::Strategic
-                )));
+                ) || workstreams >= 3)));
     let parallel_width = u64::from(
         resources
             .tool_concurrency
             .max(1)
-            .min(understanding.independent_workstreams.max(2)),
+            .min(u16::from(understanding.independent_workstreams.max(2))),
     );
     let parallel_execution_width = if understanding.requires_write {
         1
@@ -1587,7 +1619,7 @@ fn estimate_execution_candidates(
         resources
             .team_slots
             .max(1)
-            .min(understanding.independent_workstreams.max(2)),
+            .min(u16::from(understanding.independent_workstreams.max(2))),
     );
     // The governed write topology is one bounded implementer followed by a
     // reviewer. It improves verification quality but is not parallel write
@@ -1778,25 +1810,65 @@ fn select_execution_candidate(
                 estimate.candidate
             });
     }
+    // Automatic Team selection is allowed only for a genuinely strategic,
+    // multi-domain task.  A high provider-concurrency penalty is a runtime
+    // capacity fact: it blocks automatic fan-out, but must not erase an
+    // explicit Team request (which is retained with its cost warning).
+    if (matches!(
+        understanding.complexity,
+        TaskComplexity::Complex | TaskComplexity::Strategic
+    ) || understanding.independent_workstreams >= 3)
+        && understanding.independent_workstreams >= 2
+        && resources.provider_concurrency_penalty_bp < 8_000
+    {
+        if let Some(team) = estimates
+            .iter()
+            .find(|estimate| estimate.candidate == ExecutionCandidateKind::Team)
+            .filter(|estimate| estimate.eligible)
+        {
+            return team.candidate;
+        }
+    }
+    if understanding.requires_external_facts {
+        return estimates
+            .iter()
+            .find(|estimate| estimate.candidate == ExecutionCandidateKind::ParallelTools)
+            .filter(|estimate| estimate.eligible)
+            .map_or(ExecutionCandidateKind::Direct, |estimate| {
+                estimate.candidate
+            });
+    }
     estimates
         .iter()
         .filter(|estimate| estimate.eligible)
+        .filter(|estimate| {
+            estimate.candidate != ExecutionCandidateKind::Team
+                || resources.provider_concurrency_penalty_bp < 8_000
+        })
         .max_by_key(|estimate| {
             (
                 estimate.net_benefit_score,
                 std::cmp::Reverse(estimate.candidate),
             )
         })
-        .map_or_else(
-            || {
-                if resources.provider_available {
-                    ExecutionCandidateKind::Direct
-                } else {
-                    ExecutionCandidateKind::ParallelTools
-                }
-            },
-            |estimate| estimate.candidate,
-        )
+        // No candidate is executable without a provider.  Keep the fallback
+        // representationally direct so Runtime can expose the actual provider
+        // outage as a blocked direct turn instead of inventing a tool fan-out
+        // that cannot make progress.
+        .map_or(ExecutionCandidateKind::Direct, |estimate| {
+            estimate.candidate
+        })
+}
+
+fn candidate_for_pattern(pattern: ExecutionPattern) -> Option<ExecutionCandidateKind> {
+    match pattern {
+        ExecutionPattern::Direct | ExecutionPattern::Execute => {
+            Some(ExecutionCandidateKind::Direct)
+        }
+        ExecutionPattern::Explore => Some(ExecutionCandidateKind::ParallelTools),
+        ExecutionPattern::Collaborate => Some(ExecutionCandidateKind::Team),
+        ExecutionPattern::Deliberate | ExecutionPattern::Supervise => None,
+    }
 }
 
 fn pattern_for_candidate(
@@ -2377,7 +2449,14 @@ const EXTERNAL_FACT_TERMS: &[&str] = &[
     "读取",
     "read_file",
 ];
-const PARALLEL_TERMS: &[&str] = &["parallel", "并行", "同时", "fanout", "多路"];
+const PARALLEL_TERMS: &[&str] = &[
+    "parallel",
+    "simultaneously",
+    "并行",
+    "同时",
+    "fanout",
+    "多路",
+];
 const MULTI_AGENT_TERMS: &[&str] = &[
     "multi-agent",
     "多agent",
@@ -2449,14 +2528,18 @@ mod tests {
     }
 
     fn assert_contract_legal(decision: &StrategyDecision) {
-        assert!(decision
-            .modifiers
-            .iter()
-            .all(|modifier| decision.pattern.supports_modifier(*modifier)));
-        assert!(decision
-            .gates
-            .iter()
-            .all(|gate| decision.pattern.supports_gate(*gate)));
+        assert!(
+            decision
+                .modifiers
+                .iter()
+                .all(|modifier| decision.pattern.supports_modifier(*modifier))
+        );
+        assert!(
+            decision
+                .gates
+                .iter()
+                .all(|gate| decision.pattern.supports_gate(*gate))
+        );
     }
 
     fn paired_calibration(
@@ -2548,12 +2631,16 @@ mod tests {
         assert_eq!(decision.understanding.complexity, TaskComplexity::Strategic);
         assert!(decision.uses_modifier(ExecutionModifier::WithVerifier));
         assert_eq!(decision.policy_version, "strategy-decision-v4");
-        assert!(decision
-            .required_capabilities
-            .contains(&KernelCapability::ExecutionGraph));
-        assert!(decision
-            .required_capabilities
-            .contains(&KernelCapability::VerificationLedger));
+        assert!(
+            decision
+                .required_capabilities
+                .contains(&KernelCapability::ExecutionGraph)
+        );
+        assert!(
+            decision
+                .required_capabilities
+                .contains(&KernelCapability::VerificationLedger)
+        );
     }
 
     #[test]
@@ -2826,13 +2913,17 @@ mod tests {
             });
         }
 
-        assert!(store
-            .cost_summary_for_candidate(&understanding, ExecutionCandidateKind::Team)
-            .is_none());
+        assert!(
+            store
+                .cost_summary_for_candidate(&understanding, ExecutionCandidateKind::Team)
+                .is_none()
+        );
         let enriched = store.enrich_input(input);
-        assert!(!enriched
-            .candidate_costs
-            .contains_key(&ExecutionCandidateKind::Team));
+        assert!(
+            !enriched
+                .candidate_costs
+                .contains_key(&ExecutionCandidateKind::Team)
+        );
     }
 
     #[test]
@@ -2861,9 +2952,11 @@ mod tests {
             paired_calibration: None,
         });
 
-        assert!(store
-            .cost_summary_for_candidate(&understanding, ExecutionCandidateKind::Direct)
-            .is_none());
+        assert!(
+            store
+                .cost_summary_for_candidate(&understanding, ExecutionCandidateKind::Direct)
+                .is_none()
+        );
     }
 
     #[test]
@@ -2906,10 +2999,12 @@ mod tests {
         assert_eq!(decision.pattern, ExecutionPattern::Direct);
         assert_eq!(decision.source, StrategyDecisionSource::Deterministic);
         assert!(!decision.uses_modifier(ExecutionModifier::Background));
-        assert!(decision
-            .reasons
-            .iter()
-            .any(|reason| reason.contains("rejected by contract policy")));
+        assert!(
+            decision
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("rejected by contract policy"))
+        );
         assert_contract_legal(&decision);
     }
 
@@ -3036,10 +3131,12 @@ mod tests {
         );
 
         assert_eq!(decision.pattern, ExecutionPattern::Execute);
-        assert!(decision
-            .reasons
-            .iter()
-            .any(|reason| reason.contains("low multi-agent lift")));
+        assert!(
+            decision
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("low multi-agent lift"))
+        );
     }
 
     #[test]
@@ -3188,7 +3285,7 @@ mod tests {
                         "parallel_tool_batches": if condition == "direct" { 0 } else { 1 },
                         "judge": {
                             "judge_isolation_verified": true,
-                            "observed_models": ["judge-model"]
+                            "observed_models": ["test-judge"]
                         },
                         "workspace_reset_verified": true,
                         "workspace_mutation_verified": true,
@@ -3271,9 +3368,11 @@ mod tests {
 
         let mut rejected = report;
         rejected["gate"]["claim_allowed"] = serde_json::Value::Bool(false);
-        assert!(StrategyExperienceStore::new()
-            .import_paired_evaluation_report(&rejected)
-            .is_err());
+        assert!(
+            StrategyExperienceStore::new()
+                .import_paired_evaluation_report(&rejected)
+                .is_err()
+        );
     }
 
     #[test]

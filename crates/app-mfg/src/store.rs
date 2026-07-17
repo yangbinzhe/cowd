@@ -984,7 +984,7 @@ impl MfgStore {
 #[cfg(test)]
 mod workflow_tests {
     use super::*;
-    use crate::{run_server_manufacturing_skill, server_manufacturing_skill_pack, MfgSkillPlan};
+    use crate::{MfgSkillPlan, run_server_manufacturing_skill, server_manufacturing_skill_pack};
 
     fn runtime_completed(mut run: MfgSkillRun) -> MfgSkillRun {
         run.status = "completed".to_string();
@@ -1106,13 +1106,17 @@ mod workflow_tests {
         assert!(completed.revision > planned.revision);
         assert_eq!(completed.incident_id, incident.incident_id);
         assert_eq!(recorded_run.execution_id, run.execution_id);
-        assert!(store
-            .get_skill_run(run.execution_id.as_deref().unwrap())
-            .unwrap()
-            .is_some());
-        assert!(completed
-            .evidence
-            .iter()
-            .any(|item| item.kind == "mfg_skill_run"));
+        assert!(
+            store
+                .get_skill_run(run.execution_id.as_deref().unwrap())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            completed
+                .evidence
+                .iter()
+                .any(|item| item.kind == "mfg_skill_run")
+        );
     }
 }

@@ -508,7 +508,7 @@ fn capability_scopes_overlap(left: &str, right: &str) -> bool {
                 value => components.push(value),
             }
         }
-        (!components.is_empty()).then_some((mode, components.join("/")))
+        (!components.is_empty()).then_some((mode.to_string(), components.join("/")))
     };
     let Some((left_mode, left_path)) = parse(left) else {
         return left == right;
@@ -517,7 +517,7 @@ fn capability_scopes_overlap(left: &str, right: &str) -> bool {
         return left == right;
     };
     let workspace_mode = |mode: &str| matches!(mode, "read" | "write" | "workspace");
-    if !workspace_mode(left_mode) || !workspace_mode(right_mode) {
+    if !workspace_mode(&left_mode) || !workspace_mode(&right_mode) {
         return left == right;
     }
     let contains = |ancestor: &str, descendant: &str| {

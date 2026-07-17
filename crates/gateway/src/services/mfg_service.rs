@@ -3,22 +3,22 @@ use std::{
     path::Path,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
     },
 };
 
 use super::ServiceEnvelope;
 use app_mfg::{
-    plan_server_manufacturing_skills, run_server_manufacturing_skill,
-    server_manufacturing_skill_pack, MfgActionExecution, MfgActionExecutionRequest,
-    MfgActionFeedback, MfgAlertCommandInput, MfgAlertOccurrence, MfgAlertRule,
-    MfgAlertSubscription, MfgAssignment, MfgAssignmentCommandInput, MfgCasePromotion,
-    MfgCockpitProfile, MfgCockpitProjection, MfgCockpitReportDeliveryReceipt,
-    MfgCockpitReportRequest, MfgCockpitReportSnapshot, MfgCockpitWidgetProjection,
-    MfgCommandReceipt, MfgCrossPlaneBridgeReceipt, MfgDomainSeedResult, MfgForecastProjection,
-    MfgHealth, MfgIncident, MfgMemoryCase, MfgMetricRecomputeResult, MfgOperationalAnalysis,
-    MfgPlaybook, MfgRepositoryError, MfgSkillManifest, MfgSkillPlan, MfgSkillRun, MfgStore,
+    MfgActionExecution, MfgActionExecutionRequest, MfgActionFeedback, MfgAlertCommandInput,
+    MfgAlertOccurrence, MfgAlertRule, MfgAlertSubscription, MfgAssignment,
+    MfgAssignmentCommandInput, MfgCasePromotion, MfgCockpitProfile, MfgCockpitProjection,
+    MfgCockpitReportDeliveryReceipt, MfgCockpitReportRequest, MfgCockpitReportSnapshot,
+    MfgCockpitWidgetProjection, MfgCommandReceipt, MfgCrossPlaneBridgeReceipt, MfgDomainSeedResult,
+    MfgForecastProjection, MfgHealth, MfgIncident, MfgMemoryCase, MfgMetricRecomputeResult,
+    MfgOperationalAnalysis, MfgPlaybook, MfgRepositoryError, MfgSkillManifest, MfgSkillPlan,
+    MfgSkillRun, MfgStore, plan_server_manufacturing_skills, run_server_manufacturing_skill,
+    server_manufacturing_skill_pack,
 };
 use app_mfg_contract::{
     MfgReportDeliveryReview, MfgReportDeliveryReviewDecision, MfgReportDeliveryReviewEffect,
@@ -293,7 +293,11 @@ impl MfgService {
         let Some(incident) = store.get_incident(incident_id)? else {
             return Ok(None);
         };
-        let analysis = store.analyze_incident(incident_id).ok();
+        // A context lookup is used by read and Preview routes (including
+        // skill planning).  It must not materialize an analysis or advance
+        // the incident revision: analysis has its own explicit durable
+        // action and CAS boundary.
+        let analysis = store.latest_analysis_for_incident(incident_id)?;
         let packet = incident
             .evidence_packet_id
             .as_deref()

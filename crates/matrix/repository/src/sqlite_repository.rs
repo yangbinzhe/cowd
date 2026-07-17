@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use storage::{SqliteConnectionFactory, StorageHandle};
@@ -13,18 +13,18 @@ use thiserror::Error;
 
 use crate::MatrixSqliteDataPlane;
 use matrix_core::{
-    build_metric_compute_jobs, MatrixAttentionItem, MatrixChangeEvent, MatrixComputeJob,
-    MatrixComputeJobInput, MatrixComputePlan, MatrixConnectorRun, MatrixConnectorRunInput,
-    MatrixDataPlane, MatrixDataPlaneHealth, MatrixDataPlaneIngestPlan,
-    MatrixDataPlaneIngestPlanInput, MatrixDataPlaneWatermark, MatrixEntity, MatrixEvidencePacket,
-    MatrixEvidenceSourceRef, MatrixFact, MatrixImpactHop, MatrixImpactTrace,
-    MatrixMetricAttentionPlan, MatrixMetricAttentionScore, MatrixMetricDefinition,
-    MatrixMetricDependency, MatrixMetricLineage, MatrixMetricSnapshot, MatrixMetricSnapshotItem,
-    MatrixMetricState, MatrixOntologyPack, MatrixQualityGateDecision, MatrixRelation,
-    MatrixScenarioResult, MatrixScenarioRun, MatrixScenarioRunStatus, MatrixScenarioSpec,
-    MatrixSeverity, MatrixSourceDeltaPlan, MatrixSourceKey, MatrixSourcePack,
-    MatrixSourcePackValidation, MatrixSourceSnapshot, MatrixSourceSnapshotApplyReport,
-    MatrixSourceSnapshotInput, MatrixSourceSnapshotPlan,
+    MatrixAttentionItem, MatrixChangeEvent, MatrixComputeJob, MatrixComputeJobInput,
+    MatrixComputePlan, MatrixConnectorRun, MatrixConnectorRunInput, MatrixDataPlane,
+    MatrixDataPlaneHealth, MatrixDataPlaneIngestPlan, MatrixDataPlaneIngestPlanInput,
+    MatrixDataPlaneWatermark, MatrixEntity, MatrixEvidencePacket, MatrixEvidenceSourceRef,
+    MatrixFact, MatrixImpactHop, MatrixImpactTrace, MatrixMetricAttentionPlan,
+    MatrixMetricAttentionScore, MatrixMetricDefinition, MatrixMetricDependency,
+    MatrixMetricLineage, MatrixMetricSnapshot, MatrixMetricSnapshotItem, MatrixMetricState,
+    MatrixOntologyPack, MatrixQualityGateDecision, MatrixRelation, MatrixScenarioResult,
+    MatrixScenarioRun, MatrixScenarioRunStatus, MatrixScenarioSpec, MatrixSeverity,
+    MatrixSourceDeltaPlan, MatrixSourceKey, MatrixSourcePack, MatrixSourcePackValidation,
+    MatrixSourceSnapshot, MatrixSourceSnapshotApplyReport, MatrixSourceSnapshotInput,
+    MatrixSourceSnapshotPlan, build_metric_compute_jobs,
 };
 
 #[derive(Debug, Error)]
@@ -201,6 +201,23 @@ impl MatrixSqliteRepository {
             plan.affected_metric_ids = affected;
         }
         Ok(plan)
+    }
+
+    /// Commit the durable cursor of an already-applied source batch.
+    ///
+    /// Planning deliberately has no persistence side effect: callers may use
+    /// it for previews.  The source-ingestion pipeline invokes this only after
+    /// its snapshot rows have been applied, so a watermark is never advanced
+    /// for a batch that did not reach the Matrix store.
+    pub fn commit_data_plane_ingest(
+        &self,
+        plan: &MatrixDataPlaneIngestPlan,
+    ) -> Result<(), MatrixSqliteRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        upsert_data_plane_watermark(&connection, &plan.watermark)
     }
 
     pub fn upsert_entity(

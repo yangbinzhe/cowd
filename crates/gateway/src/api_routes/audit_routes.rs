@@ -1,10 +1,10 @@
 use std::{collections::HashMap, sync::Arc};
 
 use axum::{
+    Json, Router,
     extract::{Extension, Query, State as AxumState},
     response::IntoResponse,
     routing::get,
-    Json, Router,
 };
 
 use super::{AppState, AuthenticatedPrincipal};

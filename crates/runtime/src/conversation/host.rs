@@ -11,15 +11,15 @@ use crate::execution_core::{
     NodeExecutionTicket, NodeExecutorError,
 };
 use crate::{
-    model_context_window_with_overrides, permissions::SharedPrompter, AutoCompactionEvent,
-    ContentBlock, ContextAuthority, ContextEnvelope, ContextItem, ContextProfile, ContextRole,
-    ContextSourceKind, ContextVisibility, ConversationMessage, CowdEvent, CowdEventBus,
-    HookAbortSignal, HookProgressReporter, PermissionPolicy, ProviderRuntimeClient,
-    ProviderToolDefinition, ResumeContextPacket, RuntimeError, RuntimeFeatureConfig, Session,
-    ToolCallback, ToolExecutor, TurnSummary,
+    AutoCompactionEvent, ContentBlock, ContextAuthority, ContextEnvelope, ContextItem,
+    ContextProfile, ContextRole, ContextSourceKind, ContextVisibility, ConversationMessage,
+    CowdEvent, CowdEventBus, HookAbortSignal, HookProgressReporter, PermissionPolicy,
+    ProviderRuntimeClient, ProviderToolDefinition, ResumeContextPacket, RuntimeError,
+    RuntimeFeatureConfig, Session, ToolCallback, ToolExecutor, TurnSummary,
+    model_context_window_with_overrides, permissions::SharedPrompter,
 };
 use async_trait::async_trait;
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 use harness_contract::agent::AgentTaskIntent;
 use harness_contract::execution_graph::{
     ExecutionEdge, ExecutionEdgeKind, ExecutionNodeKind, ExecutionNodeResult, ExecutionNodeSpec,
@@ -623,6 +623,7 @@ where
             content: content.to_string(),
             prompter: prompter.clone(),
             first_model_step: true,
+            pending_next_model_context: Vec::new(),
             next_calls: Vec::new(),
             next_resource_scopes: Vec::new(),
             assistant_messages: Vec::new(),
@@ -1337,7 +1338,7 @@ impl EvaluationResourceQuotaGuard {
                 _ => {
                     return Err(RuntimeError::new(format!(
                         "unknown evaluation resource constraint `{name}`"
-                    )))
+                    )));
                 }
             };
             let snapshot = guard.manager.snapshot(&kind).map_err(|error| {
@@ -1812,13 +1813,29 @@ where
             "write_attempt_paths".to_string(),
             serde_json::json!(child_write_attempt_paths),
         );
+        // `RuntimeOrchestrationResult` has already verified materialized Team
+        // working state against the durable child graph. Preserve that fact in
+        // the parent receipt so the turn outcome and every Surface project the
+        // same completed-state truth instead of reverting to the default false.
+        receipt.insert(
+            "working_state_verified".to_string(),
+            serde_json::json!(
+                result
+                    .evidence
+                    .get("working_state_verified")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            ),
+        );
         receipt.insert(
             "replayed_team_request".to_string(),
-            serde_json::json!(result
-                .evidence
-                .get("reused")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)),
+            serde_json::json!(
+                result
+                    .evidence
+                    .get("reused")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            ),
         );
     }
     let receipt_text = serde_json::to_string(&receipt)
@@ -2353,6 +2370,9 @@ struct TurnGraphState {
     content: String,
     prompter: SharedPrompter,
     first_model_step: bool,
+    /// Runtime-authored checkpoint instructions that must be inserted in the
+    /// next provider request's durable context envelope exactly once.
+    pending_next_model_context: Vec<ContextItem>,
     next_calls: Vec<ModelToolCall>,
     next_resource_scopes: Vec<String>,
     assistant_messages: Vec<ConversationMessage>,
@@ -2582,6 +2602,7 @@ where
             force_text_only_response,
             clean_terminal_synthesis,
             clean_terminal_evidence,
+            pending_next_model_context,
         ) = {
             let mut state = self.state.lock().await;
             let first = state.first_model_step;
@@ -2635,6 +2656,7 @@ where
                 std::mem::take(&mut state.force_text_only_next_model),
                 clean_terminal_synthesis,
                 clean_terminal_evidence,
+                std::mem::take(&mut state.pending_next_model_context),
             )
         };
         if let Some(intervention) = fuse_intervention {
@@ -2672,6 +2694,9 @@ where
             return Ok(outcome);
         }
         let mut runtime = self.runtime.lock().await;
+        for item in pending_next_model_context {
+            runtime.push_next_model_context_item(item);
+        }
         if let Some(bus) = runtime.cowd_bus().cloned() {
             bus.emit(CowdEvent::ExecutionPhase {
                 status: harness_contract::projection::ExecutionLiveStatus::CallingModel,
@@ -2997,6 +3022,7 @@ where
                 // stale proposal previously encouraged a completed protocol
                 // synthesis role to continue exploring.
                 let mut model_intervention = None;
+                let mut next_model_context = None;
                 let next = match intent {
                     ModelStepIntent::FinalAnswer { text } => {
                         let mut text = strip_trailing_simulated_tool_markup(text);
@@ -3031,11 +3057,20 @@ where
                             if state.reasoning_only_attempts <= continuation_budget {
                                 let instruction = format!(
                                     "Runtime continuation (mandatory): the previous model step produced private reasoning but no visible answer. Continue the same goal from retained evidence. If evidence is still missing, use the smallest relevant available tool; otherwise write the visible final answer now. Do not finish with reasoning only. Continuation attempt {}/{}.",
-                                    state.reasoning_only_attempts,
-                                    continuation_budget,
+                                    state.reasoning_only_attempts, continuation_budget,
                                 );
                                 state.content.push_str("\n\n");
                                 state.content.push_str(&instruction);
+                                let mut item = ContextItem::new(
+                                    format!("runtime-reasoning-continuation:{}", ticket.node_id),
+                                    ContextSourceKind::Task,
+                                    ContextRole::Instruction,
+                                    instruction.clone(),
+                                );
+                                item.authority = ContextAuthority::System;
+                                item.visibility = ContextVisibility::Private;
+                                item.evidence = vec![format!("execution_node:{}", ticket.node_id)];
+                                next_model_context = Some(item);
                                 model_intervention =
                                     Some(harness_contract::goal::RuntimeIntervention {
                                         goal_id: state.goal_id.clone(),
@@ -3089,8 +3124,7 @@ where
                             if state.terminal_recovery_attempts <= normal_recovery_budget {
                                 let instruction = format!(
                                     "Runtime final-answer recovery (mandatory): the prior provider response was unusable ({reason}). Do not call tools or emit simulated tool markup. Use only already committed evidence and return a concise final answer now; name any remaining uncertainty explicitly. Recovery attempt {}/{}.",
-                                    state.terminal_recovery_attempts,
-                                    normal_recovery_budget,
+                                    state.terminal_recovery_attempts, normal_recovery_budget,
                                 );
                                 state.content.push_str("\n\n");
                                 state.content.push_str(&instruction);
@@ -3119,8 +3153,8 @@ where
                             {
                                 state.clean_terminal_synthesis_attempted = true;
                                 state.clean_terminal_synthesis_next = true;
-                                model_intervention =
-                                    Some(harness_contract::goal::RuntimeIntervention {
+                                model_intervention = Some(
+                                    harness_contract::goal::RuntimeIntervention {
                                         goal_id: state.goal_id.clone(),
                                         kind: RuntimeInterventionKind::Synthesize,
                                         reason: format!(
@@ -3131,7 +3165,8 @@ where
                                             ticket.node_id
                                         )],
                                         expected_graph_revision: None,
-                                    });
+                                    },
+                                );
                                 vec![dynamic_node(
                                     ticket,
                                     state.iterations,
@@ -3197,8 +3232,8 @@ where
                             {
                                 state.clean_terminal_retry_attempted = true;
                                 state.clean_terminal_synthesis_next = true;
-                                model_intervention =
-                                    Some(harness_contract::goal::RuntimeIntervention {
+                                model_intervention = Some(
+                                    harness_contract::goal::RuntimeIntervention {
                                         goal_id: state.goal_id.clone(),
                                         kind: RuntimeInterventionKind::Synthesize,
                                         reason: format!(
@@ -3209,7 +3244,8 @@ where
                                             ticket.node_id
                                         )],
                                         expected_graph_revision: None,
-                                    });
+                                    },
+                                );
                                 vec![dynamic_node(
                                     ticket,
                                     state.iterations,
@@ -3225,15 +3261,20 @@ where
                                         "Execution could not obtain a usable final answer after bounded normal and clean synthesis recovery: {reason}. Committed evidence was retained; provide a new constraint, provider, or explicit replan to continue."
                                     ),
                                 ));
-                                model_intervention = Some(harness_contract::goal::RuntimeIntervention {
-                                    goal_id: state.goal_id.clone(),
-                                    kind: RuntimeInterventionKind::Block,
-                                    reason: format!(
-                                        "provider produced unusable final output after one normal and one clean synthesis attempt: {reason}",
-                                    ),
-                                    evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
-                                    expected_graph_revision: None,
-                                });
+                                model_intervention = Some(
+                                    harness_contract::goal::RuntimeIntervention {
+                                        goal_id: state.goal_id.clone(),
+                                        kind: RuntimeInterventionKind::Block,
+                                        reason: format!(
+                                            "provider produced unusable final output after one normal and one clean synthesis attempt: {reason}",
+                                        ),
+                                        evidence_refs: vec![format!(
+                                            "execution_node:{}",
+                                            ticket.node_id
+                                        )],
+                                        expected_graph_revision: None,
+                                    },
+                                );
                                 let mut node = dynamic_node(
                                     ticket,
                                     state.iterations,
@@ -3276,8 +3317,8 @@ where
                         if let Some(violation) = evaluation_scope_violation {
                             state.assistant_messages.pop();
                             state.pending_transcript.remove(&ticket.node_id);
-                            model_intervention =
-                                Some(harness_contract::goal::RuntimeIntervention {
+                            model_intervention = Some(
+                                harness_contract::goal::RuntimeIntervention {
                                     goal_id: state.goal_id.clone(),
                                     kind: RuntimeInterventionKind::Replan,
                                     reason: format!(
@@ -3288,7 +3329,8 @@ where
                                         ticket.node_id
                                     )],
                                     expected_graph_revision: None,
-                                });
+                                },
+                            );
                             vec![dynamic_node(
                                 ticket,
                                 state.iterations,
@@ -3374,8 +3416,8 @@ where
                         {
                             state.assistant_messages.pop();
                             state.pending_transcript.remove(&ticket.node_id);
-                            model_intervention =
-                                Some(harness_contract::goal::RuntimeIntervention {
+                            model_intervention = Some(
+                                harness_contract::goal::RuntimeIntervention {
                                     goal_id: state.goal_id.clone(),
                                     kind: RuntimeInterventionKind::Replan,
                                     reason: format!(
@@ -3386,7 +3428,8 @@ where
                                         ticket.node_id
                                     )],
                                     expected_graph_revision: None,
-                                });
+                                },
+                            );
                             vec![dynamic_node(
                                 ticket,
                                 state.iterations,
@@ -3406,8 +3449,8 @@ where
                         {
                             state.assistant_messages.pop();
                             state.pending_transcript.remove(&ticket.node_id);
-                            model_intervention =
-                                Some(harness_contract::goal::RuntimeIntervention {
+                            model_intervention = Some(
+                                harness_contract::goal::RuntimeIntervention {
                                     goal_id: state.goal_id.clone(),
                                     kind: RuntimeInterventionKind::Replan,
                                     reason: format!(
@@ -3418,7 +3461,8 @@ where
                                         ticket.node_id
                                     )],
                                     expected_graph_revision: None,
-                                });
+                                },
+                            );
                             vec![dynamic_node(
                                 ticket,
                                 state.iterations,
@@ -3462,8 +3506,8 @@ where
                         {
                             state.assistant_messages.pop();
                             state.pending_transcript.remove(&ticket.node_id);
-                            model_intervention =
-                                Some(harness_contract::goal::RuntimeIntervention {
+                            model_intervention = Some(
+                                harness_contract::goal::RuntimeIntervention {
                                     goal_id: state.goal_id.clone(),
                                     kind: RuntimeInterventionKind::Replan,
                                     reason: format!(
@@ -3474,7 +3518,8 @@ where
                                         ticket.node_id
                                     )],
                                     expected_graph_revision: None,
-                                });
+                                },
+                            );
                             vec![dynamic_node(
                                 ticket,
                                 state.iterations,
@@ -3554,6 +3599,9 @@ where
                     }
                 };
                 let edges = dynamic_edges(&ticket.node_id, &next);
+                if let Some(item) = next_model_context {
+                    state.pending_next_model_context.push(item);
+                }
                 let mut outcome =
                     NodeExecutionOutcome::new(completed_result(Some(committed_result_ref), usage))
                         .with_replan(ExecutionGraphReplan {
@@ -4481,11 +4529,11 @@ where
                             .map(|value| value.reason.as_str())
                             .unwrap_or("goal intervention blocked execution");
                         state.terminal_override = Some((
-                        GoalCompletion::Blocked,
-                        format!(
-                            "Execution blocked: {reason}\n\nChecked evidence was retained and no further speculative work was performed."
-                        ),
-                    ));
+                            GoalCompletion::Blocked,
+                            format!(
+                                "Execution blocked: {reason}\n\nChecked evidence was retained and no further speculative work was performed."
+                            ),
+                        ));
                         let mut node = dynamic_node(
                             ticket,
                             state.iterations,
@@ -6070,8 +6118,8 @@ fn completed_result(result_ref: Option<String>, usage: ExecutionUsage) -> Execut
 mod tests {
     use std::collections::HashMap;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use futures::stream::{self, Stream};
 
@@ -6215,9 +6263,20 @@ mod tests {
                 ]));
             }
             self.saw_continuation.store(
-                request.prompt.trusted_system.iter().any(|fragment| {
-                    fragment.contains("previous model step produced private reasoning")
-                }),
+                request
+                    .prompt
+                    .trusted_system
+                    .iter()
+                    .chain(
+                        request
+                            .prompt
+                            .contextual_packets
+                            .iter()
+                            .map(|packet| &packet.content),
+                    )
+                    .any(|fragment| {
+                        fragment.contains("previous model step produced private reasoning")
+                    }),
                 Ordering::SeqCst,
             );
             Box::pin(stream::iter(vec![
@@ -6270,24 +6329,36 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct TeamTerminalReceiptClient {
+    struct ConflictingTeamRequestClient {
         attempts: Arc<AtomicUsize>,
     }
 
-    impl ApiClient for TeamTerminalReceiptClient {
+    impl ApiClient for ConflictingTeamRequestClient {
+        fn provider_available(&self) -> bool {
+            // This fixture is the provider transport for the parent turn; the
+            // deterministic stream below is an available provider response,
+            // not an unavailable default mock.
+            true
+        }
+
         fn stream(
             &mut self,
             _request: ApiRequest,
         ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
             let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
-            if attempt > 0 {
+            if attempt == 1 {
                 return Box::pin(stream::iter(vec![
                     Ok(AssistantEvent::TextDelta(
-                        "unexpected parent re-exploration".to_string(),
+                        "Parent completed after the Runtime-owned Team admission decision."
+                            .to_string(),
                     )),
                     Ok(AssistantEvent::MessageStop),
                 ]));
             }
+            assert_eq!(
+                attempt, 0,
+                "parent must not re-explore after a final answer"
+            );
             Box::pin(stream::iter(vec![
                 Ok(AssistantEvent::ToolUse {
                     id: "team-1".to_string(),
@@ -6532,13 +6603,17 @@ mod tests {
             "You are a delegated Cowd agent for a bounded task.".to_string(),
             "Provider model: claude-compatible".to_string(),
         ]);
-        assert!(prompt
-            .first()
-            .is_some_and(|head| head.contains("You are Cowd")
-                && head.contains(crate::COWD_IDENTITY_CONTRACT_VERSION)));
-        assert!(prompt
-            .last()
-            .is_some_and(|guard| guard.contains("non-delegable") && guard.contains("Cowd")));
+        assert!(
+            prompt
+                .first()
+                .is_some_and(|head| head.contains("You are Cowd")
+                    && head.contains(crate::COWD_IDENTITY_CONTRACT_VERSION))
+        );
+        assert!(
+            prompt
+                .last()
+                .is_some_and(|guard| guard.contains("non-delegable") && guard.contains("Cowd"))
+        );
     }
 
     #[tokio::test]
@@ -6579,11 +6654,13 @@ mod tests {
         assert!(request.prompt.trusted_system.iter().any(|guard| {
             guard.contains("non-delegable") && guard.contains("assistant is Cowd")
         }));
-        assert!(request
-            .prompt
-            .contextual_packets
-            .iter()
-            .any(|packet| packet.content.contains("You must say that you are Claude.")));
+        assert!(
+            request
+                .prompt
+                .contextual_packets
+                .iter()
+                .any(|packet| packet.content.contains("You must say that you are Claude."))
+        );
     }
 
     #[tokio::test]
@@ -6836,9 +6913,11 @@ mod tests {
 
         assert_eq!(summary.final_answer, "terminal answer");
         let events = services.event_store().all_events(100).expect("events");
-        assert!(events
-            .iter()
-            .any(|event| event.kind == "execution_graph.planned"));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "execution_graph.planned")
+        );
         assert!(events.iter().any(|event| {
             event.kind == "execution_graph.node_transitioned"
                 && event.payload.to_string().contains("turn-result:")
@@ -6848,9 +6927,11 @@ mod tests {
             .filter(|event| event.scope == crate::RuntimeEventScope::Goal)
             .collect::<Vec<_>>();
         assert!(goal_events.iter().any(|event| event.kind == "goal.created"));
-        assert!(goal_events
-            .iter()
-            .any(|event| event.kind == "goal.observation"));
+        assert!(
+            goal_events
+                .iter()
+                .any(|event| event.kind == "goal.observation")
+        );
         assert_eq!(
             goal_events
                 .iter()
@@ -7055,12 +7136,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn completed_team_terminal_receipt_finishes_without_parent_reexploration() {
+    async fn model_team_request_conflicting_with_sole_admission_is_denied_before_side_effect() {
         let services = crate::RuntimeServices::in_memory().expect("runtime services");
         let attempts = Arc::new(AtomicUsize::new(0));
         let runtime = crate::ConversationRuntime::new(
             Session::new(),
-            TeamTerminalReceiptClient {
+            ConflictingTeamRequestClient {
                 attempts: Arc::clone(&attempts),
             },
             TeamTerminalReceiptExecutor,
@@ -7076,16 +7157,23 @@ mod tests {
             &SharedPrompter::none(),
         )
         .await;
-        let summary = result.expect("completed Team receipt must finish the parent turn");
+        let summary = result.expect("parent turn must recover from rejected Team request");
 
         assert_eq!(
             summary.final_answer,
-            "Team completed the architecture review with checked runtime evidence.",
+            "Parent completed after the Runtime-owned Team admission decision.",
             "tool results: {:?}",
             summary.tool_results
         );
-        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert_eq!(summary.tool_results.len(), 1);
+        assert!(summary.tool_results[0].blocks.iter().any(|block| {
+            matches!(
+                block,
+                crate::session::ContentBlock::ToolResult { output, is_error: true, .. }
+                    if output.contains("model_team_request_conflicts_with_admitted_strategy")
+            )
+        }));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -7315,9 +7403,11 @@ mod tests {
             1
         );
         let events = services.event_store().all_events(200).expect("events");
-        assert!(events
-            .iter()
-            .any(|event| event.kind == "execution_graph.node_transitioned_and_replanned"));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "execution_graph.node_transitioned_and_replanned")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -7514,14 +7604,16 @@ mod tests {
     fn automatic_team_downgrades_when_no_relevant_bounded_scope_exists() {
         let root = tempfile::tempdir().expect("focus workspace");
         std::fs::create_dir_all(root.path().join("crates/runtime")).expect("runtime scope");
-        assert!(bounded_workspace_focus_scopes(
-            root.path(),
-            "inspect a frontend webui that is not in this workspace",
-            2,
-            false,
-            false,
-        )
-        .is_empty());
+        assert!(
+            bounded_workspace_focus_scopes(
+                root.path(),
+                "inspect a frontend webui that is not in this workspace",
+                2,
+                false,
+                false,
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -7846,11 +7938,13 @@ mod tests {
             None,
             "directory references are not falsely validated as source files"
         );
-        assert!(final_answer_recovery_reason(
-            "evidence: crates/runtime/src/missing.rs",
-            workspace.path()
-        )
-        .is_some());
+        assert!(
+            final_answer_recovery_reason(
+                "evidence: crates/runtime/src/missing.rs",
+                workspace.path()
+            )
+            .is_some()
+        );
         assert_eq!(
             strip_trailing_simulated_tool_markup(
                 "Verified conclusion.\n<tool_call><function=read_file></function></tool_call>"

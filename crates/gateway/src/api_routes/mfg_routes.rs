@@ -1,28 +1,28 @@
 use std::sync::Arc;
 
 use app_mfg::{
-    mfg_cockpit_filter_merge_policy, mfg_cockpit_global_filter_schema, mfg_widget_catalog,
     MfgActionExecutionRequest, MfgActionFeedback, MfgAlertCommand, MfgAlertCommandInput,
     MfgAlertRule, MfgAlertRuleInput, MfgAlertSubscription, MfgAlertSubscriptionInput,
     MfgAssignment, MfgAssignmentCommand, MfgAssignmentCommandInput, MfgAssignmentInput,
     MfgCockpitProfile, MfgCockpitProfileInput, MfgCockpitReportDeliveryState,
     MfgCockpitReportRequest, MfgCockpitReportSnapshot, MfgIncident, MfgPlaybook,
-    MfgRepositoryError,
+    MfgRepositoryError, mfg_cockpit_filter_merge_policy, mfg_cockpit_global_filter_schema,
+    mfg_widget_catalog,
 };
 use axum::{
+    Extension, Json, Router,
     body::Body,
     extract::{MatchedPath, Path as AxumPath, Query, State as AxumState},
     http::{HeaderMap, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     routing::{get, post},
-    Extension, Json, Router,
 };
 use matrix_core::{
-    MatrixComputeJobInput, MatrixConnectorRunInput, MatrixDataPlaneIngestPlanInput, MatrixEntity,
-    MatrixEntityInput, MatrixFact, MatrixFactInput, MatrixMetricDependency,
-    MatrixMetricDependencyInput, MatrixRelation, MatrixRelationInput, MatrixSourcePack,
-    MATRIX_SCHEMA_VERSION,
+    MATRIX_SCHEMA_VERSION, MatrixComputeJobInput, MatrixConnectorRunInput,
+    MatrixDataPlaneIngestPlanInput, MatrixEntity, MatrixEntityInput, MatrixFact, MatrixFactInput,
+    MatrixMetricDependency, MatrixMetricDependencyInput, MatrixRelation, MatrixRelationInput,
+    MatrixSourcePack,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -42,7 +42,7 @@ mod cockpit;
 mod decision;
 mod incidents;
 mod operations;
-use super::{principal_actor_id, AppState, AuthenticatedPrincipal, ErrorResponse};
+use super::{AppState, AuthenticatedPrincipal, ErrorResponse, principal_actor_id};
 use cockpit::*;
 use decision::*;
 use incidents::*;
@@ -58,7 +58,7 @@ pub(super) fn start_review_reconciler(state: &Arc<AppState>) {
     let Some(lifecycle) = state.services.mfg.begin_review_reconciler() else {
         return;
     };
-    let state = Arc::downgrade(state);
+    let state_weak = Arc::downgrade(state);
     let handle = runtime.spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -70,7 +70,7 @@ pub(super) fn start_review_reconciler(state: &Arc<AppState>) {
             if lifecycle_owner.is_cancelled() {
                 break;
             }
-            let Some(state) = state.upgrade() else {
+            let Some(state) = state_weak.upgrade() else {
                 break;
             };
             if let Err((status, error)) = reconcile_mfg_report_review_saga(&state, None, 32).await {
@@ -1064,6 +1064,18 @@ async fn mfg_mutation_ledger_middleware(
             }
             Ok(app_mfg::MfgMutationClaim::Replayed(mut receipt, mut response)) => {
                 receipt.status = MfgReceiptStatus::Replayed;
+                // Preserve the route-level replay signal when the canonical
+                // outer receipt short-circuits before the route handler.  A
+                // consumer that already renders this field must never see a
+                // stale `false` alongside a replayed MFG receipt.
+                if let Some(object) = response.as_object_mut() {
+                    if object.contains_key("idempotent_replay") {
+                        object.insert(
+                            "idempotent_replay".to_string(),
+                            serde_json::Value::Bool(true),
+                        );
+                    }
+                }
                 attach_mfg_receipt(&mut response, &receipt);
                 return json_response_with_receipt(StatusCode::OK, response, &receipt);
             }
@@ -1132,7 +1144,6 @@ async fn mfg_mutation_ledger_middleware(
     if !response.status().is_success() {
         return response;
     }
-    let status = response.status();
     let (mut response_parts, response_body) = response.into_parts();
     let response_bytes = match axum::body::to_bytes(response_body, MAX_MFG_MUTATION_BODY).await {
         Ok(bytes) => bytes,
@@ -2071,21 +2082,31 @@ async fn mfg_contract_handler(
             MfgSurfaceContract {
                 surface: MfgSurfaceKind::Management,
                 role: MfgSurfaceRole::EnhancedManagement,
-                entrypoints: vec!["/api/apps/mfg/contract".to_string()],
+                entrypoints: vec![
+                    "/api/apps/mfg/app".to_string(),
+                    "/api/apps/mfg/contract".to_string(),
+                ],
                 routes: webui_routes,
                 actions: webui_actions,
             },
             MfgSurfaceContract {
                 surface: MfgSurfaceKind::Tui,
                 role: MfgSurfaceRole::ConsoleOperationalControl,
-                entrypoints: vec!["/api/apps/mfg/contract".to_string(), "/mfg".to_string()],
+                entrypoints: vec![
+                    "/api/apps/mfg/app".to_string(),
+                    "/api/apps/mfg/contract".to_string(),
+                    "/mfg".to_string(),
+                ],
                 routes: tui_routes,
                 actions: tui_actions,
             },
             MfgSurfaceContract {
                 surface: MfgSurfaceKind::Cli,
                 role: MfgSurfaceRole::MinimalCoreControl,
-                entrypoints: vec!["/api/apps/mfg/contract".to_string()],
+                entrypoints: vec![
+                    "/api/apps/mfg/app".to_string(),
+                    "/api/apps/mfg/contract".to_string(),
+                ],
                 routes: cli_routes,
                 actions: Vec::new(),
             },
@@ -2316,6 +2337,7 @@ struct MfgSkillRunRequest {
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct MfgCockpitReportDeliveryRetryRequest {
     #[serde(default)]
     mode: String,
@@ -3706,9 +3728,11 @@ async fn mfg_execution_feedback_handler(
 #[cfg(test)]
 mod tests {
     use super::{
-        mfg_api_error, mfg_contract_handler, mfg_idempotency_key, parse_mfg_query_pairs,
-        resolve_mfg_action_id, resolve_mfg_resource_ref, MfgActionExecutionIntent,
-        MfgCockpitReportDeliveryIntent, MfgCrossPlaneBridgeIntent, MfgExecutionFeedbackRequest,
+        MfgActionExecutionIntent, MfgCockpitReportDeliveryIntent,
+        MfgCockpitReportDeliveryRetryRequest, MfgCrossPlaneBridgeIntent,
+        MfgExecutionFeedbackRequest, mfg_api_error, mfg_contract_handler, mfg_idempotency_key,
+        normalize_mfg_action_mode, parse_mfg_query_pairs, resolve_mfg_action_id,
+        resolve_mfg_resource_ref,
     };
     use axum::{
         extract::Extension,

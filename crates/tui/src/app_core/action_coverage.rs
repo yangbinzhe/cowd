@@ -297,9 +297,11 @@ mod tests {
         assert!(GATEWAY_CLIENT.contains("subscribe_mfg_live"));
         assert!(MFG_STATE.contains("apply_live_envelope"));
         assert_eq!(panel, p0_expected);
-        assert!(routes
-            .iter()
-            .all(|route| crate::runtime_control_store::mfg_route_section(*route).is_some()));
+        assert!(
+            routes
+                .iter()
+                .all(|route| crate::runtime_control_store::mfg_route_section(*route).is_some())
+        );
         assert!(GATEWAY_CLIENT.contains("mfg_tui_read"));
         assert!(GATEWAY_CLIENT.contains("mfg_tui_route_path"));
         assert!(MFG_STATE.contains("MfgOperationsState"));
@@ -348,7 +350,7 @@ mod tests {
         assert!(MFG_STATE.contains("apply_action_success"));
         assert!(MFG_STATE.contains("apply_action_error"));
         assert!(MFG_PANEL.contains("Governed actions"));
-        assert!(MFG_PANEL.contains("action_is_capability_enabled"));
+        assert!(MFG_PANEL.contains("visible_action_contracts"));
 
         for action in canonical {
             let route = app_mfg_contract::mfg_route_contract(action.route_id)

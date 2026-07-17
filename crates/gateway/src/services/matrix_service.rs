@@ -322,6 +322,10 @@ impl MatrixService {
             raw_checksum: Some(batch.checksum.clone()),
             metric_ids: Vec::new(),
         })?;
+        // A connector batch is an applied ingestion, unlike the public
+        // ingest-plan preview endpoint.  Advance its durable watermark only
+        // after source rows and their snapshot committed successfully.
+        repository.commit_data_plane_ingest(&plan)?;
         let receipt_id = stable_receipt_id(&[
             batch.adapter_id.as_str(),
             batch.resource_ref.as_str(),
@@ -909,15 +913,19 @@ mod tests {
             .expect("bridge ingest");
 
         assert!(!attention.is_empty());
-        assert!(!service
-            .list_source_packs(&config_home, 10)
-            .expect("source packs")
-            .is_empty());
-        assert!(service
-            .list_facts(&config_home, 10)
-            .expect("facts")
-            .iter()
-            .any(|fact| fact.fact_type.starts_with("knowledge_")));
+        assert!(
+            !service
+                .list_source_packs(&config_home, 10)
+                .expect("source packs")
+                .is_empty()
+        );
+        assert!(
+            service
+                .list_facts(&config_home, 10)
+                .expect("facts")
+                .iter()
+                .any(|fact| fact.fact_type.starts_with("knowledge_"))
+        );
         let _ = std::fs::remove_dir_all(config_home);
     }
 
@@ -965,22 +973,30 @@ mod tests {
             .expect("source batch receipt");
 
         assert_eq!(receipt.row_count, 1);
-        assert!(receipt
-            .matrix_refs
-            .iter()
-            .any(|value| value.starts_with("matrix:source_pack:")));
-        assert!(!service
-            .list_source_packs(&config_home, 10)
-            .expect("source packs")
-            .is_empty());
-        assert!(!service
-            .list_source_snapshots(&config_home, None, 10)
-            .expect("snapshots")
-            .is_empty());
-        assert!(!service
-            .list_data_plane_watermarks(&config_home, 10)
-            .expect("watermarks")
-            .is_empty());
+        assert!(
+            receipt
+                .matrix_refs
+                .iter()
+                .any(|value| value.starts_with("matrix:source_pack:"))
+        );
+        assert!(
+            !service
+                .list_source_packs(&config_home, 10)
+                .expect("source packs")
+                .is_empty()
+        );
+        assert!(
+            !service
+                .list_source_snapshots(&config_home, None, 10)
+                .expect("snapshots")
+                .is_empty()
+        );
+        assert!(
+            !service
+                .list_data_plane_watermarks(&config_home, 10)
+                .expect("watermarks")
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(config_home);
     }
 }
