@@ -261,7 +261,7 @@ async fn empty_answer_is_blocked_by_finalization_gate() {
 }
 
 #[test]
-fn low_value_multi_agent_experience_downgrades_next_route() {
+fn untrusted_multi_agent_experience_cannot_downgrade_next_route() {
     let prompt = "使用多 Agent 协同完成复杂架构分析";
     let initial = decide_strategy(&StrategyInput::from_prompt(prompt));
     assert_eq!(initial.pattern, ExecutionPattern::Collaborate);
@@ -274,22 +274,59 @@ fn low_value_multi_agent_experience_downgrades_next_route() {
             complexity: understanding.complexity,
             risk: understanding.risk,
             selected_pattern: ExecutionPattern::Collaborate,
+            selected_candidate: Some(harness_contract::strategy::ExecutionCandidateKind::Team),
             succeeded: created_at_ms == 0,
             verification_blocked: false,
             context_pressure: false,
+            composite_execution: false,
             multi_agent_positive_lift: false,
             created_at_ms,
+            actual_duration_ms: 120,
+            actual_input_tokens: 10,
+            actual_output_tokens: 5,
+            actual_cached_tokens: 0,
+            actual_coordination_cost_ms: 3,
+            paired_calibration: Some(
+                harness_contract::strategy::PairedStrategyCalibrationEvidence {
+                    evaluation_ref: format!(
+                        "harness_eval.auto_strategy_paired.v1:e2e-{created_at_ms}"
+                    ),
+                    corpus_sha256: "a".repeat(64),
+                    workspace_revision: "test-revision".to_string(),
+                    provider_account_ref: "test-provider".to_string(),
+                    baseline_pattern: ExecutionPattern::Direct,
+                    baseline_duration_ms: 100,
+                    baseline_quality_score_bp: 8_000,
+                    candidate_duration_ms: 120,
+                    candidate_quality_score_bp: 8_000,
+                    blind_judge_completed: true,
+                    baseline_total_tokens: 15,
+                    candidate_total_tokens: 15,
+                    candidate_duplicate_tool_ratio_bp: 0,
+                    admission_channel: None,
+                    report_sha256: "b".repeat(64),
+                    rubric_sha256: "c".repeat(64),
+                    binary_sha256: "d".repeat(64),
+                    frontend_workspace_revision: "test-frontend".to_string(),
+                    model_revision: "test-model".to_string(),
+                    judge_model_revision: "test-judge".to_string(),
+                    invariant_fingerprint: "e".repeat(64),
+                },
+            ),
         });
     }
 
     let enriched = store.enrich_input(StrategyInput::from_prompt(prompt));
     let adapted = decide_strategy(&enriched);
 
-    assert_eq!(adapted.pattern, ExecutionPattern::Execute);
-    assert!(adapted
-        .reasons
-        .iter()
-        .any(|reason| reason.contains("low multi-agent lift")));
+    assert_eq!(adapted.pattern, ExecutionPattern::Collaborate);
+    assert_eq!(
+        enriched
+            .experience
+            .as_ref()
+            .map(|summary| summary.multi_agent_lift_sample_count),
+        Some(0)
+    );
 }
 
 #[test]

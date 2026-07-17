@@ -8,17 +8,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use harness_contract::agent::{AgentDefinitionRevisionRef, AgentTaskIntent, RevisionSelector};
-use harness_contract::context::ContextBudgetLeaseRef;
-use harness_contract::execution_graph::{
-    ExecutionEdge, ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec,
-};
-use harness_contract::team::{
-    FocusPartitionPlan, FocusPartitionSlot, RoleCardinalityPolicy, RolePartitionPolicy,
-    TeamInstantiationRequest, TeamRoleBindingOverride, TeamRoleDefinition,
-    TeamTemplateDefinitionId, TeamTemplateSelector,
-};
-
 use crate::execution_core::graph::executors::{
     AgentTaskExecutor, SynthesizeNodeExecutor, VerifyNodeExecutor,
 };
@@ -28,6 +17,17 @@ use crate::{
     EvolutionCandidateSubject, EvolutionGovernanceService, EvolutionReleaseAssignment,
     RuntimeDefinitionRegistry,
 };
+use harness_contract::agent::{AgentDefinitionRevisionRef, AgentTaskIntent, RevisionSelector};
+use harness_contract::context::ContextBudgetLeaseRef;
+use harness_contract::execution_graph::{
+    ExecutionEdge, ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec,
+};
+use harness_contract::team::{
+    FocusPartitionPlan, FocusPartitionSlot, RoleCardinalityPolicy, RolePartitionPolicy,
+    TeamAcceptanceCheck, TeamAcceptanceRequirement, TeamInstantiationRequest,
+    TeamRoleBindingOverride, TeamRoleDefinition, TeamStructuredOutputField,
+    TeamTemplateDefinitionId, TeamTemplateSelector,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedFocusPartition {
@@ -35,7 +35,12 @@ pub struct ResolvedFocusPartition {
     pub boundary: String,
     pub evidence_responsibility: String,
     pub output_contract: Vec<String>,
+    pub output_acceptance: Vec<String>,
     pub shared_baseline: Vec<String>,
+    pub capability_cropped_refs: Vec<String>,
+    pub scope_hash: String,
+    pub overlap_budget_bp: u16,
+    pub novelty_target_bp: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +150,18 @@ impl TeamInstantiationService {
         let binding_overrides = role_binding_overrides(&request, &manifest.roles)?;
         let cardinality_overrides = role_cardinality_overrides(&request, &manifest.roles)?;
         let focus_plans = focus_partition_plans(&request, &manifest.roles)?;
+        for plan in focus_plans.values() {
+            for slot in &plan.slots {
+                for reference in &slot.capability_cropped_refs {
+                    if !request.resource_scopes.contains(reference) {
+                        return Err(format!(
+                            "focus `{}` evidence ref `{reference}` is outside the Team resource/capability lease",
+                            slot.focus_id
+                        ));
+                    }
+                }
+            }
+        }
         let runtime_parallel_capacity = self.runtime_parallel_capacity()?;
 
         let mut graph = ExecutionGraph::new(request.objective.clone());
@@ -181,9 +198,30 @@ impl TeamInstantiationService {
             )?;
             cardinality_resolutions.push(cardinality_resolution);
             for (slot, focus_partition) in focuses.into_iter().enumerate() {
+                let mut slot_acceptance = role.task_contract.acceptance.clone();
+                slot_acceptance.extend(focus_partition.output_acceptance.iter().cloned());
+                slot_acceptance.sort();
+                slot_acceptance.dedup();
                 let node_id = format!("{}:{}:{}", graph.id, role.role_id, slot + 1);
                 let run_id = format!("{}:run:{}:{}", request.team_id, role.role_id, slot + 1);
                 let task_id = format!("{}:task:{}:{}", request.team_id, role.role_id, slot + 1);
+                let resource_scopes = bounded_slot_resource_scopes(
+                    &request.resource_scopes,
+                    &focus_partition.capability_cropped_refs,
+                );
+                let acceptance_contract = team_acceptance_contract(
+                    &slot_acceptance,
+                    &resource_scopes,
+                    !role.task_contract.contract_ref.starts_with("builtin/"),
+                    manifest
+                        .dependencies
+                        .iter()
+                        .any(|dependency| dependency.to_role_id == role.role_id)
+                        && matches!(
+                            role.role_id.as_str(),
+                            "synthesizer" | "arbiter" | "commander" | "comparator" | "coordinator"
+                        ),
+                )?;
                 let intent = AgentTaskIntent {
                     selected_agent_id: Some(definition_ref.definition_id.as_str().to_string()),
                     definition_ref: Some(definition_ref.clone()),
@@ -208,7 +246,7 @@ impl TeamInstantiationService {
                         focus_partition.shared_baseline.join("; "),
                         focus_partition.output_contract.join(", "),
                     ),
-                    acceptance: role.task_contract.acceptance.clone(),
+                    acceptance: slot_acceptance,
                     constraints: vec![
                         format!("team_template:{}@{}", template.revision.revision_ref.template_id.as_str(), template.revision.revision_ref.revision),
                         format!("team_role:{}", role.role_id),
@@ -219,10 +257,44 @@ impl TeamInstantiationService {
                             "focus_evidence_responsibility:{}",
                             focus_partition.evidence_responsibility
                         ),
+                        format!("focus_scope_hash:{}", focus_partition.scope_hash),
+                        format!(
+                            "focus_overlap_budget_bp:{}",
+                            focus_partition.overlap_budget_bp
+                        ),
+                        format!(
+                            "focus_novelty_target_bp:{}",
+                            focus_partition.novelty_target_bp
+                        ),
+                        format!(
+                            "focus_output_acceptance:{}",
+                            focus_partition.output_acceptance.join(", ")
+                        ),
+                        format!(
+                            "team_acceptance_contract:{}",
+                            serde_json::to_string(&acceptance_contract).map_err(|error| {
+                                format!("encode Team acceptance contract: {error}")
+                            })?
+                        ),
+                        "nested_team:forbidden".to_string(),
+                        "parent_merge:exactly_once".to_string(),
                         "team_working_state:visible".to_string(),
-                    ],
-                    context_refs: Vec::new(),
+                    ]
+                    .into_iter()
+                    .chain(request.strategy_binding.iter().flat_map(|binding| {
+                        [
+                            format!("strategy_decision_id:{}", binding.decision_id),
+                            format!("strategy_decision_revision:{}", binding.decision_revision),
+                            format!("collaboration_lease:{}", binding.decision_lease),
+                            format!("turn_ref:{}", binding.turn_ref),
+                        ]
+                    }))
+                    .collect(),
+                    context_refs: focus_partition.capability_cropped_refs.clone(),
+                    // A resource lease authorizes discovery but is not itself
+                    // evidence. Durable tool audits populate result evidence.
                     evidence_refs: Vec::new(),
+                    resource_scopes,
                     // Runtime derives normal role tools from the immutable
                     // capability grant. Evaluation may only narrow that set;
                     // it cannot grant a tool absent from the role contract.
@@ -253,7 +325,7 @@ impl TeamInstantiationService {
                 node.id = node_id.clone();
                 node.idempotency_key = packet.idempotency_key.clone();
                 node.acceptance.criteria = packet.acceptance.clone();
-                node.resource_scopes = request.resource_scopes.clone();
+                node.resource_scopes = packet.resource_scopes.clone();
                 graph.nodes.push(node);
                 slots_by_role
                     .entry(role.role_id.clone())
@@ -382,11 +454,20 @@ impl TeamInstantiationService {
             TeamTemplateSelector::Default { template_id } => {
                 (template_id.clone(), RevisionSelector::DefaultPointer)
             }
-            TeamTemplateSelector::Automatic => (
-                TeamTemplateDefinitionId::try_from("builtin/cowd/execute-review")
-                    .map_err(|error| error.to_string())?,
-                RevisionSelector::LatestApprovedStable,
-            ),
+            TeamTemplateSelector::Automatic => {
+                let template = if request.permission_lease == "workspace_write"
+                    || request.permission_lease == "workspace-write"
+                {
+                    "builtin/cowd/execute-review"
+                } else {
+                    "builtin/cowd/parallel-research-synthesis"
+                };
+                (
+                    TeamTemplateDefinitionId::try_from(template)
+                        .map_err(|error| error.to_string())?,
+                    RevisionSelector::LatestApprovedStable,
+                )
+            }
         };
         let routing_identity = format!(
             "{}|{}|{}|{}",
@@ -433,22 +514,142 @@ impl TeamInstantiationService {
             .resources
             .snapshot(&ExecutionResourceKind::Tool)
             .map_err(|error| format!("read Tool resource capacity: {error}"))?;
-        let agent_available = agent
-            .effective_limit
-            .saturating_sub(agent.active_leases)
-            .max(1);
+        let agent_available = agent.effective_limit.saturating_sub(agent.active_leases);
         let provider_available = provider
             .effective_limit
-            .saturating_sub(provider.active_leases)
-            .max(1);
-        let tool_available = tool
-            .effective_limit
-            .saturating_sub(tool.active_leases)
-            .max(1);
-        u16::try_from(agent_available.min(provider_available).min(tool_available)).map_err(|_| {
-            "Runtime resource capacity exceeds Team cardinality representation".to_string()
-        })
+            .saturating_sub(provider.active_leases);
+        let tool_available = tool.effective_limit.saturating_sub(tool.active_leases);
+        available_team_parallel_capacity(agent_available, provider_available, tool_available)
     }
+}
+
+fn available_team_parallel_capacity(
+    agent_available: usize,
+    provider_available: usize,
+    tool_available: usize,
+) -> Result<u16, String> {
+    if agent_available == 0 || provider_available == 0 || tool_available == 0 {
+        return Err(format!(
+            "Team resource capacity exhausted: agent={agent_available}, provider={provider_available}, tool={tool_available}"
+        ));
+    }
+    u16::try_from(agent_available.min(provider_available).min(tool_available)).map_err(|_| {
+        "Runtime resource capacity exceeds Team cardinality representation".to_string()
+    })
+}
+
+fn team_acceptance_contract(
+    criteria: &[String],
+    resource_scopes: &[String],
+    allow_legacy_custom_contract: bool,
+    upstream_synthesis_role: bool,
+) -> Result<Vec<TeamAcceptanceRequirement>, String> {
+    let workspace_scopes = resource_scopes
+        .iter()
+        .filter(|scope| {
+            scope.starts_with("read:")
+                || scope.starts_with("write:")
+                || scope.starts_with("workspace:")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let write_scopes = workspace_scopes
+        .iter()
+        .filter(|scope| scope.starts_with("write:") || scope.starts_with("workspace:"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let structured = |criterion: &str, field| TeamAcceptanceRequirement {
+        criterion: criterion.to_string(),
+        check: TeamAcceptanceCheck::StructuredField { field },
+    };
+    criteria
+        .iter()
+        .map(|criterion| {
+            let check = match criterion.as_str() {
+                "summary" => structured(criterion, TeamStructuredOutputField::Summary),
+                "findings" => structured(criterion, TeamStructuredOutputField::Findings),
+                "plan" => structured(criterion, TeamStructuredOutputField::Plan),
+                "risks" => structured(criterion, TeamStructuredOutputField::Risks),
+                "unresolved" => structured(criterion, TeamStructuredOutputField::Unresolved),
+                "proposal" => structured(criterion, TeamStructuredOutputField::Proposal),
+                "critique" => structured(criterion, TeamStructuredOutputField::Critique),
+                "checkpoint" => structured(criterion, TeamStructuredOutputField::Checkpoint),
+                "implementation" => TeamAcceptanceRequirement {
+                    criterion: criterion.clone(),
+                    check: TeamAcceptanceCheck::WorkspaceChange {
+                        field: TeamStructuredOutputField::Implementation,
+                        scopes: write_scopes.clone(),
+                    },
+                },
+                "mitigation" => TeamAcceptanceRequirement {
+                    criterion: criterion.clone(),
+                    check: TeamAcceptanceCheck::WorkspaceChange {
+                        field: TeamStructuredOutputField::Mitigation,
+                        scopes: write_scopes.clone(),
+                    },
+                },
+                "source_verification" => TeamAcceptanceRequirement {
+                    criterion: criterion.clone(),
+                    check: TeamAcceptanceCheck::SourceVerification {
+                        scopes: write_scopes.clone(),
+                    },
+                },
+                "review" => TeamAcceptanceRequirement {
+                    criterion: criterion.clone(),
+                    check: TeamAcceptanceCheck::UpstreamReview,
+                },
+                "evidence" => TeamAcceptanceRequirement {
+                    criterion: criterion.clone(),
+                    check: if upstream_synthesis_role {
+                        TeamAcceptanceCheck::UpstreamEvidence
+                    } else {
+                        TeamAcceptanceCheck::ScopedEvidence {
+                            scopes: workspace_scopes.clone(),
+                        }
+                    },
+                },
+                _ => {
+                    if let Some(scope) = criterion.strip_prefix("evidence_scope:") {
+                        if scope.trim().is_empty() {
+                            return Err("Team evidence scope criterion is empty".to_string());
+                        }
+                        TeamAcceptanceRequirement {
+                            criterion: criterion.clone(),
+                            check: TeamAcceptanceCheck::ScopedEvidence {
+                                scopes: vec![scope.trim().to_string()],
+                            },
+                        }
+                    } else if allow_legacy_custom_contract {
+                        TeamAcceptanceRequirement {
+                            criterion: criterion.clone(),
+                            check: TeamAcceptanceCheck::LegacyEvidenceBound {
+                                scopes: workspace_scopes.clone(),
+                            },
+                        }
+                    } else {
+                        return Err(format!(
+                            "Team acceptance criterion `{criterion}` has no typed Runtime check"
+                        ));
+                    }
+                }
+            };
+            let missing_scope = match &check.check {
+                TeamAcceptanceCheck::ScopedEvidence { scopes }
+                | TeamAcceptanceCheck::LegacyEvidenceBound { scopes } => scopes.is_empty(),
+                TeamAcceptanceCheck::WorkspaceChange { scopes, .. }
+                | TeamAcceptanceCheck::SourceVerification { scopes } => scopes.is_empty(),
+                TeamAcceptanceCheck::StructuredField { .. }
+                | TeamAcceptanceCheck::UpstreamReview
+                | TeamAcceptanceCheck::UpstreamEvidence => false,
+            };
+            if missing_scope {
+                return Err(format!(
+                    "Team acceptance criterion `{criterion}` has no bounded Runtime resource scope"
+                ));
+            }
+            Ok(check)
+        })
+        .collect()
 }
 
 fn role_binding_overrides<'a>(
@@ -626,7 +827,16 @@ fn resolve_focuses(
             focus_id: "default".to_string(),
             boundary: role.responsibility.clone(),
             evidence_responsibility: "role-local evidence".to_string(),
+            capability_cropped_refs: Vec::new(),
+            scope_hash: harness_contract::team::focus_scope_hash(
+                &role.role_id,
+                &role.responsibility,
+                &[],
+            ),
+            overlap_budget_bp: 0,
+            novelty_target_bp: 2_500,
             output_contract: role.task_contract.acceptance.clone(),
+            output_acceptance: role.task_contract.acceptance.clone(),
         }],
         RolePartitionPolicy::Explicit { partitions } => partitions
             .iter()
@@ -634,7 +844,12 @@ fn resolve_focuses(
                 focus_id: partition.clone(),
                 boundary: partition.clone(),
                 evidence_responsibility: "partition-specific evidence".to_string(),
+                capability_cropped_refs: Vec::new(),
+                scope_hash: harness_contract::team::focus_scope_hash(&role.role_id, partition, &[]),
+                overlap_budget_bp: 0,
+                novelty_target_bp: 2_500,
                 output_contract: role.task_contract.acceptance.clone(),
+                output_acceptance: role.task_contract.acceptance.clone(),
             })
             .collect(),
         RolePartitionPolicy::ByFocus { partition_key } if planned.is_empty() => (1
@@ -643,7 +858,16 @@ fn resolve_focuses(
                 focus_id: format!("{partition_key}:{slot}"),
                 boundary: format!("{partition_key}:{slot}"),
                 evidence_responsibility: "independent evidence for this focus".to_string(),
+                capability_cropped_refs: Vec::new(),
+                scope_hash: harness_contract::team::focus_scope_hash(
+                    &role.role_id,
+                    &format!("{partition_key}:{slot}"),
+                    &[],
+                ),
+                overlap_budget_bp: 0,
+                novelty_target_bp: 2_500,
                 output_contract: role.task_contract.acceptance.clone(),
+                output_acceptance: role.task_contract.acceptance.clone(),
             })
             .collect(),
         RolePartitionPolicy::ByFocus { .. } => planned,
@@ -666,7 +890,16 @@ fn resolve_focuses(
             } else {
                 slot.output_contract
             },
+            output_acceptance: if slot.output_acceptance.is_empty() {
+                role.task_contract.acceptance.clone()
+            } else {
+                slot.output_acceptance
+            },
             shared_baseline: shared_baseline.clone(),
+            capability_cropped_refs: slot.capability_cropped_refs,
+            scope_hash: slot.scope_hash,
+            overlap_budget_bp: slot.overlap_budget_bp,
+            novelty_target_bp: slot.novelty_target_bp,
         })
         .collect::<Vec<_>>();
     Ok((
@@ -679,6 +912,26 @@ fn resolve_focuses(
             reason,
         },
     ))
+}
+
+fn bounded_slot_resource_scopes(team_scopes: &[String], focus_refs: &[String]) -> Vec<String> {
+    if focus_refs.is_empty() {
+        return team_scopes.to_vec();
+    }
+    let mut scopes = focus_refs.to_vec();
+    scopes.extend(
+        team_scopes
+            .iter()
+            .filter(|scope| {
+                !scope.starts_with("read:")
+                    && !scope.starts_with("write:")
+                    && !scope.starts_with("worktree:")
+            })
+            .cloned(),
+    );
+    scopes.sort();
+    scopes.dedup();
+    scopes
 }
 
 fn slot_budget_lease(
@@ -698,4 +951,118 @@ fn slot_budget_lease(
         max_tokens,
         revision,
     )
+}
+
+#[cfg(test)]
+mod acceptance_contract_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_acceptance_text_fails_closed() {
+        assert!(team_acceptance_contract(
+            &["looks reasonable".to_string()],
+            &["read:crates/runtime".to_string()],
+            false,
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn typed_acceptance_uses_exact_scopes_and_checks() {
+        let contract = team_acceptance_contract(
+            &[
+                "implementation".to_string(),
+                "source_verification".to_string(),
+                "evidence_scope:crates/runtime".to_string(),
+            ],
+            &["write:crates/runtime".to_string()],
+            false,
+            false,
+        )
+        .expect("typed contract");
+        assert_eq!(contract.len(), 3);
+        assert!(matches!(
+            contract[0].check,
+            TeamAcceptanceCheck::WorkspaceChange { .. }
+        ));
+        assert!(matches!(
+            contract[1].check,
+            TeamAcceptanceCheck::SourceVerification { .. }
+        ));
+        assert_eq!(
+            contract[2].check,
+            TeamAcceptanceCheck::ScopedEvidence {
+                scopes: vec!["crates/runtime".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn session_authority_is_not_misclassified_as_a_workspace_evidence_scope() {
+        let contract = team_acceptance_contract(
+            &["evidence-backed output".to_string()],
+            &[
+                "read:crates/runtime".to_string(),
+                "session:session-1".to_string(),
+            ],
+            true,
+            false,
+        )
+        .expect("legacy custom contract has an exact evidence-bound adapter");
+        assert_eq!(
+            contract[0].check,
+            TeamAcceptanceCheck::LegacyEvidenceBound {
+                scopes: vec!["read:crates/runtime".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn evidence_acceptance_without_a_bounded_scope_fails_at_instantiation() {
+        assert!(team_acceptance_contract(
+            &["evidence".to_string()],
+            &["session:session-1".to_string()],
+            false,
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn zero_runtime_capacity_fails_closed_instead_of_inventing_one_slot() {
+        assert!(available_team_parallel_capacity(0, 3, 3).is_err());
+        assert!(available_team_parallel_capacity(3, 0, 3).is_err());
+        assert!(available_team_parallel_capacity(3, 3, 0).is_err());
+        assert_eq!(available_team_parallel_capacity(4, 2, 3), Ok(2));
+    }
+
+    #[test]
+    fn upstream_synthesizer_consumes_predecessor_evidence_without_reacquisition() {
+        let contract = team_acceptance_contract(
+            &[
+                "summary".to_string(),
+                "evidence".to_string(),
+                "unresolved".to_string(),
+            ],
+            &[
+                "read:crates/runtime".to_string(),
+                "read:crates/gateway".to_string(),
+                "session:session-1".to_string(),
+            ],
+            false,
+            true,
+        )
+        .expect("upstream reducer contract");
+        assert!(contract.iter().any(|requirement| {
+            requirement.criterion == "evidence"
+                && requirement.check == TeamAcceptanceCheck::UpstreamEvidence
+        }));
+        assert!(!contract.iter().any(|requirement| {
+            matches!(
+                &requirement.check,
+                TeamAcceptanceCheck::ScopedEvidence { .. }
+            )
+        }));
+    }
 }

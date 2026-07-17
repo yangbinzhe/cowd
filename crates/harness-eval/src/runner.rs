@@ -698,8 +698,7 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
     let strategy = harness_contract::strategy::decide_strategy(
         &harness_contract::strategy::StrategyInput::from_prompt(objective),
     );
-    let collaboration =
-        runtime::CollaborationTemplateMatcher.decide(objective, &strategy);
+    let collaboration = runtime::CollaborationTemplateMatcher.decide(objective, &strategy);
     let session_id = format!("mission-eval-session-{}", uuid::Uuid::new_v4());
     let mission = runtime::MissionRuntime::new();
     let session = match mission.start_session(runtime::StartMissionSessionRequest {
@@ -746,6 +745,7 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
             mission_id: None,
             parent_execution: None,
             selection_mode: harness_contract::team::TeamSelectionMode::Explicit,
+            strategy_binding: None,
             template_selector: harness_contract::team::TeamTemplateSelector::LatestStable {
                 template_id: harness_contract::team::TeamTemplateDefinitionId::new(
                     harness_contract::agent::DefinitionScope::Builtin,
@@ -763,7 +763,7 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
             model_lease: "harness_eval".to_string(),
             budget_lease: None,
             managed_invocation: None,
-            resource_scopes: Vec::new(),
+            resource_scopes: vec!["read:crates/runtime".to_string()],
         },
     ) {
         Ok(team_plan) => team_plan,
@@ -815,7 +815,8 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
         runtime_services.mission_evidence(),
         runtime_services.mission_schedules().projection(),
     );
-    let checks = [(
+    let checks = [
+        (
             "simple_question_direct",
             simple_decision.pattern() == ExecutionPattern::Direct,
         ),
@@ -861,14 +862,17 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
                         .iter()
                         .any(|contract| contract["runtime_action"] == "use_team_template")
                 }),
-        )];
+        ),
+    ];
     let passed_checks = checks
         .iter()
-        .filter(|&(_name, passed)| *passed).map(|(name, _passed)| (*name).to_string())
+        .filter(|&(_name, passed)| *passed)
+        .map(|(name, _passed)| (*name).to_string())
         .collect::<Vec<_>>();
     let failed_checks = checks
         .iter()
-        .filter(|&(_name, passed)| !passed ).map(|(name, _passed)| (*name).to_string())
+        .filter(|&(_name, passed)| !passed)
+        .map(|(name, _passed)| (*name).to_string())
         .collect::<Vec<_>>();
     let elapsed_ms = started.elapsed().as_millis();
     json!({
@@ -1405,13 +1409,11 @@ mod tests {
         assert!(report["mission_projection"]["schema_version"]
             .as_u64()
             .is_some_and(|version| version >= 2));
-        assert!(
-            report["selected_strategy"]["runtime_actions"]
-                .as_array()
-                .expect("runtime actions")
-                .iter()
-                .any(|item| item == "use_team_template")
-        );
+        assert!(report["selected_strategy"]["runtime_actions"]
+            .as_array()
+            .expect("runtime actions")
+            .iter()
+            .any(|item| item == "use_team_template"));
         assert!(report["execution_graph"]["is_dag"]
             .as_bool()
             .unwrap_or(false));

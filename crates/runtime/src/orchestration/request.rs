@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use harness_contract::team::FocusPartitionPlan;
+use harness_contract::team::{FocusPartitionPlan, TeamSelectionMode, TeamStrategyBinding};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeOrchestrationRequest {
@@ -17,6 +17,12 @@ pub struct RuntimeOrchestrationRequest {
     pub target_session_id: Option<String>,
     #[serde(default)]
     pub action: RuntimeOrchestrationAction,
+    /// Runtime-owned selection source. Model JSON normally leaves this empty;
+    /// host auto-start and explicit user adapters bind it before compilation.
+    #[serde(default)]
+    pub selection_mode: Option<TeamSelectionMode>,
+    #[serde(default)]
+    pub strategy_binding: Option<TeamStrategyBinding>,
     #[serde(default)]
     pub reason: Option<String>,
     #[serde(default)]
@@ -54,7 +60,6 @@ pub enum RuntimeOrchestrationAction {
     RequestRiskGate,
     DispatchSession,
 }
-
 
 impl RuntimeOrchestrationAction {
     #[must_use]

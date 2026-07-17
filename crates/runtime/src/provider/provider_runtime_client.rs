@@ -298,6 +298,7 @@ async fn forward_provider_attempt(
         tool_choice,
         stream: true,
         reasoning_effort,
+        temperature: evaluation_request_temperature(),
         ..Default::default()
     };
     if let Err(error) = forward_provider_stream(
@@ -315,6 +316,17 @@ async fn forward_provider_attempt(
             error.error.context_window_limit_hint(),
         )));
     }
+}
+
+fn evaluation_request_temperature() -> Option<f64> {
+    (std::env::var("COWD_EVAL_HARNESS").as_deref() == Ok("1")
+        && std::env::var("COWD_EVAL_CORPUS_ID").as_deref() == Ok("auto-strategy-v1"))
+    .then(|| {
+        std::env::var("COWD_MODEL_TEMPERATURE")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+    })
+    .flatten()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -403,9 +415,10 @@ async fn forward_provider_stream(
                             emit_output,
                             &stream_callback,
                             &mut emitted,
-                        ) {
-                            return Ok(ForwardedProviderStream::ConsumerDropped);
-                        }
+                        )
+                    {
+                        return Ok(ForwardedProviderStream::ConsumerDropped);
+                    }
                 }
                 ContentBlockDelta::InputJsonDelta { partial_json } => {
                     if let Some((_, _, input)) = pending_tools.get_mut(&delta.index) {

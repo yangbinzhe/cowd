@@ -139,6 +139,12 @@ pub struct ExecutionUsage {
     pub cached_tokens: u64,
     pub duration_ms: u64,
     pub tool_calls: u64,
+    #[serde(default)]
+    pub duplicate_tool_calls: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_write_attempt_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_observed_resource_scopes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

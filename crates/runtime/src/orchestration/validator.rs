@@ -67,6 +67,16 @@ pub fn validate_request(
         push_gate(&mut policy_gates, ExecutionPolicyGate::Permission);
         findings.push("write_scope_not_present_in_strategy_lease".to_string());
     }
+    if request.action == RuntimeOrchestrationAction::RequestTeam
+        && request.constraints.requires_write == Some(true)
+        && !request
+            .capabilities
+            .iter()
+            .any(|capability| capability.starts_with("resource:"))
+    {
+        status = "rejected".to_string();
+        findings.push("team_write_requires_explicit_cropped_resource_scope".to_string());
+    }
     if request
         .constraints
         .max_parallel_agents
@@ -80,6 +90,30 @@ pub fn validate_request(
     {
         status = "rejected".to_string();
         findings.push("missing_session_id_for_team_runtime".to_string());
+    }
+    if request.action == RuntimeOrchestrationAction::RequestTeam {
+        if let Some(binding) = request.strategy_binding.as_ref() {
+            if binding.decision_id != execution.decision_id
+                || binding.decision_lease != execution.lease.lease_id
+                || binding.decision_revision != execution.decision_revision
+                || execution
+                    .turn_ref
+                    .as_deref()
+                    .is_some_and(|turn_ref| turn_ref != binding.turn_ref)
+            {
+                status = "rejected".to_string();
+                findings.push("team_strategy_binding_mismatch".to_string());
+            } else {
+                findings.push("team_collaboration_lease_bound".to_string());
+            }
+        }
+        if request.selection_mode == Some(harness_contract::team::TeamSelectionMode::Automatic)
+            && execution.strategy.selected_candidate
+                != harness_contract::strategy::ExecutionCandidateKind::Team
+        {
+            status = "rejected".to_string();
+            findings.push("automatic_team_not_selected_by_strategy".to_string());
+        }
     }
     if request.intent.trim().is_empty()
         && !matches!(request.action, RuntimeOrchestrationAction::PlanOnly)
@@ -133,6 +167,9 @@ pub fn validate_request(
             "parallelism_owner": "runtime_team_instantiation_resource_policy",
             "plan_only": request.action == RuntimeOrchestrationAction::PlanOnly,
             "strategy_lease_id": execution.lease.lease_id,
+            "strategy_decision_id": execution.decision_id,
+            "strategy_decision_revision": execution.decision_revision,
+            "collaboration_lease": request.strategy_binding.as_ref().map(|binding| binding.decision_lease.as_str()),
         }),
         permission: json!({
             "requires_write": request.constraints.requires_write.unwrap_or(false),

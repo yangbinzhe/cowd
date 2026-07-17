@@ -577,6 +577,8 @@ impl GatewayToolExecutor {
 /// deliberate human/API authoring capability, while model-originated team
 /// requests always let Runtime resolve the template's versioned role contract.
 fn sanitize_model_orchestration_request(request: &mut runtime::RuntimeOrchestrationRequest) {
+    request.selection_mode = None;
+    request.strategy_binding = None;
     if !request.focus_partition_plans.is_empty() {
         tracing::info!(
             discarded_focus_plan_count = request.focus_partition_plans.len(),
@@ -1288,6 +1290,8 @@ mod tests {
             session_id: Some("session".to_string()),
             target_session_id: None,
             action: runtime::RuntimeOrchestrationAction::RequestTeam,
+            selection_mode: None,
+            strategy_binding: None,
             reason: None,
             template_hint: None,
             focus_partition_plans: Vec::new(),

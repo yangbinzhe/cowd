@@ -98,6 +98,9 @@ impl NodeExecutor for VerifyNodeExecutor {
         let mut evidence = Vec::<EvidenceAccessRef>::new();
         let mut available = BTreeSet::new();
         let mut incomplete = Vec::new();
+        let mut invalid_team_slots = Vec::new();
+        let mut satisfied_team_criteria = BTreeSet::new();
+        let team_verification = ticket.payload_ref.starts_with("team:");
         for predecessor_id in predecessor_ids {
             if graph.node_statuses.get(predecessor_id) != Some(&ExecutionNodeStatus::Completed) {
                 incomplete.push(predecessor_id.to_string());
@@ -113,39 +116,218 @@ impl NodeExecutor for VerifyNodeExecutor {
                     available.insert(item.sha256.clone());
                     evidence.push(item.clone());
                 }
+                if team_verification {
+                    let Some(predecessor_node) = graph
+                        .nodes
+                        .iter()
+                        .find(|candidate| candidate.id == predecessor_id)
+                    else {
+                        invalid_team_slots.push(format!("{predecessor_id}:missing_node_contract"));
+                        continue;
+                    };
+                    let Ok(packet) = serde_json::from_str::<harness_contract::agent::AgentTaskPacket>(
+                        &predecessor_node.payload_ref,
+                    ) else {
+                        invalid_team_slots.push(format!("{predecessor_id}:invalid_agent_packet"));
+                        continue;
+                    };
+                    let upstream_evidence = graph
+                        .edges
+                        .iter()
+                        .filter(|edge| {
+                            edge.to == predecessor_id && edge.kind == ExecutionEdgeKind::DependsOn
+                        })
+                        .filter_map(|edge| graph.node_results.get(&edge.from))
+                        .flat_map(|result| result.evidence_refs.iter())
+                        .filter(|reference| {
+                            crate::agent_result_validator::is_materialized_durable_evidence(
+                                reference,
+                            )
+                        })
+                        .map(|reference| {
+                            (
+                                reference.evidence_ref.0.ref_type.clone(),
+                                reference.evidence_ref.0.id.clone(),
+                            )
+                        })
+                        .collect::<BTreeSet<_>>();
+                    let produced_evidence = result.evidence_refs.iter().any(|reference| {
+                        crate::agent_result_validator::is_materialized_durable_evidence(reference)
+                            && !packet
+                                .evidence_refs
+                                .iter()
+                                .any(|input| input.evidence_ref == reference.evidence_ref)
+                            && !upstream_evidence.contains(&(
+                                reference.evidence_ref.0.ref_type.clone(),
+                                reference.evidence_ref.0.id.clone(),
+                            ))
+                    });
+                    let completed_acceptance = packet.acceptance.iter().all(|criterion| {
+                        result.evidence_refs.iter().any(|reference| {
+                            reference.evidence_ref.0.ref_type == "runtime_acceptance"
+                                && reference.evidence_ref.0.id
+                                    == crate::execution_core::graph::executors::agent::acceptance_marker_id(
+                                        predecessor_id,
+                                        criterion,
+                                    )
+                        })
+                    });
+                    let typed_requirements = packet
+                        .constraints
+                        .iter()
+                        .find_map(|constraint| constraint.strip_prefix("team_acceptance_contract:"))
+                        .and_then(|value| {
+                            serde_json::from_str::<
+                                Vec<harness_contract::team::TeamAcceptanceRequirement>,
+                            >(value)
+                            .ok()
+                        })
+                        .filter(|requirements| {
+                            requirements.len() == packet.acceptance.len()
+                                && requirements.iter().all(|requirement| {
+                                    packet.acceptance.contains(&requirement.criterion)
+                                })
+                        });
+                    let typed_acceptance = typed_requirements.is_some();
+                    let requires_new_tool_evidence = typed_requirements
+                        .as_ref()
+                        .is_some_and(|requirements| {
+                            requirements.iter().any(|requirement| {
+                                matches!(
+                                    &requirement.check,
+                                    harness_contract::team::TeamAcceptanceCheck::ScopedEvidence {
+                                        ..
+                                    } | harness_contract::team::TeamAcceptanceCheck::WorkspaceChange {
+                                        ..
+                                    } | harness_contract::team::TeamAcceptanceCheck::SourceVerification {
+                                        ..
+                                    } | harness_contract::team::TeamAcceptanceCheck::UpstreamReview
+                                        | harness_contract::team::TeamAcceptanceCheck::LegacyEvidenceBound {
+                                            ..
+                                        }
+                                )
+                            })
+                        });
+                    let consumes_upstream =
+                        typed_requirements.as_ref().is_some_and(|requirements| {
+                            requirements.iter().any(|requirement| {
+                                requirement.check
+                                    == harness_contract::team::TeamAcceptanceCheck::UpstreamEvidence
+                            })
+                        });
+                    let retained_upstream = consumes_upstream
+                        && !upstream_evidence.is_empty()
+                        && upstream_evidence.iter().any(|(ref_type, id)| {
+                            result.evidence_refs.iter().any(|reference| {
+                                reference.evidence_ref.0.ref_type == ref_type.as_str()
+                                    && reference.evidence_ref.0.id == id.as_str()
+                            })
+                        });
+                    let evidence_satisfied =
+                        (requires_new_tool_evidence && produced_evidence) || retained_upstream;
+                    let role = packet_constraint(&packet, "team_role:");
+                    let focus = packet_constraint(&packet, "focus_partition:");
+                    let focus_hash = packet_constraint(&packet, "focus_scope_hash:");
+                    let evidence_responsibility =
+                        packet_constraint(&packet, "focus_evidence_responsibility:");
+                    if requires_new_tool_evidence && result.usage.tool_calls == 0 {
+                        invalid_team_slots.push(format!("{predecessor_id}:zero_tool_calls"));
+                    }
+                    if !evidence_satisfied {
+                        invalid_team_slots.push(format!(
+                            "{predecessor_id}:missing_required_durable_evidence"
+                        ));
+                    }
+                    if !completed_acceptance {
+                        invalid_team_slots
+                            .push(format!("{predecessor_id}:acceptance_not_runtime_satisfied"));
+                    }
+                    if !typed_acceptance {
+                        invalid_team_slots.push(format!(
+                            "{predecessor_id}:missing_typed_acceptance_contract"
+                        ));
+                    }
+                    if role.is_none()
+                        || focus.is_none()
+                        || focus_hash.is_none()
+                        || evidence_responsibility.is_none()
+                    {
+                        invalid_team_slots
+                            .push(format!("{predecessor_id}:incomplete_role_focus_contract"));
+                    }
+                    if result
+                        .summary
+                        .as_deref()
+                        .map(str::trim)
+                        .is_none_or(str::is_empty)
+                    {
+                        invalid_team_slots.push(format!("{predecessor_id}:missing_summary"));
+                    } else {
+                        satisfied_team_criteria.insert("summary".to_string());
+                    }
+                    if evidence_satisfied {
+                        satisfied_team_criteria.insert("evidence".to_string());
+                    }
+                    for criterion in &packet.acceptance {
+                        if result.evidence_refs.iter().any(|reference| {
+                            reference.evidence_ref.0.ref_type == "runtime_acceptance"
+                                && reference.evidence_ref.0.id
+                                    == crate::execution_core::graph::executors::agent::acceptance_marker_id(
+                                        predecessor_id,
+                                        criterion,
+                                    )
+                        }) {
+                            satisfied_team_criteria.insert(criterion.to_ascii_lowercase());
+                        }
+                    }
+                }
             }
         }
 
-        let missing = node
+        let mut missing = node
             .acceptance
             .required_evidence
             .iter()
             .filter(|required| !available.contains(required.as_str()))
             .cloned()
             .collect::<Vec<_>>();
-        let (status, failure) = if !incomplete.is_empty() || !missing.is_empty() {
-            let mut detail = Vec::new();
-            if !incomplete.is_empty() {
-                detail.push(format!(
-                    "incomplete predecessors: {}",
-                    incomplete.join(", ")
-                ));
-            }
-            if !missing.is_empty() {
-                detail.push(format!("missing required evidence: {}", missing.join(", ")));
-            }
-            (
-                ExecutionNodeStatus::Blocked,
-                Some(ExecutionFailure {
-                    kind: "missing_evidence".into(),
-                    message: detail.join("; "),
-                    retryable: true,
-                    evidence_refs: evidence.clone(),
-                }),
-            )
-        } else {
-            (ExecutionNodeStatus::Completed, None)
-        };
+        if team_verification {
+            missing.extend(node.acceptance.criteria.iter().filter_map(|required| {
+                let required_normalized = required.to_ascii_lowercase();
+                (!satisfied_team_criteria.contains(&required_normalized))
+                    .then(|| format!("team_contract:{required}"))
+            }));
+        }
+        let (status, failure) =
+            if !incomplete.is_empty() || !missing.is_empty() || !invalid_team_slots.is_empty() {
+                let mut detail = Vec::new();
+                if !incomplete.is_empty() {
+                    detail.push(format!(
+                        "incomplete predecessors: {}",
+                        incomplete.join(", ")
+                    ));
+                }
+                if !missing.is_empty() {
+                    detail.push(format!("missing required evidence: {}", missing.join(", ")));
+                }
+                if !invalid_team_slots.is_empty() {
+                    detail.push(format!(
+                        "invalid Team role slots: {}",
+                        invalid_team_slots.join(", ")
+                    ));
+                }
+                (
+                    ExecutionNodeStatus::Blocked,
+                    Some(ExecutionFailure {
+                        kind: "missing_evidence".into(),
+                        message: detail.join("; "),
+                        retryable: true,
+                        evidence_refs: evidence.clone(),
+                    }),
+                )
+            } else {
+                (ExecutionNodeStatus::Completed, None)
+            };
 
         Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
             status,
@@ -165,6 +347,19 @@ impl NodeExecutor for VerifyNodeExecutor {
             finished_at_ms: crate::tool_invocation::now_ms(),
         }))
     }
+}
+
+fn packet_constraint(
+    packet: &harness_contract::agent::AgentTaskPacket,
+    prefix: &str,
+) -> Option<String> {
+    packet
+        .constraints
+        .iter()
+        .find_map(|constraint| constraint.strip_prefix(prefix))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 #[cfg(test)]

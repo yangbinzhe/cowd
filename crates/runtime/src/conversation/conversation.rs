@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -12,20 +12,38 @@ use fact_kernel::FactExtractionTokenUsage;
 use tokio::sync::{RwLock, Semaphore};
 
 /// T35: Lightweight cancellation token (tokio-util not available in dep tree).
+#[derive(Default, Debug)]
+struct CancellationState {
+    cancelled: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
 #[derive(Clone, Default, Debug)]
-pub struct CancellationToken(Arc<AtomicBool>);
+pub struct CancellationToken(Arc<CancellationState>);
 
 impl CancellationToken {
     pub fn new() -> Self {
-        Self(Arc::new(AtomicBool::new(false)))
+        Self(Arc::new(CancellationState::default()))
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.0.cancelled.load(Ordering::SeqCst)
     }
 
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        if !self.0.cancelled.swap(true, Ordering::SeqCst) {
+            self.0.notify.notify_waiters();
+        }
+    }
+
+    pub async fn cancelled(&self) {
+        loop {
+            let notified = self.0.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -57,6 +75,185 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::budget_policy::{clamp_context_budget_ratio_bp, RuntimeBudgetInputs, RuntimeBudgetPlan};
+
+static STRATEGY_EXPERIENCE_IO_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+static EVALUATION_PROVIDER_TOKEN_LEASE: OnceLock<
+    std::sync::Mutex<Option<EvaluationProviderTokenLeaseState>>,
+> = OnceLock::new();
+
+#[derive(Debug)]
+struct EvaluationProviderTokenLeaseState {
+    lease_id: String,
+    limit: u64,
+    remaining: u64,
+    outstanding: usize,
+    breached: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EvaluationProviderTokenLeaseSnapshot {
+    pub lease_id: String,
+    pub limit: u64,
+    pub consumed: u64,
+    pub outstanding: usize,
+    pub breached: bool,
+}
+
+pub(crate) fn install_evaluation_provider_token_lease(
+    lease_id: &str,
+    limit: u64,
+) -> Result<(), RuntimeError> {
+    if lease_id.trim().is_empty() || limit == 0 || limit > 2_000_000 {
+        return Err(RuntimeError::new(
+            "evaluation provider token lease identity/limit is invalid",
+        ));
+    }
+    let lease = EVALUATION_PROVIDER_TOKEN_LEASE.get_or_init(|| std::sync::Mutex::new(None));
+    let mut lease = lease
+        .lock()
+        .map_err(|_| RuntimeError::new("evaluation provider token lease lock poisoned"))?;
+    if lease
+        .as_ref()
+        .is_some_and(|current| current.outstanding > 0)
+    {
+        return Err(RuntimeError::new(
+            "evaluation provider token lease cannot reset while a request is outstanding",
+        ));
+    }
+    *lease = Some(EvaluationProviderTokenLeaseState {
+        lease_id: lease_id.to_string(),
+        limit,
+        remaining: limit,
+        outstanding: 0,
+        breached: false,
+    });
+    Ok(())
+}
+
+pub(crate) fn evaluation_provider_token_lease_snapshot(
+) -> Option<EvaluationProviderTokenLeaseSnapshot> {
+    EVALUATION_PROVIDER_TOKEN_LEASE
+        .get()
+        .and_then(|lease| lease.lock().ok())
+        .and_then(|lease| {
+            lease
+                .as_ref()
+                .map(|lease| EvaluationProviderTokenLeaseSnapshot {
+                    lease_id: lease.lease_id.clone(),
+                    limit: lease.limit,
+                    consumed: lease.limit.saturating_sub(lease.remaining),
+                    outstanding: lease.outstanding,
+                    breached: lease.breached,
+                })
+        })
+}
+
+struct EvaluationProviderTokenReservation {
+    reserved: u64,
+    reconciled: bool,
+}
+
+impl EvaluationProviderTokenReservation {
+    fn acquire(request: &mut ApiRequest) -> Result<Option<Self>, RuntimeError> {
+        let Some(lease) = EVALUATION_PROVIDER_TOKEN_LEASE.get() else {
+            return Ok(None);
+        };
+        let mut lease = lease
+            .lock()
+            .map_err(|_| RuntimeError::new("evaluation provider token lease lock poisoned"))?;
+        let Some(lease) = lease.as_mut() else {
+            return Ok(None);
+        };
+        if lease.breached {
+            return Err(RuntimeError::new(format!(
+                "evaluation provider token lease `{}` is already breached",
+                lease.lease_id
+            )));
+        }
+        // Reserve a conservative upper bound before touching the provider.
+        // Input estimation, protocol framing and the normal request safety
+        // margin are all charged; the remainder becomes the provider-enforced
+        // maximum output. This lease is process-wide in the dedicated
+        // evaluator Gateway, so Team children and their parent share it.
+        let input_reserve = request
+            .budget
+            .input_total_tokens()
+            .saturating_add(request.budget.protocol_overhead_tokens)
+            .saturating_add(request.budget.safety_margin_tokens);
+        if input_reserve >= lease.remaining {
+            return Err(RuntimeError::new(format!(
+                "evaluation provider token lease `{}` has {} tokens remaining but request input reserves {}",
+                lease.lease_id, lease.remaining, input_reserve
+            )));
+        }
+        let output_reserve = request
+            .budget
+            .requested_output_tokens
+            .min(lease.remaining.saturating_sub(input_reserve));
+        if output_reserve == 0 {
+            return Err(RuntimeError::new(format!(
+                "evaluation provider token lease `{}` has no output capacity",
+                lease.lease_id
+            )));
+        }
+        request.budget.requested_output_tokens = output_reserve;
+        let reserved = input_reserve.saturating_add(output_reserve);
+        lease.remaining = lease.remaining.saturating_sub(reserved);
+        lease.outstanding = lease.outstanding.saturating_add(1);
+        Ok(Some(Self {
+            reserved,
+            reconciled: false,
+        }))
+    }
+
+    fn reconcile(&mut self, usage: TokenUsage) {
+        if self.reconciled {
+            return;
+        }
+        let actual = u64::from(usage.input_tokens)
+            .saturating_add(u64::from(usage.output_tokens))
+            .saturating_add(u64::from(usage.cache_creation_input_tokens))
+            .saturating_add(u64::from(usage.cache_read_input_tokens));
+        if actual == 0 {
+            // Missing provider usage is not permission to refund a hard
+            // reservation. Drop will close the outstanding request while
+            // retaining the conservative charge.
+            return;
+        }
+        if let Some(lease) = EVALUATION_PROVIDER_TOKEN_LEASE.get() {
+            if let Ok(mut lease) = lease.lock() {
+                if let Some(lease) = lease.as_mut() {
+                    if actual <= self.reserved {
+                        lease.remaining = lease
+                            .remaining
+                            .saturating_add(self.reserved.saturating_sub(actual))
+                            .min(lease.limit);
+                    } else {
+                        lease.breached = true;
+                        lease.remaining = 0;
+                    }
+                    lease.outstanding = lease.outstanding.saturating_sub(1);
+                    self.reconciled = true;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for EvaluationProviderTokenReservation {
+    fn drop(&mut self) {
+        if self.reconciled {
+            return;
+        }
+        if let Some(lease) = EVALUATION_PROVIDER_TOKEN_LEASE.get() {
+            if let Ok(mut lease) = lease.lock() {
+                if let Some(lease) = lease.as_mut() {
+                    lease.outstanding = lease.outstanding.saturating_sub(1);
+                }
+            }
+        }
+    }
+}
 use crate::compact::{
     apply_compaction_summary, estimate_session_tokens, plan_session_compaction, CompactionConfig,
 };
@@ -346,6 +543,14 @@ fn tool_batch_pattern(calls: &[ModelToolCall]) -> harness_contract::core::Execut
     } else {
         harness_contract::core::ExecutionPattern::Execute
     }
+}
+
+fn model_team_request_conflicts_with_admission(
+    candidate: harness_contract::strategy::ExecutionCandidateKind,
+    calls: &[ModelToolCall],
+) -> bool {
+    tool_batch_pattern(calls) == harness_contract::core::ExecutionPattern::Collaborate
+        && candidate != harness_contract::strategy::ExecutionCandidateKind::Team
 }
 
 fn required_team_orchestration_call(objective: &str) -> ModelToolCall {
@@ -799,6 +1004,14 @@ pub struct TurnSummary {
     pub auto_compaction: Option<AutoCompactionEvent>,
     pub ai_kernel_trace: RuntimeAiKernelTrace,
     pub context_turn_report: ContextTurnReport,
+    pub duplicate_tool_calls: u64,
+    /// Canonical workspace paths targeted by write-capable tool calls during
+    /// this turn, including calls rejected before execution. This is distinct
+    /// from the final workspace diff: mutate-and-restore and same-bytes writes
+    /// remain observable to evaluation and audit consumers.
+    pub write_attempt_paths: Vec<String>,
+    pub max_tool_concurrency_observed: usize,
+    pub parallel_tool_batches: usize,
 }
 
 /// One provider decision. Model steps are deliberately side-effect free with
@@ -840,6 +1053,8 @@ pub struct ModelStepResult {
 pub struct ToolBatchStepResult {
     pub messages: Vec<ConversationMessage>,
     pub failed: usize,
+    pub max_concurrency_observed: usize,
+    pub parallel_batches: usize,
 }
 
 /// Details about automatic session compaction applied during a turn.
@@ -998,6 +1213,20 @@ fn normalize_image_media_type(path: &Path, media_type: &str) -> Option<String> {
 }
 
 /// Coordinates the model loop, tool execution, hooks, and session updates.
+struct RecoveredTurnStrategyIdentity {
+    decision_id: String,
+    decision_lease: String,
+    revision: u64,
+    policy_version: String,
+    selected_candidate: harness_contract::strategy::ExecutionCandidateKind,
+    status: crate::execution_core::TurnStrategyDecisionStatus,
+    resource_snapshot: harness_contract::strategy::StrategyResourceSnapshot,
+    candidate_estimates: Vec<harness_contract::strategy::ExecutionCandidateEstimate>,
+    collaboration_receipt: Option<serde_json::Value>,
+    focus_partition_plans: Vec<harness_contract::team::FocusPartitionPlan>,
+    pattern: harness_contract::core::ExecutionPattern,
+}
+
 pub struct ConversationRuntime<C, T> {
     session: Arc<RwLock<Session>>, // tokio::sync::RwLock
     session_input_stream: crate::session_input::SessionInputStream,
@@ -1109,6 +1338,10 @@ pub struct ConversationRuntime<C, T> {
     tool_trace_context_items: std::sync::Mutex<Vec<ContextItem>>,
     /// Governance observations produced by tool calls in the active turn.
     turn_tool_observations: std::sync::Mutex<Vec<ToolObservation>>,
+    /// Sole strategy identity for the admitted turn. Host creates it before
+    /// graph compilation; every later checkpoint reads or revises this state.
+    active_turn_strategy:
+        std::sync::Mutex<Option<crate::execution_core::TurnStrategyDecisionState>>,
     /// Revisioned tool set visible to the next provider request.
     tool_exposure_state: std::sync::Mutex<Option<ToolExposureState>>,
     /// Provider visibility changes must be monotonically ordered. A governed
@@ -1148,6 +1381,10 @@ pub struct ConversationRuntime<C, T> {
     /// turns owned by this host. `0` means derive the normal main-turn lease.
     /// Delegated Agent workers bind this from their immutable budget packet.
     model_step_limit_override: AtomicUsize,
+    /// Runtime-owned Focus policy copied from the immutable AgentTaskPacket.
+    /// `0` disables the delegated novelty gate for normal root turns.
+    delegated_focus_novelty_target_bp: AtomicU64,
+    delegated_focus_acceptance_scopes: std::sync::Mutex<Vec<String>>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -1358,6 +1595,7 @@ where
             next_model_text_only: AtomicBool::new(false),
             tool_trace_context_items: std::sync::Mutex::new(Vec::new()),
             turn_tool_observations: std::sync::Mutex::new(Vec::new()),
+            active_turn_strategy: std::sync::Mutex::new(None),
             tool_exposure_state: std::sync::Mutex::new(None),
             tool_exposure_revision: AtomicU64::new(0),
             turn_evidence_audits: std::sync::Mutex::new(Vec::new()),
@@ -1383,6 +1621,8 @@ where
             tool_timeout: Some(Duration::from_secs(120)),
             explicit_team_escalation: true,
             model_step_limit_override: AtomicUsize::new(0),
+            delegated_focus_novelty_target_bp: AtomicU64::new(0),
+            delegated_focus_acceptance_scopes: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1463,6 +1703,36 @@ where
             0 => None,
             limit => Some(limit),
         }
+    }
+
+    /// Bind the validated Focus acceptance/novelty policy for a delegated
+    /// child. The values are Runtime-owned and cannot be changed by provider
+    /// output or model-visible prompt text.
+    pub fn set_delegated_focus_policy(
+        &self,
+        novelty_target_bp: u16,
+        acceptance_scopes: Vec<String>,
+    ) {
+        self.delegated_focus_novelty_target_bp
+            .store(u64::from(novelty_target_bp.min(10_000)), Ordering::SeqCst);
+        if let Ok(mut guard) = self.delegated_focus_acceptance_scopes.lock() {
+            *guard = acceptance_scopes;
+        }
+    }
+
+    #[must_use]
+    pub fn delegated_focus_policy(&self) -> (u16, Vec<String>) {
+        (
+            u16::try_from(
+                self.delegated_focus_novelty_target_bp
+                    .load(Ordering::SeqCst),
+            )
+            .unwrap_or(10_000),
+            self.delegated_focus_acceptance_scopes
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or_default(),
+        )
     }
 
     /// Replace runtime-owned context supplied by orchestration layers.
@@ -1636,13 +1906,23 @@ where
         let mut last_error = None;
 
         for model in self.model_candidates_for_turn(objective) {
-            let request = match self.pack_provider_attempt(&prompt, &messages, &model, inventory) {
-                Ok(request) => request,
-                Err(error) => {
-                    last_error = Some(error);
-                    continue;
-                }
-            };
+            let mut request =
+                match self.pack_provider_attempt(&prompt, &messages, &model, inventory) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        last_error = Some(error);
+                        continue;
+                    }
+                };
+            let mut evaluation_reservation =
+                match EvaluationProviderTokenReservation::acquire(&mut request) {
+                    Ok(reservation) => reservation,
+                    Err(error) => {
+                        last_error = Some(error);
+                        continue;
+                    }
+                };
+            let cancellation = self.cancellation_token.clone();
             let mut stream = self.api_client.stream(request);
             let mut text = String::new();
             let mut thinking = String::new();
@@ -1653,7 +1933,19 @@ where
             let mut effective_model = None;
             let mut failed = None;
             use futures::StreamExt;
-            while let Some(event) = stream.next().await {
+            loop {
+                let event = tokio::select! {
+                    () = cancellation.cancelled() => {
+                        failed = Some(RuntimeError::new(
+                            "turn cancelled during clean terminal provider stream",
+                        ));
+                        break;
+                    }
+                    event = stream.next() => match event {
+                        Some(event) => event,
+                        None => break,
+                    }
+                };
                 match event {
                     Ok(AssistantEvent::ProviderModel { model }) => {
                         effective_model = Some(model);
@@ -1684,6 +1976,9 @@ where
                 }
             }
             drop(stream);
+            if let Some(reservation) = evaluation_reservation.as_mut() {
+                reservation.reconcile(usage);
+            }
             if let Some(error) = failed {
                 last_error = Some(error);
                 continue;
@@ -2587,6 +2882,15 @@ where
         }
     }
 
+    #[must_use]
+    pub(crate) fn active_model_lease(&self) -> String {
+        self.model
+            .as_deref()
+            .filter(|model| !model.trim().is_empty())
+            .unwrap_or("default")
+            .to_string()
+    }
+
     /// Set a tool callback for real-time execution visualization (P0-2).
     ///
     /// # Safety
@@ -2729,6 +3033,11 @@ where
     pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
         self.cancellation_token = token;
         self
+    }
+
+    #[must_use]
+    pub(crate) fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation_token.clone()
     }
 
     /// Attach a CowdEventBus for domain event emission.
@@ -3085,22 +3394,15 @@ where
             self.activate_skills_for_turn(user_input).await?;
         }
 
-        let strategy_input = self.strategy_input_for_turn(user_input);
-        let resource_health = crate::execution_core::StrategyResourceHealth {
-            provider_available: self.api_client.provider_available(),
-            tools_available: self.tool_executor.has_registered_tools(),
-            collaboration_available: self.runtime_control_policy.enabled
-                && self.runtime_control_policy.agent.enabled
-                && self.tool_executor.collaboration_runtime_available(),
-            mission_available: self.runtime_control_policy.enabled
-                && self.tool_executor.mission_runtime_available(),
-            observed: true,
-        };
-        let decision = crate::execution_core::StrategyDecisionEngine.decide_with_input(
-            strategy_input,
-            Some(self.context_profile()),
-            resource_health,
-        );
+        if self.active_turn_strategy().is_none() {
+            return Err(RuntimeError::new(
+                "model execution requires the Host-admitted turn strategy owner",
+            ));
+        }
+        let decision = self
+            .active_turn_strategy()
+            .map(|state| state.decision)
+            .ok_or_else(|| RuntimeError::new("turn strategy was not admitted"))?;
         if !decision.executable {
             return Err(RuntimeError::new(format!(
                 "runtime strategy is not executable: {}",
@@ -3297,9 +3599,17 @@ where
         // smaller. Repeating beyond that would mask malformed provider errors.
         let mut calibration_retries = BTreeSet::new();
         while let Some(model) = candidates.pop_front() {
-            let request =
+            let mut request =
                 match self.pack_provider_attempt(&prompt, &request_messages, &model, inventory) {
                     Ok(request) => request,
+                    Err(error) => {
+                        last_error = Some(error);
+                        continue;
+                    }
+                };
+            let mut evaluation_reservation =
+                match EvaluationProviderTokenReservation::acquire(&mut request) {
+                    Ok(reservation) => reservation,
                     Err(error) => {
                         last_error = Some(error);
                         continue;
@@ -3313,6 +3623,7 @@ where
             );
             let idle_timeout = transport_policy.idle_timeout;
             let heartbeat_grace = transport_policy.heartbeat_grace;
+            let cancellation = self.cancellation_token.clone();
             let mut stream = self.api_client.stream(request);
             let mut text = String::new();
             let mut effective_model = None;
@@ -3324,7 +3635,16 @@ where
             let mut failed = None;
             use futures::StreamExt;
             loop {
-                let event = match tokio::time::timeout(idle_timeout, stream.next()).await {
+                let next = tokio::select! {
+                    () = cancellation.cancelled() => {
+                        failed = Some(RuntimeError::new(
+                            "turn cancelled during provider stream",
+                        ));
+                        break;
+                    }
+                    next = tokio::time::timeout(idle_timeout, stream.next()) => next,
+                };
+                let event = match next {
                     Ok(Some(event)) => event,
                     Ok(None) => break,
                     Err(_) => {
@@ -3332,7 +3652,16 @@ where
                         // flushes a heartbeat or a long reasoning segment.
                         // Give the provider a bounded, policy-derived grace
                         // period before declaring a real transport stall.
-                        match tokio::time::timeout(heartbeat_grace, stream.next()).await {
+                        let heartbeat = tokio::select! {
+                            () = cancellation.cancelled() => {
+                                failed = Some(RuntimeError::new(
+                                    "turn cancelled during provider heartbeat grace",
+                                ));
+                                break;
+                            }
+                            heartbeat = tokio::time::timeout(heartbeat_grace, stream.next()) => heartbeat,
+                        };
+                        match heartbeat {
                             Ok(Some(event)) => event,
                             Ok(None) => break,
                             Err(_) => {
@@ -3405,6 +3734,9 @@ where
                 }
             }
             drop(stream);
+            if let Some(reservation) = evaluation_reservation.as_mut() {
+                reservation.reconcile(usage);
+            }
             if let Some(error) = failed {
                 if let Some(observed_limit) = error.provider_context_window_limit() {
                     if calibration_retries.insert(model.clone())
@@ -3513,24 +3845,22 @@ where
             .iter()
             .map(|call| (call.id.clone(), call.name.clone(), call.input.clone()))
             .collect::<Vec<_>>();
-        let mut decision = crate::execution_core::StrategyDecisionEngine.decide_with_input(
-            self.strategy_input_for_turn(&latest_user_prompt_text(&self.session().messages)),
-            Some(self.context_profile()),
-            crate::execution_core::StrategyResourceHealth {
-                provider_available: self.api_client.provider_available(),
-                tools_available: self.tool_executor.has_registered_tools(),
-                collaboration_available: self.tool_executor.collaboration_runtime_available(),
-                mission_available: self.tool_executor.mission_runtime_available(),
-                observed: true,
-            },
-        );
+        let mut decision = self
+            .active_turn_strategy()
+            .map(|state| state.decision)
+            .ok_or_else(|| RuntimeError::new("tool batch has no admitted turn strategy"))?;
         let plan = ToolExecutionPlan::from_requests_with_classifier(&requests, |name, input| {
             self.tool_executor.classify_tool_safety(name, input)
         });
         self.record_tool_execution_plan(&plan, self.session().messages.len());
+        let model_team_conflicts_with_admission = model_team_request_conflicts_with_admission(
+            decision.strategy.selected_candidate,
+            calls,
+        );
         if plan.tasks.iter().any(|task| {
             task.safety_category != crate::tool_orchestrator::ToolSafetyCategory::ReadOnly
-        }) {
+        }) && !model_team_conflicts_with_admission
+        {
             let target_pattern = tool_batch_pattern(calls);
             decision
                 .strategy
@@ -3574,18 +3904,88 @@ where
                     .gates
                     .push(harness_contract::core::ExecutionPolicyGate::Permission);
             }
+            let selected_candidate =
+                if target_pattern == harness_contract::core::ExecutionPattern::Collaborate {
+                    harness_contract::strategy::ExecutionCandidateKind::Team
+                } else if decision
+                    .strategy
+                    .modifiers
+                    .contains(&harness_contract::core::ExecutionModifier::Parallel)
+                {
+                    harness_contract::strategy::ExecutionCandidateKind::ParallelTools
+                } else {
+                    harness_contract::strategy::ExecutionCandidateKind::Direct
+                };
+            decision = self.revise_active_turn_strategy(
+                selected_candidate,
+                target_pattern,
+                crate::execution_core::TurnStrategyDecisionStatus::Running,
+                "provider tool batch retained the admitted decision lease",
+                Some("runtime.strategy.retargeted"),
+            )?;
+            if target_pattern == harness_contract::core::ExecutionPattern::Collaborate
+                && !decision
+                    .strategy
+                    .modifiers
+                    .contains(&harness_contract::core::ExecutionModifier::Parallel)
+            {
+                decision
+                    .strategy
+                    .modifiers
+                    .push(harness_contract::core::ExecutionModifier::Parallel);
+            }
+            if !decision
+                .strategy
+                .modifiers
+                .contains(&harness_contract::core::ExecutionModifier::WithGuardrails)
+            {
+                decision
+                    .strategy
+                    .modifiers
+                    .push(harness_contract::core::ExecutionModifier::WithGuardrails);
+            }
+            if !decision
+                .strategy
+                .gates
+                .contains(&harness_contract::core::ExecutionPolicyGate::Permission)
+            {
+                decision
+                    .strategy
+                    .gates
+                    .push(harness_contract::core::ExecutionPolicyGate::Permission);
+            }
             decision.compile_target = crate::execution_core::RuntimeCompileTarget::ExecutionGraph;
         }
         self.tool_executor.bind_execution_decision(decision.clone());
         let mut validation = plan.validate_against_execution_decision(&decision);
+        if model_team_conflicts_with_admission {
+            validation.allowed = false;
+            validation.findings.push(
+                "model_team_request_conflicts_with_admitted_strategy; Team must be selected by the sole admission owner"
+                    .to_string(),
+            );
+        }
         if validation.allowed {
             self.satisfy_tool_strategy_gates(&plan, &decision, &mut validation)
                 .await;
         }
         self.record_tool_strategy_validation(&validation, self.session().messages.len());
         let mut result_map = std::collections::HashMap::new();
+        let mut max_concurrency_observed = 0;
+        let mut parallel_batches = 0;
         if validation.allowed {
             let schedule = schedule_tool_execution_plan_for_decision(&requests, &plan, &decision);
+            max_concurrency_observed = schedule
+                .batches
+                .iter()
+                .map(|batch| batch.max_concurrency.min(batch.indices.len()))
+                .max()
+                .unwrap_or(0);
+            parallel_batches = schedule
+                .batches
+                .iter()
+                .filter(|batch| batch.max_concurrency > 1 && batch.indices.len() > 1)
+                .count();
             self.record_tool_schedule(&schedule, &requests, self.session().messages.len());
             for batch in &schedule.batches {
                 self.execute_tool_schedule_batch(
@@ -3629,7 +4029,12 @@ where
             }
         }
         let failed = count_failed_tool_results(&messages);
-        Ok(ToolBatchStepResult { messages, failed })
+        Ok(ToolBatchStepResult {
+            messages,
+            failed,
+            max_concurrency_observed,
+            parallel_batches,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3645,6 +4050,10 @@ where
         input_tokens: u64,
         output_tokens: u64,
         wall_duration_ms: u64,
+        duplicate_tool_calls: u64,
+        write_attempt_paths: Vec<String>,
+        max_tool_concurrency_observed: usize,
+        parallel_tool_batches: usize,
         terminal_completion: harness_contract::goal::GoalCompletion,
         defer_post_turn_memory_maintenance: bool,
     ) -> Result<TurnSummary, RuntimeError> {
@@ -3652,17 +4061,15 @@ where
         if final_answer.trim().is_empty() {
             return Err(RuntimeError::new("model produced an empty final answer"));
         }
-        let decision = crate::execution_core::StrategyDecisionEngine.decide_with_input(
-            self.strategy_input_for_turn(user_input),
-            Some(self.context_profile()),
-            crate::execution_core::StrategyResourceHealth {
-                provider_available: self.api_client.provider_available(),
-                tools_available: self.tool_executor.has_registered_tools(),
-                collaboration_available: self.tool_executor.collaboration_runtime_available(),
-                mission_available: self.tool_executor.mission_runtime_available(),
-                observed: true,
-            },
-        );
+        if self.active_turn_strategy().is_none() {
+            return Err(RuntimeError::new(
+                "turn finalization requires the Host-admitted turn strategy owner",
+            ));
+        }
+        let decision = self
+            .active_turn_strategy()
+            .map(|state| state.decision)
+            .ok_or_else(|| RuntimeError::new("turn finalization has no strategy owner"))?;
         let mut kernel = RuntimeAiKernel::begin_turn_with_execution_decision(
             self.session().session_id.clone(),
             user_input.to_string(),
@@ -3710,8 +4117,8 @@ where
             output_chunks: iterations as u64,
             input_tokens,
             output_tokens,
-            cache_create_tokens: 0,
-            cache_read_tokens: 0,
+            cache_create_tokens: u64::from(usage.cache_creation_input_tokens),
+            cache_read_tokens: u64::from(usage.cache_read_input_tokens),
             total_tokens: input_tokens.saturating_add(output_tokens),
             usage_source: "provider".to_string(),
             wall_chars_per_second: rate_per_second(
@@ -3755,10 +4162,13 @@ where
             auto_compaction,
             ai_kernel_trace,
             context_turn_report,
+            duplicate_tool_calls,
+            write_attempt_paths,
+            max_tool_concurrency_observed,
+            parallel_tool_batches,
         };
         self.record_turn_completed(&summary);
         self.record_ai_kernel_trace_event(&summary.ai_kernel_trace, self.session().messages.len());
-        self.record_strategy_experience(&summary.ai_kernel_trace);
         if let Some(ref cowd) = self.cowd_bus {
             cowd.emit(crate::cowd_event::CowdEvent::RunModelTelemetry {
                 telemetry: summary.model_telemetry.clone(),
@@ -4408,7 +4818,8 @@ where
         result_map: &mut std::collections::HashMap<String, (ConversationMessage, Option<String>)>,
     ) -> Result<(), RuntimeError> {
         match batch.mode {
-            crate::execution_scheduler::ExecutionBatchMode::Wave => {
+            crate::execution_scheduler::ExecutionBatchMode::Wave
+            | crate::execution_scheduler::ExecutionBatchMode::SerialStrategy => {
                 self.execute_tool_indices_serial_into_map(
                     &batch.indices,
                     pending_tool_uses,
@@ -6453,14 +6864,598 @@ where
     }
 
     fn strategy_input_for_turn(&self, user_input: &str) -> StrategyInput {
-        let store = StrategyExperienceStore::load_or_default(strategy_experience_path());
+        let _io_guard = STRATEGY_EXPERIENCE_IO_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let path = strategy_experience_path();
+        let mut store = StrategyExperienceStore::load_or_default(path.clone());
+        if let Ok(report_path) = std::env::var("COWD_STRATEGY_CALIBRATION_REPORT") {
+            match std::fs::read(&report_path)
+                .map_err(|error| error.to_string())
+                .and_then(|bytes| {
+                    serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .map_err(|error| error.to_string())
+                })
+                .and_then(|report| store.import_paired_evaluation_report(&report))
+            {
+                Ok(imported) if imported > 0 => {
+                    if let Err(error) = store.save(&path) {
+                        tracing::warn!(
+                            %error,
+                            report_path,
+                            "failed to persist imported paired strategy calibration"
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(
+                    %error,
+                    report_path,
+                    "rejected paired strategy calibration report"
+                ),
+            }
+        }
         store.enrich_input(StrategyInput::from_prompt(user_input.to_string()))
     }
 
-    fn record_strategy_experience(&self, trace: &RuntimeAiKernelTrace) {
+    /// Admit exactly one strategy identity for a turn. This is the only
+    /// conversation-layer call site allowed to create a decision.
+    pub(crate) fn begin_turn_strategy(
+        &self,
+        turn_ref: impl Into<String>,
+        user_input: &str,
+    ) -> Result<crate::execution_core::TurnStrategyDecisionState, RuntimeError> {
+        self.begin_turn_strategy_with_resource_snapshot(turn_ref, user_input, None)
+    }
+
+    pub(crate) fn begin_turn_strategy_with_resource_snapshot(
+        &self,
+        turn_ref: impl Into<String>,
+        user_input: &str,
+        resource_snapshot: Option<harness_contract::strategy::StrategyResourceSnapshot>,
+    ) -> Result<crate::execution_core::TurnStrategyDecisionState, RuntimeError> {
+        let turn_ref = turn_ref.into();
+        let mut guard = self
+            .active_turn_strategy
+            .lock()
+            .map_err(|_| RuntimeError::new("turn strategy owner lock poisoned"))?;
+        if let Some(active) = guard.as_ref() {
+            if active.turn_ref == turn_ref {
+                return Ok(active.clone());
+            }
+            return Err(RuntimeError::new(format!(
+                "turn `{turn_ref}` cannot replace active strategy turn `{}`",
+                active.turn_ref
+            )));
+        }
+        let evaluation_isolated = resource_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.sample_source.contains("corpus="));
+        let mut strategy_input = if evaluation_isolated {
+            StrategyInput::from_prompt(user_input.to_string())
+        } else {
+            self.strategy_input_for_turn(user_input)
+        };
+        if let Some(resource_snapshot) = resource_snapshot {
+            strategy_input = strategy_input.with_resource_snapshot(resource_snapshot);
+        }
+        let mut decision = crate::execution_core::StrategyDecisionEngine.decide_with_input(
+            strategy_input,
+            Some(self.context_profile()),
+            crate::execution_core::StrategyResourceHealth {
+                provider_available: self.api_client.provider_available(),
+                tools_available: self.tool_executor.has_registered_tools(),
+                collaboration_available: self.runtime_control_policy.enabled
+                    && self.runtime_control_policy.agent.enabled
+                    && self.context_profile() != ContextProfile::SubAgent
+                    && self.tool_executor.collaboration_runtime_available(),
+                mission_available: self.runtime_control_policy.enabled
+                    && self.tool_executor.mission_runtime_available(),
+                observed: true,
+            },
+        );
+        apply_eval_strategy_override(&mut decision)?;
+        if !decision.executable {
+            return Err(RuntimeError::new(format!(
+                "runtime strategy is not executable: {}",
+                decision.blocked_reasons.join("; ")
+            )));
+        }
+        let state = crate::execution_core::TurnStrategyDecisionState::admitted(
+            decision,
+            self.session().session_id,
+            turn_ref,
+        );
+        *guard = Some(state.clone());
+        Ok(state)
+    }
+
+    #[must_use]
+    pub(crate) fn active_turn_strategy(
+        &self,
+    ) -> Option<crate::execution_core::TurnStrategyDecisionState> {
+        self.active_turn_strategy
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    pub(crate) fn bind_turn_strategy_execution(
+        &self,
+        turn_ref: &str,
+        execution_graph_ref: &str,
+    ) -> Result<crate::execution_core::TurnStrategyDecisionState, RuntimeError> {
+        let recovered = self.recover_turn_strategy_identity(turn_ref, execution_graph_ref);
+        let (state, should_emit, previous) = {
+            let mut guard = self
+                .active_turn_strategy
+                .lock()
+                .map_err(|_| RuntimeError::new("turn strategy owner lock poisoned"))?;
+            let previous = guard.clone();
+            let state = guard
+                .as_mut()
+                .filter(|state| state.turn_ref == turn_ref)
+                .ok_or_else(|| RuntimeError::new("turn strategy binding scope mismatch"))?;
+            let should_emit = state.execution_graph_ref.is_none() && recovered.is_none();
+            if let Some(recovered) = recovered {
+                state.decision_id = recovered.decision_id.clone();
+                state.decision_lease = recovered.decision_lease.clone();
+                state.revision = recovered.revision;
+                state.policy_version.clone_from(&recovered.policy_version);
+                state.selected_candidate = recovered.selected_candidate;
+                state.status = recovered.status;
+                state.resource_snapshot = recovered.resource_snapshot;
+                state.collaboration_receipt = recovered.collaboration_receipt;
+                state.focus_partition_plans = recovered.focus_partition_plans;
+                state.decision.decision_id = recovered.decision_id;
+                state.decision.decision_revision = recovered.revision;
+                state.decision.lease.lease_id = recovered.decision_lease;
+                state.decision.strategy.policy_version = recovered.policy_version;
+                state.decision.strategy.selected_candidate = recovered.selected_candidate;
+                state.decision.strategy.resource_snapshot = state.resource_snapshot.clone();
+                state.decision.strategy.candidate_estimates = recovered.candidate_estimates;
+                let recovered_pattern = recovered.pattern;
+                state
+                    .decision
+                    .strategy
+                    .retarget(
+                        recovered_pattern,
+                        "recovered the durable turn strategy identity before graph resume",
+                    )
+                    .map_err(RuntimeError::new)?;
+                state.decision.lease.locked_pattern = recovered_pattern;
+                state.decision.compile_target =
+                    crate::execution_core::ExecutionPatternCatalog::current()
+                        .find(recovered_pattern)
+                        .map_or(
+                            crate::execution_core::RuntimeCompileTarget::InlineModel,
+                            |spec| spec.compile_target,
+                        );
+            }
+            if state.execution_graph_ref.as_deref() != Some(execution_graph_ref) {
+                if !should_emit {
+                    return Err(RuntimeError::new(
+                        "turn strategy cannot be rebound to another execution graph",
+                    ));
+                }
+                state.bind_execution_graph(execution_graph_ref);
+            }
+            (state.clone(), should_emit, previous)
+        };
+        if should_emit {
+            if let Err(error) = self.append_turn_strategy_event(
+                "runtime.strategy.selected",
+                &state,
+                "turn admitted and parent execution graph bound",
+            ) {
+                *self
+                    .active_turn_strategy
+                    .lock()
+                    .map_err(|_| RuntimeError::new("turn strategy owner lock poisoned"))? =
+                    previous;
+                return Err(error);
+            }
+        }
+        Ok(state)
+    }
+
+    fn recover_turn_strategy_identity(
+        &self,
+        turn_ref: &str,
+        execution_graph_ref: &str,
+    ) -> Option<RecoveredTurnStrategyIdentity> {
+        let store = self.runtime_event_store.as_ref()?;
+        let session_id = self.session().session_id;
+        let events = store
+            .list_stream(&format!("session:{session_id}"))
+            .map_err(|error| {
+                tracing::warn!(%error, session_id, turn_ref, "failed to inspect durable strategy identity");
+                error
+            })
+            .ok()?;
+        events
+            .into_iter()
+            .rev()
+            .filter(|event| event.kind.starts_with("runtime.strategy."))
+            .find_map(|event| {
+                let payload = event.payload;
+                if payload.get("turn_ref").and_then(serde_json::Value::as_str) != Some(turn_ref)
+                    || payload
+                        .get("execution_graph_ref")
+                        .and_then(serde_json::Value::as_str)
+                        != Some(execution_graph_ref)
+                {
+                    return None;
+                }
+                let pattern = match payload
+                    .get("selected_pattern")
+                    .and_then(serde_json::Value::as_str)?
+                {
+                    "direct" => harness_contract::core::ExecutionPattern::Direct,
+                    "explore" => harness_contract::core::ExecutionPattern::Explore,
+                    "execute" => harness_contract::core::ExecutionPattern::Execute,
+                    "deliberate" => harness_contract::core::ExecutionPattern::Deliberate,
+                    "collaborate" => harness_contract::core::ExecutionPattern::Collaborate,
+                    "supervise" => harness_contract::core::ExecutionPattern::Supervise,
+                    _ => return None,
+                };
+                Some(RecoveredTurnStrategyIdentity {
+                    decision_id: payload.get("decision_id")?.as_str()?.to_string(),
+                    decision_lease: payload.get("decision_lease")?.as_str()?.to_string(),
+                    revision: payload.get("decision_revision")?.as_u64()?,
+                    policy_version: payload.get("policy_version")?.as_str()?.to_string(),
+                    selected_candidate: serde_json::from_value(
+                        payload.get("selected_candidate")?.clone(),
+                    )
+                    .ok()?,
+                    status: serde_json::from_value(payload.get("status")?.clone()).ok()?,
+                    resource_snapshot: serde_json::from_value(
+                        payload.get("resource_snapshot")?.clone(),
+                    )
+                    .ok()?,
+                    candidate_estimates: serde_json::from_value(
+                        payload.get("candidate_estimates")?.clone(),
+                    )
+                    .ok()?,
+                    collaboration_receipt: payload
+                        .get("collaboration_receipt")
+                        .filter(|value| !value.is_null())
+                        .cloned(),
+                    focus_partition_plans: payload
+                        .get("evidence_scopes")
+                        .cloned()
+                        .and_then(|value| serde_json::from_value(value).ok())
+                        .unwrap_or_default(),
+                    pattern,
+                })
+            })
+    }
+
+    fn revise_active_turn_strategy(
+        &self,
+        selected_candidate: harness_contract::strategy::ExecutionCandidateKind,
+        pattern: harness_contract::core::ExecutionPattern,
+        status: crate::execution_core::TurnStrategyDecisionStatus,
+        reason: &str,
+        event_kind: Option<&'static str>,
+    ) -> Result<crate::execution_core::RuntimeExecutionDecision, RuntimeError> {
+        let (state, previous) = {
+            let mut guard = self
+                .active_turn_strategy
+                .lock()
+                .map_err(|_| RuntimeError::new("turn strategy owner lock poisoned"))?;
+            let state = guard
+                .as_mut()
+                .ok_or_else(|| RuntimeError::new("turn strategy revision has no owner"))?;
+            let previous = state.clone();
+            if state.selected_candidate == selected_candidate
+                && state.decision.pattern() == pattern
+                && status == crate::execution_core::TurnStrategyDecisionStatus::Running
+            {
+                return Ok(state.decision.clone());
+            }
+            state
+                .revise_to_pattern(selected_candidate, pattern, status, reason)
+                .map_err(RuntimeError::new)?;
+            (state.clone(), previous)
+        };
+        if let Some(kind) = event_kind {
+            if let Err(error) = self.append_turn_strategy_event(kind, &state, reason) {
+                *self
+                    .active_turn_strategy
+                    .lock()
+                    .map_err(|_| RuntimeError::new("turn strategy owner lock poisoned"))? =
+                    Some(previous);
+                return Err(error);
+            }
+        }
+        Ok(state.decision)
+    }
+
+    pub(crate) fn downgrade_turn_strategy(
+        &self,
+        candidate: harness_contract::strategy::ExecutionCandidateKind,
+        reason: &str,
+    ) -> Result<crate::execution_core::TurnStrategyDecisionState, RuntimeError> {
+        let requires_write = self
+            .active_turn_strategy()
+            .is_some_and(|state| state.decision.strategy.understanding.requires_write);
+        let pattern = match candidate {
+            harness_contract::strategy::ExecutionCandidateKind::Direct => {
+                if requires_write {
+                    harness_contract::core::ExecutionPattern::Execute
+                } else {
+                    harness_contract::core::ExecutionPattern::Direct
+                }
+            }
+            harness_contract::strategy::ExecutionCandidateKind::ParallelTools => {
+                if requires_write {
+                    harness_contract::core::ExecutionPattern::Execute
+                } else {
+                    harness_contract::core::ExecutionPattern::Explore
+                }
+            }
+            harness_contract::strategy::ExecutionCandidateKind::Team => {
+                harness_contract::core::ExecutionPattern::Collaborate
+            }
+        };
+        self.revise_active_turn_strategy(
+            candidate,
+            pattern,
+            crate::execution_core::TurnStrategyDecisionStatus::Downgraded,
+            reason,
+            Some("runtime.strategy.downgraded"),
+        )?;
+        self.active_turn_strategy()
+            .ok_or_else(|| RuntimeError::new("downgraded turn strategy disappeared"))
+    }
+
+    pub(crate) fn record_turn_strategy_early_stop(&self, reason: &str) -> Result<(), RuntimeError> {
+        let active = self
+            .active_turn_strategy()
+            .ok_or_else(|| RuntimeError::new("early stop has no turn strategy"))?;
+        self.revise_active_turn_strategy(
+            active.selected_candidate,
+            active.decision.pattern(),
+            crate::execution_core::TurnStrategyDecisionStatus::EarlyStopped,
+            reason,
+            Some("runtime.strategy.early_stopped"),
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn record_turn_strategy_collaboration_receipt(
+        &self,
+        receipt: serde_json::Value,
+    ) -> Result<(), RuntimeError> {
+        let mut guard = self
+            .active_turn_strategy
+            .lock()
+            .map_err(|_| RuntimeError::new("turn strategy owner lock poisoned"))?;
+        let state = guard
+            .as_mut()
+            .ok_or_else(|| RuntimeError::new("collaboration receipt has no turn strategy"))?;
+        if state.collaboration_receipt.is_none() {
+            state.collaboration_receipt = Some(receipt);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_turn_strategy_focus_partitions(
+        &self,
+        plans: Vec<harness_contract::team::FocusPartitionPlan>,
+    ) -> Result<crate::execution_core::TurnStrategyDecisionState, RuntimeError> {
+        let mut guard = self
+            .active_turn_strategy
+            .lock()
+            .map_err(|_| RuntimeError::new("turn strategy owner lock poisoned"))?;
+        let state = guard
+            .as_mut()
+            .ok_or_else(|| RuntimeError::new("focus partitions have no turn strategy owner"))?;
+        state.focus_partition_plans = plans;
+        Ok(state.clone())
+    }
+
+    pub(crate) fn finish_turn_strategy(
+        &self,
+        turn_ref: &str,
+        status: crate::execution_core::TurnStrategyDecisionStatus,
+        mut outcome: crate::execution_core::TurnStrategyActualOutcome,
+    ) -> Result<(), RuntimeError> {
+        let state = {
+            let mut guard = self
+                .active_turn_strategy
+                .lock()
+                .map_err(|_| RuntimeError::new("turn strategy owner lock poisoned"))?;
+            let Some(mut state) = guard.take() else {
+                return Ok(());
+            };
+            if state.turn_ref != turn_ref {
+                *guard = Some(state);
+                return Err(RuntimeError::new("turn strategy finish scope mismatch"));
+            }
+            if let Some(receipt) = state.collaboration_receipt.as_ref() {
+                let metric = |name: &str| receipt.get(name).and_then(serde_json::Value::as_u64);
+                outcome.input_tokens = outcome
+                    .input_tokens
+                    .saturating_add(metric("child_input_tokens").unwrap_or(0));
+                outcome.output_tokens = outcome
+                    .output_tokens
+                    .saturating_add(metric("child_output_tokens").unwrap_or(0));
+                outcome.cached_tokens = outcome
+                    .cached_tokens
+                    .saturating_add(metric("child_cached_tokens").unwrap_or(0));
+                outcome.tool_calls = outcome
+                    .tool_calls
+                    .saturating_add(metric("child_tool_calls").unwrap_or(0));
+                outcome.duplicate_tool_calls = outcome
+                    .duplicate_tool_calls
+                    .saturating_add(metric("duplicate_tool_calls").unwrap_or(0));
+                let child_write_attempt_paths = receipt
+                    .get("write_attempt_paths")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|paths| {
+                        paths
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                outcome
+                    .write_attempt_paths
+                    .extend(child_write_attempt_paths);
+                outcome.write_attempt_paths.sort();
+                outcome.write_attempt_paths.dedup();
+                outcome.evidence_overlap_bp = metric("evidence_overlap_bp")
+                    .and_then(|value| u16::try_from(value).ok())
+                    .unwrap_or(outcome.evidence_overlap_bp);
+                outcome.evidence_overlap_observed = receipt
+                    .get("evidence_overlap_observed")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(outcome.evidence_overlap_observed);
+                outcome.working_state_verified = receipt
+                    .get("working_state_verified")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(outcome.working_state_verified);
+                outcome.actual_speedup_ratio_bp = metric("actual_speedup_ratio_bp")
+                    .and_then(|value| u16::try_from(value).ok())
+                    .or(outcome.actual_speedup_ratio_bp);
+            }
+            state.revision = state.revision.saturating_add(1);
+            state.decision.decision_revision = state.revision;
+            state.status = status;
+            state.outcome = Some(outcome);
+            state
+        };
+        if state.execution_graph_ref.is_some() {
+            if let Err(error) = self.append_turn_strategy_event(
+                "runtime.strategy.outcome",
+                &state,
+                "turn terminal owner recorded actual outcome",
+            ) {
+                *self
+                    .active_turn_strategy
+                    .lock()
+                    .map_err(|_| RuntimeError::new("turn strategy owner lock poisoned"))? =
+                    Some(state);
+                return Err(error);
+            }
+        }
+        self.record_turn_strategy_experience(&state);
+        Ok(())
+    }
+
+    fn append_turn_strategy_event(
+        &self,
+        kind: &'static str,
+        state: &crate::execution_core::TurnStrategyDecisionState,
+        reason: &str,
+    ) -> Result<(), RuntimeError> {
+        let mut refs = vec![
+            RuntimeEventRef {
+                kind: "strategy_decision".to_string(),
+                id: state.decision_id.clone(),
+            },
+            RuntimeEventRef {
+                kind: "strategy_lease".to_string(),
+                id: state.decision_lease.clone(),
+            },
+            RuntimeEventRef {
+                kind: "session".to_string(),
+                id: state.session_ref.clone(),
+            },
+            RuntimeEventRef {
+                kind: "turn".to_string(),
+                id: state.turn_ref.clone(),
+            },
+        ];
+        if let Some(graph_id) = &state.execution_graph_ref {
+            refs.push(RuntimeEventRef {
+                kind: "execution_graph".to_string(),
+                id: graph_id.clone(),
+            });
+        }
+        let store = self
+            .runtime_event_store
+            .as_ref()
+            .ok_or_else(|| RuntimeError::new("turn strategy event store is unavailable"))?;
+        store
+            .append(RuntimeEventInput {
+                stream_id: format!("session:{}", state.session_ref),
+                scope: RuntimeEventScope::ExecutionGraph,
+                kind: kind.to_string(),
+                status: Some(format!("{:?}", state.status).to_ascii_lowercase()),
+                actor: Some("conversation_runtime.strategy_owner".to_string()),
+                refs,
+                payload: serde_json::json!({
+                    "decision_id": state.decision_id,
+                    "decision_lease": state.decision_lease,
+                    "decision_revision": state.revision,
+                    "policy_version": state.policy_version,
+                    "selected_candidate": state.selected_candidate,
+                    "selected_pattern": state.decision.pattern().as_str(),
+                    "candidate_estimates": state.decision.strategy.candidate_estimates,
+                    "resource_snapshot": state.resource_snapshot,
+                    "execution_graph_ref": state.execution_graph_ref,
+                    "session_ref": state.session_ref,
+                    "turn_ref": state.turn_ref,
+                    "status": state.status,
+                    "reason": reason,
+                    "collaboration_receipt": state.collaboration_receipt,
+                    "evidence_scopes": state.focus_partition_plans,
+                    "outcome": state.outcome,
+                }),
+            })
+            .map(|_| ())
+            .map_err(|error| {
+                RuntimeError::new(format!(
+                    "durable turn strategy event `{kind}` append failed: {error}"
+                ))
+            })
+    }
+
+    fn record_turn_strategy_experience(
+        &self,
+        state: &crate::execution_core::TurnStrategyDecisionState,
+    ) {
+        if state.resource_snapshot.sample_source.contains("corpus=") {
+            return;
+        }
+        let Some(outcome) = state.outcome.as_ref() else {
+            return;
+        };
+        let _io_guard = STRATEGY_EXPERIENCE_IO_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let understanding = &state.decision.strategy.understanding;
         let path = strategy_experience_path();
         let mut store = StrategyExperienceStore::load_or_default(path.clone());
-        store.record(strategy_experience_record(trace));
+        store.record(StrategyExperienceRecord {
+            domain: understanding.domain,
+            complexity: understanding.complexity,
+            risk: understanding.risk,
+            selected_pattern: state.decision.pattern(),
+            selected_candidate: Some(state.selected_candidate),
+            succeeded: state.status == crate::execution_core::TurnStrategyDecisionStatus::Completed,
+            verification_blocked: outcome.quality_score_bp == Some(0),
+            context_pressure: false,
+            composite_execution: state.selected_candidate
+                != harness_contract::strategy::ExecutionCandidateKind::Team
+                && state.collaboration_receipt.is_some(),
+            // One live turn has no paired counterfactual. Keep absolute cost
+            // telemetry, but never infer causal lift from graph shape.
+            multi_agent_positive_lift: false,
+            created_at_ms: now_ms(),
+            actual_duration_ms: outcome.duration_ms,
+            actual_input_tokens: outcome.input_tokens,
+            actual_output_tokens: outcome.output_tokens,
+            actual_cached_tokens: outcome.cached_tokens,
+            actual_coordination_cost_ms: outcome.merge_cost_ms,
+            paired_calibration: None,
+        });
         if let Err(error) = store.save(path) {
             tracing::warn!(%error, "failed to persist AI strategy experience");
         }
@@ -6951,6 +7946,73 @@ fn strategy_experience_path() -> std::path::PathBuf {
         .join("strategy-experience.json")
 }
 
+fn apply_eval_strategy_override(
+    decision: &mut crate::execution_core::RuntimeExecutionDecision,
+) -> Result<(), RuntimeError> {
+    if std::env::var("COWD_EVAL_HARNESS").as_deref() != Ok("1")
+        || std::env::var("COWD_EVAL_CORPUS_ID").as_deref() != Ok("auto-strategy-v1")
+    {
+        return Ok(());
+    }
+    let Ok(override_) = std::env::var("COWD_EVAL_STRATEGY_OVERRIDE") else {
+        return Ok(());
+    };
+    let (candidate, pattern) = match override_.trim().to_ascii_lowercase().as_str() {
+        "auto" => return Ok(()),
+        "direct" => (
+            harness_contract::strategy::ExecutionCandidateKind::Direct,
+            if decision.strategy.understanding.requires_write {
+                harness_contract::core::ExecutionPattern::Execute
+            } else {
+                harness_contract::core::ExecutionPattern::Direct
+            },
+        ),
+        "parallel_tools" | "parallel" => (
+            harness_contract::strategy::ExecutionCandidateKind::ParallelTools,
+            if decision.strategy.understanding.requires_write {
+                harness_contract::core::ExecutionPattern::Execute
+            } else {
+                harness_contract::core::ExecutionPattern::Explore
+            },
+        ),
+        unknown => {
+            return Err(RuntimeError::new(format!(
+                "unsupported eval-only strategy override `{unknown}`"
+            )));
+        }
+    };
+    decision
+        .strategy
+        .retarget(
+            pattern,
+            format!(
+                "pre-registered auto-strategy-v1 evaluation override selected {}",
+                candidate.as_str()
+            ),
+        )
+        .map_err(RuntimeError::new)?;
+    decision.strategy.selected_candidate = candidate;
+    if candidate == harness_contract::strategy::ExecutionCandidateKind::ParallelTools
+        && !decision
+            .strategy
+            .modifiers
+            .contains(&harness_contract::core::ExecutionModifier::Parallel)
+    {
+        decision
+            .strategy
+            .modifiers
+            .push(harness_contract::core::ExecutionModifier::Parallel);
+    }
+    decision.compile_target = crate::execution_core::ExecutionPatternCatalog::current()
+        .find(pattern)
+        .map_or(
+            crate::execution_core::RuntimeCompileTarget::InlineModel,
+            |spec| spec.compile_target,
+        );
+    decision.lease.locked_pattern = pattern;
+    Ok(())
+}
+
 fn strategy_experience_record(trace: &RuntimeAiKernelTrace) -> StrategyExperienceRecord {
     let context_pressure = !trace.context_epoch.omitted.is_empty()
         || trace
@@ -6958,16 +8020,6 @@ fn strategy_experience_record(trace: &RuntimeAiKernelTrace) -> StrategyExperienc
             .as_ref()
             .map(|alignment| !alignment.aligned)
             .unwrap_or(false);
-    let multi_agent_positive_lift = trace
-        .execution_graph_quality
-        .as_ref()
-        .map(|quality| {
-            quality.is_dag
-                && quality.has_verify_node
-                && quality.has_synthesize_node
-                && quality.failed_count == 0
-        })
-        .unwrap_or(false);
     let succeeded = trace.verification_report.can_finalize
         && trace.bench_result.passed
         && trace.regression_gate.allowed;
@@ -6976,7 +8028,7 @@ fn strategy_experience_record(trace: &RuntimeAiKernelTrace) -> StrategyExperienc
         succeeded,
         trace.verification_blocked,
         context_pressure,
-        multi_agent_positive_lift,
+        false,
         now_ms(),
     )
 }
@@ -6992,6 +8044,8 @@ fn strategy_experience_projection(trace: &RuntimeAiKernelTrace) -> serde_json::V
         "verification_blocked": record.verification_blocked,
         "context_pressure": record.context_pressure,
         "multi_agent_positive_lift": record.multi_agent_positive_lift,
+        "calibration_status": "assumed_structural_only",
+        "persisted_for_routing": false,
         "store_ref": strategy_experience_path().display().to_string(),
     })
 }
@@ -7192,11 +8246,11 @@ mod tests {
         apply_explicit_team_requirement, build_cc_memory_config_with_budget,
         deterministic_checkpoint_id, enforce_explicit_team_requirement,
         image_user_message_from_path, is_runtime_team_orchestration_call,
-        memory_project_id_for_session, prepared_vision_payload, preview_chars,
-        provider_transport_policy, rate_per_second, required_team_orchestration_call,
-        tool_batch_pattern, vision_user_message, ApiClient, ApiRequest, AssistantEvent,
-        CognitiveContextManager, ConversationRuntime, ModelStepIntent, ModelToolCall, RuntimeError,
-        StaticToolExecutor, ToolExposureState,
+        memory_project_id_for_session, model_team_request_conflicts_with_admission,
+        prepared_vision_payload, preview_chars, provider_transport_policy, rate_per_second,
+        required_team_orchestration_call, tool_batch_pattern, vision_user_message, ApiClient,
+        ApiRequest, AssistantEvent, CognitiveContextManager, ConversationRuntime, ModelStepIntent,
+        ModelToolCall, RuntimeError, StaticToolExecutor, ToolExposureState,
     };
     use crate::config::RuntimeFeatureConfig;
     use crate::context_runtime::{
@@ -7252,6 +8306,19 @@ mod tests {
         assert_eq!(calls[0].name, "runtime_orchestrate");
         let input: serde_json::Value = serde_json::from_str(&calls[0].input).unwrap();
         assert_eq!(input["action"], "request_team");
+    }
+
+    #[test]
+    fn provider_cannot_retarget_a_non_team_admission_into_an_unowned_team() {
+        let call = required_team_orchestration_call("review");
+        assert!(model_team_request_conflicts_with_admission(
+            harness_contract::strategy::ExecutionCandidateKind::Direct,
+            std::slice::from_ref(&call),
+        ));
+        assert!(!model_team_request_conflicts_with_admission(
+            harness_contract::strategy::ExecutionCandidateKind::Team,
+            &[call],
+        ));
     }
 
     #[test]
@@ -7522,6 +8589,9 @@ mod tests {
         .with_model_context_window(128_000);
         runtime.set_active_model("primary");
         runtime.fallbacks = vec!["fallback".to_string()];
+        runtime
+            .begin_turn_strategy("test-fallback-turn", "summarize the current state")
+            .expect("test turn strategy admission");
 
         let result = runtime
             .execute_model_step("summarize the current state", true)
@@ -7593,6 +8663,9 @@ mod tests {
         .without_memory()
         .with_model_context_window(128_000);
         runtime.set_active_model("private-model");
+        runtime
+            .begin_turn_strategy("test-calibration-turn", "give a concise answer")
+            .expect("test turn strategy admission");
 
         let result = runtime
             .execute_model_step("give a concise answer", true)
@@ -7824,6 +8897,166 @@ mod tests {
             assert_eq!(first.lease.locked_pattern, expected_pattern);
             assert_eq!(wire["strategy"]["pattern"], expected_pattern.as_str());
         }
+    }
+
+    #[test]
+    fn strategy_selected_event_failure_restores_unbound_owner_and_blocks_execution() {
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+        runtime
+            .begin_turn_strategy("durability-turn", "explain one function")
+            .expect("strategy admission");
+
+        let error = runtime
+            .bind_turn_strategy_execution("durability-turn", "graph-without-store")
+            .expect_err("selected event must be durable before graph execution");
+        assert!(error.to_string().contains("event store is unavailable"));
+        assert_eq!(
+            runtime
+                .active_turn_strategy()
+                .and_then(|state| state.execution_graph_ref),
+            None
+        );
+    }
+
+    #[test]
+    fn admitted_turn_has_one_strategy_identity_through_terminal_outcome() {
+        let store = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory()
+        .with_runtime_event_store(Arc::clone(&store));
+        let first = runtime
+            .begin_turn_strategy("turn-one", "explain this function")
+            .expect("admit strategy");
+        let replay = runtime
+            .begin_turn_strategy("turn-one", "different wording cannot replace identity")
+            .expect("same turn reuses strategy");
+        assert_eq!(first.decision_id, replay.decision_id);
+        assert_eq!(first.decision_lease, replay.decision_lease);
+
+        let bound = runtime
+            .bind_turn_strategy_execution("turn-one", "graph-one")
+            .expect("bind graph");
+        assert_eq!(bound.decision_id, first.decision_id);
+        assert_eq!(bound.execution_graph_ref.as_deref(), Some("graph-one"));
+        runtime
+            .finish_turn_strategy(
+                "turn-one",
+                crate::execution_core::TurnStrategyDecisionStatus::Completed,
+                crate::execution_core::TurnStrategyActualOutcome {
+                    duration_ms: 10,
+                    terminal_reason: "satisfied".to_string(),
+                    ..Default::default()
+                },
+            )
+            .expect("finish strategy");
+        assert!(runtime.active_turn_strategy().is_none());
+
+        let events = store
+            .list_stream(&format!("session:{}", runtime.session().session_id))
+            .expect("strategy events");
+        let strategy_events = events
+            .iter()
+            .filter(|event| event.kind.starts_with("runtime.strategy."))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            strategy_events
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["runtime.strategy.selected", "runtime.strategy.outcome"]
+        );
+        assert!(strategy_events.iter().all(|event| {
+            event.payload["decision_id"].as_str() == Some(first.decision_id.as_str())
+                && event.payload["decision_lease"].as_str() == Some(first.decision_lease.as_str())
+                && event.payload["execution_graph_ref"].as_str() == Some("graph-one")
+                && event.payload["session_ref"].as_str()
+                    == Some(runtime.session().session_id.as_str())
+                && event.payload["turn_ref"].as_str() == Some("turn-one")
+        }));
+    }
+
+    #[test]
+    fn recovered_strategy_restores_frozen_candidate_cost_estimates() {
+        let store = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let first_runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory()
+        .with_runtime_event_store(Arc::clone(&store));
+        first_runtime
+            .begin_turn_strategy(
+                "recovery-cost-turn",
+                "全面审查 runtime gateway webui 三个责任域",
+            )
+            .expect("first admission");
+        {
+            let mut active = first_runtime
+                .active_turn_strategy
+                .lock()
+                .expect("strategy owner");
+            let estimate = active
+                .as_mut()
+                .expect("active strategy")
+                .decision
+                .strategy
+                .candidate_estimates
+                .first_mut()
+                .expect("candidate estimate");
+            estimate.estimated_critical_path_ms = 987_654;
+            estimate.calibration_source = "frozen-before-restart".to_string();
+        }
+        let frozen = first_runtime
+            .bind_turn_strategy_execution("recovery-cost-turn", "recovery-cost-graph")
+            .expect("durable selected event");
+        let session_id = first_runtime.session().session_id;
+
+        let mut resumed_session = Session::new();
+        resumed_session.session_id = session_id;
+        let resumed = ConversationRuntime::new(
+            resumed_session,
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory()
+        .with_runtime_event_store(store);
+        resumed
+            .begin_turn_strategy(
+                "recovery-cost-turn",
+                "the current router may have different live history",
+            )
+            .expect("resume admission");
+        let recovered = resumed
+            .bind_turn_strategy_execution("recovery-cost-turn", "recovery-cost-graph")
+            .expect("recover frozen decision");
+
+        assert_eq!(recovered.decision_id, frozen.decision_id);
+        assert_eq!(
+            recovered.decision.strategy.candidate_estimates,
+            frozen.decision.strategy.candidate_estimates
+        );
+        assert_eq!(
+            recovered.decision.strategy.candidate_estimates[0].calibration_source,
+            "frozen-before-restart"
+        );
     }
 
     #[test]
@@ -8252,6 +9485,9 @@ mod tests {
             source_ref: "skill://release-evidence/SKILL.md".to_string(),
         }]);
         runtime.model = Some("test-model".to_string());
+        runtime
+            .begin_turn_strategy("test-skill-turn", "prepare release evidence")
+            .expect("test turn strategy admission");
 
         runtime
             .execute_model_step("prepare release evidence", true)
@@ -8433,6 +9669,9 @@ mod tests {
 
         runtime.require_next_model_final_response();
         runtime
+            .begin_turn_strategy("test-text-only-turn", "summarize checked evidence")
+            .expect("test turn strategy admission");
+        runtime
             .execute_model_step("summarize checked evidence", true)
             .await
             .unwrap();
@@ -8544,6 +9783,9 @@ mod tests {
             vec!["system".to_string()],
         )
         .without_memory();
+        runtime
+            .begin_turn_strategy("test-dynamic-exposure-turn", "inspect files")
+            .expect("test turn strategy admission");
 
         let first = runtime
             .execute_model_step("inspect files", true)

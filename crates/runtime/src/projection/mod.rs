@@ -47,7 +47,7 @@ pub async fn snapshot(
             })
         }),
     }];
-    let strategy = strategy_entity(services, &scope, full);
+    let strategy = strategy_entity(services, &scope, execution_id, full);
     let usage = related_event_entities(services, &scope, "usage", full, |event| {
         // Model, tool and agent node outcomes all carry canonical
         // `ExecutionUsage` in their committed node result. Exposing the
@@ -96,16 +96,57 @@ pub async fn snapshot(
 fn strategy_entity(
     services: &RuntimeServices,
     scope: &ExecutionProjectionScope,
+    root_execution_id: &str,
     full: bool,
 ) -> Option<ProjectionEntity> {
-    services
+    let session_id = scope.session_id.as_deref()?;
+    let events = services
         .event_store()
-        .all_events(512)
-        .ok()?
+        .list_stream(&format!("session:{session_id}"))
+        .ok()?;
+    let selected = events.iter().find(|event| {
+        event.kind == "runtime.strategy.selected"
+            && event
+                .payload
+                .get("execution_graph_ref")
+                .and_then(serde_json::Value::as_str)
+                == Some(root_execution_id)
+    })?;
+    let decision_id = selected
+        .payload
+        .get("decision_id")
+        .and_then(serde_json::Value::as_str)?
+        .to_string();
+    events
         .into_iter()
-        .find(|event| {
-            scope.contains_event(event)
-                && (event.kind.contains("strategy") || event.kind.contains("orchestration"))
+        .filter(|event| {
+            matches!(
+                event.kind.as_str(),
+                "runtime.strategy.selected"
+                    | "runtime.strategy.retargeted"
+                    | "runtime.strategy.downgraded"
+                    | "runtime.strategy.early_stopped"
+                    | "runtime.strategy.outcome"
+            ) && event
+                .payload
+                .get("execution_graph_ref")
+                .and_then(serde_json::Value::as_str)
+                == Some(root_execution_id)
+                && event
+                    .payload
+                    .get("decision_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(decision_id.as_str())
+        })
+        .max_by_key(|event| {
+            (
+                event
+                    .payload
+                    .get("decision_revision")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                event.sequence,
+            )
         })
         .map(|event| entity_from_runtime_event("strategy", event, full))
 }
@@ -895,6 +936,153 @@ mod tests {
                 .as_ref()
                 .is_some_and(|entity| entity.summary.as_deref() == Some(child_id.as_str()))
         }));
+    }
+
+    #[tokio::test]
+    async fn projection_uses_latest_exact_strategy_revision_not_generic_orchestration() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        let session_graph = |objective: &str| {
+            let mut graph = ExecutionGraph::new(objective);
+            let mut node = ExecutionNodeSpec::new(
+                ExecutionNodeKind::InlineModel,
+                "projection-test",
+                serde_json::json!({
+                    "session_id": "strategy-projection",
+                    "kind": "projection_test",
+                })
+                .to_string(),
+            );
+            node.id = format!("{}:node", graph.id);
+            graph
+                .node_statuses
+                .insert(node.id.clone(), ExecutionNodeStatus::Planned);
+            graph.nodes.push(node);
+            graph
+        };
+        let graph = session_graph("strategy projection");
+        let graph_id = graph.id.clone();
+        services
+            .graph_runner()
+            .start(graph)
+            .await
+            .expect("graph starts");
+        let sibling = session_graph("same-session sibling strategy");
+        let sibling_id = sibling.id.clone();
+        services
+            .graph_runner()
+            .start(sibling)
+            .await
+            .expect("sibling graph starts");
+        let child = session_graph("same-session child strategy");
+        let child_id = child.id.clone();
+        services
+            .graph_runner()
+            .start(child)
+            .await
+            .expect("child graph starts");
+        let strategy_event = |execution_id: &str, decision_id: &str, kind: &str, revision: u64| {
+            crate::RuntimeEventInput {
+                stream_id: "session:strategy-projection".to_string(),
+                scope: crate::RuntimeEventScope::ExecutionGraph,
+                kind: kind.to_string(),
+                status: Some("completed".to_string()),
+                actor: Some("test".to_string()),
+                refs: vec![crate::RuntimeEventRef {
+                    kind: "execution_graph".to_string(),
+                    id: execution_id.to_string(),
+                }],
+                payload: serde_json::json!({
+                    "decision_id": decision_id,
+                    "decision_revision": revision,
+                    "execution_graph_ref": execution_id,
+                    "selected_candidate": if revision == 1 { "team" } else { "direct" },
+                }),
+            }
+        };
+        services
+            .event_store()
+            .append(strategy_event(
+                &graph_id,
+                "decision-1",
+                "runtime.strategy.selected",
+                1,
+            ))
+            .expect("selected event");
+        for index in 0..600 {
+            services
+                .event_store()
+                .append(crate::RuntimeEventInput {
+                    stream_id: "session:strategy-projection".to_string(),
+                    scope: crate::RuntimeEventScope::ExecutionGraph,
+                    kind: "runtime.noise".to_string(),
+                    status: Some("completed".to_string()),
+                    actor: Some("test".to_string()),
+                    refs: Vec::new(),
+                    payload: serde_json::json!({"index": index}),
+                })
+                .expect("noise event");
+        }
+        services
+            .event_store()
+            .append(crate::RuntimeEventInput {
+                kind: "runtime.orchestration.completed".to_string(),
+                ..strategy_event(
+                    &graph_id,
+                    "decision-1",
+                    "runtime.orchestration.completed",
+                    99,
+                )
+            })
+            .expect("generic orchestration event");
+        services
+            .event_store()
+            .append(strategy_event(
+                &graph_id,
+                "decision-1",
+                "runtime.strategy.outcome",
+                2,
+            ))
+            .expect("outcome event");
+        for (execution_id, decision_id, revision) in [
+            (&sibling_id, "decision-sibling", 30),
+            (&child_id, "decision-child", 40),
+        ] {
+            services
+                .event_store()
+                .append(strategy_event(
+                    execution_id,
+                    decision_id,
+                    "runtime.strategy.selected",
+                    1,
+                ))
+                .expect("other selected event");
+            services
+                .event_store()
+                .append(strategy_event(
+                    execution_id,
+                    decision_id,
+                    "runtime.strategy.outcome",
+                    revision,
+                ))
+                .expect("other outcome event");
+        }
+
+        let projection = snapshot(&services, &graph_id, &context(&services))
+            .await
+            .expect("projection");
+        let strategy = projection.strategy.expect("exact strategy projection");
+        assert_eq!(
+            strategy.summary.as_deref(),
+            Some("runtime.strategy.outcome")
+        );
+        assert_eq!(
+            strategy
+                .detail
+                .as_ref()
+                .and_then(|detail| detail.get("decision_revision"))
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
     }
 
     #[tokio::test]

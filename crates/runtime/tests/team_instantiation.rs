@@ -49,6 +49,7 @@ fn request(template_id: &str) -> TeamInstantiationRequest {
         mission_id: None,
         parent_execution: None,
         selection_mode: TeamSelectionMode::Explicit,
+        strategy_binding: None,
         template_selector: TeamTemplateSelector::LatestStable {
             template_id: TeamTemplateDefinitionId::new(DefinitionScope::Builtin, template_id)
                 .expect("builtin template id"),
@@ -63,7 +64,10 @@ fn request(template_id: &str) -> TeamInstantiationRequest {
         model_lease: "default".to_string(),
         budget_lease: None,
         managed_invocation: None,
-        resource_scopes: vec!["session:session-team-instantiation".to_string()],
+        resource_scopes: vec![
+            "read:crates/runtime".to_string(),
+            "session:session-team-instantiation".to_string(),
+        ],
     }
 }
 
@@ -83,22 +87,54 @@ fn explicit_template_creates_bound_non_overlapping_role_slots() {
                 focus_id: "storage".to_string(),
                 boundary: "persistence and consistency only".to_string(),
                 evidence_responsibility: "schema and repository evidence".to_string(),
+                capability_cropped_refs: vec!["read:storage".to_string()],
+                scope_hash: harness_contract::team::focus_scope_hash(
+                    "researcher",
+                    "persistence and consistency only",
+                    &["read:storage".to_string()],
+                ),
+                overlap_budget_bp: 0,
+                novelty_target_bp: 2_500,
                 output_contract: vec!["findings".to_string(), "evidence".to_string()],
+                output_acceptance: vec!["findings".to_string(), "evidence".to_string()],
             },
             FocusPartitionSlot {
                 focus_id: "runtime".to_string(),
                 boundary: "execution lifecycle and scheduling only".to_string(),
                 evidence_responsibility: "runtime call-chain evidence".to_string(),
+                capability_cropped_refs: vec!["read:runtime".to_string()],
+                scope_hash: harness_contract::team::focus_scope_hash(
+                    "researcher",
+                    "execution lifecycle and scheduling only",
+                    &["read:runtime".to_string()],
+                ),
+                overlap_budget_bp: 0,
+                novelty_target_bp: 2_500,
                 output_contract: vec!["findings".to_string(), "evidence".to_string()],
+                output_acceptance: vec!["findings".to_string(), "evidence".to_string()],
             },
             FocusPartitionSlot {
                 focus_id: "surface".to_string(),
                 boundary: "API and surface projection only".to_string(),
                 evidence_responsibility: "route and UI evidence".to_string(),
+                capability_cropped_refs: vec!["read:surface".to_string()],
+                scope_hash: harness_contract::team::focus_scope_hash(
+                    "researcher",
+                    "API and surface projection only",
+                    &["read:surface".to_string()],
+                ),
+                overlap_budget_bp: 0,
+                novelty_target_bp: 2_500,
                 output_contract: vec!["findings".to_string(), "evidence".to_string()],
+                output_acceptance: vec!["findings".to_string(), "evidence".to_string()],
             },
         ],
     }];
+    request.resource_scopes.extend([
+        "read:storage".to_string(),
+        "read:runtime".to_string(),
+        "read:surface".to_string(),
+    ]);
 
     let instantiated = services
         .team_runtime()
@@ -185,6 +221,18 @@ impl AgentRuntimeBackend for CompletedBackend {
         packet: AgentTaskPacket,
         selection: AgentModelSelection,
     ) -> Result<AgentReturnPacket, String> {
+        let mut evidence_refs = packet.evidence_refs.clone();
+        evidence_refs.push(harness_contract::context::EvidenceAccessRef::durable(
+            harness_contract::context::EvidenceRef::new(
+                "tool",
+                format!("materialized:{}", packet.node_id),
+            ),
+            "a".repeat(64),
+            1,
+            "application/json",
+            format!("session-event://{}/1", packet.session_id),
+            format!("session:{}", packet.session_id),
+        ));
         Ok(AgentReturnPacket {
             run_id: packet.run_id,
             agent_id: packet.agent_id,
@@ -197,17 +245,26 @@ impl AgentRuntimeBackend for CompletedBackend {
             attempt: packet.attempt,
             expected_graph_revision: packet.expected_graph_revision,
             status: AgentTerminalStatus::Completed,
-            outcome: "completed with evidence reference".to_string(),
-            acceptance: vec!["summary".to_string(), "evidence".to_string()],
-            evidence_refs: Vec::new(),
+            outcome: serde_json::json!({
+                "summary": "completed with evidence reference",
+                "evidence": "materialized durable tool evidence"
+            })
+            .to_string(),
+            acceptance: packet.acceptance,
+            evidence_refs,
             changes: Vec::new(),
+            runtime_change_receipts: Vec::new(),
             conflicts: Vec::new(),
             unresolved: Vec::new(),
             input_tokens: 1,
             output_tokens: 1,
+            cached_tokens: 0,
             model: selection.model,
             provider: selection.provider,
-            tool_calls: 0,
+            tool_calls: 1,
+            duplicate_tool_calls: 0,
+            runtime_write_attempt_paths: Vec::new(),
+            runtime_observed_resource_scopes: Vec::new(),
             failure: None,
         })
     }
@@ -232,10 +289,9 @@ async fn terminal_role_transition_commits_team_working_state_with_graph() {
         .expect("durable TeamWorkingState");
     assert_eq!(state.graph_id, projection.graph_id);
     assert_eq!(state.entries.len(), 1);
-    assert_eq!(
-        state.entries[0].summary,
-        "completed with evidence reference"
-    );
+    assert!(state.entries[0]
+        .summary
+        .contains("completed with evidence reference"));
     assert!(
         !state.entries[0].producer_instance_id.is_empty(),
         "working state records the immutable producing Agent instance"

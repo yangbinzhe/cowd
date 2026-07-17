@@ -2,7 +2,8 @@ use harness_contract::core::{
     ExecutionModifier, ExecutionPattern, ExecutionPolicyGate, TaskComplexity, TaskRisk,
 };
 use harness_contract::strategy::{
-    decide_strategy, CollaborationLiftEstimate, StrategyDecision, StrategyInput,
+    decide_strategy, CollaborationLiftEstimate, ExecutionCandidateKind, StrategyDecision,
+    StrategyInput, StrategyResourceSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -15,6 +16,10 @@ use crate::evidence_planner::EvidenceAcquisitionMode;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeExecutionDecision {
     pub decision_id: String,
+    pub decision_revision: u64,
+    pub execution_graph_ref: Option<String>,
+    pub session_ref: Option<String>,
+    pub turn_ref: Option<String>,
     pub user_intent_preview: String,
     pub strategy: StrategyDecision,
     pub candidate_patterns: Vec<RuntimeExecutionPatternCandidate>,
@@ -90,6 +95,154 @@ pub struct StrategyLease {
     pub locked_pattern: ExecutionPattern,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnStrategyDecisionStatus {
+    Selected,
+    Running,
+    Downgraded,
+    EarlyStopped,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnStrategyActualOutcome {
+    pub duration_ms: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_tokens: u64,
+    pub tool_calls: u64,
+    pub duplicate_tool_calls: u64,
+    #[serde(default)]
+    pub max_tool_concurrency_observed: u64,
+    #[serde(default)]
+    pub parallel_tool_batches: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub write_attempt_paths: Vec<String>,
+    pub evidence_overlap_bp: u16,
+    pub evidence_overlap_observed: bool,
+    pub working_state_verified: bool,
+    pub merge_cost_ms: u64,
+    pub parent_merge_count: u8,
+    #[serde(default)]
+    pub evaluation_token_limit: u64,
+    #[serde(default)]
+    pub evaluation_tokens_consumed: u64,
+    #[serde(default)]
+    pub evaluation_budget_observed: bool,
+    #[serde(default)]
+    pub evaluation_budget_breached: bool,
+    pub quality_score_bp: Option<u16>,
+    pub actual_speedup_ratio_bp: Option<u16>,
+    pub terminal_reason: String,
+}
+
+/// The sole strategy identity for one admitted conversation turn. Re-targets,
+/// resource downgrades and early stops revise this record in place; they never
+/// allocate another decision or collaboration lease.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TurnStrategyDecisionState {
+    pub decision_id: String,
+    pub decision_lease: String,
+    pub revision: u64,
+    pub policy_version: String,
+    pub resource_snapshot: StrategyResourceSnapshot,
+    pub selected_candidate: ExecutionCandidateKind,
+    pub status: TurnStrategyDecisionStatus,
+    pub execution_graph_ref: Option<String>,
+    pub session_ref: String,
+    pub turn_ref: String,
+    pub decision: RuntimeExecutionDecision,
+    pub collaboration_receipt: Option<serde_json::Value>,
+    #[serde(default)]
+    pub focus_partition_plans: Vec<harness_contract::team::FocusPartitionPlan>,
+    pub outcome: Option<TurnStrategyActualOutcome>,
+}
+
+impl TurnStrategyDecisionState {
+    #[must_use]
+    pub fn admitted(
+        mut decision: RuntimeExecutionDecision,
+        session_ref: impl Into<String>,
+        turn_ref: impl Into<String>,
+    ) -> Self {
+        let session_ref = session_ref.into();
+        let turn_ref = turn_ref.into();
+        decision.session_ref = Some(session_ref.clone());
+        decision.turn_ref = Some(turn_ref.clone());
+        Self {
+            decision_id: decision.decision_id.clone(),
+            decision_lease: decision.lease.lease_id.clone(),
+            revision: 1,
+            policy_version: decision.strategy.policy_version.clone(),
+            resource_snapshot: decision.strategy.resource_snapshot.clone(),
+            selected_candidate: decision.strategy.selected_candidate,
+            status: TurnStrategyDecisionStatus::Selected,
+            execution_graph_ref: None,
+            session_ref,
+            turn_ref,
+            decision,
+            collaboration_receipt: None,
+            focus_partition_plans: Vec::new(),
+            outcome: None,
+        }
+    }
+
+    pub fn bind_execution_graph(&mut self, graph_id: impl Into<String>) {
+        let graph_id = graph_id.into();
+        self.execution_graph_ref = Some(graph_id.clone());
+        self.decision.execution_graph_ref = Some(graph_id);
+    }
+
+    pub fn revise(
+        &mut self,
+        selected_candidate: ExecutionCandidateKind,
+        status: TurnStrategyDecisionStatus,
+        reason: impl Into<String>,
+    ) -> Result<(), String> {
+        let pattern = match selected_candidate {
+            ExecutionCandidateKind::Direct
+                if self.decision.strategy.understanding.requires_write =>
+            {
+                ExecutionPattern::Execute
+            }
+            ExecutionCandidateKind::Direct => ExecutionPattern::Direct,
+            ExecutionCandidateKind::ParallelTools
+                if self.decision.strategy.understanding.requires_write =>
+            {
+                ExecutionPattern::Execute
+            }
+            ExecutionCandidateKind::ParallelTools => ExecutionPattern::Explore,
+            ExecutionCandidateKind::Team => ExecutionPattern::Collaborate,
+        };
+        self.revise_to_pattern(selected_candidate, pattern, status, reason)
+    }
+
+    pub fn revise_to_pattern(
+        &mut self,
+        selected_candidate: ExecutionCandidateKind,
+        pattern: ExecutionPattern,
+        status: TurnStrategyDecisionStatus,
+        reason: impl Into<String>,
+    ) -> Result<(), String> {
+        self.revision = self.revision.saturating_add(1);
+        self.selected_candidate = selected_candidate;
+        self.status = status;
+        self.decision.strategy.retarget(pattern, reason)?;
+        self.decision.decision_revision = self.revision;
+        self.decision.strategy.selected_candidate = selected_candidate;
+        self.decision.compile_target = ExecutionPatternCatalog::current()
+            .find(pattern)
+            .map_or(RuntimeCompileTarget::InlineModel, |spec| {
+                spec.compile_target
+            });
+        self.decision.lease.locked_pattern = pattern;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeExecutionPatternCandidate {
     pub pattern: ExecutionPattern,
@@ -154,10 +307,53 @@ pub fn build_runtime_execution_decision(
 }
 
 fn build_runtime_execution_decision_inner(
-    input: StrategyInput,
+    mut input: StrategyInput,
     context_profile: Option<ContextProfile>,
     resource_health: StrategyResourceHealth,
 ) -> RuntimeExecutionDecision {
+    if input.resource_snapshot.sample_source == "assumed-detached-default" {
+        input.resource_snapshot = StrategyResourceSnapshot {
+            version: "strategy-resource-v1".to_string(),
+            provider_available: resource_health.provider_available,
+            tools_available: resource_health.tools_available,
+            team_available: resource_health.collaboration_available,
+            provider_concurrency: u16::from(resource_health.provider_available),
+            tool_concurrency: if resource_health.tools_available {
+                4
+            } else {
+                0
+            },
+            team_slots: if resource_health.collaboration_available {
+                3
+            } else {
+                0
+            },
+            provider_concurrency_penalty_bp: if resource_health.provider_available {
+                0
+            } else {
+                10_000
+            },
+            sample_source: if resource_health.observed {
+                "runtime-observed-availability;assumed-capacity-v1".to_string()
+            } else {
+                "assumed-detached-default".to_string()
+            },
+            sample_count: u32::from(resource_health.observed),
+            assumed: true,
+        };
+    }
+    input.resource_snapshot.provider_available &= resource_health.provider_available;
+    input.resource_snapshot.tools_available &= resource_health.tools_available;
+    input.resource_snapshot.team_available &= resource_health.collaboration_available;
+    if !input.resource_snapshot.provider_available {
+        input.resource_snapshot.provider_concurrency = 0;
+    }
+    if !input.resource_snapshot.tools_available {
+        input.resource_snapshot.tool_concurrency = 0;
+    }
+    if !input.resource_snapshot.team_available {
+        input.resource_snapshot.team_slots = 0;
+    }
     let user_input = input.prompt.clone();
     let requested_template = input
         .proposal
@@ -262,6 +458,10 @@ fn build_runtime_execution_decision_inner(
     let recommended_spec = catalog.find(recommended_pattern);
     RuntimeExecutionDecision {
         decision_id: format!("execution-decision-{}", Uuid::new_v4()),
+        decision_revision: 1,
+        execution_graph_ref: None,
+        session_ref: None,
+        turn_ref: None,
         user_intent_preview: user_input.chars().take(180).collect(),
         strategy: strategy.clone(),
         candidate_patterns,

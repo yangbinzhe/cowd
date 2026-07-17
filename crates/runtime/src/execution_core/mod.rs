@@ -72,7 +72,8 @@ pub use strategy_decision::{
     action_selection_report_for_decision, build_runtime_action_selection_report,
     build_runtime_execution_decision, RuntimeActionSelectionReport, RuntimeExecutionActionHint,
     RuntimeExecutionDecision, RuntimeExecutionPatternCandidate, StrategyDecisionEngine,
-    StrategyLease, StrategyResourceHealth,
+    StrategyLease, StrategyResourceHealth, TurnStrategyActualOutcome, TurnStrategyDecisionState,
+    TurnStrategyDecisionStatus,
 };
 pub use tool_dag::{
     tool_dag_from_rewoo, ToolDagEdge, ToolDagEdgeKind, ToolDagPlan, ToolDagSafetySummary,

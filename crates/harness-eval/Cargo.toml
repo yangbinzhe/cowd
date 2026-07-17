@@ -11,12 +11,17 @@ fact-kernel = { path = "../fact-kernel" }
 futures = "0.3"
 harness-contract = { path = "../harness-contract" }
 memory = { path = "../memory" }
+model-protocol = { path = "../model-protocol" }
 runtime = { path = "../runtime" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
 tools = { path = "../tools" }
 uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true

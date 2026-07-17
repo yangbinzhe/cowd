@@ -67,6 +67,7 @@ impl RuntimeOrchestrationResult {
         });
         json!({
             "schema_version": 1,
+            "receipt_id": format!("runtime-orchestration-receipt:{}", self.request_id),
             "request_id": self.request_id,
             "status": self.status,
             "decision": {
@@ -83,7 +84,12 @@ impl RuntimeOrchestrationResult {
                 "report": report,
                 "terminal_result_available": terminal_result_ref.is_some(),
                 "terminal_result_kind": terminal_result_kind,
+                "focus_overlap_assessment": execution.get("focus_overlap_assessment"),
             },
+            "team_id": self.evidence.get("team_id"),
+            "working_state_verified": self.evidence.get("working_state_verified"),
+            "focus_overlap_verified": self.evidence.get("focus_overlap_verified"),
+            "focus_overlap_exceeded": self.evidence.get("focus_overlap_exceeded"),
             "evidence": {
                 "action": self.evidence.get("action"),
                 "compiled": self.evidence.get("compiled"),
@@ -94,6 +100,10 @@ impl RuntimeOrchestrationResult {
                 "executed": self.evidence.get("executed"),
                 "reused": self.evidence.get("reused"),
                 "graph_id": self.evidence.get("graph_id"),
+                "team_id": self.evidence.get("team_id"),
+                "working_state_verified": self.evidence.get("working_state_verified"),
+                "focus_overlap_verified": self.evidence.get("focus_overlap_verified"),
+                "focus_overlap_exceeded": self.evidence.get("focus_overlap_exceeded"),
             },
             "terminal_summary": terminal_summary,
             "next_model_guidance": self.next_model_guidance,

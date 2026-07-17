@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::Duration;
 
 use harness_contract::execution_graph::{
@@ -9,7 +9,7 @@ use harness_contract::execution_graph::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard, OwnedNotified};
 use tokio::task::JoinSet;
 
 use super::commit_service::{ExecutionCommitError, ExecutionCommitService, ExecutionEffectState};
@@ -50,6 +50,8 @@ pub enum ExecutionRunnerError {
     Resource { node_id: String, reason: String },
     #[error("execution mutation is blocked: {0}")]
     MutationBlocked(String),
+    #[error("execution node `{node_id}` was superseded by a graph command")]
+    CommandSuperseded { node_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,10 +117,88 @@ pub struct ExecutionGraphRunner {
     workspace_root: PathBuf,
     active: Arc<Mutex<BTreeMap<(String, String), ActiveNode>>>,
     coordination: Arc<Mutex<()>>,
+    command_intents: Arc<StdMutex<BTreeMap<String, Arc<Notify>>>>,
     mutation_gate: Arc<RwLock<Option<MutationGate>>>,
 }
 
 type MutationGate = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+
+struct CommandIntentOwner {
+    graph_id: String,
+    intent: Arc<Notify>,
+    intents: Arc<StdMutex<BTreeMap<String, Arc<Notify>>>>,
+}
+
+type ActiveCancellation = (String, Arc<dyn NodeExecutor>, NodeExecutionTicket);
+
+struct CancellationFinalizationOwner {
+    active: Vec<ActiveCancellation>,
+}
+
+impl CancellationFinalizationOwner {
+    fn new(active: Vec<ActiveCancellation>) -> Self {
+        Self { active }
+    }
+
+    fn active(&self) -> &[ActiveCancellation] {
+        &self.active
+    }
+}
+
+impl Drop for CancellationFinalizationOwner {
+    fn drop(&mut self) {
+        for (_, executor, ticket) in &self.active {
+            executor.cancellation_finalized(ticket);
+        }
+    }
+}
+
+impl CommandIntentOwner {
+    fn install(
+        graph_id: &str,
+        intents: Arc<StdMutex<BTreeMap<String, Arc<Notify>>>>,
+    ) -> Result<Self, ExecutionRunnerError> {
+        let intent = Arc::new(Notify::new());
+        let mut current = intents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if current.contains_key(graph_id) {
+            return Err(ExecutionRunnerError::MutationBlocked(format!(
+                "graph `{graph_id}` already has a command in flight"
+            )));
+        }
+        current.insert(graph_id.to_string(), Arc::clone(&intent));
+        drop(current);
+        Ok(Self {
+            graph_id: graph_id.to_string(),
+            intent,
+            intents,
+        })
+    }
+}
+
+impl Drop for CommandIntentOwner {
+    fn drop(&mut self) {
+        let removed = {
+            let mut intents = self
+                .intents
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if intents
+                .get(&self.graph_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &self.intent))
+            {
+                intents.remove(&self.graph_id);
+                true
+            } else {
+                false
+            }
+        };
+        if removed {
+            self.intent.notify_waiters();
+        }
+    }
+}
 
 impl ExecutionGraphRunner {
     #[must_use]
@@ -143,7 +223,33 @@ impl ExecutionGraphRunner {
             workspace_root: workspace_root.into(),
             active: Arc::new(Mutex::new(BTreeMap::new())),
             coordination: Arc::new(Mutex::new(())),
+            command_intents: Arc::new(StdMutex::new(BTreeMap::new())),
             mutation_gate: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    fn command_intent_waiter(&self, graph_id: &str) -> Option<OwnedNotified> {
+        self.command_intents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(graph_id)
+            .cloned()
+            .map(Notify::notified_owned)
+    }
+
+    async fn graph_coordination_without_command(&self, graph_id: &str) -> OwnedMutexGuard<()> {
+        loop {
+            if let Some(waiter) = self.command_intent_waiter(graph_id) {
+                waiter.await;
+                continue;
+            }
+            let coordination = Arc::clone(&self.coordination).lock_owned().await;
+            if let Some(waiter) = self.command_intent_waiter(graph_id) {
+                drop(coordination);
+                waiter.await;
+                continue;
+            }
+            return coordination;
         }
     }
 
@@ -224,6 +330,7 @@ impl ExecutionGraphRunner {
                 let result =
                     joined.map_err(|error| ExecutionRunnerError::Join(error.to_string()))?;
                 let (node_id, outcome) = match result {
+                    Err(ExecutionRunnerError::CommandSuperseded { .. }) => continue,
                     Err(ExecutionRunnerError::Resource { node_id, reason }) => {
                         self.block_unstarted_resource_node(graph_id, &node_id, reason)
                             .await?;
@@ -232,13 +339,16 @@ impl ExecutionGraphRunner {
                     Ok(value) => value,
                     Err(ExecutionRunnerError::Executor(error)) => {
                         let node_id = executor_error_node_id(&error).to_string();
+                        if let Some(waiter) = self.command_intent_waiter(graph_id) {
+                            waiter.await;
+                        }
                         self.active
                             .lock()
                             .await
                             .remove(&(graph_id.to_string(), node_id.clone()));
                         let result = failed_result(&error);
                         let terminal_status = result.status;
-                        let _coordination = self.coordination.lock().await;
+                        let _coordination = self.graph_coordination_without_command(graph_id).await;
                         let current = self.state_store.load_async(graph_id).await?;
                         if current.node_statuses.get(&node_id)
                             == Some(&ExecutionNodeStatus::Running)
@@ -254,19 +364,29 @@ impl ExecutionGraphRunner {
                                 .await?;
                             continue;
                         }
-                        return Err(ExecutionRunnerError::Executor(error));
+                        // A Pause/Cancel command may have superseded the
+                        // executor while it was returning its terminal
+                        // result. The command's durable graph state wins.
+                        continue;
                     }
                     Err(error) => return Err(error),
                 };
                 validate_outcome(&node_id, &outcome)?;
+                if let Some(waiter) = self.command_intent_waiter(graph_id) {
+                    waiter.await;
+                }
                 // Durable graph state must be serialized, but executor callbacks are
                 // process-local follow-up work. Holding the graph coordination lock
                 // while an executor publishes its transcript can deadlock unrelated
                 // graph progress and leave a durable successor permanently Ready.
                 let committed_executor = {
-                    let _coordination = self.coordination.lock().await;
+                    let _coordination = self.graph_coordination_without_command(graph_id).await;
                     let current = self.state_store.load_async(graph_id).await?;
                     if current.node_statuses.get(&node_id) != Some(&ExecutionNodeStatus::Running) {
+                        self.active
+                            .lock()
+                            .await
+                            .remove(&(graph_id.to_string(), node_id.clone()));
                         continue;
                     }
                     if let Some(replan) = outcome.replan {
@@ -321,10 +441,14 @@ impl ExecutionGraphRunner {
         graph_id: &str,
         node: harness_contract::execution_graph::ExecutionNodeSpec,
     ) -> Result<(String, NodeExecutionOutcome), ExecutionRunnerError> {
+        if let Some(waiter) = self.command_intent_waiter(graph_id) {
+            waiter.await;
+            return Err(ExecutionRunnerError::CommandSuperseded { node_id: node.id });
+        }
         let resources = self
             .acquire_node_resources(&self.state_store.load_async(graph_id).await?, &node)
             .await?;
-        let _coordination = self.coordination.lock().await;
+        let _coordination = self.graph_coordination_without_command(graph_id).await;
         let graph = self.state_store.load_async(graph_id).await?;
         if graph.node_statuses.get(&node.id) != Some(&ExecutionNodeStatus::Ready) {
             return Err(ExecutionRunnerError::NodeMissing(node.id));
@@ -376,8 +500,11 @@ impl ExecutionGraphRunner {
         // child execution graph (for example `runtime_orchestrate`), which
         // correctly needs the same Runner to make progress. Holding the gate
         // across that await creates a parent/child re-entrancy deadlock.
+        if let Some(waiter) = self.command_intent_waiter(graph_id) {
+            waiter.await;
+        }
         let effect_state = {
-            let _poll_gate = self.coordination.lock().await;
+            let _poll_gate = self.graph_coordination_without_command(graph_id).await;
             let current = self.state_store.load_async(graph_id).await?;
             if current.node_statuses.get(&ticket.node_id) != Some(&ExecutionNodeStatus::Running) {
                 self.active
@@ -548,7 +675,7 @@ impl ExecutionGraphRunner {
         node_id: &str,
         reason: String,
     ) -> Result<(), ExecutionRunnerError> {
-        let _coordination = self.coordination.lock().await;
+        let _coordination = self.graph_coordination_without_command(graph_id).await;
         let current = self.state_store.load_async(graph_id).await?;
         if current.node_statuses.get(node_id) != Some(&ExecutionNodeStatus::Ready) {
             return Ok(());
@@ -584,27 +711,94 @@ impl ExecutionGraphRunner {
         command: ExecutionGraphCommand,
     ) -> Result<ExecutionGraph, ExecutionRunnerError> {
         self.ensure_mutation_allowed()?;
-        let coordination = self.coordination.lock().await;
-        let graph = self.state_store.load_async(graph_id).await?;
-        self.commit_service
-            .validate_command_revision(&graph, &command)?;
-        let active = if matches!(
+        if matches!(
             command,
             ExecutionGraphCommand::Pause { .. } | ExecutionGraphCommand::Cancel { .. }
         ) {
-            self.active
+            let coordination = self.graph_coordination_without_command(graph_id).await;
+            let graph = self.state_store.load_async(graph_id).await?;
+            self.commit_service
+                .validate_command_revision(&graph, &command)?;
+            let intent = CommandIntentOwner::install(graph_id, Arc::clone(&self.command_intents))?;
+            let active = self
+                .active
                 .lock()
                 .await
                 .iter()
                 .filter(|((active_graph_id, _), _)| active_graph_id == graph_id)
-                .map(|(_, node)| (Arc::clone(&node.executor), node.ticket.clone()))
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        for (executor, ticket) in active {
-            executor.cancel(&ticket).await?;
+                .map(|((_, node_id), node)| {
+                    (
+                        node_id.clone(),
+                        Arc::clone(&node.executor),
+                        node.ticket.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if matches!(command, ExecutionGraphCommand::Pause { .. })
+                && active
+                    .iter()
+                    .any(|(_, executor, _)| !executor.supports_resumable_pause())
+            {
+                return Err(ExecutionCommitError::InvalidCommand(
+                    "an active execution node does not expose a resumable pause capability; cancel or wait for quiescence"
+                        .to_string(),
+                )
+                .into());
+            }
+            let cancellation_finalizer = CancellationFinalizationOwner::new(active);
+            drop(coordination);
+
+            // Executor cancellation can wait for a nested child graph to
+            // quiesce. It must never run while the global graph coordination
+            // gate is held, because that child uses this same Runner.
+            let mut cancellation_errors = Vec::new();
+            if matches!(
+                command,
+                ExecutionGraphCommand::Pause { .. } | ExecutionGraphCommand::Cancel { .. }
+            ) {
+                for (node_id, executor, ticket) in cancellation_finalizer.active() {
+                    if let Err(error) = executor.cancel(ticket).await {
+                        cancellation_errors.push((node_id.clone(), error));
+                    }
+                }
+            }
+
+            let coordination = self.coordination.lock().await;
+            let current = self.state_store.load_async(graph_id).await?;
+            if let Some((_, error)) = cancellation_errors.into_iter().find(|(node_id, _)| {
+                current
+                    .node_statuses
+                    .get(node_id)
+                    .is_some_and(|status| !status.is_terminal())
+            }) {
+                drop(coordination);
+                return Err(ExecutionRunnerError::Executor(error));
+            }
+            // The intent gate prevents node transitions while cancellation is
+            // in flight. Re-validating the original caller revision here is
+            // the CAS that prevents a delayed command from overwriting a
+            // concurrently committed graph mutation.
+            if let Err(error) = self
+                .commit_service
+                .validate_command_revision(&current, &command)
+            {
+                drop(coordination);
+                return Err(error.into());
+            }
+            let result = self
+                .commit_service
+                .apply_command_async(current, command.clone())
+                .await;
+            drop(intent);
+            drop(coordination);
+            drop(cancellation_finalizer);
+            return result.map(|receipt| receipt.graph).map_err(Into::into);
         }
+
+        let coordination = self.graph_coordination_without_command(graph_id).await;
+        let graph = self.state_store.load_async(graph_id).await?;
+        self.commit_service
+            .validate_command_revision(&graph, &command)?;
         let graph = self
             .commit_service
             .apply_command_async(graph, command.clone())
@@ -624,8 +818,9 @@ impl ExecutionGraphRunner {
                 .load_async(graph_id)
                 .await
                 .map_err(Into::into);
+        } else {
+            Ok(graph)
         }
-        Ok(graph)
     }
 
     pub async fn projection(
@@ -643,8 +838,9 @@ impl ExecutionGraphRunner {
         &self,
         graph: ExecutionGraph,
     ) -> Result<ExecutionGraph, ExecutionRunnerError> {
-        let _coordination = self.coordination.lock().await;
-        let mut graph = self.state_store.load_async(&graph.id).await?;
+        let graph_id = graph.id;
+        let coordination = self.graph_coordination_without_command(&graph_id).await;
+        let mut graph = self.state_store.load_async(&graph_id).await?;
         loop {
             let mut changed = false;
             let planned = graph
@@ -683,6 +879,7 @@ impl ExecutionGraphRunner {
                 }
             }
             if !changed {
+                drop(coordination);
                 return Ok(graph);
             }
         }

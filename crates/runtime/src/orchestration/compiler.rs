@@ -31,6 +31,7 @@ pub struct CompiledOrchestration {
     pub graph: ExecutionGraph,
     pub command: ExecutionGraphCommand,
     pub execute_without_protocol: bool,
+    pub team_request: Option<harness_contract::team::TeamInstantiationRequest>,
 }
 
 /// Pure orchestration mapper. It may describe work, but it never executes it.
@@ -46,59 +47,79 @@ pub fn compile_orchestration(
     }
     if let Some(fallback_template_path) = team_template_path(request, plan) {
         let team_runtime = team_runtime.ok_or(OrchestrationCompileError::TeamRuntimeRequired)?;
+        let selection_mode = request
+            .selection_mode
+            .unwrap_or(harness_contract::team::TeamSelectionMode::ModelAssisted);
         // `template_hint` is part of the model/human request and wins over a
         // strategy fallback.  Every role-scoped override must therefore use
         // that same resolved template path.  Using the fallback here used to
         // attach (for example) a `workstream` override to an explicitly
         // selected research template, which makes a valid Team request fail
         // before Runtime can create a graph.
-        let selected_template_path = requested_template_path(request, fallback_template_path);
-        let template_selector = requested_template_selector(selected_template_path)?;
+        let selected_template_path =
+            if selection_mode == harness_contract::team::TeamSelectionMode::Automatic {
+                if request.constraints.requires_write == Some(true) {
+                    "cowd/execute-review"
+                } else {
+                    "cowd/parallel-research-synthesis"
+                }
+            } else {
+                requested_template_path(request, fallback_template_path)
+            };
+        let template_selector =
+            if selection_mode == harness_contract::team::TeamSelectionMode::Automatic {
+                harness_contract::team::TeamTemplateSelector::Automatic
+            } else {
+                requested_template_selector(selected_template_path)?
+            };
         let team_id = format!("runtime-team:{request_id}");
         let agent_budget_tokens =
             orchestration_agent_budget_tokens(plan.execution_decision.complexity());
+        let team_request = harness_contract::team::TeamInstantiationRequest {
+            request_id: request_id.to_string(),
+            team_id: team_id.clone(),
+            session_id: request.session_id.clone().unwrap_or_default(),
+            mission_id: None,
+            parent_execution: parent_execution.clone(),
+            selection_mode,
+            strategy_binding: request.strategy_binding.clone(),
+            template_selector,
+            objective: request.intent.clone(),
+            acceptance: Vec::new(),
+            risk: None,
+            role_binding_overrides: Vec::new(),
+            cardinality_overrides: team_cardinality_overrides(request, selected_template_path)?,
+            focus_partition_plans: request.focus_partition_plans.clone(),
+            permission_lease: if request.constraints.requires_write == Some(true) {
+                "workspace-write".to_string()
+            } else {
+                "read_only".to_string()
+            },
+            model_lease: request
+                .model_lease
+                .as_deref()
+                .filter(|model| !model.trim().is_empty())
+                .unwrap_or("default")
+                .to_string(),
+            budget_lease: Some(harness_contract::context::ContextBudgetLeaseRef::new(
+                format!("runtime-team-budget:{request_id}"),
+                team_id,
+                "runtime_team_agent",
+                agent_budget_tokens,
+                1,
+            )),
+            managed_invocation: None,
+            resource_scopes: orchestration_resource_scopes(request),
+        };
         let instantiated = team_runtime
-            .plan(harness_contract::team::TeamInstantiationRequest {
-                request_id: request_id.to_string(),
-                team_id: team_id.clone(),
-                session_id: request.session_id.clone().unwrap_or_default(),
-                mission_id: None,
-                parent_execution: parent_execution.clone(),
-                selection_mode: harness_contract::team::TeamSelectionMode::ModelAssisted,
-                template_selector,
-                objective: request.intent.clone(),
-                acceptance: Vec::new(),
-                risk: None,
-                role_binding_overrides: Vec::new(),
-                cardinality_overrides: team_cardinality_overrides(request, selected_template_path)?,
-                focus_partition_plans: request.focus_partition_plans.clone(),
-                permission_lease: if request.constraints.requires_write == Some(true) {
-                    "workspace_write".to_string()
-                } else {
-                    "read_only".to_string()
-                },
-                model_lease: request
-                    .model_lease
-                    .as_deref()
-                    .filter(|model| !model.trim().is_empty())
-                    .unwrap_or("default")
-                    .to_string(),
-                budget_lease: Some(harness_contract::context::ContextBudgetLeaseRef::new(
-                    format!("runtime-team-budget:{request_id}"),
-                    team_id,
-                    "runtime_team_agent",
-                    agent_budget_tokens,
-                    1,
-                )),
-                managed_invocation: None,
-                resource_scopes: orchestration_resource_scopes(request),
-            })
+            .plan(team_request.clone())
             .map_err(OrchestrationCompileError::TeamInstantiation)?;
         let expected_revision = instantiated.graph.revision;
         return Ok(CompiledOrchestration {
             graph: instantiated.graph,
             command: ExecutionGraphCommand::Start { expected_revision },
             execute_without_protocol: true,
+            team_request: Some(team_request),
         });
     }
     let mut graph = ExecutionGraphCompiler.compile(ExecutionCompileRequest {
@@ -113,6 +134,7 @@ pub fn compile_orchestration(
         graph,
         command: ExecutionGraphCommand::Start { expected_revision },
         execute_without_protocol: false,
+        team_request: None,
     })
 }
 
@@ -123,8 +145,8 @@ const fn orchestration_agent_budget_tokens(
         harness_contract::core::TaskComplexity::Trivial => 8_000,
         harness_contract::core::TaskComplexity::Simple => 12_000,
         harness_contract::core::TaskComplexity::Moderate => 16_000,
-        harness_contract::core::TaskComplexity::Complex => 24_000,
-        harness_contract::core::TaskComplexity::Strategic => 32_000,
+        harness_contract::core::TaskComplexity::Complex
+        | harness_contract::core::TaskComplexity::Strategic => 24_000,
     }
 }
 
@@ -165,7 +187,7 @@ fn compile_session_dispatch(
             .collect(),
         context_budget_lease: None,
         permission_lease: if request.constraints.requires_write == Some(true) {
-            "workspace_write".to_string()
+            "workspace-write".to_string()
         } else {
             "read_only".to_string()
         },
@@ -201,6 +223,7 @@ fn compile_session_dispatch(
         graph,
         command: ExecutionGraphCommand::Start { expected_revision },
         execute_without_protocol: true,
+        team_request: None,
     })
 }
 
@@ -288,7 +311,10 @@ fn orchestration_resource_scopes(request: &RuntimeOrchestrationRequest) -> Vec<S
         .iter()
         .filter_map(|capability| capability.strip_prefix("resource:").map(str::to_owned))
         .collect::<Vec<_>>();
-    if request.constraints.requires_write == Some(true) && scopes.is_empty() {
+    if request.constraints.requires_write == Some(true)
+        && request.action != RuntimeOrchestrationAction::RequestTeam
+        && scopes.is_empty()
+    {
         scopes.extend(["write:.".to_string(), "worktree:.".to_string()]);
     }
     if let Some(session_id) = request.session_id.as_deref().filter(|id| !id.is_empty()) {
@@ -325,6 +351,8 @@ mod tests {
             session_id: Some("session-root".to_string()),
             target_session_id: None,
             action: RuntimeOrchestrationAction::RequestTeam,
+            selection_mode: None,
+            strategy_binding: None,
             reason: Some("test nested delegation boundary".to_string()),
             template_hint: None,
             focus_partition_plans: Vec::new(),
@@ -332,6 +360,7 @@ mod tests {
                 "tool:runtime_orchestrate".to_string(),
                 "tool:runtime_capabilities".to_string(),
                 "tool:read_file".to_string(),
+                "resource:read:crates/runtime".to_string(),
             ],
             evidence_refs: Vec::new(),
             constraints: Default::default(),
@@ -386,6 +415,8 @@ mod tests {
             session_id: Some("session-root".to_string()),
             target_session_id: None,
             action: RuntimeOrchestrationAction::RequestTeam,
+            selection_mode: Some(harness_contract::team::TeamSelectionMode::Explicit),
+            strategy_binding: None,
             reason: Some("test explicit template constraint ownership".to_string()),
             template_hint: Some("cowd/parallel-research-synthesis".to_string()),
             focus_partition_plans: Vec::new(),

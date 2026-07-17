@@ -111,10 +111,13 @@ fn understanding_with_action_signal(
             promote_complexity(&mut understanding, TaskComplexity::Moderate);
         }
         Action::RequestTeam => {
-            understanding.requests_multi_agent = true;
-            understanding.requests_parallelism = true;
-            understanding.independent_workstreams = understanding.independent_workstreams.max(2);
-            promote_complexity(&mut understanding, TaskComplexity::Complex);
+            if !understanding.forbids_team {
+                understanding.requests_multi_agent = true;
+                understanding.requests_parallelism = true;
+                understanding.independent_workstreams =
+                    understanding.independent_workstreams.max(2);
+                promote_complexity(&mut understanding, TaskComplexity::Complex);
+            }
         }
         Action::RequestDeliberation => {
             understanding.requests_deliberation = true;

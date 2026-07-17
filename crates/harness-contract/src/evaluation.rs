@@ -191,6 +191,11 @@ pub struct EvaluationScenarioSpec {
     pub allowed_tools: Vec<String>,
     #[serde(default)]
     pub allowed_skills: Vec<String>,
+    /// Exact bounded resources shared by both sides of a paired scenario.
+    /// The evaluation harness may narrow these leases but never invent a
+    /// whole-workspace fallback.
+    #[serde(default)]
+    pub resource_scopes: Vec<String>,
     pub permission_lease: String,
     pub model_lease: String,
 }

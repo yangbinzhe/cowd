@@ -896,7 +896,13 @@ async fn cancel_session_turn_handler(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("user_requested");
-    let aborted_run_id: Option<String> = None;
+    let cancelled_execution_ids = state
+        .services
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.cancel_active_session(&id, reason))
+        .unwrap_or_default();
+    let aborted_run_id = cancelled_execution_ids.first().cloned();
     let event = serde_json::json!({
         "type": "TurnCancelRequested",
         "session_id": id,
@@ -905,6 +911,7 @@ async fn cancel_session_turn_handler(
         "status": "accepted",
         "aborted": aborted_run_id.is_some(),
         "run_id": aborted_run_id,
+        "execution_ids": cancelled_execution_ids,
     });
     state.event_bus().broadcast(&id, &event.to_string()).await;
 
@@ -916,6 +923,7 @@ async fn cancel_session_turn_handler(
         "reason": reason,
         "aborted": event["aborted"],
         "run_id": event["run_id"],
+        "execution_ids": event["execution_ids"],
     })))
 }
 

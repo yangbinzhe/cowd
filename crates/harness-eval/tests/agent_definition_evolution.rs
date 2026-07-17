@@ -37,6 +37,7 @@ fn paired_definition_workload_executes_contract_samples_and_returns_runtime_owne
         acceptance: vec!["evidence".to_string()],
         allowed_tools: Vec::new(),
         allowed_skills: Vec::new(),
+        resource_scopes: vec!["read:crates/runtime".to_string()],
         permission_lease: "read_only".to_string(),
         model_lease: "default".to_string(),
     };
@@ -87,6 +88,7 @@ fn evaluator_rejects_observations_not_bound_to_candidate_revision() {
             acceptance: vec!["evidence".to_string()],
             allowed_tools: Vec::new(),
             allowed_skills: Vec::new(),
+            resource_scopes: vec!["read:crates/runtime".to_string()],
             permission_lease: "read_only".to_string(),
             model_lease: "default".to_string(),
         })

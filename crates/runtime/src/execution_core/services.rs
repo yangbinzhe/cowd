@@ -659,7 +659,8 @@ impl RuntimeServices {
         let tool_batch_executor = Arc::new(ScopedNodeExecutor::new("tool_batch"));
         let cross_plane_connector_executor =
             Arc::new(ScopedNodeExecutor::new("cross_plane_connector"));
-        let agent_task_executor = Arc::new(AgentTaskExecutor::new());
+        let agent_task_executor =
+            Arc::new(AgentTaskExecutor::new().with_state_store(graph_state_store.clone()));
         let agent_runtime = Arc::new(AgentRuntime::new(
             Arc::clone(&event_store),
             Arc::clone(&provider_registry),
@@ -2104,6 +2105,7 @@ impl RuntimeServices {
                 ],
                 context_refs: Vec::new(),
                 evidence_refs: Vec::new(),
+                resource_scopes: Vec::new(),
                 allowed_tools: scenario.allowed_tools.clone(),
                 allowed_skills: scenario.allowed_skills.clone(),
                 permission_lease: scenario.permission_lease.clone(),
@@ -2808,6 +2810,7 @@ impl RuntimeServices {
                         ],
                         context_refs: Vec::new(),
                         evidence_refs: Vec::new(),
+                        resource_scopes: definition.resource_scopes.clone(),
                         allowed_tools: definition.allowed_tool_contract_refs.clone(),
                         allowed_skills: definition.allowed_skill_refs.clone(),
                         permission_lease: definition.permission_lease.clone(),
@@ -2898,6 +2901,7 @@ impl RuntimeServices {
                         mission_id: None,
                         parent_execution: None,
                         selection_mode: TeamSelectionMode::Explicit,
+                        strategy_binding: None,
                         template_selector: selector.clone(),
                         objective: definition.objective.clone(),
                         acceptance: definition.acceptance.clone(),
@@ -3120,6 +3124,7 @@ fn evolution_team_request(
         mission_id: None,
         parent_execution: None,
         selection_mode: TeamSelectionMode::Explicit,
+        strategy_binding: None,
         template_selector: TeamTemplateSelector::Exact {
             revision_ref: revision_ref.clone(),
         },
@@ -3139,7 +3144,7 @@ fn evolution_team_request(
             1,
         )),
         managed_invocation: None,
-        resource_scopes: Vec::new(),
+        resource_scopes: scenario.resource_scopes.clone(),
     }
 }
 
@@ -3462,6 +3467,18 @@ mod tests {
             packet: AgentTaskPacket,
             selection: crate::AgentModelSelection,
         ) -> Result<AgentReturnPacket, String> {
+            let mut evidence_refs = packet.evidence_refs.clone();
+            evidence_refs.push(harness_contract::context::EvidenceAccessRef::durable(
+                harness_contract::context::EvidenceRef::new(
+                    "tool",
+                    format!("materialized:{}", packet.node_id),
+                ),
+                "a".repeat(64),
+                1,
+                "application/json",
+                format!("session-event://{}/1", packet.session_id),
+                format!("session:{}", packet.session_id),
+            ));
             Ok(AgentReturnPacket {
                 run_id: packet.run_id,
                 agent_id: packet.agent_id,
@@ -3474,17 +3491,27 @@ mod tests {
                 attempt: packet.attempt,
                 expected_graph_revision: packet.expected_graph_revision,
                 status: AgentTerminalStatus::Completed,
-                outcome: "verified agent result".into(),
-                acceptance: vec!["completed".into()],
-                evidence_refs: Vec::new(),
+                outcome: serde_json::json!({
+                    "summary": "verified agent result",
+                    "evidence": "materialized durable tool evidence",
+                    "completed": "verified"
+                })
+                .to_string(),
+                acceptance: packet.acceptance,
+                evidence_refs,
                 changes: Vec::new(),
+                runtime_change_receipts: Vec::new(),
                 conflicts: Vec::new(),
                 unresolved: Vec::new(),
                 input_tokens: 5,
                 output_tokens: 3,
+                cached_tokens: 0,
                 model: selection.model,
                 provider: selection.provider,
-                tool_calls: 0,
+                tool_calls: 1,
+                duplicate_tool_calls: 0,
+                runtime_write_attempt_paths: Vec::new(),
+                runtime_observed_resource_scopes: Vec::new(),
                 failure: None,
             })
         }
@@ -3509,6 +3536,18 @@ mod tests {
             self.max_active.fetch_max(active, Ordering::SeqCst);
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             self.active.fetch_sub(1, Ordering::SeqCst);
+            let mut evidence_refs = packet.evidence_refs.clone();
+            evidence_refs.push(harness_contract::context::EvidenceAccessRef::durable(
+                harness_contract::context::EvidenceRef::new(
+                    "tool",
+                    format!("materialized:{}", packet.node_id),
+                ),
+                "a".repeat(64),
+                1,
+                "application/json",
+                format!("session-event://{}/1", packet.session_id),
+                format!("session:{}", packet.session_id),
+            ));
             Ok(AgentReturnPacket {
                 run_id: packet.run_id,
                 agent_id: packet.agent_id,
@@ -3521,17 +3560,27 @@ mod tests {
                 attempt: packet.attempt,
                 expected_graph_revision: packet.expected_graph_revision,
                 status: AgentTerminalStatus::Completed,
-                outcome: "parallel agent result".into(),
-                acceptance: vec!["completed".into()],
-                evidence_refs: Vec::new(),
+                outcome: serde_json::json!({
+                    "summary": "parallel agent result",
+                    "evidence": "materialized durable tool evidence",
+                    "completed": "verified"
+                })
+                .to_string(),
+                acceptance: packet.acceptance,
+                evidence_refs,
                 changes: Vec::new(),
+                runtime_change_receipts: Vec::new(),
                 conflicts: Vec::new(),
                 unresolved: Vec::new(),
                 input_tokens: 5,
                 output_tokens: 3,
+                cached_tokens: 0,
                 model: selection.model,
                 provider: selection.provider,
-                tool_calls: 0,
+                tool_calls: 1,
+                duplicate_tool_calls: 0,
+                runtime_write_attempt_paths: Vec::new(),
+                runtime_observed_resource_scopes: Vec::new(),
                 failure: None,
             })
         }
@@ -4500,6 +4549,7 @@ mod tests {
             constraints: Vec::new(),
             context_refs: Vec::new(),
             evidence_refs: Vec::new(),
+            resource_scopes: Vec::new(),
             allowed_tools: Vec::new(),
             allowed_skills: Vec::new(),
             permission_lease: "read_only".into(),
@@ -4611,6 +4661,7 @@ mod tests {
                 constraints: vec![format!("role_slot:researcher-{index}")],
                 context_refs: Vec::new(),
                 evidence_refs: Vec::new(),
+                resource_scopes: Vec::new(),
                 allowed_tools: Vec::new(),
                 allowed_skills: Vec::new(),
                 permission_lease: "read_only".to_string(),
@@ -4796,24 +4847,56 @@ mod tests {
                             boundary: "only architecture-a".to_string(),
                             evidence_responsibility: "source evidence for architecture-a"
                                 .to_string(),
+                            capability_cropped_refs: vec!["read:architecture-a".to_string()],
+                            scope_hash: harness_contract::team::focus_scope_hash(
+                                "researcher",
+                                "only architecture-a",
+                                &["read:architecture-a".to_string()],
+                            ),
+                            overlap_budget_bp: 0,
+                            novelty_target_bp: 2_500,
                             output_contract: vec!["findings".to_string(), "evidence".to_string()],
+                            output_acceptance: vec!["findings".to_string(), "evidence".to_string()],
                         },
                         harness_contract::team::FocusPartitionSlot {
                             focus_id: "architecture-b".to_string(),
                             boundary: "only architecture-b".to_string(),
                             evidence_responsibility: "source evidence for architecture-b"
                                 .to_string(),
+                            capability_cropped_refs: vec!["read:architecture-b".to_string()],
+                            scope_hash: harness_contract::team::focus_scope_hash(
+                                "researcher",
+                                "only architecture-b",
+                                &["read:architecture-b".to_string()],
+                            ),
+                            overlap_budget_bp: 0,
+                            novelty_target_bp: 2_500,
                             output_contract: vec!["findings".to_string(), "evidence".to_string()],
+                            output_acceptance: vec!["findings".to_string(), "evidence".to_string()],
                         },
                         harness_contract::team::FocusPartitionSlot {
                             focus_id: "architecture-c".to_string(),
                             boundary: "only architecture-c".to_string(),
                             evidence_responsibility: "source evidence for architecture-c"
                                 .to_string(),
+                            capability_cropped_refs: vec!["read:architecture-c".to_string()],
+                            scope_hash: harness_contract::team::focus_scope_hash(
+                                "researcher",
+                                "only architecture-c",
+                                &["read:architecture-c".to_string()],
+                            ),
+                            overlap_budget_bp: 0,
+                            novelty_target_bp: 2_500,
                             output_contract: vec!["findings".to_string(), "evidence".to_string()],
+                            output_acceptance: vec!["findings".to_string(), "evidence".to_string()],
                         },
                     ],
                 }],
+                resource_scopes: vec![
+                    "read:architecture-a".to_string(),
+                    "read:architecture-b".to_string(),
+                    "read:architecture-c".to_string(),
+                ],
                 ..team_request(
                     "team-runtime-fanout",
                     "team-runtime-session",
@@ -4843,6 +4926,7 @@ mod tests {
             mission_id: None,
             parent_execution: None,
             selection_mode: TeamSelectionMode::Explicit,
+            strategy_binding: None,
             template_selector: TeamTemplateSelector::LatestStable {
                 template_id: TeamTemplateDefinitionId::new(DefinitionScope::Builtin, template_id)
                     .expect("builtin Team template id"),
@@ -4853,11 +4937,19 @@ mod tests {
             role_binding_overrides: Vec::new(),
             cardinality_overrides: Vec::new(),
             focus_partition_plans: Vec::new(),
-            permission_lease: "read_only".to_string(),
+            permission_lease: if template_id == "cowd/execute-review" {
+                "workspace-write".to_string()
+            } else {
+                "read_only".to_string()
+            },
             model_lease: model_lease.to_string(),
             budget_lease: None,
             managed_invocation: None,
-            resource_scopes: Vec::new(),
+            resource_scopes: vec![if template_id == "cowd/execute-review" {
+                "write:crates/runtime".to_string()
+            } else {
+                "read:crates/runtime".to_string()
+            }],
         }
     }
 

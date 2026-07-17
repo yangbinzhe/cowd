@@ -236,7 +236,7 @@ fn agent_parallel_research_scenario_keeps_independent_nodes_ready_for_merge() {
 }
 
 #[test]
-fn agent_low_lift_downgrade_keeps_simple_work_out_of_multi_agent_path() {
+fn agent_untrusted_low_lift_cannot_change_multi_agent_path() {
     let prompt = "使用多 Agent 协同完成复杂架构分析";
     let understanding = understand(&StrategyInput::from_prompt(prompt));
     let mut store = StrategyExperienceStore::new();
@@ -246,20 +246,52 @@ fn agent_low_lift_downgrade_keeps_simple_work_out_of_multi_agent_path() {
             complexity: understanding.complexity,
             risk: understanding.risk,
             selected_pattern: harness_contract::core::ExecutionPattern::Collaborate,
+            selected_candidate: Some(harness_contract::strategy::ExecutionCandidateKind::Team),
             succeeded: idx == 0,
             verification_blocked: false,
             context_pressure: false,
+            composite_execution: false,
             multi_agent_positive_lift: false,
             created_at_ms: idx,
+            actual_duration_ms: 120,
+            actual_input_tokens: 10,
+            actual_output_tokens: 5,
+            actual_cached_tokens: 0,
+            actual_coordination_cost_ms: 3,
+            paired_calibration: Some(
+                harness_contract::strategy::PairedStrategyCalibrationEvidence {
+                    evaluation_ref: format!("harness_eval.auto_strategy_paired.v1:deep-{idx}"),
+                    corpus_sha256: "a".repeat(64),
+                    workspace_revision: "test-revision".to_string(),
+                    provider_account_ref: "test-provider".to_string(),
+                    baseline_pattern: harness_contract::core::ExecutionPattern::Direct,
+                    baseline_duration_ms: 100,
+                    baseline_quality_score_bp: 8_000,
+                    candidate_duration_ms: 120,
+                    candidate_quality_score_bp: 8_000,
+                    blind_judge_completed: true,
+                    baseline_total_tokens: 15,
+                    candidate_total_tokens: 15,
+                    candidate_duplicate_tool_ratio_bp: 0,
+                    admission_channel: None,
+                    report_sha256: "b".repeat(64),
+                    rubric_sha256: "c".repeat(64),
+                    binary_sha256: "d".repeat(64),
+                    frontend_workspace_revision: "test-frontend".to_string(),
+                    model_revision: "test-model".to_string(),
+                    judge_model_revision: "test-judge".to_string(),
+                    invariant_fingerprint: "e".repeat(64),
+                },
+            ),
         });
     }
 
     let adapted = decide_strategy(&store.enrich_input(StrategyInput::from_prompt(prompt)));
     assert_eq!(
         adapted.pattern,
-        harness_contract::core::ExecutionPattern::Execute
+        harness_contract::core::ExecutionPattern::Collaborate
     );
-    assert!(adapted
+    assert!(!adapted
         .reasons
         .iter()
         .any(|reason| reason.contains("low multi-agent lift")));

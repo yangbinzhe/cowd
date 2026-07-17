@@ -239,6 +239,7 @@ impl<'a> ProtocolGraphBuilder<'a> {
             constraints,
             context_refs: self.request.context_refs.clone(),
             evidence_refs: self.request.evidence_refs.clone(),
+            resource_scopes: self.request.resource_scopes.clone(),
             allowed_tools,
             allowed_skills: self.request.allowed_skills.clone(),
             permission_lease: self.request.permission_lease.clone(),
