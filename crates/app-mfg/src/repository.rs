@@ -5788,6 +5788,9 @@ fn canonical_action_id(domain: &str, command: &str) -> String {
 
 fn canonical_upsert_action_id(domain: &str, command: &str, previous_revision: u64) -> String {
     let base = canonical_action_id(domain, command);
+    if !command.ends_with(".upsert") {
+        return base;
+    }
     format!(
         "{}.{}",
         base.trim_end_matches(".upsert"),
@@ -10027,6 +10030,18 @@ mod tests {
         MatrixRelationInput, MatrixSourceKey,
     };
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn cockpit_clone_keeps_its_canonical_action_id() {
+        assert_eq!(
+            canonical_upsert_action_id("cockpit", "profile.clone", 0),
+            "mfg.cockpit.profile.clone"
+        );
+        assert_eq!(
+            canonical_upsert_action_id("cockpit", "profile.upsert", 0),
+            "mfg.cockpit.profile.create"
+        );
+    }
 
     fn insert_live_snapshot_sentinel(
         connection: &Connection,
