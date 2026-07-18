@@ -506,7 +506,7 @@ pub fn resource_hint(
         }
         ResourceKind::Text | ResourceKind::Markdown | ResourceKind::Code => {
             recommended_directions.push(
-                "Use read_file/read_many or batch readonly tools to inspect text content directly."
+                "For large text or code, use grep_search/grep_many first to locate relevant lines, then read only bounded matching regions with read_file/read_many or batch readonly tools; do not sequentially scan the whole file when search can answer the question."
                     .to_string(),
             );
         }

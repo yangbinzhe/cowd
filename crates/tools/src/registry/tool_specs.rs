@@ -51,7 +51,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "read_file",
-            description: "Read a text file from the workspace.",
+            description: "Read a bounded line window from a workspace text file. For large files, use grep_search first to locate relevant symbols or logic, then read only the matching region with explicit offset and limit. Do not sequentially scan a large file when search can answer the question.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -317,7 +317,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "grep_search",
-            description: "Search file contents with a regex pattern.",
+            description: "Preferred locator for symbols, text, or logic in large files. Search workspace file contents with a regex and return exact matching lines with optional context; use it before bounded read_file calls to avoid expensive full-file scans.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -851,4 +851,26 @@ pub(crate) fn deferred_tool_specs() -> Vec<ToolSpec> {
             )
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mvp_tool_specs;
+
+    #[test]
+    fn source_inspection_tools_promote_search_before_bounded_reads() {
+        let specs = mvp_tool_specs();
+        let read_file = specs
+            .iter()
+            .find(|spec| spec.name == "read_file")
+            .expect("read_file spec");
+        let grep_search = specs
+            .iter()
+            .find(|spec| spec.name == "grep_search")
+            .expect("grep_search spec");
+
+        assert!(read_file.description.contains("bounded"));
+        assert!(read_file.description.contains("grep_search first"));
+        assert!(grep_search.description.contains("Preferred locator"));
+    }
 }

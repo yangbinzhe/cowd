@@ -14,6 +14,9 @@ use crate::path_policy::WorkspacePathPolicy;
 /// Maximum file size that can be read (10 MB).
 const MAX_READ_SIZE: u64 = 10 * 1024 * 1024;
 
+/// Default line window used when callers omit an explicit read limit.
+const DEFAULT_READ_LINE_LIMIT: usize = 1_000;
+
 /// Maximum file size that can be written (10 MB).
 const MAX_WRITE_SIZE: usize = 10 * 1024 * 1024;
 
@@ -188,9 +191,8 @@ pub fn read_file(
     let content = fs::read_to_string(&absolute_path)?;
     let lines: Vec<&str> = content.lines().collect();
     let start_index = offset.unwrap_or(0).min(lines.len());
-    let end_index = limit.map_or(lines.len(), |limit| {
-        start_index.saturating_add(limit).min(lines.len())
-    });
+    let line_limit = limit.unwrap_or(DEFAULT_READ_LINE_LIMIT);
+    let end_index = start_index.saturating_add(line_limit).min(lines.len());
     let selected = lines[start_index..end_index].join("\n");
 
     Ok(ReadFileOutput {
@@ -595,7 +597,7 @@ mod tests {
 
     use super::{
         edit_file, expand_braces, glob_search, grep_search, read_file, write_file, GrepSearchInput,
-        MAX_WRITE_SIZE,
+        DEFAULT_READ_LINE_LIMIT, MAX_WRITE_SIZE,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -621,6 +623,26 @@ mod tests {
         let read_output = read_file(&policy, path.to_string_lossy().as_ref(), Some(1), Some(1))
             .expect("read should succeed");
         assert_eq!(read_output.file.content, "two");
+    }
+
+    #[test]
+    fn bounds_implicit_reads_but_reports_full_line_count() {
+        let path = temp_path("bounded-read.txt");
+        let policy = policy_for(&path);
+        let content = (0..1_250)
+            .map(|line| format!("line-{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        write_file(&policy, path.to_string_lossy().as_ref(), &content)
+            .expect("write should succeed");
+
+        let output = read_file(&policy, path.to_string_lossy().as_ref(), None, None)
+            .expect("read should succeed");
+
+        assert_eq!(output.file.num_lines, DEFAULT_READ_LINE_LIMIT);
+        assert_eq!(output.file.total_lines, 1_250);
+        assert_eq!(output.file.start_line, 1);
+        assert!(output.file.content.ends_with("line-999"));
     }
 
     #[test]
