@@ -275,9 +275,13 @@ where
         &self,
         novelty_target_bp: u16,
         acceptance_scopes: Vec<String>,
+        required_output_fields: Vec<String>,
     ) {
-        self.runtime_ref()
-            .set_delegated_focus_policy(novelty_target_bp, acceptance_scopes);
+        self.runtime_ref().set_delegated_focus_policy(
+            novelty_target_bp,
+            acceptance_scopes,
+            required_output_fields,
+        );
     }
 
     /// Control whether this host may publish transcript rows. Delegated
@@ -657,6 +661,8 @@ where
             focus_novelty_target_bp: 0,
             focus_acceptance_scopes: Vec::new(),
             focus_acceptance_pending_scopes: Vec::new(),
+            focus_required_output_fields: Vec::new(),
+            structured_output_replans: 0,
             focus_observed_resource_scopes: BTreeSet::new(),
             focus_action_rejections: 0,
             pending_focus_terminal_candidate: None,
@@ -752,6 +758,7 @@ where
             graph_state.focus_novelty_target_bp = delegated_focus_policy.0;
             graph_state.focus_acceptance_pending_scopes = delegated_focus_policy.1.clone();
             graph_state.focus_acceptance_scopes = delegated_focus_policy.1;
+            graph_state.focus_required_output_fields = delegated_focus_policy.2;
         }
         let turn_payload = serde_json::json!({
             "kind": "conversation_turn",
@@ -2511,6 +2518,8 @@ struct TurnGraphState {
     focus_novelty_target_bp: u16,
     focus_acceptance_scopes: Vec<String>,
     focus_acceptance_pending_scopes: Vec<String>,
+    focus_required_output_fields: Vec<String>,
+    structured_output_replans: u8,
     focus_observed_resource_scopes: BTreeSet<String>,
     focus_action_rejections: u8,
     pending_focus_terminal_candidate: Option<String>,
@@ -3283,6 +3292,100 @@ where
                         } else {
                             None
                         };
+                        let structured_output_continuation = if focus_acceptance_continuation
+                            .is_none()
+                            && state.bounded_evidence_role
+                            && state.focus_acceptance_pending_scopes.is_empty()
+                            && !state.focus_required_output_fields.is_empty()
+                            && !reasoning_only_response
+                            && !text.trim().is_empty()
+                        {
+                            let missing = missing_required_structured_fields(
+                                &text,
+                                &state.focus_required_output_fields,
+                            );
+                            if missing.is_empty() {
+                                None
+                            } else {
+                                state.assistant_messages.pop();
+                                state.pending_transcript.remove(&ticket.node_id);
+                                state.structured_output_replans =
+                                    state.structured_output_replans.saturating_add(1);
+                                if state.structured_output_replans == 1 {
+                                    let instruction = format!(
+                                        "Runtime structured-output recovery (mandatory): retained evidence satisfies the bounded role, but the final JSON is missing materialized required field(s): {}. Tools are disabled. Return exactly one JSON object containing every required field [{}], grounded only in retained receipts; use an explicit non-empty risks or unresolved value when uncertainty remains.",
+                                        missing.join(", "),
+                                        state.focus_required_output_fields.join(", "),
+                                    );
+                                    state.force_text_only_next_model = true;
+                                    state.content.push_str("\n\n");
+                                    state.content.push_str(&instruction);
+                                    let mut item = ContextItem::new(
+                                        format!(
+                                            "runtime-structured-output-recovery:{}",
+                                            ticket.node_id
+                                        ),
+                                        ContextSourceKind::Task,
+                                        ContextRole::Instruction,
+                                        instruction.clone(),
+                                    );
+                                    item.authority = ContextAuthority::System;
+                                    item.visibility = ContextVisibility::Private;
+                                    item.evidence =
+                                        vec![format!("execution_node:{}", ticket.node_id)];
+                                    next_model_context = Some(item);
+                                    model_intervention =
+                                        Some(harness_contract::goal::RuntimeIntervention {
+                                            goal_id: state.goal_id.clone(),
+                                            kind: RuntimeInterventionKind::Replan,
+                                            reason: instruction,
+                                            evidence_refs: vec![format!(
+                                                "execution_node:{}",
+                                                ticket.node_id
+                                            )],
+                                            expected_graph_revision: None,
+                                        });
+                                    Some(vec![dynamic_node(
+                                        ticket,
+                                        state.iterations,
+                                        "structured-output-recovery-model",
+                                        ExecutionNodeKind::InlineModel,
+                                        "inline_model",
+                                        "inline_model",
+                                    )])
+                                } else {
+                                    let reason = format!(
+                                        "delegated role omitted required structured field(s) after bounded recovery: {}",
+                                        missing.join(", ")
+                                    );
+                                    state.terminal_override =
+                                        Some((GoalCompletion::Blocked, reason.clone()));
+                                    model_intervention =
+                                        Some(harness_contract::goal::RuntimeIntervention {
+                                            goal_id: state.goal_id.clone(),
+                                            kind: RuntimeInterventionKind::Block,
+                                            reason,
+                                            evidence_refs: vec![format!(
+                                                "execution_node:{}",
+                                                ticket.node_id
+                                            )],
+                                            expected_graph_revision: None,
+                                        });
+                                    let mut node = dynamic_node(
+                                        ticket,
+                                        state.iterations,
+                                        "structured-output-block-synthesize",
+                                        ExecutionNodeKind::Synthesize,
+                                        crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND,
+                                        "inline_model",
+                                    );
+                                    node.executor_kind = crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND.to_string();
+                                    Some(vec![node])
+                                }
+                            }
+                        } else {
+                            None
+                        };
                         let normal_reasoning_continuation = if reasoning_only_response
                             && !force_text_only_response
                             && !step.text_only_response
@@ -3339,6 +3442,8 @@ where
                             None
                         };
                         if let Some(next) = focus_acceptance_continuation {
+                            next
+                        } else if let Some(next) = structured_output_continuation {
                             next
                         } else if let Some(next) = normal_reasoning_continuation {
                             next
@@ -4892,14 +4997,19 @@ where
                     .map_or(RuntimeInterventionKind::Continue, |value| value.kind);
                 match kind {
                     RuntimeInterventionKind::Synthesize => {
-                        let focus_terminal_candidate =
-                            if focus_acceptance_met {
-                                state.pending_focus_terminal_candidate.take().and_then(
-                                    |candidate| normalized_team_terminal_candidate(&candidate),
-                                )
-                            } else {
-                                None
-                            };
+                        let focus_terminal_candidate = if focus_acceptance_met {
+                            state
+                                .pending_focus_terminal_candidate
+                                .take()
+                                .and_then(|candidate| {
+                                    normalized_team_terminal_candidate(
+                                        &candidate,
+                                        &state.focus_required_output_fields,
+                                    )
+                                })
+                        } else {
+                            None
+                        };
                         if let Some(candidate) = focus_terminal_candidate {
                             state.focus_acceptance_pending_scopes.clear();
                             state.terminal_override = Some((GoalCompletion::Satisfied, candidate));
@@ -6679,6 +6789,36 @@ fn evaluation_scope_rejection_outcome(
         }
     }
 
+    // After exact-path evidence recovery, a mutation objective may still
+    // repeat the same broad read instead of attempting its authorized write.
+    // Grant one final model step with the existing resource ceiling intact;
+    // never synthesize a write on the model's behalf and never loop.
+    if required_write_final_replan_allowed(
+        state.evaluation_scope_rejections,
+        violation,
+        state.required_write_for_completion,
+        &state.write_attempt_paths,
+    ) {
+        let reason = "exact-path evidence is already retained, but the mutation objective has not attempted its authorized write. Do not read the workspace broadly again. Invoke the smallest authorized exact-path write now, or return an honest blocked result if the retained evidence is insufficient".to_string();
+        return (
+            RuntimeIntervention {
+                goal_id: state.goal_id.clone(),
+                kind: RuntimeInterventionKind::Replan,
+                reason,
+                evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
+                expected_graph_revision: None,
+            },
+            vec![dynamic_node(
+                ticket,
+                state.iterations,
+                "eval-required-write-final-replan-model",
+                ExecutionNodeKind::InlineModel,
+                "inline_model",
+                "inline_model",
+            )],
+        );
+    }
+
     let terminal_reason = format!(
         "Execution blocked after repeated evaluation scope violations: `{violation}`. No out-of-scope effect was executed; narrow the requested action or explicitly expand the authorized scope."
     );
@@ -6703,6 +6843,18 @@ fn evaluation_scope_rejection_outcome(
         },
         vec![node],
     )
+}
+
+fn required_write_final_replan_allowed(
+    rejection_count: u8,
+    violation: &str,
+    required_write_for_completion: bool,
+    write_attempt_paths: &[String],
+) -> bool {
+    rejection_count == 3
+        && violation == "read:."
+        && required_write_for_completion
+        && write_attempt_paths.is_empty()
 }
 
 /// Compile a repeated broad evaluation read into bounded exact-path calls.
@@ -6918,9 +7070,37 @@ fn dynamic_edges(from: &str, nodes: &[ExecutionNodeSpec]) -> Vec<ExecutionEdge> 
         .collect()
 }
 
-fn normalized_team_terminal_candidate(candidate: &str) -> Option<String> {
-    crate::agent_in_process_worker::structured_agent_output(candidate)
-        .and_then(|object| serde_json::to_string(&object).ok())
+fn structured_field_is_materialized(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        Some(serde_json::Value::String(value)) => !value.trim().is_empty(),
+        Some(serde_json::Value::Array(values)) => !values.is_empty(),
+        Some(serde_json::Value::Object(values)) => !values.is_empty(),
+        Some(serde_json::Value::Bool(_) | serde_json::Value::Number(_)) => true,
+        Some(serde_json::Value::Null) | None => false,
+    }
+}
+
+fn missing_required_structured_fields(candidate: &str, required: &[String]) -> Vec<String> {
+    let output = crate::agent_in_process_worker::structured_agent_output(candidate);
+    required
+        .iter()
+        .filter(|field| {
+            !structured_field_is_materialized(
+                output
+                    .as_ref()
+                    .and_then(|object| object.get(field.as_str())),
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+fn normalized_team_terminal_candidate(candidate: &str, required: &[String]) -> Option<String> {
+    let object = crate::agent_in_process_worker::structured_agent_output(candidate)?;
+    missing_required_structured_fields(candidate, required)
+        .is_empty()
+        .then(|| serde_json::to_string(&object).ok())
+        .flatten()
 }
 
 fn completed_result(result_ref: Option<String>, usage: ExecutionUsage) -> ExecutionNodeResult {
@@ -6975,11 +7155,33 @@ mod tests {
     fn focus_terminal_candidate_requires_and_normalizes_team_json() {
         let fenced = "```json\n{\"implementation\":\"done\",\"source_verification\":\"receipt\"}\n```\nprose";
         assert_eq!(
-            normalized_team_terminal_candidate(fenced).as_deref(),
+            normalized_team_terminal_candidate(
+                fenced,
+                &[
+                    "implementation".to_string(),
+                    "source_verification".to_string()
+                ],
+            )
+            .as_deref(),
             Some("{\"implementation\":\"done\",\"source_verification\":\"receipt\"}")
         );
-        assert!(normalized_team_terminal_candidate("## Step 4: verify").is_none());
-        assert!(normalized_team_terminal_candidate("{\"unrelated\":true}").is_none());
+        assert!(
+            normalized_team_terminal_candidate("## Step 4: verify", &["review".into()]).is_none()
+        );
+        assert!(
+            normalized_team_terminal_candidate(
+                "{\"review\":\"checked\",\"risks\":[]}",
+                &["review".into(), "risks".into()],
+            )
+            .is_none()
+        );
+        assert_eq!(
+            missing_required_structured_fields(
+                "prefix {\"evidence\":\"receipt\",\"review\":\"checked\"}",
+                &["review".into(), "risks".into()],
+            ),
+            vec!["risks".to_string()]
+        );
     }
 
     #[derive(Clone)]
@@ -8508,6 +8710,25 @@ mod tests {
             .map(|index| format!("read:fixtures/{index}.txt"))
             .collect::<Vec<_>>();
         assert!(evaluation_scope_recovery_tool_calls(&too_many, 1).is_none());
+    }
+
+    #[test]
+    fn final_write_replan_is_single_use_and_requires_zero_write_attempts() {
+        assert!(required_write_final_replan_allowed(3, "read:.", true, &[]));
+        assert!(!required_write_final_replan_allowed(2, "read:.", true, &[]));
+        assert!(!required_write_final_replan_allowed(4, "read:.", true, &[]));
+        assert!(!required_write_final_replan_allowed(
+            3,
+            "read:src",
+            true,
+            &[]
+        ));
+        assert!(!required_write_final_replan_allowed(
+            3,
+            "read:.",
+            true,
+            &["fixtures/target.txt".into()],
+        ));
     }
 
     #[test]

@@ -301,6 +301,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         runtime.set_delegated_focus_policy(
             packet_focus_novelty_target_bp(&packet),
             packet_focus_acceptance_scopes(&packet),
+            packet_required_output_fields(&packet),
         );
         // Delegated Agents share the parent Session's evidence authority, but
         // only the parent Turn may publish conversation messages. The child
@@ -622,6 +623,37 @@ fn packet_focus_acceptance_scopes(packet: &AgentTaskPacket) -> Vec<String> {
     focus_acceptance_scopes_from_constraints(&packet.constraints)
 }
 
+fn packet_required_output_fields(packet: &AgentTaskPacket) -> Vec<String> {
+    let mut fields = packet_acceptance_contract(packet)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|requirement| match requirement.check {
+            harness_contract::team::TeamAcceptanceCheck::StructuredField { field }
+            | harness_contract::team::TeamAcceptanceCheck::WorkspaceChange { field, .. } => {
+                Some(field.as_str().to_string())
+            }
+            harness_contract::team::TeamAcceptanceCheck::SourceVerification { .. } => Some(
+                harness_contract::team::TeamStructuredOutputField::SourceVerification
+                    .as_str()
+                    .to_string(),
+            ),
+            harness_contract::team::TeamAcceptanceCheck::UpstreamReview => Some(
+                harness_contract::team::TeamStructuredOutputField::Review
+                    .as_str()
+                    .to_string(),
+            ),
+            harness_contract::team::TeamAcceptanceCheck::ScopedEvidence { .. }
+            | harness_contract::team::TeamAcceptanceCheck::UpstreamEvidence => None,
+            harness_contract::team::TeamAcceptanceCheck::LegacyEvidenceBound { .. } => {
+                Some("legacy_acceptance".to_string())
+            }
+        })
+        .collect::<Vec<_>>();
+    fields.sort();
+    fields.dedup();
+    fields
+}
+
 fn focus_acceptance_scopes_from_constraints(constraints: &[String]) -> Vec<String> {
     let explicit = constraints.iter().find_map(|constraint| {
         constraint
@@ -793,8 +825,10 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
                 "tool `{tool_name}` is outside the AgentTaskPacket allow-list"
             )));
         }
-        self.enforce_resource_ceiling(tool_name, input)?;
-        self.execute_scoped(tool_name, input, None)
+        let normalized_input =
+            normalize_workspace_internal_resource_paths(tool_name, input, &self.workspace_root)?;
+        self.enforce_resource_ceiling(tool_name, &normalized_input)?;
+        self.execute_scoped(tool_name, &normalized_input, None)
     }
 
     fn tool_discovery_receipt(&self) -> harness_contract::tool::ToolDiscoveryReceipt {
@@ -873,8 +907,10 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
                 "agent tool authorization does not match the allowed tool request",
             ));
         }
-        self.enforce_resource_ceiling(tool_name, input)?;
-        self.execute_scoped(tool_name, input, Some(authorization.clone()))
+        let normalized_input =
+            normalize_workspace_internal_resource_paths(tool_name, input, &self.workspace_root)?;
+        self.enforce_resource_ceiling(tool_name, &normalized_input)?;
+        self.execute_scoped(tool_name, &normalized_input, Some(authorization.clone()))
     }
 
     fn available_tool_names(&self) -> Vec<String> {
@@ -1147,6 +1183,63 @@ impl ScopedRuntimeToolExecutor {
             )),
         }
     }
+}
+
+fn normalize_workspace_internal_resource_paths(
+    tool_name: &str,
+    input: &str,
+    workspace_root: &std::path::Path,
+) -> Result<String, ToolError> {
+    let mut parsed = serde_json::from_str::<serde_json::Value>(input)
+        .map_err(|error| ToolError::new(format!("invalid scoped tool input: {error}")))?;
+    let requested = crate::tool_execution_plan::resource_scope_for_tool_request(
+        tool_name,
+        &parsed,
+        crate::ToolSafetyCategory::from_tool_name(tool_name),
+    );
+    let replacements = requested
+        .paths
+        .iter()
+        .filter_map(|path| {
+            let absolute = std::path::Path::new(path);
+            if !absolute.is_absolute() {
+                return None;
+            }
+            let relative = absolute.strip_prefix(workspace_root).ok()?;
+            let parts = normalized_relative_parts(&relative.to_string_lossy())?;
+            (!parts.is_empty()).then(|| (path.clone(), parts.join("/")))
+        })
+        .collect::<BTreeMap<_, _>>();
+    if replacements.is_empty() {
+        return Ok(input.to_string());
+    }
+
+    fn rewrite(value: &mut serde_json::Value, replacements: &BTreeMap<String, String>) {
+        match value {
+            serde_json::Value::String(value) => {
+                let normalized = value.trim().replace('\\', "/");
+                if let Some(replacement) = replacements.get(&normalized) {
+                    value.clone_from(replacement);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    rewrite(value, replacements);
+                }
+            }
+            serde_json::Value::Object(values) => {
+                for value in values.values_mut() {
+                    rewrite(value, replacements);
+                }
+            }
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            }
+        }
+    }
+
+    rewrite(&mut parsed, &replacements);
+    serde_json::to_string(&parsed)
+        .map_err(|error| ToolError::new(format!("serialize normalized scoped tool input: {error}")))
 }
 
 fn workspace_file_sha256(workspace_root: &std::path::Path, relative: &str) -> Option<String> {
@@ -2122,6 +2215,72 @@ mod tests {
     }
 
     #[test]
+    fn acceptance_contract_projects_materialized_output_fields_to_the_host() {
+        let mut packet = test_agent_packet(Vec::new());
+        packet.constraints = vec![
+            "team_acceptance_contract:[{\"criterion\":\"evidence\",\"check\":{\"kind\":\"scoped_evidence\",\"scopes\":[\"read:fixtures/target.txt\"]}},{\"criterion\":\"review\",\"check\":{\"kind\":\"upstream_review\"}},{\"criterion\":\"risks\",\"check\":{\"kind\":\"structured_field\",\"field\":\"risks\"}},{\"criterion\":\"legacy\",\"check\":{\"kind\":\"legacy_evidence_bound\",\"scopes\":[\"read:fixtures/target.txt\"]}}]".to_string(),
+        ];
+
+        assert_eq!(
+            packet_required_output_fields(&packet),
+            [
+                "legacy_acceptance".to_string(),
+                "review".to_string(),
+                "risks".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn workspace_internal_absolute_resource_path_is_normalized_once() {
+        let root = tempfile::tempdir().expect("workspace");
+        let target = root.path().join("fixtures/target.txt");
+        let input = serde_json::json!({
+            "path": target,
+            "content": format!("do not rewrite {}", root.path().display()),
+        })
+        .to_string();
+
+        let normalized =
+            normalize_workspace_internal_resource_paths("write_file", &input, root.path())
+                .expect("normalize internal absolute path");
+        let normalized: serde_json::Value = serde_json::from_str(&normalized).expect("json");
+        assert_eq!(normalized["path"], "fixtures/target.txt");
+        assert!(
+            normalized["content"]
+                .as_str()
+                .is_some_and(|content| content.contains(&root.path().display().to_string()))
+        );
+    }
+
+    #[test]
+    fn absolute_escape_and_parent_traversal_remain_unauthorized() {
+        let root = tempfile::tempdir().expect("workspace");
+        let allowed = root.path().join("fixtures/target.txt");
+        std::fs::create_dir_all(allowed.parent().expect("parent")).expect("scope directory");
+        std::fs::write(&allowed, "before").expect("scope file");
+        let outside = root.path().parent().expect("parent").join("outside.txt");
+        let outside_input = serde_json::json!({"path": outside}).to_string();
+        assert_eq!(
+            normalize_workspace_internal_resource_paths("read_file", &outside_input, root.path(),)
+                .expect("unchanged outside input"),
+            outside_input
+        );
+        assert!(!resource_path_is_authorized(
+            root.path(),
+            outside.to_string_lossy().as_ref(),
+            &["read:fixtures/target.txt".into()],
+            false,
+        ));
+        assert!(!resource_path_is_authorized(
+            root.path(),
+            "fixtures/../outside.txt",
+            &["read:fixtures/target.txt".into()],
+            false,
+        ));
+    }
+
+    #[test]
     fn permission_policy_uses_the_explicit_packet_lease() {
         let tools = BTreeSet::from(["write_file".to_string()]);
         let policy = permission_policy("workspace-write", &tools);
@@ -2135,7 +2294,9 @@ mod tests {
     #[test]
     fn team_tool_boundary_enforces_the_exact_focus_scope() {
         let root = tempfile::tempdir().expect("scoped workspace");
-        std::fs::create_dir_all(root.path().join("crates/runtime")).expect("runtime scope");
+        std::fs::create_dir_all(root.path().join("crates/runtime/src")).expect("runtime scope");
+        std::fs::write(root.path().join("crates/runtime/src/lib.rs"), "checked")
+            .expect("runtime file");
         std::fs::create_dir_all(root.path().join("crates/gateway")).expect("gateway scope");
         let executor = ScopedRuntimeToolExecutor {
             host: Arc::new(EchoRuntimeExecutionHost),
@@ -2163,6 +2324,30 @@ mod tests {
         assert!(executor
             .enforce_resource_ceiling("grep_search", r#"{"pattern":"unsafe"}"#)
             .is_err());
+
+        let descriptor = test_tool_descriptor("read_file").expect("read descriptor");
+        let authorization = harness_contract::tool::ToolExecutionAuthorization {
+            request_id: "absolute-read".into(),
+            tool_id: "read_file".into(),
+            descriptor_hash: descriptor.descriptor_hash,
+            scope: descriptor.scopes[0].clone(),
+            permission_lease: "permission:read_only".into(),
+            timeout_lease: "timeout:30".into(),
+            idempotency_key: None,
+        };
+        let absolute_input = serde_json::json!({
+            "path": root.path().join("crates/runtime/src/lib.rs"),
+        })
+        .to_string();
+        executor
+            .execute_authorized(&authorization, "read_file", &absolute_input)
+            .expect("workspace-internal absolute read is normalized and executed");
+        let receipts = executor
+            .receipts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].paths, ["crates/runtime/src/lib.rs"]);
     }
 
     #[cfg(unix)]

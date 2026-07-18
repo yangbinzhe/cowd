@@ -1404,6 +1404,7 @@ pub struct ConversationRuntime<C, T> {
     /// `0` disables the delegated novelty gate for normal root turns.
     delegated_focus_novelty_target_bp: AtomicU64,
     delegated_focus_acceptance_scopes: std::sync::Mutex<Vec<String>>,
+    delegated_focus_required_output_fields: std::sync::Mutex<Vec<String>>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -1642,6 +1643,7 @@ where
             model_step_limit_override: AtomicUsize::new(0),
             delegated_focus_novelty_target_bp: AtomicU64::new(0),
             delegated_focus_acceptance_scopes: std::sync::Mutex::new(Vec::new()),
+            delegated_focus_required_output_fields: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1731,16 +1733,20 @@ where
         &self,
         novelty_target_bp: u16,
         acceptance_scopes: Vec<String>,
+        required_output_fields: Vec<String>,
     ) {
         self.delegated_focus_novelty_target_bp
             .store(u64::from(novelty_target_bp.min(10_000)), Ordering::SeqCst);
         if let Ok(mut guard) = self.delegated_focus_acceptance_scopes.lock() {
             *guard = acceptance_scopes;
         }
+        if let Ok(mut guard) = self.delegated_focus_required_output_fields.lock() {
+            *guard = required_output_fields;
+        }
     }
 
     #[must_use]
-    pub fn delegated_focus_policy(&self) -> (u16, Vec<String>) {
+    pub fn delegated_focus_policy(&self) -> (u16, Vec<String>, Vec<String>) {
         (
             u16::try_from(
                 self.delegated_focus_novelty_target_bp
@@ -1748,6 +1754,10 @@ where
             )
             .unwrap_or(10_000),
             self.delegated_focus_acceptance_scopes
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or_default(),
+            self.delegated_focus_required_output_fields
                 .lock()
                 .map(|guard| guard.clone())
                 .unwrap_or_default(),
