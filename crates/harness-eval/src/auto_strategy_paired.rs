@@ -28,6 +28,7 @@ pub const DEFAULT_MAX_TOKENS: u64 = 20_000_000;
 pub const DEFAULT_MAX_COST_USD_MILLI: u64 = 50_000;
 const BUSINESS_SAMPLE_TOKEN_LEASE: u64 = 128_000;
 const JUDGE_SAMPLE_TOKEN_LEASE: u64 = 32_000;
+const DEFAULT_CONDITION_CONCURRENCY: usize = 2;
 const FROZEN_CORPUS_SHA256: &str =
     "d8dc4ba671dacd7a12b41d0cbe17d1cb4f2d5f5055cb2b9e7cefab2bb8c22e3c";
 const FROZEN_RUBRIC_SHA256: &str =
@@ -208,6 +209,7 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
         "COWD_AUTO_STRATEGY_JUDGE_SAMPLE_TOKEN_LEASE",
         JUDGE_SAMPLE_TOKEN_LEASE,
     )?;
+    let condition_concurrency = condition_concurrency()?;
     let schedule = preregistered_schedule(&corpus, options.repetitions);
     let binary_sha256 = std::env::var("COWD_EVAL_BINARY_SHA256").ok();
     let workspace_revision = std::env::var("COWD_EVAL_WORKSPACE_REVISION").ok();
@@ -240,6 +242,7 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
         "cost_budget_usd_milli": max_cost_usd_milli,
         "business_sample_token_lease": business_sample_token_lease,
         "judge_sample_token_lease": judge_sample_token_lease,
+        "condition_concurrency": condition_concurrency,
     });
     let condition_invariant_fingerprint = format!(
         "{:x}",
@@ -266,6 +269,7 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
         "cost_budget_usd_milli": max_cost_usd_milli,
         "business_sample_token_lease": business_sample_token_lease,
         "judge_sample_token_lease": judge_sample_token_lease,
+        "condition_concurrency": condition_concurrency,
         "all_failures_retained": true,
         "bootstrap_cluster": "task_id",
         "binary_sha256": binary_sha256,
@@ -370,8 +374,10 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
                     })
                     .collect::<Vec<_>>()
             } else {
-                // 三个条件拥有独立 Gateway、数据库和工作区，因此可并发运行；
-                // 同一条件内仍按组串行，保证 workspace reset 不发生竞争。
+                // 三个条件拥有独立 Gateway、数据库和工作区，可按 Provider
+                // 账户并发上限分波运行；同一条件内仍按组串行，保证
+                // workspace reset 不发生竞争。默认双路并发，避免第三路在
+                // Provider 账户排队时无限占用评测样本的 900 秒业务租约。
                 // 预算按整组均分后预留，避免并发请求超卖全局硬上限。
                 let condition_count = u64::try_from(order.len()).unwrap_or(1).max(1);
                 let sample_token_limit = provider_admission_token_limit(
@@ -399,51 +405,62 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
                     ));
                     continue;
                 };
-                thread::scope(|scope| {
-                    let mut workers = Vec::with_capacity(order.len());
-                    for (order_index, condition) in order.iter().copied().enumerate() {
-                        let endpoint = &endpoints[&condition];
-                        let client = &condition_clients[&condition];
-                        let options = &options;
-                        workers.push((
-                            order_index,
-                            condition,
-                            scope.spawn(move || {
-                                run_sample(
-                                    client,
-                                    endpoint,
-                                    options,
-                                    task,
-                                    scored_repetition,
-                                    warmup,
-                                    order_index,
-                                    condition,
-                                    sample_token_limit,
-                                )
-                            }),
-                        ));
-                    }
-                    workers
-                        .into_iter()
-                        .map(|(order_index, condition, worker)| {
-                            worker.join().unwrap_or_else(|_| {
-                                let mut sample = sample_shell(
-                                    task,
-                                    scored_repetition,
-                                    warmup,
-                                    order_index,
-                                    condition,
-                                );
-                                sample.status = "worker_panicked".to_string();
-                                sample.error = Some(
-                                    "condition worker panicked; retained as failed sample"
-                                        .to_string(),
-                                );
-                                sample
+                let mut group = Vec::with_capacity(order.len());
+                for wave_start in (0..order.len()).step_by(condition_concurrency) {
+                    let wave_end = wave_start
+                        .saturating_add(condition_concurrency)
+                        .min(order.len());
+                    let wave = thread::scope(|scope| {
+                        let mut workers = Vec::with_capacity(wave_end - wave_start);
+                        for (relative_index, condition) in
+                            order[wave_start..wave_end].iter().copied().enumerate()
+                        {
+                            let order_index = wave_start + relative_index;
+                            let endpoint = &endpoints[&condition];
+                            let client = &condition_clients[&condition];
+                            let options = &options;
+                            workers.push((
+                                order_index,
+                                condition,
+                                scope.spawn(move || {
+                                    run_sample(
+                                        client,
+                                        endpoint,
+                                        options,
+                                        task,
+                                        scored_repetition,
+                                        warmup,
+                                        order_index,
+                                        condition,
+                                        sample_token_limit,
+                                    )
+                                }),
+                            ));
+                        }
+                        workers
+                            .into_iter()
+                            .map(|(order_index, condition, worker)| {
+                                worker.join().unwrap_or_else(|_| {
+                                    let mut sample = sample_shell(
+                                        task,
+                                        scored_repetition,
+                                        warmup,
+                                        order_index,
+                                        condition,
+                                    );
+                                    sample.status = "worker_panicked".to_string();
+                                    sample.error = Some(
+                                        "condition worker panicked; retained as failed sample"
+                                            .to_string(),
+                                    );
+                                    sample
+                                })
                             })
-                        })
-                        .collect::<Vec<_>>()
-                })
+                            .collect::<Vec<_>>()
+                    });
+                    group.extend(wave);
+                }
+                group
             };
             for sample in &mut group {
                 execution_isolation_stopped |= sample.status == "isolation_failed";
@@ -639,6 +656,26 @@ fn lowered_budget(name: &str, hard_default: u64) -> Result<u64, String> {
         }
         Err(_) => Ok(hard_default),
     }
+}
+
+fn condition_concurrency() -> Result<usize, String> {
+    let configured = std::env::var("COWD_AUTO_STRATEGY_CONCURRENCY").ok();
+    parse_condition_concurrency(configured.as_deref())
+}
+
+fn parse_condition_concurrency(configured: Option<&str>) -> Result<usize, String> {
+    let concurrency = configured.map_or(Ok(DEFAULT_CONDITION_CONCURRENCY), |value| {
+        value
+            .parse::<usize>()
+            .map_err(|_| "COWD_AUTO_STRATEGY_CONCURRENCY must be an integer".to_string())
+    })?;
+    if !(1..=Condition::ALL.len()).contains(&concurrency) {
+        return Err(format!(
+            "COWD_AUTO_STRATEGY_CONCURRENCY must be between 1 and {}",
+            Condition::ALL.len()
+        ));
+    }
+    Ok(concurrency)
 }
 
 fn provider_admission_token_limit(
@@ -2530,6 +2567,16 @@ mod tests {
             None,
             "a zero remaining cost budget must produce zero provider admission"
         );
+    }
+
+    #[test]
+    fn condition_concurrency_defaults_to_two_and_stays_bounded() {
+        assert_eq!(parse_condition_concurrency(None), Ok(2));
+        assert_eq!(parse_condition_concurrency(Some("1")), Ok(1));
+        assert_eq!(parse_condition_concurrency(Some("3")), Ok(3));
+        assert!(parse_condition_concurrency(Some("0")).is_err());
+        assert!(parse_condition_concurrency(Some("4")).is_err());
+        assert!(parse_condition_concurrency(Some("many")).is_err());
     }
 
     #[test]
