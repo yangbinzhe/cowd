@@ -15,6 +15,8 @@ const MAX_READ_SIZE: u64 = 10 * 1024 * 1024;
 /// Default line window used when callers omit an explicit read limit.
 const DEFAULT_READ_LINE_LIMIT: usize = 1_000;
 
+const TRUNCATED_READ_GUIDANCE: &str = "This is a bounded window, not the whole file. Do not continue with consecutive read_file offsets to scan a large file. Use grep_search (or grep_many for independent patterns) to locate the relevant symbol or logic, then read only the matching region.";
+
 /// Maximum file size that can be written (10 MB).
 const MAX_WRITE_SIZE: usize = 10 * 1024 * 1024;
 
@@ -47,6 +49,10 @@ pub struct TextFilePayload {
 pub struct ReadFileOutput {
     #[serde(rename = "type")]
     pub kind: String,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<String>,
     pub file: TextFilePayload,
 }
 
@@ -191,9 +197,12 @@ pub fn read_file(
     let line_limit = limit.unwrap_or(DEFAULT_READ_LINE_LIMIT);
     let end_index = start_index.saturating_add(line_limit).min(lines.len());
     let selected = lines[start_index..end_index].join("\n");
+    let truncated = end_index < lines.len();
 
     Ok(ReadFileOutput {
         kind: String::from("text"),
+        truncated,
+        guidance: truncated.then(|| TRUNCATED_READ_GUIDANCE.to_string()),
         file: TextFilePayload {
             file_path: absolute_path.to_string_lossy().into_owned(),
             content: selected,
@@ -653,6 +662,11 @@ mod tests {
         assert_eq!(output.file.total_lines, 1_250);
         assert_eq!(output.file.start_line, 1);
         assert!(output.file.content.ends_with("line-999"));
+        assert!(output.truncated);
+        assert!(output
+            .guidance
+            .as_deref()
+            .is_some_and(|guidance| guidance.contains("grep_search")));
     }
 
     #[test]
