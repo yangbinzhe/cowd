@@ -1757,13 +1757,14 @@ fn evaluation_resource_scopes(task: &AutoStrategyTask) -> Vec<String> {
     task.mutation_fixture
         .as_ref()
         .map_or_else(Vec::new, |fixture| {
-            // The mutation ceiling constrains effects, not evidence gathering.
-            // A read-only workspace scope lets the model inspect the protected
-            // sentinel or discover the exact target without granting any extra
-            // write authority. The verifier still rejects every changed or
-            // attempted write path outside the frozen target.
+            // The mutation ceiling constrains effects while preserving the
+            // two exact evidence paths required by this frozen task. Keep the
+            // reads bounded so automatic Team focus leases remain valid; the
+            // verifier still rejects every changed or attempted write path
+            // outside the target.
             vec![
-                "read:.".to_string(),
+                format!("read:{}", fixture.target_path),
+                format!("read:{}", fixture.protected_path),
                 format!("write:{}", fixture.target_path),
             ]
         })
@@ -2862,7 +2863,7 @@ mod tests {
         assert_eq!(rendered_task_prompt(&task, 2), "write after-2");
         assert_eq!(
             evaluation_resource_scopes(&task),
-            ["read:.", "write:target"]
+            ["read:target", "read:protected", "write:target"]
         );
     }
 

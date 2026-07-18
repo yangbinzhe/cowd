@@ -648,7 +648,9 @@ where
             terminal_override: None,
             last_verified_progress: false,
             reasoning_only_attempts: 0,
-            force_text_only_next_model: false,
+            force_text_only_next_model: evaluation_control
+                .as_ref()
+                .is_some_and(|control| control.provider_constraint == "judge"),
             terminal_recovery_attempts: 0,
             bounded_evidence_role: false,
             focus_novelty_target_bp: 0,
@@ -668,6 +670,9 @@ where
                 .map(|control| control.resource_scopes.clone())
                 .unwrap_or_default(),
             evaluation_scope_rejections: 0,
+            evaluation_judge_only: evaluation_control
+                .as_ref()
+                .is_some_and(|control| control.provider_constraint == "judge"),
             team_orchestration_requests: 0,
             collaboration_started: false,
             team_orchestration_forbidden: evaluation_control.is_some()
@@ -2415,6 +2420,7 @@ struct TurnGraphState {
     parallel_tool_batches: usize,
     evaluation_resource_scopes: Vec<String>,
     evaluation_scope_rejections: u8,
+    evaluation_judge_only: bool,
     team_orchestration_requests: usize,
     collaboration_started: bool,
     team_orchestration_forbidden: bool,
@@ -3109,11 +3115,20 @@ where
                         };
                         if let Some(next) = normal_reasoning_continuation {
                             next
-                        } else if let Some(reason) = final_answer_recovery_reason_for_objective(
-                            &text,
-                            self.services.workspace_root(),
-                            &state.content,
-                        ) {
+                        // A frozen Judge turn deliberately returns machine JSON
+                        // rather than a user-facing answer. The harness validates
+                        // its exact schema; running normal prose recovery here can
+                        // replace a valid score object with unrelated fallback text.
+                        } else if let Some(reason) = (!state.evaluation_judge_only)
+                            .then(|| {
+                                final_answer_recovery_reason_for_objective(
+                                    &text,
+                                    self.services.workspace_root(),
+                                    &state.content,
+                                )
+                            })
+                            .flatten()
+                        {
                             // A malformed or obviously unfinished answer is
                             // not proof that the user goal failed. First try
                             // one normal text-only continuation. If the
