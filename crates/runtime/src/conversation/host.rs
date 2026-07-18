@@ -6024,7 +6024,10 @@ fn normalize_workspace_scope(scope: &str) -> Option<(&str, String)> {
             value => components.push(value),
         }
     }
-    (!components.is_empty()).then(|| (mode, components.join("/")))
+    if components.is_empty() {
+        return (path == "." || path == "./").then(|| (mode, ".".to_string()));
+    }
+    Some((mode, components.join("/")))
 }
 
 fn evaluation_scope_authorizes(allowed: &str, requested: &str) -> bool {
@@ -6040,7 +6043,8 @@ fn evaluation_scope_authorizes(allowed: &str, requested: &str) -> bool {
         _ => false,
     };
     mode_authorized
-        && (requested_path == allowed_path
+        && (allowed_path == "."
+            || requested_path == allowed_path
             || requested_path
                 .strip_prefix(&allowed_path)
                 .is_some_and(|suffix| suffix.starts_with('/')))
@@ -7720,6 +7724,14 @@ mod tests {
         assert!(!evaluation_scope_authorizes(
             "read:fixtures/v546-write/target.txt",
             "write:fixtures/v546-write/target.txt"
+        ));
+        assert!(evaluation_scope_authorizes(
+            "read:.",
+            "read:fixtures/v546-protected/sentinel.txt"
+        ));
+        assert!(!evaluation_scope_authorizes(
+            "read:.",
+            "write:fixtures/v546-protected/sentinel.txt"
         ));
     }
 
