@@ -394,7 +394,29 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         let changes = runtime_change_receipts
             .iter()
             .map(|receipt| receipt.path.clone())
-            .collect();
+            .collect::<Vec<_>>();
+        let receipt_summary = tool_executor
+            .receipts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|receipt| {
+                let digest_changed = receipt.paths.iter().any(|path| {
+                    receipt.before_digests.get(path) != receipt.after_digests.get(path)
+                });
+                format!(
+                    "{}:{:?}:{:?}:changed={digest_changed}",
+                    receipt.sequence, receipt.effect_kind, receipt.paths
+                )
+            })
+            .collect::<Vec<_>>();
+        let _ = services.agent_runtime().record_progress(
+            &packet.agent_id,
+            "agent.acceptance.evaluated",
+            &format!(
+                "accepted={acceptance:?}; changes={changes:?}; receipts={receipt_summary:?}"
+            ),
+        );
         let (status, failure) =
             agent_terminal_outcome(summary.terminal_completion, &summary.final_answer);
         Ok(AgentReturnPacket {

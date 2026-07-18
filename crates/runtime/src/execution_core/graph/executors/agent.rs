@@ -245,9 +245,21 @@ impl NodeExecutor for AgentTaskExecutor {
                     node_id: ticket.node_id.clone(),
                     reason,
                 })?;
-        validate_agent_return(&packet, &returned).map_err(|reason| NodeExecutorError::Poll {
-            node_id: ticket.node_id.clone(),
-            reason: reason.to_string(),
+        validate_agent_return(&packet, &returned).map_err(|reason| {
+            let missing_acceptance = packet
+                .acceptance
+                .iter()
+                .filter(|criterion| !returned.acceptance.contains(criterion))
+                .cloned()
+                .collect::<Vec<_>>();
+            NodeExecutorError::Poll {
+                node_id: ticket.node_id.clone(),
+                reason: format!(
+                    "{reason}; missing_acceptance={missing_acceptance:?}; runtime_change_receipts={}; observed_resource_scopes={:?}",
+                    returned.runtime_change_receipts.len(),
+                    returned.runtime_observed_resource_scopes,
+                ),
+            }
         })?;
         let unresolved_tolerated = packet
             .constraints
