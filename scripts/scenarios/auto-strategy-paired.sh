@@ -8,6 +8,17 @@ COWD_BIN="${COWD_BIN:-${TARGET_ROOT}/debug/cowd}"
 EVAL_BIN="${COWD_HARNESS_EVAL_BIN:-${TARGET_ROOT}/debug/harness-eval}"
 MODEL="${COWD_AUTO_STRATEGY_MODEL:-claude-sonnet-4-6}"
 JUDGE_MODEL="${COWD_AUTO_STRATEGY_JUDGE_MODEL:-${MODEL}}"
+PROVIDER_ID="${COWD_AUTO_STRATEGY_PROVIDER_ID:-anthropic}"
+PROVIDER_PROTOCOL="${COWD_AUTO_STRATEGY_PROVIDER_PROTOCOL:-anthropic}"
+PROVIDER_BASE_URL="${COWD_AUTO_STRATEGY_PROVIDER_BASE_URL:-${ANTHROPIC_BASE_URL:-https://api.anthropic.com/v1}}"
+PROVIDER_API_KEY="${COWD_AUTO_STRATEGY_PROVIDER_API_KEY:-${ANTHROPIC_API_KEY:-}}"
+PROVIDER_ACCOUNT_REF="${COWD_EVAL_PROVIDER_ACCOUNT_REF:-${PROVIDER_ID}-default}"
+MODEL_INPUT_USD_PER_MILLION="${COWD_AUTO_STRATEGY_INPUT_USD_PER_MILLION:-}"
+MODEL_OUTPUT_USD_PER_MILLION="${COWD_AUTO_STRATEGY_OUTPUT_USD_PER_MILLION:-}"
+MODEL_CACHE_WRITE_USD_PER_MILLION="${COWD_AUTO_STRATEGY_CACHE_WRITE_USD_PER_MILLION:-0}"
+MODEL_CACHE_READ_USD_PER_MILLION="${COWD_AUTO_STRATEGY_CACHE_READ_USD_PER_MILLION:-0}"
+MODEL_CONTEXT_WINDOW="${COWD_AUTO_STRATEGY_CONTEXT_WINDOW:-128000}"
+MODEL_MAX_OUTPUT_TOKENS="${COWD_AUTO_STRATEGY_MAX_OUTPUT_TOKENS:-64000}"
 API_TOKEN="${COWD_API_TOKEN:-auto-strategy-$$_credential}"
 SCENARIO_ID="auto-strategy-paired-$$-$(date +%s)"
 SCENARIO_ROOT="${TMPDIR:-/tmp}/${SCENARIO_ID}"
@@ -22,6 +33,21 @@ FRONTEND_SOURCE_ARCHIVE_SHA256=""
 PORTS=(18652 18653 18654)
 CONDITIONS=(direct parallel_tools auto)
 PIDS=()
+
+case "${MODEL}" in
+  *haiku*)
+    MODEL_INPUT_USD_PER_MILLION="${MODEL_INPUT_USD_PER_MILLION:-1}"
+    MODEL_OUTPUT_USD_PER_MILLION="${MODEL_OUTPUT_USD_PER_MILLION:-5}"
+    ;;
+  *opus*)
+    MODEL_INPUT_USD_PER_MILLION="${MODEL_INPUT_USD_PER_MILLION:-15}"
+    MODEL_OUTPUT_USD_PER_MILLION="${MODEL_OUTPUT_USD_PER_MILLION:-75}"
+    ;;
+  *sonnet-4*)
+    MODEL_INPUT_USD_PER_MILLION="${MODEL_INPUT_USD_PER_MILLION:-3}"
+    MODEL_OUTPUT_USD_PER_MILLION="${MODEL_OUTPUT_USD_PER_MILLION:-15}"
+    ;;
+esac
 
 cleanup() {
   for pid in "${PIDS[@]:-}"; do
@@ -76,6 +102,31 @@ done
 BIN_SHA256="$(sha256sum "${COWD_BIN}" | awk '{print $1}')"
 
 mkdir -p "${SCENARIO_ROOT}" "${ARTIFACT_DIR}"
+if [[ "${COWD_AUTO_STRATEGY_ALLOW_REAL_MODEL:-0}" == "1" ]] \
+  && { [[ -z "${MODEL_INPUT_USD_PER_MILLION}" ]] || [[ -z "${MODEL_OUTPUT_USD_PER_MILLION}" ]]; }; then
+  echo "real-model evaluation requires explicit input/output USD-per-million pricing for ${MODEL}" >&2
+  exit 1
+fi
+EVAL_HOME="${SCENARIO_ROOT}/evaluator-home"
+mkdir -p "${EVAL_HOME}/.cowd"
+if [[ -n "${MODEL_INPUT_USD_PER_MILLION}" && -n "${MODEL_OUTPUT_USD_PER_MILLION}" ]]; then
+  {
+    echo 'version: "1"'
+    echo "updated_at: \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+    echo 'models:'
+    echo "  \"${MODEL}\":"
+    echo "    provider: \"${PROVIDER_ID}\""
+    echo "    display_name: \"${MODEL}\""
+    echo "    context_window: ${MODEL_CONTEXT_WINDOW}"
+    echo "    max_output_tokens: ${MODEL_MAX_OUTPUT_TOKENS}"
+    echo '    pricing:'
+    echo "      input_per_1m: ${MODEL_INPUT_USD_PER_MILLION}"
+    echo "      output_per_1m: ${MODEL_OUTPUT_USD_PER_MILLION}"
+    echo "      cache_write_per_1m: ${MODEL_CACHE_WRITE_USD_PER_MILLION}"
+    echo "      cache_read_per_1m: ${MODEL_CACHE_READ_USD_PER_MILLION}"
+    echo '    capabilities: ["text", "tool_use", "reasoning"]'
+  } >"${EVAL_HOME}/.cowd/models.yaml"
+fi
 for index in 0 1 2; do
   condition="${CONDITIONS[$index]}"
   port="${PORTS[$index]}"
@@ -96,10 +147,10 @@ for index in 0 1 2; do
     echo "model: \"${MODEL}\""
     echo "fallbacks: []"
     echo "providers:"
-    echo "  anthropic:"
-    echo "    base_url: \"${ANTHROPIC_BASE_URL:-https://api.anthropic.com/v1}\""
-    echo "    api_key: \"${ANTHROPIC_API_KEY:-}\""
-    echo "    protocol: \"anthropic\""
+    echo "  ${PROVIDER_ID}:"
+    echo "    base_url: \"${PROVIDER_BASE_URL}\""
+    echo "    api_key: \"${PROVIDER_API_KEY}\""
+    echo "    protocol: \"${PROVIDER_PROTOCOL}\""
     echo "    models: [\"${MODEL}\", \"${JUDGE_MODEL}\"]"
     echo "permissions:"
     echo "  defaultMode: \"dontAsk\""
@@ -118,6 +169,9 @@ for index in 0 1 2; do
     echo "        token: \"${API_TOKEN}\""
   } >"${config_home}/config.yaml"
   cp "${config_home}/config.yaml" "${home}/.cowd/config.yaml"
+  if [[ -f "${EVAL_HOME}/.cowd/models.yaml" ]]; then
+    cp "${EVAL_HOME}/.cowd/models.yaml" "${home}/.cowd/models.yaml"
+  fi
   (
     cd "${workspace}"
     exec env \
@@ -166,13 +220,14 @@ fi
     COWD_EVAL_FRONTEND_WORKSPACE_REVISION="${FRONTEND_WORKSPACE_REVISION}" \
     COWD_EVAL_BACKEND_SOURCE_ARCHIVE_SHA256="${BACKEND_SOURCE_ARCHIVE_SHA256}" \
     COWD_EVAL_FRONTEND_SOURCE_ARCHIVE_SHA256="${FRONTEND_SOURCE_ARCHIVE_SHA256}" \
-    COWD_EVAL_PROVIDER_ACCOUNT_REF="${COWD_EVAL_PROVIDER_ACCOUNT_REF:-anthropic-default}" \
+    COWD_EVAL_PROVIDER_ACCOUNT_REF="${PROVIDER_ACCOUNT_REF}" \
     COWD_EVAL_DIRECT_WORKSPACE="${SCENARIO_ROOT}/direct/workspace" \
     COWD_EVAL_PARALLEL_WORKSPACE="${SCENARIO_ROOT}/parallel_tools/workspace" \
     COWD_EVAL_AUTO_WORKSPACE="${SCENARIO_ROOT}/auto/workspace" \
     COWD_EVAL_DIRECT_PRISTINE="${SCENARIO_ROOT}/direct/pristine" \
     COWD_EVAL_PARALLEL_PRISTINE="${SCENARIO_ROOT}/parallel_tools/pristine" \
     COWD_EVAL_AUTO_PRISTINE="${SCENARIO_ROOT}/auto/pristine" \
+    HOME="${EVAL_HOME}" \
     "${EVAL_BIN}" auto-strategy-paired \
       --direct-url "http://127.0.0.1:18652" \
       --parallel-url "http://127.0.0.1:18653" \
