@@ -575,6 +575,17 @@ fn resource_scope_for(
     }
 }
 
+/// Resolve the same concrete resource footprint used by graph scheduling for
+/// one delegated tool call. Child Agent executors use this at the final tool
+/// boundary so a graph lock cannot be mistaken for authorization.
+pub(crate) fn resource_scope_for_tool_request(
+    tool_name: &str,
+    input: &Value,
+    safety_category: ToolSafetyCategory,
+) -> ToolResourceScope {
+    resource_scope_for(tool_name, input, safety_category)
+}
+
 fn extract_array_paths(input: &Value, array_key: &str, path_key: &str) -> Vec<String> {
     input
         .get(array_key)

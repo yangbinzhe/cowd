@@ -6,10 +6,12 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+app-mfg-contract = { path = "../app-mfg-contract" }
 auth-broker = { path = "../auth-broker" }
 gateway = { path = "../gateway" }
 sandbox-launcher = { path = "../sandbox-launcher" }
 serde.workspace = true
+serde_json.workspace = true
 tui = { path = "../tui", optional = true }
 
 [[bin]]

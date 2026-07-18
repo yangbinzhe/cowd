@@ -1,6 +1,6 @@
 use harness_contract::core::{ExecutionPattern, ExecutionPolicyGate};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeOrchestrationApprovalRequirement {
@@ -67,6 +67,7 @@ impl RuntimeOrchestrationResult {
         });
         json!({
             "schema_version": 1,
+            "receipt_id": format!("runtime-orchestration-receipt:{}", self.request_id),
             "request_id": self.request_id,
             "status": self.status,
             "decision": {
@@ -83,7 +84,12 @@ impl RuntimeOrchestrationResult {
                 "report": report,
                 "terminal_result_available": terminal_result_ref.is_some(),
                 "terminal_result_kind": terminal_result_kind,
+                "focus_overlap_assessment": execution.get("focus_overlap_assessment"),
             },
+            "team_id": self.evidence.get("team_id"),
+            "working_state_verified": self.evidence.get("working_state_verified"),
+            "focus_overlap_verified": self.evidence.get("focus_overlap_verified"),
+            "focus_overlap_exceeded": self.evidence.get("focus_overlap_exceeded"),
             "evidence": {
                 "action": self.evidence.get("action"),
                 "compiled": self.evidence.get("compiled"),
@@ -94,6 +100,10 @@ impl RuntimeOrchestrationResult {
                 "executed": self.evidence.get("executed"),
                 "reused": self.evidence.get("reused"),
                 "graph_id": self.evidence.get("graph_id"),
+                "team_id": self.evidence.get("team_id"),
+                "working_state_verified": self.evidence.get("working_state_verified"),
+                "focus_overlap_verified": self.evidence.get("focus_overlap_verified"),
+                "focus_overlap_exceeded": self.evidence.get("focus_overlap_exceeded"),
             },
             "terminal_summary": terminal_summary,
             "next_model_guidance": self.next_model_guidance,
@@ -112,7 +122,9 @@ fn truncate_chars(value: &str, limit: usize) -> String {
         return value.to_string();
     }
     let kept = chars.into_iter().take(limit).collect::<String>();
-    format!("{kept}\n...[terminal synthesis truncated; retrieve durable execution evidence for full detail]")
+    format!(
+        "{kept}\n...[terminal synthesis truncated; retrieve durable execution evidence for full detail]"
+    )
 }
 
 #[cfg(test)]
@@ -157,9 +169,11 @@ mod tests {
         assert_eq!(receipt["execution"]["type"], "execution_graph_run");
         assert!(receipt["execution"].get("projection").is_none());
         assert!(receipt["execution"].get("terminal_result_ref").is_none());
-        assert!(receipt["terminal_summary"]
-            .as_str()
-            .is_some_and(|value| value.contains("terminal synthesis truncated")));
+        assert!(
+            receipt["terminal_summary"]
+                .as_str()
+                .is_some_and(|value| value.contains("terminal synthesis truncated"))
+        );
         assert!(serde_json::to_string(&receipt).unwrap().len() < 20_000);
     }
 }

@@ -5,28 +5,28 @@ use std::{
 };
 
 use axum::{
+    Json, Router,
     extract::{Path, Query, State as AxumState},
     response::IntoResponse,
     routing::get,
-    Json, Router,
 };
 use connector::{
-    builtin_service_connector_registry, builtin_source_adapter_manifests, default_capabilities,
     CapabilityManifest, ConnectorHealth, ConnectorRegistrySnapshot, ExternalResourceRef,
     ProviderAccount, ServiceConnector, ServiceToolRequest, ServiceToolResult, SourceConnectorState,
     SourceIncrementalRunRequest, SourceIncrementalRunResult, SourceReadPlan, SourceWatermark,
+    builtin_service_connector_registry, builtin_source_adapter_manifests, default_capabilities,
 };
+use memory::MemoryScope;
 use memory::types::{
     AgentVisibility, MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, Priority,
 };
-use memory::MemoryScope;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::services::GatewayMemoryManager;
 
-use super::{message_connector_routes, AppState};
+use super::{AppState, message_connector_routes};
 
 mod mcp;
 mod resources;
@@ -762,9 +762,11 @@ mod tests {
             normalized.attributes.get("resource_ref"),
             Some(&"bitable://app/table".to_string())
         );
-        assert!(normalized
-            .source_capabilities
-            .contains(&"connector.source.event.receive".to_string()));
+        assert!(
+            normalized
+                .source_capabilities
+                .contains(&"connector.source.event.receive".to_string())
+        );
         assert!(normalized.payload_digest.starts_with("sha256:"));
     }
 }

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{MatrixComputeJobInput, MatrixMetricState};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixMetricAttentionScore {
     pub metric_id: String,
     pub score: f32,
@@ -17,7 +17,7 @@ pub struct MatrixMetricAttentionScore {
     pub latest_delta: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixMetricAttentionPlan {
     pub plan_id: String,
     pub trigger_fact_type: String,
@@ -35,14 +35,14 @@ pub struct MatrixMetricAttentionPlan {
     pub generated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixMetricSnapshotItem {
     pub metric_id: String,
     #[serde(default)]
     pub state: Option<MatrixMetricState>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixMetricSnapshot {
     pub snapshot_id: String,
     pub scope_ref: String,

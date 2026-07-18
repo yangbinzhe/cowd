@@ -8,17 +8,17 @@ use std::{
 };
 
 use axum::{
+    Router,
     body::Body,
     extract::State as AxumState,
-    http::{header, Request, StatusCode},
+    http::{Request, StatusCode, header},
     middleware::{self, Next},
-    response::{IntoResponse, Json},
-    Router,
+    response::{IntoResponse, Json, Response},
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use runtime::approval_gate::SmartApprovalGate;
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 #[cfg(test)]
 use runtime::ApprovalConfig;
+use runtime::approval_gate::SmartApprovalGate;
 #[cfg(test)]
 use runtime::{
     ContextEnvelopeRequest, ContextIdentity, ContextItem, ContextRole, ContextRuntimeKernel,
@@ -38,6 +38,8 @@ use crate::session_kernel::SessionKernel;
 #[cfg(test)]
 use crate::task_kernel::TaskKernel;
 #[cfg(test)]
+use memory::MemoryScope;
+#[cfg(test)]
 use memory::cognitive::CognitiveContextManager;
 use memory::session_store::UnifiedSessionStore;
 use memory::store::session::SessionRecord;
@@ -45,8 +47,6 @@ use memory::store::session::SessionRecord;
 use memory::types::{
     AgentVisibility, MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, Priority,
 };
-#[cfg(test)]
-use memory::MemoryScope;
 
 mod agent_routes;
 mod approval_routes;
@@ -131,6 +131,53 @@ pub(crate) fn surface_actor_id(principal: &AuthenticatedPrincipal, surface: &str
     )
 }
 
+/// Revalidate a long-lived projection stream against the same broker
+/// lifecycle authority used when its request was authenticated. Axum's
+/// middleware can authenticate only the opening HTTP request; without this
+/// check an already-open SSE response would retain revoked or re-profiled
+/// access indefinitely.
+pub(super) fn projection_stream_principal_current(
+    config_home: &std::path::Path,
+    principal: &AuthenticatedPrincipal,
+) -> Result<(), String> {
+    let claims = principal.0.claims();
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(u64::MAX, |duration| duration.as_millis() as u64);
+    if claims
+        .expires_at_ms
+        .is_some_and(|expires_at| expires_at <= now_ms)
+    {
+        return Err("projection stream principal expired".to_string());
+    }
+
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        let client = auth_broker::BrokerClient::new(auth_broker::BrokerClient::default_socket(
+            config_home.join("auth-broker"),
+        ));
+        let lifecycle = client
+            .credential_lifecycle()
+            .map_err(|error| format!("projection authorization authority unavailable: {error}"))?;
+        if lifecycle.status != auth_broker::CredentialLifecycleStatus::Active {
+            return Err("projection stream credential is no longer active".to_string());
+        }
+        if lifecycle.credential_epoch != claims.credential_epoch {
+            return Err("projection stream credential epoch changed".to_string());
+        }
+        if lifecycle.profile_revision != claims.profile_revision {
+            return Err("projection stream authorization profile changed".to_string());
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        let _ = config_home;
+    }
+
+    Ok(())
+}
+
 impl AppState {
     pub(crate) fn startup_config_snapshot(&self) -> Option<&serde_json::Value> {
         self.config.as_ref()
@@ -183,7 +230,8 @@ async fn auth_middleware(
     AxumState(state): AxumState<Arc<AppState>>,
     mut request: Request<Body>,
     next: Next,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Response, Response> {
+    let is_mfg = request.uri().path().starts_with("/api/apps/mfg");
     let claims = if let Some(token) = &state.auth_token {
         let auth_header = request
             .headers()
@@ -192,12 +240,22 @@ async fn auth_middleware(
 
         match auth_header {
             Some(h) if h == format!("Bearer {token}") => {
-                authenticated_human_principal(&state.config_home, token).map_err(|error| {
-                    (
+                let (surface_id, requested_capabilities) =
+                    requested_capabilities_for_headers(request.headers()).map_err(|error| {
+                        auth_error_response(is_mfg, StatusCode::BAD_REQUEST, error)
+                    })?;
+                authenticated_human_principal_for_surface(
+                    &state.config_home,
+                    token,
+                    &surface_id,
+                    requested_capabilities,
+                )
+                .map(|(principal, _)| principal)
+                .map_err(|error| {
+                    auth_error_response(
+                        is_mfg,
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ErrorResponse {
-                            error: format!("authentication_authority_error:{error}"),
-                        }),
+                        format!("authentication_authority_error:{error}"),
                     )
                 })?
             }
@@ -207,11 +265,10 @@ async fn auth_middleware(
                 state.auth_token.as_deref(),
             )
             .map_err(|error| {
-                (
+                auth_error_response(
+                    is_mfg,
                     StatusCode::UNAUTHORIZED,
-                    Json(ErrorResponse {
-                        error: format!("unauthorized:{error}"),
-                    }),
+                    format!("unauthorized:{error}"),
                 )
             })?,
         }
@@ -221,11 +278,10 @@ async fn auth_middleware(
             test_human_principal()
         }
         #[cfg(not(any(test, feature = "test-support")))]
-        return Err((
+        return Err(auth_error_response(
+            is_mfg,
             StatusCode::UNAUTHORIZED,
-            Json(ErrorResponse {
-                error: "authentication_not_configured".to_string(),
-            }),
+            "authentication_not_configured".to_string(),
         ));
     };
     request
@@ -234,17 +290,86 @@ async fn auth_middleware(
     Ok(next.run(request).await)
 }
 
+fn auth_error_response(is_mfg: bool, status: StatusCode, message: String) -> Response {
+    if is_mfg {
+        let mut error = match status {
+            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+                app_mfg_contract::MfgApiErrorV1 {
+                    code: app_mfg_contract::MfgErrorCode::ValidationFailed,
+                    message,
+                    http_status: status.as_u16(),
+                    details: serde_json::Value::Null,
+                    retryable: false,
+                    contract_version: app_mfg_contract::MfgContractVersion::default(),
+                    recovery_actions: Vec::new(),
+                    request_id: None,
+                    receipt_ref: None,
+                }
+            }
+            StatusCode::FORBIDDEN => app_mfg_contract::MfgApiErrorV1::capability_denied(message),
+            status if status.is_server_error() => app_mfg_contract::MfgApiErrorV1 {
+                code: app_mfg_contract::MfgErrorCode::Internal,
+                message,
+                http_status: status.as_u16(),
+                details: serde_json::Value::Null,
+                retryable: true,
+                contract_version: app_mfg_contract::MfgContractVersion::default(),
+                recovery_actions: vec![app_mfg_contract::MfgRecoveryAction {
+                    kind: app_mfg_contract::MfgRecoveryActionKind::RetrySameIntent,
+                    label: "Retry authentication".to_string(),
+                    target: None,
+                    enabled: true,
+                }],
+                request_id: None,
+                receipt_ref: None,
+            },
+            _ => app_mfg_contract::MfgApiErrorV1::authentication_required(message),
+        };
+        error.http_status = status.as_u16();
+        return (status, Json(error)).into_response();
+    }
+    (status, Json(ErrorResponse { error: message })).into_response()
+}
+
 pub(super) fn authenticated_human_principal(
     config_home: &std::path::Path,
     token: &str,
 ) -> Result<runtime::VerifiedPrincipal, String> {
+    authenticated_human_principal_for_surface(
+        config_home,
+        token,
+        "legacy_gateway",
+        human_capabilities(),
+    )
+    .map(|(principal, _)| principal)
+}
+
+pub(super) fn authenticated_human_principal_for_surface(
+    config_home: &std::path::Path,
+    token: &str,
+    surface_id: &str,
+    requested_capabilities: Vec<String>,
+) -> Result<
+    (
+        runtime::VerifiedPrincipal,
+        app_mfg_contract::MfgEntitlementProjectionV2,
+    ),
+    String,
+> {
+    let requested_capabilities =
+        validate_surface_capability_request(surface_id, requested_capabilities)?;
     #[cfg(not(any(test, feature = "test-support")))]
     {
         let client = auth_broker::BrokerClient::new(auth_broker::BrokerClient::default_socket(
             config_home.join("auth-broker"),
         ));
-        let (envelope, public_key) = client
-            .authenticate_human(token, human_capabilities(), Some(5 * 60 * 1_000))
+        let result = client
+            .authenticate_human_for_surface(
+                token,
+                surface_id,
+                requested_capabilities,
+                Some(5 * 60 * 1_000),
+            )
             .map_err(|error| error.to_string())?;
         let lifecycle = client
             .credential_lifecycle()
@@ -252,11 +377,15 @@ pub(super) fn authenticated_human_principal(
         if lifecycle.status != auth_broker::CredentialLifecycleStatus::Active {
             return Err("local human credential is revoked".to_string());
         }
-        runtime::PrincipalVerifier::from_base64(&envelope.key_id, &public_key)
-            .map_err(|error| error.to_string())?
-            .requiring_credential_epoch(lifecycle.credential_epoch)
-            .verify(&envelope)
-            .map_err(|error| error.to_string())
+        let principal = runtime::PrincipalVerifier::from_base64(
+            &result.envelope.key_id,
+            &result.public_key_base64,
+        )
+        .map_err(|error| error.to_string())?
+        .requiring_credential_epoch(lifecycle.credential_epoch)
+        .verify(&result.envelope)
+        .map_err(|error| error.to_string())?;
+        Ok((principal, result.entitlement))
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -264,14 +393,26 @@ pub(super) fn authenticated_human_principal(
         let (envelope, public_key) = auth_broker::test_support::issue_human_principal(
             config_home.join("auth-broker"),
             token,
-            human_capabilities(),
+            requested_capabilities.clone(),
             Some(5 * 60 * 1_000),
         )
         .map_err(|error| error.to_string())?;
-        runtime::PrincipalVerifier::from_base64(&envelope.key_id, &public_key)
+        let principal = runtime::PrincipalVerifier::from_base64(&envelope.key_id, &public_key)
             .map_err(|error| error.to_string())?
             .verify(&envelope)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        Ok((
+            principal,
+            app_mfg_contract::MfgEntitlementProjectionV2 {
+                core_profile_id: app_mfg_contract::MfgCoreProfileId::CoreManager,
+                mfg_profile_id: app_mfg_contract::MfgProfileId::MfgManager,
+                profile_revision: 1,
+                credential_epoch: 1,
+                ceiling: human_capabilities(),
+                granted: requested_capabilities,
+                denied: Vec::new(),
+            },
+        ))
     }
 }
 
@@ -282,14 +423,23 @@ pub(super) fn authenticated_human_principal(
 pub(super) fn issue_web_session(
     config_home: &std::path::Path,
     credential: &str,
-) -> Result<String, String> {
+    surface_id: &str,
+    requested_capabilities: Vec<String>,
+) -> Result<(String, app_mfg_contract::MfgEntitlementProjectionV2), String> {
+    let requested_capabilities =
+        validate_surface_capability_request(surface_id, requested_capabilities)?;
     #[cfg(not(any(test, feature = "test-support")))]
     {
         let client = auth_broker::BrokerClient::new(auth_broker::BrokerClient::default_socket(
             config_home.join("auth-broker"),
         ));
-        let (envelope, public_key) = client
-            .authenticate_human(credential, human_capabilities(), Some(5 * 60 * 1_000))
+        let result = client
+            .authenticate_human_for_surface(
+                credential,
+                surface_id,
+                requested_capabilities,
+                Some(5 * 60 * 1_000),
+            )
             .map_err(|error| error.to_string())?;
         let lifecycle = client
             .credential_lifecycle()
@@ -297,8 +447,12 @@ pub(super) fn issue_web_session(
         if lifecycle.status != auth_broker::CredentialLifecycleStatus::Active {
             return Err("local human credential is revoked".to_string());
         }
-        verify_human_envelope(&envelope, &public_key, lifecycle.credential_epoch)?;
-        encode_web_session(&envelope)
+        verify_human_envelope(
+            &result.envelope,
+            &result.public_key_base64,
+            lifecycle.credential_epoch,
+        )?;
+        encode_web_session(&result.envelope).map(|session| (session, result.entitlement))
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -306,12 +460,25 @@ pub(super) fn issue_web_session(
         let (envelope, public_key) = auth_broker::test_support::issue_human_principal(
             config_home.join("auth-broker"),
             credential,
-            human_capabilities(),
+            requested_capabilities.clone(),
             Some(5 * 60 * 1_000),
         )
         .map_err(|error| error.to_string())?;
         verify_human_envelope(&envelope, &public_key, 0)?;
-        encode_web_session(&envelope)
+        encode_web_session(&envelope).map(|session| {
+            (
+                session,
+                app_mfg_contract::MfgEntitlementProjectionV2 {
+                    core_profile_id: app_mfg_contract::MfgCoreProfileId::CoreManager,
+                    mfg_profile_id: app_mfg_contract::MfgProfileId::MfgManager,
+                    profile_revision: 1,
+                    credential_epoch: 1,
+                    ceiling: human_capabilities(),
+                    granted: requested_capabilities,
+                    denied: Vec::new(),
+                },
+            )
+        })
     }
 }
 
@@ -446,14 +613,96 @@ pub(super) fn issue_human_decision_lease(
 }
 
 fn human_capabilities() -> Vec<String> {
-    vec![
+    let mut capabilities = vec![
         "approval.respond".to_string(),
         "definition.manage".to_string(),
+        "definition.default.set".to_string(),
+        "definition.rollback".to_string(),
         "evolution.release.manage".to_string(),
         "runtime.maintenance.manage".to_string(),
         "runtime.outbox.retry".to_string(),
-        "mfg.read".to_string(),
-    ]
+    ];
+    capabilities.extend(
+        app_mfg_contract::MfgCapabilityId::ALL
+            .iter()
+            .copied()
+            .map(|capability| capability.as_str().to_string()),
+    );
+    capabilities.sort();
+    capabilities.dedup();
+    capabilities
+}
+
+fn surface_capability_inventory(surface_id: &str) -> Vec<String> {
+    let mut inventory = human_capabilities()
+        .into_iter()
+        .filter(|capability| !capability.starts_with("mfg."))
+        .collect::<Vec<_>>();
+    inventory.extend(app_mfg_contract::active_mfg_capabilities_for_surface(
+        surface_id,
+    ));
+    inventory.sort();
+    inventory.dedup();
+    inventory
+}
+
+fn requested_capabilities_for_headers(
+    headers: &axum::http::HeaderMap,
+) -> Result<(String, Vec<String>), String> {
+    let surface_id = headers
+        .get("x-cowd-surface-id")
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| "x-cowd-surface-id must be valid UTF-8".to_string())
+        })
+        .transpose()?
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("legacy_gateway")
+        .trim()
+        .to_string();
+    let allowed = surface_capability_inventory(&surface_id);
+    let requested = headers
+        .get("x-cowd-requested-capabilities")
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| "x-cowd-requested-capabilities must be valid UTF-8".to_string())
+        })
+        .transpose()?
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .filter(|requested| !requested.is_empty())
+        .unwrap_or_else(|| allowed.clone());
+    let mut requested = validate_surface_capability_request(&surface_id, requested)?;
+    requested.sort();
+    requested.dedup();
+    Ok((surface_id, requested))
+}
+
+pub(super) fn validate_surface_capability_request(
+    surface_id: &str,
+    requested: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let allowed = surface_capability_inventory(surface_id);
+    let unknown = requested
+        .iter()
+        .filter(|capability| !allowed.contains(capability))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "surface {surface_id} requested capabilities outside its inventory: {}",
+            unknown.join(",")
+        ));
+    }
+    Ok(requested)
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -461,8 +710,14 @@ fn test_human_principal() -> runtime::VerifiedPrincipal {
     static PRINCIPAL: std::sync::OnceLock<runtime::VerifiedPrincipal> = std::sync::OnceLock::new();
     PRINCIPAL
         .get_or_init(|| {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos());
             let (envelope, public_key) = auth_broker::test_support::issue_human_principal(
-                std::env::temp_dir().join("cowd-gateway-test-auth"),
+                std::env::temp_dir().join(format!(
+                    "cowd-gateway-test-auth-{}-{nonce}",
+                    std::process::id()
+                )),
                 "test-only-credential",
                 human_capabilities(),
                 None,
@@ -489,12 +744,12 @@ pub mod test_support {
     use approval::FileApprovalRepository;
     use axum::Router;
     use runtime::{
-        approval_gate::SmartApprovalGate, permission_enforcer::DestructivePatternDetector,
-        ApprovalConfig, ProfileManager,
+        ApprovalConfig, ProfileManager, approval_gate::SmartApprovalGate,
+        permission_enforcer::DestructivePatternDetector,
     };
     use tools::ToolCatalog;
 
-    use super::{api_router, AppState};
+    use super::{AppState, api_router};
     use crate::{
         event_bus::SessionEventBus, gateway::ActiveSessions, runtime_service::RuntimeService,
         services::GatewayServices, session_kernel::SessionKernel, task_kernel::TaskKernel,
@@ -683,6 +938,7 @@ pub mod test_support {
 // ── Router ─────────────────────────────────────────────────────
 
 pub fn api_router(state: Arc<AppState>) -> Router {
+    mfg_routes::start_review_reconciler(&state);
     let public_routes = public_routes::router();
 
     let protected_routes = Router::new()
@@ -700,7 +956,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .merge(harness_eval_routes::router())
         .merge(managed_agent_routes::router())
         .merge(matrix_routes::router())
-        .merge(mfg_routes::router())
+        .merge(mfg_routes::router(state.clone()))
         .merge(mission_routes::router())
         .merge(memory_routes::router())
         .merge(message_routes::router())
@@ -725,9 +981,26 @@ pub fn api_router(state: Arc<AppState>) -> Router {
 
 // ── Response types ─────────────────────────────────────────────
 
-#[derive(Serialize)]
+#[derive(Debug)]
 struct ErrorResponse {
     error: String,
+}
+
+impl Serialize for ErrorResponse {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        const MFG_PREFIX: &str = "__mfg_api_error_v1__:";
+        if let Some(encoded) = self.error.strip_prefix(MFG_PREFIX) {
+            let value = serde_json::from_str::<serde_json::Value>(encoded)
+                .map_err(serde::ser::Error::custom)?;
+            return value.serialize(serializer);
+        }
+        let mut state = serializer.serialize_struct("ErrorResponse", 1)?;
+        serde::ser::SerializeStruct::serialize_field(&mut state, "error", &self.error)?;
+        serde::ser::SerializeStruct::end(state)
+    }
 }
 
 fn default_config_home() -> PathBuf {
@@ -866,14 +1139,16 @@ fn api_error(status: StatusCode, error: impl Into<String>) -> (StatusCode, Json<
 pub(crate) mod tests {
     use super::*;
     use axum::{
-        body::to_bytes,
         body::Body,
+        body::to_bytes,
         http::{Request, StatusCode},
     };
     use memory::config::{BudgetConfig, StoreConfig};
+    use model_protocol::provider_config::{ProviderConfig, ProvidersConfig};
     use runtime::permission_enforcer::DestructivePatternDetector;
     use runtime::{ContextProfile, ResumeContextSource};
     use sha2::Digest;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Instant;
     use tower::ServiceExt;
@@ -882,6 +1157,19 @@ pub(crate) mod tests {
 
     struct CrossPlaneApprovalTestBackend {
         calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[test]
+    fn surface_capability_requests_reject_unknown_values_instead_of_dropping_them() {
+        let webui_inventory = surface_capability_inventory("webui");
+        assert!(webui_inventory.contains(&"mfg.read".to_string()));
+        assert!(validate_surface_capability_request("webui", vec!["mfg.read".to_string()]).is_ok());
+        let error = validate_surface_capability_request(
+            "webui",
+            vec!["mfg.read".to_string(), "mfg.not_real".to_string()],
+        )
+        .expect_err("unknown capability must fail closed");
+        assert!(error.contains("mfg.not_real"));
     }
 
     #[async_trait::async_trait]
@@ -1043,6 +1331,26 @@ pub(crate) mod tests {
         Arc::new(SessionKernel::new(sessions, store, event_bus))
     }
 
+    fn test_provider_registry() -> Arc<runtime::ProviderRegistry> {
+        Arc::new(
+            runtime::ProviderRegistry::new(ProvidersConfig {
+                providers: HashMap::from([(
+                    "test".to_string(),
+                    ProviderConfig {
+                        name: "test".to_string(),
+                        // Tests never submit this provider.  A closed loopback
+                        // endpoint keeps accidental future calls deterministic.
+                        base_url: "http://127.0.0.1:9/v1".to_string(),
+                        api_key: "test".to_string(),
+                        models: vec![crate::DEFAULT_MODEL.to_string(), "test-model".to_string()],
+                        protocol: Some("completions".to_string()),
+                    },
+                )]),
+            })
+            .expect("valid inert test provider registry"),
+        )
+    }
+
     fn test_task_kernel() -> Arc<TaskKernel> {
         let path =
             std::env::temp_dir().join(format!("cowd-api-task-{}.json", uuid::Uuid::new_v4()));
@@ -1089,7 +1397,7 @@ pub(crate) mod tests {
                 session_kernel,
                 lifecycle_kernel,
                 Instant::now(),
-                Arc::new(runtime::ProviderRegistry::empty()),
+                test_provider_registry(),
                 Arc::new(runtime::UpgradeCoordinator::new()),
                 runtime_services,
             )
@@ -1900,11 +2208,13 @@ pub(crate) mod tests {
         let runs_body = to_bytes(runs.into_body(), usize::MAX).await.unwrap();
         let runs_json: serde_json::Value = serde_json::from_slice(&runs_body).unwrap();
         assert_eq!(runs_json["kind"], "skills.runs");
-        assert!(runs_json["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|run| run["run_id"] == run_id));
+        assert!(
+            runs_json["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|run| run["run_id"] == run_id)
+        );
 
         let _ = std::fs::remove_dir_all(workspace);
         let _ = std::fs::remove_dir_all(config_home);
@@ -1995,9 +2305,11 @@ pub(crate) mod tests {
         assert_eq!(copied.len(), 2);
         assert_eq!(copied[0].session_id, branch_id);
         assert_ne!(copied[0].stable_message_id, format!("branch:{source_id}:0"));
-        assert!(copied[0]
-            .stable_message_id
-            .starts_with(&format!("branch:{branch_id}:")));
+        assert!(
+            copied[0]
+                .stable_message_id
+                .starts_with(&format!("branch:{branch_id}:"))
+        );
         assert_eq!(copied[0].sequence, 0);
         assert!(copied[0].content_json.contains("hello"));
         let branch_record = store
@@ -2006,11 +2318,13 @@ pub(crate) mod tests {
             .unwrap()
             .expect("branch record should exist");
         assert_eq!(branch_record.message_count, 2);
-        assert!(branch_record
-            .metadata_json
-            .as_deref()
-            .unwrap_or_default()
-            .contains("branch-source"));
+        assert!(
+            branch_record
+                .metadata_json
+                .as_deref()
+                .unwrap_or_default()
+                .contains("branch-source")
+        );
         let source_events = store.get_events(source_id, 0).await.unwrap();
         assert!(source_events.iter().any(|event| {
             event.event_type == "SessionBranched"
@@ -2127,9 +2441,11 @@ pub(crate) mod tests {
         assert_eq!(scenarios.status(), StatusCode::OK);
         let scenarios_body = to_bytes(scenarios.into_body(), usize::MAX).await.unwrap();
         let scenarios_json: serde_json::Value = serde_json::from_slice(&scenarios_body).unwrap();
-        assert!(scenarios_json["next_gen_harness_closure"]
-            .as_array()
-            .is_some_and(|items| items.len() >= 7));
+        assert!(
+            scenarios_json["next_gen_harness_closure"]
+                .as_array()
+                .is_some_and(|items| items.len() >= 7)
+        );
 
         let _ = std::fs::remove_dir_all(workspace);
         let _ = std::fs::remove_dir_all(report_dir);
@@ -2228,10 +2544,12 @@ pub(crate) mod tests {
         let draft_body = to_bytes(draft.into_body(), usize::MAX).await.unwrap();
         let draft_json: serde_json::Value = serde_json::from_slice(&draft_body).unwrap();
         assert_eq!(draft_json["kind"], "skills.evolution_draft");
-        assert!(draft_json["draft"]["markdown"]
-            .as_str()
-            .unwrap()
-            .contains("Acceptance Gates"));
+        assert!(
+            draft_json["draft"]["markdown"]
+                .as_str()
+                .unwrap()
+                .contains("Acceptance Gates")
+        );
 
         let candidates = app
             .clone()
@@ -2300,14 +2618,18 @@ pub(crate) mod tests {
 
         assert_eq!(json["gateway"], "gateway-runtime-host");
         assert_eq!(json["api_router"], "gateway-api-router");
-        assert!(json["process"]["pid_file"]
-            .as_str()
-            .unwrap()
-            .contains("cowd"));
-        assert!(json["process"]["addr_file"]
-            .as_str()
-            .unwrap()
-            .contains("addr"));
+        assert!(
+            json["process"]["pid_file"]
+                .as_str()
+                .unwrap()
+                .contains("cowd")
+        );
+        assert!(
+            json["process"]["addr_file"]
+                .as_str()
+                .unwrap()
+                .contains("addr")
+        );
         assert_eq!(json["static_webui"]["config_key"], "gateway.webui_dir");
         assert_eq!(json["static_webui"]["required"], false);
         assert_eq!(json["static_webui"]["status"], "missing_config");
@@ -2319,27 +2641,35 @@ pub(crate) mod tests {
                 .unwrap_or_default()
                 >= 11
         );
-        assert!(json["storage"]["registry"]["root"]
-            .as_str()
-            .unwrap()
-            .contains("storage"));
-        assert!(json["storage"]["migrations"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["id"] == "storage.matrix.layout"));
-        assert!(json["storage"]["migrations"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["id"] == "growth.v1.init"
-                && item["domain"] == "growth"
-                && item["status"].as_str().is_some()));
-        assert!(json["storage"]["locks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["domain"] == "tasks"));
+        assert!(
+            json["storage"]["registry"]["root"]
+                .as_str()
+                .unwrap()
+                .contains("storage")
+        );
+        assert!(
+            json["storage"]["migrations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["id"] == "storage.matrix.layout")
+        );
+        assert!(
+            json["storage"]["migrations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["id"] == "growth.v1.init"
+                    && item["domain"] == "growth"
+                    && item["status"].as_str().is_some())
+        );
+        assert!(
+            json["storage"]["locks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["domain"] == "tasks")
+        );
     }
 
     #[tokio::test]
@@ -2363,25 +2693,32 @@ pub(crate) mod tests {
         assert!(handles.iter().any(|item| item["domain"] == "session"));
         assert!(handles.iter().any(|item| item["domain"] == "memory"));
         assert!(handles.iter().any(|item| item["domain"] == "matrix"));
-        assert!(handles
-            .iter()
-            .any(|item| item["domain"] == "resource_directory"));
+        assert!(
+            handles
+                .iter()
+                .any(|item| item["domain"] == "resource_directory")
+        );
         assert!(handles.iter().any(|item| item["domain"] == "tasks"));
         assert!(
             json["storage"]["locks"].as_array().unwrap().len() >= 7,
             "storage lock list should include all core sqlite domains"
         );
-        assert!(json["storage"]["migrations"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["id"] == "storage.tasks.layout"));
-        assert!(json["storage"]["migrations"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["id"] == "growth.v1.init"
-                && item["description"] == "initialize growth durable event and promotion schema"));
+        assert!(
+            json["storage"]["migrations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["id"] == "storage.tasks.layout")
+        );
+        assert!(
+            json["storage"]["migrations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["id"] == "growth.v1.init"
+                    && item["description"]
+                        == "initialize growth durable event and promotion schema")
+        );
     }
 
     #[tokio::test]
@@ -2421,14 +2758,16 @@ pub(crate) mod tests {
 
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["storage"]["migrations"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["id"] == "growth.v1.init"
-                && item["domain"] == "growth"
-                && item["status"] == "applied"
-                && item["version"] == 1));
+        assert!(
+            json["storage"]["migrations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["id"] == "growth.v1.init"
+                    && item["domain"] == "growth"
+                    && item["status"] == "applied"
+                    && item["version"] == 1)
+        );
         let _ = std::fs::remove_dir_all(tmp);
     }
 
@@ -2487,11 +2826,13 @@ pub(crate) mod tests {
         assert!(required.iter().any(|item| item == "storage-registry"));
         let old_required_webui = ["static", "webui", "index"].join("-");
         assert!(!required.iter().any(|item| item == &old_required_webui));
-        assert!(json["optional"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item == "static-webui"));
+        assert!(
+            json["optional"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item == "static-webui")
+        );
     }
 
     #[tokio::test]
@@ -2631,11 +2972,13 @@ pub(crate) mod tests {
                 .unwrap();
         assert_eq!(created["ok"], true);
         assert_eq!(created["mission"]["kind"], "mission.runtime");
-        assert!(created["mission"]["sessions"]
-            .as_array()
-            .expect("mission sessions")
-            .iter()
-            .any(|session| session["session_id"].as_str() == Some(session_id.as_str())));
+        assert!(
+            created["mission"]["sessions"]
+                .as_array()
+                .expect("mission sessions")
+                .iter()
+                .any(|session| session["session_id"].as_str() == Some(session_id.as_str()))
+        );
 
         let detail = app
             .clone()
@@ -2680,14 +3023,16 @@ pub(crate) mod tests {
             backgrounded["receipt"]["result"]["receipt"]["status"],
             "accepted"
         );
-        assert!(backgrounded["projection"]["mission"]["sessions"]
-            .as_array()
-            .expect("mission sessions")
-            .iter()
-            .any(
-                |session| session["session_id"].as_str() == Some(session_id.as_str())
-                    && session["status"].as_str() == Some("background")
-            ));
+        assert!(
+            backgrounded["projection"]["mission"]["sessions"]
+                .as_array()
+                .expect("mission sessions")
+                .iter()
+                .any(
+                    |session| session["session_id"].as_str() == Some(session_id.as_str())
+                        && session["status"].as_str() == Some("background")
+                )
+        );
 
         let projection = app
             .clone()
@@ -2704,11 +3049,13 @@ pub(crate) mod tests {
             serde_json::from_slice(&to_bytes(projection.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(projection["envelope"]["service"], "mission");
-        assert!(projection["mission"]["sessions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|session| session["session_id"].as_str() == Some(session_id.as_str())));
+        assert!(
+            projection["mission"]["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|session| session["session_id"].as_str() == Some(session_id.as_str()))
+        );
 
         let interpreted = app
             .oneshot(
@@ -2909,12 +3256,14 @@ pub(crate) mod tests {
         assert_eq!(dispatch["ok"], true);
         let dispatch_report = dispatch["result"].get("Ok").unwrap_or(&dispatch["result"]);
         assert!(dispatch_report["claimed"].as_u64().is_some());
-        assert!(dispatch_report["receipts"]
-            .as_array()
-            .expect("execution graph submission receipts")
-            .iter()
-            .all(|receipt| receipt["graph_id"].as_str().is_some()
-                && receipt["commit_cursor"].as_u64().is_some()));
+        assert!(
+            dispatch_report["receipts"]
+                .as_array()
+                .expect("execution graph submission receipts")
+                .iter()
+                .all(|receipt| receipt["graph_id"].as_str().is_some()
+                    && receipt["commit_cursor"].as_u64().is_some())
+        );
 
         let control = app
             .oneshot(
@@ -2992,9 +3341,9 @@ pub(crate) mod tests {
                             },
                             "objective": "research architecture and review implementation",
                             "acceptance": ["summary", "evidence"],
-                            "permission_lease": "read_only",
+                            "permission_lease": "workspace-write",
                             "model_lease": "default",
-                            "resource_scopes": ["session:mission-route"]
+                            "resource_scopes": ["write:crates/runtime"]
                         })
                         .to_string(),
                     ))
@@ -3002,9 +3351,15 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(team.status(), StatusCode::OK);
-        let team_json: serde_json::Value =
-            serde_json::from_slice(&to_bytes(team.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let team_status = team.status();
+        let team_body = to_bytes(team.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            team_status,
+            StatusCode::OK,
+            "team runtime response: {}",
+            String::from_utf8_lossy(&team_body)
+        );
+        let team_json: serde_json::Value = serde_json::from_slice(&team_body).unwrap();
         assert_eq!(team_json["ok"], true);
         assert!(team_json["team"]["graph_id"].as_str().is_some());
         assert!(matches!(
@@ -3078,11 +3433,13 @@ pub(crate) mod tests {
             approval_pending_json["kind"],
             "gateway.unified_approval_pending"
         );
-        assert!(approval_pending_json["pending"]
-            .as_array()
-            .expect("pending")
-            .iter()
-            .any(|approval| approval["approval_id"].as_str() == Some(approval_id.as_str())));
+        assert!(
+            approval_pending_json["pending"]
+                .as_array()
+                .expect("pending")
+                .iter()
+                .any(|approval| approval["approval_id"].as_str() == Some(approval_id.as_str()))
+        );
 
         let approval_decision = app
             .clone()
@@ -3218,12 +3575,14 @@ pub(crate) mod tests {
             serde_json::from_slice(&to_bytes(events.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(events_json["mission"]["kind"], "mission.runtime");
-        assert!(events_json["events"]
-            .as_array()
-            .or_else(|| events_json["mission"]["events"].as_array())
-            .expect("events")
-            .iter()
-            .any(|event| event["event_type"].as_str() == Some("mission.session.started")));
+        assert!(
+            events_json["events"]
+                .as_array()
+                .or_else(|| events_json["mission"]["events"].as_array())
+                .expect("events")
+                .iter()
+                .any(|event| event["event_type"].as_str() == Some("mission.session.started"))
+        );
     }
 
     #[tokio::test]
@@ -3244,12 +3603,16 @@ pub(crate) mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let capabilities = json["capabilities"].as_array().unwrap();
 
-        assert!(capabilities
-            .iter()
-            .any(|capability| capability["id"] == "cowd.structured_data.core"));
-        assert!(!capabilities
-            .iter()
-            .any(|capability| capability["id"] == "mfg.manufacturing.application"));
+        assert!(
+            capabilities
+                .iter()
+                .any(|capability| capability["id"] == "cowd.structured_data.core")
+        );
+        assert!(
+            !capabilities
+                .iter()
+                .any(|capability| capability["id"] == "mfg.manufacturing.application")
+        );
     }
 
     #[tokio::test]
@@ -3285,11 +3648,13 @@ pub(crate) mod tests {
         assert_eq!(webui_json["surface"], "webui");
         assert_eq!(cli_json["surface"], "cli");
         assert_eq!(webui_json["capability_count"], cli_json["capability_count"]);
-        assert!(webui_json["capabilities"][0]["management_fields"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|field| field == "bulk_actions"));
+        assert!(
+            webui_json["capabilities"][0]["management_fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "bulk_actions")
+        );
         assert_eq!(
             cli_json["capabilities"][0]["management_fields"],
             serde_json::json!(["json_output", "core_controls"])
@@ -3315,11 +3680,13 @@ pub(crate) mod tests {
 
         assert_eq!(json["app_id"], "mfg.manufacturing");
         assert_eq!(json["layer"], "application");
-        assert!(json["cowd_capabilities"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|capability| capability == "cowd.structured_data.core"));
+        assert!(
+            json["cowd_capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|capability| capability == "cowd.structured_data.core")
+        );
         assert_eq!(json["domains"][0]["domain_id"], "server_manufacturing");
     }
 
@@ -3342,25 +3709,27 @@ pub(crate) mod tests {
 
         assert_eq!(json["app_id"], "mfg.manufacturing");
         assert_eq!(json["layer"], "application");
-        assert!(json["cowd_capabilities"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|capability| capability == "cowd.structured_data.core"));
-        assert!(!json["cowd_capabilities"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|capability| capability == "cowd.matrix.runtime"));
-        assert!(json["surfaces"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|surface| surface["entrypoints"]
+        assert!(
+            json["cowd_capabilities"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|entrypoint| entrypoint == "/api/apps/mfg/app")));
+                .any(|capability| capability == "cowd.structured_data.core")
+        );
+        assert!(
+            !json["cowd_capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|capability| capability == "cowd.matrix.runtime")
+        );
+        assert!(json["surfaces"].as_array().unwrap().iter().all(|surface| {
+            surface["entrypoints"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entrypoint| entrypoint == "/api/apps/mfg/app")
+        }));
     }
 
     #[tokio::test]
@@ -3465,6 +3834,7 @@ pub(crate) mod tests {
                     .method("POST")
                     .uri("/api/apps/mfg/cockpit/profiles/upsert")
                     .header("content-type", "application/json")
+                    .header("idempotency-key", "cockpit-contract-create")
                     .body(Body::from(
                         serde_json::json!({
                             "profile": {
@@ -3524,6 +3894,7 @@ pub(crate) mod tests {
                     .method("POST")
                     .uri("/api/apps/mfg/cockpit/profiles/upsert")
                     .header("content-type", "application/json")
+                    .header("idempotency-key", "cockpit-contract-conflict")
                     .body(Body::from(
                         serde_json::json!({
                             "profile": {
@@ -3546,13 +3917,172 @@ pub(crate) mod tests {
         let conflict: serde_json::Value =
             serde_json::from_slice(&to_bytes(conflict.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        assert_eq!(conflict["code"], "mfg_revision_conflict");
+        assert_eq!(conflict["code"], "revision_conflict");
         assert_eq!(conflict["details"]["actual_revision"], 1);
-        assert!(conflict["recovery"]["actions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|action| action == "save_as"));
+        assert!(
+            conflict["recovery_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| action["kind"] == "save_as")
+        );
+
+        let delete_key = "webui-mfg:mfg.cockpit.profile.delete:contract-profile";
+        let deleted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/apps/mfg/cockpit/profiles/contract-profile?expected_revision=1&idempotency_key=webui-mfg%3Amfg.cockpit.profile.delete%3Acontract-profile")
+                    .header("idempotency-key", delete_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::OK);
+        let deleted: serde_json::Value =
+            serde_json::from_slice(&to_bytes(deleted.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            deleted["receipt"]["receipt_id"],
+            deleted["_mfg_receipt"]["receipt_id"]
+        );
+        assert_eq!(deleted["receipt"]["idempotency_key"], delete_key);
+        assert_eq!(deleted["receipt"]["expected_revision"], 1);
+
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[tokio::test]
+    async fn mfg_report_delivery_previews_do_not_mutate_report_or_cross_plane_ledger() {
+        let workspace = test_temp_dir("mfg-report-preview");
+        let config_home = test_temp_dir("mfg-report-preview-config");
+        let app = api_router(test_state_with_workspace(
+            workspace.clone(),
+            config_home.clone(),
+        ));
+
+        let profile = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apps/mfg/cockpit/profiles/upsert")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "report-preview-profile")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "profile": {
+                                "profile_id": "report-preview-profile",
+                                "owner_ref": "ignored-at-boundary",
+                                "display_name": "Report Preview Profile",
+                                "focus_refs": [],
+                                "focus_metric_ids": [],
+                                "thresholds": null
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(profile.status(), StatusCode::OK);
+
+        let generated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apps/mfg/cockpit/profiles/report-preview-profile/reports/generate")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "report-preview-generate")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "report": {
+                                "cadence": "daily",
+                                "delivery_ref": "channel://feishu/user/preview-target"
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(generated.status(), StatusCode::OK);
+        let generated_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(generated.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let baseline = generated_json["report"].clone();
+        let report_id = baseline["report_id"].as_str().unwrap();
+        assert_eq!(baseline["revision"], 1);
+        assert!(baseline["delivery_receipts"].as_array().unwrap().is_empty());
+
+        for uri in [
+            format!("/api/apps/mfg/cockpit/reports/{report_id}/deliver"),
+            format!("/api/apps/mfg/cockpit/reports/{report_id}/delivery/retry"),
+        ] {
+            let preview = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "mode": "dry_run",
+                                "expected_revision": 999,
+                                "target_ref": "channel://feishu/user/preview-target"
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(preview.status(), StatusCode::OK);
+            let preview_json: serde_json::Value =
+                serde_json::from_slice(&to_bytes(preview.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            let delivery = preview_json.get("delivery").unwrap_or(&preview_json);
+            assert_eq!(delivery["report"], baseline);
+            assert_eq!(delivery["idempotent_replay"], false);
+            assert!(delivery["cross_plane_execution_receipt"]["audit_record_id"].is_null());
+        }
+
+        let fetched = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/apps/mfg/cockpit/reports/{report_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fetched.status(), StatusCode::OK);
+        let fetched_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(fetched.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(fetched_json["report"], baseline);
+
+        let executions = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cross-plane/action/executions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let executions_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(executions.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(executions_json["total"], 0);
 
         let _ = std::fs::remove_dir_all(workspace);
         let _ = std::fs::remove_dir_all(config_home);
@@ -3571,6 +4101,7 @@ pub(crate) mod tests {
                     .method("POST")
                     .uri("/api/apps/mfg/cockpit/profiles/upsert")
                     .header("content-type", "application/json")
+                    .header("idempotency-key", "decision-trace-profile")
                     .body(Body::from(
                         serde_json::json!({
                             "profile": {
@@ -3598,6 +4129,8 @@ pub(crate) mod tests {
             String::from_utf8_lossy(&profile_body)
         );
 
+        let report_key = "decision-trace-report";
+        let report_id = mfg_routes::stable_mfg_resource_id("cockpit-report", report_key);
         let report = app
             .clone()
             .oneshot(
@@ -3605,10 +4138,11 @@ pub(crate) mod tests {
                     .method("POST")
                     .uri("/api/apps/mfg/cockpit/profiles/trace-profile/reports/generate")
                     .header("content-type", "application/json")
+                    .header("idempotency-key", report_key)
                     .body(Body::from(
                         serde_json::json!({
                             "report": {
-                                "report_id": "trace-report",
+                                "report_id": "client-supplied-id-is-not-authoritative",
                                 "cadence": "daily",
                                 "delivery_ref": "channel://test/operator",
                                 "note": "decision trace test"
@@ -3636,16 +4170,20 @@ pub(crate) mod tests {
         let report_list: serde_json::Value =
             serde_json::from_slice(&to_bytes(report_list.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        assert!(report_list["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|report| report["report_id"] == "trace-report"));
+        assert!(
+            report_list["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|report| report["report_id"] == report_id)
+        );
 
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/apps/mfg/decision-trace?report_id=trace-report")
+                    .uri(format!(
+                        "/api/apps/mfg/decision-trace?report_id={report_id}"
+                    ))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3669,10 +4207,10 @@ pub(crate) mod tests {
         );
         assert!(json["rows"].as_array().unwrap().iter().any(|row| {
             row["stage"] == "report"
-                && row["ref"] == "trace-report"
+                && row["ref"] == report_id
                 && row["endpoint"] == "/api/apps/mfg/cockpit/reports/:id/delivery-state"
         }));
-        assert_eq!(json["objects"]["report"]["report_id"], "trace-report");
+        assert_eq!(json["objects"]["report"]["report_id"], report_id);
     }
 
     #[tokio::test]
@@ -3882,7 +4420,12 @@ pub(crate) mod tests {
             "2026-06-14T00:00:00Z"
         );
         assert_eq!(watermarks_json["list_status"], "ready");
-        assert_eq!(watermarks_json["items"][0]["source_ref"], "pack-1");
+        assert_eq!(watermarks_json["count"], 0);
+        assert!(
+            watermarks_json["items"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
         let _ = std::fs::remove_dir_all(workspace);
     }
 
@@ -3905,11 +4448,13 @@ pub(crate) mod tests {
         assert_eq!(adapters.status(), StatusCode::OK);
         let adapters_body = to_bytes(adapters.into_body(), usize::MAX).await.unwrap();
         let adapters_json: serde_json::Value = serde_json::from_slice(&adapters_body).unwrap();
-        assert!(adapters_json["adapters"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|adapter| adapter["adapter_id"] == "feishu_bitable"));
+        assert!(
+            adapters_json["adapters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|adapter| adapter["adapter_id"] == "feishu_bitable")
+        );
 
         let source_upsert = app
             .clone()
@@ -4109,11 +4654,15 @@ pub(crate) mod tests {
 
         assert_eq!(json["gate_id"], "cowd.release_gate.v1");
         assert_eq!(json["status"], "fail");
-        assert!(json["checks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|check| check["check_id"] == "surface.cli.minimal" && check["status"] == "pass"));
+        assert!(
+            json["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(
+                    |check| check["check_id"] == "surface.cli.minimal" && check["status"] == "pass"
+                )
+        );
         assert!(json["checks"].as_array().unwrap().iter().any(|check| {
             check["check_id"] == "execution_outcome.timeline.available" && check["status"] == "fail"
         }));
@@ -4347,7 +4896,6 @@ pub(crate) mod tests {
             "/api/cowd/structured/sources",
             "/api/cowd/structured/facts",
             "/api/cowd/structured/evidence",
-            "/api/cowd/structured/watermarks",
         ] {
             let response = app
                 .clone()
@@ -4360,6 +4908,22 @@ pub(crate) mod tests {
             assert_eq!(json["list_status"], "ready", "{uri}");
             assert!(json["count"].as_u64().unwrap_or_default() >= 1, "{uri}");
         }
+        let watermarks = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cowd/structured/watermarks")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(watermarks.status(), StatusCode::OK);
+        let watermarks: serde_json::Value =
+            serde_json::from_slice(&to_bytes(watermarks.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(watermarks["list_status"], "ready");
+        assert_eq!(watermarks["count"], 0);
 
         let gate = app
             .oneshot(
@@ -4481,9 +5045,11 @@ pub(crate) mod tests {
         let body = to_bytes(evidence.into_body(), usize::MAX).await.unwrap();
         let evidence_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let packet_id = evidence_json["packet"]["packet_id"].as_str().unwrap();
-        assert!(evidence_json["packet"]["missing_evidence"]
-            .as_array()
-            .is_some_and(|items| !items.is_empty()));
+        assert!(
+            evidence_json["packet"]["missing_evidence"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        );
 
         let fetched = app
             .oneshot(
@@ -4613,14 +5179,18 @@ pub(crate) mod tests {
             )
             .await;
         assert!(receipt.errors.is_empty(), "{receipt:#?}");
-        assert!(receipt
-            .promotions
-            .iter()
-            .any(|item| item.target == "fact.memory" && item.status == "promote"));
-        assert!(receipt
-            .promotions
-            .iter()
-            .any(|item| item.target == "matrix.fact" && item.status == "promoted"));
+        assert!(
+            receipt
+                .promotions
+                .iter()
+                .any(|item| item.target == "fact.memory" && item.status == "promote")
+        );
+        assert!(
+            receipt
+                .promotions
+                .iter()
+                .any(|item| item.target == "matrix.fact" && item.status == "promoted")
+        );
 
         let recall = app
             .clone()
@@ -4643,16 +5213,20 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
         assert!(source_names.contains(&"fact"), "{recall_json:#}");
         assert!(source_names.contains(&"matrix"), "{recall_json:#}");
-        assert!(recall_json["recall_report"]["selected"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["source"] == "fact"));
-        assert!(recall_json["recall_report"]["selected"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["source"] == "matrix"));
+        assert!(
+            recall_json["recall_report"]["selected"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["source"] == "fact")
+        );
+        assert!(
+            recall_json["recall_report"]["selected"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["source"] == "matrix")
+        );
 
         let context = app
             .oneshot(
@@ -4909,6 +5483,260 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn mfg_data_plane_ingest_preview_preserves_watermarks_and_session_timeline() {
+        let workspace = test_temp_dir("mfg-ingest-preview");
+        let config_home = test_temp_dir("mfg-ingest-preview-config");
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let app = api_router(test_state_with_store_and_workspace(
+            Arc::clone(&store),
+            workspace.clone(),
+            config_home.clone(),
+        ));
+        let session_id = "mfg-ingest-preview-session";
+
+        let before = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/mfg/reality/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let before_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(before.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+
+        let preview = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apps/mfg/reality/data-plane/ingest-plan")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "request_id": "mfg-ingest-preview-request",
+                            "session_id": session_id,
+                            "ingest": {
+                                "source_ref": "source-pack://preview-only",
+                                "fact_type": "manufacturing.preview_only",
+                                "partition_ref": "line:preview",
+                                "high_watermark": "2026-07-16T00:00:00Z",
+                                "estimated_rows": 8,
+                                "raw_checksum": "sha256:preview",
+                                "metric_ids": ["preview_metric"]
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preview.status(), StatusCode::OK);
+
+        let repository = matrix_repository::MatrixSqliteRepository::open(
+            config_home.join("storage").join("matrix.sqlite"),
+        )
+        .unwrap();
+        assert_eq!(
+            repository.health().unwrap().data_plane_watermark_count,
+            before_json["data_plane_watermark_count"].as_u64().unwrap()
+        );
+        let timeline = store
+            .session_domain_events_page(session_id, 0, 20)
+            .await
+            .unwrap();
+        assert_eq!(timeline.total, 0);
+        assert!(timeline.events.is_empty());
+
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[tokio::test]
+    async fn mfg_live_snapshot_and_stream_use_distinct_authenticated_transports() {
+        let workspace = test_temp_dir("mfg-live-transport");
+        let config_home = test_temp_dir("mfg-live-transport-config");
+        let broker_root = config_home.join("auth-broker");
+        std::fs::create_dir_all(&broker_root).unwrap();
+        let broker_socket = auth_broker::BrokerClient::default_socket(&broker_root);
+        let broker_socket_for_worker = broker_socket.clone();
+        let broker_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let broker_shutdown_for_worker = Arc::clone(&broker_shutdown);
+        let broker_worker = std::thread::spawn(move || {
+            auth_broker::serve_local_until(
+                broker_root,
+                "mfg-live-auth-token",
+                broker_socket_for_worker,
+                || broker_shutdown_for_worker.load(std::sync::atomic::Ordering::Acquire),
+            )
+            .expect("test auth broker");
+        });
+        for _ in 0..100 {
+            if broker_socket.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(broker_socket.exists(), "test auth broker did not start");
+        let mut state = test_state_with_workspace(workspace.clone(), config_home.clone());
+        Arc::get_mut(&mut state).unwrap().auth_token = Some("mfg-live-auth-token".to_string());
+        let app = api_router(state);
+
+        let bearer_snapshot = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/mfg/live/snapshot")
+                    .header("authorization", "Bearer mfg-live-auth-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bearer_snapshot.status(), StatusCode::OK);
+        assert_eq!(
+            bearer_snapshot
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        let bearer_snapshot: serde_json::Value = serde_json::from_slice(
+            &to_bytes(bearer_snapshot.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(bearer_snapshot["kind"], "snapshot");
+        assert!(bearer_snapshot["cursor"].as_str().is_some());
+        assert!(bearer_snapshot["view_epoch"].as_str().is_some());
+
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "token": "mfg-live-auth-token",
+                            "surface_id": "webui",
+                            "requested_capabilities": ["mfg.read"],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let cookie = login
+            .headers()
+            .get("set-cookie")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .expect("login must return the broker-signed browser cookie")
+            .to_string();
+        let cookie_snapshot = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/mfg/live/snapshot")
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cookie_snapshot.status(), StatusCode::OK);
+        let cookie_snapshot: serde_json::Value = serde_json::from_slice(
+            &to_bytes(cookie_snapshot.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cookie_snapshot["kind"], "snapshot");
+        assert_ne!(
+            cookie_snapshot["view_epoch"], bearer_snapshot["view_epoch"],
+            "public live epoch must change when the WebUI requests a narrower capability view"
+        );
+
+        let stream = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/mfg/live")
+                    .header("accept", "application/json")
+                    .header("authorization", "Bearer mfg-live-auth-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stream.status(), StatusCode::OK);
+        assert!(
+            stream
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/event-stream"))
+        );
+        broker_shutdown.store(true, std::sync::atomic::Ordering::Release);
+        broker_worker.join().expect("test auth broker shutdown");
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[tokio::test]
+    async fn mfg_live_snapshot_without_verified_principal_returns_typed_401() {
+        let workspace = test_temp_dir("mfg-live-auth");
+        let config_home = test_temp_dir("mfg-live-auth-config");
+        let mut state = test_state_with_workspace(workspace.clone(), config_home);
+        Arc::get_mut(&mut state).unwrap().auth_token = Some("mfg-live-auth-token".to_string());
+        let app = api_router(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/mfg/live/snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(
+            body["code"] == "authentication_required"
+                || body["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("authentication_required"))
+        );
+        let forbidden = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/mfg/live/snapshot")
+                    .header("authorization", "Bearer mfg-live-auth-token")
+                    .header("x-cowd-requested-capabilities", "approval.respond")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+        let forbidden: serde_json::Value =
+            serde_json::from_slice(&to_bytes(forbidden.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(forbidden["code"], "capability_denied");
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
     async fn matrix_metric_recompute_projects_changes_and_attention() {
         let workspace = test_temp_dir("matrix-metric");
         let config_home = test_temp_dir("matrix-metric-config");
@@ -5011,15 +5839,13 @@ pub(crate) mod tests {
         assert_eq!(hot.status(), StatusCode::OK);
         let body = to_bytes(hot.into_body(), usize::MAX).await.unwrap();
         let hot_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(hot_json["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["reason_codes"]
+        assert!(hot_json["items"].as_array().unwrap().iter().any(|item| {
+            item["reason_codes"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|reason| reason == "metric_delta_detected")));
+                .any(|reason| reason == "metric_delta_detected")
+        }));
         let _ = std::fs::remove_dir_all(workspace);
     }
 
@@ -5096,12 +5922,16 @@ pub(crate) mod tests {
         assert_eq!(evidence.status(), StatusCode::OK);
         let body = to_bytes(evidence.into_body(), usize::MAX).await.unwrap();
         let evidence_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(evidence_json["packet"]["metric_evidence"]
-            .as_array()
-            .is_some_and(|items| !items.is_empty()));
-        assert!(evidence_json["packet"]["change_evidence"]
-            .as_array()
-            .is_some_and(|items| !items.is_empty()));
+        assert!(
+            evidence_json["packet"]["metric_evidence"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        );
+        assert!(
+            evidence_json["packet"]["change_evidence"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        );
         let packet_id = evidence_json["packet"]["packet_id"].as_str().unwrap();
 
         let context = app
@@ -5129,6 +5959,7 @@ pub(crate) mod tests {
                     .method("POST")
                     .uri("/api/apps/mfg/incidents")
                     .header("content-type", "application/json")
+                    .header("idempotency-key", "mfg-domain-incident")
                     .body(Body::from(
                         serde_json::json!({
                             "title": "GPU material shortage incident",
@@ -5144,17 +5975,22 @@ pub(crate) mod tests {
         let body = to_bytes(incident.into_body(), usize::MAX).await.unwrap();
         let incident_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(incident_json["incident"]["evidence_packet_id"], packet_id);
-        assert!(incident_json["workflow_graph"]["nodes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|node| node["node_id"] == "mfg_researcher"));
-        assert!(incident_json["workflow_graph"]["evidence"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|evidence| evidence["reference"] == format!("mfg:evidence:{packet_id}")));
+        assert!(
+            incident_json["workflow_graph"]["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|node| node["node_id"] == "mfg_researcher")
+        );
+        assert!(
+            incident_json["workflow_graph"]["evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|evidence| evidence["reference"] == format!("mfg:evidence:{packet_id}"))
+        );
         let incident_id = incident_json["incident"]["incident_id"].as_str().unwrap();
+        let incident_revision = incident_json["incident"]["revision"].as_u64().unwrap();
 
         let room = app
             .clone()
@@ -5195,12 +6031,41 @@ pub(crate) mod tests {
             .as_str()
             .unwrap();
         let skill_node_id = app_mfg::skill_agent_node_id(skill_id);
-        assert!(skill_plan_json["workflow_graph"]["nodes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|node| node["node_id"] == skill_node_id));
+        assert!(
+            skill_plan_json["workflow_graph"]["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|node| node["node_id"] == skill_node_id)
+        );
         assert!(skill_plan_json.get("agent_graph").is_none());
+        let room_after_preview = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/apps/mfg/incidents/{incident_id}/room"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let room_after_preview_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(room_after_preview.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !room_after_preview_json["workflow_graph"]["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|node| node["node_id"] == skill_node_id)
+        );
+        assert_eq!(
+            room_after_preview_json["incident"]["revision"], incident_revision,
+            "a Preview skill plan must not advance the incident CAS revision"
+        );
 
         let skill_run = app
             .clone()
@@ -5211,7 +6076,10 @@ pub(crate) mod tests {
                         "/api/apps/mfg/incidents/{incident_id}/skills/{skill_id}/run"
                     ))
                     .header("content-type", "application/json")
-                    .body(Body::from("{}"))
+                    .header("idempotency-key", "mfg-domain-skill-run")
+                    .body(Body::from(
+                        serde_json::json!({"expected_revision": incident_revision}).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -5226,11 +6094,60 @@ pub(crate) mod tests {
         );
         let skill_run_json: serde_json::Value = serde_json::from_slice(&skill_run_body).unwrap();
         assert_eq!(skill_run_json["skill_run"]["status"], "completed");
-        assert!(skill_run_json["workflow_graph"]["nodes"]
-            .as_array()
+        assert_eq!(
+            skill_run_json["skill_run"]["tool_results"]
+                .as_array()
+                .unwrap()
+                .len(),
+            skill_run_json["skill_run"]["tool_plan"]
+                .as_array()
+                .unwrap()
+                .len()
+        );
+        assert!(
+            skill_run_json["skill_run"]["tool_results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|result| result["status"] == "completed")
+        );
+        let skill_graph_id = skill_run_json["skill_run"]["runtime_execution_ref"]
+            .as_str()
             .unwrap()
-            .iter()
-            .any(|node| node["node_id"] == skill_node_id && node["status"] == "completed"));
+            .strip_prefix("runtime-execution://")
+            .unwrap();
+        let skill_graph = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/runtime/executions/{skill_graph_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(skill_graph.status(), StatusCode::OK);
+        let skill_graph_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(skill_graph.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(
+            skill_graph_json["graph"]["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|node| {
+                    node["kind"] == "tool_batch"
+                        && node["status"] == "completed"
+                        && node["result_ref"].as_str().is_some()
+                })
+        );
+        assert!(
+            skill_run_json["workflow_graph"]["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|node| node["node_id"] == skill_node_id && node["status"] == "completed")
+        );
         assert!(skill_run_json.get("agent_graph").is_none());
 
         let analysis = app
@@ -5239,6 +6156,7 @@ pub(crate) mod tests {
                 Request::builder()
                     .method("POST")
                     .uri(format!("/api/apps/mfg/incidents/{incident_id}/analyze"))
+                    .header("idempotency-key", "mfg-domain-analyze")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -5248,15 +6166,21 @@ pub(crate) mod tests {
         let body = to_bytes(analysis.into_body(), usize::MAX).await.unwrap();
         let analysis_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(analysis_json["analysis"]["incident_id"], incident_id);
-        assert!(analysis_json["analysis"]["attribution_candidates"]
-            .as_array()
-            .is_some_and(|items| !items.is_empty()));
-        assert!(analysis_json["analysis"]["impact_paths"]
-            .as_array()
-            .is_some_and(|items| !items.is_empty()));
-        assert!(analysis_json["analysis"]["recommended_actions"]
-            .as_array()
-            .is_some_and(|items| !items.is_empty()));
+        assert!(
+            analysis_json["analysis"]["attribution_candidates"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        );
+        assert!(
+            analysis_json["analysis"]["impact_paths"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        );
+        assert!(
+            analysis_json["analysis"]["recommended_actions"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        );
         let analysis_id = analysis_json["analysis"]["analysis_id"].as_str().unwrap();
         let action_id = analysis_json["analysis"]["recommended_actions"][0]["action_id"]
             .as_str()
@@ -5274,6 +6198,61 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(fetched_analysis.status(), StatusCode::OK);
 
+        let preview_execution = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/apps/mfg/analyses/{analysis_id}/actions/{action_id}/execute"
+                    ))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"mode":" PlAn ","note":"preview only"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preview_execution.status(), StatusCode::OK);
+        let preview_execution_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(preview_execution.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            preview_execution_json["execution"]["status"],
+            "dry_run_ready"
+        );
+        let preview_execution_id = preview_execution_json["execution"]["execution_id"]
+            .as_str()
+            .unwrap();
+        let preview_lookup = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/apps/mfg/executions/{preview_execution_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preview_lookup.status(), StatusCode::NOT_FOUND);
+        let invalid_mode = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/apps/mfg/analyses/{analysis_id}/actions/{action_id}/execute"
+                    ))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"mode":"unknown"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_mode.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
         let execution = app
             .clone()
             .oneshot(
@@ -5283,9 +6262,11 @@ pub(crate) mod tests {
                         "/api/apps/mfg/analyses/{analysis_id}/actions/{action_id}/execute"
                     ))
                     .header("content-type", "application/json")
+                    .header("idempotency-key", "mfg-domain-analysis-action")
                     .body(Body::from(
                         serde_json::json!({
                             "mode": "commit",
+                            "expected_revision": 1,
                             "note": "queue reviewed recovery action"
                         })
                         .to_string(),
@@ -5310,6 +6291,109 @@ pub(crate) mod tests {
             .as_str()
             .unwrap();
 
+        let bridge_preview = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/apps/mfg/executions/{execution_id}/cross-plane/execute"
+                    ))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"mode":"dry_run"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bridge_preview.status(), StatusCode::OK);
+        let bridge_preview_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(bridge_preview.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            bridge_preview_json["execution"],
+            execution_json["execution"]
+        );
+        assert!(bridge_preview_json["cross_plane_execution_receipt"]["audit_record_id"].is_null());
+        let bridge_preview_receipt = bridge_preview_json["cross_plane_execution_receipt"]["id"]
+            .as_str()
+            .unwrap();
+        let bridge_preview_lookup = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/cross-plane/action/executions/{bridge_preview_receipt}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bridge_preview_lookup.status(), StatusCode::NOT_FOUND);
+
+        let bridge_key = "mfg-domain-execution-cross-plane";
+        let bridge_commit = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/apps/mfg/executions/{execution_id}/cross-plane/execute"
+                    ))
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", bridge_key)
+                    .body(Body::from(r#"{"mode":"commit"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bridge_commit.status(), StatusCode::OK);
+        let bridge_commit_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(bridge_commit.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let bridge_receipt_id = bridge_commit_json["cross_plane_execution_receipt"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let bridge_execution_after_first = bridge_commit_json["execution"].clone();
+        let bridge_replay = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/apps/mfg/executions/{execution_id}/cross-plane/execute"
+                    ))
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", bridge_key)
+                    .body(Body::from(r#"{"mode":"commit"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bridge_replay.status(), StatusCode::OK);
+        let bridge_replay_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(bridge_replay.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            bridge_replay_json["cross_plane_execution_receipt"]["id"],
+            bridge_receipt_id
+        );
+        assert_eq!(
+            bridge_replay_json["execution"],
+            bridge_execution_after_first
+        );
+        assert_eq!(bridge_replay_json["idempotent_replay"], true);
+
         let feedback = app
             .clone()
             .oneshot(
@@ -5317,6 +6401,7 @@ pub(crate) mod tests {
                     .method("POST")
                     .uri(format!("/api/apps/mfg/executions/{execution_id}/feedback"))
                     .header("content-type", "application/json")
+                    .header("idempotency-key", "mfg-domain-feedback")
                     .body(Body::from(
                         serde_json::json!({
                             "outcome": "resolved",
@@ -6291,20 +7376,24 @@ pub(crate) mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let resource_id = json["resource"]["id"].as_str().unwrap().to_string();
-        assert!(json["resource"]["uri"]
-            .as_str()
-            .unwrap()
-            .starts_with("resource://"));
+        assert!(
+            json["resource"]["uri"]
+                .as_str()
+                .unwrap()
+                .starts_with("resource://")
+        );
         assert_eq!(json["resource"]["kind"], "audio");
         assert_eq!(json["resource"]["detected_mime"], "audio/mpeg");
-        assert!(json["hint"]["guardrails"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item
-                .as_str()
-                .unwrap_or("")
-                .contains("Do not claim audio content")));
+        assert!(
+            json["hint"]["guardrails"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("Do not claim audio content"))
+        );
         assert!(!workspace.join("voice.mp3").exists());
 
         let metadata_path = config_home
@@ -6340,11 +7429,13 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let evidence_json: serde_json::Value = serde_json::from_slice(&evidence_body).unwrap();
-        assert!(evidence_json["evidence"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["action"] == "register_resource_from_path"));
+        assert!(
+            evidence_json["evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["action"] == "register_resource_from_path")
+        );
     }
 
     #[tokio::test]
@@ -6617,11 +7708,13 @@ pub(crate) mod tests {
             .unwrap()
             .expect("stored session");
         assert_eq!(record.model.as_deref(), Some("patched-model"));
-        assert!(record
-            .metadata_json
-            .as_deref()
-            .unwrap_or("")
-            .contains("Patch Session Title"));
+        assert!(
+            record
+                .metadata_json
+                .as_deref()
+                .unwrap_or("")
+                .contains("Patch Session Title")
+        );
     }
 
     #[tokio::test]
@@ -7133,11 +8226,13 @@ pub(crate) mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["events"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|event| event["kind"] == "execution_graph.planned"));
+        assert!(
+            json["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["kind"] == "execution_graph.planned")
+        );
         assert_eq!(json["execution_graph_summary"]["count"], 1);
         assert_eq!(json["execution_graph_summary"]["agent_tasks"], 1);
         assert_eq!(
@@ -7454,42 +8549,54 @@ runtime:
         assert_eq!(json["diagnostics"]["blocked_required_count"], 4);
         assert_eq!(json["readiness"]["production_ready"], false);
         assert_eq!(json["readiness"]["score"], 63);
-        assert!(json["readiness"]["blocked"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|check| check["id"] == "session.sqlite_source_of_truth"));
-        assert!(json["readiness"]["blocked"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|check| check["id"] == "memory.manager"));
-        assert!(json["readiness"]["blocked"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|check| check["id"] == "provider.registry"));
-        assert!(json["next_actions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|action| action
-                .as_str()
-                .unwrap_or_default()
-                .contains("SQLite session store")));
-        assert!(json["next_actions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|action| action
-                .as_str()
-                .unwrap_or_default()
-                .contains("runtime provider")));
-        assert!(json["degraded_reasons"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|reason| reason == "session store not available"));
+        assert!(
+            json["readiness"]["blocked"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|check| check["id"] == "session.sqlite_source_of_truth")
+        );
+        assert!(
+            json["readiness"]["blocked"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|check| check["id"] == "memory.manager")
+        );
+        assert!(
+            json["readiness"]["blocked"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|check| check["id"] == "provider.registry")
+        );
+        assert!(
+            json["next_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| action
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("SQLite session store"))
+        );
+        assert!(
+            json["next_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| action
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("runtime provider"))
+        );
+        assert!(
+            json["degraded_reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reason| reason == "session store not available")
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -7643,33 +8750,41 @@ runtime:
         assert_eq!(json["diagnostics"]["blocked_required_count"], 2);
         assert_eq!(json["readiness"]["production_ready"], false);
         assert_eq!(json["readiness"]["score"], 81);
-        assert!(json["readiness"]["blocked"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|check| check["id"] == "memory.manager"));
-        assert!(json["readiness"]["blocked"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|check| check["id"] == "provider.registry"));
-        assert!(json["next_actions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|action| action
-                .as_str()
-                .unwrap_or_default()
-                .contains("memory manager")));
+        assert!(
+            json["readiness"]["blocked"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|check| check["id"] == "memory.manager")
+        );
+        assert!(
+            json["readiness"]["blocked"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|check| check["id"] == "provider.registry")
+        );
+        assert!(
+            json["next_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| action
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("memory manager"))
+        );
         assert_eq!(
             json["components"]["channels"]["adapters"][0]["id"],
             "wechat-ilink"
         );
-        assert!(json["capabilities"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|capability| capability == "permission.cross_plane"));
+        assert!(
+            json["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|capability| capability == "permission.cross_plane")
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -7799,10 +8914,12 @@ providers:
             json["components"]["provider"]["configured_model_resolved"],
             true
         );
-        assert!(json["components"]["provider"]["catalog_generation"]
-            .as_str()
-            .unwrap_or_default()
-            .starts_with("provider-catalog-v1-"));
+        assert!(
+            json["components"]["provider"]["catalog_generation"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("provider-catalog-v1-")
+        );
         assert_eq!(
             json["components"]["provider"]["catalog"]["models"][0]["effective_protocol"],
             "anthropic"
@@ -7817,16 +8934,20 @@ providers:
         assert_eq!(json["diagnostics"]["provider_count"], 1);
         assert_eq!(json["diagnostics"]["provider_model_count"], 2);
         assert_eq!(json["diagnostics"]["configured_model_resolved"], true);
-        assert!(json["readiness"]["checks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|check| check["id"] == "provider.registry" && check["status"] == "ready"));
-        assert!(json["readiness"]["checks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|check| check["id"] == "provider.model_routing" && check["status"] == "ready"));
+        assert!(
+            json["readiness"]["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|check| check["id"] == "provider.registry" && check["status"] == "ready")
+        );
+        assert!(
+            json["readiness"]["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|check| check["id"] == "provider.model_routing" && check["status"] == "ready")
+        );
         assert!(!json.to_string().contains("secret-provider-key"));
 
         let _ = std::fs::remove_dir_all(root);
@@ -7873,10 +8994,12 @@ providers:
         assert_eq!(json["models"][1]["id"], "model-b");
         assert_eq!(json["models"][1]["effective_protocol"], "completions");
         assert_eq!(json["models"][1]["protocol_configured"], true);
-        assert!(json["catalog_generation"]
-            .as_str()
-            .unwrap_or_default()
-            .starts_with("provider-catalog-v1-"));
+        assert!(
+            json["catalog_generation"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("provider-catalog-v1-")
+        );
         assert_eq!(json["catalog"]["providers"][0]["id"], "local");
         assert_eq!(json["catalog"]["models"][1]["id"], "model-b");
         assert_eq!(json["catalog"]["profiles"][0]["id"], "default");
@@ -7950,10 +9073,12 @@ providers:
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("model `missing-model` is not declared"));
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("model `missing-model` is not declared")
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -7980,11 +9105,13 @@ providers:
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["commands"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|command| command["name"] == "/status"));
+        assert!(
+            json["commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|command| command["name"] == "/status")
+        );
 
         let response = app
             .clone()
@@ -8175,9 +9302,11 @@ providers:
         assert_eq!(json["status"], "failed");
         assert_eq!(json["applied"], false);
         assert_eq!(json["configured_model_resolved"], false);
-        assert!(json["warnings"]
-            .to_string()
-            .contains("unsupported-protocol"));
+        assert!(
+            json["warnings"]
+                .to_string()
+                .contains("unsupported-protocol")
+        );
         assert!(!json.to_string().contains("broken-secret-key"));
         assert!(invalid_registry.pin().resolve("broken-model").is_none());
         let retained_snapshot = provider_registry.pin();
@@ -8984,14 +10113,18 @@ providers:
 
         assert_eq!(packet.session_id, "session-task");
         assert_eq!(packet.source, ResumeContextSource::ExecutionGraph);
-        assert!(packet
-            .active_task
-            .as_deref()
-            .is_some_and(|task| task.contains("ship context runtime")));
-        assert!(packet
-            .recent_decisions
-            .iter()
-            .any(|event| event.contains("artifact")));
+        assert!(
+            packet
+                .active_task
+                .as_deref()
+                .is_some_and(|task| task.contains("ship context runtime"))
+        );
+        assert!(
+            packet
+                .recent_decisions
+                .iter()
+                .any(|event| event.contains("artifact"))
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -9030,6 +10163,8 @@ providers:
                     agent_id: None,
                     team_id: None,
                     mission_id: Some("mission-approval-route".to_string()),
+                    resource_ref: None,
+                    review_ref: None,
                 },
                 action: "apply_patch".to_string(),
                 summary: "modify runtime file".to_string(),
@@ -9053,11 +10188,13 @@ providers:
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let pending_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(pending_json["kind"], "gateway.unified_approval_pending");
-        assert!(pending_json["pending"]
-            .as_array()
-            .expect("pending approvals")
-            .iter()
-            .any(|item| item["approval_id"].as_str() == Some(approval.approval_id.as_str())));
+        assert!(
+            pending_json["pending"]
+                .as_array()
+                .expect("pending approvals")
+                .iter()
+                .any(|item| item["approval_id"].as_str() == Some(approval.approval_id.as_str()))
+        );
 
         let response = app
             .clone()
@@ -9272,13 +10409,15 @@ providers:
             degrade_to: None,
         };
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let graph_key = format!("cross-plane-approval-{}", uuid::Uuid::new_v4());
         let projection = state
             .services
             .cross_plane
             .execute_commit_graph(
                 &action,
                 &decision,
-                &format!("cross-plane-approval-{}", uuid::Uuid::new_v4()),
+                &graph_key,
+                None,
                 Arc::new(CrossPlaneApprovalTestBackend {
                     calls: Arc::clone(&calls),
                 }),
@@ -9297,6 +10436,27 @@ providers:
             harness_contract::execution_graph::ExecutionNodeStatus::WaitingApproval
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let conflicting_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let conflicting_action =
+            runtime::CrossPlaneAction::new("different-operator", "service.execute");
+        let conflict = state
+            .services
+            .cross_plane
+            .execute_commit_graph(
+                &conflicting_action,
+                &decision,
+                &graph_key,
+                None,
+                Arc::new(CrossPlaneApprovalTestBackend {
+                    calls: Arc::clone(&conflicting_calls),
+                }),
+            )
+            .await;
+        assert!(conflict.is_err());
+        assert_eq!(
+            conflicting_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
 
         let approval_id = runtime::execution_core::graph::executors::graph_approval_id(
             &projection.graph_id,
@@ -9332,6 +10492,62 @@ providers:
             tool.status,
             harness_contract::execution_graph::ExecutionNodeStatus::Completed
         );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cross_plane_terminal_graph_recovers_before_owner_receipt_without_reexecution() {
+        let state = test_state();
+        let action = runtime::CrossPlaneAction::new("operator", "channel.send");
+        let decision = runtime::CrossPlanePolicyDecision {
+            decision: runtime::PolicyDecisionKind::Allow,
+            reason: "test grant".to_string(),
+            matched_grant: None,
+            required_approval: None,
+            degrade_to: None,
+        };
+        let graph_key = format!("cross-plane-terminal-window-{}", uuid::Uuid::new_v4());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first = state
+            .services
+            .cross_plane
+            .execute_commit_graph(
+                &action,
+                &decision,
+                &graph_key,
+                None,
+                Arc::new(CrossPlaneApprovalTestBackend {
+                    calls: Arc::clone(&calls),
+                }),
+            )
+            .await
+            .expect("first graph execution");
+        assert!(first.nodes.iter().all(|node| node.status.is_terminal()));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            state
+                .services
+                .cross_plane
+                .find_execution_by_idempotency_key(&graph_key)
+                .is_none()
+        );
+
+        let recovered = state
+            .services
+            .cross_plane
+            .execute_commit_graph(
+                &action,
+                &decision,
+                &graph_key,
+                None,
+                Arc::new(CrossPlaneApprovalTestBackend {
+                    calls: Arc::clone(&calls),
+                }),
+            )
+            .await
+            .expect("terminal graph recovery");
+        assert_eq!(recovered.graph_id, first.graph_id);
+        assert_eq!(recovered.commit_cursor, first.commit_cursor);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
@@ -9388,15 +10604,17 @@ providers:
         assert!(platforms.iter().any(|item| item["name"] == "feishu"
             && item["status"] == "disabled"
             && item["credential_present"] == false));
-        assert!(platforms.iter().any(|item| item["name"] == "wechat-ilink"
-            && item["capabilities"]
-                .as_array()
-                .unwrap()
-                .contains(&serde_json::json!("message.ingress"))
-            && item["capabilities"]
-                .as_array()
-                .unwrap()
-                .contains(&serde_json::json!("message.send.text"))));
+        assert!(platforms.iter().any(|item| {
+            item["name"] == "wechat-ilink"
+                && item["capabilities"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!("message.ingress"))
+                && item["capabilities"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!("message.send.text"))
+        }));
     }
 
     #[tokio::test]
@@ -9428,10 +10646,12 @@ providers:
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["readiness"]["status"], "degraded");
         assert_eq!(json["readiness"]["credential_present"], false);
-        assert!(json["readiness"]["missing_required"]
-            .as_array()
-            .unwrap()
-            .contains(&serde_json::json!("app_secret")));
+        assert!(
+            json["readiness"]["missing_required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("app_secret"))
+        );
         assert!(!json.to_string().contains("cli_app_id"));
     }
 
@@ -9475,20 +10695,25 @@ providers:
         let capabilities: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(capabilities["kind"], "connector_capabilities");
         let list = capabilities["capabilities"].as_array().unwrap();
-        assert!(list
-            .iter()
-            .any(|item| item["capability_id"] == "channel.feishu.send_text"));
-        assert!(list
-            .iter()
-            .any(|item| item["capability_id"] == "governance.cross_plane.audit"));
-        assert!(list
-            .iter()
-            .any(|item| item["capability_id"] == "service.local.docs.read"
-                && item["plane"] == "service"));
-        assert!(!list.iter().any(|item| item["capability_id"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("feishu_document_operation")));
+        assert!(
+            list.iter()
+                .any(|item| item["capability_id"] == "channel.feishu.send_text")
+        );
+        assert!(
+            list.iter()
+                .any(|item| item["capability_id"] == "governance.cross_plane.audit")
+        );
+        assert!(
+            list.iter()
+                .any(|item| item["capability_id"] == "service.local.docs.read"
+                    && item["plane"] == "service")
+        );
+        assert!(!list.iter().any(|item| {
+            item["capability_id"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("feishu_document_operation")
+        }));
     }
 
     #[tokio::test]
@@ -9524,11 +10749,13 @@ providers:
         assert_eq!(json["accounts"][0]["account_id"], "feishu-main");
         assert_eq!(json["accounts"][0]["auth_mode"], "app_secret");
         assert_eq!(json["accounts"][0]["health"]["status"], "degraded");
-        assert!(json["accounts"][0]["enabled_bindings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item == "channel.feishu.send_text"));
+        assert!(
+            json["accounts"][0]["enabled_bindings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item == "channel.feishu.send_text")
+        );
         assert!(!json.to_string().contains("cli_app_id"));
     }
 
@@ -9598,15 +10825,11 @@ providers:
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["capabilities"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(
-                |capability| capability["capability_id"] == "mcp.github_com.server"
-                    && capability["plane"] == "mcp"
-                    && capability["supports_commit"] == false
-            ));
+        assert!(json["capabilities"].as_array().unwrap().iter().any(
+            |capability| capability["capability_id"] == "mcp.github_com.server"
+                && capability["plane"] == "mcp"
+                && capability["supports_commit"] == false
+        ));
 
         let mcp_servers = app
             .clone()
@@ -9745,14 +10968,10 @@ providers:
         assert_eq!(resources.status(), StatusCode::OK);
         let body = to_bytes(resources.into_body(), usize::MAX).await.unwrap();
         let resources_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(resources_json["resources"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(
-                |resource| resource["reference"] == "service://local.docs/document/doc-1"
-                    && resource["title"] == "Architecture"
-            ));
+        assert!(resources_json["resources"].as_array().unwrap().iter().any(
+            |resource| resource["reference"] == "service://local.docs/document/doc-1"
+                && resource["title"] == "Architecture"
+        ));
 
         let replay = app
             .oneshot(
@@ -9818,13 +11037,15 @@ providers:
         let body = to_bytes(resources.into_body(), usize::MAX).await.unwrap();
         let resources_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(resources_json["status"], "available");
-        assert!(resources_json["resources"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|resource| resource["reference"]
-                == "service://local.docs/document/persisted-doc"
-                && resource["title"] == "Persisted Runtime Resource"));
+        assert!(
+            resources_json["resources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|resource| resource["reference"]
+                    == "service://local.docs/document/persisted-doc"
+                    && resource["title"] == "Persisted Runtime Resource")
+        );
     }
 
     #[tokio::test]
@@ -9917,11 +11138,13 @@ providers:
         assert_eq!(resources.status(), StatusCode::OK);
         let body = to_bytes(resources.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["resources"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|resource| resource["indexed_state"] == "stale"));
+        assert!(
+            json["resources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|resource| resource["indexed_state"] == "stale")
+        );
     }
 
     #[tokio::test]
@@ -10604,10 +11827,12 @@ providers:
         assert_eq!(json["dispatch_status"], "dry_run");
         assert_eq!(json["executable"], false);
         assert_eq!(json["dispatched"], false);
-        assert!(json["audit_record_id"]
-            .as_str()
-            .unwrap()
-            .starts_with("cpa-"));
+        assert!(
+            json["audit_record_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("cpa-")
+        );
 
         let first = app
             .clone()
@@ -10914,9 +12139,11 @@ providers:
                 && item["live_supported"] == true
                 && item["adapter_bound"] == false
         }));
-        assert!(!capabilities
-            .iter()
-            .any(|item| item["platform"] == "wecom" && item["operation"] == "callback"));
+        assert!(
+            !capabilities
+                .iter()
+                .any(|item| item["platform"] == "wecom" && item["operation"] == "callback")
+        );
     }
 
     #[tokio::test]
@@ -11105,11 +12332,13 @@ providers:
             .unwrap();
         let executions_body = to_bytes(executions.into_body(), usize::MAX).await.unwrap();
         let executions_json: serde_json::Value = serde_json::from_slice(&executions_body).unwrap();
-        assert!(executions_json["executions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|receipt| receipt["dispatch_target"]["session_key"] == "feishu:demo-chat"));
+        assert!(
+            executions_json["executions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|receipt| receipt["dispatch_target"]["session_key"] == "feishu:demo-chat")
+        );
     }
 
     #[tokio::test]
@@ -11192,15 +12421,17 @@ providers:
         assert_eq!(executed_json["status"], "blocked");
         assert_eq!(executed_json["dispatch_status"], "adapter_unavailable");
         assert_eq!(executed_json["dispatched"], false);
-        assert!(executed_json["blockers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|value| {
-                value
-                    .as_str()
-                    .is_some_and(|value| value.starts_with("adapter:feishu:send_text:not_bound"))
-            }));
+        assert!(
+            executed_json["blockers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| {
+                    value.as_str().is_some_and(|value| {
+                        value.starts_with("adapter:feishu:send_text:not_bound")
+                    })
+                })
+        );
         assert!(executed_json["execution_graph"].is_null());
     }
 
@@ -11284,15 +12515,14 @@ providers:
         assert_eq!(executed_json["status"], "blocked");
         assert_eq!(executed_json["dispatch_status"], "adapter_unavailable");
         assert_eq!(
-            executed_json["execution_receipt"]["dispatch_target"]["outbound_message"]
-                ["payload_kind"],
+            executed_json["execution_receipt"]["dispatch_target"]["outbound_message"]["payload_kind"],
             "image"
         );
     }
 
     #[tokio::test]
-    async fn cross_plane_execute_commit_resolves_workspace_file_target_but_requires_surface_sidecar(
-    ) {
+    async fn cross_plane_execute_commit_resolves_workspace_file_target_but_requires_surface_sidecar()
+     {
         let root = test_temp_dir("cross-plane-file-dispatch");
         let workspace = root.join("workspace");
         std::fs::create_dir_all(workspace.join("reports")).unwrap();
@@ -11377,13 +12607,11 @@ providers:
         assert_eq!(executed_json["status"], "blocked");
         assert_eq!(executed_json["dispatch_status"], "adapter_unavailable");
         assert_eq!(
-            executed_json["execution_receipt"]["dispatch_target"]["outbound_message"]
-                ["payload_kind"],
+            executed_json["execution_receipt"]["dispatch_target"]["outbound_message"]["payload_kind"],
             "file"
         );
         assert_eq!(
-            executed_json["execution_receipt"]["dispatch_target"]["outbound_message"]
-                ["payload_ref"],
+            executed_json["execution_receipt"]["dispatch_target"]["outbound_message"]["payload_ref"],
             "reports/panel.txt"
         );
 
@@ -11475,14 +12703,16 @@ providers:
 
         assert_eq!(executed_json["status"], "blocked");
         assert_eq!(executed_json["dispatch_status"], "payload_rejected");
-        assert!(executed_json["blockers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|blocker| blocker
-                .as_str()
-                .unwrap_or_default()
-                .contains("payload_blocked")));
+        assert!(
+            executed_json["blockers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|blocker| blocker
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("payload_blocked"))
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -11565,19 +12795,25 @@ providers:
         assert_eq!(json["envelope"]["profile"], "YoloGoal");
         assert_eq!(json["envelope"]["identity"]["mode"], "YoloGoal");
         assert_eq!(json["envelope"]["budget"]["leases"][0]["source"], "Task");
-        assert!(json["envelope"]["assembled"]["runtime_header"][0]
-            .as_str()
-            .unwrap()
-            .contains("profile:YoloGoal"));
-        assert!(json["envelope"]["assembled"]["runtime_header"][0]
-            .as_str()
-            .unwrap()
-            .contains("mode:YoloGoal"));
-        assert!(json["mode_coverage"]["entries"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|entry| entry["profile"] == "SubAgent" && entry["mode"] == "SubAgent"));
+        assert!(
+            json["envelope"]["assembled"]["runtime_header"][0]
+                .as_str()
+                .unwrap()
+                .contains("profile:YoloGoal")
+        );
+        assert!(
+            json["envelope"]["assembled"]["runtime_header"][0]
+                .as_str()
+                .unwrap()
+                .contains("mode:YoloGoal")
+        );
+        assert!(
+            json["mode_coverage"]["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["profile"] == "SubAgent" && entry["mode"] == "SubAgent")
+        );
     }
 
     #[tokio::test]
@@ -11653,14 +12889,18 @@ providers:
             .expect("resource context item should be selected");
         assert_eq!(resource_item["source"], "Workspace");
         assert_eq!(resource_item["role"], "Evidence");
-        assert!(resource_item["content"]
-            .as_str()
-            .unwrap()
-            .contains("indexed_state: unknown"));
-        assert!(!resource_item["content"]
-            .as_str()
-            .unwrap()
-            .contains("Mock document"));
+        assert!(
+            resource_item["content"]
+                .as_str()
+                .unwrap()
+                .contains("indexed_state: unknown")
+        );
+        assert!(
+            !resource_item["content"]
+                .as_str()
+                .unwrap()
+                .contains("Mock document")
+        );
         assert_eq!(
             resource_item["evidence"][0],
             "service://local.docs/document/context-doc"
@@ -12666,10 +13906,12 @@ providers:
         assert_eq!(json["results"][0]["category"], "ProjectKnowledge");
         assert!(json["results"][0]["score"].as_f64().is_some());
         assert!(json["results"][0]["mode"].as_str().is_some());
-        assert!(json["results"][0]["snippet"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("SessionKernel"));
+        assert!(
+            json["results"][0]["snippet"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("SessionKernel")
+        );
 
         std::fs::remove_dir_all(tmp).unwrap();
     }
@@ -12840,9 +14082,11 @@ providers:
         assert_eq!(status_json["context_health"]["level"], "healthy");
         assert_eq!(status_json["kernel_health"]["degraded"], false);
         assert_eq!(status_json["kernel_health"]["stale_pressure"], 0.0);
-        assert!(status_json["kernel_health"]["evidence_coverage"]
-            .as_f64()
-            .is_some());
+        assert!(
+            status_json["kernel_health"]["evidence_coverage"]
+                .as_f64()
+                .is_some()
+        );
 
         let layers_response = app
             .clone()

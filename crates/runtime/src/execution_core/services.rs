@@ -23,14 +23,14 @@ use thiserror::Error;
 use super::cross_plane::{CrossPlaneRuntimeError, CrossPlaneRuntimeService};
 use super::goal::GoalStore;
 use super::graph::{
-    executors::{
-        AgentTaskExecutor, ApprovalNodeExecutor, CompileTargetGuardExecutor, ScopedNodeExecutor,
-        SynthesizeNodeExecutor, VerifyNodeExecutor,
-    },
     ExecutionCommitService, ExecutionGraphRunner, ExecutionGraphStateStore, ExecutionRecoveryError,
     ExecutionResourceKind, ExecutionResourceManager, ExecutionRunnerError,
     ExecutionStateStoreError, NodeExecutor, NodeExecutorError, NodeExecutorRegistry, ResourceQuota,
     ScopeLockError, ScopeLockManager, WorktreeLeaseError, WorktreeLeaseManager,
+    executors::{
+        AgentTaskExecutor, ApprovalNodeExecutor, CompileTargetGuardExecutor, ScopedNodeExecutor,
+        SynthesizeNodeExecutor, VerifyNodeExecutor,
+    },
 };
 use super::protocols::ProtocolResultReducer;
 use crate::agent::binding::request_for_intent;
@@ -330,6 +330,7 @@ pub enum TaskLifecycleKind {
     Completed,
     FailureRecorded,
     Blocked,
+    AssignmentTerminalObserved,
 }
 
 impl TaskLifecycleKind {
@@ -344,6 +345,7 @@ impl TaskLifecycleKind {
             Self::Completed => "task.completed",
             Self::FailureRecorded => "task.failure.recorded",
             Self::Blocked => "task.blocked",
+            Self::AssignmentTerminalObserved => "task.assignment_terminal_observed",
         }
     }
 }
@@ -657,7 +659,8 @@ impl RuntimeServices {
         let tool_batch_executor = Arc::new(ScopedNodeExecutor::new("tool_batch"));
         let cross_plane_connector_executor =
             Arc::new(ScopedNodeExecutor::new("cross_plane_connector"));
-        let agent_task_executor = Arc::new(AgentTaskExecutor::new());
+        let agent_task_executor =
+            Arc::new(AgentTaskExecutor::new().with_state_store(graph_state_store.clone()));
         let agent_runtime = Arc::new(AgentRuntime::new(
             Arc::clone(&event_store),
             Arc::clone(&provider_registry),
@@ -1179,6 +1182,147 @@ impl RuntimeServices {
             refs: Vec::new(),
             payload: event.payload,
         })
+    }
+
+    pub fn record_task_lifecycle_once(
+        &self,
+        event: TaskLifecycleEvent,
+        idempotency_key: &str,
+    ) -> Result<DurableRuntimeEvent, String> {
+        use crate::runtime_event_store::{
+            AppendTransactionRequest, ExpectedStreamRevision, RuntimeTransactionEventInput,
+        };
+
+        let idempotency_key = idempotency_key.trim();
+        if event.task_id.trim().is_empty() || idempotency_key.is_empty() {
+            return Err(
+                "idempotent task lifecycle event requires task_id and idempotency_key".to_string(),
+            );
+        }
+        if let Some(receipt) = self
+            .event_store
+            .event_by_idempotency_key(&event.task_id, idempotency_key)
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(receipt);
+        }
+        let expected_revision = self
+            .event_store
+            .stream_revision(&event.task_id)
+            .map_err(|error| error.to_string())?;
+        let transaction_id = format!(
+            "runtime-task-lifecycle-{:x}",
+            Sha256::digest(format!("{}:{idempotency_key}", event.task_id).as_bytes())
+        );
+        self.event_store
+            .append_transaction(AppendTransactionRequest {
+                transaction_id,
+                expected_streams: vec![ExpectedStreamRevision {
+                    stream_id: event.task_id.clone(),
+                    expected_revision,
+                }],
+                events: vec![RuntimeTransactionEventInput {
+                    event: RuntimeEventInput {
+                        stream_id: event.task_id.clone(),
+                        scope: RuntimeEventScope::Task,
+                        kind: event.kind.event_kind().to_string(),
+                        status: None,
+                        actor: Some("gateway-task-command".to_string()),
+                        refs: Vec::new(),
+                        payload: event.payload,
+                    },
+                    idempotency_key: Some(idempotency_key.to_string()),
+                    schema_version: 1,
+                }],
+            })
+            .map_err(|error| error.to_string())?;
+        self.event_store
+            .event_by_idempotency_key(&event.task_id, idempotency_key)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                "task lifecycle transaction committed without a readable event".to_string()
+            })
+    }
+
+    pub fn task_lifecycle_receipt(
+        &self,
+        task_id: &str,
+        correlation_id: &str,
+    ) -> Result<Option<DurableRuntimeEvent>, String> {
+        let correlation_id = correlation_id.trim();
+        if task_id.trim().is_empty() || correlation_id.is_empty() {
+            return Ok(None);
+        }
+        let receipt = self
+            .event_store
+            .list_stream(task_id)?
+            .into_iter()
+            .rev()
+            .find(|event| {
+                event.kind == TaskLifecycleKind::Completed.event_kind()
+                    && event
+                        .payload
+                        .get("correlation_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(correlation_id)
+            });
+        Ok(receipt)
+    }
+
+    pub fn latest_task_terminal_receipt(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<DurableRuntimeEvent>, String> {
+        if task_id.trim().is_empty() {
+            return Ok(None);
+        }
+        self.event_store
+            .list_stream(task_id)
+            .map(|events| {
+                events.into_iter().rev().find(|event| {
+                    event.kind != TaskLifecycleKind::AssignmentTerminalObserved.event_kind()
+                        && event
+                            .payload
+                            .get("status")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|status| {
+                                matches!(status, "completed" | "cancelled" | "failed" | "blocked")
+                            })
+                })
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn record_task_terminal_observation(
+        &self,
+        task_id: &str,
+        terminal_status: &str,
+        source_receipt_ref: &str,
+        correlation_id: &str,
+    ) -> Result<DurableRuntimeEvent, String> {
+        if !matches!(
+            terminal_status,
+            "completed" | "cancelled" | "failed" | "blocked"
+        ) {
+            return Err(format!(
+                "task terminal observation rejected non-terminal status {terminal_status}"
+            ));
+        }
+        let event = TaskLifecycleEvent {
+            task_id: task_id.to_string(),
+            kind: TaskLifecycleKind::AssignmentTerminalObserved,
+            payload: serde_json::json!({
+                "task_id": task_id,
+                "status": terminal_status,
+                "source_receipt_ref": source_receipt_ref,
+                "correlation_id": correlation_id,
+                "observed_for": "mfg.assignment.complete",
+            }),
+        };
+        self.record_task_lifecycle_once(
+            event,
+            &format!("task-assignment-terminal-observed:{correlation_id}"),
+        )
     }
 
     /// Runtime-owned startup migration command.  Gateway may trigger the
@@ -1961,6 +2105,7 @@ impl RuntimeServices {
                 ],
                 context_refs: Vec::new(),
                 evidence_refs: Vec::new(),
+                resource_scopes: Vec::new(),
                 allowed_tools: scenario.allowed_tools.clone(),
                 allowed_skills: scenario.allowed_skills.clone(),
                 permission_lease: scenario.permission_lease.clone(),
@@ -2665,6 +2810,7 @@ impl RuntimeServices {
                         ],
                         context_refs: Vec::new(),
                         evidence_refs: Vec::new(),
+                        resource_scopes: definition.resource_scopes.clone(),
                         allowed_tools: definition.allowed_tool_contract_refs.clone(),
                         allowed_skills: definition.allowed_skill_refs.clone(),
                         permission_lease: definition.permission_lease.clone(),
@@ -2755,6 +2901,7 @@ impl RuntimeServices {
                         mission_id: None,
                         parent_execution: None,
                         selection_mode: TeamSelectionMode::Explicit,
+                        strategy_binding: None,
                         template_selector: selector.clone(),
                         objective: definition.objective.clone(),
                         acceptance: definition.acceptance.clone(),
@@ -2977,6 +3124,7 @@ fn evolution_team_request(
         mission_id: None,
         parent_execution: None,
         selection_mode: TeamSelectionMode::Explicit,
+        strategy_binding: None,
         template_selector: TeamTemplateSelector::Exact {
             revision_ref: revision_ref.clone(),
         },
@@ -2996,7 +3144,7 @@ fn evolution_team_request(
             1,
         )),
         managed_invocation: None,
-        resource_scopes: Vec::new(),
+        resource_scopes: scenario.resource_scopes.clone(),
     }
 }
 
@@ -3210,6 +3358,36 @@ mod tests {
     use memory::SessionRecord;
 
     #[test]
+    fn task_completion_lifecycle_receipt_is_idempotent_by_correlation_key() {
+        let services = RuntimeServices::in_memory().expect("in-memory runtime services");
+        let event = TaskLifecycleEvent {
+            task_id: "task-completion-1".to_string(),
+            kind: TaskLifecycleKind::Completed,
+            payload: serde_json::json!({
+                "task_id": "task-completion-1",
+                "status": "completed",
+                "correlation_id": "correlation-1"
+            }),
+        };
+        let first = services
+            .record_task_lifecycle_once(event.clone(), "task-completed:correlation-1")
+            .expect("first completion event");
+        let replay = services
+            .record_task_lifecycle_once(event, "task-completed:correlation-1")
+            .expect("idempotent completion replay");
+        assert_eq!(first.event_id, replay.event_id);
+        assert_eq!(first.commit_cursor, replay.commit_cursor);
+        assert_eq!(
+            services
+                .event_store
+                .list_stream("task-completion-1")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn runtime_skill_catalog_is_available_to_delegated_execution_services() {
         let services = RuntimeServices::in_memory().expect("in-memory runtime services");
         let profile = SkillCapabilityProfile {
@@ -3289,6 +3467,18 @@ mod tests {
             packet: AgentTaskPacket,
             selection: crate::AgentModelSelection,
         ) -> Result<AgentReturnPacket, String> {
+            let mut evidence_refs = packet.evidence_refs.clone();
+            evidence_refs.push(harness_contract::context::EvidenceAccessRef::durable(
+                harness_contract::context::EvidenceRef::new(
+                    "tool",
+                    format!("materialized:{}", packet.node_id),
+                ),
+                "a".repeat(64),
+                1,
+                "application/json",
+                format!("session-event://{}/1", packet.session_id),
+                format!("session:{}", packet.session_id),
+            ));
             Ok(AgentReturnPacket {
                 run_id: packet.run_id,
                 agent_id: packet.agent_id,
@@ -3301,17 +3491,27 @@ mod tests {
                 attempt: packet.attempt,
                 expected_graph_revision: packet.expected_graph_revision,
                 status: AgentTerminalStatus::Completed,
-                outcome: "verified agent result".into(),
-                acceptance: vec!["completed".into()],
-                evidence_refs: Vec::new(),
+                outcome: serde_json::json!({
+                    "summary": "verified agent result",
+                    "evidence": "materialized durable tool evidence",
+                    "completed": "verified"
+                })
+                .to_string(),
+                acceptance: packet.acceptance,
+                evidence_refs,
                 changes: Vec::new(),
+                runtime_change_receipts: Vec::new(),
                 conflicts: Vec::new(),
                 unresolved: Vec::new(),
                 input_tokens: 5,
                 output_tokens: 3,
+                cached_tokens: 0,
                 model: selection.model,
                 provider: selection.provider,
-                tool_calls: 0,
+                tool_calls: 1,
+                duplicate_tool_calls: 0,
+                runtime_write_attempt_paths: Vec::new(),
+                runtime_observed_resource_scopes: Vec::new(),
                 failure: None,
             })
         }
@@ -3336,6 +3536,18 @@ mod tests {
             self.max_active.fetch_max(active, Ordering::SeqCst);
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             self.active.fetch_sub(1, Ordering::SeqCst);
+            let mut evidence_refs = packet.evidence_refs.clone();
+            evidence_refs.push(harness_contract::context::EvidenceAccessRef::durable(
+                harness_contract::context::EvidenceRef::new(
+                    "tool",
+                    format!("materialized:{}", packet.node_id),
+                ),
+                "a".repeat(64),
+                1,
+                "application/json",
+                format!("session-event://{}/1", packet.session_id),
+                format!("session:{}", packet.session_id),
+            ));
             Ok(AgentReturnPacket {
                 run_id: packet.run_id,
                 agent_id: packet.agent_id,
@@ -3348,17 +3560,27 @@ mod tests {
                 attempt: packet.attempt,
                 expected_graph_revision: packet.expected_graph_revision,
                 status: AgentTerminalStatus::Completed,
-                outcome: "parallel agent result".into(),
-                acceptance: vec!["completed".into()],
-                evidence_refs: Vec::new(),
+                outcome: serde_json::json!({
+                    "summary": "parallel agent result",
+                    "evidence": "materialized durable tool evidence",
+                    "completed": "verified"
+                })
+                .to_string(),
+                acceptance: packet.acceptance,
+                evidence_refs,
                 changes: Vec::new(),
+                runtime_change_receipts: Vec::new(),
                 conflicts: Vec::new(),
                 unresolved: Vec::new(),
                 input_tokens: 5,
                 output_tokens: 3,
+                cached_tokens: 0,
                 model: selection.model,
                 provider: selection.provider,
-                tool_calls: 0,
+                tool_calls: 1,
+                duplicate_tool_calls: 0,
+                runtime_write_attempt_paths: Vec::new(),
+                runtime_observed_resource_scopes: Vec::new(),
                 failure: None,
             })
         }
@@ -3419,22 +3641,26 @@ mod tests {
             left.executor_registry().available_kinds(),
             right.executor_registry().available_kinds()
         );
-        assert!(left
-            .executor_registry()
-            .available_kinds()
-            .contains("inline_model"));
-        assert!(left
-            .executor_registry()
-            .available_kinds()
-            .contains("tool_batch"));
-        assert!(left
-            .executor_registry()
-            .available_kinds()
-            .contains("session_dispatch"));
-        assert!(left
-            .executor_registry()
-            .available_kinds()
-            .contains("cross_plane_connector"));
+        assert!(
+            left.executor_registry()
+                .available_kinds()
+                .contains("inline_model")
+        );
+        assert!(
+            left.executor_registry()
+                .available_kinds()
+                .contains("tool_batch")
+        );
+        assert!(
+            left.executor_registry()
+                .available_kinds()
+                .contains("session_dispatch")
+        );
+        assert!(
+            left.executor_registry()
+                .available_kinds()
+                .contains("cross_plane_connector")
+        );
         assert!(!Arc::ptr_eq(
             left.cross_plane_connector_executor(),
             right.cross_plane_connector_executor()
@@ -3535,11 +3761,13 @@ mod tests {
         services
             .refresh_definition_catalog()
             .expect("catalog refresh");
-        assert!(services
-            .agent_runtime()
-            .catalog()
-            .get(definition_id.as_str())
-            .is_none());
+        assert!(
+            services
+                .agent_runtime()
+                .catalog()
+                .get(definition_id.as_str())
+                .is_none()
+        );
     }
 
     #[test]
@@ -3658,14 +3886,18 @@ mod tests {
             .agents()
             .read_revision(&revision_ref)
             .expect("candidate revision");
-        assert!(revision
-            .agent_markdown
-            .contains("repeated evidence validation failure"));
+        assert!(
+            revision
+                .agent_markdown
+                .contains("repeated evidence validation failure")
+        );
         assert!(services.evolution_release_reviews().unwrap().is_empty());
-        assert!(services
-            .consider_agent_evolution(&trigger)
-            .expect("idempotent planner")
-            .is_none());
+        assert!(
+            services
+                .consider_agent_evolution(&trigger)
+                .expect("idempotent planner")
+                .is_none()
+        );
     }
 
     #[test]
@@ -3916,11 +4148,13 @@ mod tests {
         services
             .refresh_definition_catalog()
             .expect("catalog refresh");
-        assert!(services
-            .agent_runtime()
-            .catalog()
-            .get("workspace/external/reviewer")
-            .is_none());
+        assert!(
+            services
+                .agent_runtime()
+                .catalog()
+                .get("workspace/external/reviewer")
+                .is_none()
+        );
     }
 
     #[test]
@@ -4034,10 +4268,12 @@ mod tests {
             .clone()
             .expect("stable graph id");
         let graph = services.graph_state_store().load(&graph_id).unwrap();
-        assert!(graph
-            .node_statuses
-            .values()
-            .all(|status| *status == ExecutionNodeStatus::WaitingExternal));
+        assert!(
+            graph
+                .node_statuses
+                .values()
+                .all(|status| *status == ExecutionNodeStatus::WaitingExternal)
+        );
 
         let target_outbox = store
             .claim_session_runtime_outbox(
@@ -4161,9 +4397,11 @@ mod tests {
             services.workspace_root(),
             "0.9.472",
         );
-        assert!(importer
-            .import_receipt_file(temp.path().join("missing-receipt.json"))
-            .is_err());
+        assert!(
+            importer
+                .import_receipt_file(temp.path().join("missing-receipt.json"))
+                .is_err()
+        );
 
         let graph = harness_contract::execution_graph::ExecutionGraph::new("blocked");
         let graph_id = graph.id.clone();
@@ -4327,6 +4565,7 @@ mod tests {
             constraints: Vec::new(),
             context_refs: Vec::new(),
             evidence_refs: Vec::new(),
+            resource_scopes: Vec::new(),
             allowed_tools: Vec::new(),
             allowed_skills: Vec::new(),
             permission_lease: "read_only".into(),
@@ -4421,7 +4660,7 @@ mod tests {
             let agent_id = format!("researcher-slot-{index}");
             let node_id = format!("binding-agent-node-{index}");
             let intent = AgentTaskIntent {
-                selected_agent_id: None,
+                selected_agent_id: Some("builtin/cowd/direct".to_string()),
                 definition_ref: None,
                 granted_capabilities: Vec::new(),
                 run_id: format!("binding-run-{index}"),
@@ -4435,10 +4674,26 @@ mod tests {
                 expected_graph_revision: 0,
                 objective: format!("research isolated domain {index}"),
                 acceptance: vec!["evidence".to_string()],
-                constraints: vec![format!("role_slot:researcher-{index}")],
+                constraints: vec![
+                    format!("role_slot:researcher-{index}"),
+                    format!(
+                        "team_acceptance_contract:{}",
+                        serde_json::to_string(&vec![
+                            harness_contract::team::TeamAcceptanceRequirement {
+                                criterion: "evidence".to_string(),
+                                check:
+                                    harness_contract::team::TeamAcceptanceCheck::ScopedEvidence {
+                                        scopes: vec![format!("read:binding-domain-{index}")],
+                                    },
+                            },
+                        ])
+                        .expect("team acceptance contract")
+                    ),
+                ],
                 context_refs: Vec::new(),
                 evidence_refs: Vec::new(),
-                allowed_tools: Vec::new(),
+                resource_scopes: vec![format!("read:binding-domain-{index}")],
+                allowed_tools: vec!["read_file".to_string()],
                 allowed_skills: Vec::new(),
                 permission_lease: "read_only".to_string(),
                 model_lease: "fast".to_string(),
@@ -4466,13 +4721,23 @@ mod tests {
         let graph = services
             .compile_graph_agent_intents(graph)
             .expect("bind graph");
+        assert!(graph.nodes.iter().all(|node| {
+            serde_json::from_str::<AgentTaskPacket>(&node.payload_ref)
+                .ok()
+                .is_some_and(|packet| {
+                    packet
+                        .constraints
+                        .iter()
+                        .any(|constraint| constraint.starts_with("team_acceptance_contract:"))
+                })
+        }));
 
         let report = services
             .graph_runner()
             .start(graph)
             .await
             .expect("run graph");
-        assert_eq!(report.completed, 8);
+        assert_eq!(report.completed, 8, "parallel agent report: {report:?}");
         let snapshots = services
             .agent_runtime()
             .list()
@@ -4547,10 +4812,12 @@ mod tests {
             .graph_state_store()
             .load(&projection.graph_id)
             .expect("canonical graph");
-        assert!(graph
-            .node_statuses
-            .values()
-            .all(|status| *status == ExecutionNodeStatus::Completed));
+        assert!(
+            graph
+                .node_statuses
+                .values()
+                .all(|status| *status == ExecutionNodeStatus::Completed)
+        );
         let team_bindings = graph
             .nodes
             .iter()
@@ -4573,9 +4840,11 @@ mod tests {
         assert!(team_bindings.iter().all(|binding| {
             binding.data_lease.team_id.as_deref() == Some("team-runtime-integration")
         }));
-        assert!(services.team_runtime().projection_json()["teams"]
-            .as_array()
-            .is_some_and(|teams| teams.len() == 1));
+        assert!(
+            services.team_runtime().projection_json()["teams"]
+                .as_array()
+                .is_some_and(|teams| teams.len() == 1)
+        );
     }
 
     #[tokio::test]
@@ -4623,24 +4892,56 @@ mod tests {
                             boundary: "only architecture-a".to_string(),
                             evidence_responsibility: "source evidence for architecture-a"
                                 .to_string(),
+                            capability_cropped_refs: vec!["read:architecture-a".to_string()],
+                            scope_hash: harness_contract::team::focus_scope_hash(
+                                "researcher",
+                                "only architecture-a",
+                                &["read:architecture-a".to_string()],
+                            ),
+                            overlap_budget_bp: 0,
+                            novelty_target_bp: 2_500,
                             output_contract: vec!["findings".to_string(), "evidence".to_string()],
+                            output_acceptance: vec!["findings".to_string(), "evidence".to_string()],
                         },
                         harness_contract::team::FocusPartitionSlot {
                             focus_id: "architecture-b".to_string(),
                             boundary: "only architecture-b".to_string(),
                             evidence_responsibility: "source evidence for architecture-b"
                                 .to_string(),
+                            capability_cropped_refs: vec!["read:architecture-b".to_string()],
+                            scope_hash: harness_contract::team::focus_scope_hash(
+                                "researcher",
+                                "only architecture-b",
+                                &["read:architecture-b".to_string()],
+                            ),
+                            overlap_budget_bp: 0,
+                            novelty_target_bp: 2_500,
                             output_contract: vec!["findings".to_string(), "evidence".to_string()],
+                            output_acceptance: vec!["findings".to_string(), "evidence".to_string()],
                         },
                         harness_contract::team::FocusPartitionSlot {
                             focus_id: "architecture-c".to_string(),
                             boundary: "only architecture-c".to_string(),
                             evidence_responsibility: "source evidence for architecture-c"
                                 .to_string(),
+                            capability_cropped_refs: vec!["read:architecture-c".to_string()],
+                            scope_hash: harness_contract::team::focus_scope_hash(
+                                "researcher",
+                                "only architecture-c",
+                                &["read:architecture-c".to_string()],
+                            ),
+                            overlap_budget_bp: 0,
+                            novelty_target_bp: 2_500,
                             output_contract: vec!["findings".to_string(), "evidence".to_string()],
+                            output_acceptance: vec!["findings".to_string(), "evidence".to_string()],
                         },
                     ],
                 }],
+                resource_scopes: vec![
+                    "read:architecture-a".to_string(),
+                    "read:architecture-b".to_string(),
+                    "read:architecture-c".to_string(),
+                ],
                 ..team_request(
                     "team-runtime-fanout",
                     "team-runtime-session",
@@ -4670,6 +4971,7 @@ mod tests {
             mission_id: None,
             parent_execution: None,
             selection_mode: TeamSelectionMode::Explicit,
+            strategy_binding: None,
             template_selector: TeamTemplateSelector::LatestStable {
                 template_id: TeamTemplateDefinitionId::new(DefinitionScope::Builtin, template_id)
                     .expect("builtin Team template id"),
@@ -4680,11 +4982,19 @@ mod tests {
             role_binding_overrides: Vec::new(),
             cardinality_overrides: Vec::new(),
             focus_partition_plans: Vec::new(),
-            permission_lease: "read_only".to_string(),
+            permission_lease: if template_id == "cowd/execute-review" {
+                "workspace-write".to_string()
+            } else {
+                "read_only".to_string()
+            },
             model_lease: model_lease.to_string(),
             budget_lease: None,
             managed_invocation: None,
-            resource_scopes: Vec::new(),
+            resource_scopes: vec![if template_id == "cowd/execute-review" {
+                "write:crates/runtime".to_string()
+            } else {
+                "read:crates/runtime".to_string()
+            }],
         }
     }
 

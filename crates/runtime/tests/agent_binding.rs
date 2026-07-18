@@ -68,6 +68,7 @@ fn binding_compiler_intersects_capabilities_and_freezes_data_leases_into_a_snaps
             constraints: Vec::new(),
             context_refs: Vec::new(),
             evidence_refs: Vec::new(),
+            resource_scopes: Vec::new(),
             allowed_tools: Vec::new(),
             allowed_skills: Vec::new(),
             permission_lease: "read_only".to_string(),

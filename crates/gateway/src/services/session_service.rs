@@ -306,6 +306,15 @@ impl SessionService {
         }
     }
 
+    pub(crate) async fn list_stored_sessions(
+        &self,
+    ) -> Result<Option<Vec<SessionRecord>>, MemoryError> {
+        match self.kernel() {
+            Some(kernel) => kernel.list_stored_sessions().await,
+            None => Ok(None),
+        }
+    }
+
     pub(crate) async fn stored_session(
         &self,
         session_id: &str,
@@ -359,13 +368,18 @@ impl SessionService {
         }
     }
 
-    pub(crate) async fn search_stored_messages(
+    pub(crate) async fn search_stored_messages_in_sessions(
         &self,
         query: &str,
+        session_ids: &[String],
         limit: usize,
     ) -> Result<Option<Vec<SessionMessage>>, MemoryError> {
         match self.kernel() {
-            Some(kernel) => kernel.search_stored_messages(query, limit).await,
+            Some(kernel) => {
+                kernel
+                    .search_stored_messages_in_sessions(query, session_ids, limit)
+                    .await
+            }
             None => Ok(None),
         }
     }

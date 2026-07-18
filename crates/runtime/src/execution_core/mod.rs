@@ -29,9 +29,9 @@ pub use goal::{policy::InterventionPolicy, GoalProjection, GoalStore};
 pub use graph::{
     ExecutionCommitService, ExecutionCompileError, ExecutionCompileRequest, ExecutionGraphCompiler,
     ExecutionGraphHost, ExecutionGraphHostReceipt, ExecutionGraphReplan, ExecutionGraphRunner,
-    ExecutionGraphStateStore, ExecutionRunnerError, NodeExecutionContext, NodeExecutionOutcome,
-    NodeExecutionTicket, NodeExecutor, NodeExecutorError, NodeExecutorRegistry, ScopedNodeBackend,
-    ScopedNodeExecutor,
+    ExecutionGraphStateStore, ExecutionRunnerError, ExecutionStateStoreError, NodeExecutionContext,
+    NodeExecutionOutcome, NodeExecutionTicket, NodeExecutor, NodeExecutorError,
+    NodeExecutorRegistry, ScopedNodeBackend, ScopedNodeExecutor,
 };
 pub use model_affordance::{
     runtime_execution_guidance_prompt, runtime_execution_guidance_prompt_with_tool_exposure,
@@ -72,7 +72,8 @@ pub use strategy_decision::{
     action_selection_report_for_decision, build_runtime_action_selection_report,
     build_runtime_execution_decision, RuntimeActionSelectionReport, RuntimeExecutionActionHint,
     RuntimeExecutionDecision, RuntimeExecutionPatternCandidate, StrategyDecisionEngine,
-    StrategyLease, StrategyResourceHealth,
+    StrategyLease, StrategyResourceHealth, TurnStrategyActualOutcome, TurnStrategyDecisionState,
+    TurnStrategyDecisionStatus,
 };
 pub use tool_dag::{
     tool_dag_from_rewoo, ToolDagEdge, ToolDagEdgeKind, ToolDagPlan, ToolDagSafetySummary,

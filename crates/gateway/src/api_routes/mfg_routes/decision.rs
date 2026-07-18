@@ -22,7 +22,7 @@ pub(super) async fn mfg_skill_get_handler(
         .services
         .mfg
         .skill_manifest(&id)
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "MFG skill not found"))?;
+        .ok_or_else(|| mfg_api_error(StatusCode::NOT_FOUND, "MFG skill not found"))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.skill",
         "skill": skill,
@@ -36,17 +36,17 @@ pub(super) async fn mfg_command_center_handler(
         .services
         .mfg
         .health(&state.config_home)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let attention = state
         .services
         .mfg
         .list_attention(&state.config_home, 10)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let changes = state
         .services
         .mfg
         .list_changes(&state.config_home, 10)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let skills = state.services.mfg.skill_pack();
     Ok(Json(serde_json::json!({
         "kind": "mfg.command_center",
@@ -73,22 +73,22 @@ pub(super) async fn mfg_command_center_live_handler(
         .services
         .mfg
         .list_incidents(&state.config_home, 12)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let attention = state
         .services
         .mfg
         .list_attention(&state.config_home, 12)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let action_queue = state
         .services
         .mfg
         .list_recent_action_executions(&state.config_home, 12)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let skill_queue = state
         .services
         .mfg
         .list_recent_skill_runs(&state.config_home, 12)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.command_center.live",
         "incident_queue": incidents,
@@ -108,42 +108,42 @@ pub(super) async fn mfg_decision_trace_handler(
         .services
         .mfg
         .list_source_packs(&state.config_home, 1)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .into_iter()
         .next();
     let fact = state
         .services
         .mfg
         .list_facts(&state.config_home, 1)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .into_iter()
         .next();
     let entity = state
         .services
         .mfg
         .list_entities(&state.config_home, 1)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .into_iter()
         .next();
     let metric = state
         .services
         .mfg
         .list_metric_definitions(&state.config_home)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .into_iter()
         .next();
     let attention = state
         .services
         .mfg
         .list_attention(&state.config_home, 1)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .into_iter()
         .next();
     let evidence = state
         .services
         .mfg
         .list_evidence_packets(&state.config_home, 1)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .into_iter()
         .next();
     let incident = if let Some(id) = query.incident_id.as_deref() {
@@ -151,13 +151,13 @@ pub(super) async fn mfg_decision_trace_handler(
             .services
             .mfg
             .get_incident(&state.config_home, id)
-            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+            .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
     } else {
         state
             .services
             .mfg
             .list_incidents(&state.config_home, 1)
-            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+            .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
             .into_iter()
             .next()
     };
@@ -166,7 +166,7 @@ pub(super) async fn mfg_decision_trace_handler(
             .services
             .mfg
             .latest_analysis_for_incident(&state.config_home, &incident.incident_id)
-            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+            .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
     } else {
         None
     };
@@ -174,7 +174,7 @@ pub(super) async fn mfg_decision_trace_handler(
         .services
         .mfg
         .list_recent_action_executions(&state.config_home, 1)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .into_iter()
         .next();
     let report = if let Some(id) = query.report_id.as_deref() {
@@ -182,23 +182,23 @@ pub(super) async fn mfg_decision_trace_handler(
             .services
             .mfg
             .get_cockpit_report(&state.config_home, id)
-            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+            .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
     } else {
         None
     };
     let report = match report {
         Some(report)
             if cockpit_report_accessible_to(&state, &report, &principal).map_err(|error| {
-                api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+                mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
             })? =>
         {
             Some(report)
         }
         Some(_) => {
-            return Err(api_error(
-                StatusCode::FORBIDDEN,
-                "MFG cockpit report is not accessible",
-            ))
+            return Err(mfg_api_error(
+                StatusCode::NOT_FOUND,
+                "MFG cockpit report was not found in the verified principal scope",
+            ));
         }
         None => None,
     };

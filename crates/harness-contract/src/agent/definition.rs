@@ -749,6 +749,7 @@ impl AgentBindingSnapshot {
             constraints: intent.constraints,
             context_refs: intent.context_refs,
             evidence_refs: intent.evidence_refs,
+            resource_scopes: intent.resource_scopes,
             allowed_tools: self.tool_contract_refs.clone(),
             allowed_skills: self.skill_refs.clone(),
             permission_lease: intent.permission_lease,

@@ -54,6 +54,7 @@ impl SynthesizeBackend for TeamResultReducer {
             .await
             .map_err(|error| error.to_string())?;
         let mut summaries = Vec::new();
+        let mut supporting_outputs = Vec::new();
         let mut evidence = Vec::new();
         let mut usage = ExecutionUsage::default();
         let mut blockers = Vec::new();
@@ -97,6 +98,9 @@ impl SynthesizeBackend for TeamResultReducer {
                 AgentTerminalStatus::Completed => {
                     if terminal_agent_nodes.contains(&node.id) {
                         summaries.push(format!("## {}\n{}", packet.agent_id, returned.outcome));
+                    } else {
+                        supporting_outputs
+                            .push(format!("## {}\n{}", packet.agent_id, returned.outcome));
                     }
                 }
                 AgentTerminalStatus::Failed
@@ -131,7 +135,13 @@ impl SynthesizeBackend for TeamResultReducer {
             // completed evidence and name the gap for the parent turn. This
             // keeps a single unavailable synthesis worker from erasing a
             // real, auditable team result.
-            let mut final_answer = summaries.join("\n\n");
+            let mut final_answer = String::new();
+            if !supporting_outputs.is_empty() {
+                final_answer.push_str("# Committed supporting role outputs\n\n");
+                final_answer.push_str(&supporting_outputs.join("\n\n"));
+                final_answer.push_str("\n\n# Terminal review/synthesis\n\n");
+            }
+            final_answer.push_str(&summaries.join("\n\n"));
             if !blockers.is_empty() {
                 final_answer.push_str("\n\n## Unresolved team role outcomes\n");
                 for blocker in blockers {

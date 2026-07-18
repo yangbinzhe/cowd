@@ -228,6 +228,13 @@ pub fn action_coverage_summary() -> Vec<&'static str> {
         .collect()
 }
 
+pub fn mfg_tui_read_coverage() -> Vec<app_mfg_contract::MfgRouteId> {
+    app_mfg_contract::mfg_tui_read_route_contracts()
+        .into_iter()
+        .map(|route| route.route_id)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,6 +253,11 @@ mod tests {
         include_str!("../../../gateway/src/api_routes/harness_eval_routes.rs");
     const EVOLUTION_ROUTES: &str =
         include_str!("../../../gateway/src/api_routes/evolution_routes.rs");
+    const MFG_PANEL: &str = include_str!("../components/mfg_operations_panel.rs");
+    const MFG_STATE: &str = include_str!("runtime_control_store.rs");
+    const MFG_RUNNER: &str = include_str!("../gateway/runner.rs");
+    const MFG_ROUTES: &str = include_str!("../../../gateway/src/api_routes/mfg_routes.rs");
+    const MFG_ACTION_REGISTRY: &str = include_str!("../workbench/action_registry.rs");
 
     #[test]
     fn action_coverage_has_expected_core_actions() {
@@ -262,6 +274,112 @@ mod tests {
         assert!(ids.contains(&"harness_eval.run_smoke"));
         assert!(ids.contains(&"evolution.overview"));
         assert!(ids.len() >= 23);
+    }
+
+    #[test]
+    fn mfg_read_coverage_is_contract_derived_and_wired_to_client_state_and_panel() {
+        let routes = mfg_tui_read_coverage();
+        let p0_expected = app_mfg_contract::mfg_tui_p0_read_route_contracts()
+            .into_iter()
+            .map(|route| route.route_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = routes
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let panel = crate::components::mfg_operations_panel::MFG_PANEL_READ_ROUTE_IDS
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(routes.len(), 34);
+        assert_eq!(expected.len(), routes.len());
+        assert!(routes.contains(&app_mfg_contract::MfgRouteId::LiveSnapshot));
+        assert!(GATEWAY_CLIENT.contains("mfg_live_snapshot"));
+        assert!(GATEWAY_CLIENT.contains("subscribe_mfg_live"));
+        assert!(MFG_STATE.contains("apply_live_envelope"));
+        assert_eq!(panel, p0_expected);
+        assert!(
+            routes
+                .iter()
+                .all(|route| crate::runtime_control_store::mfg_route_section(*route).is_some())
+        );
+        assert!(GATEWAY_CLIENT.contains("mfg_tui_read"));
+        assert!(GATEWAY_CLIENT.contains("mfg_tui_route_path"));
+        assert!(MFG_STATE.contains("MfgOperationsState"));
+        assert!(MFG_STATE.contains("p1_documents"));
+        assert!(MFG_STATE.contains("selection_revision"));
+        assert!(MFG_PANEL.contains("render_state"));
+        assert!(MFG_PANEL.contains("Insights"));
+        assert!(MFG_PANEL.contains("Backlinks"));
+        for route in app_mfg_contract::mfg_tui_read_route_contracts()
+            .into_iter()
+            .filter(|route| {
+                route
+                    .consumers
+                    .contains(&app_mfg_contract::MfgConsumer::TuiP1)
+            })
+        {
+            assert!(
+                MFG_RUNNER.contains(&format!("{:?}", route.route_id)),
+                "{} is not fetched by the TUI runner",
+                route.route_id.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn mfg_operational_actions_have_five_way_exact_coverage() {
+        let canonical = app_mfg_contract::mfg_tui_action_contracts();
+        let canonical_ids = canonical
+            .iter()
+            .map(|action| action.action_id.as_str().to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        let registered = crate::workbench::action_registry::registered_mfg_actions();
+        let registered_ids = registered
+            .iter()
+            .map(|action| action.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(!canonical_ids.is_empty());
+        assert_eq!(registered_ids, canonical_ids);
+        assert!(MFG_ACTION_REGISTRY.contains("registered_mfg_actions"));
+        assert!(GATEWAY_CLIENT.contains("pub async fn mfg_action"));
+        assert!(MFG_RUNNER.contains("start_pending_mfg_action"));
+        assert!(MFG_RUNNER.contains("MfgActionAccepted"));
+        assert!(MFG_RUNNER.contains("MfgActionFailed"));
+        assert!(MFG_STATE.contains("build_mfg_action_draft"));
+        assert!(MFG_STATE.contains("apply_action_success"));
+        assert!(MFG_STATE.contains("apply_action_error"));
+        assert!(MFG_PANEL.contains("Governed actions"));
+        assert!(MFG_PANEL.contains("visible_action_contracts"));
+
+        for action in canonical {
+            let route = app_mfg_contract::mfg_route_contract(action.route_id)
+                .expect("active TUI action route");
+            assert_eq!(route.method, "POST");
+            assert!(
+                !action.required_capabilities.is_empty(),
+                "{} has no capability guard",
+                action.action_id.as_str()
+            );
+            assert!(
+                MFG_ROUTES.contains(&route.path),
+                "{} gateway route is not mounted: {}",
+                action.action_id.as_str(),
+                route.path
+            );
+            let variant = format!("{:?}", action.action_id)
+                .trim_start_matches("Route(")
+                .trim_start_matches("Multi(")
+                .trim_end_matches(')')
+                .to_string();
+            assert!(
+                MFG_STATE.contains(&variant),
+                "{} has no request builder branch",
+                action.action_id.as_str()
+            );
+        }
+        assert!(!canonical_ids.contains("mfg.alert.command"));
+        assert!(!canonical_ids.contains("mfg.live.snapshot"));
     }
 
     #[test]

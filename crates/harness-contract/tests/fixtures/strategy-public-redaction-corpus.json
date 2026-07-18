@@ -1,0 +1,19 @@
+[
+  "/etc/shadow",
+  "path:/etc/shadow",
+  "[secret](/etc/shadow)",
+  "url(/etc/shadow)",
+  "file:///srv/private",
+  "C:\\secrets\\operator",
+  "../relative-secret",
+  "..\\windows-secret",
+  "write>/etc/shadow",
+  "run;/srv/private",
+  "read|/tmp/secret",
+  "input</var/private",
+  "read:/etc/shadow",
+  "write:/var/private",
+  "worktree:C:\\secret",
+  "agent-/etc/shadow",
+  "scope_/srv/private"
+]

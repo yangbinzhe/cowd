@@ -1,21 +1,22 @@
 use std::{
     collections::{BTreeSet, VecDeque},
     convert::Infallible,
+    path::PathBuf,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
-    extract::{Path, Query, State as AxumState},
+    Json, Router,
+    extract::{Extension, Path, Query, State as AxumState},
     http::{HeaderMap, StatusCode},
     response::{
-        sse::{Event, KeepAlive, Sse},
         IntoResponse,
+        sse::{Event, KeepAlive, Sse},
     },
     routing::{get, post},
-    Json, Router,
 };
-use futures::{stream::Stream, StreamExt};
+use futures::{StreamExt, stream::Stream};
 use harness_contract::turn::{
     InputRoutingDecision, InputSourceKind, SessionInputEnvelope, SessionInputId, TurnId,
 };
@@ -27,7 +28,10 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::event_bus::SessionEventBus;
 use crate::task_kernel::TaskRecord;
 
-use super::{AppState, ErrorResponse};
+use super::{
+    AppState, AuthenticatedPrincipal, ErrorResponse,
+    session_routes::{SessionAccess, authorize_session_access},
+};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -239,6 +243,7 @@ pub(super) fn runtime_run_completed_payload(
 async fn send_message(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(body): Json<SendMessageRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
@@ -249,7 +254,36 @@ async fn send_message(
             }),
         )
     })?;
+    let session_exists = state
+        .services
+        .session
+        .session_exists(&id)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to resolve session ownership: {error}"),
+                }),
+            )
+        })?;
+    if session_exists || runtime_service.has_active_session(&id) {
+        authorize_session_access(&state, &principal, &id, SessionAccess::Write).await?;
+    }
+    // The durable record is the authority boundary, not proof that this
+    // Gateway process has an active Runtime instance.  A permitted owner must
+    // still restore a cold session before ingress; conversely the foreign
+    // check above runs before activation so a guessed id cannot warm or
+    // mutate another principal's session.
     if !runtime_service.has_active_session(&id) {
+        let mut request = crate::unified_session_manager::EnsureSessionRequest::new(
+            &id,
+            None,
+            crate::unified_session_manager::SessionSource::WebUi,
+        );
+        request.owner_principal_id = Some(principal.0.claims().principal_id.clone());
+        request.allow_legacy_owner_migration = principal.0.is_human_interactive()
+            && principal.0.has_capability("runtime.maintenance.manage");
         state
             .services
             .session_manager
@@ -262,11 +296,7 @@ async fn send_message(
                     }),
                 )
             })?
-            .ensure_session(crate::unified_session_manager::EnsureSessionRequest::new(
-                &id,
-                None,
-                crate::unified_session_manager::SessionSource::WebUi,
-            ))
+            .ensure_session(request)
             .await
             .map_err(|error| {
                 (
@@ -366,7 +396,9 @@ async fn send_message(
 async fn get_session_input_projection(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    authorize_session_access(&state, &principal, &id, SessionAccess::Read).await?;
     let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -392,8 +424,10 @@ async fn get_session_input_projection(
 async fn get_turn_inbox(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Query(params): Query<TurnInboxParams>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    authorize_session_access(&state, &principal, &id, SessionAccess::Read).await?;
     let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -420,7 +454,9 @@ async fn get_turn_inbox(
 async fn get_turn_inbox_by_path(
     AxumState(state): AxumState<Arc<AppState>>,
     Path((id, turn_id)): Path<(String, String)>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    authorize_session_access(&state, &principal, &id, SessionAccess::Read).await?;
     let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -446,8 +482,10 @@ async fn get_turn_inbox_by_path(
 async fn cancel_session_input(
     AxumState(state): AxumState<Arc<AppState>>,
     Path((id, input_id)): Path<(String, String)>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(body): Json<SessionInputCancelRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    authorize_session_access(&state, &principal, &id, SessionAccess::Write).await?;
     let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -486,8 +524,10 @@ async fn cancel_session_input(
 async fn reclassify_session_input(
     AxumState(state): AxumState<Arc<AppState>>,
     Path((id, input_id)): Path<(String, String)>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(body): Json<SessionInputReclassifyRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    authorize_session_access(&state, &principal, &id, SessionAccess::Write).await?;
     let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -572,8 +612,10 @@ fn render_message_resource_context(
 async fn get_session_messages(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Query(params): Query<GetMessagesParams>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    authorize_session_access(&state, &principal, &id, SessionAccess::Read).await?;
     let offset = params.offset.unwrap_or(0);
     let from_seq = params.from_seq;
     let limit = params.limit.unwrap_or(50).min(500);
@@ -727,11 +769,13 @@ impl Drop for SseStream {
 async fn sse_stream_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(session_id): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Query(query): Query<SessionStreamQuery>,
     headers: HeaderMap,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<ErrorResponse>)> {
+    authorize_session_access(&state, &principal, &session_id, SessionAccess::Read).await?;
     let (tx, rx) = mpsc::channel(256);
-    let bus_tx = tx.clone();
+    let (bus_tx, bus_rx) = mpsc::channel(256);
     let event_bus = state.event_bus();
     let subscription_id = event_bus.subscribe(&session_id, bus_tx).await;
     let resume_cursor = headers
@@ -753,6 +797,14 @@ async fn sse_stream_handler(
         )
         .await;
 
+    spawn_session_stream_authorization_guard(
+        bus_rx,
+        tx.clone(),
+        state.config_home.clone(),
+        principal,
+        session_id.clone(),
+    );
+
     let stream = SseStream {
         rx: ReceiverStream::new(rx),
         session_id,
@@ -762,11 +814,65 @@ async fn sse_stream_handler(
         durable_cursor_order: VecDeque::new(),
     };
 
-    Sse::new(stream).keep_alive(
+    Ok(Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(std::time::Duration::from_secs(15))
             .text("keep-alive"),
-    )
+    ))
+}
+
+/// Bus subscriptions outlive one HTTP poll, therefore auth middleware alone
+/// cannot protect a Session SSE connection.  Forward through a private
+/// channel and revalidate on a bounded cadence without ever blocking Tokio's
+/// worker threads on the broker's Unix socket.  Once revoked, emit exactly one
+/// typed terminal event and stop forwarding before any later durable event.
+fn spawn_session_stream_authorization_guard(
+    mut bus_rx: mpsc::Receiver<String>,
+    tx: mpsc::Sender<String>,
+    config_home: PathBuf,
+    principal: AuthenticatedPrincipal,
+    session_id: String,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                biased;
+                _ = interval.tick() => {
+                    if tx.is_closed() {
+                        break;
+                    }
+                    let config_home = config_home.clone();
+                    let principal = principal.clone();
+                    let check = tokio::task::spawn_blocking(move || {
+                        super::projection_stream_principal_current(&config_home, &principal)
+                    }).await;
+                    let reason = match check {
+                        Ok(Ok(())) => None,
+                        Ok(Err(reason)) => Some(reason),
+                        Err(error) => Some(format!("session stream authorization check aborted: {error}")),
+                    };
+                    if let Some(reason) = reason {
+                        let _ = tx.send(serde_json::json!({
+                            "type": "SessionAuthorizationRevoked",
+                            "session_id": session_id,
+                            "reason": reason,
+                        }).to_string()).await;
+                        break;
+                    }
+                }
+                event = bus_rx.recv() => match event {
+                    Some(event) => {
+                        if tx.send(event).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                },
+            }
+        }
+    });
 }
 
 fn stream_durable_cursor(data: &str) -> Option<u64> {

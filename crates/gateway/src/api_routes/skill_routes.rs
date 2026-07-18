@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use axum::{
+    Json, Router,
     extract::{Path as AxumPath, Query, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
 use provider::{InputMessage, MessageRequest, OutputContentBlock, ProviderClient};
 use serde::Deserialize;
@@ -16,7 +16,7 @@ use crate::services::{
 };
 use skill::SkillActionKind;
 
-use super::{api_error, AppState, ErrorResponse};
+use super::{AppState, ErrorResponse, api_error};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()

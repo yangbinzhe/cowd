@@ -1,12 +1,12 @@
-use crate::tui::TuiSession;
 use crate::reporter::TestRunner;
+use crate::tui::{TuiLaunchConfig, TuiSession};
 
 pub fn has_scenario(name: &str) -> bool {
     matches!(name, "tui_skills_panel" | "tui_skills_hints" | "" | "all")
 }
 
 pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
-    let tui = TuiSession::new("tui-skills")?;
+    let tui = TuiSession::new(TuiLaunchConfig::from_env("tui-skills")?)?;
     tui.wait_until_ready(15)?;
     println!("\n── TUI Skills ──");
 

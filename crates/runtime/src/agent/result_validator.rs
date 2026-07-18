@@ -6,6 +6,8 @@ pub enum AgentResultValidationError {
     MissingOutcome,
     MissingAcceptance,
     MissingEvidence,
+    MissingToolExecution,
+    AcceptanceMismatch,
 }
 
 impl std::fmt::Display for AgentResultValidationError {
@@ -15,6 +17,12 @@ impl std::fmt::Display for AgentResultValidationError {
             Self::MissingOutcome => "completed agent return has no outcome",
             Self::MissingAcceptance => "completed agent return omitted acceptance evaluation",
             Self::MissingEvidence => "completed agent return omitted required evidence",
+            Self::MissingToolExecution => {
+                "completed Team agent return has no successful evidence-producing tool execution"
+            }
+            Self::AcceptanceMismatch => {
+                "completed agent return did not satisfy every Runtime-evaluated acceptance criterion"
+            }
         };
         formatter.write_str(message)
     }
@@ -42,17 +50,242 @@ pub fn validate_agent_return(
     if returned.status == AgentTerminalStatus::Completed && returned.outcome.trim().is_empty() {
         return Err(AgentResultValidationError::MissingOutcome);
     }
-    if returned.status == AgentTerminalStatus::Completed
-        && !task.acceptance.is_empty()
-        && returned.acceptance.is_empty()
-    {
-        return Err(AgentResultValidationError::MissingAcceptance);
-    }
-    if returned.status == AgentTerminalStatus::Completed
-        && !task.evidence_refs.is_empty()
-        && returned.evidence_refs.is_empty()
-    {
-        return Err(AgentResultValidationError::MissingEvidence);
+    if returned.status == AgentTerminalStatus::Completed {
+        if task.team_id.is_some() {
+            let requirements = task
+                .constraints
+                .iter()
+                .find_map(|constraint| constraint.strip_prefix("team_acceptance_contract:"))
+                .and_then(|value| {
+                    serde_json::from_str::<Vec<harness_contract::team::TeamAcceptanceRequirement>>(
+                        value,
+                    )
+                    .ok()
+                })
+                .filter(|requirements| {
+                    requirements.len() == task.acceptance.len()
+                        && requirements
+                            .iter()
+                            .all(|requirement| task.acceptance.contains(&requirement.criterion))
+                })
+                .ok_or(AgentResultValidationError::AcceptanceMismatch)?;
+            if !task
+                .acceptance
+                .iter()
+                .all(|criterion| returned.acceptance.contains(criterion))
+            {
+                return Err(AgentResultValidationError::AcceptanceMismatch);
+            }
+            let requires_new_tool_evidence = requirements.iter().any(|requirement| {
+                matches!(
+                    &requirement.check,
+                    harness_contract::team::TeamAcceptanceCheck::ScopedEvidence { .. }
+                        | harness_contract::team::TeamAcceptanceCheck::WorkspaceChange { .. }
+                        | harness_contract::team::TeamAcceptanceCheck::SourceVerification { .. }
+                        | harness_contract::team::TeamAcceptanceCheck::UpstreamReview
+                        | harness_contract::team::TeamAcceptanceCheck::LegacyEvidenceBound { .. }
+                )
+            });
+            let consumes_upstream = requirements.iter().any(|requirement| {
+                matches!(
+                    &requirement.check,
+                    harness_contract::team::TeamAcceptanceCheck::UpstreamEvidence
+                )
+            });
+            let produced = returned.evidence_refs.iter().any(|evidence| {
+                is_materialized_durable_evidence(evidence)
+                    && !task
+                        .evidence_refs
+                        .iter()
+                        .any(|input| input.evidence_ref == evidence.evidence_ref)
+            });
+            if requires_new_tool_evidence && returned.tool_calls == 0 {
+                return Err(AgentResultValidationError::MissingToolExecution);
+            }
+            if requires_new_tool_evidence && !produced {
+                return Err(AgentResultValidationError::MissingEvidence);
+            }
+            if consumes_upstream
+                && !task.evidence_refs.iter().any(|input| {
+                    is_materialized_durable_evidence(input)
+                        && returned
+                            .evidence_refs
+                            .iter()
+                            .any(|evidence| evidence.evidence_ref == input.evidence_ref)
+                })
+            {
+                return Err(AgentResultValidationError::MissingEvidence);
+            }
+            if !requires_new_tool_evidence && !consumes_upstream {
+                return Err(AgentResultValidationError::AcceptanceMismatch);
+            }
+        } else {
+            if !task.acceptance.is_empty() && returned.acceptance.is_empty() {
+                return Err(AgentResultValidationError::MissingAcceptance);
+            }
+            if !task.evidence_refs.is_empty() && returned.evidence_refs.is_empty() {
+                return Err(AgentResultValidationError::MissingEvidence);
+            }
+        }
     }
     Ok(())
+}
+
+#[must_use]
+pub(crate) fn is_materialized_durable_evidence(
+    evidence: &harness_contract::context::EvidenceAccessRef,
+) -> bool {
+    evidence.is_durable()
+        && evidence.bytes > 0
+        && !evidence.sha256.trim().is_empty()
+        && !evidence.retrieval_selector.trim().is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harness_contract::{
+        agent::{AgentReturnPacket, AgentTaskPacket},
+        context::{ContextBudgetLeaseRef, EvidenceAccessRef, EvidenceRef},
+    };
+
+    fn team_task() -> AgentTaskPacket {
+        AgentTaskPacket {
+            run_id: "run".to_string(),
+            agent_id: "agent".to_string(),
+            task_id: "task".to_string(),
+            session_id: "session".to_string(),
+            mission_id: None,
+            team_id: Some("team".to_string()),
+            graph_id: "graph".to_string(),
+            node_id: "node".to_string(),
+            attempt: 1,
+            expected_graph_revision: 0,
+            objective: "inspect".to_string(),
+            acceptance: vec!["evidence".to_string()],
+            constraints: vec![format!(
+                "team_acceptance_contract:{}",
+                serde_json::to_string(&vec![harness_contract::team::TeamAcceptanceRequirement {
+                    criterion: "evidence".to_string(),
+                    check: harness_contract::team::TeamAcceptanceCheck::ScopedEvidence {
+                        scopes: vec!["read:src".to_string()],
+                    },
+                },])
+                .expect("acceptance contract")
+            )],
+            context_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            resource_scopes: vec!["read:src".to_string()],
+            allowed_tools: vec!["read_file".to_string()],
+            allowed_skills: Vec::new(),
+            permission_lease: "read_only".to_string(),
+            model_lease: "model".to_string(),
+            budget_lease: ContextBudgetLeaseRef::new("budget", "agent", "team", 100, 1),
+            binding: None,
+            managed_invocation: None,
+            idempotency_key: "team-task".to_string(),
+        }
+    }
+
+    fn team_return(task: &AgentTaskPacket) -> AgentReturnPacket {
+        AgentReturnPacket {
+            run_id: task.run_id.clone(),
+            agent_id: task.agent_id.clone(),
+            task_id: task.task_id.clone(),
+            session_id: task.session_id.clone(),
+            mission_id: None,
+            team_id: task.team_id.clone(),
+            graph_id: task.graph_id.clone(),
+            node_id: task.node_id.clone(),
+            attempt: task.attempt,
+            expected_graph_revision: task.expected_graph_revision,
+            status: AgentTerminalStatus::Completed,
+            outcome: r#"{"evidence":"checked"}"#.to_string(),
+            acceptance: task.acceptance.clone(),
+            evidence_refs: vec![EvidenceAccessRef::durable(
+                EvidenceRef::new("tool", "read-1"),
+                "a".repeat(64),
+                1,
+                "text/plain",
+                "session-event://session/1",
+                "session:session",
+            )],
+            changes: Vec::new(),
+            runtime_change_receipts: Vec::new(),
+            conflicts: Vec::new(),
+            unresolved: Vec::new(),
+            input_tokens: 1,
+            output_tokens: 1,
+            cached_tokens: 0,
+            model: "model".to_string(),
+            provider: "provider".to_string(),
+            tool_calls: 1,
+            duplicate_tool_calls: 0,
+            runtime_write_attempt_paths: Vec::new(),
+            runtime_observed_resource_scopes: Vec::new(),
+            failure: None,
+        }
+    }
+
+    #[test]
+    fn team_text_and_self_report_cannot_replace_tool_or_durable_evidence() {
+        let task = team_task();
+        let mut returned = team_return(&task);
+        returned.tool_calls = 0;
+        assert_eq!(
+            validate_agent_return(&task, &returned),
+            Err(AgentResultValidationError::MissingToolExecution)
+        );
+
+        returned.tool_calls = 1;
+        returned.evidence_refs.clear();
+        assert_eq!(
+            validate_agent_return(&task, &returned),
+            Err(AgentResultValidationError::MissingEvidence)
+        );
+    }
+
+    #[test]
+    fn team_requires_every_runtime_evaluated_acceptance_criterion() {
+        let task = team_task();
+        let mut returned = team_return(&task);
+        returned.acceptance.clear();
+        assert_eq!(
+            validate_agent_return(&task, &returned),
+            Err(AgentResultValidationError::AcceptanceMismatch)
+        );
+        assert_eq!(validate_agent_return(&task, &team_return(&task)), Ok(()));
+    }
+
+    #[test]
+    fn upstream_synthesis_allows_zero_tools_but_never_missing_predecessor_evidence() {
+        let mut task = team_task();
+        task.constraints = vec![format!(
+            "team_acceptance_contract:{}",
+            serde_json::to_string(&vec![harness_contract::team::TeamAcceptanceRequirement {
+                criterion: "evidence".to_string(),
+                check: harness_contract::team::TeamAcceptanceCheck::UpstreamEvidence,
+            },])
+            .expect("upstream contract")
+        )];
+        let upstream = EvidenceAccessRef::durable(
+            EvidenceRef::new("tool", "upstream"),
+            "b".repeat(64),
+            1,
+            "text/plain",
+            "session-event://session/2",
+            "session:session",
+        );
+        task.evidence_refs = vec![upstream.clone()];
+        let mut returned = team_return(&task);
+        returned.tool_calls = 0;
+        returned.evidence_refs = vec![upstream];
+        assert_eq!(validate_agent_return(&task, &returned), Ok(()));
+
+        task.evidence_refs.clear();
+        assert_eq!(
+            validate_agent_return(&task, &returned),
+            Err(AgentResultValidationError::MissingEvidence)
+        );
+    }
 }

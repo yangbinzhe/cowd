@@ -1,17 +1,26 @@
-use crate::tui::TuiSession;
 use crate::api::ApiClient;
-use crate::server::ServerProcess;
-use crate::reporter::TestRunner;
 use crate::llm;
+use crate::reporter::TestRunner;
+use crate::server::ServerProcess;
+use crate::tui::{TuiLaunchConfig, TuiSession};
 
 pub fn has_scenario(name: &str) -> bool {
-    matches!(name, "cross_session_api" | "cross_memory" | "cross_approval" | "cross_e2e" | "cross_cut" | "" | "all")
+    matches!(
+        name,
+        "cross_session_api"
+            | "cross_memory"
+            | "cross_approval"
+            | "cross_e2e"
+            | "cross_cut"
+            | ""
+            | "all"
+    )
 }
 
 pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
     let mut srv = ServerProcess::start()?;
     let api = ApiClient::new("http://127.0.0.1:8642");
-    let tui = TuiSession::new("cross-cut")?;
+    let tui = TuiSession::new(TuiLaunchConfig::from_env("cross-cut")?)?;
     tui.wait_until_ready(15)?;
     println!("\n── Cross-Cut ──");
 

@@ -549,6 +549,13 @@ impl RuntimeService {
             .collect()
     }
 
+    /// Cancel every live turn owned by one session and propagate cancellation
+    /// to the Runtime execution registry. The HTTP session-cancel endpoint
+    /// uses this owner path; broadcasting a UI event alone is not cancellation.
+    pub(crate) fn cancel_active_session(&self, session_id: &str, reason: &str) -> Vec<String> {
+        self.cancel_active_session_turns(session_id, reason)
+    }
+
     pub(crate) fn refresh_resource_capabilities(&self) -> runtime::ResourceCapabilitySnapshot {
         self.resource_capabilities.refresh_from_environment()
     }
@@ -2841,6 +2848,22 @@ mod tests {
             .running_session_execution_indices()
             .iter()
             .any(|entry| entry.session_id == "session-index"));
+    }
+
+    #[test]
+    fn session_cancel_reaches_the_runtime_turn_control_instead_of_only_emitting_ui_state() {
+        let service = test_runtime_service(Arc::new(ActiveSessions::default()), None);
+        let (cancellation, _guard) = service.install_active_turn_control(
+            "turn-cancel",
+            "session-cancel",
+            Some("execution-cancel".to_string()),
+        );
+
+        let cancelled =
+            service.cancel_active_session("session-cancel", "evaluator timeout isolation");
+
+        assert_eq!(cancelled, vec!["execution-cancel"]);
+        assert!(cancellation.is_cancelled());
     }
 
     #[test]

@@ -3,14 +3,14 @@ use serde::{Deserialize, Serialize};
 
 use super::MatrixComputeJobInput;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixDataPlaneCapability {
     pub capability_id: String,
     pub status: String,
     pub description: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixDataPlaneHealth {
     pub provider: String,
     pub mode: String,
@@ -21,7 +21,7 @@ pub struct MatrixDataPlaneHealth {
     pub checked_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixDataPlaneWatermark {
     pub source_ref: String,
     pub fact_type: String,
@@ -31,7 +31,7 @@ pub struct MatrixDataPlaneWatermark {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixDataPlaneIngestPlanInput {
     pub source_ref: String,
     pub fact_type: String,
@@ -47,7 +47,7 @@ pub struct MatrixDataPlaneIngestPlanInput {
     pub metric_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixDataPlaneIngestPlan {
     pub batch_id: String,
     pub source_ref: String,

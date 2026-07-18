@@ -105,8 +105,17 @@ pub const PANEL_GATEWAY: PanelDefinition = PanelDefinition {
     label: "Gateway",
     compact_label: "Gate",
     domain: WorkbenchDomain::Diagnostics,
-    sidebar_index: Some(9),
+    sidebar_index: Some(10),
     aliases: &["gateway", "diagnostics", "doctor"],
+};
+
+pub const PANEL_MFG: PanelDefinition = PanelDefinition {
+    id: "mfg",
+    label: "MFG",
+    compact_label: "MFG",
+    domain: WorkbenchDomain::SurfaceApp,
+    sidebar_index: Some(9),
+    aliases: &["mfg", "manufacturing", "operations"],
 };
 
 pub const PANEL_CONFIG: PanelDefinition = PanelDefinition {
@@ -137,6 +146,7 @@ pub const PANELS: &[PanelDefinition] = &[
     PANEL_FILES,
     PANEL_SESSIONS,
     PANEL_SURFACES,
+    PANEL_MFG,
     PANEL_GATEWAY,
     PANEL_CONFIG,
     PANEL_REALITY,
@@ -207,10 +217,11 @@ mod tests {
                 "Files",
                 "Sessions",
                 "Surfaces",
+                "MFG",
                 "Gateway"
             ]
         );
-        assert_eq!(sidebar_count(), 10);
+        assert_eq!(sidebar_count(), 11);
     }
 
     #[test]
@@ -224,5 +235,6 @@ mod tests {
             find_by_alias("matrix").unwrap().domain,
             WorkbenchDomain::Reality
         );
+        assert_eq!(find_by_alias("/mfg").unwrap().id, "mfg");
     }
 }

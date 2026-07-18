@@ -97,6 +97,15 @@ impl SessionKernel {
         store.list_sessions_page(options).await.map(Some)
     }
 
+    pub(crate) async fn list_stored_sessions(
+        &self,
+    ) -> Result<Option<Vec<SessionRecord>>, MemoryError> {
+        let Some(store) = self.unified_store.as_ref() else {
+            return Ok(None);
+        };
+        store.list_sessions().await.map(Some)
+    }
+
     pub(crate) async fn stored_session(
         &self,
         session_id: &str,
@@ -265,15 +274,19 @@ impl SessionKernel {
         store.get_context_event_by_envelope_id(envelope_id).await
     }
 
-    pub(crate) async fn search_stored_messages(
+    pub(crate) async fn search_stored_messages_in_sessions(
         &self,
         query: &str,
+        session_ids: &[String],
         limit: usize,
     ) -> Result<Option<Vec<SessionMessage>>, MemoryError> {
         let Some(store) = self.unified_store.as_ref() else {
             return Ok(None);
         };
-        store.search_messages(query, None, limit).await.map(Some)
+        store
+            .search_messages_in_sessions(query, session_ids, limit)
+            .await
+            .map(Some)
     }
 
     pub(crate) async fn append_timeline_event(

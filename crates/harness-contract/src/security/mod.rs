@@ -35,6 +35,19 @@ pub struct PrincipalClaims {
     pub expires_at_ms: Option<u64>,
     pub credential_fingerprint: String,
     pub credential_epoch: u64,
+    #[serde(
+        default = "default_profile_revision",
+        skip_serializing_if = "is_default_profile_revision"
+    )]
+    pub profile_revision: u64,
+}
+
+const fn default_profile_revision() -> u64 {
+    1
+}
+
+fn is_default_profile_revision(revision: &u64) -> bool {
+    *revision == default_profile_revision()
 }
 
 impl PrincipalClaims {
@@ -51,6 +64,7 @@ impl PrincipalClaims {
             expires_at_ms: None,
             credential_fingerprint: "anonymous".to_string(),
             credential_epoch: 0,
+            profile_revision: default_profile_revision(),
         }
     }
 
@@ -93,6 +107,37 @@ pub struct SignedDecisionLease {
     pub key_id: String,
     pub claims: DecisionLeaseClaims,
     pub signature_base64: String,
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn profile_revision_preserves_v1_signed_claim_serialization() {
+        let legacy = serde_json::json!({
+            "principal_id": "legacy-human",
+            "kind": "human",
+            "scopes": ["gateway"],
+            "capabilities": ["mfg.read"],
+            "assurance": "human_interactive",
+            "issuer": "cowd.local-auth-broker.v1",
+            "issued_at_ms": 1,
+            "expires_at_ms": null,
+            "credential_fingerprint": "sha256:legacy",
+            "credential_epoch": 1
+        });
+        let claims: PrincipalClaims = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(claims.profile_revision, 1);
+        assert_eq!(serde_json::to_value(claims).unwrap(), legacy);
+    }
+
+    #[test]
+    fn non_default_profile_revision_is_part_of_the_signed_claim() {
+        let mut claims = PrincipalClaims::anonymous();
+        claims.profile_revision = 7;
+        assert_eq!(serde_json::to_value(claims).unwrap()["profile_revision"], 7);
+    }
 }
 
 #[cfg(test)]

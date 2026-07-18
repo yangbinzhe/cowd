@@ -27,6 +27,11 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 start_gateway() {
+  # STR-07 uses a fixed, marker-scoped strategy-cost fixture.  It is enabled
+  # only in this isolated E2E Gateway and proves the actual admission →
+  # projection → WebUI path; request prose itself never controls the model.
+  COWD_E2E_HARNESS=1 \
+  COWD_E2E_STRATEGY_FIXTURE=explicit-team-negative \
   COWD_CONFIG_HOME="$TEMP_HOME" ./target/debug/cowd gateway run --port "$PORT" >"$GATEWAY_LOG" 2>&1 &
   GATEWAY_PID=$!
   for _ in $(seq 1 80); do

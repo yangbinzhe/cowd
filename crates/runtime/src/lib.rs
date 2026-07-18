@@ -429,7 +429,7 @@ pub use execution_core::{
     RuntimeServicesBuilder, RuntimeServicesError, SessionTerminalDeliveryPort,
     StrategyDecisionEngine, StrategyLease, StrategyResourceHealth, TaskLifecycleEvent,
     TaskLifecycleKind, ToolDagEdge, ToolDagEdgeKind, ToolDagPlan, ToolDagSafetySummary,
-    ToolDagTask,
+    ToolDagTask, TurnStrategyActualOutcome, TurnStrategyDecisionState, TurnStrategyDecisionStatus,
 };
 pub use file_ops::{
     edit_file, glob_search, grep_search, read_file, write_file, EditFileOutput, GlobSearchOutput,
@@ -681,7 +681,9 @@ pub use team_profile_migration::LegacyTeamProfileMigrationReport;
 pub use team_projection::{TeamProjection, TeamProjectionReader};
 pub use team_result_reducer::TeamResultReducer;
 pub use team_runtime::TeamRuntime;
-pub use team_working_state::{TeamWorkingState, TeamWorkingStateEntry, TeamWorkingStateKind};
+pub use team_working_state::{
+    FocusOverlapAssessment, TeamWorkingState, TeamWorkingStateEntry, TeamWorkingStateKind,
+};
 pub use tool_execution_plan::{ToolExecutionMode, ToolExecutionPlan, ToolExecutionPlanTask};
 pub use tool_host::{
     RuntimeExecutionHost, RuntimeToolExecutionOutcome, RuntimeToolExecutionRequest,

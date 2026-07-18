@@ -4,16 +4,16 @@ use std::{
 };
 
 use axum::{
+    Json, Router,
     extract::{Extension, Path, Query, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
-use memory::store::session::{SessionEvent, SessionListOptions, SessionRecord};
+use memory::store::session::{SessionEvent, SessionRecord};
 use serde::{Deserialize, Serialize};
 
-use super::{surface_actor_id, AppState, AuthenticatedPrincipal, ErrorResponse};
+use super::{AppState, AuthenticatedPrincipal, ErrorResponse, surface_actor_id};
 use crate::services::{
     SessionMessageCounts, SessionStatsSnapshot, SessionTokenCounts, SessionUpdateRequest,
 };
@@ -65,23 +65,26 @@ pub(super) fn router() -> Router<Arc<AppState>> {
 
 pub(super) async fn get_session_evidence(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Path(id): Path<String>,
 ) -> Result<
     Json<harness_contract::projection::SessionEvidenceProjection>,
     (StatusCode, Json<ErrorResponse>),
 > {
-    let projection = session_evidence_projection(&state, &id, None).await?;
+    let projection = session_evidence_projection(&state, &principal, &id, None).await?;
     Ok(Json(projection))
 }
 
 pub(super) async fn get_turn_evidence(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Path((id, turn_id)): Path<(String, String)>,
 ) -> Result<
     Json<harness_contract::projection::TurnEvidenceProjection>,
     (StatusCode, Json<ErrorResponse>),
 > {
-    let projection = session_evidence_projection(&state, &id, Some(turn_id.as_str())).await?;
+    let projection =
+        session_evidence_projection(&state, &principal, &id, Some(turn_id.as_str())).await?;
     projection
         .turns
         .into_iter()
@@ -101,6 +104,7 @@ pub(super) async fn get_turn_evidence(
 
 async fn session_evidence_projection(
     state: &AppState,
+    principal: &AuthenticatedPrincipal,
     session_id: &str,
     turn_id: Option<&str>,
 ) -> Result<
@@ -108,8 +112,7 @@ async fn session_evidence_projection(
     (StatusCode, Json<ErrorResponse>),
 > {
     use harness_contract::projection::{
-        EvidenceFreshness, ProjectionDetailScope, ProjectionQueryContext,
-        SessionEvidenceProjection, TurnEvidenceProjection,
+        EvidenceFreshness, ProjectionDetailScope, SessionEvidenceProjection, TurnEvidenceProjection,
     };
 
     let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
@@ -131,6 +134,11 @@ async fn session_evidence_projection(
                 }),
             )
         })?;
+    // Authorize the durable Session boundary before inspecting its outbox.
+    // A pruned execution graph cannot turn an unauthorized request into an
+    // "unavailable" projection that still leaks turn, message or receipt
+    // identifiers from the outbox.
+    authorize_session_evidence_read(state, principal, session_id).await?;
     let mut records = store
         .session_runtime_outbox_for_session(session_id, 100)
         .await
@@ -147,20 +155,6 @@ async fn session_evidence_projection(
     }
     records.sort_by_key(|record| (record.sequence, record.request_id.clone()));
 
-    let context = ProjectionQueryContext {
-        principal: "gateway-local".to_string(),
-        workspace_id: runtime_service
-            .runtime_services()
-            .workspace_key()
-            .to_string(),
-        // This query is scoped by the durable record selected above, and the
-        // Runtime projection performs the same session-scope verification.
-        session_scopes: vec![session_id.to_string()],
-        mission_scopes: Vec::new(),
-        visibility_grants: vec!["gateway-local".to_string()],
-        detail_scope: ProjectionDetailScope::Summary,
-        authorization_revision: 1,
-    };
     let mut all_refs = BTreeSet::new();
     let mut turns = Vec::with_capacity(records.len());
     for record in records {
@@ -168,13 +162,37 @@ async fn session_evidence_projection(
         // never approximate it from message text, sequence, or timestamps.
         let execution_id =
             runtime::session_ingress_graph_id(session_id, &record.request_id, &record.turn_id);
-        let projection = runtime::execution_projection::snapshot(
-            runtime_service.runtime_services().as_ref(),
+        let projection = match super::runtime_routes::execution_projection_context(
+            state,
+            principal,
             &execution_id,
-            &context,
+            ProjectionDetailScope::Summary,
         )
         .await
-        .ok();
+        {
+            Ok(context) => match runtime::execution_projection::snapshot(
+                runtime_service.runtime_services().as_ref(),
+                &execution_id,
+                &context,
+            )
+            .await
+            {
+                Ok(projection) => Some(projection),
+                Err(runtime::RuntimeServicesError::ProjectionAccessDenied) => {
+                    return Err((
+                        StatusCode::FORBIDDEN,
+                        Json(ErrorResponse {
+                            error: format!(
+                                "execution {execution_id} evidence is outside the authenticated principal scope"
+                            ),
+                        }),
+                    ));
+                }
+                Err(_) => None,
+            },
+            Err((StatusCode::NOT_FOUND, _)) => None,
+            Err(error) => return Err(error),
+        };
         let mut evidence_refs = projection
             .as_ref()
             .map(|projection| {
@@ -232,8 +250,160 @@ async fn session_evidence_projection(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SessionAccess {
+    /// Inspect durable or live Session facts without changing them.
+    Read,
+    /// Add input, attach a surface, cancel a turn, or update mutable metadata.
+    Write,
+    /// Irreversibly remove or compact a Session.
+    Destructive,
+}
+
+async fn authorize_session_evidence_read(
+    state: &AppState,
+    principal: &AuthenticatedPrincipal,
+    session_id: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    authorize_session_access(state, principal, session_id, SessionAccess::Read).await
+}
+
+/// Resolve Session authority before a route can inspect, mutate, replay, or
+/// stream a session.  Session ids are not bearer credentials: a route must
+/// prove owner identity, an explicit delegated scope, or privileged human
+/// maintenance authority.  The action is deliberately part of the decision:
+/// Mission observers may read their Mission's sessions but cannot alter or
+/// destroy them merely because they can follow execution progress.
+pub(super) async fn authorize_session_access(
+    state: &AppState,
+    principal: &AuthenticatedPrincipal,
+    session_id: &str,
+    access: SessionAccess,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let record = state
+        .services
+        .session
+        .stored_session(session_id)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to resolve session ownership: {error}"),
+                }),
+            )
+        })?;
+    let active = state
+        .services
+        .runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.has_active_session(session_id));
+    if record.is_none() && !active {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("session {session_id} not found"),
+            }),
+        ));
+    }
+    let claims = principal.0.claims();
+    let owner_matches = record
+        .as_ref()
+        .and_then(|record| session_owner_from_metadata(record.metadata_json.as_deref()))
+        .is_some_and(|owner| owner == claims.principal_id);
+    let explicit_session = claims
+        .scopes
+        .iter()
+        .any(|scope| scope == &format!("session:{session_id}"));
+    let mission_id = state.services.runtime.as_ref().and_then(|runtime| {
+        runtime
+            .runtime_services()
+            .mission_runtime()
+            .mission_id_for_session(session_id)
+    });
+    let explicit_mission = mission_id.as_ref().is_some_and(|mission_id| {
+        claims
+            .scopes
+            .iter()
+            .any(|scope| scope == &format!("mission:{mission_id}"))
+    });
+    let manager = principal.0.is_human_interactive()
+        && principal.0.has_capability("runtime.maintenance.manage");
+    if session_access_authorized(
+        access,
+        owner_matches,
+        explicit_session,
+        explicit_mission,
+        manager,
+    ) {
+        return Ok(());
+    }
+    Err((
+        StatusCode::FORBIDDEN,
+        Json(ErrorResponse {
+            error: format!(
+                "session {session_id} is outside the authenticated principal scope for {access:?} access"
+            ),
+        }),
+    ))
+}
+
+async fn session_record_access_authorized(
+    state: &AppState,
+    principal: &AuthenticatedPrincipal,
+    record: &SessionRecord,
+    access: SessionAccess,
+) -> bool {
+    let claims = principal.0.claims();
+    let owner_matches = session_owner_from_metadata(record.metadata_json.as_deref())
+        .is_some_and(|owner| owner == claims.principal_id);
+    let explicit_session = claims
+        .scopes
+        .iter()
+        .any(|scope| scope == &format!("session:{}", record.session_id));
+    let mission_id = state.services.runtime.as_ref().and_then(|runtime| {
+        runtime
+            .runtime_services()
+            .mission_runtime()
+            .mission_id_for_session(&record.session_id)
+    });
+    let explicit_mission = mission_id.as_ref().is_some_and(|mission_id| {
+        claims
+            .scopes
+            .iter()
+            .any(|scope| scope == &format!("mission:{mission_id}"))
+    });
+    let manager = principal.0.is_human_interactive()
+        && principal.0.has_capability("runtime.maintenance.manage");
+    session_access_authorized(
+        access,
+        owner_matches,
+        explicit_session,
+        explicit_mission,
+        manager,
+    )
+}
+
+/// Keep the authorization decision independent from projection/outbox lookup:
+/// when the execution graph has been pruned there is still no authority to
+/// disclose the durable turn binding that used to reference it.
+fn session_access_authorized(
+    access: SessionAccess,
+    owner_matches: bool,
+    explicit_session: bool,
+    explicit_mission: bool,
+    manager: bool,
+) -> bool {
+    match access {
+        SessionAccess::Read => owner_matches || explicit_session || explicit_mission || manager,
+        SessionAccess::Write => owner_matches || explicit_session || manager,
+        SessionAccess::Destructive => owner_matches || manager,
+    }
+}
+
 pub(super) async fn list_running_session_execution_indices(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
 ) -> Result<
     Json<harness_contract::projection::SessionExecutionIndicesProjection>,
     (StatusCode, Json<ErrorResponse>),
@@ -246,18 +416,27 @@ pub(super) async fn list_running_session_execution_indices(
             }),
         )
     })?;
+    let mut items = Vec::new();
+    for index in runtime
+        .recoverable_running_session_execution_indices()
+        .await
+    {
+        if authorize_session_access(&state, &principal, &index.session_id, SessionAccess::Read)
+            .await
+            .is_ok()
+        {
+            items.push(index);
+        }
+    }
     Ok(Json(
-        harness_contract::projection::SessionExecutionIndicesProjection {
-            items: runtime
-                .recoverable_running_session_execution_indices()
-                .await,
-        },
+        harness_contract::projection::SessionExecutionIndicesProjection { items },
     ))
 }
 
 pub(super) async fn get_session_execution_index(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
 ) -> Result<
     Json<harness_contract::projection::SessionExecutionIndexProjection>,
     (StatusCode, Json<ErrorResponse>),
@@ -270,6 +449,7 @@ pub(super) async fn get_session_execution_index(
             }),
         )
     })?;
+    authorize_session_access(&state, &principal, &id, SessionAccess::Read).await?;
     Ok(Json(runtime.recoverable_session_execution_index(&id).await))
 }
 
@@ -410,15 +590,16 @@ async fn attach_session_handler(
     Path(id): Path<String>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(body): Json<SessionAttachRequest>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    authorize_session_access(&state, &principal, &id, SessionAccess::Write).await?;
     let actor_id = surface_actor_id(&principal, &body.surface);
-    Json(
+    Ok(Json(
         state
             .services
             .session
             .attach_session_value(&id, &actor_id, &body.surface, body.role.as_deref())
             .await,
-    )
+    ))
 }
 
 async fn detach_session_handler(
@@ -426,36 +607,41 @@ async fn detach_session_handler(
     Path(id): Path<String>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(body): Json<SessionDetachRequest>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    authorize_session_access(&state, &principal, &id, SessionAccess::Write).await?;
     let actor_id = surface_actor_id(&principal, &body.surface);
-    Json(
+    Ok(Json(
         state
             .services
             .session
             .detach_session_value(&id, &actor_id)
             .await,
-    )
+    ))
 }
 
 async fn session_lifecycle_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Json<serde_json::Value> {
-    Json(
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    authorize_session_access(&state, &principal, &id, SessionAccess::Read).await?;
+    Ok(Json(
         state
             .services
             .session
             .lifecycle_snapshot_value(Some(&id))
             .await,
-    )
+    ))
 }
 
 async fn replay_session_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Query(params): Query<SessionReplayParams>,
-) -> Json<serde_json::Value> {
-    Json(
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    authorize_session_access(&state, &principal, &id, SessionAccess::Read).await?;
+    Ok(Json(
         state
             .services
             .session
@@ -465,7 +651,7 @@ async fn replay_session_handler(
                 params.limit.unwrap_or(100),
             )
             .await,
-    )
+    ))
 }
 
 #[derive(Serialize)]
@@ -505,6 +691,21 @@ fn session_title_from_metadata(metadata_json: Option<&str>) -> Option<String> {
         })
 }
 
+fn session_owner_from_metadata(metadata_json: Option<&str>) -> Option<String> {
+    metadata_json
+        .and_then(|metadata| serde_json::from_str::<serde_json::Value>(metadata).ok())
+        .and_then(|metadata| {
+            metadata
+                .get("owner_principal_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+}
+
+fn principal_can_migrate_legacy_session(principal: &AuthenticatedPrincipal) -> bool {
+    principal.0.is_human_interactive() && principal.0.has_capability("runtime.maintenance.manage")
+}
+
 fn session_info_from_record(record: SessionRecord) -> SessionInfo {
     SessionInfo {
         id: record.session_id,
@@ -533,31 +734,24 @@ fn active_session_info(id: String) -> SessionInfo {
 
 async fn list_sessions(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Query(params): Query<ListSessionsParams>,
 ) -> impl IntoResponse {
     let limit = params.limit.unwrap_or(20).min(200);
     let offset = params.offset.unwrap_or(0);
 
-    if let Ok(Some(page)) = state
-        .services
-        .session
-        .list_stored_sessions_page(&SessionListOptions {
-            query: params.q.as_deref(),
-            model: params.model.as_deref(),
-            status: params.status.as_deref(),
-            sort: &params.sort,
-            order: &params.order,
-            limit,
-            offset,
-        })
-        .await
-    {
-        let total = page.total;
-        let sessions: Vec<SessionInfo> = page
-            .records
-            .into_iter()
-            .map(session_info_from_record)
-            .collect();
+    if let Ok(Some(records)) = state.services.session.list_stored_sessions().await {
+        let mut sessions = Vec::new();
+        for record in records {
+            if session_record_access_authorized(&state, &principal, &record, SessionAccess::Read)
+                .await
+            {
+                sessions.push(session_info_from_record(record));
+            }
+        }
+        filter_and_sort_session_infos(&mut sessions, &params);
+        let total = sessions.len();
+        let sessions: Vec<SessionInfo> = sessions.into_iter().skip(offset).take(limit).collect();
         return Json(serde_json::json!({
             "sessions": sessions,
             "total": total,
@@ -568,13 +762,29 @@ async fn list_sessions(
         }));
     }
 
-    let mut sessions: Vec<SessionInfo> = state
-        .services
-        .session
-        .list_active_session_ids()
-        .into_iter()
-        .map(active_session_info)
-        .collect();
+    let mut sessions = Vec::new();
+    for id in state.services.session.list_active_session_ids() {
+        if authorize_session_access(&state, &principal, &id, SessionAccess::Read)
+            .await
+            .is_ok()
+        {
+            sessions.push(active_session_info(id));
+        }
+    }
+    filter_and_sort_session_infos(&mut sessions, &params);
+    let total = sessions.len();
+    let sessions: Vec<SessionInfo> = sessions.into_iter().skip(offset).take(limit).collect();
+    Json(serde_json::json!({
+        "sessions": sessions,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "sort": params.sort,
+        "order": params.order,
+    }))
+}
+
+fn filter_and_sort_session_infos(sessions: &mut Vec<SessionInfo>, params: &ListSessionsParams) {
     if let Some(status) = params.status.as_ref().filter(|value| !value.is_empty()) {
         sessions.retain(|session| session.status.eq_ignore_ascii_case(status));
     }
@@ -610,20 +820,11 @@ async fn list_sessions(
     if !params.order.eq_ignore_ascii_case("asc") {
         sessions.reverse();
     }
-    let total = sessions.len();
-    let sessions: Vec<SessionInfo> = sessions.into_iter().skip(offset).take(limit).collect();
-    Json(serde_json::json!({
-        "sessions": sessions,
-        "total": total,
-        "offset": offset,
-        "limit": limit,
-        "sort": params.sort,
-        "order": params.order,
-    }))
 }
 
 async fn create_session(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(body): Json<CreateSessionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -633,12 +834,15 @@ async fn create_session(
         .filter(|model| !model.trim().is_empty())
         .unwrap_or_else(|| default_session_model(&state));
     let manager = required_session_manager(&state)?;
+    let mut request = crate::unified_session_manager::EnsureSessionRequest::new(
+        &session_id,
+        Some(model),
+        crate::unified_session_manager::SessionSource::WebUi,
+    );
+    request.owner_principal_id = Some(principal.0.claims().principal_id.clone());
+    request.allow_legacy_owner_migration = principal_can_migrate_legacy_session(&principal);
     let outcome = manager
-        .ensure_session(crate::unified_session_manager::EnsureSessionRequest::new(
-            &session_id,
-            Some(model),
-            crate::unified_session_manager::SessionSource::WebUi,
-        ))
+        .ensure_session(request)
         .await
         .map_err(session_manager_error)?;
     let info = session_info_from_record(outcome.record);
@@ -648,6 +852,7 @@ async fn create_session(
 
 async fn branch_session_handler(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     if id.trim().is_empty() {
@@ -680,6 +885,8 @@ async fn branch_session_handler(
         ));
     }
 
+    authorize_session_access(&state, &principal, &id, SessionAccess::Write).await?;
+
     let source_record = state
         .services
         .session
@@ -708,6 +915,8 @@ async fn branch_session_handler(
         crate::unified_session_manager::SessionSource::WebUi,
     );
     request.title = Some(format!("{} / branch", source_title));
+    request.owner_principal_id = Some(principal.0.claims().principal_id.clone());
+    request.allow_legacy_owner_migration = principal_can_migrate_legacy_session(&principal);
     request.metadata = serde_json::json!({
         "branched_from": id,
         "branch_source_title": source_title,
@@ -785,6 +994,7 @@ async fn branch_session_handler(
 
 async fn ensure_session_handler(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Path(id): Path<String>,
     Json(body): Json<CreateSessionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
@@ -797,12 +1007,32 @@ async fn ensure_session_handler(
         ));
     }
 
+    if state
+        .services
+        .session
+        .session_exists(&id)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to resolve session ownership: {error}"),
+                }),
+            )
+        })?
+    {
+        authorize_session_access(&state, &principal, &id, SessionAccess::Write).await?;
+    }
+
+    let mut request = crate::unified_session_manager::EnsureSessionRequest::new(
+        &id,
+        body.model.filter(|model| !model.trim().is_empty()),
+        crate::unified_session_manager::SessionSource::Tui,
+    );
+    request.owner_principal_id = Some(principal.0.claims().principal_id.clone());
+    request.allow_legacy_owner_migration = principal_can_migrate_legacy_session(&principal);
     let outcome = required_session_manager(&state)?
-        .ensure_session(crate::unified_session_manager::EnsureSessionRequest::new(
-            &id,
-            body.model.filter(|model| !model.trim().is_empty()),
-            crate::unified_session_manager::SessionSource::Tui,
-        ))
+        .ensure_session(request)
         .await
         .map_err(session_manager_error)?;
 
@@ -819,7 +1049,9 @@ async fn ensure_session_handler(
 async fn get_session(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    authorize_session_access(&state, &principal, &id, SessionAccess::Read).await?;
     if state.services.session.has_unified_store() {
         match state.services.session.stored_session(&id).await {
             Ok(Some(record)) => return Ok(Json(session_info_from_record(record))),
@@ -867,27 +1099,7 @@ async fn cancel_session_turn_handler(
         ));
     }
 
-    if !state
-        .services
-        .session
-        .session_exists(&id)
-        .await
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("failed to load session: {error}"),
-                }),
-            )
-        })?
-    {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("session {id} not found"),
-            }),
-        ));
-    }
+    authorize_session_access(&state, &principal, &id, SessionAccess::Write).await?;
 
     let actor_id = format!("principal:{}", principal.0.claims().principal_id);
     let reason = body
@@ -896,7 +1108,13 @@ async fn cancel_session_turn_handler(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("user_requested");
-    let aborted_run_id: Option<String> = None;
+    let cancelled_execution_ids = state
+        .services
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.cancel_active_session(&id, reason))
+        .unwrap_or_default();
+    let aborted_run_id = cancelled_execution_ids.first().cloned();
     let event = serde_json::json!({
         "type": "TurnCancelRequested",
         "session_id": id,
@@ -905,6 +1123,7 @@ async fn cancel_session_turn_handler(
         "status": "accepted",
         "aborted": aborted_run_id.is_some(),
         "run_id": aborted_run_id,
+        "execution_ids": cancelled_execution_ids,
     });
     state.event_bus().broadcast(&id, &event.to_string()).await;
 
@@ -916,13 +1135,16 @@ async fn cancel_session_turn_handler(
         "reason": reason,
         "aborted": event["aborted"],
         "run_id": event["run_id"],
+        "execution_ids": event["execution_ids"],
     })))
 }
 
 async fn delete_session(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    authorize_session_access(&state, &principal, &id, SessionAccess::Destructive).await?;
     let removed = required_session_manager(&state)?
         .delete_session(&id)
         .await
@@ -942,8 +1164,10 @@ async fn delete_session(
 async fn get_session_events(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Query(params): Query<GetEventsParams>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    authorize_session_access(&state, &principal, &id, SessionAccess::Read).await?;
     let from_seq = params.from_seq.unwrap_or(0);
     let limit = params.limit.unwrap_or(100).min(500);
     let include_payload = params.include_payload.unwrap_or(false);
@@ -1642,8 +1866,10 @@ fn session_run_projection_from_events(
 async fn get_session_runs(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Query(params): Query<GetEventsParams>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    authorize_session_access(&state, &principal, &id, SessionAccess::Read).await?;
     let from_seq = params.from_seq.unwrap_or(0);
     let limit = params.limit.unwrap_or(50).min(200);
     let Some((total, stored_events)) = state
@@ -1694,8 +1920,10 @@ async fn get_session_runs(
 async fn get_session_turns(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Query(params): Query<GetEventsParams>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    authorize_session_access(&state, &principal, &id, SessionAccess::Read).await?;
     let from_seq = params.from_seq.unwrap_or(0);
     let limit = params.limit.unwrap_or(2_000).min(10_000);
     let Some((total, stored_events)) = state
@@ -1743,8 +1971,10 @@ async fn get_session_turns(
 async fn get_session_turn(
     AxumState(state): AxumState<Arc<AppState>>,
     Path((id, turn_id)): Path<(String, String)>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Query(params): Query<GetEventsParams>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    authorize_session_access(&state, &principal, &id, SessionAccess::Read).await?;
     let from_seq = params.from_seq.unwrap_or(0);
     let limit = params.limit.unwrap_or(2_000).min(10_000);
     let Some((_total, stored_events)) = state
@@ -1804,8 +2034,10 @@ async fn get_session_turn(
 async fn get_session_projection(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Query(params): Query<GetEventsParams>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    authorize_session_access(&state, &principal, &id, SessionAccess::Read).await?;
     let from_seq = params.from_seq.unwrap_or(0);
     let limit = params.limit.unwrap_or(2_000).min(10_000);
     let Some((total, stored_events)) = state
@@ -1859,12 +2091,44 @@ async fn get_session_projection(
 
 async fn search_messages_handler(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Query(params): Query<SearchMessagesParams>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let limit = params.limit.clamp(1, 100);
+    let Some(stored_sessions) = state
+        .services
+        .session
+        .list_stored_sessions()
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to load session search authority set: {error}"),
+                }),
+            )
+        })?
+    else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "session store not available".to_string(),
+            }),
+        ));
+    };
+    let mut authorized_session_ids = Vec::new();
+    for record in stored_sessions {
+        if authorize_session_access(&state, &principal, &record.session_id, SessionAccess::Read)
+            .await
+            .is_ok()
+        {
+            authorized_session_ids.push(record.session_id);
+        }
+    }
     let Some(db_messages) = state
         .services
         .session
-        .search_stored_messages(&params.q, params.limit)
+        .search_stored_messages_in_sessions(&params.q, &authorized_session_ids, limit)
         .await
         .map_err(|error| {
             (
@@ -1883,33 +2147,25 @@ async fn search_messages_handler(
         ));
     };
 
-    let results: Vec<SearchMessagesItem> = db_messages
-        .into_iter()
-        .map(|message| {
-            let blocks: Vec<serde_json::Value> =
-                serde_json::from_str(&message.content_json).unwrap_or_default();
-            let content_preview = blocks
-                .iter()
-                .filter_map(|block| block.get("text").and_then(|text| text.as_str()))
-                .collect::<Vec<_>>()
-                .join(" ");
-            let preview = if content_preview.len() > 200 {
-                format!("{}...", &content_preview[..200])
-            } else {
-                content_preview
-            };
-            SearchMessagesItem {
-                session_id: message.session_id,
-                sequence: message.sequence,
-                role: message.role,
-                blocks,
-                content_preview: preview,
-                tool_use_id: message.tool_use_id,
-                tool_name: message.tool_name,
-                created_at_ms: message.created_at_ms,
-            }
-        })
-        .collect();
+    let mut results = Vec::new();
+    for message in db_messages {
+        let blocks: Vec<serde_json::Value> =
+            serde_json::from_str(&message.content_json).unwrap_or_default();
+        let preview = search_message_preview(&blocks);
+        results.push(SearchMessagesItem {
+            session_id: message.session_id,
+            sequence: message.sequence,
+            role: message.role,
+            blocks,
+            content_preview: preview,
+            tool_use_id: message.tool_use_id,
+            tool_name: message.tool_name,
+            created_at_ms: message.created_at_ms,
+        });
+        if results.len() >= limit {
+            break;
+        }
+    }
 
     let total = results.len();
     Ok(Json(SearchMessagesResponse {
@@ -1919,10 +2175,28 @@ async fn search_messages_handler(
     }))
 }
 
+fn search_message_preview(blocks: &[serde_json::Value]) -> String {
+    let content_preview = blocks
+        .iter()
+        .filter_map(|block| block.get("text").and_then(|text| text.as_str()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if content_preview.chars().count() > 200 {
+        format!(
+            "{}...",
+            content_preview.chars().take(200).collect::<String>()
+        )
+    } else {
+        content_preview
+    }
+}
+
 async fn compact_session_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    authorize_session_access(&state, &principal, &id, SessionAccess::Destructive).await?;
     let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1961,7 +2235,9 @@ async fn compact_session_handler(
 async fn get_session_stats_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    authorize_session_access(&state, &principal, &id, SessionAccess::Read).await?;
     let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2086,8 +2362,23 @@ async fn stored_session_stats_response(
 async fn update_session_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(body): Json<SessionUpdateRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    authorize_session_access(&state, &principal, &id, SessionAccess::Write).await?;
+    if body
+        .metadata
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|metadata| metadata.contains_key("owner_principal_id"))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "owner_principal_id is immutable after Session creation".to_string(),
+            }),
+        ));
+    }
     let active_found = match state.services.runtime.as_ref() {
         Some(runtime_service) => {
             runtime_service
@@ -2129,6 +2420,86 @@ async fn update_session_handler(
 mod tests {
     use super::*;
 
+    #[test]
+    fn search_preview_truncates_on_unicode_character_boundaries() {
+        let blocks = vec![serde_json::json!({
+            "type": "text",
+            "text": "你".repeat(201),
+        })];
+        let preview = search_message_preview(&blocks);
+        assert_eq!(preview.chars().count(), 203);
+        assert!(preview.starts_with(&"你".repeat(200)));
+        assert!(preview.ends_with("..."));
+    }
+
+    #[test]
+    fn session_evidence_rejects_foreign_principal_before_pruned_graph_metadata() {
+        assert!(session_access_authorized(
+            SessionAccess::Read,
+            true,
+            false,
+            false,
+            false
+        ));
+        assert!(session_access_authorized(
+            SessionAccess::Read,
+            false,
+            true,
+            false,
+            false
+        ));
+        assert!(session_access_authorized(
+            SessionAccess::Read,
+            false,
+            false,
+            true,
+            false
+        ));
+        assert!(session_access_authorized(
+            SessionAccess::Read,
+            false,
+            false,
+            false,
+            true
+        ));
+        assert!(
+            !session_access_authorized(SessionAccess::Read, false, false, false, false),
+            "a missing execution graph must not turn a foreign session into evidence access"
+        );
+    }
+
+    #[test]
+    fn session_access_actions_do_not_turn_observer_scope_into_write_or_delete() {
+        assert!(session_access_authorized(
+            SessionAccess::Read,
+            false,
+            false,
+            true,
+            false
+        ));
+        assert!(!session_access_authorized(
+            SessionAccess::Write,
+            false,
+            false,
+            true,
+            false
+        ));
+        assert!(!session_access_authorized(
+            SessionAccess::Destructive,
+            false,
+            true,
+            false,
+            false
+        ));
+        assert!(session_access_authorized(
+            SessionAccess::Destructive,
+            true,
+            false,
+            false,
+            false
+        ));
+    }
+
     fn session_event(
         sequence: usize,
         event_type: &str,
@@ -2145,7 +2516,8 @@ mod tests {
 
     #[test]
     fn turn_projection_builds_stable_turns_from_journal() {
-        let events = [session_event(
+        let events = [
+            session_event(
                 0,
                 "TurnJournal",
                 serde_json::json!({
@@ -2206,7 +2578,8 @@ mod tests {
                     },
                     "created_at": "2026-07-05T00:00:02Z"
                 }),
-            )];
+            ),
+        ];
         let values = events.iter().map(session_event_value).collect::<Vec<_>>();
         let projection = turn_projection_from_event_values("session-v31", &values);
 
@@ -2220,10 +2593,12 @@ mod tests {
             projection["turns"][0]["event_sequences"],
             serde_json::json!([0, 1, 2, 3])
         );
-        assert!(projection["turns"][0]["evidence_refs"]
-            .as_array()
-            .unwrap()
-            .contains(&serde_json::json!("ctx-report-1")));
+        assert!(
+            projection["turns"][0]["evidence_refs"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("ctx-report-1"))
+        );
     }
 
     #[test]

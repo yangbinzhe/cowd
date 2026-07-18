@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgCockpitProfileInput {
     #[serde(default)]
     pub profile_id: Option<String>,
@@ -33,7 +33,7 @@ pub struct MfgCockpitProfileInput {
     pub sharing_policy: Option<MfgDashboardSharingPolicy>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgDashboardScope {
     pub kind: String,
     #[serde(default)]
@@ -49,7 +49,7 @@ impl Default for MfgDashboardScope {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgDashboardLayout {
     pub columns: u16,
     pub row_height: u16,
@@ -66,7 +66,7 @@ impl Default for MfgDashboardLayout {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgDashboardSharingPolicy {
     pub visibility: String,
     #[serde(default)]
@@ -85,7 +85,7 @@ impl Default for MfgDashboardSharingPolicy {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgWidgetPlacement {
     pub x: u16,
     pub y: u16,
@@ -93,7 +93,7 @@ pub struct MfgWidgetPlacement {
     pub height: u16,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgWidgetInstance {
     pub instance_id: String,
     pub definition_id: String,
@@ -106,7 +106,7 @@ pub struct MfgWidgetInstance {
     pub visible: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgWidgetDefinition {
     pub definition_id: String,
     pub title: String,
@@ -126,7 +126,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgCockpitProfile {
     pub profile_id: String,
     pub owner_ref: String,
@@ -155,7 +155,7 @@ pub struct MfgCockpitProfile {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgCockpitWidget {
     pub widget_id: String,
     pub widget_type: String,
@@ -185,7 +185,7 @@ const fn default_renderer_version() -> u32 {
     1
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgCockpitProjection {
     pub projection_id: String,
     pub profile: MfgCockpitProfile,
@@ -195,7 +195,7 @@ pub struct MfgCockpitProjection {
     pub generated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgCockpitWidgetProjection {
     pub projection_id: String,
     pub profile_id: String,
@@ -204,7 +204,7 @@ pub struct MfgCockpitWidgetProjection {
     pub generated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgCockpitReportRequest {
     #[serde(default)]
     pub report_id: Option<String>,
@@ -216,7 +216,7 @@ pub struct MfgCockpitReportRequest {
     pub note: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgCockpitReportDeliveryPayloadRequest {
     #[serde(default)]
     pub channel: Option<String>,
@@ -228,7 +228,7 @@ pub struct MfgCockpitReportDeliveryPayloadRequest {
     pub requested_capability: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgCockpitReportDeliveryPayload {
     pub payload_id: String,
     pub report_id: String,
@@ -248,7 +248,7 @@ pub struct MfgCockpitReportDeliveryPayload {
     pub rendered_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgCockpitReportSnapshot {
     pub report_id: String,
     pub profile_id: String,
@@ -263,11 +263,13 @@ pub struct MfgCockpitReportSnapshot {
     pub note: Option<String>,
     #[serde(default)]
     pub delivery_receipts: Vec<MfgCockpitReportDeliveryReceipt>,
+    #[serde(default = "default_report_revision")]
+    pub revision: u64,
     pub projection: MfgCockpitProjection,
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgCockpitReportDeliveryReceipt {
     pub delivery_id: String,
     pub report_id: String,
@@ -279,7 +281,7 @@ pub struct MfgCockpitReportDeliveryReceipt {
     pub delivered_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgCockpitReportDeliveryState {
     pub report_id: String,
     pub report_status: String,
@@ -294,6 +296,12 @@ pub struct MfgCockpitReportDeliveryState {
     pub recommended_mode: String,
     #[serde(default)]
     pub reasons: Vec<String>,
+    #[serde(default)]
+    pub review: Option<app_mfg_contract::MfgReportDeliveryReviewSummary>,
+}
+
+const fn default_report_revision() -> u64 {
+    1
 }
 
 impl MfgCockpitProfile {
@@ -593,6 +601,7 @@ impl MfgCockpitReportSnapshot {
             delivery_ref: request.delivery_ref,
             note: request.note,
             delivery_receipts: Vec::new(),
+            revision: 1,
             projection,
             created_at: Utc::now(),
         }
@@ -607,7 +616,14 @@ impl MfgCockpitReportSnapshot {
             "blocked" => "delivery_blocked".to_string(),
             other => format!("delivery_{other}"),
         };
+        self.revision = self.revision.max(1).saturating_add(1);
         self.delivery_receipts.push(receipt);
+    }
+
+    pub fn normalize_legacy(&mut self) {
+        if self.revision == 0 {
+            self.revision = 1;
+        }
     }
 }
 
@@ -715,6 +731,7 @@ impl MfgCockpitReportDeliveryState {
             retryable,
             recommended_mode,
             reasons,
+            review: None,
         }
     }
 }
@@ -724,6 +741,22 @@ fn classify_report_delivery(
     latest_receipt: Option<&MfgCockpitReportDeliveryReceipt>,
     retry_attempt_count: usize,
 ) -> (String, bool, String, Vec<String>) {
+    if report.status == "delivery_abandoned" {
+        return (
+            "delivery_abandoned".to_string(),
+            false,
+            "none".to_string(),
+            vec!["delivery:abandoned_irreversible".to_string()],
+        );
+    }
+    if report.status == "delivery_resolved_external" {
+        return (
+            "delivery_resolved_external".to_string(),
+            false,
+            "none".to_string(),
+            vec!["delivery:resolved_outside_cowd".to_string()],
+        );
+    }
     let Some(receipt) = latest_receipt else {
         return (
             "not_delivered".to_string(),

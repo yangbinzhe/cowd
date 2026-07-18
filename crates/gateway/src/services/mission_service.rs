@@ -726,10 +726,11 @@ mod tests {
             mission_id: None,
             parent_execution: None,
             selection_mode: harness_contract::team::TeamSelectionMode::Explicit,
+            strategy_binding: None,
             template_selector: harness_contract::team::TeamTemplateSelector::LatestStable {
                 template_id: harness_contract::team::TeamTemplateDefinitionId::new(
                     harness_contract::agent::DefinitionScope::Builtin,
-                    "cowd/execute-review",
+                    "cowd/direct-executor",
                 )
                 .expect("builtin Team template"),
             },
@@ -743,7 +744,10 @@ mod tests {
             model_lease: "default".to_string(),
             budget_lease: None,
             managed_invocation: None,
-            resource_scopes: vec!["session:mission".to_string()],
+            resource_scopes: vec![
+                "read:crates/runtime".to_string(),
+                "session:mission".to_string(),
+            ],
         }
     }
 

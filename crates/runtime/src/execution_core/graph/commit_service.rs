@@ -2,9 +2,8 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use harness_contract::execution_graph::{
-    apply_node_transition, validate_execution_graph, ExecutionEdge, ExecutionGraph,
-    ExecutionGraphCommand, ExecutionNodeResult, ExecutionNodeSpec, ExecutionNodeStatus,
-    ExecutionTransitionError,
+    ExecutionEdge, ExecutionGraph, ExecutionGraphCommand, ExecutionNodeResult, ExecutionNodeSpec,
+    ExecutionNodeStatus, ExecutionTransitionError, apply_node_transition, validate_execution_graph,
 };
 use serde_json::json;
 use thiserror::Error;
@@ -25,9 +24,7 @@ pub enum ExecutionCommitError {
     Transition(#[from] ExecutionTransitionError),
     #[error("execution graph commit serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
-    #[error(
-        "execution graph `{graph_id}` revision mismatch: expected {expected}, actual {actual}"
-    )]
+    #[error("execution graph `{graph_id}` revision mismatch: expected {expected}, actual {actual}")]
     StaleRevision {
         graph_id: String,
         expected: u64,
@@ -486,6 +483,76 @@ impl ExecutionCommitService {
         tokio::task::spawn_blocking(move || service.replan(&graph, nodes, edges, reason))
             .await
             .map_err(|error| ExecutionCommitError::BlockingTask(error.to_string()))?
+    }
+
+    /// Replace an admitted graph topology before any node starts.
+    ///
+    /// Strategy downgrade uses this boundary when the initially selected Team
+    /// cannot start. Replacing the still-planned snapshot keeps the durable
+    /// graph ID and Surface subscription stable while ensuring the executed
+    /// topology matches the revised strategy compile target.
+    pub fn retarget_planned_graph(
+        &self,
+        graph: &ExecutionGraph,
+        mut replacement: ExecutionGraph,
+        reason: String,
+    ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
+        if graph.nodes.is_empty()
+            || graph
+                .node_statuses
+                .values()
+                .any(|status| *status != ExecutionNodeStatus::Planned)
+            || !graph.node_results.is_empty()
+            || replacement.nodes.is_empty()
+            || replacement.id != graph.id
+        {
+            return Err(ExecutionCommitError::InvalidReplan(
+                "strategy retarget requires the same non-empty graph id before any node starts"
+                    .to_string(),
+            ));
+        }
+        replacement.revision = graph.revision.saturating_add(1);
+        replacement.recovery_cursor = graph.recovery_cursor.clone();
+        replacement.node_results.clear();
+        replacement.node_statuses.clear();
+        for node in &replacement.nodes {
+            replacement
+                .node_statuses
+                .insert(node.id.clone(), ExecutionNodeStatus::Planned);
+        }
+        validate_execution_graph(&replacement)
+            .map_err(|error| ExecutionCommitError::InvalidReplan(error.to_string()))?;
+        let added_node_ids = replacement
+            .nodes
+            .iter()
+            .map(|node| node.id.clone())
+            .collect();
+        let replacement_snapshot = replacement.clone();
+        self.append_graph_event(
+            &replacement_snapshot,
+            graph.revision,
+            format!("{}:strategy-retarget:{}", graph.id, replacement.revision),
+            ExecutionGraphEvent::Replanned {
+                reason,
+                added_node_ids,
+                graph: replacement,
+            },
+            Vec::new(),
+        )
+    }
+
+    pub async fn retarget_planned_graph_async(
+        &self,
+        graph: ExecutionGraph,
+        replacement: ExecutionGraph,
+        reason: String,
+    ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || {
+            service.retarget_planned_graph(&graph, replacement, reason)
+        })
+        .await
+        .map_err(|error| ExecutionCommitError::BlockingTask(error.to_string()))?
     }
 
     pub fn apply_command(

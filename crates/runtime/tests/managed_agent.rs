@@ -41,7 +41,7 @@ fn definition(trigger: ManagedAgentTrigger) -> ManagedAgentDefinition {
         granted_capabilities: vec![AgentCapability::Read],
         allowed_tool_contract_refs: Vec::new(),
         allowed_skill_refs: Vec::new(),
-        resource_scopes: vec!["workspace".to_string()],
+        resource_scopes: vec!["read:crates/runtime".to_string()],
         overlap_policy: ManagedAgentOverlapPolicy::Forbid,
         retry_policy: ManagedAgentRetryPolicy::default(),
         health_policy: ManagedAgentHealthPolicy::default(),
@@ -90,6 +90,18 @@ impl AgentRuntimeBackend for CompletedBackend {
         packet: AgentTaskPacket,
         selection: AgentModelSelection,
     ) -> Result<AgentReturnPacket, String> {
+        let mut evidence_refs = packet.evidence_refs.clone();
+        evidence_refs.push(harness_contract::context::EvidenceAccessRef::durable(
+            harness_contract::context::EvidenceRef::new(
+                "tool",
+                format!("materialized:{}", packet.node_id),
+            ),
+            "a".repeat(64),
+            1,
+            "application/json",
+            format!("session-event://{}/1", packet.session_id),
+            format!("session:{}", packet.session_id),
+        ));
         Ok(AgentReturnPacket {
             run_id: packet.run_id,
             agent_id: packet.agent_id,
@@ -102,17 +114,26 @@ impl AgentRuntimeBackend for CompletedBackend {
             attempt: packet.attempt,
             expected_graph_revision: packet.expected_graph_revision,
             status: AgentTerminalStatus::Completed,
-            outcome: "managed Agent completed through Runtime binding".to_string(),
+            outcome: serde_json::json!({
+                "summary": "managed Agent completed through Runtime binding",
+                "evidence": "materialized durable tool evidence"
+            })
+            .to_string(),
             acceptance: packet.acceptance,
-            evidence_refs: Vec::new(),
+            evidence_refs,
             changes: Vec::new(),
+            runtime_change_receipts: Vec::new(),
             conflicts: Vec::new(),
             unresolved: Vec::new(),
             input_tokens: 1,
             output_tokens: 1,
+            cached_tokens: 0,
             model: selection.model,
             provider: selection.provider,
-            tool_calls: 0,
+            tool_calls: 1,
+            duplicate_tool_calls: 0,
+            runtime_write_attempt_paths: Vec::new(),
+            runtime_observed_resource_scopes: Vec::new(),
             failure: None,
         })
     }

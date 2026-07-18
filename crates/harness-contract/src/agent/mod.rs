@@ -66,6 +66,10 @@ pub struct AgentTaskIntent {
     pub constraints: Vec<String>,
     pub context_refs: Vec<String>,
     pub evidence_refs: Vec<EvidenceAccessRef>,
+    /// Runtime-cropped filesystem/network scopes carried into the executable
+    /// worker. Empty means no workspace resource authority, never "all".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resource_scopes: Vec<String>,
     pub allowed_tools: Vec<String>,
     pub allowed_skills: Vec<String>,
     pub permission_lease: String,
@@ -99,6 +103,10 @@ pub struct AgentTaskPacket {
     pub constraints: Vec<String>,
     pub context_refs: Vec<String>,
     pub evidence_refs: Vec<EvidenceAccessRef>,
+    /// Exact resource ceiling compiled from the parent graph node. The
+    /// in-process worker enforces it again at every tool boundary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resource_scopes: Vec<String>,
     pub allowed_tools: Vec<String>,
     pub allowed_skills: Vec<String>,
     pub permission_lease: String,
@@ -131,15 +139,44 @@ pub struct AgentReturnPacket {
     pub outcome: String,
     pub acceptance: Vec<String>,
     pub evidence_refs: Vec<EvidenceAccessRef>,
+    /// Legacy external-backend change hints. These are never sufficient for a
+    /// Team acceptance decision.
     pub changes: Vec<String>,
+    /// Cowd-native before/after receipts. External process Team backends are
+    /// rejected and this field is ignored outside the in-process trust path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_change_receipts: Vec<AgentChangeReceipt>,
     pub conflicts: Vec<String>,
     pub unresolved: Vec<String>,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    #[serde(default)]
+    pub cached_tokens: u64,
     pub model: String,
     pub provider: String,
     pub tool_calls: u64,
+    #[serde(default)]
+    pub duplicate_tool_calls: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_write_attempt_paths: Vec<String>,
+    /// Canonical resource scopes that successful in-process tools actually
+    /// touched. Planned/granted scopes are carried by `AgentTaskPacket`; this
+    /// field is the observed counterpart used for overlap evidence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_observed_resource_scopes: Vec<String>,
     pub failure: Option<String>,
+}
+
+/// Cowd-native Runtime-generated proof that a bounded workspace write changed
+/// bytes. Team execution rejects external process backends before they can
+/// submit this field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentChangeReceipt {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_sha256: Option<String>,
+    pub after_sha256: String,
+    pub write_sequence: u64,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -531,5 +568,51 @@ mod tests {
             spec.validate(),
             Err(AgentSpecError::MissingField(field)) if field == "instructions"
         ));
+    }
+
+    #[test]
+    fn agent_return_change_wire_is_rolling_compatible() {
+        let legacy = serde_json::json!({
+            "run_id": "run",
+            "agent_id": "agent",
+            "task_id": "task",
+            "session_id": "session",
+            "mission_id": null,
+            "team_id": null,
+            "graph_id": "graph",
+            "node_id": "node",
+            "attempt": 1,
+            "expected_graph_revision": 0,
+            "status": "completed",
+            "outcome": "done",
+            "acceptance": [],
+            "evidence_refs": [],
+            "changes": ["src/lib.rs"],
+            "conflicts": [],
+            "unresolved": [],
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "cached_tokens": 0,
+            "model": "model",
+            "provider": "provider",
+            "tool_calls": 1,
+            "failure": null
+        });
+        let mut returned: AgentReturnPacket =
+            serde_json::from_value(legacy).expect("legacy change hints remain readable");
+        assert_eq!(returned.changes, vec!["src/lib.rs"]);
+        assert!(returned.runtime_change_receipts.is_empty());
+
+        returned.runtime_change_receipts.push(AgentChangeReceipt {
+            path: "src/lib.rs".to_string(),
+            before_sha256: Some("a".repeat(64)),
+            after_sha256: "b".repeat(64),
+            write_sequence: 2,
+        });
+        let round_trip: AgentReturnPacket = serde_json::from_value(
+            serde_json::to_value(&returned).expect("encode additive receipt"),
+        )
+        .expect("decode additive receipt");
+        assert_eq!(round_trip, returned);
     }
 }

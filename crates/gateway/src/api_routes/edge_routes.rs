@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use axum::{
+    Json, Router,
     extract::State as AxumState,
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
 use connector::builtin_source_adapter_manifests;
 use serde::Serialize;
@@ -73,6 +73,8 @@ struct EdgeSurfaceProjection {
     lifecycle: surface::SurfaceLifecycle,
     status: surface::SurfaceStatus,
     runtime: Option<SurfaceRuntimeSnapshot>,
+    runtime_spec: Option<surface::SurfaceRuntimeSpec>,
+    transport: Option<surface::SurfaceTransport>,
     capability_count: usize,
     capabilities: Vec<String>,
     route_count: usize,
@@ -213,6 +215,8 @@ fn edge_surface_projection(
         lifecycle: descriptor.lifecycle,
         status: descriptor.status.clone(),
         runtime: runtime_snapshot.clone(),
+        runtime_spec: descriptor.runtime.clone(),
+        transport: descriptor.transport,
         capability_count: descriptor.capabilities.len(),
         capabilities: descriptor
             .capabilities
@@ -224,11 +228,7 @@ fn edge_surface_projection(
         routes: descriptor.routes.clone(),
         resources: descriptor.resources.clone(),
         source: descriptor.source.clone(),
-        entry: descriptor.entry.clone().or_else(|| {
-            descriptor
-                .managed_artifact()
-                .map(|(artifact, _)| artifact.to_string())
-        }),
+        entry: descriptor.entry.clone(),
         diagnostics: descriptor.diagnostics.clone(),
         message_descriptor: message_connector_descriptor(descriptor, runtime_snapshot.as_ref()),
     }
@@ -374,23 +374,31 @@ mod tests {
         let projection = edge_registry_projection(&state);
 
         assert_eq!(projection.kind, "edge.registry");
-        assert!(projection
-            .surfaces
-            .iter()
-            .any(|surface| surface.id == "tui"));
-        assert!(projection
-            .surfaces
-            .iter()
-            .any(|surface| surface.id == "webui"));
-        assert!(projection
-            .source_connectors
-            .iter()
-            .any(|connector| connector.adapter_id.as_deref() == Some("feishu_bitable")));
-        assert!(projection
-            .source_connectors
-            .iter()
-            .any(|connector| connector.adapter_id.as_deref() == Some("csv")
-                && !connector.requires_sidecar));
+        assert!(
+            projection
+                .surfaces
+                .iter()
+                .any(|surface| surface.id == "tui")
+        );
+        assert!(
+            projection
+                .surfaces
+                .iter()
+                .any(|surface| surface.id == "webui")
+        );
+        assert!(
+            projection
+                .source_connectors
+                .iter()
+                .any(|connector| connector.adapter_id.as_deref() == Some("feishu_bitable"))
+        );
+        assert!(
+            projection
+                .source_connectors
+                .iter()
+                .any(|connector| connector.adapter_id.as_deref() == Some("csv")
+                    && !connector.requires_sidecar)
+        );
     }
 
     #[test]
@@ -407,7 +415,7 @@ mod tests {
                 driver_profile: "feishu-message".to_string(),
                 transport: surface::SurfaceTransport::UdsHttp2,
             }),
-            entry: Some("feishu".to_string()),
+            entry: None,
             transport: Some(surface::SurfaceTransport::UdsHttp2),
             lifecycle: surface::SurfaceLifecycle::Managed,
             capabilities: vec![surface::SurfaceCapability::new(
@@ -428,10 +436,21 @@ mod tests {
 
         assert_eq!(descriptor.descriptor_version, 1);
         assert!(descriptor.max_message_length > 0);
-        assert!(descriptor
-            .supported_actions
-            .iter()
-            .any(|action| action == "message.send.text"));
+        assert!(
+            descriptor
+                .supported_actions
+                .iter()
+                .any(|action| action == "message.send.text")
+        );
         assert!(!descriptor.markdown_dialect.is_empty());
+        assert!(projection.entry.is_none());
+        assert!(matches!(
+            projection.runtime_spec,
+            Some(surface::SurfaceRuntimeSpec::Managed { .. })
+        ));
+        assert_eq!(
+            projection.transport,
+            Some(surface::SurfaceTransport::UdsHttp2)
+        );
     }
 }

@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixSourceKey {
     pub source_system: String,
     pub source_key: String,
@@ -22,7 +22,7 @@ impl MatrixSourceKey {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixEntityInput {
     #[serde(default)]
     pub entity_id: Option<String>,
@@ -38,7 +38,7 @@ pub struct MatrixEntityInput {
     pub confidence: Option<f32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixEntity {
     pub entity_id: String,
     pub entity_type: String,

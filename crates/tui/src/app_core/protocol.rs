@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
 
+use crate::runtime_control_store::MfgOperationsSnapshot;
+
 pub use harness_contract::projection::{
     ExecutionCommandReceipt, ExecutionCommandRequest, ExecutionProjection, ProjectionDelta,
 };
@@ -23,14 +25,22 @@ pub enum ProjectionDeltaApply {
 }
 
 impl ExecutionProjectionReducer {
-    pub fn install_snapshot(&mut self, projection: &ExecutionProjection) {
+    pub fn install_snapshot(&mut self, projection: &ExecutionProjection) -> ProjectionDeltaApply {
+        if validate_execution_projection_schema(projection).is_err() {
+            self.execution_id = None;
+            self.cursor = 0;
+            self.seen_event_ids.clear();
+            return ProjectionDeltaApply::ResyncRequired;
+        }
         self.execution_id = Some(projection.execution_id.clone());
         self.cursor = projection.cursor;
         self.seen_event_ids.clear();
+        ProjectionDeltaApply::Applied
     }
 
     pub fn apply_delta(&mut self, delta: &ProjectionDelta) -> ProjectionDeltaApply {
-        if self.execution_id.as_deref() != Some(delta.execution_id.as_str())
+        if validate_projection_delta_schema(delta).is_err()
+            || self.execution_id.as_deref() != Some(delta.execution_id.as_str())
             || self.cursor != delta.base_cursor
             || delta.target_cursor < delta.base_cursor
         {
@@ -51,6 +61,40 @@ impl ExecutionProjectionReducer {
     pub const fn cursor(&self) -> u64 {
         self.cursor
     }
+}
+
+pub fn validate_execution_projection_schema(
+    projection: &ExecutionProjection,
+) -> Result<(), String> {
+    if projection.schema_version
+        != harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION
+    {
+        return Err(format!(
+            "unsupported execution projection schema_version {}",
+            projection.schema_version
+        ));
+    }
+    if let Some(strategy) = projection.strategy.as_ref() {
+        if strategy.schema_version
+            != harness_contract::projection::STRATEGY_DECISION_PROJECTION_SCHEMA_VERSION
+        {
+            return Err(format!(
+                "unsupported strategy projection schema_version {}",
+                strategy.schema_version
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_projection_delta_schema(delta: &ProjectionDelta) -> Result<(), String> {
+    if delta.schema_version != harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported execution projection delta schema_version {}",
+            delta.schema_version
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,7 +181,55 @@ pub enum CowdEvent {
         summary: RuntimeExecutionGraphSummary,
     },
     ExecutionProjectionDelta {
+        generation: u64,
         delta: ProjectionDelta,
+    },
+    ExecutionProjectionLoaded {
+        generation: u64,
+        projection: ExecutionProjection,
+    },
+    RuntimeBacklinkResolved {
+        target: String,
+        object: Value,
+        mfg_generation: u64,
+        selection_revision: u64,
+        live_generation: u64,
+        live_epoch: Option<String>,
+        live_reauthentication_count: u64,
+    },
+    RuntimeBacklinkFailed {
+        target: String,
+        message: String,
+        mfg_generation: u64,
+        selection_revision: u64,
+        live_generation: u64,
+        live_epoch: Option<String>,
+        live_reauthentication_count: u64,
+    },
+    /// A stream established under an earlier credential or schema contract
+    /// must never keep rendering its last full snapshot after Gateway rejects
+    /// it.  The generation makes a delayed revoke harmless after a selection
+    /// switch.
+    ExecutionProjectionAccessRevoked {
+        generation: u64,
+        execution_id: String,
+        message: String,
+    },
+    ApprovalBacklinkResolved {
+        target: String,
+        object: Value,
+    },
+    ApprovalBacklinkFailed {
+        target: String,
+        message: String,
+    },
+    SurfaceBacklinkResolved {
+        target: String,
+        receipt: Value,
+    },
+    SurfaceBacklinkFailed {
+        target: String,
+        message: String,
     },
     Warning {
         message: String,
@@ -184,6 +276,38 @@ pub enum CowdEvent {
     },
     ApprovalRequested {
         tool: String,
+    },
+    MfgContract {
+        generation: u64,
+        contract: app_mfg_contract::MfgFrontendContractV1,
+    },
+    MfgSnapshot {
+        generation: u64,
+        snapshot: MfgOperationsSnapshot,
+    },
+    MfgReadFailed {
+        generation: u64,
+        section: String,
+        error: app_mfg_contract::MfgApiErrorV1,
+    },
+    MfgLiveEnvelope {
+        generation: u64,
+        envelope: app_mfg_contract::MfgLiveEnvelopeV1,
+    },
+    MfgLiveFailed {
+        generation: u64,
+        error: app_mfg_contract::MfgApiErrorV1,
+    },
+    MfgLiveStopped {
+        generation: u64,
+    },
+    MfgActionAccepted {
+        intent_id: String,
+        response: app_mfg_contract::MfgMutationResponseV1,
+    },
+    MfgActionFailed {
+        intent_id: String,
+        error: app_mfg_contract::MfgApiErrorV1,
     },
 }
 
@@ -246,6 +370,49 @@ mod tests {
         assert_eq!(reducer.cursor(), 11);
         assert_eq!(
             reducer.apply_delta(&delta),
+            ProjectionDeltaApply::ResyncRequired
+        );
+    }
+
+    #[test]
+    fn projection_reducer_fails_closed_on_execution_delta_and_nested_strategy_versions() {
+        let mut invalid_execution = snapshot();
+        invalid_execution.schema_version = 2;
+        let mut reducer = ExecutionProjectionReducer::default();
+        assert_eq!(
+            reducer.install_snapshot(&invalid_execution),
+            ProjectionDeltaApply::ResyncRequired
+        );
+
+        let mut invalid_strategy = snapshot();
+        invalid_strategy.strategy = Some(
+            serde_json::from_value(serde_json::json!({
+                "schema_version": 2,
+                "id": "strategy-v2",
+                "kind": "strategy_decision",
+                "revision": 1,
+                "evidence_refs": []
+            }))
+            .expect("future strategy wire remains deserializable for explicit rejection"),
+        );
+        assert_eq!(
+            reducer.install_snapshot(&invalid_strategy),
+            ProjectionDeltaApply::ResyncRequired
+        );
+
+        let projection = snapshot();
+        assert_eq!(
+            reducer.install_snapshot(&projection),
+            ProjectionDeltaApply::Applied
+        );
+        assert_eq!(
+            reducer.apply_delta(&ProjectionDelta {
+                schema_version: 2,
+                execution_id: projection.execution_id,
+                base_cursor: projection.cursor,
+                target_cursor: projection.cursor,
+                events: Vec::new(),
+            }),
             ProjectionDeltaApply::ResyncRequired
         );
     }

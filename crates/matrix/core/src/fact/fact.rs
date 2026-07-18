@@ -17,7 +17,7 @@ pub const KNOWLEDGE_PROCESS_STEP_FACT: &str = "knowledge_process_step";
 pub const KNOWLEDGE_CONSTRAINT_FACT: &str = "knowledge_constraint";
 pub const KNOWLEDGE_CONFLICT_FACT: &str = "knowledge_conflict";
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixFact {
     pub fact_id: String,
     pub snapshot_id: String,
@@ -189,7 +189,7 @@ fn confidence_basis_points(confidence: f32) -> u16 {
     (confidence.clamp(0.0, 1.0) * 10_000.0).round() as u16
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixFactInput {
     #[serde(default)]
     pub fact_id: Option<String>,

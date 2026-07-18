@@ -47,6 +47,7 @@ fn request() -> TeamInstantiationRequest {
         mission_id: None,
         parent_execution: None,
         selection_mode: TeamSelectionMode::Explicit,
+        strategy_binding: None,
         template_selector: TeamTemplateSelector::LatestStable {
             template_id: TeamTemplateDefinitionId::new(
                 DefinitionScope::Builtin,
@@ -64,7 +65,10 @@ fn request() -> TeamInstantiationRequest {
         model_lease: "default".to_string(),
         budget_lease: None,
         managed_invocation: None,
-        resource_scopes: vec!["session:working-state-commit".to_string()],
+        resource_scopes: vec![
+            "read:crates/runtime".to_string(),
+            "session:working-state-commit".to_string(),
+        ],
     }
 }
 
@@ -83,6 +87,18 @@ impl AgentRuntimeBackend for CompletedBackend {
         packet: AgentTaskPacket,
         selection: AgentModelSelection,
     ) -> Result<AgentReturnPacket, String> {
+        let mut evidence_refs = packet.evidence_refs.clone();
+        evidence_refs.push(harness_contract::context::EvidenceAccessRef::durable(
+            harness_contract::context::EvidenceRef::new(
+                "tool",
+                format!("materialized:{}", packet.node_id),
+            ),
+            "a".repeat(64),
+            1,
+            "application/json",
+            format!("session-event://{}/1", packet.session_id),
+            format!("session:{}", packet.session_id),
+        ));
         Ok(AgentReturnPacket {
             run_id: packet.run_id,
             agent_id: packet.agent_id,
@@ -95,17 +111,26 @@ impl AgentRuntimeBackend for CompletedBackend {
             attempt: packet.attempt,
             expected_graph_revision: packet.expected_graph_revision,
             status: AgentTerminalStatus::Completed,
-            outcome: "completed with evidence".to_string(),
-            acceptance: vec!["summary".to_string(), "evidence".to_string()],
-            evidence_refs: Vec::new(),
+            outcome: serde_json::json!({
+                "summary": "completed with evidence",
+                "evidence": "materialized durable tool evidence"
+            })
+            .to_string(),
+            acceptance: packet.acceptance,
+            evidence_refs,
             changes: Vec::new(),
+            runtime_change_receipts: Vec::new(),
             conflicts: Vec::new(),
             unresolved: Vec::new(),
             input_tokens: 1,
             output_tokens: 1,
+            cached_tokens: 0,
             model: selection.model,
             provider: selection.provider,
-            tool_calls: 0,
+            tool_calls: 1,
+            duplicate_tool_calls: 0,
+            runtime_write_attempt_paths: Vec::new(),
+            runtime_observed_resource_scopes: Vec::new(),
             failure: None,
         })
     }
@@ -130,7 +155,7 @@ async fn terminal_graph_transition_commits_exactly_one_replayable_team_working_s
         .expect("working state");
     assert_eq!(state.graph_id, projection.graph_id);
     assert_eq!(state.entries.len(), 1);
-    assert_eq!(state.entries[0].summary, "completed with evidence");
+    assert!(state.entries[0].summary.contains("completed with evidence"));
     assert!(!state.entries[0].producer_instance_id.is_empty());
     assert!(state.entries[0]
         .boundary

@@ -6,9 +6,15 @@
 use serde::{Deserialize, Serialize};
 
 use crate::context::ContextComponentUsage;
+use crate::core::ExecutionPattern;
 use crate::execution_graph::ExecutionGraphProjection;
+use crate::strategy::{
+    ExecutionCandidateEstimate, ExecutionCandidateKind, StrategyDecisionSource,
+    StrategyResourceSnapshot,
+};
 
 pub const EXECUTION_PROJECTION_SCHEMA_VERSION: u32 = 1;
+pub const STRATEGY_DECISION_PROJECTION_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -46,6 +52,154 @@ pub struct ProjectionEntity {
     pub evidence_refs: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<serde_json::Value>,
+}
+
+/// Public, capability-cropped responsibility assigned to one strategy lane.
+///
+/// Runtime deliberately omits workspace paths, prompts, hidden content and
+/// internal reasoning. `capability_cropped_refs` contains only opaque public
+/// evidence references admitted by the projection reducer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StrategyEvidenceScopeProjection {
+    pub role_id: String,
+    pub focus_id: String,
+    pub responsibility_summary: String,
+    #[serde(default)]
+    pub capability_cropped_refs: Vec<String>,
+    pub scope_hash: String,
+    pub overlap_budget_bp: u16,
+    pub novelty_target_bp: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StrategyTransitionProjection {
+    pub revision: u64,
+    pub kind: String,
+    pub status: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StrategyProofStatus {
+    NotProven,
+    Calibrated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StrategyActualStatus {
+    Unknown,
+    Observed,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StrategyActualProjection {
+    pub duration_ms: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_tokens: u64,
+    pub tool_calls: u64,
+    pub duplicate_tool_calls: u64,
+    pub max_tool_concurrency_observed: u64,
+    pub parallel_tool_batches: u64,
+    #[serde(default)]
+    pub write_attempt_refs: Vec<String>,
+    pub evidence_overlap_bp: u16,
+    pub evidence_overlap_observed: bool,
+    pub working_state_verified: bool,
+    pub merge_cost_ms: u64,
+    pub parent_merge_count: u8,
+    #[serde(default)]
+    pub evaluation_token_limit: u64,
+    #[serde(default)]
+    pub evaluation_tokens_consumed: u64,
+    #[serde(default)]
+    pub evaluation_budget_observed: bool,
+    #[serde(default)]
+    pub evaluation_budget_breached: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality_score_bp: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_speedup_ratio_bp: Option<u16>,
+    pub terminal_reason: String,
+}
+
+/// Backward-compatible typed strategy projection.
+///
+/// The legacy-named fields intentionally preserve the [`ProjectionEntity`]
+/// JSON shape. An old reader ignores the additive schema and typed fields; a
+/// new reader accepts an old generic entity and reports it as a legacy/unknown
+/// decision because all typed fields use serde defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StrategyDecisionProjection {
+    #[serde(default = "strategy_decision_projection_schema_version")]
+    pub schema_version: u32,
+    pub id: String,
+    pub kind: String,
+    pub revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<serde_json::Value>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_candidate: Option<ExecutionCandidateKind>,
+    #[serde(
+        default,
+        rename = "selected_pattern",
+        alias = "pattern",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pattern: Option<ExecutionPattern>,
+    #[serde(default)]
+    pub candidate_estimates: Vec<ExecutionCandidateEstimate>,
+    #[serde(default, rename = "benefit_reason", alias = "benefit_reasons")]
+    pub benefit_reasons: Vec<String>,
+    #[serde(default, rename = "cost_reason", alias = "cost_reasons")]
+    pub cost_reasons: Vec<String>,
+    #[serde(default)]
+    pub evidence_scopes: Vec<StrategyEvidenceScopeProjection>,
+    #[serde(default, rename = "downgrade", alias = "downgrades")]
+    pub downgrades: Vec<StrategyTransitionProjection>,
+    #[serde(default, rename = "early_stop", alias = "early_stops")]
+    pub early_stops: Vec<StrategyTransitionProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated: Option<ExecutionCandidateEstimate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual: Option<StrategyActualProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_snapshot: Option<StrategyResourceSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<StrategyDecisionSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof_status: Option<StrategyProofStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_status: Option<StrategyActualStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_execution_id: Option<String>,
+}
+
+const fn strategy_decision_projection_schema_version() -> u32 {
+    STRATEGY_DECISION_PROJECTION_SCHEMA_VERSION
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,7 +404,7 @@ pub struct ExecutionProjection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mission_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub strategy: Option<ProjectionEntity>,
+    pub strategy: Option<StrategyDecisionProjection>,
     pub graph: ExecutionGraphProjection,
     #[serde(default)]
     pub child_executions: Vec<ChildExecutionProjection>,
@@ -298,6 +452,7 @@ pub enum ProjectionEventKind {
     UsageChanged,
     HealthChanged,
     CommandsChanged,
+    StrategyChanged,
     TerminalCommitted,
     CursorAdvanced,
 }
@@ -407,5 +562,57 @@ mod tests {
         assert_eq!(legacy_reader.execution_id, "execution-legacy");
         assert_eq!(legacy_reader.revision, 4);
         assert_eq!(legacy_reader.cursor, 9);
+    }
+
+    #[test]
+    fn typed_strategy_projection_is_bidirectionally_compatible_with_legacy_entity_json() {
+        let legacy = serde_json::json!({
+            "id": "legacy-strategy-event",
+            "kind": "strategy",
+            "revision": 7,
+            "status": "running",
+            "summary": "runtime.strategy.selected",
+            "evidence_refs": [],
+            "detail": {"legacy": true}
+        });
+        let decoded: StrategyDecisionProjection =
+            serde_json::from_value(legacy).expect("new reader accepts old generic strategy");
+        assert_eq!(
+            decoded.schema_version,
+            STRATEGY_DECISION_PROJECTION_SCHEMA_VERSION
+        );
+        assert!(decoded.decision_id.is_none());
+        assert!(decoded.selected_candidate.is_none());
+        assert!(decoded.actual_status.is_none());
+
+        let typed: StrategyDecisionProjection = serde_json::from_value(serde_json::json!({
+            "id": "decision-1",
+            "kind": "strategy_decision",
+            "revision": 2,
+            "status": "completed",
+            "summary": "runtime.strategy.outcome",
+            "evidence_refs": ["evidence:checked"],
+            "decision_id": "decision-1",
+            "execution_id": "execution-1",
+            "session_id": "session-1",
+            "turn_id": "turn-1",
+            "selected_candidate": "team",
+            "pattern": "collaborate",
+            "candidate_estimates": [],
+            "benefit_reasons": [],
+            "cost_reasons": [],
+            "evidence_scopes": [],
+            "downgrades": [],
+            "early_stops": [],
+            "proof_status": "not_proven",
+            "actual_status": "unknown"
+        }))
+        .expect("typed projection fixture");
+        let encoded = serde_json::to_value(typed).expect("typed strategy serializes");
+        let legacy_reader: ProjectionEntity =
+            serde_json::from_value(encoded).expect("legacy generic reader ignores typed fields");
+        assert_eq!(legacy_reader.id, "decision-1");
+        assert_eq!(legacy_reader.kind, "strategy_decision");
+        assert_eq!(legacy_reader.revision, 2);
     }
 }

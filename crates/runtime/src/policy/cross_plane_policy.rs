@@ -827,6 +827,20 @@ impl CrossPlaneControlPlane {
             .cloned()
     }
 
+    #[must_use]
+    pub fn find_execution(&self, receipt_id: &str) -> Option<CrossPlaneExecutionReceipt> {
+        let receipt_id = receipt_id.trim();
+        if receipt_id.is_empty() {
+            return None;
+        }
+        let state = self.inner.read().unwrap_or_else(|err| err.into_inner());
+        state
+            .executions
+            .iter()
+            .find(|receipt| receipt.id == receipt_id)
+            .cloned()
+    }
+
     pub fn record_execution(&self, receipt: CrossPlaneExecutionReceipt) {
         let mut state = self.inner.write().unwrap_or_else(|err| err.into_inner());
         state.executions.push(receipt);

@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 
+use crate::CowdEvent;
 use crate::accessibility::AccessibilityMode;
 use crate::animation::{AnimationEngine, AnimationKind};
 use crate::app::{App, SystemNoticeKind};
@@ -43,6 +44,7 @@ use crate::components::file_tree::FileTree;
 use crate::components::gateway_panel::GatewayPanel;
 use crate::components::goal_workbench_panel::GoalWorkbenchPanel;
 use crate::components::memory_panel::MemoryPanel;
+use crate::components::mfg_operations_panel::MfgOperationsPanel;
 use crate::components::performance_dashboard::PerformanceDashboard;
 use crate::components::prompt::Prompt;
 use crate::components::question_form::QuestionForm;
@@ -59,18 +61,18 @@ use crate::components::toast::{ToastManager, ToastVariant};
 use crate::components::todo_panel::TodoPanel;
 use crate::components::tool_ops_panel::{ToolOpsMode, ToolOpsPanel};
 use crate::components::{Component, RenderContext};
-use crate::context_tokens::{validate_context_tokens_against_entries, ContextWorkspaceEntry};
+use crate::context_tokens::{ContextWorkspaceEntry, validate_context_tokens_against_entries};
 use crate::error_recovery::{self, RenderResult};
 use crate::event::dispatcher::EventDispatcher;
 use crate::event::{ComponentId as EventComponentId, EventBus};
 use crate::keybind::types::Action;
 use crate::keybind::which_key::WhichKey;
-use crate::keybind::{default_bindings, KeybindEngine};
+use crate::keybind::{KeybindEngine, default_bindings};
 use crate::layout::{LayoutState, LayoutTree};
 use crate::profiler::{FrameTimer, RenderProfiler};
+use crate::runtime_control_store::{MfgBacklinkKind, MfgIntentStatus, MfgViewFocus};
 use crate::theme::ThemeEngine;
 use crate::workbench::panel_registry;
-use crate::CowdEvent;
 
 /// Result of processing a key event through the TUI input pipeline.
 #[derive(Debug, Clone)]
@@ -81,7 +83,7 @@ pub enum ProcessedKey {
     Nothing,
 }
 
-pub(crate) const SIDEBAR_TAB_COUNT: usize = 10;
+pub(crate) const SIDEBAR_TAB_COUNT: usize = 11;
 pub(crate) const TAB_RUNTIME: usize = 0;
 pub(crate) const TAB_TOOLS: usize = 1;
 pub(crate) const TAB_CHANGES: usize = 2;
@@ -91,7 +93,8 @@ pub(crate) const TAB_TODO: usize = 5;
 pub(crate) const TAB_FILES: usize = 6;
 pub(crate) const TAB_SESSIONS: usize = 7;
 pub(crate) const TAB_SURFACES: usize = 8;
-pub(crate) const TAB_GATEWAY: usize = 9;
+pub(crate) const TAB_MFG: usize = 9;
+pub(crate) const TAB_GATEWAY: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FocusTarget {
@@ -393,6 +396,9 @@ pub struct TuiState {
     /// Surface panel showing Gateway-managed UI and external surface registry.
     pub surface_panel: SurfacePanel,
 
+    /// Read-only MFG control-plane panel. It owns no business state.
+    pub mfg_operations_panel: MfgOperationsPanel,
+
     /// Runtime activity panel summarizing run/context/tool state.
     pub runtime_activity_panel: RuntimeActivityPanel,
 
@@ -407,7 +413,7 @@ pub struct TuiState {
     pub activity_panel_visible: bool,
 
     /// Active tab index in the sidebar.
-    /// 0=Runtime, 1=Tools, 2=Changes, 3=Goals, 4=Approvals, 5=Todo, 6=Files, 7=Sessions, 8=Surfaces, 9=Gateway.
+    /// 0=Runtime, 1=Tools, 2=Changes, 3=Goals, 4=Approvals, 5=Todo, 6=Files, 7=Sessions, 8=Surfaces, 9=MFG, 10=Gateway.
     pub sidebar_active_tab: usize,
 
     /// Heavy topic panel opened on demand instead of participating in normal tab rotation.
@@ -523,6 +529,7 @@ impl TuiState {
         let config_panel = ConfigPanel::new();
         let gateway_panel = GatewayPanel::new();
         let surface_panel = SurfacePanel::new();
+        let mfg_operations_panel = MfgOperationsPanel::new();
         let runtime_activity_panel = RuntimeActivityPanel::new();
         let tool_ops_panel = ToolOpsPanel::new();
         let system_status_bar = SystemStatusBar::new();
@@ -575,6 +582,7 @@ impl TuiState {
             config_panel,
             gateway_panel,
             surface_panel,
+            mfg_operations_panel,
             runtime_activity_panel,
             tool_ops_panel,
             system_status_bar,
@@ -637,12 +645,147 @@ impl TuiState {
     /// internal state-change notification. It is intentionally not encoded
     /// as a fake terminal event.
     pub fn apply_event(&mut self, event: CowdEvent) {
+        let updates_mfg_actions = matches!(
+            &event,
+            CowdEvent::MfgContract { .. }
+                | CowdEvent::MfgSnapshot { .. }
+                | CowdEvent::MfgReadFailed { .. }
+                | CowdEvent::MfgLiveEnvelope { .. }
+                | CowdEvent::MfgLiveFailed { .. }
+                | CowdEvent::MfgLiveStopped { .. }
+                | CowdEvent::MfgActionAccepted { .. }
+                | CowdEvent::MfgActionFailed { .. }
+        );
         match &event {
             CowdEvent::TurnStarted => self.app.turn_interaction.submit_started(),
             CowdEvent::ExecutionGraphSummary { summary } => {
                 if let Some(execution_id) = summary.graph_id.as_deref() {
                     self.app.turn_interaction.ingress_accepted(execution_id);
                 }
+            }
+            CowdEvent::RuntimeBacklinkResolved {
+                target,
+                object,
+                mfg_generation,
+                selection_revision,
+                live_generation,
+                live_epoch,
+                live_reauthentication_count,
+            } => {
+                let accepted = self.app.mfg_operations.accepts_runtime_backlink_result(
+                    target,
+                    *mfg_generation,
+                    *selection_revision,
+                    *live_generation,
+                    live_epoch.as_deref(),
+                    *live_reauthentication_count,
+                );
+                if !accepted {
+                    // A selection, generation, or reauthentication changed
+                    // while this request was in flight.  Do not let stale
+                    // success reclaim the Runtime panel or strategy cache.
+                } else if !runtime_backlink_object_matches_target(target, object) {
+                    self.app
+                        .mfg_operations
+                        .invalidate_runtime_strategy_target(target);
+                    self.runtime_activity_panel.record_backlink_failure(
+                        target.clone(),
+                        "Gateway returned an object whose canonical identity does not match the backlink",
+                    );
+                } else if target.starts_with("runtime-execution://") {
+                    if let Ok(projection) = serde_json::from_value::<
+                        crate::protocol::ExecutionProjection,
+                    >(object.clone())
+                    {
+                        if crate::protocol::validate_execution_projection_schema(&projection)
+                            .is_ok()
+                        {
+                            self.app.mfg_operations.record_runtime_strategy_projection(
+                                &projection,
+                                *mfg_generation,
+                                *selection_revision,
+                                *live_generation,
+                                live_epoch.clone(),
+                                *live_reauthentication_count,
+                            );
+                            self.runtime_activity_panel
+                                .record_backlink_object(target.clone(), object);
+                        } else {
+                            self.app
+                                .mfg_operations
+                                .invalidate_runtime_strategy_target(target);
+                            self.runtime_activity_panel.record_backlink_failure(
+                                target.clone(),
+                                "Gateway returned an unsupported execution projection schema",
+                            );
+                        }
+                    } else {
+                        self.app
+                            .mfg_operations
+                            .invalidate_runtime_strategy_target(target);
+                        self.runtime_activity_panel.record_backlink_failure(
+                            target.clone(),
+                            "Gateway returned an invalid execution projection contract",
+                        );
+                    }
+                } else {
+                    self.runtime_activity_panel
+                        .record_backlink_object(target.clone(), object);
+                }
+            }
+            CowdEvent::RuntimeBacklinkFailed {
+                target,
+                message,
+                mfg_generation,
+                selection_revision,
+                live_generation,
+                live_epoch,
+                live_reauthentication_count,
+            } => {
+                if self.app.mfg_operations.accepts_runtime_backlink_result(
+                    target,
+                    *mfg_generation,
+                    *selection_revision,
+                    *live_generation,
+                    live_epoch.as_deref(),
+                    *live_reauthentication_count,
+                ) {
+                    self.app
+                        .mfg_operations
+                        .invalidate_runtime_strategy_target(target);
+                    self.runtime_activity_panel
+                        .record_backlink_failure(target.clone(), message.clone());
+                }
+            }
+            CowdEvent::ApprovalBacklinkResolved { target, object } => {
+                if approval_backlink_object_matches_target(target, object) {
+                    self.approval_cockpit_panel
+                        .record_backlink_object(target.clone(), object);
+                } else {
+                    self.approval_cockpit_panel.record_backlink_failure(
+                        target.clone(),
+                        "Gateway returned an approval whose canonical identity does not match the backlink",
+                    );
+                }
+            }
+            CowdEvent::ApprovalBacklinkFailed { target, message } => {
+                self.approval_cockpit_panel
+                    .record_backlink_failure(target.clone(), message.clone());
+            }
+            CowdEvent::SurfaceBacklinkResolved { target, receipt } => {
+                if surface_backlink_receipt_matches_target(target, receipt) {
+                    self.surface_panel
+                        .record_backlink_receipt(target.clone(), receipt.clone());
+                } else {
+                    self.surface_panel.record_backlink_failure(
+                        target.clone(),
+                        "Gateway returned a Surface receipt whose canonical identity does not match the backlink",
+                    );
+                }
+            }
+            CowdEvent::SurfaceBacklinkFailed { target, message } => {
+                self.surface_panel
+                    .record_backlink_failure(target.clone(), message.clone());
             }
             // Stream terminal events update the timeline only. Runtime
             // projection terminal_ref remains the lifecycle authority.
@@ -665,6 +808,10 @@ impl TuiState {
 
         // Preserve ALL existing App behavior
         self.app.apply_event(event);
+        if updates_mfg_actions {
+            self.command_palette
+                .sync_mfg_actions(&self.app.mfg_operations);
+        }
 
         // Bridge: notify new components that state has changed without
         // overloading an operating-system input event.
@@ -678,8 +825,19 @@ impl TuiState {
     /// state from its live revision.  Gateway transport may reconnect or
     /// replay, but older snapshots cannot move this state backward.
     pub fn apply_execution_projection(&mut self, projection: crate::protocol::ExecutionProjection) {
-        self.app.turn_interaction.projection_snapshot(&projection);
-        self.app.apply_execution_projection(projection);
+        if self.app.apply_execution_projection(projection.clone()) {
+            self.app.turn_interaction.projection_snapshot(&projection);
+        }
+    }
+
+    /// Fail closed for a currently selected projection.  The caller performs
+    /// the generation check before invoking this method so a delayed revoke
+    /// from an old stream cannot erase a newer selection.
+    pub fn invalidate_execution_projection(&mut self, execution_id: &str, reason: &str) {
+        if self.app.invalidate_execution_projection(execution_id) {
+            self.add_system_notice(SystemNoticeKind::Warning, reason);
+            self.runtime_activity_panel.sync_from_app(&self.app);
+        }
     }
 
     // ── Rendering ───────────────────────────────────────────────
@@ -747,6 +905,7 @@ impl TuiState {
                             .set_current_session(&self.app.session_id);
                     }
                     TAB_SURFACES => self.surface_panel.sync_from_app(&self.app),
+                    TAB_MFG => {}
                     TAB_GATEWAY => self.gateway_panel.sync_from_app(&self.app),
                     _ => {}
                 }
@@ -835,6 +994,9 @@ impl TuiState {
             let topic_fullscreen = self.layout_state.sidebar_visible
                 && self.active_topic_panel.is_some()
                 && frame_areas.body.width < 100;
+            let mfg_fullscreen = self.layout_state.sidebar_visible
+                && self.active_topic_panel.is_none()
+                && self.sidebar_active_tab == TAB_MFG;
             if self.layout_state.sidebar_visible
                 && self.active_topic_panel.is_some()
                 && frame_areas.body.width >= 100
@@ -847,7 +1009,7 @@ impl TuiState {
                 .clamp(48, max_topic_w);
                 chat_area.width = frame_areas.body.width.saturating_sub(topic_w).max(40);
             }
-            if topic_fullscreen {
+            if topic_fullscreen || mfg_fullscreen {
                 chat_area.width = 0;
                 toast_anchor_area = ratatui::layout::Rect::new(
                     frame_areas.body.x,
@@ -877,7 +1039,7 @@ impl TuiState {
             } else {
                 None
             };
-            let sidebar_area = if topic_fullscreen {
+            let sidebar_area = if topic_fullscreen || mfg_fullscreen {
                 frame_areas.body
             } else {
                 let sidebar_x = chat_area.x.saturating_add(chat_area.width);
@@ -1116,6 +1278,26 @@ impl TuiState {
                                 "surface_panel",
                                 AssertUnwindSafe(|| {
                                     self.surface_panel.render(&mut main_ctx, panel_area);
+                                }),
+                            );
+                        }
+                        TAB_MFG => {
+                            let _ = error_recovery::catch_render_panic(
+                                "mfg_operations_panel",
+                                AssertUnwindSafe(|| {
+                                    self.mfg_operations_panel.render_state(
+                                        &mut main_ctx,
+                                        panel_area,
+                                        &self.app.mfg_operations,
+                                        self.app
+                                            .latest_execution_projection
+                                            .as_ref()
+                                            .and_then(|projection| projection.strategy.as_ref()),
+                                        self.app
+                                            .latest_execution_projection
+                                            .as_ref()
+                                            .map_or(&[], |projection| projection.agents.as_slice()),
+                                    );
                                 }),
                             );
                         }
@@ -1451,6 +1633,10 @@ impl TuiState {
             }
         }
 
+        if self.handle_mfg_panel_key(event) {
+            return true;
+        }
+
         if self.handle_terminal_control_shortcut(event) {
             return true;
         }
@@ -1627,6 +1813,10 @@ impl TuiState {
                 }
                 return ProcessedKey::Nothing;
             }
+        }
+
+        if self.handle_mfg_panel_key(key) {
+            return ProcessedKey::Nothing;
         }
 
         // ── Prompt autocomplete routing (Tab / Shift+Tab / Esc) ──
@@ -1938,7 +2128,10 @@ impl TuiState {
             }
             // Ctrl+A/E/W/U/K/Z → textarea for editing
             if event.modifiers == KeyModifiers::CONTROL {
-                return matches!(event.code, KeyCode::Char('a' | 'e' | 'w' | 'u' | 'k' | 'y' | 'z'));
+                return matches!(
+                    event.code,
+                    KeyCode::Char('a' | 'e' | 'w' | 'u' | 'k' | 'y' | 'z')
+                );
             }
             return false;
         }
@@ -2042,10 +2235,8 @@ impl TuiState {
         self.app.input.insert_paste(text);
         self.composer_desired_column = None;
         let input_text = self.input_text();
-        self.prompt.refresh_suggestions_from_text_at_cursor(
-            &input_text,
-            self.input_cursor_byte_offset(),
-        );
+        self.prompt
+            .refresh_suggestions_from_text_at_cursor(&input_text, self.input_cursor_byte_offset());
         self.app.mark_dirty();
     }
 
@@ -2255,6 +2446,17 @@ impl TuiState {
                     self.surface_panel.handle_event(&event)
                 }
             }
+            TAB_MFG => {
+                if let crossterm::event::Event::Key(key) = event {
+                    if self.handle_mfg_panel_key(key) {
+                        crate::components::EventResult::Consumed
+                    } else {
+                        crate::components::EventResult::NotConsumed
+                    }
+                } else {
+                    crate::components::EventResult::NotConsumed
+                }
+            }
             TAB_GATEWAY => {
                 if self.handle_gateway_panel_action(&event) {
                     crate::components::EventResult::Consumed
@@ -2268,6 +2470,275 @@ impl TuiState {
             self.set_focus_target(FocusTarget::Sidebar);
         }
         consumed
+    }
+
+    fn handle_mfg_panel_key(&mut self, key: KeyEvent) -> bool {
+        if !self.layout_state.sidebar_visible
+            || self.active_topic_panel.is_some()
+            || self.sidebar_active_tab != TAB_MFG
+            || self.focus_target != FocusTarget::Sidebar
+        {
+            return false;
+        }
+        match key.code {
+            // Plain Tab/Shift+Tab are reserved for the global sidebar.  The
+            // MFG workbench still has a local focus ring, but it must not
+            // strand users in the panel or make the documented global switch
+            // appear unresponsive.
+            KeyCode::Tab if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.app.mfg_operations.focus = match self.app.mfg_operations.focus {
+                    MfgViewFocus::Tabs => MfgViewFocus::List,
+                    MfgViewFocus::List => MfgViewFocus::Detail,
+                    MfgViewFocus::Detail => MfgViewFocus::Backlinks,
+                    MfgViewFocus::Backlinks => MfgViewFocus::Actions,
+                    MfgViewFocus::Actions => MfgViewFocus::Tabs,
+                };
+                true
+            }
+            KeyCode::BackTab if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.app.mfg_operations.focus = match self.app.mfg_operations.focus {
+                    MfgViewFocus::Tabs => MfgViewFocus::Actions,
+                    MfgViewFocus::List => MfgViewFocus::Tabs,
+                    MfgViewFocus::Detail => MfgViewFocus::List,
+                    MfgViewFocus::Backlinks => MfgViewFocus::Detail,
+                    MfgViewFocus::Actions => MfgViewFocus::Backlinks,
+                };
+                true
+            }
+            KeyCode::Left if self.app.mfg_operations.focus == MfgViewFocus::Tabs => {
+                self.app.mfg_operations.cycle_tab(true);
+                true
+            }
+            KeyCode::Right if self.app.mfg_operations.focus == MfgViewFocus::Tabs => {
+                self.app.mfg_operations.cycle_tab(false);
+                true
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if self.app.mfg_operations.focus == MfgViewFocus::Detail {
+                    self.app.mfg_operations.detail_scroll =
+                        self.app.mfg_operations.detail_scroll.saturating_add(1);
+                } else if self.app.mfg_operations.focus == MfgViewFocus::Actions {
+                    self.app.mfg_operations.move_action_selection(true);
+                } else {
+                    self.app.mfg_operations.move_selection(true);
+                }
+                true
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if self.app.mfg_operations.focus == MfgViewFocus::Detail {
+                    self.app.mfg_operations.detail_scroll =
+                        self.app.mfg_operations.detail_scroll.saturating_sub(1);
+                } else if self.app.mfg_operations.focus == MfgViewFocus::Actions {
+                    self.app.mfg_operations.move_action_selection(false);
+                } else {
+                    self.app.mfg_operations.move_selection(false);
+                }
+                true
+            }
+            KeyCode::Enter => {
+                if self.app.mfg_operations.focus == MfgViewFocus::Actions {
+                    let should_confirm = self
+                        .app
+                        .mfg_operations
+                        .latest_action_intent()
+                        .is_some_and(|intent| {
+                            intent.status == MfgIntentStatus::AwaitingConfirmation
+                                && self
+                                    .app
+                                    .mfg_operations
+                                    .selected_action_contract()
+                                    .is_some_and(|action| action.action_id == intent.action_id)
+                        });
+                    if !should_confirm
+                        && self
+                            .app
+                            .mfg_operations
+                            .selected_action_contract()
+                            .is_some_and(|action| {
+                                crate::runtime_control_store::mfg_action_requires_explicit_input(
+                                    action.action_id,
+                                )
+                            })
+                    {
+                        let result = self
+                            .app
+                            .mfg_operations
+                            .selected_action_contract()
+                            .ok_or_else(|| "No MFG action is selected.".to_string())
+                            .and_then(|action| {
+                                self.app
+                                    .mfg_operations
+                                    .action_input_command(action.action_id)
+                            });
+                        self.prepare_mfg_action_composer(result);
+                        return true;
+                    }
+                    let result = if should_confirm {
+                        self.app.mfg_operations.confirm_pending_action()
+                    } else {
+                        self.app.mfg_operations.prepare_selected_action(None)
+                    };
+                    self.notify_mfg_intent_result(result);
+                } else {
+                    self.app.mfg_operations.focus = match self.app.mfg_operations.focus {
+                        MfgViewFocus::Detail | MfgViewFocus::Backlinks => MfgViewFocus::List,
+                        MfgViewFocus::Tabs | MfgViewFocus::List => MfgViewFocus::Detail,
+                        MfgViewFocus::Actions => MfgViewFocus::Actions,
+                    };
+                }
+                true
+            }
+            KeyCode::Char('a') => {
+                self.app.mfg_operations.focus = MfgViewFocus::Actions;
+                true
+            }
+            KeyCode::Char('y') => {
+                let result = self.app.mfg_operations.confirm_pending_action();
+                self.notify_mfg_intent_result(result);
+                true
+            }
+            KeyCode::Char('c') => {
+                let result = self.app.mfg_operations.cancel_pending_action();
+                self.notify_mfg_intent_result(result);
+                true
+            }
+            KeyCode::Char('R') => {
+                let result = self.app.mfg_operations.retry_failed_action();
+                self.notify_mfg_intent_result(result);
+                true
+            }
+            KeyCode::Char('r') => {
+                self.app.mfg_operations.request_refresh();
+                self.toast_manager.push(
+                    ToastVariant::Info,
+                    Some("MFG".into()),
+                    "Refreshing canonical MFG projection".into(),
+                    1600,
+                );
+                true
+            }
+            KeyCode::Char(']') => {
+                if self.app.mfg_operations.adjust_page_limit(true) {
+                    self.toast_manager.push(
+                        ToastVariant::Info,
+                        Some("MFG pagination".into()),
+                        "Loading more records from Gateway".into(),
+                        1600,
+                    );
+                }
+                true
+            }
+            KeyCode::Char('[') => {
+                if self.app.mfg_operations.adjust_page_limit(false) {
+                    self.toast_manager.push(
+                        ToastVariant::Info,
+                        Some("MFG pagination".into()),
+                        "Reducing the canonical page window".into(),
+                        1600,
+                    );
+                }
+                true
+            }
+            KeyCode::Char('e') => self.activate_mfg_backlink(MfgBacklinkKind::Evidence),
+            KeyCode::Char('p') => self.activate_mfg_backlink(MfgBacklinkKind::Approval),
+            KeyCode::Char('s') => self.activate_mfg_backlink(MfgBacklinkKind::Surface),
+            KeyCode::Char('x') => self.activate_mfg_backlink(MfgBacklinkKind::Runtime),
+            KeyCode::Esc => {
+                if let Ok(intent_id) = self.app.mfg_operations.cancel_pending_action() {
+                    self.notify_mfg_intent_result(Ok(intent_id));
+                } else {
+                    self.layout_state.toggle_sidebar(&mut self.layout_tree);
+                    self.set_focus_target(FocusTarget::Chat);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn notify_mfg_intent_result(&mut self, result: Result<String, String>) {
+        match result {
+            Ok(intent_id) => self.toast_manager.push(
+                ToastVariant::Info,
+                Some("MFG governed action".into()),
+                format!("Intent {intent_id} updated"),
+                1800,
+            ),
+            Err(error) => self.toast_manager.push(
+                ToastVariant::Warning,
+                Some("MFG governed action".into()),
+                error,
+                3200,
+            ),
+        }
+    }
+
+    fn prepare_mfg_action_composer(&mut self, result: Result<String, String>) {
+        match result {
+            Ok(command) => {
+                self.app.input.set_text(&command);
+                self.set_focus_target(FocusTarget::Chat);
+                self.toast_manager.push(
+                    ToastVariant::Info,
+                    Some("MFG governed input".into()),
+                    "Required fields are in the composer. Replace every <required:...> value, then submit."
+                        .into(),
+                    3600,
+                );
+            }
+            Err(error) => self.notify_mfg_intent_result(Err(error)),
+        }
+    }
+
+    fn activate_mfg_backlink(&mut self, kind: MfgBacklinkKind) -> bool {
+        let Some(backlink) = self.app.mfg_operations.activate_backlink(kind) else {
+            self.toast_manager.push(
+                ToastVariant::Warning,
+                Some("MFG backlink".into()),
+                format!("No {} backlink is available", kind.label()),
+                1800,
+            );
+            return true;
+        };
+        match kind {
+            MfgBacklinkKind::Evidence => {
+                self.open_sidebar_tab(TAB_MFG, "MFG evidence");
+                self.app
+                    .mfg_operations
+                    .focus_evidence_backlink(&backlink.target);
+            }
+            MfgBacklinkKind::Approval => {
+                self.open_sidebar_tab(TAB_APPROVALS, "Approvals");
+                self.approval_cockpit_panel
+                    .focus_backlink_target(backlink.target.clone());
+                self.app
+                    .mfg_operations
+                    .request_approval_backlink(&backlink.target);
+            }
+            MfgBacklinkKind::Surface => {
+                self.open_sidebar_tab(TAB_SURFACES, "Surfaces");
+                self.surface_panel
+                    .focus_backlink_target(backlink.target.clone());
+                self.app
+                    .mfg_operations
+                    .request_surface_receipt(&backlink.target);
+            }
+            MfgBacklinkKind::Runtime => {
+                self.open_sidebar_tab(TAB_RUNTIME, "Runtime");
+                self.runtime_activity_panel
+                    .focus_backlink_target(backlink.target.clone());
+                self.app
+                    .mfg_operations
+                    .request_runtime_backlink(&backlink.target);
+            }
+        }
+        self.toast_manager.push(
+            ToastVariant::Info,
+            Some(format!("{} backlink", kind.label())),
+            backlink.target,
+            2200,
+        );
+        true
     }
 
     fn refresh_file_preview_from_gateway(&mut self) {
@@ -3170,9 +3641,18 @@ impl TuiState {
             self.layout_state.toggle_sidebar(&mut self.layout_tree);
         }
         self.sidebar_active_tab = tab.min(SIDEBAR_TAB_COUNT.saturating_sub(1));
+        match self.sidebar_active_tab {
+            TAB_RUNTIME => self.runtime_activity_panel.clear_backlink_target(),
+            TAB_APPROVALS => self.approval_cockpit_panel.clear_backlink_target(),
+            TAB_SURFACES => self.surface_panel.clear_backlink_target(),
+            _ => {}
+        }
         self.set_focus_target(FocusTarget::Sidebar);
         if self.sidebar_active_tab == TAB_TOOLS {
             self.refresh_tool_ops_panel_overview();
+        }
+        if self.sidebar_active_tab == TAB_MFG && self.app.mfg_operations.last_updated_at.is_none() {
+            self.app.mfg_operations.request_refresh();
         }
         self.toast_manager.push(
             ToastVariant::Info,
@@ -3259,6 +3739,81 @@ impl TuiState {
             return true;
         }
 
+        if let Some(rest) = command.strip_prefix("/mfg ") {
+            self.open_sidebar_tab(TAB_MFG, "MFG Operations");
+            let rest = rest.trim();
+            let result = match rest {
+                "confirm" => {
+                    self.app.mfg_operations.focus = MfgViewFocus::Actions;
+                    self.app.mfg_operations.confirm_pending_action()
+                }
+                "cancel" => {
+                    self.app.mfg_operations.focus = MfgViewFocus::Actions;
+                    self.app.mfg_operations.cancel_pending_action()
+                }
+                "retry" => {
+                    self.app.mfg_operations.focus = MfgViewFocus::Actions;
+                    self.app.mfg_operations.retry_failed_action()
+                }
+                _ if rest.starts_with("review ") => {
+                    let review_id = rest["review ".len()..].trim();
+                    if review_id.is_empty() {
+                        Err("MFG review id is required.".to_string())
+                    } else {
+                        self.app
+                            .mfg_operations
+                            .select_tab(crate::runtime_control_store::MfgViewTab::Reviews);
+                        self.app.mfg_operations.selected_review_id = Some(review_id.to_string());
+                        self.app.mfg_operations.focus = MfgViewFocus::Detail;
+                        Ok(format!("mfg-review:{review_id}"))
+                    }
+                }
+                _ if rest.starts_with("draft ") => {
+                    let action_id = rest["draft ".len()..].trim();
+                    let Some(action_id) = app_mfg_contract::MfgActionId::parse(action_id) else {
+                        self.notify_mfg_intent_result(Err(format!(
+                            "Unknown MFG action id: {action_id}"
+                        )));
+                        return true;
+                    };
+                    let result = self.app.mfg_operations.action_input_command(action_id);
+                    self.prepare_mfg_action_composer(result);
+                    return true;
+                }
+                _ if rest.starts_with("action ") => {
+                    self.app.mfg_operations.focus = MfgViewFocus::Actions;
+                    let action = rest["action ".len()..].trim();
+                    let (action_id, payload) = action
+                        .split_once(char::is_whitespace)
+                        .map_or((action, None), |(id, payload)| (id, Some(payload.trim())));
+                    let Some(action_id) = app_mfg_contract::MfgActionId::parse(action_id) else {
+                        self.notify_mfg_intent_result(Err(format!(
+                            "Unknown MFG action id: {action_id}"
+                        )));
+                        return true;
+                    };
+                    let payload = match payload.filter(|payload| !payload.is_empty()) {
+                        Some(payload) => match serde_json::from_str::<serde_json::Value>(payload) {
+                            Ok(payload) => Some(payload),
+                            Err(error) => {
+                                self.notify_mfg_intent_result(Err(format!(
+                                    "MFG action JSON is invalid: {error}"
+                                )));
+                                return true;
+                            }
+                        },
+                        None => None,
+                    };
+                    self.app.mfg_operations.prepare_action(action_id, payload)
+                }
+                _ => Err(
+                    "Use /mfg review <review_id>, /mfg draft <action_id>, /mfg action <action_id> [JSON], /mfg confirm, /mfg cancel, or /mfg retry".to_string(),
+                ),
+            };
+            self.notify_mfg_intent_result(result);
+            return true;
+        }
+
         if command.split_whitespace().count() != 1 {
             return false;
         }
@@ -3340,6 +3895,9 @@ impl TuiState {
             "approvals" => self.open_sidebar_tab(TAB_APPROVALS, "Approvals"),
             "session" | "resume" => self.open_sidebar_tab(TAB_SESSIONS, "Sessions"),
             "surfaces" | "surface" => self.open_sidebar_tab(TAB_SURFACES, "Surfaces"),
+            "mfg" | "manufacturing" | "operations" => {
+                self.open_sidebar_tab(TAB_MFG, "MFG Operations")
+            }
             "gateway" => self.open_sidebar_tab(TAB_GATEWAY, "Gateway"),
             _ => {}
         }
@@ -3354,7 +3912,7 @@ impl TuiState {
             self.toast_manager.push(
                 ToastVariant::Info,
                 Some("Focus".into()),
-                "Use /focus chat|input|activity|runtime|tools|files|sessions|gateway|diff|memory|skills|config"
+                "Use /focus chat|input|activity|runtime|tools|files|sessions|mfg|gateway|diff|memory|skills|config"
                     .into(),
                 2400,
             );
@@ -3417,6 +3975,8 @@ impl TuiState {
         self.refresh_command_projection_from_gateway();
         let snapshot = crate::runtime_control_store::RuntimeControlSnapshot::from_app(&self.app);
         self.command_palette.sync_runtime_actions(&snapshot);
+        self.command_palette
+            .sync_mfg_actions(&self.app.mfg_operations);
         self.command_palette.open();
         self.set_focus_target(FocusTarget::CommandPalette);
     }
@@ -3425,6 +3985,8 @@ impl TuiState {
         self.refresh_command_projection_from_gateway();
         let snapshot = crate::runtime_control_store::RuntimeControlSnapshot::from_app(&self.app);
         self.command_palette.sync_runtime_actions(&snapshot);
+        self.command_palette
+            .sync_mfg_actions(&self.app.mfg_operations);
         self.command_palette.open_with_query(query);
         self.set_focus_target(FocusTarget::CommandPalette);
     }
@@ -3434,6 +3996,8 @@ impl TuiState {
             run_gateway_api_blocking(|client| async move { client.slash_projection("tui").await })
         {
             self.command_palette.sync_command_projection(&payload);
+            self.command_palette
+                .sync_mfg_actions(&self.app.mfg_operations);
             self.prompt
                 .sync_command_suggestions_from_projection(&payload);
         }
@@ -3745,6 +4309,40 @@ impl TuiState {
                     .show_notification("Command prepared. Press Enter to run.");
             }
             Action::RespondGatewayApproval { id, approved } => {
+                if let Some(mfg_approval) = self
+                    .app
+                    .gateway_approval_items
+                    .iter()
+                    .find(|approval| approval.id == *id && approval.is_mfg_source())
+                {
+                    let Some(review_ref) = mfg_approval
+                        .review_ref
+                        .clone()
+                        .filter(|review| !review.trim().is_empty())
+                    else {
+                        self.toast_manager.push(
+                            ToastVariant::Error,
+                            Some("MFG approval contract".into()),
+                            "Typed MFG review reference is missing; generic approve/reject is fail-closed."
+                                .into(),
+                            4200,
+                        );
+                        return;
+                    };
+                    self.open_sidebar_tab(TAB_MFG, "Typed MFG Review");
+                    self.app
+                        .mfg_operations
+                        .select_tab(crate::runtime_control_store::MfgViewTab::Reviews);
+                    self.app.mfg_operations.selected_review_id = Some(review_ref.clone());
+                    self.app.mfg_operations.focus = MfgViewFocus::Detail;
+                    self.toast_manager.push(
+                        ToastVariant::Info,
+                        Some("MFG Review".into()),
+                        format!("{review_ref} requires force_retry/reroute/abandon/resolve/reject"),
+                        3000,
+                    );
+                    return;
+                }
                 let approval_id = id.clone();
                 let projection_id = id.clone();
                 let result = run_gateway_api_blocking(move |client| async move {
@@ -4378,6 +4976,100 @@ impl TuiState {
     }
 }
 
+fn runtime_backlink_object_matches_target(target: &str, object: &serde_json::Value) -> bool {
+    let expected = target
+        .split_once("://")
+        .map(|(_, value)| value.split(['/', '?', '#']).next().unwrap_or_default())
+        .unwrap_or_default();
+    if expected.is_empty() {
+        return false;
+    }
+    let observed = object
+        .get("execution_id")
+        .or_else(|| object.get("task_id"))
+        .or_else(|| object.get("id"))
+        .or_else(|| {
+            object
+                .get("execution")
+                .and_then(|value| value.get("execution_id"))
+        })
+        .and_then(serde_json::Value::as_str);
+    observed == Some(expected)
+}
+
+/// Exact approval routes may return either a live runtime request
+/// (`approval_id`) or a persisted history record (`id`/`request_id`).  A
+/// backlink is an object identity, not a request to render whichever approval
+/// happened to arrive first, so accept only records that name the target.
+fn approval_backlink_object_matches_target(target: &str, object: &serde_json::Value) -> bool {
+    let expected = canonical_backlink_target_id(target, "approval://");
+    let Some(expected) = expected else {
+        return false;
+    };
+    ["approval_id", "id", "request_id"]
+        .into_iter()
+        .any(|field| {
+            object
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value == expected)
+        })
+}
+
+/// Surface backlinks span two exact object planes: cross-plane receipts and
+/// per-surface outbox/message records.  Validate both the object identity and
+/// the surface namespace before allowing a response to replace the focused
+/// panel state.
+fn surface_backlink_receipt_matches_target(target: &str, receipt: &serde_json::Value) -> bool {
+    if let Some(expected) = canonical_backlink_target_id(target, "receipt://cross-plane/") {
+        return receipt
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| value == expected);
+    }
+
+    let Some(surface_target) = target.strip_prefix("surface://") else {
+        return false;
+    };
+    let mut parts = surface_target.splitn(3, '/');
+    let surface_id = parts.next().unwrap_or_default();
+    let object_kind = parts.next().unwrap_or_default();
+    let object_id = parts
+        .next()
+        .unwrap_or(object_kind)
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default();
+    if surface_id.is_empty() || object_id.is_empty() {
+        return false;
+    }
+    let surface_matches = receipt
+        .get("surface")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|value| value == surface_id);
+    if !surface_matches {
+        return false;
+    }
+    let id_fields: &[&str] = if object_kind == "delivery" {
+        &["delivery_id"]
+    } else {
+        &["message_id", "id"]
+    };
+    id_fields.iter().any(|field| {
+        receipt
+            .get(*field)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| value == object_id)
+    })
+}
+
+fn canonical_backlink_target_id<'a>(target: &'a str, prefix: &str) -> Option<&'a str> {
+    target
+        .strip_prefix(prefix)
+        .map(|value| value.split(['/', '?', '#']).next().unwrap_or_default())
+        .filter(|value| !value.is_empty())
+}
+
 // ── Delegation to App via Deref ─────────────────────────────────
 
 impl std::ops::Deref for TuiState {
@@ -4673,6 +5365,43 @@ mod tests {
     }
 
     #[test]
+    fn mfg_backlink_identity_guards_accept_only_the_canonical_approval_and_surface_object() {
+        assert!(approval_backlink_object_matches_target(
+            "approval://approval-1",
+            &serde_json::json!({"approval_id": "approval-1", "status": "pending"}),
+        ));
+        assert!(approval_backlink_object_matches_target(
+            "approval://approval-1",
+            &serde_json::json!({"id": "history-1", "request_id": "approval-1"}),
+        ));
+        assert!(!approval_backlink_object_matches_target(
+            "approval://approval-1",
+            &serde_json::json!({"approval_id": "approval-2"}),
+        ));
+
+        assert!(surface_backlink_receipt_matches_target(
+            "surface://webui/delivery/delivery-1",
+            &serde_json::json!({"surface": "webui", "delivery_id": "delivery-1"}),
+        ));
+        assert!(surface_backlink_receipt_matches_target(
+            "surface://webui/message-1",
+            &serde_json::json!({"surface": "webui", "message_id": "message-1"}),
+        ));
+        assert!(surface_backlink_receipt_matches_target(
+            "receipt://cross-plane/cpx-1",
+            &serde_json::json!({"id": "cpx-1"}),
+        ));
+        assert!(!surface_backlink_receipt_matches_target(
+            "surface://webui/delivery/delivery-1",
+            &serde_json::json!({"surface": "webui", "delivery_id": "delivery-2"}),
+        ));
+        assert!(!surface_backlink_receipt_matches_target(
+            "surface://webui/message-1",
+            &serde_json::json!({"surface": "slack", "message_id": "message-1"}),
+        ));
+    }
+
+    #[test]
     fn local_connector_resource_state_updates_projection_state() {
         let mut state = TuiState::new("test-model", "test-session");
         state.app.gateway_connector_resources =
@@ -4708,18 +5437,22 @@ mod tests {
         state.app.available_models = vec!["tui-reload-model".to_string(), "tui-fast".to_string()];
 
         assert!(state.reload_runtime_provider_projection());
-        assert!(state
-            .app
-            .notification
-            .as_deref()
-            .unwrap_or_default()
-            .contains("Provider projection refreshed"));
-        assert!(!state
-            .app
-            .notification
-            .as_deref()
-            .unwrap_or_default()
-            .contains("tui-secret-key"));
+        assert!(
+            state
+                .app
+                .notification
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Provider projection refreshed")
+        );
+        assert!(
+            !state
+                .app
+                .notification
+                .as_deref()
+                .unwrap_or_default()
+                .contains("tui-secret-key")
+        );
     }
 
     #[test]
@@ -5147,12 +5880,14 @@ mod tests {
         assert_eq!(compact[TAB_TOOLS], "Tool");
         assert_eq!(compact[TAB_APPROVALS], "Appr");
         assert_eq!(compact[TAB_FILES], "File");
+        assert_eq!(compact[TAB_MFG], "MFG");
         assert!(!compact.contains(&"Mem"));
         assert!(!compact.contains(&"Skill"));
         assert_eq!(full[TAB_RUNTIME], "Runtime");
         assert_eq!(full[TAB_TOOLS], "Tools");
         assert_eq!(full[TAB_APPROVALS], "Approvals");
         assert_eq!(full[TAB_FILES], "Files");
+        assert_eq!(full[TAB_MFG], "MFG");
         assert!(!full.contains(&"Memory"));
         assert!(!full.contains(&"Skills"));
     }
@@ -5336,7 +6071,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_and_gateway_panel_commands_open_expected_tabs() {
+    fn runtime_mfg_and_gateway_panel_commands_open_expected_tabs() {
         let mut state = TuiState::new("m", "s");
 
         state.dispatch_action(Action::Execute("/runtime".into()));
@@ -5351,11 +6086,49 @@ mod tests {
         assert_eq!(state.sidebar_active_tab, TAB_TOOLS);
         assert_eq!(state.focus_target, FocusTarget::Sidebar);
 
+        state.dispatch_action(Action::Execute("/mfg".into()));
+        assert!(state.layout_state.sidebar_visible);
+        assert_eq!(state.active_topic_panel, None);
+        assert_eq!(state.sidebar_active_tab, TAB_MFG);
+        assert_eq!(state.focus_target, FocusTarget::Sidebar);
+        assert!(state.app.mfg_operations.refresh_requested);
+
         state.dispatch_action(Action::Execute("/gateway".into()));
         assert!(state.layout_state.sidebar_visible);
         assert_eq!(state.active_topic_panel, None);
         assert_eq!(state.sidebar_active_tab, TAB_GATEWAY);
         assert_eq!(state.focus_target, FocusTarget::Sidebar);
+    }
+
+    #[test]
+    fn mfg_focus_chain_uses_ctrl_tab_without_blocking_global_sidebar_rotation() {
+        let mut state = TuiState::new("m", "s");
+        state.dispatch_action(Action::Execute("/mfg".into()));
+        assert_eq!(state.sidebar_active_tab, TAB_MFG);
+        assert_eq!(state.app.mfg_operations.focus, MfgViewFocus::Tabs);
+
+        state.process_raw_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(state.sidebar_active_tab, TAB_GATEWAY);
+        assert_eq!(state.app.mfg_operations.focus, MfgViewFocus::Tabs);
+
+        state.process_raw_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(state.sidebar_active_tab, TAB_MFG);
+        assert_eq!(state.app.mfg_operations.focus, MfgViewFocus::Tabs);
+
+        state.process_raw_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL));
+        assert_eq!(state.sidebar_active_tab, TAB_MFG);
+        assert_eq!(state.app.mfg_operations.focus, MfgViewFocus::List);
+
+        state.process_raw_key(KeyEvent::new(
+            KeyCode::BackTab,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(state.sidebar_active_tab, TAB_MFG);
+        assert_eq!(state.app.mfg_operations.focus, MfgViewFocus::Tabs);
+
+        state.app.mfg_operations.active_tab = crate::runtime_control_store::MfgViewTab::Incidents;
+        state.process_raw_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+        assert_eq!(state.app.mfg_operations.pagination["incidents"].limit, 100);
     }
 
     #[test]
@@ -5803,6 +6576,109 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn mfg_uses_the_full_workbench_for_real_80_96_120_frame_layouts() {
+        for (width, height, expect_detail, expect_backlinks) in [
+            (80, 24, false, false),
+            (96, 28, true, false),
+            (120, 40, true, true),
+        ] {
+            let mut state = TuiState::new("m", "mfg-layout");
+            state.layout_state.toggle_sidebar(&mut state.layout_tree);
+            state.sidebar_active_tab = TAB_MFG;
+            state.app.mfg_operations.active_tab =
+                crate::runtime_control_store::MfgViewTab::Incidents;
+            state.app.mfg_operations.focus = MfgViewFocus::List;
+            state.app.mfg_operations.incidents =
+                vec![crate::runtime_control_store::MfgItemSummary {
+                    id: "incident-1".to_string(),
+                    kind: "incident".to_string(),
+                    title: "Line stop".to_string(),
+                    status: "open".to_string(),
+                    ..crate::runtime_control_store::MfgItemSummary::default()
+                }];
+            state.app.mfg_operations.selected_incident_id = Some("incident-1".to_string());
+
+            let mut terminal = MockTerminal::new(width, height);
+            terminal.draw(|frame| state.render(frame));
+            let joined = terminal.buffer_lines().join("\n");
+            assert!(joined.contains("MFG Operations"));
+            assert!(joined.contains("incident-1"));
+            assert_eq!(joined.contains("Detail"), expect_detail);
+            assert_eq!(joined.contains("Backlinks"), expect_backlinks);
+        }
+    }
+
+    #[test]
+    fn mfg_backlinks_navigate_to_real_surface_panels() {
+        let mut state = TuiState::new("m", "mfg-backlinks");
+        state.layout_state.toggle_sidebar(&mut state.layout_tree);
+        state.sidebar_active_tab = TAB_MFG;
+        state.focus_target = FocusTarget::Sidebar;
+        state.app.mfg_operations.active_tab = crate::runtime_control_store::MfgViewTab::Incidents;
+        state.app.mfg_operations.incidents = vec![crate::runtime_control_store::MfgItemSummary {
+            id: "incident-1".to_string(),
+            backlinks: vec![
+                crate::runtime_control_store::MfgBacklink {
+                    kind: MfgBacklinkKind::Evidence,
+                    target: "evidence://packet-1".to_string(),
+                    label: "Evidence".to_string(),
+                },
+                crate::runtime_control_store::MfgBacklink {
+                    kind: MfgBacklinkKind::Approval,
+                    target: "approval://review-1".to_string(),
+                    label: "Approval".to_string(),
+                },
+                crate::runtime_control_store::MfgBacklink {
+                    kind: MfgBacklinkKind::Surface,
+                    target: "surface://webui/report-1".to_string(),
+                    label: "Surface".to_string(),
+                },
+                crate::runtime_control_store::MfgBacklink {
+                    kind: MfgBacklinkKind::Runtime,
+                    target: "runtime-execution://mfg-skill-graph-1".to_string(),
+                    label: "Runtime".to_string(),
+                },
+            ],
+            ..crate::runtime_control_store::MfgItemSummary::default()
+        }];
+        state.app.mfg_operations.selected_incident_id = Some("incident-1".to_string());
+
+        assert!(state.activate_mfg_backlink(MfgBacklinkKind::Approval));
+        assert_eq!(state.sidebar_active_tab, TAB_APPROVALS);
+        state.sidebar_active_tab = TAB_MFG;
+        assert!(state.activate_mfg_backlink(MfgBacklinkKind::Surface));
+        assert_eq!(state.sidebar_active_tab, TAB_SURFACES);
+        state.sidebar_active_tab = TAB_MFG;
+        assert!(state.activate_mfg_backlink(MfgBacklinkKind::Runtime));
+        assert_eq!(state.sidebar_active_tab, TAB_RUNTIME);
+        assert_eq!(
+            state
+                .app
+                .mfg_operations
+                .last_backlink_intent
+                .as_ref()
+                .map(|link| link.target.as_str()),
+            Some("runtime-execution://mfg-skill-graph-1")
+        );
+        state.sidebar_active_tab = TAB_MFG;
+        assert!(state.activate_mfg_backlink(MfgBacklinkKind::Evidence));
+        assert_eq!(state.sidebar_active_tab, TAB_MFG);
+        assert_eq!(
+            state.app.mfg_operations.focused_evidence_ref.as_deref(),
+            Some("packet-1")
+        );
+        assert_eq!(
+            state
+                .app
+                .mfg_operations
+                .last_backlink_intent
+                .as_ref()
+                .map(|link| link.target.as_str()),
+            Some("evidence://packet-1")
+        );
     }
 
     #[test]

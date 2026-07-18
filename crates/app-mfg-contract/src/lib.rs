@@ -1,0 +1,317 @@
+//! Canonical cross-surface contract for the manufacturing application.
+//!
+//! This crate owns transport DTOs and semantic metadata only. Repository
+//! rows, SQLite inputs and Runtime services remain in `app-mfg`.
+
+pub mod capability;
+pub mod cockpit;
+pub mod error;
+pub mod live;
+pub mod mutation;
+pub mod operations;
+pub mod receipt;
+pub mod review;
+pub mod route;
+pub mod schema;
+pub mod surface;
+pub mod version;
+
+pub use capability::{
+    active_mfg_capabilities_for_surface, core_profile_capabilities, mfg_profile_capabilities,
+    MfgCapabilityId, MfgCoreProfileId, MfgEntitlementProjectionV2, MfgProfileId,
+};
+pub use cockpit::{MfgContractFreshnessV1, MfgSurfaceStatusV1};
+pub use error::{MfgApiErrorV1, MfgErrorCode, MfgRecoveryAction, MfgRecoveryActionKind};
+pub use live::{
+    mfg_live_event_priority, MfgLiveDeltaV1, MfgLiveEnvelopeV1, MfgLiveEventV1, MfgLiveHeartbeatV1,
+    MfgLiveResyncV1, MfgLiveSnapshotStateV1, MfgLiveSnapshotV1,
+};
+pub use mutation::{
+    mfg_action_contracts, mfg_tui_action_contracts, MfgActionAvailability, MfgActionContract,
+    MfgActionId, MfgActionRisk, MfgConfirmationKind, MfgIdempotencySemantics, MfgMultiActionId,
+    MfgMutationClass, MfgMutationContextV1, MfgMutationSemantics, MfgRevisionSemantics,
+};
+pub use operations::{
+    MfgAssignmentCompletionEvidenceV1, MfgContractDiagnosticV1, MfgIncidentListQuery,
+    MfgMutationRequestV1, MfgMutationResponseV1, MfgNoBodyRequestV1, MfgReadCollectionV1,
+    MfgReadResourceV1, MfgReadResponseV1,
+};
+pub use receipt::{MfgReceiptStatus, MfgReceiptV1};
+pub use review::{
+    MfgReportDeliveryReview, MfgReportDeliveryReviewCollection,
+    MfgReportDeliveryReviewCreateRequest, MfgReportDeliveryReviewDecision,
+    MfgReportDeliveryReviewDecisionRequest, MfgReportDeliveryReviewEffect,
+    MfgReportDeliveryReviewRerouteTarget, MfgReportDeliveryReviewStatus,
+    MfgReportDeliveryReviewSummary,
+};
+pub use route::{
+    mfg_route_contract, mfg_route_contracts, mfg_tui_p0_read_route_contracts,
+    mfg_tui_read_route_contracts, mfg_tui_route_contracts, MfgCapabilityRequirement, MfgConsumer,
+    MfgRouteContract, MfgRouteId, MfgSchemaOwner,
+};
+pub use schema::MfgOpenApiSchemaRegistry;
+pub use surface::{MfgFrontendContractV1, MfgSurfaceContract, MfgSurfaceKind, MfgSurfaceRole};
+pub use version::{MfgContractVersion, MFG_CONTRACT_VERSION};
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    #[test]
+    fn route_inventory_has_all_v545_routes_active() {
+        let routes = mfg_route_contracts();
+        assert_eq!(routes.len(), 104);
+        assert_eq!(
+            routes
+                .iter()
+                .filter(|route| route.availability == MfgActionAvailability::Active)
+                .count(),
+            104
+        );
+        assert_eq!(
+            routes
+                .iter()
+                .filter(|route| route.availability == MfgActionAvailability::PlannedV541)
+                .count(),
+            0
+        );
+        assert_eq!(
+            routes
+                .iter()
+                .filter(|route| route.availability == MfgActionAvailability::PlannedV545)
+                .count(),
+            0
+        );
+        let method_paths = routes
+            .iter()
+            .map(|route| (route.method.as_str(), route.path.as_str()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(method_paths.len(), routes.len());
+        let encoded = serde_json::to_string(&routes).expect("route contract JSON");
+        let decoded = serde_json::from_str::<Vec<MfgRouteContract>>(&encoded)
+            .expect("route contract roundtrip");
+        assert_eq!(decoded, routes);
+    }
+
+    #[test]
+    fn tui_p0_read_inventory_is_semantically_derived_and_includes_live_snapshot() {
+        let routes = mfg_tui_p0_read_route_contracts();
+        assert_eq!(routes.len(), 20);
+        assert!(routes
+            .iter()
+            .all(|route| route.class == MfgMutationClass::Read));
+        assert!(routes
+            .iter()
+            .all(|route| route.availability == MfgActionAvailability::Active));
+        assert!(routes
+            .iter()
+            .all(|route| route.consumers.contains(&MfgConsumer::TuiP0)));
+        assert!(routes
+            .iter()
+            .any(|route| route.route_id == MfgRouteId::LiveSnapshot));
+    }
+
+    #[test]
+    fn tui_operational_route_and_action_inventories_are_derived_from_consumers() {
+        let routes = mfg_tui_route_contracts();
+        assert!(routes.iter().all(|route| {
+            route.availability == MfgActionAvailability::Active
+                && (route.consumers.contains(&MfgConsumer::TuiP0)
+                    || route.consumers.contains(&MfgConsumer::TuiP1))
+        }));
+        assert!(routes
+            .iter()
+            .any(|route| route.route_id == MfgRouteId::LiveSnapshot));
+        let route_ids = routes
+            .iter()
+            .map(|route| route.route_id)
+            .collect::<BTreeSet<_>>();
+        let actions = mfg_tui_action_contracts();
+        assert!(actions
+            .iter()
+            .all(|action| route_ids.contains(&action.route_id)));
+        assert_eq!(
+            actions
+                .iter()
+                .map(|action| action.action_id.as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            actions.len()
+        );
+        assert!(mfg_tui_read_route_contracts()
+            .iter()
+            .all(|route| route.class == MfgMutationClass::Read));
+    }
+
+    #[test]
+    fn every_mutation_action_has_security_and_receipt_semantics() {
+        let actions = mfg_action_contracts();
+        let ids = actions
+            .iter()
+            .map(|action| action.action_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids.len(), actions.len());
+        assert!(actions.iter().all(|action| {
+            !action.required_capabilities.is_empty()
+                && matches!(
+                    action.mutation,
+                    MfgMutationSemantics::PreviewReceipt
+                        | MfgMutationSemantics::DurableReceipt { .. }
+                )
+        }));
+    }
+
+    #[test]
+    fn nine_upsert_actions_have_distinct_create_and_revision_checked_update_semantics() {
+        let actions = mfg_action_contracts();
+        for prefix in [
+            "mfg.reality.source_pack",
+            "mfg.reality.metric_dependency",
+            "mfg.reality.entity",
+            "mfg.reality.relation",
+            "mfg.playbook",
+            "mfg.cockpit.profile",
+            "mfg.alert_rule",
+            "mfg.alert_subscription",
+            "mfg.assignment",
+        ] {
+            let create = actions
+                .iter()
+                .find(|action| action.action_id.as_str() == format!("{prefix}.create"))
+                .expect("create action");
+            let update = actions
+                .iter()
+                .find(|action| action.action_id.as_str() == format!("{prefix}.update"))
+                .expect("update action");
+            assert!(matches!(
+                create.mutation,
+                MfgMutationSemantics::DurableReceipt {
+                    revision: MfgRevisionSemantics::CreateOnly,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                update.mutation,
+                MfgMutationSemantics::DurableReceipt {
+                    revision: MfgRevisionSemantics::Required,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn effect_revision_semantics_follow_the_real_state_owner() {
+        let actions = mfg_action_contracts();
+        for action_id in [
+            "mfg.reality.metric.recompute",
+            "mfg.reality.entity.conflict_decision",
+            "mfg.domain.server_manufacturing.seed",
+            "mfg.ontology.server_manufacturing.seed",
+            "mfg.execution.cross_plane.commit",
+            "mfg.report.schedule.generate_only",
+            "mfg.report.schedule.generate_and_deliver",
+        ] {
+            let action = actions
+                .iter()
+                .find(|action| action.action_id.as_str() == action_id)
+                .unwrap_or_else(|| panic!("missing action {action_id}"));
+            assert!(matches!(
+                action.mutation,
+                MfgMutationSemantics::DurableReceipt {
+                    revision: MfgRevisionSemantics::NotApplicable,
+                    ..
+                }
+            ));
+        }
+        for action_id in [
+            "mfg.assignment.complete",
+            "mfg.analysis.action.commit",
+            "mfg.report.deliver.commit",
+            "mfg.report.delivery.retry_commit",
+            "mfg.report.review.resolve",
+            "mfg.skill.run",
+        ] {
+            let action = actions
+                .iter()
+                .find(|action| action.action_id.as_str() == action_id)
+                .unwrap_or_else(|| panic!("missing action {action_id}"));
+            assert!(matches!(
+                action.mutation,
+                MfgMutationSemantics::DurableReceipt {
+                    revision: MfgRevisionSemantics::Required,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn canonical_schema_registry_contains_transport_contracts() {
+        let schemas = MfgOpenApiSchemaRegistry::canonical().into_components();
+        for required in [
+            "MfgFrontendContractV1",
+            "MfgApiErrorV1",
+            "MfgReceiptV1",
+            "MfgLiveEnvelopeV1",
+            "MfgReportDeliveryReview",
+            "MfgEntitlementProjectionV2",
+        ] {
+            assert!(schemas.contains_key(required), "missing schema {required}");
+        }
+    }
+
+    #[test]
+    fn surface_capability_inventory_uses_only_active_consumable_actions() {
+        let webui = active_mfg_capabilities_for_surface("webui");
+        let tui = active_mfg_capabilities_for_surface("tui");
+        let unknown = active_mfg_capabilities_for_surface("unknown");
+        assert!(webui.contains(&"mfg.cockpit.manage".to_string()));
+        assert!(!tui.contains(&"mfg.cockpit.manage".to_string()));
+        assert!(tui.contains(&"mfg.read".to_string()));
+        assert!(webui.contains(&"mfg.report.review".to_string()));
+        assert!(tui.contains(&"mfg.report.review".to_string()));
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn entitlement_profile_catalogs_preserve_legacy_ceiling_and_new_role_boundaries() {
+        let legacy_core = core_profile_capabilities(MfgCoreProfileId::CoreLegacy09530);
+        assert!(legacy_core.contains(&"definition.manage"));
+        assert!(!legacy_core.contains(&"definition.default.set"));
+        assert!(!legacy_core.contains(&"definition.rollback"));
+
+        let legacy_mfg = mfg_profile_capabilities(MfgProfileId::MfgLegacy09529);
+        assert!(legacy_mfg.contains(&MfgCapabilityId::DataManage));
+        assert!(!legacy_mfg.contains(&MfgCapabilityId::ReportReview));
+        assert!(!legacy_mfg.contains(&MfgCapabilityId::AssignmentLifecycle));
+        assert_eq!(
+            mfg_profile_capabilities(MfgProfileId::MfgViewer),
+            &[MfgCapabilityId::Read]
+        );
+        assert!(mfg_profile_capabilities(MfgProfileId::MfgReviewer)
+            .contains(&MfgCapabilityId::ReportReview));
+        assert!(mfg_profile_capabilities(MfgProfileId::MfgManager)
+            .contains(&MfgCapabilityId::AssignmentLifecycle));
+    }
+
+    #[test]
+    fn legacy_profile_assignment_lifecycle_is_a_typed_403_boundary() {
+        let start = mfg_tui_action_contracts()
+            .into_iter()
+            .find(|action| action.action_id.as_str() == "mfg.assignment.start")
+            .expect("assignment start action");
+        assert_eq!(
+            start.required_capabilities,
+            vec![MfgCapabilityId::AssignmentLifecycle.as_str().to_string()]
+        );
+        let legacy = mfg_profile_capabilities(MfgProfileId::MfgLegacy09529);
+        assert!(!legacy.contains(&MfgCapabilityId::AssignmentLifecycle));
+        let denied =
+            MfgApiErrorV1::capability_denied(MfgCapabilityId::AssignmentLifecycle.as_str());
+        assert_eq!(denied.http_status, 403);
+        assert_eq!(denied.code, MfgErrorCode::CapabilityDenied);
+    }
+}

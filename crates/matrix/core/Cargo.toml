@@ -10,6 +10,7 @@ chrono.workspace = true
 fact-kernel = { path = "../../fact-kernel" }
 serde.workspace = true
 serde_json.workspace = true
+schemars.workspace = true
 sha2 = "0.10"
 uuid.workspace = true
 

@@ -1315,7 +1315,7 @@ impl Component for GatewayPanel {
                     .unwrap_or_else(|| {
                         self.surfaces
                             .iter()
-                            .filter(|surface| surface.entry.is_some())
+                            .filter(|surface| surface.is_external())
                             .count() as u64
                     });
                 lines.push(Line::from(vec![

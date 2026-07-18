@@ -38,8 +38,15 @@ for cmd in tmux curl rg ss; do
   fi
 done
 
+if [[ "${COWD_TUI_SMOKE_SKIP_BUILD:-0}" != "1" ]]; then
+  # The smoke path exercises the real Ratatui surface.  A default CLI build
+  # intentionally omits that surface, so never let an earlier minimal build
+  # turn this acceptance scenario into a false negative.
+  (cd "$ROOT" && cargo build -p cli --features full)
+fi
+
 if [[ ! -x "$BIN" ]]; then
-  echo "missing cowd binary at $BIN; run cargo build -p cli first" >&2
+  echo "missing cowd binary at $BIN; run cargo build -p cli --features full first" >&2
   exit 1
 fi
 if ss -ltnp | rg -q ":$PORT\\b"; then

@@ -48,6 +48,7 @@ impl HumanAuthority {
             expires_at_ms: Some(now_ms().saturating_add(60_000)),
             credential_fingerprint: "v0-human-fixture".to_string(),
             credential_epoch: 7,
+            profile_revision: 1,
         };
         let principal = verifier
             .verify(&SignedPrincipalEnvelope {

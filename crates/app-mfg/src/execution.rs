@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use super::{MfgOperationalAnalysis, MfgRecommendedAction};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgActionExecutionRequest {
     #[serde(default = "default_execution_mode")]
     pub mode: String,
@@ -14,7 +14,7 @@ pub struct MfgActionExecutionRequest {
     pub note: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgActionExecution {
     pub execution_id: String,
     pub analysis_id: String,
@@ -40,7 +40,7 @@ pub struct MfgActionExecution {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgCrossPlaneBridgeReceipt {
     pub bridge_id: String,
     pub execution_id: String,
@@ -52,7 +52,7 @@ pub struct MfgCrossPlaneBridgeReceipt {
     pub bridged_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgActionFeedback {
     pub outcome: String,
     pub note: String,

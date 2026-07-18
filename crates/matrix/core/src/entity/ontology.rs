@@ -1,10 +1,11 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use super::MatrixEntity;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixOntologyConcept {
     pub concept_id: String,
     pub name: String,
@@ -17,7 +18,7 @@ pub struct MatrixOntologyConcept {
     pub version: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixOntologyRelation {
     pub relation_type: String,
     pub from_concept_id: String,
@@ -26,7 +27,7 @@ pub struct MatrixOntologyRelation {
     pub version: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixOntologyMetricBinding {
     pub metric_id: String,
     pub concept_id: String,
@@ -35,7 +36,7 @@ pub struct MatrixOntologyMetricBinding {
     pub version: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixOntologyPack {
     pub ontology_id: String,
     pub domain: String,
@@ -48,7 +49,7 @@ pub struct MatrixOntologyPack {
     pub metric_bindings: Vec<MatrixOntologyMetricBinding>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixEntityMatchCandidate {
     pub candidate_id: String,
     pub left_entity_id: String,
@@ -61,7 +62,7 @@ pub struct MatrixEntityMatchCandidate {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixEntityConflictDecision {
     pub decision_id: String,
     pub candidate_id: String,
@@ -112,8 +113,14 @@ pub fn match_candidate(
     if confidence < 0.5 {
         return None;
     }
+    let mut entity_ids = [left.entity_id.as_str(), right.entity_id.as_str()];
+    entity_ids.sort_unstable();
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(format!("{}:{}", entity_ids[0], entity_ids[1]).as_bytes())
+    );
     Some(MatrixEntityMatchCandidate {
-        candidate_id: format!("entity-match-{}", uuid::Uuid::new_v4()),
+        candidate_id: format!("entity-match-{}", &digest[..20]),
         left_entity_id: left.entity_id.clone(),
         right_entity_id: right.entity_id.clone(),
         match_type: "possible_duplicate".to_string(),

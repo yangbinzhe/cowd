@@ -1,11 +1,11 @@
 use std::{collections::HashMap, sync::Arc};
 
 use axum::{
+    Json, Router,
     extract::{Path as AxumPath, Query, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::get,
-    Json, Router,
 };
 use memory::RecallReport;
 

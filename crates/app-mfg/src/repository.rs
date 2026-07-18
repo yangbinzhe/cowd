@@ -5,34 +5,41 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use storage::{SqliteConnectionFactory, StorageHandle};
 use thiserror::Error;
 
 use crate::{
-    mfg_ontology_pack, mfg_seed_plan, mfg_widget_catalog, MfgActionExecution,
-    MfgActionExecutionRequest, MfgActionFeedback, MfgAlertCommand, MfgAlertCommandInput,
-    MfgAlertOccurrence, MfgAlertRule, MfgAlertSubscription, MfgAssignment, MfgAssignmentCommand,
-    MfgAssignmentCommandInput, MfgCasePromotion, MfgCockpitProfile, MfgCockpitProjection,
-    MfgCockpitReportDeliveryReceipt, MfgCockpitReportRequest, MfgCockpitReportSnapshot,
-    MfgCockpitWidget, MfgCockpitWidgetProjection, MfgCommandReceipt, MfgCrossPlaneBridgeReceipt,
-    MfgDomainSeedResult, MfgForecastProjection, MfgForecastSignal, MfgIncident, MfgLiveProjection,
-    MfgLiveProjectionEvent, MfgMemoryCase, MfgOperationalAnalysis, MfgPlaybook, MfgSkillRun,
-    MfgWidgetDefinition, MfgWidgetInstance, MfgWorkflowGraph, MfgWorkflowGraphError,
+    MfgActionExecution, MfgActionExecutionRequest, MfgActionFeedback, MfgAlertCommand,
+    MfgAlertCommandInput, MfgAlertOccurrence, MfgAlertRule, MfgAlertSubscription, MfgAssignment,
+    MfgAssignmentCommand, MfgAssignmentCommandInput, MfgCasePromotion, MfgCockpitProfile,
+    MfgCockpitProjection, MfgCockpitReportDeliveryReceipt, MfgCockpitReportRequest,
+    MfgCockpitReportSnapshot, MfgCockpitWidget, MfgCockpitWidgetProjection, MfgCommandReceipt,
+    MfgCrossPlaneBridgeReceipt, MfgDomainSeedResult, MfgForecastProjection, MfgForecastSignal,
+    MfgIncident, MfgLiveDeltaRead, MfgLiveEpoch, MfgLiveProjectionEvent, MfgLiveSnapshotRead,
+    MfgMemoryCase, MfgOperationalAnalysis, MfgPlaybook, MfgSkillRun, MfgWidgetDefinition,
+    MfgWidgetInstance, MfgWorkflowGraph, MfgWorkflowGraphError, mfg_ontology_pack, mfg_seed_plan,
+    mfg_widget_catalog,
 };
 
+use app_mfg_contract::{
+    MfgLiveSnapshotStateV1, MfgReportDeliveryReview, MfgReportDeliveryReviewDecision,
+    MfgReportDeliveryReviewEffect, MfgReportDeliveryReviewRerouteTarget,
+    MfgReportDeliveryReviewStatus,
+};
 use matrix_core::{
-    build_metric_compute_jobs, MatrixAttentionItem, MatrixChangeEvent, MatrixComputeJob,
-    MatrixComputeJobInput, MatrixComputePlan, MatrixConnectorRun, MatrixConnectorRunInput,
-    MatrixDataPlane, MatrixDataPlaneHealth, MatrixDataPlaneIngestPlan,
-    MatrixDataPlaneIngestPlanInput, MatrixDataPlaneWatermark, MatrixEntity, MatrixEvidencePacket,
-    MatrixEvidenceSourceRef, MatrixFact, MatrixImpactHop, MatrixImpactTrace,
-    MatrixMetricAttentionPlan, MatrixMetricAttentionScore, MatrixMetricDefinition,
-    MatrixMetricDependency, MatrixMetricLineage, MatrixMetricSnapshot, MatrixMetricSnapshotItem,
-    MatrixMetricState, MatrixOntologyPack, MatrixQualityGateDecision, MatrixRelation,
-    MatrixSeverity, MatrixSourceDeltaPlan, MatrixSourcePack, MatrixSourcePackValidation,
+    MatrixAttentionItem, MatrixChangeEvent, MatrixComputeJob, MatrixComputeJobInput,
+    MatrixComputePlan, MatrixConnectorRun, MatrixConnectorRunInput, MatrixDataPlane,
+    MatrixDataPlaneHealth, MatrixDataPlaneIngestPlan, MatrixDataPlaneIngestPlanInput,
+    MatrixDataPlaneWatermark, MatrixEntity, MatrixEvidencePacket, MatrixEvidenceSourceRef,
+    MatrixFact, MatrixImpactHop, MatrixImpactTrace, MatrixMetricAttentionPlan,
+    MatrixMetricAttentionScore, MatrixMetricDefinition, MatrixMetricDependency,
+    MatrixMetricLineage, MatrixMetricSnapshot, MatrixMetricSnapshotItem, MatrixMetricState,
+    MatrixOntologyPack, MatrixQualityGateDecision, MatrixRelation, MatrixSeverity,
+    MatrixSourceDeltaPlan, MatrixSourcePack, MatrixSourcePackValidation, build_metric_compute_jobs,
 };
 use matrix_repository::MatrixSqliteDataPlane;
 
@@ -67,6 +74,14 @@ pub enum MfgRepositoryError {
     CommandRejected(String),
     #[error("MFG workflow graph error: {0}")]
     Workflow(#[from] MfgWorkflowGraphError),
+}
+
+#[derive(Debug, Clone)]
+pub enum MfgMutationClaim {
+    Acquired(app_mfg_contract::MfgReceiptV1),
+    Pending(app_mfg_contract::MfgReceiptV1),
+    NativeRecovery(MfgCommandReceipt),
+    Replayed(app_mfg_contract::MfgReceiptV1, serde_json::Value),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,6 +214,7 @@ impl MfgRepository {
         &self,
         input: MatrixDataPlaneIngestPlanInput,
     ) -> Result<MatrixDataPlaneIngestPlan, MfgRepositoryError> {
+        let source_ref = input.source_ref.clone();
         let mut plan = MatrixSqliteDataPlane::new(self.health()?.data_plane_watermark_count)
             .plan_ingest(input);
         if plan.affected_metric_ids.is_empty() {
@@ -208,6 +224,26 @@ impl MfgRepository {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut affected = metrics_affected_by_fact_type(&connection, &plan.fact_type)?;
             affected.extend(metric_ids_for_fact_type(&connection, &plan.fact_type)?);
+            // A source-pack is the canonical declaration of the metrics that
+            // its facts materialize.  A newly saved pack need not already
+            // have persisted metric dependencies, so the generic fact-type
+            // lookup above alone would incorrectly return an empty ingest
+            // plan on its first use.
+            if let Some(source_pack_id) = source_ref
+                .strip_prefix("source-pack://")
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                if let Some(source_pack) = find_source_pack(&connection, source_pack_id)? {
+                    affected.extend(
+                        source_pack
+                            .fact_mappings
+                            .iter()
+                            .filter(|mapping| mapping.fact_type == plan.fact_type)
+                            .map(|mapping| mapping.metric_key.clone()),
+                    );
+                }
+            }
             affected.sort();
             affected.dedup();
             plan.compute_jobs = affected
@@ -224,11 +260,6 @@ impl MfgRepository {
                 .collect();
             plan.affected_metric_ids = affected;
         }
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        upsert_data_plane_watermark(&connection, &plan.watermark)?;
         Ok(plan)
     }
 
@@ -252,18 +283,21 @@ impl MfgRepository {
         actor_ref: &str,
         idempotency_key: &str,
     ) -> Result<(MfgCockpitProfile, MfgCommandReceipt), MfgRepositoryError> {
-        let connection = self
+        let mut connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        upsert_cockpit_profile_receipted(
-            &connection,
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = upsert_cockpit_profile_receipted(
+            &transaction,
             profile,
             expected_revision,
             command,
             actor_ref,
             idempotency_key,
-        )
+        )?;
+        transaction.commit()?;
+        Ok(result)
     }
 
     pub fn get_cockpit_profile(
@@ -416,6 +450,36 @@ impl MfgRepository {
         Ok(report)
     }
 
+    pub fn generate_cockpit_report_idempotent(
+        &self,
+        profile_id: &str,
+        report_id: &str,
+        mut request: MfgCockpitReportRequest,
+    ) -> Result<MfgCockpitReportSnapshot, MfgRepositoryError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = find_cockpit_report(&transaction, report_id)? {
+            if existing.profile_id == profile_id {
+                transaction.commit()?;
+                return Ok(existing);
+            }
+            return Err(MfgRepositoryError::CommandRejected(
+                "report id is bound to another cockpit profile".to_string(),
+            ));
+        }
+        let profile = find_cockpit_profile(&transaction, profile_id)?
+            .ok_or_else(|| MfgRepositoryError::NotFound(profile_id.to_string()))?;
+        request.report_id = Some(report_id.to_string());
+        let projection = render_cockpit_projection(&transaction, profile)?;
+        let report = MfgCockpitReportSnapshot::from_projection(projection, request);
+        insert_cockpit_report(&transaction, &report)?;
+        transaction.commit()?;
+        Ok(report)
+    }
+
     pub fn get_cockpit_report(
         &self,
         report_id: &str,
@@ -444,15 +508,221 @@ impl MfgRepository {
         report_id: &str,
         receipt: MfgCockpitReportDeliveryReceipt,
     ) -> Result<MfgCockpitReportSnapshot, MfgRepositoryError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut report = find_cockpit_report(&transaction, report_id)?
+            .ok_or_else(|| MfgRepositoryError::NotFound(report_id.to_string()))?;
+        if let Some(existing) = report
+            .delivery_receipts
+            .iter()
+            .find(|existing| existing.cross_plane_receipt_id == receipt.cross_plane_receipt_id)
+        {
+            if existing.report_id != receipt.report_id
+                || existing.cross_plane_status != receipt.cross_plane_status
+                || existing.cross_plane_dispatch_status != receipt.cross_plane_dispatch_status
+                || existing.audit_record_id != receipt.audit_record_id
+            {
+                return Err(MfgRepositoryError::CommandRejected(
+                    "cross-plane receipt id is bound to a different delivery result".to_string(),
+                ));
+            }
+            transaction.commit()?;
+            return Ok(report);
+        }
+        report.attach_delivery_receipt(receipt);
+        insert_cockpit_report(&transaction, &report)?;
+        transaction.commit()?;
+        Ok(report)
+    }
+
+    pub fn create_report_delivery_review(
+        &self,
+        report: &MfgCockpitReportSnapshot,
+        expected_report_revision: u64,
+        requester_principal: &str,
+        reason: &str,
+        evidence_refs: Vec<String>,
+        idempotency_key: &str,
+    ) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut report = find_cockpit_report(&connection, report_id)?
-            .ok_or_else(|| MfgRepositoryError::NotFound(report_id.to_string()))?;
-        report.attach_delivery_receipt(receipt);
-        insert_cockpit_report(&connection, &report)?;
-        Ok(report)
+        create_report_delivery_review(
+            &connection,
+            report,
+            expected_report_revision,
+            requester_principal,
+            reason,
+            evidence_refs,
+            idempotency_key,
+        )
+    }
+
+    pub fn bind_report_delivery_review_approval(
+        &self,
+        review_id: &str,
+        expected_revision: u64,
+        approval_id: &str,
+        actor_principal: &str,
+        idempotency_key: &str,
+    ) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        bind_report_delivery_review_approval(
+            &connection,
+            review_id,
+            expected_revision,
+            approval_id,
+            actor_principal,
+            idempotency_key,
+        )
+    }
+
+    pub fn get_report_delivery_review(
+        &self,
+        review_id: &str,
+    ) -> Result<Option<MfgReportDeliveryReview>, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        find_report_delivery_review(&connection, review_id)
+    }
+
+    pub fn report_delivery_review_by_transition_key(
+        &self,
+        review_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<MfgReportDeliveryReview>, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let exists = connection
+            .query_row(
+                "SELECT 1 FROM mfg_report_delivery_review_transition
+                 WHERE review_id = ?1 AND idempotency_key = ?2",
+                params![review_id, idempotency_key],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if exists {
+            find_report_delivery_review(&connection, review_id)
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn list_report_delivery_reviews(
+        &self,
+        report_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MfgReportDeliveryReview>, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        list_report_delivery_reviews(&connection, report_id, limit)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_report_delivery_review_decision(
+        &self,
+        review_id: &str,
+        expected_revision: u64,
+        decision: MfgReportDeliveryReviewDecision,
+        reviewer_principal: &str,
+        reason: &str,
+        evidence_refs: Vec<String>,
+        reroute: Option<MfgReportDeliveryReviewRerouteTarget>,
+        decision_lease_ref: &str,
+        idempotency_key: &str,
+    ) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        prepare_report_delivery_review_decision(
+            &connection,
+            review_id,
+            expected_revision,
+            decision,
+            reviewer_principal,
+            reason,
+            evidence_refs,
+            reroute,
+            decision_lease_ref,
+            idempotency_key,
+        )
+    }
+
+    pub fn activate_report_delivery_review_decision(
+        &self,
+        review_id: &str,
+        expected_revision: u64,
+        actor_principal: &str,
+        idempotency_key: &str,
+    ) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        activate_report_delivery_review_decision(
+            &connection,
+            review_id,
+            expected_revision,
+            actor_principal,
+            idempotency_key,
+        )
+    }
+
+    pub fn claim_report_delivery_review_effects(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<MfgReportDeliveryReviewEffect>, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        claim_report_delivery_review_effects(&connection, limit)
+    }
+
+    pub fn complete_report_delivery_review_effect(
+        &self,
+        effect_key: &str,
+        receipt_ref: &str,
+        actor_principal: &str,
+    ) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        complete_report_delivery_review_effect(
+            &connection,
+            effect_key,
+            receipt_ref,
+            actor_principal,
+        )
+    }
+
+    pub fn fail_report_delivery_review_effect(
+        &self,
+        effect_key: &str,
+        error: &str,
+        actor_principal: &str,
+    ) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        fail_report_delivery_review_effect(&connection, effect_key, error, actor_principal)
     }
 
     pub fn delete_cockpit_profile(
@@ -481,7 +751,7 @@ impl MfgRepository {
             "cockpit",
             &format!("mfg:cockpit-profile:{profile_id}"),
             "profile.deleted",
-            serde_json::to_value(&profile)?,
+            serde_json::json!({"profile": profile}),
         )?;
         Ok(profile)
     }
@@ -493,17 +763,20 @@ impl MfgRepository {
         actor_ref: &str,
         idempotency_key: &str,
     ) -> Result<(Option<MfgCockpitProfile>, MfgCommandReceipt), MfgRepositoryError> {
-        let connection = self
+        let mut connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        delete_cockpit_profile_receipted(
-            &connection,
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = delete_cockpit_profile_receipted(
+            &transaction,
             profile_id,
             expected_revision,
             actor_ref,
             idempotency_key,
-        )
+        )?;
+        transaction.commit()?;
+        Ok(result)
     }
 
     pub fn upsert_alert_rule(
@@ -525,17 +798,20 @@ impl MfgRepository {
         actor_ref: &str,
         idempotency_key: &str,
     ) -> Result<(MfgAlertRule, MfgCommandReceipt), MfgRepositoryError> {
-        let connection = self
+        let mut connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        upsert_alert_rule_receipted(
-            &connection,
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = upsert_alert_rule_receipted(
+            &transaction,
             rule,
             expected_revision,
             actor_ref,
             idempotency_key,
-        )
+        )?;
+        transaction.commit()?;
+        Ok(result)
     }
 
     pub fn list_alert_rules(
@@ -581,17 +857,20 @@ impl MfgRepository {
         actor_ref: &str,
         idempotency_key: &str,
     ) -> Result<(MfgAlertSubscription, MfgCommandReceipt), MfgRepositoryError> {
-        let connection = self
+        let mut connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        upsert_alert_subscription_receipted(
-            &connection,
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = upsert_alert_subscription_receipted(
+            &transaction,
             subscription,
             expected_revision,
             actor_ref,
             idempotency_key,
-        )
+        )?;
+        transaction.commit()?;
+        Ok(result)
     }
 
     pub fn list_alert_subscriptions(
@@ -611,11 +890,14 @@ impl MfgRepository {
         occurrence_id: &str,
         command: MfgAlertCommandInput,
     ) -> Result<(MfgAlertOccurrence, MfgCommandReceipt), MfgRepositoryError> {
-        let connection = self
+        let mut connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        command_alert(&connection, occurrence_id, command)
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = command_alert(&transaction, occurrence_id, command)?;
+        transaction.commit()?;
+        Ok(result)
     }
 
     pub fn forecasts(
@@ -650,17 +932,20 @@ impl MfgRepository {
         actor_ref: &str,
         idempotency_key: &str,
     ) -> Result<(MfgAssignment, MfgCommandReceipt), MfgRepositoryError> {
-        let connection = self
+        let mut connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        upsert_assignment_receipted(
-            &connection,
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = upsert_assignment_receipted(
+            &transaction,
             assignment,
             expected_revision,
             actor_ref,
             idempotency_key,
-        )
+        )?;
+        transaction.commit()?;
+        Ok(result)
     }
 
     pub fn get_assignment(
@@ -692,23 +977,83 @@ impl MfgRepository {
         assignment_id: &str,
         command: MfgAssignmentCommandInput,
     ) -> Result<(MfgAssignment, MfgCommandReceipt), MfgRepositoryError> {
-        let connection = self
+        let mut connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        command_assignment(&connection, assignment_id, command)
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = command_assignment(&transaction, assignment_id, command)?;
+        transaction.commit()?;
+        Ok(result)
     }
 
-    pub fn live_projection(
+    pub fn reserve_assignment_completion(
         &self,
-        cursor: Option<u64>,
-        limit: usize,
-    ) -> Result<MfgLiveProjection, MfgRepositoryError> {
+        assignment_id: &str,
+        expected_revision: u64,
+        actor_ref: &str,
+        correlation_id: &str,
+    ) -> Result<MfgAssignment, MfgRepositoryError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = reserve_assignment_completion(
+            &transaction,
+            assignment_id,
+            expected_revision,
+            actor_ref,
+            correlation_id,
+        )?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn live_epoch(&self) -> Result<MfgLiveEpoch, MfgRepositoryError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        build_live_projection(&connection, cursor, limit)
+        load_live_epoch(&connection)
+    }
+
+    pub fn rotate_live_epoch(&self, reason: &str) -> Result<MfgLiveEpoch, MfgRepositoryError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        rotate_live_epoch(&transaction, reason)?;
+        let epoch = load_live_epoch(&transaction)?;
+        transaction.commit()?;
+        Ok(epoch)
+    }
+
+    pub fn live_snapshot_read(&self) -> Result<MfgLiveSnapshotRead, MfgRepositoryError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let snapshot = build_live_snapshot_read(&transaction)?;
+        transaction.commit()?;
+        Ok(snapshot)
+    }
+
+    pub fn live_delta_read(
+        &self,
+        cursor: u64,
+        limit: usize,
+    ) -> Result<MfgLiveDeltaRead, MfgRepositoryError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let delta = build_live_delta_read(&transaction, cursor, limit)?;
+        transaction.commit()?;
+        Ok(delta)
     }
 
     pub fn record_command_notifications(
@@ -716,11 +1061,151 @@ impl MfgRepository {
         idempotency_key: &str,
         notification_refs: Vec<String>,
     ) -> Result<MfgCommandReceipt, MfgRepositoryError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result =
+            record_command_notifications(&transaction, idempotency_key, notification_refs)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn command_notification_refs_for_resource(
+        &self,
+        resource_ref: &str,
+    ) -> Result<Vec<String>, MfgRepositoryError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        record_command_notifications(&connection, idempotency_key, notification_refs)
+        command_notification_refs_for_resource(&connection, resource_ref)
+    }
+
+    pub fn native_command_receipt_by_identity(
+        &self,
+        idempotency_key: &str,
+        actor_principal: &str,
+        action_id: &str,
+        resource_ref: &str,
+    ) -> Result<Option<MfgCommandReceipt>, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        find_native_command_receipt_by_identity(
+            &connection,
+            idempotency_key,
+            actor_principal,
+            action_id,
+            resource_ref,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_mutation_receipt(
+        &self,
+        idempotency_key: &str,
+        actor_principal: &str,
+        action_id: &str,
+        resource_ref: &str,
+        expected_revision: Option<u64>,
+        payload_digest: &str,
+        correlation_id: &str,
+    ) -> Result<MfgMutationClaim, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        claim_mutation_receipt(
+            &connection,
+            idempotency_key,
+            actor_principal,
+            action_id,
+            resource_ref,
+            expected_revision,
+            payload_digest,
+            correlation_id,
+        )
+    }
+
+    pub fn release_mutation_claim(
+        &self,
+        idempotency_key: &str,
+        actor_principal: &str,
+        action_id: &str,
+        payload_digest: &str,
+    ) -> Result<bool, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(connection.execute(
+            "DELETE FROM mfg_mutation_receipt
+             WHERE idempotency_key = ?1
+               AND actor_principal = ?2
+               AND action_id = ?3
+               AND payload_digest = ?4
+               AND status = 'accepted'",
+            params![idempotency_key, actor_principal, action_id, payload_digest],
+        )? == 1)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_mutation_receipt(
+        &self,
+        idempotency_key: &str,
+        actor_principal: &str,
+        action_id: &str,
+        resource_ref: &str,
+        payload_digest: &str,
+    ) -> Result<Option<(app_mfg_contract::MfgReceiptV1, serde_json::Value)>, MfgRepositoryError>
+    {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        find_mutation_receipt(
+            &connection,
+            idempotency_key,
+            actor_principal,
+            action_id,
+            resource_ref,
+            payload_digest,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_mutation_receipt(
+        &self,
+        idempotency_key: &str,
+        actor_principal: &str,
+        action_id: &str,
+        resource_ref: &str,
+        expected_revision: Option<u64>,
+        result_revision: Option<u64>,
+        payload_digest: &str,
+        response: &serde_json::Value,
+    ) -> Result<app_mfg_contract::MfgReceiptV1, MfgRepositoryError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let receipt = record_mutation_receipt(
+            &transaction,
+            idempotency_key,
+            actor_principal,
+            action_id,
+            resource_ref,
+            expected_revision,
+            result_revision,
+            payload_digest,
+            response,
+        )?;
+        transaction.commit()?;
+        Ok(receipt)
     }
 
     pub fn upsert_entity(&self, entity: &MatrixEntity) -> Result<MatrixEntity, MfgRepositoryError> {
@@ -798,7 +1283,6 @@ impl MfgRepository {
                 "entity match candidate below confidence threshold".to_string(),
             )
         })?;
-        insert_entity_match_candidate(&connection, &candidate)?;
         Ok(candidate)
     }
 
@@ -810,16 +1294,40 @@ impl MfgRepository {
         survivorship_rule: &str,
         notes: Option<String>,
     ) -> Result<matrix_core::MatrixEntityConflictDecision, MfgRepositoryError> {
-        let connection = self
+        let mut connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        find_entity_match_candidate(&connection, candidate_id)?
-            .ok_or_else(|| MfgRepositoryError::NotFound(candidate_id.to_string()))?;
-        let survivor = find_entity(&connection, survivor_entity_id)?
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let survivor = find_entity(&transaction, survivor_entity_id)?
             .ok_or_else(|| MfgRepositoryError::NotFound(survivor_entity_id.to_string()))?;
-        let retired = find_entity(&connection, retired_entity_id)?
+        let retired = find_entity(&transaction, retired_entity_id)?
             .ok_or_else(|| MfgRepositoryError::NotFound(retired_entity_id.to_string()))?;
+        let candidate = match find_entity_match_candidate(&transaction, candidate_id)? {
+            Some(candidate) => candidate,
+            None => {
+                let candidate =
+                    matrix_core::match_candidate(&survivor, &retired).ok_or_else(|| {
+                        MfgRepositoryError::NotFound(
+                            "entity match candidate below confidence threshold".to_string(),
+                        )
+                    })?;
+                if candidate.candidate_id != candidate_id {
+                    return Err(MfgRepositoryError::NotFound(candidate_id.to_string()));
+                }
+                insert_entity_match_candidate(&transaction, &candidate)?;
+                candidate
+            }
+        };
+        let candidate_pair_matches = (candidate.left_entity_id == survivor_entity_id
+            && candidate.right_entity_id == retired_entity_id)
+            || (candidate.left_entity_id == retired_entity_id
+                && candidate.right_entity_id == survivor_entity_id);
+        if !candidate_pair_matches {
+            return Err(MfgRepositoryError::CommandRejected(
+                "entity conflict decision does not match the candidate pair".to_string(),
+            ));
+        }
         let decision = matrix_core::MatrixEntityConflictDecision {
             decision_id: format!("entity-conflict-decision-{}", uuid::Uuid::new_v4()),
             candidate_id: candidate_id.to_string(),
@@ -834,7 +1342,8 @@ impl MfgRepository {
             }),
             decided_at: Utc::now(),
         };
-        insert_entity_conflict_decision(&connection, &decision)?;
+        insert_entity_conflict_decision(&transaction, &decision)?;
+        transaction.commit()?;
         Ok(decision)
     }
 
@@ -1105,6 +1614,13 @@ impl MfgRepository {
             ],
         )?;
         upsert_attention(&connection, &attention)?;
+        append_projection_event(
+            &connection,
+            "data_compute",
+            &format!("matrix:fact:{}", fact.fact_id),
+            "fact.ingested",
+            serde_json::json!({"fact": fact}),
+        )?;
         Ok(attention)
     }
 
@@ -1373,61 +1889,39 @@ impl MfgRepository {
         attention_id: Option<&str>,
         problem_statement: Option<&str>,
     ) -> Result<MatrixEvidencePacket, MfgRepositoryError> {
-        let connection = self
+        let mut connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let attention = match attention_id {
-            Some(id) => Some(
-                find_attention(&connection, id)?
-                    .ok_or_else(|| MfgRepositoryError::NotFound(id.to_string()))?,
-            ),
-            None => latest_attention(&connection)?,
-        };
-        let mut packet = MatrixEvidencePacket::new(problem_statement.unwrap_or_else(|| {
-            attention
-                .as_ref()
-                .map(|item| item.title.as_str())
-                .unwrap_or("MATRIX operational evidence packet")
-        }));
-        packet.attention_id = attention.as_ref().map(|item| item.attention_id.clone());
-        if let Some(item) = attention {
-            packet.confidence = item.confidence.min(0.75);
-            packet.business_context = serde_json::json!({
-                "business_domain": item.business_domain,
-                "entity_ref": item.entity_ref,
-                "period": item.period,
-                "priority_score": item.priority_score,
-                "reason_codes": item.reason_codes,
-                "owner_roles": item.owner_roles,
-            });
-            for reference in item.linked_changes {
-                if let Some(change_id) = reference.strip_prefix("matrix:change:") {
-                    if let Some(change) = find_change(&connection, change_id)? {
-                        packet.change_evidence.push(serde_json::to_value(&change)?);
-                        if let Some(metric_id) = change.metric_id.as_deref() {
-                            if let Some(state) =
-                                latest_metric_state_for_metric(&connection, metric_id)?
-                            {
-                                packet.metric_evidence.push(serde_json::to_value(&state)?);
-                            }
-                        }
-                    }
-                }
-                packet.source_refs.push(MatrixEvidenceSourceRef {
-                    kind: "change_or_fact".to_string(),
-                    reference,
-                    summary: "MATRIX attention evidence source".to_string(),
-                });
-            }
-            if !packet.metric_evidence.is_empty() {
-                packet
-                    .missing_evidence
-                    .retain(|item| !item.contains("metric_network"));
-                packet.confidence = packet.confidence.max(0.65);
-            }
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let packet =
+            build_evidence_packet_transaction(&transaction, attention_id, problem_statement, None)?;
+        transaction.commit()?;
+        Ok(packet)
+    }
+
+    pub fn build_evidence_packet_idempotent(
+        &self,
+        packet_id: &str,
+        attention_id: Option<&str>,
+        problem_statement: Option<&str>,
+    ) -> Result<MatrixEvidencePacket, MfgRepositoryError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(packet) = find_evidence_packet(&transaction, packet_id)? {
+            transaction.commit()?;
+            return Ok(packet);
         }
-        insert_evidence_packet(&connection, &packet)?;
+        let packet = build_evidence_packet_transaction(
+            &transaction,
+            attention_id,
+            problem_statement,
+            Some(packet_id),
+        )?;
+        transaction.commit()?;
         Ok(packet)
     }
 
@@ -1543,7 +2037,7 @@ impl MfgRepository {
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         persist_workflow_graph(&transaction, graph, expected_revision)?;
         transaction.commit()?;
         Ok(graph.clone())
@@ -1570,7 +2064,48 @@ impl MfgRepository {
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        upsert_incident(&transaction, &incident)?;
+        persist_workflow_graph(&transaction, &graph, None)?;
+        transaction.commit()?;
+        Ok((incident, graph))
+    }
+
+    pub fn create_incident_workflow_idempotent(
+        &self,
+        incident: &MfgIncident,
+        packet: &MatrixEvidencePacket,
+        workflow_id: &str,
+    ) -> Result<(MfgIncident, MfgWorkflowGraph), MfgRepositoryError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = find_incident(&transaction, &incident.incident_id)? {
+            if existing.evidence_packet_id != Some(packet.packet_id.clone())
+                || existing.task_id != incident.task_id
+            {
+                return Err(MfgRepositoryError::CommandRejected(
+                    "incident id is bound to another evidence packet or task".to_string(),
+                ));
+            }
+            let graph = find_workflow_graph(&transaction, "incident_id", &incident.incident_id)?
+                .ok_or_else(|| {
+                    MfgRepositoryError::NotFound(format!("workflow for {}", incident.incident_id))
+                })?;
+            transaction.commit()?;
+            return Ok((existing, graph));
+        }
+        let mut incident = incident.clone();
+        let mut graph = MfgWorkflowGraph::for_incident(&incident)?;
+        graph.workflow_id = workflow_id.to_string();
+        graph.attach_evidence_packet(packet)?;
+        graph.set_node_terminal_result(
+            "planner",
+            "incident workflow initialized from structured evidence packet",
+        )?;
+        incident.workflow_graph_id = Some(graph.workflow_id.clone());
         upsert_incident(&transaction, &incident)?;
         persist_workflow_graph(&transaction, &graph, None)?;
         transaction.commit()?;
@@ -1597,11 +2132,46 @@ impl MfgRepository {
         &self,
         run: &MfgSkillRun,
     ) -> Result<(MfgSkillRun, MfgWorkflowGraph), MfgRepositoryError> {
+        if run.status != "completed"
+            || run
+                .runtime_execution_ref
+                .as_deref()
+                .is_none_or(str::is_empty)
+            || run.tool_results.len() != run.tool_plan.len()
+            || run
+                .tool_results
+                .iter()
+                .any(|result| result.status != "completed")
+        {
+            return Err(MfgRepositoryError::CommandRejected(
+                "MFG skill completion requires a terminal Runtime execution and every tool receipt"
+                    .to_string(),
+            ));
+        }
         let mut connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(execution_id) = run.execution_id.as_deref() {
+            if let Some(existing) = find_skill_execution(&transaction, execution_id)? {
+                if existing.incident_id != run.incident_id || existing.skill_id != run.skill_id {
+                    return Err(MfgRepositoryError::CommandRejected(
+                        "skill execution id is bound to another incident or skill".to_string(),
+                    ));
+                }
+                let graph =
+                    find_workflow_graph(&transaction, "incident_id", &existing.incident_id)?
+                        .ok_or_else(|| {
+                            MfgRepositoryError::NotFound(format!(
+                                "workflow for {}",
+                                existing.incident_id
+                            ))
+                        })?;
+                transaction.commit()?;
+                return Ok((existing, graph));
+            }
+        }
         let run = insert_skill_execution(&transaction, run)?;
         let mut graph = find_workflow_graph(&transaction, "incident_id", &run.incident_id)?
             .ok_or_else(|| {
@@ -1623,7 +2193,7 @@ impl MfgRepository {
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut graph = find_workflow_graph(&transaction, "incident_id", incident_id)?
             .ok_or_else(|| MfgRepositoryError::NotFound(format!("workflow for {incident_id}")))?;
         let expected_revision = graph.revision;
@@ -1681,41 +2251,37 @@ impl MfgRepository {
         &self,
         incident_id: &str,
     ) -> Result<MfgOperationalAnalysis, MfgRepositoryError> {
-        let connection = self
+        let mut connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut incident = find_incident(&connection, incident_id)?
-            .ok_or_else(|| MfgRepositoryError::NotFound(incident_id.to_string()))?;
-        let packet_id = incident
-            .evidence_packet_id
-            .clone()
-            .ok_or_else(|| MfgRepositoryError::NotFound("incident evidence packet".to_string()))?;
-        let mut packet = find_evidence_packet(&connection, &packet_id)?
-            .ok_or_else(|| MfgRepositoryError::NotFound(packet_id.clone()))?;
-        let analysis = MfgOperationalAnalysis::from_evidence(incident_id, &packet);
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let analysis = analyze_incident_transaction(&transaction, incident_id, None)?;
+        transaction.commit()?;
+        Ok(analysis)
+    }
 
-        packet.attribution_candidates = analysis
-            .attribution_candidates
-            .iter()
-            .map(serde_json::to_value)
-            .collect::<Result<Vec<_>, _>>()?;
-        packet.impact_paths = analysis
-            .impact_paths
-            .iter()
-            .map(serde_json::to_value)
-            .collect::<Result<Vec<_>, _>>()?;
-        packet.missing_evidence.retain(|item| {
-            !item.contains("attribution_not_computed")
-                && !item.contains("impact_paths_not_computed")
-        });
-        packet.confidence = packet.confidence.max(analysis.confidence);
-        insert_evidence_packet(&connection, &packet)?;
-        insert_analysis(&connection, &analysis)?;
-
-        incident.status = "analyzed".to_string();
-        incident.updated_at = Utc::now();
-        upsert_incident(&connection, &incident)?;
+    pub fn analyze_incident_idempotent(
+        &self,
+        incident_id: &str,
+        analysis_id: &str,
+    ) -> Result<MfgOperationalAnalysis, MfgRepositoryError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = find_analysis(&transaction, analysis_id)? {
+            if existing.incident_id == incident_id {
+                transaction.commit()?;
+                return Ok(existing);
+            }
+            return Err(MfgRepositoryError::CommandRejected(
+                "analysis id is bound to another incident".to_string(),
+            ));
+        }
+        let analysis = analyze_incident_transaction(&transaction, incident_id, Some(analysis_id))?;
+        transaction.commit()?;
         Ok(analysis)
     }
 
@@ -1761,6 +2327,65 @@ impl MfgRepository {
             .ok_or_else(|| MfgRepositoryError::NotFound(action_id.to_string()))?;
         let execution = MfgActionExecution::from_action(&analysis, &action, request);
         insert_execution(&connection, &execution)?;
+        Ok(execution)
+    }
+
+    pub fn preview_recommended_action(
+        &self,
+        analysis_id: &str,
+        action_id: &str,
+        request: &MfgActionExecutionRequest,
+    ) -> Result<MfgActionExecution, MfgRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let analysis = find_analysis(&connection, analysis_id)?
+            .ok_or_else(|| MfgRepositoryError::NotFound(analysis_id.to_string()))?;
+        let action = analysis
+            .recommended_actions
+            .iter()
+            .find(|action| action.action_id == action_id)
+            .cloned()
+            .ok_or_else(|| MfgRepositoryError::NotFound(action_id.to_string()))?;
+        let mut execution = MfgActionExecution::from_action(&analysis, &action, request);
+        execution.execution_id = format!("preview-{}", execution.execution_id);
+        Ok(execution)
+    }
+
+    pub fn execute_recommended_action_idempotent(
+        &self,
+        analysis_id: &str,
+        action_id: &str,
+        execution_id: &str,
+        request: &MfgActionExecutionRequest,
+    ) -> Result<MfgActionExecution, MfgRepositoryError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = find_execution(&transaction, execution_id)? {
+            if existing.analysis_id == analysis_id && existing.action_id == action_id {
+                transaction.commit()?;
+                return Ok(existing);
+            }
+            return Err(MfgRepositoryError::CommandRejected(
+                "execution id is bound to another analysis action".to_string(),
+            ));
+        }
+        let analysis = find_analysis(&transaction, analysis_id)?
+            .ok_or_else(|| MfgRepositoryError::NotFound(analysis_id.to_string()))?;
+        let action = analysis
+            .recommended_actions
+            .iter()
+            .find(|action| action.action_id == action_id)
+            .cloned()
+            .ok_or_else(|| MfgRepositoryError::NotFound(action_id.to_string()))?;
+        let mut execution = MfgActionExecution::from_action(&analysis, &action, request);
+        execution.execution_id = execution_id.to_string();
+        insert_execution(&transaction, &execution)?;
+        transaction.commit()?;
         Ok(execution)
     }
 
@@ -1845,14 +2470,33 @@ impl MfgRepository {
         execution_id: &str,
         receipt: MfgCrossPlaneBridgeReceipt,
     ) -> Result<MfgActionExecution, MfgRepositoryError> {
-        let connection = self
+        let mut connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut execution = find_execution(&connection, execution_id)?
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut execution = find_execution(&transaction, execution_id)?
             .ok_or_else(|| MfgRepositoryError::NotFound(execution_id.to_string()))?;
+        if let Some(existing) = execution
+            .cross_plane_receipts
+            .iter()
+            .find(|existing| existing.cross_plane_receipt_id == receipt.cross_plane_receipt_id)
+        {
+            if existing.execution_id != receipt.execution_id
+                || existing.cross_plane_status != receipt.cross_plane_status
+                || existing.cross_plane_dispatch_status != receipt.cross_plane_dispatch_status
+                || existing.audit_record_id != receipt.audit_record_id
+            {
+                return Err(MfgRepositoryError::CommandRejected(
+                    "cross-plane receipt id is bound to a different execution result".to_string(),
+                ));
+            }
+            transaction.commit()?;
+            return Ok(execution);
+        }
         execution.attach_cross_plane_receipt(receipt);
-        insert_execution(&connection, &execution)?;
+        insert_execution(&transaction, &execution)?;
+        transaction.commit()?;
         Ok(execution)
     }
 
@@ -1861,21 +2505,37 @@ impl MfgRepository {
         execution_id: &str,
         feedback: MfgActionFeedback,
     ) -> Result<MfgActionExecution, MfgRepositoryError> {
-        let connection = self
+        let mut connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut execution = find_execution(&connection, execution_id)?
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut execution = find_execution(&transaction, execution_id)?
             .ok_or_else(|| MfgRepositoryError::NotFound(execution_id.to_string()))?;
+        if let Some(existing) = execution.feedback.as_ref() {
+            if existing.outcome == feedback.outcome
+                && existing.note == feedback.note
+                && existing.actor_ref == feedback.actor_ref
+                && existing.metric_delta == feedback.metric_delta
+            {
+                transaction.commit()?;
+                return Ok(execution);
+            }
+            return Err(MfgRepositoryError::CommandRejected(
+                "execution feedback is immutable after the first governed submission".to_string(),
+            ));
+        }
         execution.apply_feedback(feedback);
-        insert_execution(&connection, &execution)?;
+        insert_execution(&transaction, &execution)?;
         if execution.status == "feedback_resolved" {
-            if let Some(mut incident) = find_incident(&connection, &execution.incident_id)? {
+            if let Some(mut incident) = find_incident(&transaction, &execution.incident_id)? {
                 incident.status = "closed".to_string();
+                incident.revision = incident.revision.saturating_add(1);
                 incident.updated_at = Utc::now();
-                upsert_incident(&connection, &incident)?;
+                upsert_incident(&transaction, &incident)?;
             }
         }
+        transaction.commit()?;
         Ok(execution)
     }
 
@@ -1939,13 +2599,46 @@ impl MfgRepository {
     pub fn upsert_playbook(
         &self,
         playbook: &MfgPlaybook,
+        expected_revision: Option<u64>,
     ) -> Result<MfgPlaybook, MfgRepositoryError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        insert_playbook(&connection, playbook)?;
-        Ok(playbook.clone())
+        let existing = find_playbook(&connection, &playbook.playbook_id)?;
+        let mut playbook = playbook.clone();
+        match existing {
+            Some(existing) => {
+                if expected_revision != Some(existing.revision) {
+                    return Err(MfgRepositoryError::RevisionConflict {
+                        domain: "playbook".to_string(),
+                        subject_id: playbook.playbook_id.clone(),
+                        expected: expected_revision,
+                        actual: Some(existing.revision),
+                    });
+                }
+                playbook.revision = existing.revision.checked_add(1).ok_or_else(|| {
+                    MfgRepositoryError::CommandRejected(
+                        "playbook revision cannot be advanced further".to_string(),
+                    )
+                })?;
+                playbook.created_at = existing.created_at;
+                playbook.updated_at = Utc::now();
+            }
+            None => {
+                if expected_revision.is_some() {
+                    return Err(MfgRepositoryError::RevisionConflict {
+                        domain: "playbook".to_string(),
+                        subject_id: playbook.playbook_id.clone(),
+                        expected: expected_revision,
+                        actual: None,
+                    });
+                }
+                playbook.revision = 1;
+            }
+        }
+        insert_playbook(&connection, &playbook)?;
+        Ok(playbook)
     }
 
     pub fn get_playbook(
@@ -2028,6 +2721,66 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_mfg_cockpit_report_profile
             ON mfg_cockpit_report(profile_id, created_at DESC);
 
+        CREATE TABLE IF NOT EXISTS mfg_report_delivery_review (
+            review_id TEXT PRIMARY KEY,
+            report_id TEXT NOT NULL,
+            report_revision INTEGER NOT NULL,
+            delivery_revision INTEGER NOT NULL,
+            dead_letter_digest TEXT NOT NULL,
+            requester_principal TEXT NOT NULL,
+            approval_id TEXT,
+            correlation_id TEXT NOT NULL,
+            requested_action TEXT,
+            decision TEXT,
+            reviewer_principal TEXT,
+            decision_lease_ref TEXT,
+            effect_key TEXT,
+            effect_receipt_ref TEXT,
+            status TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            review_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS review_approval_id_uq
+            ON mfg_report_delivery_review(approval_id) WHERE approval_id IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS review_correlation_id_uq
+            ON mfg_report_delivery_review(correlation_id);
+        CREATE INDEX IF NOT EXISTS review_status_updated_idx
+            ON mfg_report_delivery_review(status, updated_at);
+
+        CREATE TABLE IF NOT EXISTS mfg_report_delivery_review_transition (
+            transition_id TEXT PRIMARY KEY,
+            review_id TEXT NOT NULL,
+            from_status TEXT NOT NULL,
+            to_status TEXT NOT NULL,
+            action TEXT,
+            actor_principal TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            detail_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(review_id, idempotency_key)
+        );
+        CREATE INDEX IF NOT EXISTS transition_review_created_idx
+            ON mfg_report_delivery_review_transition(review_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS mfg_report_delivery_review_effect_outbox (
+            effect_id TEXT PRIMARY KEY,
+            review_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            effect_key TEXT NOT NULL UNIQUE,
+            payload_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            attempt_count INTEGER NOT NULL,
+            next_attempt_at TEXT,
+            last_error TEXT,
+            receipt_ref TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS outbox_due_idx
+            ON mfg_report_delivery_review_effect_outbox(status, next_attempt_at);
+
         CREATE TABLE IF NOT EXISTS mfg_alert_rule (
             rule_id TEXT PRIMARY KEY,
             owner_ref TEXT NOT NULL,
@@ -2092,6 +2845,39 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             created_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS mfg_mutation_receipt (
+            receipt_id TEXT PRIMARY KEY,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            actor_principal TEXT NOT NULL,
+            action_id TEXT NOT NULL,
+            resource_ref TEXT NOT NULL,
+            expected_revision INTEGER,
+            result_revision INTEGER,
+            payload_digest TEXT NOT NULL,
+            status TEXT NOT NULL,
+            response_json TEXT NOT NULL,
+            contract_version TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS mfg_mutation_receipt_idempotency_uq
+            ON mfg_mutation_receipt(idempotency_key);
+
+        CREATE TABLE IF NOT EXISTS mfg_mutation_receipt_alias (
+            legacy_idempotency_key TEXT PRIMARY KEY,
+            receipt_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(receipt_id) REFERENCES mfg_mutation_receipt(receipt_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS mfg_mutation_receipt_repair_report (
+            report_id TEXT PRIMARY KEY,
+            idempotency_key TEXT NOT NULL,
+            existing_receipt_json TEXT NOT NULL,
+            incoming_receipt_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS mfg_projection_event (
             event_id INTEGER PRIMARY KEY AUTOINCREMENT,
             domain TEXT NOT NULL,
@@ -2102,6 +2888,19 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_mfg_projection_event_cursor
             ON mfg_projection_event(event_id);
+
+        CREATE TABLE IF NOT EXISTS mfg_live_epoch (
+            singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+            epoch_id TEXT NOT NULL,
+            contract_version TEXT NOT NULL,
+            schema_version INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            rotation_reason TEXT NOT NULL,
+            retention_low_cursor INTEGER NOT NULL,
+            retention_high_cursor INTEGER NOT NULL,
+            last_sweep_high_cursor INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        );
 
         CREATE TABLE IF NOT EXISTS matrix_entity (
             entity_id TEXT PRIMARY KEY,
@@ -2441,7 +3240,26 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_mfg_workflow_graph_status
             ON mfg_workflow_graph(status, updated_at DESC);",
     )?;
-    migrate_mfg_incident_workflow_column(connection)
+    migrate_mfg_incident_workflow_column(connection)?;
+    recover_interrupted_report_delivery_review_effects(connection)?;
+    migrate_mfg_command_receipts(connection)?;
+    migrate_mfg_live_epoch_sweep_cursor(connection)?;
+    ensure_live_epoch(connection)?;
+    Ok(())
+}
+
+fn recover_interrupted_report_delivery_review_effects(
+    connection: &Connection,
+) -> rusqlite::Result<()> {
+    connection.execute(
+        "UPDATE mfg_report_delivery_review_effect_outbox
+         SET status = 'retry_wait', next_attempt_at = ?1,
+             last_error = COALESCE(last_error, 'recovered_after_process_restart'),
+             updated_at = ?1
+         WHERE status = 'processing'",
+        params![Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
 }
 
 fn migrate_mfg_incident_workflow_column(connection: &Connection) -> rusqlite::Result<()> {
@@ -2457,6 +3275,217 @@ fn migrate_mfg_incident_workflow_column(connection: &Connection) -> rusqlite::Re
         )?;
     }
     Ok(())
+}
+
+fn migrate_mfg_live_epoch_sweep_cursor(connection: &Connection) -> rusqlite::Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(mfg_live_epoch)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns
+        .iter()
+        .any(|column| column == "last_sweep_high_cursor")
+    {
+        connection.execute_batch(
+            "ALTER TABLE mfg_live_epoch
+             ADD COLUMN last_sweep_high_cursor INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_mfg_command_receipts(connection: &Connection) -> rusqlite::Result<()> {
+    let mut statement = connection.prepare(
+        "SELECT idempotency_key, domain, subject_ref, receipt_json, created_at
+         FROM mfg_command_receipt ORDER BY idempotency_key",
+    )?;
+    let legacy = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    if legacy.is_empty() {
+        return Ok(());
+    }
+
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let mut repair_report: Option<(String, String, String)> = None;
+    let migrated = (|| -> rusqlite::Result<()> {
+        for (key, domain, subject_ref, receipt_json, created_at) in legacy {
+            let migrated_alias = connection
+                .query_row(
+                    "SELECT receipt.receipt_id
+                     FROM mfg_mutation_receipt_alias AS alias
+                     JOIN mfg_mutation_receipt AS receipt
+                       ON receipt.receipt_id = alias.receipt_id
+                     WHERE alias.legacy_idempotency_key = ?1",
+                    params![key],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if migrated_alias.is_some() {
+                continue;
+            }
+            let mut receipt =
+                serde_json::from_str::<MfgCommandReceipt>(&receipt_json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            if receipt.action_id.is_empty() || receipt.action_id.ends_with(".upsert") {
+                receipt.action_id = if receipt.command.ends_with(".upsert") {
+                    canonical_upsert_action_id(&domain, &receipt.command, receipt.previous_revision)
+                } else {
+                    canonical_action_id(&domain, &receipt.command)
+                };
+            }
+            if receipt.payload_digest.is_empty() {
+                receipt.payload_digest = stable_payload_digest(&(
+                    domain.as_str(),
+                    subject_ref.as_str(),
+                    &receipt.command,
+                ))
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            }
+            if receipt.contract_version.is_empty() {
+                receipt.contract_version = app_mfg_contract::MFG_CONTRACT_VERSION.to_string();
+            }
+            let encoded = serde_json::to_string(&receipt)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            let existing = connection
+                .query_row(
+                    "SELECT receipt_id, actor_principal, action_id, resource_ref,
+                            payload_digest, response_json, result_revision
+                     FROM mfg_mutation_receipt WHERE idempotency_key = ?1",
+                    params![key],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, Option<i64>>(6)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let target_receipt_id = if let Some((
+                existing_receipt_id,
+                existing_actor,
+                existing_action,
+                existing_resource,
+                existing_digest,
+                existing_response,
+                existing_result_revision,
+            )) = existing
+            {
+                let existing_response_value = serde_json::from_str::<Value>(&existing_response)
+                    .map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            5,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                let incoming_response_value = serde_json::from_str::<Value>(&encoded)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                let same = existing_actor == receipt.actor_ref
+                    && existing_action == receipt.action_id
+                    && existing_resource == subject_ref
+                    && existing_digest == receipt.payload_digest
+                    && existing_result_revision == Some(receipt.current_revision as i64)
+                    && existing_response_value == incoming_response_value;
+                if !same {
+                    repair_report = Some((
+                        key.clone(),
+                        serde_json::json!({
+                            "receipt_id": existing_receipt_id,
+                            "actor_principal": existing_actor,
+                            "action_id": existing_action,
+                            "resource_ref": existing_resource,
+                            "payload_digest": existing_digest,
+                            "result_revision": existing_result_revision,
+                            "response": existing_response_value,
+                        })
+                        .to_string(),
+                        encoded,
+                    ));
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                existing_receipt_id
+            } else {
+                let expected_revision = if receipt.action_id.ends_with(".create") {
+                    None
+                } else {
+                    Some(receipt.previous_revision as i64)
+                };
+                connection.execute(
+                    "INSERT INTO mfg_mutation_receipt (
+                        receipt_id, idempotency_key, actor_principal, action_id, resource_ref,
+                        expected_revision, result_revision, payload_digest, status, response_json,
+                        contract_version, created_at, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'completed', ?9, ?10, ?11, ?11)",
+                    params![
+                        receipt.receipt_id,
+                        key,
+                        receipt.actor_ref,
+                        receipt.action_id,
+                        subject_ref,
+                        expected_revision,
+                        receipt.current_revision as i64,
+                        receipt.payload_digest,
+                        encoded,
+                        receipt.contract_version,
+                        created_at,
+                    ],
+                )?;
+                receipt.receipt_id.clone()
+            };
+            connection.execute(
+                "INSERT INTO mfg_mutation_receipt_alias (
+                    legacy_idempotency_key, receipt_id, created_at
+                 ) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(legacy_idempotency_key) DO UPDATE SET
+                    receipt_id = excluded.receipt_id,
+                    created_at = excluded.created_at",
+                params![key, target_receipt_id, created_at],
+            )?;
+        }
+        Ok(())
+    })();
+    match migrated {
+        Ok(()) => connection.execute_batch("COMMIT"),
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            if let Some((key, existing, incoming)) = repair_report {
+                connection.execute(
+                    "INSERT INTO mfg_mutation_receipt_repair_report (
+                        report_id, idempotency_key, existing_receipt_json,
+                        incoming_receipt_json, created_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        format!("repair-{}", uuid::Uuid::new_v4()),
+                        key,
+                        existing,
+                        incoming,
+                        Utc::now().to_rfc3339(),
+                    ],
+                )?;
+            }
+            Err(error)
+        }
+    }
 }
 
 fn schema_version(connection: &Connection) -> rusqlite::Result<i64> {
@@ -2535,6 +3564,13 @@ fn persist_workflow_graph(
         )?
     };
     if changed == 1 {
+        append_projection_event(
+            connection,
+            "workflow",
+            &format!("mfg:workflow:{}", graph.workflow_id),
+            "workflow.updated",
+            serde_json::json!({"workflow": graph}),
+        )?;
         return Ok(());
     }
     Err(MfgRepositoryError::WorkflowRevisionConflict {
@@ -2594,7 +3630,7 @@ fn upsert_cockpit_profile(
         }
         profile.created_at = existing.created_at;
         profile.revision = existing.revision.saturating_add(1);
-    } else if expected_revision.is_some_and(|revision| revision != 0) {
+    } else if expected_revision.is_some() {
         return Err(MfgRepositoryError::RevisionConflict {
             domain: "cockpit_profile".to_string(),
             subject_id: profile.profile_id.clone(),
@@ -2626,7 +3662,7 @@ fn upsert_cockpit_profile(
         "cockpit",
         &format!("mfg:cockpit-profile:{}", profile.profile_id),
         "profile.upserted",
-        serde_json::to_value(&profile)?,
+        serde_json::json!({"profile": profile}),
     )?;
     Ok(profile)
 }
@@ -2670,7 +3706,7 @@ fn validate_cockpit_profile(profile: &MfgCockpitProfile) -> Result<(), MfgReposi
         "personal" => {
             return Err(MfgRepositoryError::CommandRejected(
                 "personal dashboard scope must not carry scope_ref".to_string(),
-            ))
+            ));
         }
         "team" | "role" | "organization"
             if profile
@@ -2682,12 +3718,12 @@ fn validate_cockpit_profile(profile: &MfgCockpitProfile) -> Result<(), MfgReposi
             return Err(MfgRepositoryError::CommandRejected(format!(
                 "{} dashboard scope requires scope_ref",
                 profile.scope.kind
-            )))
+            )));
         }
         _ => {
             return Err(MfgRepositoryError::CommandRejected(
                 "dashboard scope must be personal, team, role, or organization".to_string(),
-            ))
+            ));
         }
     }
     if !matches!(
@@ -2895,6 +3931,16 @@ fn insert_cockpit_report(
             report.created_at.to_rfc3339(),
         ],
     )?;
+    append_projection_event(
+        connection,
+        "report",
+        &format!("mfg:cockpit-report:{}", report.report_id),
+        "report.updated",
+        serde_json::json!({
+            "report": report,
+            "profile": find_cockpit_profile(connection, &report.profile_id)?,
+        }),
+    )?;
     Ok(())
 }
 
@@ -2909,7 +3955,11 @@ fn find_cockpit_report(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|json| serde_json::from_str(&json).map_err(MfgRepositoryError::from))
+        .map(|json| {
+            let mut report = serde_json::from_str::<MfgCockpitReportSnapshot>(&json)?;
+            report.normalize_legacy();
+            Ok(report)
+        })
         .transpose()
 }
 
@@ -2926,15 +3976,1005 @@ fn list_cockpit_reports(
         let rows =
             statement.query_map(params![profile_id, limit], |row| row.get::<_, String>(0))?;
         return rows
-            .map(|row| Ok(serde_json::from_str::<MfgCockpitReportSnapshot>(&row?)?))
+            .map(|row| {
+                let mut report = serde_json::from_str::<MfgCockpitReportSnapshot>(&row?)?;
+                report.normalize_legacy();
+                Ok(report)
+            })
             .collect();
     }
     let mut statement = connection.prepare(
         "SELECT report_json FROM mfg_cockpit_report ORDER BY created_at DESC, report_id ASC LIMIT ?1",
     )?;
     let rows = statement.query_map(params![limit], |row| row.get::<_, String>(0))?;
-    rows.map(|row| Ok(serde_json::from_str::<MfgCockpitReportSnapshot>(&row?)?))
-        .collect()
+    rows.map(|row| {
+        let mut report = serde_json::from_str::<MfgCockpitReportSnapshot>(&row?)?;
+        report.normalize_legacy();
+        Ok(report)
+    })
+    .collect()
+}
+
+fn create_report_delivery_review(
+    connection: &Connection,
+    report: &MfgCockpitReportSnapshot,
+    expected_report_revision: u64,
+    requester_principal: &str,
+    reason: &str,
+    evidence_refs: Vec<String>,
+    idempotency_key: &str,
+) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+    if requester_principal.trim().is_empty() || idempotency_key.trim().is_empty() {
+        return Err(MfgRepositoryError::CommandRejected(
+            "review requester and idempotency key are required".to_string(),
+        ));
+    }
+    ensure_revision(
+        "cockpit_report",
+        &report.report_id,
+        expected_report_revision,
+        report.revision,
+    )?;
+    let delivery_state = crate::MfgCockpitReportDeliveryState::from_report(report);
+    if !delivery_state.dead_lettered {
+        return Err(MfgRepositoryError::CommandRejected(format!(
+            "report delivery is not dead-lettered: {}",
+            delivery_state.classification
+        )));
+    }
+    let dead_letter_digest = stable_review_digest(&serde_json::json!({
+        "report_id": report.report_id,
+        "report_revision": report.revision,
+        "delivery_revision": report.delivery_receipts.len(),
+        "delivery_state": delivery_state,
+    }))?;
+    let stable = stable_review_digest(&serde_json::json!({
+        "report_id": report.report_id,
+        "idempotency_key": idempotency_key,
+        "requester": requester_principal,
+    }))?;
+    let suffix = stable.trim_start_matches("sha256:");
+    let review_id = format!("mfg-report-review-{}", &suffix[..24.min(suffix.len())]);
+    let correlation_id = format!("mfg-report-review-correlation:{suffix}");
+    if let Some(existing) = find_report_delivery_review_by_correlation(connection, &correlation_id)?
+    {
+        if existing.report_id == report.report_id
+            && existing.report_revision == report.revision
+            && existing.requester_principal == requester_principal
+            && existing.dead_letter_digest == dead_letter_digest
+        {
+            return Ok(existing);
+        }
+        return Err(MfgRepositoryError::CommandRejected(
+            "review idempotency key is bound to another request".to_string(),
+        ));
+    }
+    let now = Utc::now();
+    let review = MfgReportDeliveryReview {
+        review_id,
+        report_id: report.report_id.clone(),
+        report_revision: report.revision,
+        delivery_revision: report.delivery_receipts.len() as u64,
+        dead_letter_digest,
+        requester_principal: requester_principal.to_string(),
+        approval_id: None,
+        correlation_id,
+        requested_action: None,
+        decision: None,
+        reviewer_principal: None,
+        reason: reason.trim().to_string(),
+        evidence_refs,
+        decision_lease_ref: None,
+        effect_key: None,
+        effect_payload: Value::Null,
+        effect_receipt_ref: None,
+        effect_error: None,
+        status: MfgReportDeliveryReviewStatus::ApprovalSubmissionPending,
+        revision: 1,
+        created_at: now,
+        updated_at: now,
+    };
+    let transaction = connection.unchecked_transaction()?;
+    insert_report_delivery_review(&transaction, &review)?;
+    insert_report_delivery_review_transition(
+        &transaction,
+        &review.review_id,
+        "none",
+        review.status,
+        None,
+        requester_principal,
+        idempotency_key,
+        serde_json::json!({
+            "report_id": review.report_id,
+            "report_revision": review.report_revision,
+            "dead_letter_digest": review.dead_letter_digest,
+        }),
+    )?;
+    append_projection_event(
+        &transaction,
+        "review",
+        &format!("mfg:report-review:{}", review.review_id),
+        "report_review.requested",
+        serde_json::json!({
+            "review": review,
+            "report": report,
+            "profile": find_cockpit_profile(&transaction, &report.profile_id)?,
+        }),
+    )?;
+    transaction.commit()?;
+    Ok(review)
+}
+
+fn bind_report_delivery_review_approval(
+    connection: &Connection,
+    review_id: &str,
+    expected_revision: u64,
+    approval_id: &str,
+    actor_principal: &str,
+    idempotency_key: &str,
+) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+    let current = find_report_delivery_review(connection, review_id)?
+        .ok_or_else(|| MfgRepositoryError::NotFound(review_id.to_string()))?;
+    let replayed_transition = connection
+        .query_row(
+            "SELECT 1 FROM mfg_report_delivery_review_transition
+             WHERE review_id = ?1 AND idempotency_key = ?2",
+            params![review_id, idempotency_key],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if current.status == MfgReportDeliveryReviewStatus::PendingApproval
+        && current.approval_id.as_deref() == Some(approval_id)
+        && replayed_transition
+    {
+        return Ok(current);
+    }
+    if current.status != MfgReportDeliveryReviewStatus::ApprovalSubmissionPending {
+        return Err(review_conflict(&current, expected_revision));
+    }
+    ensure_revision(
+        "report_delivery_review",
+        review_id,
+        expected_revision,
+        current.revision,
+    )?;
+    if approval_id.trim().is_empty() {
+        return Err(MfgRepositoryError::CommandRejected(
+            "approval id must not be empty".to_string(),
+        ));
+    }
+    let mut next = current.clone();
+    next.approval_id = Some(approval_id.to_string());
+    next.status = MfgReportDeliveryReviewStatus::PendingApproval;
+    next.revision = next.revision.saturating_add(1);
+    next.updated_at = Utc::now();
+    persist_report_delivery_review_transition(
+        connection,
+        &current,
+        &next,
+        None,
+        actor_principal,
+        idempotency_key,
+        serde_json::json!({"approval_id": approval_id}),
+    )
+}
+
+fn find_report_delivery_review(
+    connection: &Connection,
+    review_id: &str,
+) -> Result<Option<MfgReportDeliveryReview>, MfgRepositoryError> {
+    connection
+        .query_row(
+            "SELECT review_json FROM mfg_report_delivery_review WHERE review_id = ?1",
+            params![review_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(MfgRepositoryError::from))
+        .transpose()
+}
+
+fn find_report_delivery_review_by_correlation(
+    connection: &Connection,
+    correlation_id: &str,
+) -> Result<Option<MfgReportDeliveryReview>, MfgRepositoryError> {
+    connection
+        .query_row(
+            "SELECT review_json FROM mfg_report_delivery_review WHERE correlation_id = ?1",
+            params![correlation_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(MfgRepositoryError::from))
+        .transpose()
+}
+
+fn list_report_delivery_reviews(
+    connection: &Connection,
+    report_id: Option<&str>,
+    limit: usize,
+) -> Result<Vec<MfgReportDeliveryReview>, MfgRepositoryError> {
+    let limit = limit.clamp(1, 500) as i64;
+    let mut values = Vec::new();
+    if let Some(report_id) = report_id {
+        let mut statement = connection.prepare(
+            "SELECT review_json FROM mfg_report_delivery_review
+             WHERE report_id = ?1 ORDER BY updated_at DESC, review_id ASC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![report_id, limit], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            values.push(serde_json::from_str(&row?)?);
+        }
+    } else {
+        let mut statement = connection.prepare(
+            "SELECT review_json FROM mfg_report_delivery_review
+             ORDER BY updated_at DESC, review_id ASC LIMIT ?1",
+        )?;
+        let rows = statement.query_map(params![limit], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            values.push(serde_json::from_str(&row?)?);
+        }
+    }
+    Ok(values)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_report_delivery_review_decision(
+    connection: &Connection,
+    review_id: &str,
+    expected_revision: u64,
+    decision: MfgReportDeliveryReviewDecision,
+    reviewer_principal: &str,
+    reason: &str,
+    evidence_refs: Vec<String>,
+    reroute: Option<MfgReportDeliveryReviewRerouteTarget>,
+    decision_lease_ref: &str,
+    idempotency_key: &str,
+) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+    if reviewer_principal.trim().is_empty()
+        || decision_lease_ref.trim().is_empty()
+        || idempotency_key.trim().is_empty()
+    {
+        return Err(MfgRepositoryError::CommandRejected(
+            "reviewer, decision lease and idempotency key are required".to_string(),
+        ));
+    }
+    match decision {
+        MfgReportDeliveryReviewDecision::Reroute => {
+            let target = reroute.as_ref().ok_or_else(|| {
+                MfgRepositoryError::CommandRejected(
+                    "reroute decision requires a validated target".to_string(),
+                )
+            })?;
+            if [
+                &target.target_ref,
+                &target.provider_account,
+                &target.channel,
+                &target.requested_capability,
+            ]
+            .iter()
+            .any(|value| value.trim().is_empty())
+            {
+                return Err(MfgRepositoryError::CommandRejected(
+                    "reroute target/provider/channel/capability must not be empty".to_string(),
+                ));
+            }
+        }
+        MfgReportDeliveryReviewDecision::Resolve
+            if reason.trim().is_empty() || evidence_refs.is_empty() =>
+        {
+            return Err(MfgRepositoryError::CommandRejected(
+                "resolve requires an external disposition note and evidence".to_string(),
+            ));
+        }
+        MfgReportDeliveryReviewDecision::Abandon if reason.trim().is_empty() => {
+            return Err(MfgRepositoryError::CommandRejected(
+                "abandon requires an irreversible decision reason".to_string(),
+            ));
+        }
+        _ => {}
+    }
+    let current = find_report_delivery_review(connection, review_id)?
+        .ok_or_else(|| MfgRepositoryError::NotFound(review_id.to_string()))?;
+    let effect_key = format!(
+        "mfg-review-effect:{}",
+        stable_review_digest(&serde_json::json!({
+            "review_id": review_id,
+            "decision": decision,
+            "idempotency_key": idempotency_key,
+        }))?
+        .trim_start_matches("sha256:")
+    );
+    if current.status == MfgReportDeliveryReviewStatus::DecisionPendingEffect
+        && current.decision == Some(decision)
+        && current.effect_key.as_deref() == Some(effect_key.as_str())
+    {
+        return Ok(current);
+    }
+    if current.status != MfgReportDeliveryReviewStatus::PendingApproval {
+        return Err(review_conflict(&current, expected_revision));
+    }
+    ensure_revision(
+        "report_delivery_review",
+        review_id,
+        expected_revision,
+        current.revision,
+    )?;
+    if current.approval_id.is_none() {
+        return Err(MfgRepositoryError::CommandRejected(
+            "review has no correlated approval".to_string(),
+        ));
+    }
+    let mut next = current.clone();
+    next.requested_action = Some(decision);
+    next.decision = Some(decision);
+    next.reviewer_principal = Some(reviewer_principal.to_string());
+    next.reason = reason.trim().to_string();
+    next.evidence_refs = evidence_refs;
+    next.decision_lease_ref = Some(decision_lease_ref.to_string());
+    next.effect_key = Some(effect_key);
+    next.effect_payload = reroute
+        .map(|target| serde_json::to_value(target).unwrap_or(Value::Null))
+        .unwrap_or(Value::Null);
+    next.effect_error = None;
+    next.status = MfgReportDeliveryReviewStatus::DecisionPendingEffect;
+    next.revision = next.revision.saturating_add(1);
+    next.updated_at = Utc::now();
+    persist_report_delivery_review_transition(
+        connection,
+        &current,
+        &next,
+        Some(decision),
+        reviewer_principal,
+        idempotency_key,
+        serde_json::json!({
+            "decision_lease_ref": decision_lease_ref,
+            "effect_key": next.effect_key,
+            "reason": next.reason,
+            "evidence_refs": next.evidence_refs,
+            "effect_payload": next.effect_payload,
+        }),
+    )
+}
+
+fn activate_report_delivery_review_decision(
+    connection: &Connection,
+    review_id: &str,
+    expected_revision: u64,
+    actor_principal: &str,
+    idempotency_key: &str,
+) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+    let current = find_report_delivery_review(connection, review_id)?
+        .ok_or_else(|| MfgRepositoryError::NotFound(review_id.to_string()))?;
+    if current.status.is_terminal()
+        || (matches!(
+            current.status,
+            MfgReportDeliveryReviewStatus::DecisionPendingEffect
+                | MfgReportDeliveryReviewStatus::ApprovedPendingEffect
+        ) && report_delivery_review_effect_exists(connection, review_id)?)
+    {
+        return Ok(current);
+    }
+    if current.status != MfgReportDeliveryReviewStatus::DecisionPendingEffect {
+        return Err(review_conflict(&current, expected_revision));
+    }
+    ensure_revision(
+        "report_delivery_review",
+        review_id,
+        expected_revision,
+        current.revision,
+    )?;
+    let decision = current.decision.ok_or_else(|| {
+        MfgRepositoryError::CommandRejected("review decision is missing".to_string())
+    })?;
+    let transaction = connection.unchecked_transaction()?;
+    let result = match decision {
+        MfgReportDeliveryReviewDecision::Reject => {
+            let mut next = current.clone();
+            next.status = MfgReportDeliveryReviewStatus::Rejected;
+            next.effect_receipt_ref = Some(format!(
+                "mfg://report-review/{}/rejected",
+                current.review_id
+            ));
+            next.revision = next.revision.saturating_add(1);
+            next.updated_at = Utc::now();
+            persist_report_delivery_review_transition_in_transaction(
+                &transaction,
+                &current,
+                &next,
+                Some(decision),
+                actor_principal,
+                idempotency_key,
+                serde_json::json!({"effect": "none", "delivery_unchanged": true}),
+            )?;
+            next
+        }
+        MfgReportDeliveryReviewDecision::Abandon | MfgReportDeliveryReviewDecision::Resolve => {
+            let mut report = find_cockpit_report(&transaction, &current.report_id)?
+                .ok_or_else(|| MfgRepositoryError::NotFound(current.report_id.clone()))?;
+            ensure_revision(
+                "cockpit_report",
+                &report.report_id,
+                current.report_revision,
+                report.revision,
+            )?;
+            report.status = if decision == MfgReportDeliveryReviewDecision::Abandon {
+                "delivery_abandoned".to_string()
+            } else {
+                "delivery_resolved_external".to_string()
+            };
+            report.revision = report.revision.saturating_add(1);
+            insert_cockpit_report(&transaction, &report)?;
+            let mut next = current.clone();
+            next.status = if decision == MfgReportDeliveryReviewDecision::Abandon {
+                MfgReportDeliveryReviewStatus::Abandoned
+            } else {
+                MfgReportDeliveryReviewStatus::ResolvedExternal
+            };
+            next.effect_receipt_ref = Some(format!(
+                "mfg://report/{}/status/{}",
+                report.report_id, report.status
+            ));
+            next.revision = next.revision.saturating_add(1);
+            next.updated_at = Utc::now();
+            persist_report_delivery_review_transition_in_transaction(
+                &transaction,
+                &current,
+                &next,
+                Some(decision),
+                actor_principal,
+                idempotency_key,
+                serde_json::json!({
+                    "effect": "local_terminal",
+                    "report_status": report.status,
+                    "report_revision": report.revision,
+                }),
+            )?;
+            next
+        }
+        MfgReportDeliveryReviewDecision::ForceRetry | MfgReportDeliveryReviewDecision::Reroute => {
+            let effect_key = current.effect_key.clone().ok_or_else(|| {
+                MfgRepositoryError::CommandRejected("review effect key is missing".to_string())
+            })?;
+            let now = Utc::now();
+            transaction.execute(
+                "INSERT INTO mfg_report_delivery_review_effect_outbox (
+                    effect_id, review_id, action, effect_key, payload_json, status,
+                    attempt_count, next_attempt_at, last_error, receipt_ref, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, NULL, NULL, NULL, ?6, ?6)
+                 ON CONFLICT(effect_key) DO NOTHING",
+                params![
+                    format!("mfg-review-effect-{}", uuid::Uuid::new_v4()),
+                    current.review_id,
+                    review_decision_string(decision),
+                    effect_key,
+                    serde_json::to_string(&current.effect_payload)?,
+                    now.to_rfc3339(),
+                ],
+            )?;
+            let report = find_cockpit_report(&transaction, &current.report_id)?;
+            let profile = report
+                .as_ref()
+                .map(|report| find_cockpit_profile(&transaction, &report.profile_id))
+                .transpose()?
+                .flatten();
+            append_projection_event(
+                &transaction,
+                "review",
+                &format!("mfg:report-review:{}", current.review_id),
+                "report_review.effect_queued",
+                serde_json::json!({
+                    "review_id": current.review_id,
+                    "review": current,
+                    "report": report,
+                    "profile": profile,
+                    "decision": decision,
+                    "effect_key": current.effect_key,
+                }),
+            )?;
+            current.clone()
+        }
+    };
+    transaction.commit()?;
+    Ok(result)
+}
+
+fn claim_report_delivery_review_effects(
+    connection: &Connection,
+    limit: usize,
+) -> Result<Vec<MfgReportDeliveryReviewEffect>, MfgRepositoryError> {
+    let now = Utc::now();
+    let stale = now - chrono::Duration::minutes(2);
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute(
+        "UPDATE mfg_report_delivery_review_effect_outbox
+         SET status = 'retry_wait', next_attempt_at = ?1,
+             last_error = COALESCE(last_error, 'reclaimed_after_interrupted_processing'),
+             updated_at = ?1
+         WHERE status = 'processing' AND updated_at <= ?2",
+        params![now.to_rfc3339(), stale.to_rfc3339()],
+    )?;
+    let mut statement = transaction.prepare(
+        "SELECT effect_id, review_id, action, effect_key, payload_json, status,
+                attempt_count, next_attempt_at, last_error, receipt_ref, created_at, updated_at
+         FROM mfg_report_delivery_review_effect_outbox
+         WHERE status = 'pending'
+            OR (status = 'retry_wait' AND (next_attempt_at IS NULL OR next_attempt_at <= ?1))
+         ORDER BY created_at ASC, effect_id ASC LIMIT ?2",
+    )?;
+    let rows = statement
+        .query_map(
+            params![now.to_rfc3339(), limit.clamp(1, 100) as i64],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
+                ))
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    let mut claimed = Vec::new();
+    for (
+        effect_id,
+        review_id,
+        action,
+        effect_key,
+        payload_json,
+        _status,
+        attempt_count,
+        next_attempt_at,
+        last_error,
+        receipt_ref,
+        created_at,
+        _updated_at,
+    ) in rows
+    {
+        let changed = transaction.execute(
+            "UPDATE mfg_report_delivery_review_effect_outbox
+             SET status = 'processing', attempt_count = attempt_count + 1, updated_at = ?1
+             WHERE effect_id = ?2 AND status IN ('pending', 'retry_wait')",
+            params![now.to_rfc3339(), effect_id],
+        )?;
+        if changed != 1 {
+            continue;
+        }
+        claimed.push(MfgReportDeliveryReviewEffect {
+            effect_id,
+            review_id,
+            action: parse_review_decision(&action)?,
+            effect_key,
+            payload: serde_json::from_str(&payload_json)?,
+            status: "processing".to_string(),
+            attempt_count: attempt_count.max(0) as u64 + 1,
+            next_attempt_at: next_attempt_at
+                .as_deref()
+                .map(parse_rfc3339_utc)
+                .transpose()?,
+            last_error,
+            receipt_ref,
+            created_at: parse_rfc3339_utc(&created_at)?,
+            updated_at: now,
+        });
+    }
+    transaction.commit()?;
+    Ok(claimed)
+}
+
+fn complete_report_delivery_review_effect(
+    connection: &Connection,
+    effect_key: &str,
+    receipt_ref: &str,
+    actor_principal: &str,
+) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+    let effect = find_report_delivery_review_effect(connection, effect_key)?
+        .ok_or_else(|| MfgRepositoryError::NotFound(effect_key.to_string()))?;
+    let current = find_report_delivery_review(connection, &effect.review_id)?
+        .ok_or_else(|| MfgRepositoryError::NotFound(effect.review_id.clone()))?;
+    if effect.status == "completed" && current.status.is_terminal() {
+        return Ok(current);
+    }
+    if !matches!(
+        current.status,
+        MfgReportDeliveryReviewStatus::DecisionPendingEffect
+            | MfgReportDeliveryReviewStatus::ApprovedPendingEffect
+    ) {
+        return Err(review_conflict(&current, current.revision));
+    }
+    let terminal = match effect.action {
+        MfgReportDeliveryReviewDecision::ForceRetry => {
+            MfgReportDeliveryReviewStatus::EffectAppliedForceRetry
+        }
+        MfgReportDeliveryReviewDecision::Reroute => {
+            MfgReportDeliveryReviewStatus::EffectAppliedReroute
+        }
+        _ => {
+            return Err(MfgRepositoryError::CommandRejected(
+                "outbox contains a non-delivery review action".to_string(),
+            ));
+        }
+    };
+    let mut next = current.clone();
+    next.status = terminal;
+    next.effect_receipt_ref = Some(receipt_ref.to_string());
+    next.effect_error = None;
+    next.revision = next.revision.saturating_add(1);
+    next.updated_at = Utc::now();
+    let transaction = connection.unchecked_transaction()?;
+    persist_report_delivery_review_transition_in_transaction(
+        &transaction,
+        &current,
+        &next,
+        Some(effect.action),
+        actor_principal,
+        &format!("{}:complete", effect.effect_key),
+        serde_json::json!({"receipt_ref": receipt_ref, "attempt_count": effect.attempt_count}),
+    )?;
+    transaction.execute(
+        "UPDATE mfg_report_delivery_review_effect_outbox
+         SET status = 'completed', receipt_ref = ?1, last_error = NULL,
+             next_attempt_at = NULL, updated_at = ?2
+         WHERE effect_key = ?3 AND status = 'processing'",
+        params![receipt_ref, next.updated_at.to_rfc3339(), effect_key],
+    )?;
+    transaction.commit()?;
+    Ok(next)
+}
+
+fn fail_report_delivery_review_effect(
+    connection: &Connection,
+    effect_key: &str,
+    error: &str,
+    actor_principal: &str,
+) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+    let effect = find_report_delivery_review_effect(connection, effect_key)?
+        .ok_or_else(|| MfgRepositoryError::NotFound(effect_key.to_string()))?;
+    let current = find_report_delivery_review(connection, &effect.review_id)?
+        .ok_or_else(|| MfgRepositoryError::NotFound(effect.review_id.clone()))?;
+    let mut next = current.clone();
+    if next.status != MfgReportDeliveryReviewStatus::ApprovedPendingEffect {
+        next.status = MfgReportDeliveryReviewStatus::ApprovedPendingEffect;
+        next.revision = next.revision.saturating_add(1);
+    }
+    next.effect_error = Some(error.to_string());
+    next.updated_at = Utc::now();
+    let backoff_seconds = 2_i64.pow(effect.attempt_count.min(8) as u32).min(300);
+    let next_attempt_at = next.updated_at + chrono::Duration::seconds(backoff_seconds);
+    let transaction = connection.unchecked_transaction()?;
+    if next.revision != current.revision {
+        persist_report_delivery_review_transition_in_transaction(
+            &transaction,
+            &current,
+            &next,
+            Some(effect.action),
+            actor_principal,
+            &format!("{}:failure:{}", effect.effect_key, effect.attempt_count),
+            serde_json::json!({
+                "error": error,
+                "attempt_count": effect.attempt_count,
+                "next_attempt_at": next_attempt_at,
+            }),
+        )?;
+    } else {
+        update_report_delivery_review_row(&transaction, &next, &current)?;
+    }
+    transaction.execute(
+        "UPDATE mfg_report_delivery_review_effect_outbox
+         SET status = 'retry_wait', next_attempt_at = ?1, last_error = ?2, updated_at = ?3
+         WHERE effect_key = ?4 AND status = 'processing'",
+        params![
+            next_attempt_at.to_rfc3339(),
+            error,
+            next.updated_at.to_rfc3339(),
+            effect_key,
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(next)
+}
+
+fn insert_report_delivery_review(
+    connection: &Connection,
+    review: &MfgReportDeliveryReview,
+) -> Result<(), MfgRepositoryError> {
+    connection.execute(
+        "INSERT INTO mfg_report_delivery_review (
+            review_id, report_id, report_revision, delivery_revision, dead_letter_digest,
+            requester_principal, approval_id, correlation_id, requested_action, decision,
+            reviewer_principal, decision_lease_ref, effect_key, effect_receipt_ref,
+            status, revision, review_json, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                   ?15, ?16, ?17, ?18, ?19)",
+        params![
+            review.review_id,
+            review.report_id,
+            review.report_revision as i64,
+            review.delivery_revision as i64,
+            review.dead_letter_digest,
+            review.requester_principal,
+            review.approval_id,
+            review.correlation_id,
+            review.requested_action.map(review_decision_string),
+            review.decision.map(review_decision_string),
+            review.reviewer_principal,
+            review.decision_lease_ref,
+            review.effect_key,
+            review.effect_receipt_ref,
+            review_status_string(review.status),
+            review.revision as i64,
+            serde_json::to_string(review)?,
+            review.created_at.to_rfc3339(),
+            review.updated_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn persist_report_delivery_review_transition(
+    connection: &Connection,
+    current: &MfgReportDeliveryReview,
+    next: &MfgReportDeliveryReview,
+    action: Option<MfgReportDeliveryReviewDecision>,
+    actor_principal: &str,
+    idempotency_key: &str,
+    detail: Value,
+) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+    let transaction = connection.unchecked_transaction()?;
+    persist_report_delivery_review_transition_in_transaction(
+        &transaction,
+        current,
+        next,
+        action,
+        actor_principal,
+        idempotency_key,
+        detail,
+    )?;
+    transaction.commit()?;
+    Ok(next.clone())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_report_delivery_review_transition_in_transaction(
+    connection: &Connection,
+    current: &MfgReportDeliveryReview,
+    next: &MfgReportDeliveryReview,
+    action: Option<MfgReportDeliveryReviewDecision>,
+    actor_principal: &str,
+    idempotency_key: &str,
+    detail: Value,
+) -> Result<(), MfgRepositoryError> {
+    update_report_delivery_review_row(connection, next, current)?;
+    insert_report_delivery_review_transition(
+        connection,
+        &current.review_id,
+        &review_status_string(current.status),
+        next.status,
+        action,
+        actor_principal,
+        idempotency_key,
+        detail,
+    )?;
+    let report = find_cockpit_report(connection, &current.report_id)?;
+    let profile = report
+        .as_ref()
+        .map(|report| find_cockpit_profile(connection, &report.profile_id))
+        .transpose()?
+        .flatten();
+    append_projection_event(
+        connection,
+        "review",
+        &format!("mfg:report-review:{}", current.review_id),
+        "report_review.transitioned",
+        serde_json::json!({
+            "review_id": current.review_id,
+            "review": next,
+            "report": report,
+            "profile": profile,
+            "from_status": current.status,
+            "to_status": next.status,
+            "action": action,
+            "revision": next.revision,
+            "actor_principal": actor_principal,
+        }),
+    )?;
+    Ok(())
+}
+
+fn update_report_delivery_review_row(
+    connection: &Connection,
+    next: &MfgReportDeliveryReview,
+    current: &MfgReportDeliveryReview,
+) -> Result<(), MfgRepositoryError> {
+    let changed = connection.execute(
+        "UPDATE mfg_report_delivery_review
+         SET approval_id = ?1, requested_action = ?2, decision = ?3,
+             reviewer_principal = ?4, decision_lease_ref = ?5, effect_key = ?6,
+             effect_receipt_ref = ?7, status = ?8, revision = ?9,
+             review_json = ?10, updated_at = ?11
+         WHERE review_id = ?12 AND revision = ?13 AND status = ?14",
+        params![
+            next.approval_id,
+            next.requested_action.map(review_decision_string),
+            next.decision.map(review_decision_string),
+            next.reviewer_principal,
+            next.decision_lease_ref,
+            next.effect_key,
+            next.effect_receipt_ref,
+            review_status_string(next.status),
+            next.revision as i64,
+            serde_json::to_string(next)?,
+            next.updated_at.to_rfc3339(),
+            current.review_id,
+            current.revision as i64,
+            review_status_string(current.status),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(review_conflict(current, current.revision));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_report_delivery_review_transition(
+    connection: &Connection,
+    review_id: &str,
+    from_status: &str,
+    to_status: MfgReportDeliveryReviewStatus,
+    action: Option<MfgReportDeliveryReviewDecision>,
+    actor_principal: &str,
+    idempotency_key: &str,
+    detail: Value,
+) -> Result<(), MfgRepositoryError> {
+    connection.execute(
+        "INSERT INTO mfg_report_delivery_review_transition (
+            transition_id, review_id, from_status, to_status, action,
+            actor_principal, idempotency_key, detail_json, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            format!(
+                "mfg-review-transition:{}",
+                stable_review_digest(&serde_json::json!({
+                    "review_id": review_id,
+                    "idempotency_key": idempotency_key,
+                }))?
+                .trim_start_matches("sha256:")
+            ),
+            review_id,
+            from_status,
+            review_status_string(to_status),
+            action.map(review_decision_string),
+            actor_principal,
+            idempotency_key,
+            serde_json::to_string(&detail)?,
+            Utc::now().to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn report_delivery_review_effect_exists(
+    connection: &Connection,
+    review_id: &str,
+) -> Result<bool, MfgRepositoryError> {
+    Ok(connection
+        .query_row(
+            "SELECT 1 FROM mfg_report_delivery_review_effect_outbox WHERE review_id = ?1 LIMIT 1",
+            params![review_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn find_report_delivery_review_effect(
+    connection: &Connection,
+    effect_key: &str,
+) -> Result<Option<MfgReportDeliveryReviewEffect>, MfgRepositoryError> {
+    let row = connection
+        .query_row(
+            "SELECT effect_id, review_id, action, effect_key, payload_json, status,
+                    attempt_count, next_attempt_at, last_error, receipt_ref, created_at, updated_at
+             FROM mfg_report_delivery_review_effect_outbox WHERE effect_key = ?1",
+            params![effect_key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(
+        |(
+            effect_id,
+            review_id,
+            action,
+            effect_key,
+            payload_json,
+            status,
+            attempt_count,
+            next_attempt_at,
+            last_error,
+            receipt_ref,
+            created_at,
+            updated_at,
+        )| {
+            Ok(MfgReportDeliveryReviewEffect {
+                effect_id,
+                review_id,
+                action: parse_review_decision(&action)?,
+                effect_key,
+                payload: serde_json::from_str(&payload_json)?,
+                status,
+                attempt_count: attempt_count.max(0) as u64,
+                next_attempt_at: next_attempt_at
+                    .as_deref()
+                    .map(parse_rfc3339_utc)
+                    .transpose()?,
+                last_error,
+                receipt_ref,
+                created_at: parse_rfc3339_utc(&created_at)?,
+                updated_at: parse_rfc3339_utc(&updated_at)?,
+            })
+        },
+    )
+    .transpose()
+}
+
+fn stable_review_digest(value: &Value) -> Result<String, MfgRepositoryError> {
+    let encoded = serde_json::to_vec(value)?;
+    Ok(format!("sha256:{:x}", Sha256::digest(encoded)))
+}
+
+fn review_status_string(status: MfgReportDeliveryReviewStatus) -> String {
+    serde_json::to_value(status)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn review_decision_string(decision: MfgReportDeliveryReviewDecision) -> String {
+    serde_json::to_value(decision)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn parse_review_decision(
+    value: &str,
+) -> Result<MfgReportDeliveryReviewDecision, MfgRepositoryError> {
+    serde_json::from_value(Value::String(value.to_string())).map_err(MfgRepositoryError::from)
+}
+
+fn review_conflict(review: &MfgReportDeliveryReview, expected_revision: u64) -> MfgRepositoryError {
+    MfgRepositoryError::RevisionConflict {
+        domain: "report_delivery_review".to_string(),
+        subject_id: review.review_id.clone(),
+        expected: Some(expected_revision),
+        actual: Some(review.revision),
+    }
 }
 
 fn render_cockpit_projection(
@@ -3212,7 +5252,7 @@ fn render_cockpit_widget(
         other => {
             return Err(MfgRepositoryError::CommandRejected(format!(
                 "renderer is not implemented for {other}"
-            )))
+            )));
         }
     };
     let title = instance
@@ -3352,41 +5392,354 @@ fn append_projection_event(
         "INSERT INTO mfg_projection_event (domain, subject_ref, event_type, event_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![domain, subject_ref, event_type, serde_json::to_string(&event)?, Utc::now().to_rfc3339()],
     )?;
-    Ok(connection.last_insert_rowid() as u64)
+    let cursor = connection.last_insert_rowid() as u64;
+    connection.execute(
+        "UPDATE mfg_live_epoch
+         SET retention_high_cursor = ?1
+         WHERE singleton_id = 1",
+        params![cursor],
+    )?;
+    compact_live_events_if_due(connection)?;
+    Ok(cursor)
+}
+
+fn ensure_live_epoch(connection: &Connection) -> rusqlite::Result<()> {
+    let high = connection.query_row(
+        "SELECT COALESCE(MAX(event_id), 0) FROM mfg_projection_event",
+        [],
+        |row| row.get::<_, u64>(0),
+    )?;
+    let oldest = connection.query_row(
+        "SELECT COALESCE(MIN(event_id), 0) FROM mfg_projection_event",
+        [],
+        |row| row.get::<_, u64>(0),
+    )?;
+    let now = Utc::now().to_rfc3339();
+    connection.execute(
+        "INSERT OR IGNORE INTO mfg_live_epoch (
+            singleton_id, epoch_id, contract_version, schema_version,
+            created_at, rotation_reason, retention_low_cursor,
+            retention_high_cursor, updated_at
+         ) VALUES (1, ?1, ?2, 1, ?3, 'initial', ?4, ?5, ?3)",
+        params![
+            format!("mfg-live-epoch-{}", uuid::Uuid::new_v4()),
+            app_mfg_contract::MFG_CONTRACT_VERSION,
+            now,
+            oldest.saturating_sub(1),
+            high,
+        ],
+    )?;
+    let stored = connection.query_row(
+        "SELECT contract_version, schema_version, retention_high_cursor
+         FROM mfg_live_epoch WHERE singleton_id = 1",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, u64>(2)?,
+            ))
+        },
+    )?;
+    let rotation_reason = if stored.0 != app_mfg_contract::MFG_CONTRACT_VERSION || stored.1 != 1 {
+        Some("incompatible_contract_or_schema")
+    } else if stored.2 > high {
+        Some("event_log_rewritten")
+    } else {
+        None
+    };
+    if let Some(reason) = rotation_reason {
+        connection.execute(
+            "UPDATE mfg_live_epoch
+             SET epoch_id = ?1, contract_version = ?2, schema_version = 1,
+                 created_at = ?3, rotation_reason = ?4,
+                 retention_low_cursor = ?5, retention_high_cursor = ?6,
+                 last_sweep_high_cursor = 0,
+                 updated_at = ?3
+             WHERE singleton_id = 1",
+            params![
+                format!("mfg-live-epoch-{}", uuid::Uuid::new_v4()),
+                app_mfg_contract::MFG_CONTRACT_VERSION,
+                now,
+                reason,
+                oldest.saturating_sub(1),
+                high,
+            ],
+        )?;
+        return Ok(());
+    }
+    connection.execute(
+        "UPDATE mfg_live_epoch
+         SET retention_high_cursor = CASE
+             WHEN retention_high_cursor < ?1 THEN ?1
+             ELSE retention_high_cursor
+         END
+         WHERE singleton_id = 1",
+        params![high],
+    )?;
+    Ok(())
+}
+
+fn rotate_live_epoch(connection: &Connection, reason: &str) -> Result<(), MfgRepositoryError> {
+    let high = connection.query_row(
+        "SELECT COALESCE(MAX(event_id), 0) FROM mfg_projection_event",
+        [],
+        |row| row.get::<_, u64>(0),
+    )?;
+    let oldest = connection.query_row(
+        "SELECT COALESCE(MIN(event_id), 0) FROM mfg_projection_event",
+        [],
+        |row| row.get::<_, u64>(0),
+    )?;
+    let now = Utc::now().to_rfc3339();
+    connection.execute(
+        "UPDATE mfg_live_epoch
+         SET epoch_id = ?1, contract_version = ?2, schema_version = 1,
+             created_at = ?3, rotation_reason = ?4,
+             retention_low_cursor = ?5, retention_high_cursor = ?6,
+             last_sweep_high_cursor = 0,
+             updated_at = ?3
+         WHERE singleton_id = 1",
+        params![
+            format!("mfg-live-epoch-{}", uuid::Uuid::new_v4()),
+            app_mfg_contract::MFG_CONTRACT_VERSION,
+            now,
+            reason,
+            oldest.saturating_sub(1),
+            high,
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_live_epoch(connection: &Connection) -> Result<MfgLiveEpoch, MfgRepositoryError> {
+    connection
+        .query_row(
+            "SELECT epoch_id, contract_version, schema_version, created_at,
+                    rotation_reason, retention_low_cursor,
+                    retention_high_cursor, updated_at
+             FROM mfg_live_epoch WHERE singleton_id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u32>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, u64>(5)?,
+                    row.get::<_, u64>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            },
+        )
+        .map_err(MfgRepositoryError::from)
+        .and_then(
+            |(
+                epoch_id,
+                contract_version,
+                schema_version,
+                created_at,
+                rotation_reason,
+                retention_low_cursor,
+                retention_high_cursor,
+                updated_at,
+            )| {
+                Ok(MfgLiveEpoch {
+                    epoch_id,
+                    contract_version,
+                    schema_version,
+                    created_at: parse_rfc3339_utc(&created_at)?,
+                    rotation_reason,
+                    retention_low_cursor,
+                    retention_high_cursor,
+                    updated_at: parse_rfc3339_utc(&updated_at)?,
+                })
+            },
+        )
+}
+
+fn compact_live_events_if_due(connection: &Connection) -> Result<(), MfgRepositoryError> {
+    let (events_since_sweep, due) = connection.query_row(
+        "SELECT retention_high_cursor - last_sweep_high_cursor,
+                julianday('now') - julianday(updated_at) >= (5.0 / 1440.0)
+         FROM mfg_live_epoch WHERE singleton_id = 1",
+        [],
+        |row| Ok((row.get::<_, u64>(0)?, row.get::<_, bool>(1)?)),
+    )?;
+    if events_since_sweep <= 60_000 && !due {
+        return Ok(());
+    }
+    let keep_from = connection
+        .query_row(
+            "SELECT event_id FROM mfg_projection_event
+             ORDER BY event_id DESC LIMIT 1 OFFSET 49999",
+            [],
+            |row| row.get::<_, u64>(0),
+        )
+        .optional()?;
+    if let Some(keep_from) = keep_from {
+        connection.execute(
+            "DELETE FROM mfg_projection_event
+             WHERE event_id < ?1
+               AND julianday(created_at) < julianday('now', '-7 days')",
+            params![keep_from],
+        )?;
+    }
+    let high = connection.query_row(
+        "SELECT COALESCE(MAX(event_id), 0) FROM mfg_projection_event",
+        [],
+        |row| row.get::<_, u64>(0),
+    )?;
+    let oldest = connection.query_row(
+        "SELECT COALESCE(MIN(event_id), 0) FROM mfg_projection_event",
+        [],
+        |row| row.get::<_, u64>(0),
+    )?;
+    connection.execute(
+        "UPDATE mfg_live_epoch
+         SET retention_low_cursor = ?1, retention_high_cursor = ?2,
+             last_sweep_high_cursor = ?2,
+             updated_at = ?3
+         WHERE singleton_id = 1",
+        params![oldest.saturating_sub(1), high, Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
 }
 
 fn find_command_receipt(
     connection: &Connection,
     key: &str,
-    domain: &str,
-    subject_ref: &str,
+    actor_principal: &str,
+    action_id: &str,
+    resource_ref: &str,
+    payload_digest: &str,
 ) -> Result<Option<MfgCommandReceipt>, MfgRepositoryError> {
-    let value = connection.query_row(
-        "SELECT domain, subject_ref, receipt_json FROM mfg_command_receipt WHERE idempotency_key = ?1",
-        params![key], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
-    ).optional()?;
-    let Some((stored_domain, stored_subject, json)) = value else {
+    let value = connection
+        .query_row(
+            "SELECT actor_principal, action_id, resource_ref, payload_digest, status, response_json
+         FROM mfg_mutation_receipt WHERE idempotency_key = ?1",
+            params![key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((stored_actor, stored_action, stored_resource, _stored_digest, status, json)) = value
+    else {
         return Ok(None);
     };
-    if stored_domain != domain || stored_subject != subject_ref {
+    if stored_actor != actor_principal
+        || stored_action != action_id
+        || stored_resource != resource_ref
+    {
         return Err(MfgRepositoryError::CommandRejected(
-            "idempotency key is already bound to another command subject".to_string(),
+            "idempotency key is already bound to another actor/action/resource".to_string(),
         ));
     }
+    // Gateway claims a durable key before a native repository command runs.
+    // Its canonical HTTP digest intentionally differs from the native typed
+    // command digest; an accepted claim is not yet a replayable business row.
+    if status == "accepted" {
+        return Ok(None);
+    }
     let mut receipt: MfgCommandReceipt = serde_json::from_str(&json)?;
+    if receipt.payload_digest != payload_digest {
+        return Err(MfgRepositoryError::CommandRejected(
+            "idempotency key is already bound to another native command payload".to_string(),
+        ));
+    }
     receipt.idempotent_replay = true;
     Ok(Some(receipt))
+}
+
+fn find_native_command_receipt_by_identity(
+    connection: &Connection,
+    key: &str,
+    actor_principal: &str,
+    action_id: &str,
+    resource_ref: &str,
+) -> Result<Option<MfgCommandReceipt>, MfgRepositoryError> {
+    let json = connection
+        .query_row(
+            "SELECT response_json
+             FROM mfg_mutation_receipt
+             WHERE idempotency_key = ?1
+               AND actor_principal = ?2
+               AND action_id = ?3
+               AND resource_ref = ?4
+               AND status = 'business_completed'",
+            params![key, actor_principal, action_id, resource_ref],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(json) = json else {
+        return Ok(None);
+    };
+    let mut receipt = match serde_json::from_str::<MfgCommandReceipt>(&json) {
+        Ok(receipt) => receipt,
+        Err(_) => return Ok(None),
+    };
+    receipt.idempotent_replay = true;
+    Ok(Some(receipt))
+}
+
+fn command_receipt_snapshot<T: serde::de::DeserializeOwned>(
+    receipt: &MfgCommandReceipt,
+) -> Option<T> {
+    (!receipt.response_snapshot.is_null())
+        .then(|| serde_json::from_value(receipt.response_snapshot.clone()).ok())
+        .flatten()
 }
 
 fn insert_command_receipt(
     connection: &Connection,
     receipt: &MfgCommandReceipt,
 ) -> Result<(), MfgRepositoryError> {
-    connection.execute(
-        "INSERT INTO mfg_command_receipt (idempotency_key, domain, subject_ref, receipt_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![receipt.idempotency_key, receipt.domain, receipt.subject_ref, serde_json::to_string(receipt)?, receipt.created_at.to_rfc3339()],
+    let changed = connection.execute(
+        "INSERT INTO mfg_mutation_receipt (
+            receipt_id, idempotency_key, actor_principal, action_id, resource_ref,
+            expected_revision, result_revision, payload_digest, status, response_json,
+            contract_version, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'business_completed', ?9, ?10, ?11, ?11)
+         ON CONFLICT(idempotency_key) DO UPDATE SET
+            result_revision = excluded.result_revision,
+            status = 'business_completed',
+            response_json = excluded.response_json,
+            contract_version = excluded.contract_version,
+            updated_at = excluded.updated_at
+         WHERE mfg_mutation_receipt.status = 'accepted'
+           AND mfg_mutation_receipt.actor_principal = excluded.actor_principal
+           AND mfg_mutation_receipt.action_id = excluded.action_id
+           AND mfg_mutation_receipt.resource_ref = excluded.resource_ref",
+        params![
+            receipt.receipt_id,
+            receipt.idempotency_key,
+            receipt.actor_ref,
+            receipt.action_id,
+            receipt.subject_ref,
+            receipt.previous_revision as i64,
+            receipt.current_revision as i64,
+            receipt.payload_digest,
+            serde_json::to_string(receipt)?,
+            receipt.contract_version,
+            receipt.created_at.to_rfc3339(),
+        ],
     )?;
-    Ok(())
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(MfgRepositoryError::CommandRejected(
+            "idempotency key is already bound to another command or completed receipt".to_string(),
+        ))
+    }
 }
 
 fn mutation_receipt(
@@ -3395,6 +5748,7 @@ fn mutation_receipt(
     command: &str,
     actor_ref: &str,
     idempotency_key: &str,
+    payload_digest: String,
     previous_revision: u64,
     current_revision: u64,
 ) -> Result<MfgCommandReceipt, MfgRepositoryError> {
@@ -3403,13 +5757,26 @@ fn mutation_receipt(
             "actor and idempotency key are required".to_string(),
         ));
     }
+    let mut action_id = canonical_action_id(domain, command);
+    if command.ends_with(".upsert") {
+        action_id = action_id.trim_end_matches(".upsert").to_string()
+            + if previous_revision == 0 {
+                ".create"
+            } else {
+                ".update"
+            };
+    }
     Ok(MfgCommandReceipt {
         receipt_id: format!("receipt-{}", uuid::Uuid::new_v4()),
         domain: domain.to_string(),
         subject_ref: subject_ref.clone(),
         command: command.to_string(),
+        action_id,
         actor_ref: actor_ref.to_string(),
         idempotency_key: idempotency_key.to_string(),
+        payload_digest,
+        correlation_id: None,
+        contract_version: app_mfg_contract::MFG_CONTRACT_VERSION.to_string(),
         idempotent_replay: false,
         previous_revision,
         current_revision,
@@ -3419,8 +5786,433 @@ fn mutation_receipt(
             current_revision
         ),
         notification_refs: Vec::new(),
+        response_snapshot: Value::Null,
         created_at: Utc::now(),
     })
+}
+
+fn canonical_action_id(domain: &str, command: &str) -> String {
+    match (domain, command) {
+        ("cockpit", "profile.upsert") => "mfg.cockpit.profile.upsert".to_string(),
+        ("cockpit", "profile.clone") => "mfg.cockpit.profile.clone".to_string(),
+        ("cockpit", "profile.share") => "mfg.cockpit.profile.share".to_string(),
+        ("cockpit", "profile.delete") => "mfg.cockpit.profile.delete".to_string(),
+        ("alert", "rule.upsert") => "mfg.alert_rule.upsert".to_string(),
+        ("alert", "subscription.upsert") => "mfg.alert_subscription.upsert".to_string(),
+        ("assignment", "assignment.upsert") => "mfg.assignment.upsert".to_string(),
+        ("assignment", "requestupdate") => "mfg.assignment.request_update".to_string(),
+        ("alert", command) => format!("mfg.alert.{command}"),
+        ("assignment", command) => format!("mfg.assignment.{command}"),
+        _ => format!("mfg.{domain}.{}", command.replace('_', ".")),
+    }
+}
+
+fn canonical_upsert_action_id(domain: &str, command: &str, previous_revision: u64) -> String {
+    let base = canonical_action_id(domain, command);
+    if !command.ends_with(".upsert") {
+        return base;
+    }
+    format!(
+        "{}.{}",
+        base.trim_end_matches(".upsert"),
+        if previous_revision == 0 {
+            "create"
+        } else {
+            "update"
+        }
+    )
+}
+
+fn stable_payload_digest<T: serde::Serialize>(value: &T) -> Result<String, MfgRepositoryError> {
+    use sha2::{Digest, Sha256};
+    let encoded = serde_json::to_vec(value)?;
+    let digest = Sha256::digest(encoded);
+    Ok(format!("sha256:{digest:x}"))
+}
+
+fn stable_upsert_payload_digest<T: serde::Serialize>(
+    resource: &T,
+    expected_revision: Option<u64>,
+    command: &str,
+) -> Result<String, MfgRepositoryError> {
+    let mut resource = serde_json::to_value(resource)?;
+    if let Some(object) = resource.as_object_mut() {
+        for server_owned in [
+            "revision",
+            "created_at",
+            "updated_at",
+            "created_by",
+            "status",
+        ] {
+            object.remove(server_owned);
+        }
+    }
+    stable_payload_digest(&(resource, expected_revision, command))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn claim_mutation_receipt(
+    connection: &Connection,
+    idempotency_key: &str,
+    actor_principal: &str,
+    action_id: &str,
+    resource_ref: &str,
+    expected_revision: Option<u64>,
+    payload_digest: &str,
+    correlation_id: &str,
+) -> Result<MfgMutationClaim, MfgRepositoryError> {
+    let action_id_value = app_mfg_contract::MfgActionId::parse(action_id).ok_or_else(|| {
+        MfgRepositoryError::CommandRejected(format!(
+            "action is not in the canonical MFG contract: {action_id}"
+        ))
+    })?;
+    let now = Utc::now();
+    let pending_response = serde_json::json!({
+        "kind": "mfg.mutation.accepted",
+        "correlation_id": correlation_id,
+        "resource_ref": resource_ref,
+    });
+    let receipt = app_mfg_contract::MfgReceiptV1 {
+        receipt_id: format!("receipt-{}", uuid::Uuid::new_v4()),
+        idempotency_key: idempotency_key.to_string(),
+        actor_principal: actor_principal.to_string(),
+        action_id: action_id_value,
+        resource_ref: resource_ref.to_string(),
+        expected_revision,
+        result_revision: None,
+        payload_digest: payload_digest.to_string(),
+        correlation_id: Some(correlation_id.to_string()),
+        status: app_mfg_contract::MfgReceiptStatus::Accepted,
+        response: pending_response.clone(),
+        contract_version: app_mfg_contract::MfgContractVersion::default(),
+        created_at: now,
+        updated_at: now,
+    };
+    let inserted = connection.execute(
+        "INSERT OR IGNORE INTO mfg_mutation_receipt (
+            receipt_id, idempotency_key, actor_principal, action_id, resource_ref,
+            expected_revision, result_revision, payload_digest, status, response_json,
+            contract_version, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, 'accepted', ?8, ?9, ?10, ?10)",
+        params![
+            receipt.receipt_id,
+            receipt.idempotency_key,
+            receipt.actor_principal,
+            action_id,
+            receipt.resource_ref,
+            expected_revision.map(|value| value as i64),
+            receipt.payload_digest,
+            serde_json::to_string(&pending_response)?,
+            receipt.contract_version.0,
+            now.to_rfc3339(),
+        ],
+    )?;
+    if inserted == 1 {
+        return Ok(MfgMutationClaim::Acquired(receipt));
+    }
+    let native_recovery = connection
+        .query_row(
+            "SELECT actor_principal, action_id, resource_ref, payload_digest, response_json
+             FROM mfg_mutation_receipt WHERE idempotency_key = ?1",
+            params![idempotency_key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?
+        .and_then(|(actor, action, resource, digest, json)| {
+            serde_json::from_str::<MfgCommandReceipt>(&json)
+                .ok()
+                .map(|business| (actor, action, resource, digest, business))
+        });
+    if let Some((stored_actor, stored_action, stored_resource, stored_digest, business)) =
+        native_recovery
+    {
+        if stored_actor == actor_principal
+            && stored_action == action_id
+            && stored_resource == resource_ref
+            && stored_digest == payload_digest
+            && business.actor_ref == actor_principal
+            && business.action_id == action_id
+            && business.subject_ref == resource_ref
+        {
+            return Ok(MfgMutationClaim::NativeRecovery(business));
+        }
+        return Err(MfgRepositoryError::CommandRejected(
+            "idempotency key is already bound to another native business command".to_string(),
+        ));
+    }
+    match find_mutation_receipt(
+        connection,
+        idempotency_key,
+        actor_principal,
+        action_id,
+        resource_ref,
+        payload_digest,
+    )? {
+        Some((receipt, _)) if receipt.status == app_mfg_contract::MfgReceiptStatus::Accepted => {
+            Ok(MfgMutationClaim::Pending(receipt))
+        }
+        Some((receipt, response)) => Ok(MfgMutationClaim::Replayed(receipt, response)),
+        None => Err(MfgRepositoryError::CommandRejected(
+            "idempotency key is occupied by an unfinished business command".to_string(),
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn find_mutation_receipt(
+    connection: &Connection,
+    idempotency_key: &str,
+    actor_principal: &str,
+    action_id: &str,
+    resource_ref: &str,
+    payload_digest: &str,
+) -> Result<Option<(app_mfg_contract::MfgReceiptV1, serde_json::Value)>, MfgRepositoryError> {
+    let stored = connection
+        .query_row(
+            "SELECT receipt_id, actor_principal, action_id, resource_ref,
+                    expected_revision, result_revision, payload_digest, status,
+                    response_json, contract_version, created_at, updated_at
+             FROM mfg_mutation_receipt WHERE idempotency_key = ?1",
+            params![idempotency_key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        receipt_id,
+        stored_actor,
+        stored_action,
+        stored_resource,
+        expected_revision,
+        result_revision,
+        stored_digest,
+        status,
+        response_json,
+        contract_version,
+        created_at,
+        updated_at,
+    )) = stored
+    else {
+        return Ok(None);
+    };
+    // Native command handlers persist a crash-recovery record before the
+    // Gateway middleware can finalize the canonical governance receipt. Let
+    // the handler replay that command and upgrade this same row instead of
+    // treating the temporary record as a conflicting second authority.
+    if let Ok(business) = serde_json::from_str::<MfgCommandReceipt>(&response_json) {
+        if business.actor_ref == actor_principal && business.action_id == action_id {
+            return Ok(None);
+        }
+        return Err(MfgRepositoryError::CommandRejected(
+            "idempotency key is already bound to another actor or action".to_string(),
+        ));
+    }
+    if stored_actor != actor_principal
+        || stored_action != action_id
+        || stored_resource != resource_ref
+        || stored_digest != payload_digest
+    {
+        return Err(MfgRepositoryError::CommandRejected(
+            "idempotency key is already bound to another actor/action/resource/payload".to_string(),
+        ));
+    }
+    let action_id = app_mfg_contract::MfgActionId::parse(&stored_action).ok_or_else(|| {
+        MfgRepositoryError::CommandRejected(format!(
+            "stored receipt action is not in the canonical contract: {stored_action}"
+        ))
+    })?;
+    let parse_time = |value: String| {
+        chrono::DateTime::parse_from_rfc3339(&value)
+            .map(|value| value.with_timezone(&Utc))
+            .map_err(|error| {
+                MfgRepositoryError::CommandRejected(format!(
+                    "stored receipt timestamp is invalid: {error}"
+                ))
+            })
+    };
+    let receipt_status = match status.as_str() {
+        "preview" => app_mfg_contract::MfgReceiptStatus::Preview,
+        "accepted" => app_mfg_contract::MfgReceiptStatus::Accepted,
+        "replayed" => app_mfg_contract::MfgReceiptStatus::Replayed,
+        "conflict" => app_mfg_contract::MfgReceiptStatus::Conflict,
+        "rejected" => app_mfg_contract::MfgReceiptStatus::Rejected,
+        "failed" => app_mfg_contract::MfgReceiptStatus::Failed,
+        _ => app_mfg_contract::MfgReceiptStatus::Completed,
+    };
+    let response = serde_json::from_str::<serde_json::Value>(&response_json)?;
+    Ok(Some((
+        app_mfg_contract::MfgReceiptV1 {
+            receipt_id,
+            idempotency_key: idempotency_key.to_string(),
+            actor_principal: stored_actor,
+            action_id,
+            resource_ref: stored_resource,
+            expected_revision: expected_revision.map(|value| value as u64),
+            result_revision: result_revision.map(|value| value as u64),
+            payload_digest: stored_digest,
+            correlation_id: find_string_recursive(&response, "correlation_id"),
+            status: receipt_status,
+            response: response.clone(),
+            contract_version: app_mfg_contract::MfgContractVersion(contract_version),
+            created_at: parse_time(created_at)?,
+            updated_at: parse_time(updated_at)?,
+        },
+        response,
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_mutation_receipt(
+    connection: &Connection,
+    idempotency_key: &str,
+    actor_principal: &str,
+    action_id: &str,
+    resource_ref: &str,
+    expected_revision: Option<u64>,
+    result_revision: Option<u64>,
+    payload_digest: &str,
+    response: &serde_json::Value,
+) -> Result<app_mfg_contract::MfgReceiptV1, MfgRepositoryError> {
+    let transitional_identity = connection
+        .query_row(
+            "SELECT receipt_id, created_at
+             FROM mfg_mutation_receipt
+             WHERE idempotency_key = ?1
+               AND status IN ('accepted', 'business_completed')",
+            params![idempotency_key],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let existing = find_mutation_receipt(
+        connection,
+        idempotency_key,
+        actor_principal,
+        action_id,
+        resource_ref,
+        payload_digest,
+    )?;
+    if let Some((mut receipt, _)) = existing
+        .as_ref()
+        .filter(|(receipt, _)| receipt.status != app_mfg_contract::MfgReceiptStatus::Accepted)
+        .cloned()
+    {
+        receipt.status = app_mfg_contract::MfgReceiptStatus::Replayed;
+        return Ok(receipt);
+    }
+    let action_id_value = app_mfg_contract::MfgActionId::parse(action_id).ok_or_else(|| {
+        MfgRepositoryError::CommandRejected(format!(
+            "action is not in the canonical MFG contract: {action_id}"
+        ))
+    })?;
+    let now = Utc::now();
+    let (receipt_id, created_at) = existing
+        .map(|(receipt, _)| (receipt.receipt_id, receipt.created_at))
+        .or_else(|| {
+            transitional_identity.and_then(|(receipt_id, created_at)| {
+                chrono::DateTime::parse_from_rfc3339(&created_at)
+                    .ok()
+                    .map(|created_at| (receipt_id, created_at.with_timezone(&Utc)))
+            })
+        })
+        .unwrap_or_else(|| (format!("receipt-{}", uuid::Uuid::new_v4()), now));
+    let receipt = app_mfg_contract::MfgReceiptV1 {
+        receipt_id,
+        idempotency_key: idempotency_key.to_string(),
+        actor_principal: actor_principal.to_string(),
+        action_id: action_id_value,
+        resource_ref: resource_ref.to_string(),
+        expected_revision,
+        result_revision,
+        payload_digest: payload_digest.to_string(),
+        correlation_id: find_string_recursive(response, "correlation_id"),
+        status: app_mfg_contract::MfgReceiptStatus::Completed,
+        response: response.clone(),
+        contract_version: app_mfg_contract::MfgContractVersion::default(),
+        created_at,
+        updated_at: now,
+    };
+    connection.execute(
+        "INSERT INTO mfg_mutation_receipt (
+            receipt_id, idempotency_key, actor_principal, action_id, resource_ref,
+            expected_revision, result_revision, payload_digest, status, response_json,
+            contract_version, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'completed', ?9, ?10, ?11, ?12)
+         ON CONFLICT(idempotency_key) DO UPDATE SET
+            receipt_id = excluded.receipt_id,
+            actor_principal = excluded.actor_principal,
+            action_id = excluded.action_id,
+            resource_ref = excluded.resource_ref,
+            expected_revision = excluded.expected_revision,
+            result_revision = excluded.result_revision,
+            payload_digest = excluded.payload_digest,
+            status = excluded.status,
+            response_json = excluded.response_json,
+            contract_version = excluded.contract_version,
+            created_at = excluded.created_at,
+            updated_at = excluded.updated_at",
+        params![
+            receipt.receipt_id,
+            idempotency_key,
+            receipt.actor_principal,
+            action_id,
+            receipt.resource_ref,
+            expected_revision.map(|value| value as i64),
+            result_revision.map(|value| value as i64),
+            receipt.payload_digest,
+            serde_json::to_string(response)?,
+            receipt.contract_version.0,
+            receipt.created_at.to_rfc3339(),
+            now.to_rfc3339(),
+        ],
+    )?;
+    append_projection_event(
+        connection,
+        "receipt",
+        &format!("mfg:receipt:{}", receipt.receipt_id),
+        "receipt.completed",
+        serde_json::json!({"receipt": receipt}),
+    )?;
+    Ok(receipt)
+}
+
+fn find_string_recursive(value: &Value, key: &str) -> Option<String> {
+    match value {
+        Value::Object(object) => object
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                object
+                    .values()
+                    .find_map(|child| find_string_recursive(child, key))
+            }),
+        Value::Array(items) => items
+            .iter()
+            .find_map(|child| find_string_recursive(child, key)),
+        _ => None,
+    }
 }
 
 fn upsert_cockpit_profile_receipted(
@@ -3432,31 +6224,45 @@ fn upsert_cockpit_profile_receipted(
     idempotency_key: &str,
 ) -> Result<(MfgCockpitProfile, MfgCommandReceipt), MfgRepositoryError> {
     let subject_ref = format!("mfg:cockpit-profile:{}", profile.profile_id);
-    if let Some(receipt) =
-        find_command_receipt(connection, idempotency_key, "cockpit", &subject_ref)?
-    {
+    let previous_revision = find_cockpit_profile(connection, &profile.profile_id)?
+        .map(|item| item.revision)
+        .unwrap_or_default();
+    let action_id = canonical_upsert_action_id(
+        "cockpit",
+        command,
+        if expected_revision.is_some() { 1 } else { 0 },
+    );
+    let payload_digest = stable_upsert_payload_digest(profile, expected_revision, command)?;
+    if let Some(receipt) = find_command_receipt(
+        connection,
+        idempotency_key,
+        actor_ref,
+        &action_id,
+        &subject_ref,
+        &payload_digest,
+    )? {
         if receipt.actor_ref != actor_ref {
             return Err(MfgRepositoryError::CommandRejected(
                 "idempotency key is bound to another actor".to_string(),
             ));
         }
-        let profile = find_cockpit_profile(connection, &profile.profile_id)?
+        let profile = command_receipt_snapshot(&receipt)
+            .or(find_cockpit_profile(connection, &profile.profile_id)?)
             .ok_or_else(|| MfgRepositoryError::NotFound(profile.profile_id.clone()))?;
         return Ok((profile, receipt));
     }
-    let previous_revision = find_cockpit_profile(connection, &profile.profile_id)?
-        .map(|item| item.revision)
-        .unwrap_or_default();
     let profile = upsert_cockpit_profile(connection, profile, expected_revision)?;
-    let receipt = mutation_receipt(
+    let mut receipt = mutation_receipt(
         "cockpit",
         subject_ref.clone(),
         command,
         actor_ref,
         idempotency_key,
+        payload_digest,
         previous_revision,
         profile.revision,
     )?;
+    receipt.response_snapshot = serde_json::to_value(&profile)?;
     insert_command_receipt(connection, &receipt)?;
     append_projection_event(
         connection,
@@ -3476,15 +6282,23 @@ fn delete_cockpit_profile_receipted(
     idempotency_key: &str,
 ) -> Result<(Option<MfgCockpitProfile>, MfgCommandReceipt), MfgRepositoryError> {
     let subject_ref = format!("mfg:cockpit-profile:{profile_id}");
-    if let Some(receipt) =
-        find_command_receipt(connection, idempotency_key, "cockpit", &subject_ref)?
-    {
+    let action_id = canonical_action_id("cockpit", "profile.delete");
+    let payload_digest = stable_payload_digest(&(profile_id, expected_revision))?;
+    if let Some(receipt) = find_command_receipt(
+        connection,
+        idempotency_key,
+        actor_ref,
+        &action_id,
+        &subject_ref,
+        &payload_digest,
+    )? {
         if receipt.actor_ref != actor_ref {
             return Err(MfgRepositoryError::CommandRejected(
                 "idempotency key is bound to another actor".to_string(),
             ));
         }
-        return Ok((None, receipt));
+        let profile = command_receipt_snapshot(&receipt);
+        return Ok((profile, receipt));
     }
     let profile = find_cockpit_profile(connection, profile_id)?
         .ok_or_else(|| MfgRepositoryError::NotFound(profile_id.to_string()))?;
@@ -3498,15 +6312,17 @@ fn delete_cockpit_profile_receipted(
         "DELETE FROM mfg_cockpit_profile WHERE profile_id = ?1",
         params![profile_id],
     )?;
-    let receipt = mutation_receipt(
+    let mut receipt = mutation_receipt(
         "cockpit",
         subject_ref.clone(),
         "profile.delete",
         actor_ref,
         idempotency_key,
+        payload_digest,
         profile.revision,
         profile.revision,
     )?;
+    receipt.response_snapshot = serde_json::to_value(&profile)?;
     insert_command_receipt(connection, &receipt)?;
     append_projection_event(
         connection,
@@ -3526,30 +6342,45 @@ fn upsert_alert_rule_receipted(
     idempotency_key: &str,
 ) -> Result<(MfgAlertRule, MfgCommandReceipt), MfgRepositoryError> {
     let subject_ref = format!("mfg:alert-rule:{}", rule.rule_id);
-    if let Some(receipt) = find_command_receipt(connection, idempotency_key, "alert", &subject_ref)?
-    {
+    let previous_revision = find_alert_rule(connection, &rule.rule_id)?
+        .map(|item| item.revision)
+        .unwrap_or_default();
+    let action_id = canonical_upsert_action_id(
+        "alert",
+        "rule.upsert",
+        if expected_revision.is_some() { 1 } else { 0 },
+    );
+    let payload_digest = stable_upsert_payload_digest(rule, expected_revision, "rule.upsert")?;
+    if let Some(receipt) = find_command_receipt(
+        connection,
+        idempotency_key,
+        actor_ref,
+        &action_id,
+        &subject_ref,
+        &payload_digest,
+    )? {
         if receipt.actor_ref != actor_ref {
             return Err(MfgRepositoryError::CommandRejected(
                 "idempotency key is bound to another actor".to_string(),
             ));
         }
-        let rule = find_alert_rule(connection, &rule.rule_id)?
+        let rule = command_receipt_snapshot(&receipt)
+            .or(find_alert_rule(connection, &rule.rule_id)?)
             .ok_or_else(|| MfgRepositoryError::NotFound(rule.rule_id.clone()))?;
         return Ok((rule, receipt));
     }
-    let previous_revision = find_alert_rule(connection, &rule.rule_id)?
-        .map(|item| item.revision)
-        .unwrap_or_default();
     let rule = upsert_alert_rule(connection, rule, expected_revision)?;
-    let receipt = mutation_receipt(
+    let mut receipt = mutation_receipt(
         "alert",
         subject_ref.clone(),
         "rule.upsert",
         actor_ref,
         idempotency_key,
+        payload_digest,
         previous_revision,
         rule.revision,
     )?;
+    receipt.response_snapshot = serde_json::to_value(&rule)?;
     insert_command_receipt(connection, &receipt)?;
     append_projection_event(
         connection,
@@ -3569,30 +6400,49 @@ fn upsert_alert_subscription_receipted(
     idempotency_key: &str,
 ) -> Result<(MfgAlertSubscription, MfgCommandReceipt), MfgRepositoryError> {
     let subject_ref = format!("mfg:alert-subscription:{}", subscription.subscription_id);
-    if let Some(receipt) = find_command_receipt(connection, idempotency_key, "alert", &subject_ref)?
-    {
+    let previous_revision = find_alert_subscription(connection, &subscription.subscription_id)?
+        .map(|item| item.revision)
+        .unwrap_or_default();
+    let action_id = canonical_upsert_action_id(
+        "alert",
+        "subscription.upsert",
+        if expected_revision.is_some() { 1 } else { 0 },
+    );
+    let payload_digest =
+        stable_upsert_payload_digest(subscription, expected_revision, "subscription.upsert")?;
+    if let Some(receipt) = find_command_receipt(
+        connection,
+        idempotency_key,
+        actor_ref,
+        &action_id,
+        &subject_ref,
+        &payload_digest,
+    )? {
         if receipt.actor_ref != actor_ref {
             return Err(MfgRepositoryError::CommandRejected(
                 "idempotency key is bound to another actor".to_string(),
             ));
         }
-        let subscription = find_alert_subscription(connection, &subscription.subscription_id)?
+        let subscription = command_receipt_snapshot(&receipt)
+            .or(find_alert_subscription(
+                connection,
+                &subscription.subscription_id,
+            )?)
             .ok_or_else(|| MfgRepositoryError::NotFound(subscription.subscription_id.clone()))?;
         return Ok((subscription, receipt));
     }
-    let previous_revision = find_alert_subscription(connection, &subscription.subscription_id)?
-        .map(|item| item.revision)
-        .unwrap_or_default();
     let subscription = upsert_alert_subscription(connection, subscription, expected_revision)?;
-    let receipt = mutation_receipt(
+    let mut receipt = mutation_receipt(
         "alert",
         subject_ref.clone(),
         "subscription.upsert",
         actor_ref,
         idempotency_key,
+        payload_digest,
         previous_revision,
         subscription.revision,
     )?;
+    receipt.response_snapshot = serde_json::to_value(&subscription)?;
     insert_command_receipt(connection, &receipt)?;
     append_projection_event(
         connection,
@@ -3612,31 +6462,46 @@ fn upsert_assignment_receipted(
     idempotency_key: &str,
 ) -> Result<(MfgAssignment, MfgCommandReceipt), MfgRepositoryError> {
     let subject_ref = format!("mfg:assignment:{}", assignment.assignment_id);
-    if let Some(receipt) =
-        find_command_receipt(connection, idempotency_key, "assignment", &subject_ref)?
-    {
+    let previous_revision = find_assignment(connection, &assignment.assignment_id)?
+        .map(|item| item.revision)
+        .unwrap_or_default();
+    let action_id = canonical_upsert_action_id(
+        "assignment",
+        "assignment.upsert",
+        if expected_revision.is_some() { 1 } else { 0 },
+    );
+    let payload_digest =
+        stable_upsert_payload_digest(assignment, expected_revision, "assignment.upsert")?;
+    if let Some(receipt) = find_command_receipt(
+        connection,
+        idempotency_key,
+        actor_ref,
+        &action_id,
+        &subject_ref,
+        &payload_digest,
+    )? {
         if receipt.actor_ref != actor_ref {
             return Err(MfgRepositoryError::CommandRejected(
                 "idempotency key is bound to another actor".to_string(),
             ));
         }
-        let assignment = find_assignment(connection, &assignment.assignment_id)?
+        let assignment = command_receipt_snapshot(&receipt)
+            .or(find_assignment(connection, &assignment.assignment_id)?)
             .ok_or_else(|| MfgRepositoryError::NotFound(assignment.assignment_id.clone()))?;
         return Ok((assignment, receipt));
     }
-    let previous_revision = find_assignment(connection, &assignment.assignment_id)?
-        .map(|item| item.revision)
-        .unwrap_or_default();
     let assignment = upsert_assignment(connection, assignment, expected_revision)?;
-    let receipt = mutation_receipt(
+    let mut receipt = mutation_receipt(
         "assignment",
         subject_ref.clone(),
         "assignment.upsert",
         actor_ref,
         idempotency_key,
+        payload_digest,
         previous_revision,
         assignment.revision,
     )?;
+    receipt.response_snapshot = serde_json::to_value(&assignment)?;
     insert_command_receipt(connection, &receipt)?;
     append_projection_event(
         connection,
@@ -3655,7 +6520,7 @@ fn record_command_notifications(
 ) -> Result<MfgCommandReceipt, MfgRepositoryError> {
     let value = connection
         .query_row(
-            "SELECT receipt_json FROM mfg_command_receipt WHERE idempotency_key = ?1",
+            "SELECT response_json FROM mfg_mutation_receipt WHERE idempotency_key = ?1",
             params![idempotency_key],
             |row| row.get::<_, String>(0),
         )
@@ -3664,17 +6529,71 @@ fn record_command_notifications(
     let mut receipt: MfgCommandReceipt = serde_json::from_str(&value)?;
     receipt.notification_refs = notification_refs;
     connection.execute(
-        "UPDATE mfg_command_receipt SET receipt_json = ?2 WHERE idempotency_key = ?1",
-        params![idempotency_key, serde_json::to_string(&receipt)?],
+        "UPDATE mfg_mutation_receipt
+         SET response_json = ?2, updated_at = ?3
+         WHERE idempotency_key = ?1",
+        params![
+            idempotency_key,
+            serde_json::to_string(&receipt)?,
+            Utc::now().to_rfc3339()
+        ],
     )?;
     append_projection_event(
         connection,
         &receipt.domain,
         &receipt.subject_ref,
         "notification.delivery_observed",
-        serde_json::to_value(&receipt)?,
+        serde_json::json!({"receipt": receipt}),
     )?;
     Ok(receipt)
+}
+
+fn command_notification_refs_for_resource(
+    connection: &Connection,
+    resource_ref: &str,
+) -> Result<Vec<String>, MfgRepositoryError> {
+    let mut statement = connection.prepare(
+        "SELECT response_json
+         FROM mfg_mutation_receipt
+         WHERE resource_ref = ?1
+         ORDER BY updated_at DESC",
+    )?;
+    let rows = statement.query_map(params![resource_ref], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        let json = row?;
+        if let Ok(value) = serde_json::from_str::<Value>(&json) {
+            if let Some(notification_refs) = find_notification_refs(&value) {
+                return Ok(notification_refs);
+            }
+        }
+    }
+    Ok(Vec::new())
+}
+
+fn find_notification_refs(value: &Value) -> Option<Vec<String>> {
+    match value {
+        Value::Object(object) => {
+            if let Some(notification_refs) =
+                object.get("notification_refs").and_then(Value::as_array)
+            {
+                let notification_refs = notification_refs
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                if !notification_refs.is_empty() {
+                    return Some(notification_refs);
+                }
+            }
+            // The finalized Gateway row nests the native MfgCommandReceipt as
+            // response.business_receipt.response. Recursive typed traversal
+            // keeps the durable backlink available after that in-place
+            // governance upgrade.
+            object.values().find_map(find_notification_refs)
+        }
+        Value::Array(items) => items.iter().find_map(find_notification_refs),
+        _ => None,
+    }
 }
 
 fn upsert_alert_rule(
@@ -3698,7 +6617,7 @@ fn upsert_alert_rule(
             rule.created_at = existing.created_at;
             rule.revision = existing.revision.saturating_add(1);
         }
-        None if expected_revision.is_some_and(|revision| revision != 0) => {
+        None if expected_revision.is_some() => {
             return Err(MfgRepositoryError::RevisionConflict {
                 domain: "alert_rule".to_string(),
                 subject_id: rule.rule_id.clone(),
@@ -3721,7 +6640,7 @@ fn upsert_alert_rule(
         "alert",
         &format!("mfg:alert-rule:{}", rule.rule_id),
         "alert_rule.upserted",
-        serde_json::to_value(&rule)?,
+        serde_json::json!({"rule": rule}),
     )?;
     Ok(rule)
 }
@@ -3783,13 +6702,13 @@ fn upsert_alert_subscription(
             subscription.created_at = existing.created_at;
             subscription.revision = existing.revision.saturating_add(1);
         }
-        None if expected_revision.is_some_and(|revision| revision != 0) => {
+        None if expected_revision.is_some() => {
             return Err(MfgRepositoryError::RevisionConflict {
                 domain: "alert_subscription".to_string(),
                 subject_id: subscription.subscription_id.clone(),
                 expected: expected_revision,
                 actual: None,
-            })
+            });
         }
         None => {}
     }
@@ -3802,7 +6721,7 @@ fn upsert_alert_subscription(
         "alert",
         &format!("mfg:alert-subscription:{}", subscription.subscription_id),
         "alert_subscription.upserted",
-        serde_json::to_value(&subscription)?,
+        serde_json::json!({"subscription": subscription}),
     )?;
     Ok(subscription)
 }
@@ -3896,7 +6815,10 @@ fn materialize_alert_occurrences(
             "alert",
             &format!("mfg:alert-occurrence:{}", occurrence.occurrence_id),
             "alert.opened",
-            serde_json::to_value(&occurrence)?,
+            serde_json::json!({
+                "occurrence": occurrence,
+                "owner_ref": rule.owner_ref,
+            }),
         )?;
     }
     Ok(())
@@ -4094,15 +7016,24 @@ fn command_alert(
     input: MfgAlertCommandInput,
 ) -> Result<(MfgAlertOccurrence, MfgCommandReceipt), MfgRepositoryError> {
     let subject_ref = format!("mfg:alert-occurrence:{occurrence_id}");
-    if let Some(receipt) =
-        find_command_receipt(connection, &input.idempotency_key, "alert", &subject_ref)?
-    {
+    let command = format!("{:?}", input.command).to_lowercase();
+    let action_id = canonical_action_id("alert", &command);
+    let payload_digest = stable_payload_digest(&input)?;
+    if let Some(receipt) = find_command_receipt(
+        connection,
+        &input.idempotency_key,
+        &input.actor_ref,
+        &action_id,
+        &subject_ref,
+        &payload_digest,
+    )? {
         if receipt.actor_ref != input.actor_ref {
             return Err(MfgRepositoryError::CommandRejected(
                 "idempotency key is bound to another actor".to_string(),
             ));
         }
-        let occurrence = find_alert_occurrence(connection, occurrence_id)?
+        let occurrence = command_receipt_snapshot(&receipt)
+            .or(find_alert_occurrence(connection, occurrence_id)?)
             .ok_or_else(|| MfgRepositoryError::NotFound(occurrence_id.to_string()))?;
         return Ok((occurrence, receipt));
     }
@@ -4135,19 +7066,23 @@ fn command_alert(
     occurrence.revision = occurrence.revision.saturating_add(1);
     occurrence.updated_at = Utc::now();
     save_alert_occurrence(connection, &occurrence)?;
-    let command = format!("{:?}", input.command).to_lowercase();
     let receipt = MfgCommandReceipt {
         receipt_id: format!("receipt-{}", uuid::Uuid::new_v4()),
         domain: "alert".to_string(),
         subject_ref: subject_ref.clone(),
         command: command.clone(),
+        action_id,
         actor_ref: input.actor_ref,
         idempotency_key: input.idempotency_key,
+        payload_digest,
+        correlation_id: None,
+        contract_version: app_mfg_contract::MFG_CONTRACT_VERSION.to_string(),
         idempotent_replay: false,
         previous_revision,
         current_revision: occurrence.revision,
         audit_ref: format!("audit://mfg/alert/{occurrence_id}/{}", occurrence.revision),
         notification_refs: Vec::new(),
+        response_snapshot: serde_json::to_value(&occurrence)?,
         created_at: Utc::now(),
     };
     insert_command_receipt(connection, &receipt)?;
@@ -4256,13 +7191,13 @@ fn upsert_assignment(
             assignment.status = existing.status;
             assignment.revision = existing.revision.saturating_add(1);
         }
-        None if expected_revision.is_some_and(|revision| revision != 0) => {
+        None if expected_revision.is_some() => {
             return Err(MfgRepositoryError::RevisionConflict {
                 domain: "assignment".to_string(),
                 subject_id: assignment.assignment_id.clone(),
                 expected: expected_revision,
                 actual: None,
-            })
+            });
         }
         None => {}
     }
@@ -4273,7 +7208,7 @@ fn upsert_assignment(
         "assignment",
         &format!("mfg:assignment:{}", assignment.assignment_id),
         "assignment.upserted",
-        serde_json::to_value(&assignment)?,
+        serde_json::json!({"assignment": assignment}),
     )?;
     Ok(assignment)
 }
@@ -4391,18 +7326,24 @@ fn command_assignment(
     input: MfgAssignmentCommandInput,
 ) -> Result<(MfgAssignment, MfgCommandReceipt), MfgRepositoryError> {
     let subject_ref = format!("mfg:assignment:{assignment_id}");
+    let command = format!("{:?}", input.command).to_lowercase();
+    let action_id = canonical_action_id("assignment", &command);
+    let payload_digest = stable_payload_digest(&input)?;
     if let Some(receipt) = find_command_receipt(
         connection,
         &input.idempotency_key,
-        "assignment",
+        &input.actor_ref,
+        &action_id,
         &subject_ref,
+        &payload_digest,
     )? {
         if receipt.actor_ref != input.actor_ref {
             return Err(MfgRepositoryError::CommandRejected(
                 "idempotency key is bound to another actor".to_string(),
             ));
         }
-        let assignment = find_assignment(connection, assignment_id)?
+        let assignment = command_receipt_snapshot(&receipt)
+            .or(find_assignment(connection, assignment_id)?)
             .ok_or_else(|| MfgRepositoryError::NotFound(assignment_id.to_string()))?;
         return Ok((assignment, receipt));
     }
@@ -4428,6 +7369,8 @@ fn command_assignment(
             | MfgAssignmentCommand::Transfer
             | MfgAssignmentCommand::Unassign
             | MfgAssignmentCommand::Escalate
+            | MfgAssignmentCommand::Start
+            | MfgAssignmentCommand::Complete
     ) && input.actor_ref != assignment.created_by
         && input.actor_ref != assignment.assignee_ref
     {
@@ -4441,6 +7384,14 @@ fn command_assignment(
         input.expected_revision,
         assignment.revision,
     )?;
+    if assignment.status == "completion_pending"
+        && (!matches!(input.command, MfgAssignmentCommand::Complete)
+            || assignment.lifecycle_correlation_id.as_deref() != Some(&input.correlation_id))
+    {
+        return Err(MfgRepositoryError::CommandRejected(
+            "assignment completion is reserved by another lifecycle command".to_string(),
+        ));
+    }
     let previous_revision = assignment.revision;
     match input.command {
         MfgAssignmentCommand::Assign | MfgAssignmentCommand::Transfer => {
@@ -4472,18 +7423,65 @@ fn command_assignment(
             assignment.status = "escalated".to_string();
             assignment.priority = "urgent".to_string();
         }
+        MfgAssignmentCommand::Start => {
+            if !matches!(
+                assignment.status.as_str(),
+                "assigned" | "claimed" | "update_requested"
+            ) {
+                return Err(MfgRepositoryError::CommandRejected(format!(
+                    "assignment cannot start from status {}",
+                    assignment.status
+                )));
+            }
+            assignment.status = "in_progress".to_string();
+            assignment.lifecycle_correlation_id = Some(input.correlation_id.clone());
+        }
+        MfgAssignmentCommand::Complete => {
+            if assignment.status != "completion_pending" {
+                return Err(MfgRepositoryError::CommandRejected(format!(
+                    "assignment cannot complete from status {}",
+                    assignment.status
+                )));
+            }
+            let evidence = input.completion_evidence.as_ref().ok_or_else(|| {
+                MfgRepositoryError::CommandRejected(
+                    "mfg_assignment_task_transition_required".to_string(),
+                )
+            })?;
+            if evidence.task_ref != assignment.task_ref
+                || evidence.workflow_node_id != assignment.workflow_node_id
+                || evidence.correlation_id != input.correlation_id
+                || evidence.receipt_ref.trim().is_empty()
+                || !matches!(
+                    evidence.terminal_status.as_str(),
+                    "completed" | "blocked" | "failed" | "cancelled"
+                )
+                || evidence.owner_kind != "runtime_assignment_terminal_observation"
+            {
+                return Err(MfgRepositoryError::CommandRejected(
+                    "assignment completion evidence does not match the canonical task binding"
+                        .to_string(),
+                ));
+            }
+            assignment.status = "completed".to_string();
+            assignment.completion_ref = Some(evidence.receipt_ref.clone());
+            assignment.lifecycle_correlation_id = Some(evidence.correlation_id.clone());
+        }
     }
     assignment.revision = assignment.revision.saturating_add(1);
     assignment.updated_at = Utc::now();
     save_assignment(connection, &assignment)?;
-    let command = format!("{:?}", input.command).to_lowercase();
     let receipt = MfgCommandReceipt {
         receipt_id: format!("receipt-{}", uuid::Uuid::new_v4()),
         domain: "assignment".to_string(),
         subject_ref: subject_ref.clone(),
         command: command.clone(),
+        action_id,
         actor_ref: input.actor_ref,
         idempotency_key: input.idempotency_key,
+        payload_digest,
+        correlation_id: Some(input.correlation_id.clone()),
+        contract_version: app_mfg_contract::MFG_CONTRACT_VERSION.to_string(),
         idempotent_replay: false,
         previous_revision,
         current_revision: assignment.revision,
@@ -4492,6 +7490,7 @@ fn command_assignment(
             assignment.revision
         ),
         notification_refs: Vec::new(),
+        response_snapshot: serde_json::to_value(&assignment)?,
         created_at: Utc::now(),
     };
     insert_command_receipt(connection, &receipt)?;
@@ -4500,9 +7499,86 @@ fn command_assignment(
         "assignment",
         &subject_ref,
         &format!("assignment.{command}"),
-        serde_json::json!({ "assignment": assignment, "receipt": receipt, "reason": input.reason }),
+        serde_json::json!({
+            "assignment": assignment,
+            "receipt": receipt,
+            "reason": input.reason,
+            "correlation_id": input.correlation_id,
+        }),
     )?;
     Ok((assignment, receipt))
+}
+
+fn reserve_assignment_completion(
+    connection: &Connection,
+    assignment_id: &str,
+    expected_revision: u64,
+    actor_ref: &str,
+    correlation_id: &str,
+) -> Result<MfgAssignment, MfgRepositoryError> {
+    let mut assignment = find_assignment(connection, assignment_id)?
+        .ok_or_else(|| MfgRepositoryError::NotFound(assignment_id.to_string()))?;
+    if assignment.revision != expected_revision {
+        return Err(MfgRepositoryError::RevisionConflict {
+            domain: "assignment".to_string(),
+            subject_id: assignment_id.to_string(),
+            expected: Some(expected_revision),
+            actual: Some(assignment.revision),
+        });
+    }
+    if assignment.status != "in_progress" {
+        return Err(MfgRepositoryError::CommandRejected(format!(
+            "assignment cannot reserve completion from status {}",
+            assignment.status
+        )));
+    }
+    if actor_ref != assignment.created_by && actor_ref != assignment.assignee_ref {
+        return Err(MfgRepositoryError::CommandRejected(
+            "assignment completion requires the owner or current assignee".to_string(),
+        ));
+    }
+    assignment.status = "completion_pending".to_string();
+    assignment.lifecycle_correlation_id = Some(correlation_id.to_string());
+    assignment.revision = assignment.revision.saturating_add(1);
+    assignment.updated_at = Utc::now();
+    let assignment_json = serde_json::to_string(&assignment)?;
+    let changed = connection.execute(
+        "UPDATE mfg_assignment
+         SET status = 'completion_pending',
+             revision = ?2,
+             assignment_json = ?3,
+             updated_at = ?4
+         WHERE assignment_id = ?1
+           AND revision = ?5
+           AND status = 'in_progress'",
+        params![
+            assignment_id,
+            assignment.revision as i64,
+            assignment_json,
+            assignment.updated_at.to_rfc3339(),
+            expected_revision as i64,
+        ],
+    )?;
+    if changed != 1 {
+        let actual = find_assignment(connection, assignment_id)?.map(|item| item.revision);
+        return Err(MfgRepositoryError::RevisionConflict {
+            domain: "assignment".to_string(),
+            subject_id: assignment_id.to_string(),
+            expected: Some(expected_revision),
+            actual,
+        });
+    }
+    append_projection_event(
+        connection,
+        "assignment",
+        &format!("mfg:assignment:{assignment_id}"),
+        "assignment.completion_reserved",
+        serde_json::json!({
+            "assignment": assignment,
+            "correlation_id": correlation_id,
+        }),
+    )?;
+    Ok(assignment)
 }
 
 fn assignment_kind_from_ref(reference: &str) -> Option<&'static str> {
@@ -4511,81 +7587,304 @@ fn assignment_kind_from_ref(reference: &str) -> Option<&'static str> {
         .find(|kind| reference.starts_with(&format!("{kind}:")))
 }
 
-fn build_live_projection(
+fn build_live_snapshot_read(
     connection: &Connection,
-    cursor: Option<u64>,
-    limit: usize,
-) -> Result<MfgLiveProjection, MfgRepositoryError> {
-    let latest = connection.query_row(
+) -> Result<MfgLiveSnapshotRead, MfgRepositoryError> {
+    let epoch = load_live_epoch(connection)?;
+    let high_cursor = connection.query_row(
         "SELECT COALESCE(MAX(event_id), 0) FROM mfg_projection_event",
         [],
         |row| row.get::<_, u64>(0),
     )?;
-    let oldest = connection.query_row(
-        "SELECT COALESCE(MIN(event_id), 0) FROM mfg_projection_event",
+    let state = MfgLiveSnapshotStateV1 {
+        cockpit: serde_json::json!({
+            "profiles": json_column_rows(
+                connection,
+                "SELECT profile_json FROM mfg_cockpit_profile ORDER BY updated_at DESC",
+            )?,
+        }),
+        alerts: serde_json::json!({
+            "rules": json_column_rows(
+                connection,
+                "SELECT rule_json FROM mfg_alert_rule ORDER BY updated_at DESC",
+            )?,
+            "subscriptions": json_column_rows(
+                connection,
+                "SELECT subscription_json FROM mfg_alert_subscription ORDER BY updated_at DESC",
+            )?,
+            "occurrences": json_column_rows(
+                connection,
+                "SELECT occurrence_json FROM mfg_alert_occurrence ORDER BY updated_at DESC",
+            )?,
+        }),
+        assignments: serde_json::json!({
+            "items": json_column_rows(
+                connection,
+                "SELECT assignment_json FROM mfg_assignment ORDER BY updated_at DESC",
+            )?,
+        }),
+        incidents: serde_json::json!({
+            "items": json_column_rows(
+                connection,
+                "SELECT incident_json FROM mfg_incident ORDER BY updated_at DESC",
+            )?,
+            "workflows": json_column_rows(
+                connection,
+                "SELECT graph_json FROM mfg_workflow_graph ORDER BY updated_at DESC",
+            )?,
+            "analyses": json_column_rows(
+                connection,
+                "SELECT analysis_json FROM mfg_operational_analysis ORDER BY created_at DESC",
+            )?,
+            "memory_cases": json_column_rows(
+                connection,
+                "SELECT memory_case_json FROM mfg_memory_case ORDER BY created_at DESC",
+            )?,
+            "playbooks": json_column_rows(
+                connection,
+                "SELECT playbook_json FROM mfg_playbook ORDER BY updated_at DESC",
+            )?,
+        }),
+        executions: serde_json::json!({
+            "actions": json_column_rows(
+                connection,
+                "SELECT execution_json FROM mfg_action_execution ORDER BY updated_at DESC",
+            )?,
+            "skills": json_column_rows(
+                connection,
+                "SELECT execution_json FROM mfg_skill_execution ORDER BY updated_at DESC",
+            )?,
+        }),
+        reports: serde_json::json!({
+            "items": json_column_rows(
+                connection,
+                "SELECT report_json FROM mfg_cockpit_report ORDER BY created_at DESC",
+            )?,
+        }),
+        reviews: serde_json::json!({
+            "items": json_column_rows(
+                connection,
+                "SELECT review_json FROM mfg_report_delivery_review ORDER BY updated_at DESC",
+            )?,
+        }),
+        receipts: serde_json::json!({
+            "commands": json_column_rows(
+                connection,
+                "SELECT receipt_json FROM mfg_command_receipt ORDER BY created_at DESC",
+            )?,
+            "mutations": mutation_receipt_rows(connection)?,
+        }),
+        data_compute: serde_json::json!({
+            "entities": json_column_rows(
+                connection,
+                "SELECT entity_json FROM matrix_entity ORDER BY updated_at DESC",
+            )?,
+            "relations": json_column_rows(
+                connection,
+                "SELECT relation_json FROM matrix_relation ORDER BY updated_at DESC",
+            )?,
+            "facts": serde_json::to_value(list_facts(connection, i64::MAX as usize)?)?,
+            "attention": json_column_rows(
+                connection,
+                "SELECT attention_json FROM matrix_attention_item ORDER BY updated_at DESC",
+            )?,
+            "evidence": json_column_rows(
+                connection,
+                "SELECT packet_json FROM matrix_evidence_packet ORDER BY created_at DESC",
+            )?,
+            "quality_gates": json_column_rows(
+                connection,
+                "SELECT gate_json FROM matrix_quality_gate ORDER BY created_at DESC",
+            )?,
+            "metric_definitions": json_column_rows(
+                connection,
+                "SELECT definition_json FROM matrix_metric_definition ORDER BY updated_at DESC",
+            )?,
+            "metric_dependencies": json_column_rows(
+                connection,
+                "SELECT dependency_json FROM matrix_metric_dependency ORDER BY updated_at DESC",
+            )?,
+            "metric_states": json_column_rows(
+                connection,
+                "SELECT state_json FROM matrix_metric_state ORDER BY computed_at DESC",
+            )?,
+            "metric_snapshots": json_column_rows(
+                connection,
+                "SELECT snapshot_json FROM matrix_metric_snapshot ORDER BY created_at DESC",
+            )?,
+            "watermarks": json_column_rows(
+                connection,
+                "SELECT watermark_json FROM matrix_data_plane_watermark ORDER BY updated_at DESC",
+            )?,
+            "jobs": json_column_rows(
+                connection,
+                "SELECT job_json FROM matrix_compute_job ORDER BY updated_at DESC",
+            )?,
+            "changes": json_column_rows(
+                connection,
+                "SELECT change_json FROM matrix_change_event ORDER BY detected_at DESC",
+            )?,
+            "source_packs": json_column_rows(
+                connection,
+                "SELECT source_pack_json FROM matrix_source_pack ORDER BY updated_at DESC",
+            )?,
+            "connector_runs": json_column_rows(
+                connection,
+                "SELECT run_json FROM matrix_connector_run ORDER BY updated_at DESC",
+            )?,
+            "ontology_packs": json_column_rows(
+                connection,
+                "SELECT pack_json FROM matrix_ontology_pack ORDER BY updated_at DESC",
+            )?,
+            "entity_match_candidates": json_column_rows(
+                connection,
+                "SELECT candidate_json FROM matrix_entity_match_candidate ORDER BY created_at DESC",
+            )?,
+            "entity_conflict_decisions": json_column_rows(
+                connection,
+                "SELECT decision_json FROM matrix_entity_conflict_decision ORDER BY decided_at DESC",
+            )?,
+        }),
+    };
+    Ok(MfgLiveSnapshotRead {
+        epoch,
+        high_cursor,
+        state,
+    })
+}
+
+fn build_live_delta_read(
+    connection: &Connection,
+    cursor: u64,
+    limit: usize,
+) -> Result<MfgLiveDeltaRead, MfgRepositoryError> {
+    let epoch = load_live_epoch(connection)?;
+    let high_cursor = connection.query_row(
+        "SELECT COALESCE(MAX(event_id), 0) FROM mfg_projection_event",
         [],
         |row| row.get::<_, u64>(0),
     )?;
-    if cursor.is_none() {
-        return Ok(MfgLiveProjection {
-            kind: "snapshot".to_string(),
-            cursor: latest,
-            recoverable: true,
-            snapshot: serde_json::json!({
-                "cockpit_profiles": list_cockpit_profiles(connection, None, 100)?,
-                "alert_rules": list_alert_rules(connection, None, 100)?,
-                "alerts": list_alert_occurrences(connection, None, 100)?,
-                "assignments": list_assignments(connection, None, None, 100)?,
-                "incidents": list_incidents(connection, 100)?,
-                "workflows": list_workflow_graphs(connection, 100)?,
-            }),
-            events: Vec::new(),
-            resync_reason: None,
-        });
-    }
-    let cursor = cursor.unwrap_or(0);
-    if cursor > latest || (oldest > 0 && cursor.saturating_add(1) < oldest) {
-        return Ok(MfgLiveProjection {
-            kind: "resync".to_string(),
-            cursor: latest,
-            recoverable: true,
-            snapshot: Value::Null,
-            events: Vec::new(),
-            resync_reason: Some("cursor is outside the retained event window".to_string()),
-        });
-    }
-    let mut statement = connection.prepare("SELECT event_id, event_type, subject_ref, event_json, created_at FROM mfg_projection_event WHERE event_id > ?1 ORDER BY event_id ASC LIMIT ?2")?;
-    let rows = statement.query_map(params![cursor as i64, limit.clamp(1, 500) as i64], |row| {
-        Ok((
-            row.get::<_, u64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-        ))
-    })?;
-    let events = rows
-        .map(|row| {
-            let (event_cursor, event_type, subject_ref, json, created_at) = row?;
-            let value: Value = serde_json::from_str(&json)?;
-            Ok(MfgLiveProjectionEvent {
-                cursor: event_cursor,
-                event_type,
-                subject_ref,
-                payload: value.get("payload").cloned().unwrap_or(Value::Null),
-                created_at: parse_rfc3339_utc(&created_at)?,
+    let resync_reason = if cursor < epoch.retention_low_cursor {
+        Some("cursor_below_retention_low_watermark".to_string())
+    } else if cursor > high_cursor {
+        Some("cursor_ahead_of_retained_log".to_string())
+    } else {
+        None
+    };
+    let events = if resync_reason.is_some() {
+        Vec::new()
+    } else {
+        let mut statement = connection.prepare(
+            "SELECT event_id, event_type, subject_ref, event_json, created_at
+             FROM mfg_projection_event
+             WHERE event_id > ?1
+             ORDER BY event_id ASC
+             LIMIT ?2",
+        )?;
+        let rows = statement
+            .query_map(params![cursor, limit.clamp(1, 500)], |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .map(|row| {
+                let (cursor, event_type, subject_ref, event_json, created_at) = row?;
+                let event_json: Value = serde_json::from_str(&event_json)?;
+                Ok(MfgLiveProjectionEvent {
+                    cursor,
+                    event_type,
+                    subject_ref,
+                    payload: event_json.get("payload").cloned().unwrap_or(Value::Null),
+                    created_at: parse_rfc3339_utc(&created_at)?,
+                })
             })
+            .collect::<Result<Vec<_>, MfgRepositoryError>>()?;
+        rows
+    };
+    Ok(MfgLiveDeltaRead {
+        epoch,
+        base_cursor: cursor,
+        high_cursor,
+        events,
+        resync_reason,
+    })
+}
+
+fn json_column_rows(connection: &Connection, sql: &str) -> Result<Vec<Value>, MfgRepositoryError> {
+    let mut statement = connection.prepare(sql)?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .map(|row| -> Result<Value, MfgRepositoryError> {
+            let json = row?;
+            serde_json::from_str::<Value>(&json).map_err(MfgRepositoryError::from)
         })
         .collect::<Result<Vec<_>, MfgRepositoryError>>()?;
-    let next_cursor = events.last().map_or(cursor, |event| event.cursor);
-    Ok(MfgLiveProjection {
-        kind: "delta".to_string(),
-        cursor: next_cursor,
-        recoverable: true,
-        snapshot: Value::Null,
-        events,
-        resync_reason: None,
-    })
+    Ok(rows)
+}
+
+fn mutation_receipt_rows(connection: &Connection) -> Result<Vec<Value>, MfgRepositoryError> {
+    let mut statement = connection.prepare(
+        "SELECT receipt_id, idempotency_key, actor_principal, action_id,
+                resource_ref, expected_revision, result_revision, payload_digest,
+                status, response_json, contract_version, created_at, updated_at
+         FROM mfg_mutation_receipt ORDER BY updated_at DESC",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<u64>>(5)?,
+                row.get::<_, Option<u64>>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
+                row.get::<_, String>(11)?,
+                row.get::<_, String>(12)?,
+            ))
+        })?
+        .map(|row| -> Result<Value, MfgRepositoryError> {
+            let (
+                receipt_id,
+                idempotency_key,
+                actor_principal,
+                action_id,
+                resource_ref,
+                expected_revision,
+                result_revision,
+                payload_digest,
+                status,
+                response_json,
+                contract_version,
+                created_at,
+                updated_at,
+            ) = row?;
+            Ok(serde_json::json!({
+                "receipt_id": receipt_id,
+                "idempotency_key": idempotency_key,
+                "actor_principal": actor_principal,
+                "action_id": action_id,
+                "resource_ref": resource_ref,
+                "expected_revision": expected_revision,
+                "result_revision": result_revision,
+                "payload_digest": payload_digest,
+                "status": status,
+                "response": serde_json::from_str::<Value>(&response_json)?,
+                "contract_version": contract_version,
+                "created_at": created_at,
+                "updated_at": updated_at,
+            }))
+        })
+        .collect::<Result<Vec<_>, MfgRepositoryError>>()?;
+    Ok(rows)
 }
 
 fn insert_ontology_pack(
@@ -4603,6 +7902,13 @@ fn insert_ontology_pack(
             serde_json::to_string(pack)?,
             Utc::now().to_rfc3339(),
         ],
+    )?;
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!("matrix:ontology:{}", pack.ontology_id),
+        "ontology.updated",
+        serde_json::json!({"ontology": pack}),
     )?;
     Ok(())
 }
@@ -4641,6 +7947,13 @@ fn insert_entity_match_candidate(
             candidate.created_at.to_rfc3339(),
         ],
     )?;
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!("matrix:entity-match:{}", candidate.candidate_id),
+        "entity.match_candidate_updated",
+        serde_json::json!({"entity_match_candidate": candidate}),
+    )?;
     Ok(())
 }
 
@@ -4676,6 +7989,13 @@ fn insert_entity_conflict_decision(
             serde_json::to_string(decision)?,
             decision.decided_at.to_rfc3339(),
         ],
+    )?;
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!("matrix:entity-conflict:{}", decision.decision_id),
+        "entity.conflict_decided",
+        serde_json::json!({"entity_conflict_decision": decision}),
     )?;
     Ok(())
 }
@@ -4741,6 +8061,13 @@ fn upsert_entity(
             ],
         )?;
     }
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!("matrix:entity:{}", entity.entity_id),
+        "entity.updated",
+        serde_json::json!({"entity": entity}),
+    )?;
     Ok(entity)
 }
 
@@ -4878,6 +8205,13 @@ fn upsert_relation(
             relation.updated_at.to_rfc3339(),
         ],
     )?;
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!("matrix:relation:{}", relation.relation_id),
+        "relation.updated",
+        serde_json::json!({"relation": relation}),
+    )?;
     Ok(relation)
 }
 
@@ -4999,6 +8333,13 @@ fn upsert_attention(
     for rule in list_alert_rules(connection, None, 500)? {
         materialize_alert_occurrences(connection, &rule)?;
     }
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!("matrix:attention:{}", item.attention_id),
+        "attention.updated",
+        serde_json::json!({"attention": item}),
+    )?;
     Ok(())
 }
 
@@ -5049,6 +8390,68 @@ fn latest_attention(
         .transpose()
 }
 
+fn build_evidence_packet_transaction(
+    connection: &Connection,
+    attention_id: Option<&str>,
+    problem_statement: Option<&str>,
+    packet_id: Option<&str>,
+) -> Result<MatrixEvidencePacket, MfgRepositoryError> {
+    let attention = match attention_id {
+        Some(id) => Some(
+            find_attention(connection, id)?
+                .ok_or_else(|| MfgRepositoryError::NotFound(id.to_string()))?,
+        ),
+        None => latest_attention(connection)?,
+    };
+    let mut packet = MatrixEvidencePacket::new(problem_statement.unwrap_or_else(|| {
+        attention
+            .as_ref()
+            .map(|item| item.title.as_str())
+            .unwrap_or("MATRIX operational evidence packet")
+    }));
+    if let Some(packet_id) = packet_id {
+        packet.packet_id = packet_id.to_string();
+    }
+    packet.attention_id = attention.as_ref().map(|item| item.attention_id.clone());
+    if let Some(item) = attention {
+        packet.confidence = item.confidence.min(0.75);
+        packet.business_context = serde_json::json!({
+            "business_domain": item.business_domain,
+            "entity_ref": item.entity_ref,
+            "period": item.period,
+            "priority_score": item.priority_score,
+            "reason_codes": item.reason_codes,
+            "owner_roles": item.owner_roles,
+        });
+        for reference in item.linked_changes {
+            if let Some(change_id) = reference.strip_prefix("matrix:change:") {
+                if let Some(change) = find_change(connection, change_id)? {
+                    packet.change_evidence.push(serde_json::to_value(&change)?);
+                    if let Some(metric_id) = change.metric_id.as_deref() {
+                        if let Some(state) = latest_metric_state_for_metric(connection, metric_id)?
+                        {
+                            packet.metric_evidence.push(serde_json::to_value(&state)?);
+                        }
+                    }
+                }
+            }
+            packet.source_refs.push(MatrixEvidenceSourceRef {
+                kind: "change_or_fact".to_string(),
+                reference,
+                summary: "MATRIX attention evidence source".to_string(),
+            });
+        }
+        if !packet.metric_evidence.is_empty() {
+            packet
+                .missing_evidence
+                .retain(|item| !item.contains("metric_network"));
+            packet.confidence = packet.confidence.max(0.65);
+        }
+    }
+    insert_evidence_packet(connection, &packet)?;
+    Ok(packet)
+}
+
 fn insert_evidence_packet(
     connection: &Connection,
     packet: &MatrixEvidencePacket,
@@ -5063,6 +8466,13 @@ fn insert_evidence_packet(
             serde_json::to_string(packet)?,
             packet.created_at.to_rfc3339(),
         ],
+    )?;
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!("matrix:evidence:{}", packet.packet_id),
+        "evidence.updated",
+        serde_json::json!({"evidence": packet}),
     )?;
     Ok(())
 }
@@ -5114,6 +8524,13 @@ fn insert_quality_gate(
             serde_json::to_string(gate)?,
             gate.created_at.to_rfc3339(),
         ],
+    )?;
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!("matrix:quality-gate:{}", gate.gate_id),
+        "quality_gate.updated",
+        serde_json::json!({"quality_gate": gate}),
     )?;
     Ok(())
 }
@@ -5352,6 +8769,13 @@ fn upsert_metric_definition(
             definition.updated_at.to_rfc3339(),
         ],
     )?;
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!("matrix:metric-definition:{}", definition.metric_id),
+        "metric_definition.updated",
+        serde_json::json!({"metric_definition": definition}),
+    )?;
     Ok(())
 }
 
@@ -5407,6 +8831,13 @@ fn upsert_metric_dependency(
             dependency.created_at.to_rfc3339(),
             dependency.updated_at.to_rfc3339(),
         ],
+    )?;
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!("matrix:metric-dependency:{}", dependency.dependency_id),
+        "metric_dependency.updated",
+        serde_json::json!({"metric_dependency": dependency}),
     )?;
     Ok(dependency)
 }
@@ -5647,6 +9078,13 @@ fn insert_metric_snapshot(
             snapshot.created_at.to_rfc3339(),
         ],
     )?;
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!("matrix:metric-snapshot:{}", snapshot.snapshot_id),
+        "metric_snapshot.updated",
+        serde_json::json!({"metric_snapshot": snapshot}),
+    )?;
     Ok(())
 }
 
@@ -5689,6 +9127,13 @@ fn insert_skill_execution(
             created_at.to_rfc3339(),
             updated_at.to_rfc3339(),
         ],
+    )?;
+    append_projection_event(
+        connection,
+        "execution",
+        &format!("mfg:skill-execution:{execution_id}"),
+        "skill_run.updated",
+        serde_json::json!({"skill_run": run}),
     )?;
     Ok(run)
 }
@@ -5763,6 +9208,13 @@ fn upsert_compute_job(
             job.updated_at.to_rfc3339(),
         ],
     )?;
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!("matrix:compute-job:{}", job.job_id),
+        "compute_job.updated",
+        serde_json::json!({"job": job}),
+    )?;
     Ok(job.clone())
 }
 
@@ -5824,6 +9276,13 @@ fn insert_metric_state(
             state.computed_at.to_rfc3339(),
         ],
     )?;
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!("matrix:metric-state:{}", state.state_id),
+        "metric_state.updated",
+        serde_json::json!({"metric_state": state}),
+    )?;
     Ok(())
 }
 
@@ -5846,6 +9305,13 @@ fn insert_change_event(
             serde_json::to_string(change)?,
             change.detected_at.to_rfc3339(),
         ],
+    )?;
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!("matrix:change:{}", change.change_id),
+        "metric_change.detected",
+        serde_json::json!({"change": change}),
     )?;
     Ok(())
 }
@@ -5904,6 +9370,13 @@ fn upsert_incident(
             incident.created_at.to_rfc3339(),
             incident.updated_at.to_rfc3339(),
         ],
+    )?;
+    append_projection_event(
+        connection,
+        "incident",
+        &format!("mfg:incident:{}", incident.incident_id),
+        "incident.updated",
+        serde_json::json!({"incident": incident}),
     )?;
     Ok(())
 }
@@ -5970,7 +9443,54 @@ fn insert_analysis(
             analysis.created_at.to_rfc3339(),
         ],
     )?;
+    append_projection_event(
+        connection,
+        "incident",
+        &format!("mfg:analysis:{}", analysis.analysis_id),
+        "analysis.updated",
+        serde_json::json!({"analysis": analysis}),
+    )?;
     Ok(())
+}
+
+fn analyze_incident_transaction(
+    connection: &Connection,
+    incident_id: &str,
+    analysis_id: Option<&str>,
+) -> Result<MfgOperationalAnalysis, MfgRepositoryError> {
+    let mut incident = find_incident(connection, incident_id)?
+        .ok_or_else(|| MfgRepositoryError::NotFound(incident_id.to_string()))?;
+    let packet_id = incident
+        .evidence_packet_id
+        .clone()
+        .ok_or_else(|| MfgRepositoryError::NotFound("incident evidence packet".to_string()))?;
+    let mut packet = find_evidence_packet(connection, &packet_id)?
+        .ok_or_else(|| MfgRepositoryError::NotFound(packet_id.clone()))?;
+    let mut analysis = MfgOperationalAnalysis::from_evidence(incident_id, &packet);
+    if let Some(analysis_id) = analysis_id {
+        analysis.analysis_id = analysis_id.to_string();
+    }
+    packet.attribution_candidates = analysis
+        .attribution_candidates
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    packet.impact_paths = analysis
+        .impact_paths
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    packet.missing_evidence.retain(|item| {
+        !item.contains("attribution_not_computed") && !item.contains("impact_paths_not_computed")
+    });
+    packet.confidence = packet.confidence.max(analysis.confidence);
+    insert_evidence_packet(connection, &packet)?;
+    insert_analysis(connection, &analysis)?;
+    incident.status = "analyzed".to_string();
+    incident.revision = incident.revision.saturating_add(1);
+    incident.updated_at = Utc::now();
+    upsert_incident(connection, &incident)?;
+    Ok(analysis)
 }
 
 fn find_analysis(
@@ -6027,6 +9547,13 @@ fn insert_execution(
             execution.created_at.to_rfc3339(),
             execution.updated_at.to_rfc3339(),
         ],
+    )?;
+    append_projection_event(
+        connection,
+        "execution",
+        &format!("mfg:execution:{}", execution.execution_id),
+        "execution.updated",
+        serde_json::json!({"execution": execution}),
     )?;
     Ok(())
 }
@@ -6109,6 +9636,13 @@ fn insert_memory_case(
             memory_case.created_at.to_rfc3339(),
         ],
     )?;
+    append_projection_event(
+        connection,
+        "incident",
+        &format!("mfg:memory-case:{}", memory_case.case_id),
+        "memory_case.updated",
+        serde_json::json!({"memory_case": memory_case}),
+    )?;
     Ok(())
 }
 
@@ -6176,6 +9710,13 @@ fn insert_playbook(
             playbook.created_at.to_rfc3339(),
             playbook.updated_at.to_rfc3339(),
         ],
+    )?;
+    append_projection_event(
+        connection,
+        "incident",
+        &format!("mfg:playbook:{}", playbook.playbook_id),
+        "playbook.updated",
+        serde_json::json!({"playbook": playbook}),
     )?;
     Ok(())
 }
@@ -6256,6 +9797,13 @@ fn insert_source_pack(
             source_pack.created_at.to_rfc3339(),
             source_pack.updated_at.to_rfc3339(),
         ],
+    )?;
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!("matrix:source-pack:{}", source_pack.source_pack_id),
+        "source_pack.updated",
+        serde_json::json!({"source_pack": source_pack}),
     )?;
     Ok(())
 }
@@ -6340,6 +9888,13 @@ fn insert_connector_run(
             run.updated_at.to_rfc3339(),
         ],
     )?;
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!("matrix:connector-run:{}", run.run_id),
+        "connector_run.updated",
+        serde_json::json!({"connector_run": run}),
+    )?;
     Ok(())
 }
 
@@ -6376,6 +9931,16 @@ fn upsert_data_plane_watermark(
             serde_json::to_string(watermark)?,
             watermark.updated_at.to_rfc3339(),
         ],
+    )?;
+    append_projection_event(
+        connection,
+        "data_compute",
+        &format!(
+            "matrix:watermark:{}:{}:{}",
+            watermark.source_ref, watermark.fact_type, watermark.partition_ref
+        ),
+        "data_watermark.updated",
+        serde_json::json!({"watermark": watermark}),
     )?;
     Ok(())
 }
@@ -6476,16 +10041,671 @@ fn attention_from_change(
 mod tests {
     use super::*;
     use crate::{
-        default_mfg_widget_instances, MfgAlertRuleInput, MfgAssignmentInput,
-        MfgCockpitProfileInput, MfgCockpitReportDeliveryPayload,
-        MfgCockpitReportDeliveryPayloadRequest, MfgCockpitReportDeliveryReceipt,
-        MfgCockpitReportDeliveryState, MfgCockpitReportRequest, MfgDashboardScope,
+        MfgAlertRuleInput, MfgAlertSubscriptionInput, MfgAssignmentInput, MfgCockpitProfileInput,
+        MfgCockpitReportDeliveryPayload, MfgCockpitReportDeliveryPayloadRequest,
+        MfgCockpitReportDeliveryReceipt, MfgCockpitReportDeliveryState, MfgCockpitReportRequest,
+        MfgDashboardScope, default_mfg_widget_instances,
     };
     use matrix_core::{
-        MatrixComputeJobInput, MatrixEntityInput, MatrixFactInput, MatrixMetricStatus,
-        MatrixRelationInput, MatrixSourceKey,
+        MatrixComputeJobInput, MatrixDataPlaneIngestPlanInput, MatrixEntityInput, MatrixFactInput,
+        MatrixMetricStatus, MatrixRelationInput, MatrixSourceFactMapping, MatrixSourceKey,
     };
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn cockpit_clone_keeps_its_canonical_action_id() {
+        assert_eq!(
+            canonical_upsert_action_id("cockpit", "profile.clone", 0),
+            "mfg.cockpit.profile.clone"
+        );
+        assert_eq!(
+            canonical_upsert_action_id("cockpit", "profile.upsert", 0),
+            "mfg.cockpit.profile.create"
+        );
+    }
+
+    fn insert_live_snapshot_sentinel(
+        connection: &Connection,
+        table: &str,
+        json_column: &str,
+        marker: &str,
+    ) {
+        connection
+            .execute_batch("PRAGMA foreign_keys = OFF; PRAGMA ignore_check_constraints = ON;")
+            .unwrap();
+        let mut statement = connection
+            .prepare(&format!("PRAGMA table_info(\"{table}\")"))
+            .unwrap();
+        let columns = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?.to_ascii_uppercase(),
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let names = columns
+            .iter()
+            .map(|(name, _)| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let placeholders = (1..=columns.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let now = Utc::now().to_rfc3339();
+        let values = columns
+            .iter()
+            .map(|(name, data_type)| {
+                if name == json_column {
+                    rusqlite::types::Value::Text(
+                        serde_json::json!({"_live_snapshot_sentinel": marker}).to_string(),
+                    )
+                } else if name.ends_with("_json") {
+                    rusqlite::types::Value::Text("{}".to_string())
+                } else if data_type.contains("INT") {
+                    rusqlite::types::Value::Integer(1)
+                } else if data_type.contains("REAL")
+                    || data_type.contains("FLOAT")
+                    || data_type.contains("DOUBLE")
+                {
+                    rusqlite::types::Value::Real(1.0)
+                } else if data_type.contains("BLOB") {
+                    rusqlite::types::Value::Blob(vec![1])
+                } else if name.ends_with("_at") {
+                    rusqlite::types::Value::Text(now.clone())
+                } else {
+                    rusqlite::types::Value::Text(format!("{marker}:{name}"))
+                }
+            })
+            .collect::<Vec<_>>();
+        connection
+            .execute(
+                &format!("INSERT INTO \"{table}\" ({names}) VALUES ({placeholders})"),
+                rusqlite::params_from_iter(values),
+            )
+            .unwrap_or_else(|error| panic!("insert live sentinel into {table}: {error}"));
+    }
+
+    #[test]
+    fn live_epoch_survives_restart_and_rotates_only_for_identity_change() {
+        let path = std::env::temp_dir().join(format!(
+            "cowd-mfg-live-epoch-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let repository = MfgRepository::open(&path).unwrap();
+        let initial = repository.live_epoch().unwrap();
+        drop(repository);
+
+        let reopened = MfgRepository::open(&path).unwrap();
+        let stable = reopened.live_epoch().unwrap();
+        assert_eq!(stable.epoch_id, initial.epoch_id);
+        let rotated = reopened.rotate_live_epoch("cursor_key_recreated").unwrap();
+        assert_ne!(rotated.epoch_id, initial.epoch_id);
+        assert_eq!(rotated.rotation_reason, "cursor_key_recreated");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn live_epoch_rotates_when_the_event_log_is_rewritten() {
+        let path = std::env::temp_dir().join(format!(
+            "cowd-mfg-live-rewrite-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let repository = MfgRepository::open(&path).unwrap();
+        {
+            let connection = repository.connection.lock().unwrap();
+            append_projection_event(
+                &connection,
+                "assignment",
+                "mfg:assignment:before-rewrite",
+                "assignment.receipted",
+                serde_json::json!({"revision": 1}),
+            )
+            .unwrap();
+        }
+        let initial = repository.live_epoch().unwrap();
+        drop(repository);
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute("DELETE FROM mfg_projection_event", [])
+                .unwrap();
+        }
+        let reopened = MfgRepository::open(&path).unwrap();
+        let rotated = reopened.live_epoch().unwrap();
+        assert_ne!(rotated.epoch_id, initial.epoch_id);
+        assert_eq!(rotated.rotation_reason, "event_log_rewritten");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn live_snapshot_and_delta_share_high_watermark_and_cover_every_domain() {
+        let repository = MfgRepository::in_memory().unwrap();
+        repository.seed_mfg_domain().unwrap();
+        let snapshot_fields = [
+            ("cockpit", "profiles", "mfg_cockpit_profile", "profile_json"),
+            ("alerts", "rules", "mfg_alert_rule", "rule_json"),
+            (
+                "alerts",
+                "subscriptions",
+                "mfg_alert_subscription",
+                "subscription_json",
+            ),
+            (
+                "alerts",
+                "occurrences",
+                "mfg_alert_occurrence",
+                "occurrence_json",
+            ),
+            ("assignments", "items", "mfg_assignment", "assignment_json"),
+            ("incidents", "items", "mfg_incident", "incident_json"),
+            ("incidents", "workflows", "mfg_workflow_graph", "graph_json"),
+            (
+                "incidents",
+                "analyses",
+                "mfg_operational_analysis",
+                "analysis_json",
+            ),
+            (
+                "incidents",
+                "memory_cases",
+                "mfg_memory_case",
+                "memory_case_json",
+            ),
+            ("incidents", "playbooks", "mfg_playbook", "playbook_json"),
+            (
+                "executions",
+                "actions",
+                "mfg_action_execution",
+                "execution_json",
+            ),
+            (
+                "executions",
+                "skills",
+                "mfg_skill_execution",
+                "execution_json",
+            ),
+            ("reports", "items", "mfg_cockpit_report", "report_json"),
+            (
+                "reviews",
+                "items",
+                "mfg_report_delivery_review",
+                "review_json",
+            ),
+            (
+                "receipts",
+                "commands",
+                "mfg_command_receipt",
+                "receipt_json",
+            ),
+            ("data_compute", "entities", "matrix_entity", "entity_json"),
+            (
+                "data_compute",
+                "relations",
+                "matrix_relation",
+                "relation_json",
+            ),
+            (
+                "data_compute",
+                "attention",
+                "matrix_attention_item",
+                "attention_json",
+            ),
+            (
+                "data_compute",
+                "evidence",
+                "matrix_evidence_packet",
+                "packet_json",
+            ),
+            (
+                "data_compute",
+                "quality_gates",
+                "matrix_quality_gate",
+                "gate_json",
+            ),
+            (
+                "data_compute",
+                "metric_definitions",
+                "matrix_metric_definition",
+                "definition_json",
+            ),
+            (
+                "data_compute",
+                "metric_dependencies",
+                "matrix_metric_dependency",
+                "dependency_json",
+            ),
+            (
+                "data_compute",
+                "metric_states",
+                "matrix_metric_state",
+                "state_json",
+            ),
+            (
+                "data_compute",
+                "metric_snapshots",
+                "matrix_metric_snapshot",
+                "snapshot_json",
+            ),
+            (
+                "data_compute",
+                "watermarks",
+                "matrix_data_plane_watermark",
+                "watermark_json",
+            ),
+            ("data_compute", "jobs", "matrix_compute_job", "job_json"),
+            (
+                "data_compute",
+                "changes",
+                "matrix_change_event",
+                "change_json",
+            ),
+            (
+                "data_compute",
+                "source_packs",
+                "matrix_source_pack",
+                "source_pack_json",
+            ),
+            (
+                "data_compute",
+                "connector_runs",
+                "matrix_connector_run",
+                "run_json",
+            ),
+            (
+                "data_compute",
+                "ontology_packs",
+                "matrix_ontology_pack",
+                "pack_json",
+            ),
+            (
+                "data_compute",
+                "entity_match_candidates",
+                "matrix_entity_match_candidate",
+                "candidate_json",
+            ),
+            (
+                "data_compute",
+                "entity_conflict_decisions",
+                "matrix_entity_conflict_decision",
+                "decision_json",
+            ),
+        ];
+        {
+            let connection = repository.connection.lock().unwrap();
+            for (domain, field, table, json_column) in snapshot_fields {
+                insert_live_snapshot_sentinel(
+                    &connection,
+                    table,
+                    json_column,
+                    &format!("{domain}.{field}"),
+                );
+            }
+            insert_live_snapshot_sentinel(
+                &connection,
+                "mfg_mutation_receipt",
+                "response_json",
+                "receipts.mutations",
+            );
+        }
+        let event_cursor = {
+            let connection = repository.connection.lock().unwrap();
+            append_projection_event(
+                &connection,
+                "assignment",
+                "mfg:assignment:assignment-live-1",
+                "assignment.receipted",
+                serde_json::json!({
+                    "assignment": {
+                        "assignment_id": "assignment-live-1",
+                        "status": "assigned",
+                        "revision": 1
+                    }
+                }),
+            )
+            .unwrap()
+        };
+        let snapshot = repository.live_snapshot_read().unwrap();
+        assert_eq!(snapshot.high_cursor, event_cursor);
+        let state = serde_json::to_value(&snapshot.state).unwrap();
+        for (domain, field, _, _) in snapshot_fields {
+            let marker = format!("{domain}.{field}");
+            assert!(
+                state[domain][field].as_array().is_some_and(|items| {
+                    items.iter().any(|item| {
+                        item["_live_snapshot_sentinel"].as_str() == Some(marker.as_str())
+                    })
+                }),
+                "snapshot field {marker} is not wired to its durable table"
+            );
+        }
+        assert!(
+            !state["data_compute"]["facts"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            state["receipts"]["mutations"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| {
+                    item["response"]["_live_snapshot_sentinel"].as_str()
+                        == Some("receipts.mutations")
+                }))
+        );
+        let delta = repository
+            .live_delta_read(event_cursor.saturating_sub(1), 100)
+            .unwrap();
+        assert_eq!(delta.high_cursor, snapshot.high_cursor);
+        assert_eq!(delta.events.len(), 1);
+        assert_eq!(delta.events[0].cursor, event_cursor);
+        assert_eq!(delta.events[0].event_type, "assignment.receipted");
+    }
+
+    #[test]
+    fn live_delta_below_retention_watermark_requires_resync_without_rotating_epoch() {
+        let repository = MfgRepository::in_memory().unwrap();
+        let epoch = repository.live_epoch().unwrap();
+        {
+            let connection = repository.connection.lock().unwrap();
+            connection
+                .execute(
+                    "UPDATE mfg_live_epoch
+                     SET retention_low_cursor = 50, retention_high_cursor = 75
+                     WHERE singleton_id = 1",
+                    [],
+                )
+                .unwrap();
+        }
+        let delta = repository.live_delta_read(49, 100).unwrap();
+        assert_eq!(
+            delta.resync_reason.as_deref(),
+            Some("cursor_below_retention_low_watermark")
+        );
+        assert_eq!(delta.epoch.epoch_id, epoch.epoch_id);
+    }
+
+    #[test]
+    fn every_completed_gateway_mutation_produces_one_durable_receipt_event() {
+        let repository = MfgRepository::in_memory().unwrap();
+        let claim = repository
+            .claim_mutation_receipt(
+                "live-receipt-key",
+                "principal:operator",
+                "mfg.incident.create",
+                "mfg:incident:live-receipt",
+                None,
+                "sha256:live-receipt",
+                "correlation:live-receipt",
+            )
+            .unwrap();
+        assert!(matches!(claim, MfgMutationClaim::Acquired(_)));
+        let before = repository.live_epoch().unwrap().retention_high_cursor;
+        let receipt = repository
+            .record_mutation_receipt(
+                "live-receipt-key",
+                "principal:operator",
+                "mfg.incident.create",
+                "mfg:incident:live-receipt",
+                None,
+                Some(1),
+                "sha256:live-receipt",
+                &serde_json::json!({"revision": 1}),
+            )
+            .unwrap();
+        let delta = repository.live_delta_read(before, 10).unwrap();
+        assert_eq!(delta.events.len(), 1);
+        assert_eq!(delta.events[0].event_type, "receipt.completed");
+        assert_eq!(
+            delta.events[0].payload["receipt"]["receipt_id"],
+            receipt.receipt_id
+        );
+        let after = delta.high_cursor;
+
+        let replay = repository
+            .record_mutation_receipt(
+                "live-receipt-key",
+                "principal:operator",
+                "mfg.incident.create",
+                "mfg:incident:live-receipt",
+                None,
+                Some(1),
+                "sha256:live-receipt",
+                &serde_json::json!({"revision": 1}),
+            )
+            .unwrap();
+        assert_eq!(replay.status, app_mfg_contract::MfgReceiptStatus::Replayed);
+        assert_eq!(
+            repository.live_delta_read(after, 10).unwrap().events.len(),
+            0
+        );
+    }
+
+    #[test]
+    fn completed_gateway_receipt_rolls_back_when_its_live_event_cannot_commit() {
+        let repository = MfgRepository::in_memory().unwrap();
+        repository
+            .claim_mutation_receipt(
+                "live-atomicity-key",
+                "principal:operator",
+                "mfg.incident.create",
+                "mfg:incident:live-atomicity",
+                None,
+                "sha256:live-atomicity",
+                "correlation:live-atomicity",
+            )
+            .unwrap();
+        {
+            let connection = repository.connection.lock().unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TRIGGER reject_live_receipt_event
+                     BEFORE INSERT ON mfg_projection_event
+                     BEGIN
+                         SELECT RAISE(ABORT, 'live event unavailable');
+                     END;",
+                )
+                .unwrap();
+        }
+
+        assert!(
+            repository
+                .record_mutation_receipt(
+                    "live-atomicity-key",
+                    "principal:operator",
+                    "mfg.incident.create",
+                    "mfg:incident:live-atomicity",
+                    None,
+                    Some(1),
+                    "sha256:live-atomicity",
+                    &serde_json::json!({"revision": 1}),
+                )
+                .is_err()
+        );
+
+        let connection = repository.connection.lock().unwrap();
+        let status = connection
+            .query_row(
+                "SELECT status FROM mfg_mutation_receipt
+                 WHERE idempotency_key = 'live-atomicity-key'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(status, "accepted");
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM mfg_projection_event", [], |row| {
+                    row.get::<_, u64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn live_retention_deletes_only_old_events_outside_the_latest_fifty_thousand() {
+        let repository = MfgRepository::in_memory().unwrap();
+        {
+            let connection = repository.connection.lock().unwrap();
+            connection
+                .execute_batch(
+                    "WITH RECURSIVE seq(value) AS (
+                         VALUES(1)
+                         UNION ALL
+                         SELECT value + 1 FROM seq WHERE value < 50001
+                     )
+                     INSERT INTO mfg_projection_event (
+                         domain, subject_ref, event_type, event_json, created_at
+                     )
+                     SELECT
+                         'retention',
+                         'mfg:retention:' || value,
+                         'retention.test',
+                         '{\"payload\":{}}',
+                         CASE WHEN value = 1
+                              THEN datetime('now', '-8 days')
+                              ELSE datetime('now')
+                         END
+                     FROM seq;
+                     UPDATE mfg_live_epoch
+                     SET retention_low_cursor = 0,
+                         retention_high_cursor = 50001,
+                         updated_at = datetime('now', '-6 minutes')
+                     WHERE singleton_id = 1;",
+                )
+                .unwrap();
+            compact_live_events_if_due(&connection).unwrap();
+            let count = connection
+                .query_row("SELECT COUNT(*) FROM mfg_projection_event", [], |row| {
+                    row.get::<_, u64>(0)
+                })
+                .unwrap();
+            assert_eq!(count, 50_000);
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT MIN(event_id) FROM mfg_projection_event",
+                        [],
+                        |row| row.get::<_, u64>(0),
+                    )
+                    .unwrap(),
+                2
+            );
+        }
+        let epoch = repository.live_epoch().unwrap();
+        assert_eq!(epoch.retention_low_cursor, 1);
+        assert_eq!(epoch.retention_high_cursor, 50_001);
+    }
+
+    #[test]
+    fn gateway_governance_receipt_upgrades_the_business_recovery_row_in_place() {
+        let repository = MfgRepository::from_connection(
+            Connection::open_in_memory().expect("in-memory database"),
+        )
+        .unwrap();
+        let business = mutation_receipt(
+            "alert",
+            "mfg:alert-occurrence:alert-1".to_string(),
+            "resolve",
+            "principal:tui",
+            "shared-key",
+            "sha256:business-body".to_string(),
+            1,
+            2,
+        )
+        .unwrap();
+        {
+            let connection = repository.connection.lock().unwrap();
+            insert_command_receipt(&connection, &business).unwrap();
+        }
+        let receipt = repository
+            .record_mutation_receipt(
+                "shared-key",
+                "principal:tui",
+                "mfg.alert.resolve",
+                "mfg:alert-occurrence:alert-1",
+                Some(1),
+                Some(2),
+                "sha256:gateway-body",
+                &serde_json::json!({"correlation_id": "correlation-1"}),
+            )
+            .unwrap();
+        assert_eq!(receipt.idempotency_key, "shared-key");
+        let connection = repository.connection.lock().unwrap();
+        let stored = connection
+            .query_row(
+                "SELECT COUNT(*), idempotency_key, response_json
+                 FROM mfg_mutation_receipt WHERE idempotency_key = ?1",
+                params!["shared-key"],
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(stored.0, 1);
+        assert_eq!(stored.1, "shared-key");
+        assert_eq!(
+            serde_json::from_str::<Value>(&stored.2).unwrap()["correlation_id"],
+            "correlation-1"
+        );
+    }
+
+    #[test]
+    fn finalized_gateway_receipt_preserves_assignment_notification_backlinks() {
+        let repository = MfgRepository::from_connection(
+            Connection::open_in_memory().expect("in-memory database"),
+        )
+        .unwrap();
+        let mut business = mutation_receipt(
+            "assignment",
+            "mfg:assignment:assignment-1".to_string(),
+            "start",
+            "principal:tui",
+            "assignment-notification-key",
+            "sha256:business-body".to_string(),
+            1,
+            2,
+        )
+        .unwrap();
+        business.notification_refs =
+            vec!["surface://feishu/delivery/surface-delivery-1".to_string()];
+        {
+            let connection = repository.connection.lock().unwrap();
+            insert_command_receipt(&connection, &business).unwrap();
+        }
+        let canonical_business = business.canonical_receipt().unwrap();
+        repository
+            .record_mutation_receipt(
+                "assignment-notification-key",
+                "principal:tui",
+                "mfg.assignment.start",
+                "mfg:assignment:assignment-1",
+                Some(1),
+                Some(2),
+                "sha256:gateway-body",
+                &serde_json::json!({
+                    "kind": "mfg.assignment_command_receipt",
+                    "business_receipt": canonical_business,
+                    "assignment": {"assignment_id": "assignment-1", "revision": 2}
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(
+            repository
+                .command_notification_refs_for_resource("mfg:assignment:assignment-1")
+                .unwrap(),
+            vec!["surface://feishu/delivery/surface-delivery-1".to_string()]
+        );
+    }
 
     #[test]
     fn legacy_incident_graph_column_is_renamed_without_dual_truth() {
@@ -6518,6 +10738,121 @@ mod tests {
 
         assert!(columns.iter().any(|column| column == "workflow_graph_id"));
         assert!(!columns.iter().any(|column| column == "agent_graph_id"));
+    }
+
+    #[test]
+    fn legacy_receipt_binding_conflict_rolls_back_and_persists_repair_report() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                r"CREATE TABLE mfg_command_receipt (
+                    idempotency_key TEXT PRIMARY KEY,
+                    domain TEXT NOT NULL,
+                    subject_ref TEXT NOT NULL,
+                    receipt_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE mfg_mutation_receipt (
+                    receipt_id TEXT PRIMARY KEY,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    actor_principal TEXT NOT NULL,
+                    action_id TEXT NOT NULL,
+                    resource_ref TEXT NOT NULL,
+                    expected_revision INTEGER,
+                    result_revision INTEGER,
+                    payload_digest TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    response_json TEXT NOT NULL,
+                    contract_version TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE mfg_mutation_receipt_alias (
+                    legacy_idempotency_key TEXT PRIMARY KEY,
+                    receipt_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE mfg_mutation_receipt_repair_report (
+                    report_id TEXT PRIMARY KEY,
+                    idempotency_key TEXT NOT NULL,
+                    existing_receipt_json TEXT NOT NULL,
+                    incoming_receipt_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+        let legacy = MfgCommandReceipt {
+            receipt_id: "legacy-receipt".to_string(),
+            domain: "alert".to_string(),
+            subject_ref: "mfg:alert-rule:rule-a".to_string(),
+            command: "rule.upsert".to_string(),
+            action_id: "mfg.alert_rule.create".to_string(),
+            actor_ref: "principal:legacy".to_string(),
+            idempotency_key: "conflicting-key".to_string(),
+            payload_digest: "sha256:legacy".to_string(),
+            correlation_id: None,
+            contract_version: app_mfg_contract::MFG_CONTRACT_VERSION.to_string(),
+            idempotent_replay: false,
+            previous_revision: 0,
+            current_revision: 1,
+            audit_ref: "audit://legacy".to_string(),
+            notification_refs: Vec::new(),
+            response_snapshot: Value::Null,
+            created_at: Utc::now(),
+        };
+        connection
+            .execute(
+                "INSERT INTO mfg_command_receipt (
+                    idempotency_key, domain, subject_ref, receipt_json, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    legacy.idempotency_key,
+                    legacy.domain,
+                    legacy.subject_ref,
+                    serde_json::to_string(&legacy).unwrap(),
+                    legacy.created_at.to_rfc3339(),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO mfg_mutation_receipt (
+                    receipt_id, idempotency_key, actor_principal, action_id, resource_ref,
+                    expected_revision, result_revision, payload_digest, status, response_json,
+                    contract_version, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, 1, ?6, 'completed', ?7, ?8, ?9, ?9)",
+                params![
+                    "existing-receipt",
+                    "conflicting-key",
+                    "principal:other",
+                    "mfg.alert_rule.create",
+                    "mfg:alert-rule:rule-a",
+                    "sha256:other",
+                    serde_json::json!({"existing": true}).to_string(),
+                    app_mfg_contract::MFG_CONTRACT_VERSION,
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .unwrap();
+
+        assert!(initialize_schema(&connection).is_err());
+        let repair_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM mfg_mutation_receipt_repair_report
+                 WHERE idempotency_key = 'conflicting-key'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let alias_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM mfg_mutation_receipt_alias",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(repair_count, 1);
+        assert_eq!(alias_count, 0);
     }
 
     #[test]
@@ -6599,10 +10934,12 @@ mod tests {
             expected_revision: None,
         });
         repository.upsert_alert_rule(&rule, None).unwrap();
-        assert!(repository
-            .list_alert_occurrences(None, 10)
-            .unwrap()
-            .is_empty());
+        assert!(
+            repository
+                .list_alert_occurrences(None, 10)
+                .unwrap()
+                .is_empty()
+        );
 
         let now = Utc::now();
         let matching = MatrixAttentionItem {
@@ -6686,12 +11023,218 @@ mod tests {
                     idempotency_key: "assignment-transfer-kind".to_string(),
                     target_ref: Some("team:operations".to_string()),
                     reason: Some("move ownership to the operations team".to_string()),
+                    correlation_id: "assignment-transfer-correlation".to_string(),
+                    completion_evidence: None,
                 },
             )
             .unwrap();
         assert_eq!(transferred.assignee_ref, "team:operations");
         assert_eq!(transferred.assignee_kind, "team");
         assert_eq!(receipt.current_revision, saved.revision + 1);
+    }
+
+    #[test]
+    fn assignment_lifecycle_never_fabricates_task_completion_and_binds_canonical_evidence() {
+        let repository = MfgRepository::in_memory().unwrap();
+        let mut incident = MfgIncident::new("canonical assignment lifecycle");
+        incident.task_id = Some("canonical-1".to_string());
+        let mut workflow = MfgWorkflowGraph::for_incident(&incident).unwrap();
+        workflow.workflow_id = "workflow-1".to_string();
+        let workflow_node_id = workflow.nodes[0].node_id.clone();
+        repository.save_workflow_graph(&workflow, None).unwrap();
+        let assignment = MfgAssignment::from_input(
+            MfgAssignmentInput {
+                assignment_id: Some("assignment-lifecycle".to_string()),
+                task_ref: "task:canonical-1".to_string(),
+                workflow_id: Some("workflow-1".to_string()),
+                workflow_node_id: Some(workflow_node_id.clone()),
+                incident_id: None,
+                assignee_ref: "agent:operator".to_string(),
+                assignee_kind: "agent".to_string(),
+                watcher_refs: Vec::new(),
+                priority: "high".to_string(),
+                due_at: None,
+                sla_minutes: Some(30),
+                notification_targets: Vec::new(),
+                visibility: "team".to_string(),
+                expected_revision: None,
+            },
+            "user:dispatcher".to_string(),
+        );
+        let saved = repository.upsert_assignment(&assignment, None).unwrap();
+        let correlation_id = "assignment-lifecycle-correlation".to_string();
+        let (started, start_receipt) = repository
+            .command_assignment(
+                &saved.assignment_id,
+                MfgAssignmentCommandInput {
+                    command: MfgAssignmentCommand::Start,
+                    actor_ref: "user:dispatcher".to_string(),
+                    expected_revision: saved.revision,
+                    idempotency_key: "assignment-start".to_string(),
+                    target_ref: None,
+                    reason: Some("work accepted".to_string()),
+                    correlation_id: correlation_id.clone(),
+                    completion_evidence: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(started.status, "in_progress");
+        assert_eq!(started.completion_ref, None);
+        assert_eq!(
+            started.lifecycle_correlation_id.as_deref(),
+            Some(correlation_id.as_str())
+        );
+        assert_eq!(
+            start_receipt.correlation_id.as_deref(),
+            Some(correlation_id.as_str())
+        );
+        let pending = repository
+            .reserve_assignment_completion(
+                &started.assignment_id,
+                started.revision,
+                "user:dispatcher",
+                &correlation_id,
+            )
+            .unwrap();
+
+        let missing = repository.command_assignment(
+            &started.assignment_id,
+            MfgAssignmentCommandInput {
+                command: MfgAssignmentCommand::Complete,
+                actor_ref: "user:dispatcher".to_string(),
+                expected_revision: pending.revision,
+                idempotency_key: "assignment-complete-missing".to_string(),
+                target_ref: None,
+                reason: None,
+                correlation_id: correlation_id.clone(),
+                completion_evidence: None,
+            },
+        );
+        assert!(matches!(
+            missing,
+            Err(MfgRepositoryError::CommandRejected(message))
+                if message == "mfg_assignment_task_transition_required"
+        ));
+
+        let completion_evidence = app_mfg_contract::MfgAssignmentCompletionEvidenceV1 {
+            correlation_id: correlation_id.clone(),
+            owner_kind: "runtime_assignment_terminal_observation".to_string(),
+            task_ref: started.task_ref.clone(),
+            workflow_node_id: started.workflow_node_id.clone(),
+            terminal_status: "completed".to_string(),
+            receipt_ref: format!(
+                "execution://{}/nodes/{}?revision=7",
+                workflow.workflow_id, workflow_node_id,
+            ),
+        };
+        let complete_input = MfgAssignmentCommandInput {
+            command: MfgAssignmentCommand::Complete,
+            actor_ref: "user:dispatcher".to_string(),
+            expected_revision: pending.revision,
+            idempotency_key: "assignment-complete".to_string(),
+            target_ref: None,
+            reason: Some("canonical runtime node completed".to_string()),
+            correlation_id: correlation_id.clone(),
+            completion_evidence: Some(completion_evidence.clone()),
+        };
+        let (completed, complete_receipt) = repository
+            .command_assignment(&started.assignment_id, complete_input.clone())
+            .unwrap();
+        assert_eq!(completed.status, "completed");
+        assert_eq!(
+            completed.completion_ref.as_deref(),
+            Some(completion_evidence.receipt_ref.as_str())
+        );
+        assert_eq!(
+            complete_receipt.correlation_id.as_deref(),
+            Some(correlation_id.as_str())
+        );
+
+        let (replayed, replay_receipt) = repository
+            .command_assignment(&started.assignment_id, complete_input)
+            .unwrap();
+        assert_eq!(replayed, completed);
+        assert!(replay_receipt.idempotent_replay);
+        assert_eq!(replay_receipt.receipt_id, complete_receipt.receipt_id);
+
+        let task_assignment = MfgAssignment::from_input(
+            MfgAssignmentInput {
+                assignment_id: Some("assignment-task-command".to_string()),
+                task_ref: "task://canonical-task-2".to_string(),
+                workflow_id: None,
+                workflow_node_id: None,
+                incident_id: None,
+                assignee_ref: "agent:operator".to_string(),
+                assignee_kind: "agent".to_string(),
+                watcher_refs: Vec::new(),
+                priority: "normal".to_string(),
+                due_at: None,
+                sla_minutes: None,
+                notification_targets: Vec::new(),
+                visibility: "team".to_string(),
+                expected_revision: None,
+            },
+            "user:dispatcher".to_string(),
+        );
+        let task_assignment = repository
+            .upsert_assignment(&task_assignment, None)
+            .unwrap();
+        let (task_started, _) = repository
+            .command_assignment(
+                &task_assignment.assignment_id,
+                MfgAssignmentCommandInput {
+                    command: MfgAssignmentCommand::Start,
+                    actor_ref: "user:dispatcher".to_string(),
+                    expected_revision: task_assignment.revision,
+                    idempotency_key: "assignment-task-start".to_string(),
+                    target_ref: None,
+                    reason: None,
+                    correlation_id: correlation_id.clone(),
+                    completion_evidence: None,
+                },
+            )
+            .unwrap();
+        let runtime_receipt = "runtime-event://event-1?cursor=9&transaction=tx-1";
+        let task_pending = repository
+            .reserve_assignment_completion(
+                &task_started.assignment_id,
+                task_started.revision,
+                "user:dispatcher",
+                &correlation_id,
+            )
+            .unwrap();
+        let (task_completed, task_receipt) = repository
+            .command_assignment(
+                &task_started.assignment_id,
+                MfgAssignmentCommandInput {
+                    command: MfgAssignmentCommand::Complete,
+                    actor_ref: "user:dispatcher".to_string(),
+                    expected_revision: task_pending.revision,
+                    idempotency_key: "assignment-task-complete".to_string(),
+                    target_ref: None,
+                    reason: None,
+                    correlation_id: correlation_id.clone(),
+                    completion_evidence: Some(
+                        app_mfg_contract::MfgAssignmentCompletionEvidenceV1 {
+                            correlation_id: correlation_id.clone(),
+                            owner_kind: "runtime_assignment_terminal_observation".to_string(),
+                            task_ref: task_started.task_ref.clone(),
+                            workflow_node_id: None,
+                            terminal_status: "completed".to_string(),
+                            receipt_ref: runtime_receipt.to_string(),
+                        },
+                    ),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            task_completed.completion_ref.as_deref(),
+            Some(runtime_receipt)
+        );
+        assert_eq!(
+            task_receipt.correlation_id.as_deref(),
+            Some(correlation_id.as_str())
+        );
     }
 
     #[test]
@@ -6850,10 +11393,12 @@ mod tests {
             .expect("impact path builds");
         assert_eq!(trace.root_entity_id, component.entity_id);
         assert_eq!(trace.hops.len(), 2);
-        assert!(trace
-            .entities
-            .iter()
-            .any(|entity| entity.entity_id == order.entity_id));
+        assert!(
+            trace
+                .entities
+                .iter()
+                .any(|entity| entity.entity_id == order.entity_id)
+        );
         assert_eq!(store.health().unwrap().relation_count, 2);
     }
 
@@ -6887,16 +11432,20 @@ mod tests {
         let trace = store
             .impact_trace("entity-component-gpu-h100", 3)
             .expect("impact trace builds");
-        assert!(trace
-            .entities
-            .iter()
-            .any(|entity| entity.entity_id == "entity-order-co-2026-0001"));
+        assert!(
+            trace
+                .entities
+                .iter()
+                .any(|entity| entity.entity_id == "entity-order-co-2026-0001")
+        );
 
         let recompute = store.recompute_metrics().expect("metrics recompute");
-        assert!(recompute
-            .metric_states
-            .iter()
-            .any(|state| state.metric_id == "material_shortage_risk"));
+        assert!(
+            recompute
+                .metric_states
+                .iter()
+                .any(|state| state.metric_id == "material_shortage_risk")
+        );
         assert!(!recompute.attention.is_empty());
     }
 
@@ -6909,24 +11458,32 @@ mod tests {
         let lineage = store
             .metric_lineage("supplier_commit_variance", 6)
             .expect("lineage builds");
-        assert!(lineage
-            .downstream_dependencies
-            .iter()
-            .any(|dependency| dependency.downstream_metric_id == "material_shortage_risk"));
-        assert!(lineage
-            .impacted_metric_ids
-            .iter()
-            .any(|metric_id| metric_id == "order_delivery_risk"));
+        assert!(
+            lineage
+                .downstream_dependencies
+                .iter()
+                .any(|dependency| dependency.downstream_metric_id == "material_shortage_risk")
+        );
+        assert!(
+            lineage
+                .impacted_metric_ids
+                .iter()
+                .any(|metric_id| metric_id == "order_delivery_risk")
+        );
 
         let affected = store
             .metrics_affected_by_fact_type("supply.commit_variance")
             .expect("affected metrics resolve");
-        assert!(affected
-            .iter()
-            .any(|metric_id| metric_id == "supplier_commit_variance"));
-        assert!(affected
-            .iter()
-            .any(|metric_id| metric_id == "order_delivery_risk"));
+        assert!(
+            affected
+                .iter()
+                .any(|metric_id| metric_id == "supplier_commit_variance")
+        );
+        assert!(
+            affected
+                .iter()
+                .any(|metric_id| metric_id == "order_delivery_risk")
+        );
         assert_eq!(store.health().unwrap().metric_dependency_count, 5);
     }
 
@@ -6948,14 +11505,16 @@ mod tests {
             .expect("job plans");
 
         assert_eq!(plan.job.status, "planned");
-        assert!(plan
-            .affected_metric_ids
-            .iter()
-            .any(|metric_id| metric_id == "supplier_commit_variance"));
-        assert!(plan
-            .affected_metric_ids
-            .iter()
-            .any(|metric_id| metric_id == "order_delivery_risk"));
+        assert!(
+            plan.affected_metric_ids
+                .iter()
+                .any(|metric_id| metric_id == "supplier_commit_variance")
+        );
+        assert!(
+            plan.affected_metric_ids
+                .iter()
+                .any(|metric_id| metric_id == "order_delivery_risk")
+        );
         assert_eq!(store.health().unwrap().compute_job_count, 1);
 
         let job = store.run_compute_job(&plan.job.job_id).expect("job runs");
@@ -6969,10 +11528,12 @@ mod tests {
                 .len()
                 == 1
         );
-        assert!(store
-            .metric_states("work_center_load")
-            .expect("states load")
-            .is_empty());
+        assert!(
+            store
+                .metric_states("work_center_load")
+                .expect("states load")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -7133,10 +11694,11 @@ mod tests {
                     priority: None,
                 })
                 .expect("compute plan builds");
-            assert!(plan
-                .affected_metric_ids
-                .iter()
-                .any(|metric_id| metric_id == expected.trigger_metric));
+            assert!(
+                plan.affected_metric_ids
+                    .iter()
+                    .any(|metric_id| metric_id == expected.trigger_metric)
+            );
         }
     }
 
@@ -7179,6 +11741,63 @@ mod tests {
         assert_eq!(health.fact_count, 1);
         assert_eq!(health.attention_count, 1);
         assert_eq!(health.evidence_count, 1);
+    }
+
+    #[test]
+    fn data_plane_ingest_plan_includes_metric_declared_by_source_pack() {
+        let store = MfgRepository::in_memory().expect("store opens");
+        let source_pack_id = "source-pack-ingest-metric";
+        store
+            .upsert_source_pack(MatrixSourcePack {
+                source_pack_id: source_pack_id.to_string(),
+                source_name: "manufacturing events".to_string(),
+                owner: "test".to_string(),
+                access_mode: "manual".to_string(),
+                refresh_mode: "manual".to_string(),
+                entity_mappings: Vec::new(),
+                fact_mappings: vec![MatrixSourceFactMapping {
+                    source_table: "manufacturing_events".to_string(),
+                    fact_type: "manufacturing.event".to_string(),
+                    metric_key: "manufacturing_event_count".to_string(),
+                    entity_ref_fields: vec!["asset_id".to_string()],
+                    measure_fields: Vec::new(),
+                    event_time_field: None,
+                    dedup_key: "event_id".to_string(),
+                    delta_signature: "updated_at".to_string(),
+                }],
+                relation_mappings: Vec::new(),
+                reconciliation_rules: Vec::new(),
+                quality_rules: Vec::new(),
+                freshness_sla: None,
+                security_policy: None,
+                metadata: Value::Null,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .expect("source pack saves");
+
+        let plan = store
+            .plan_data_plane_ingest(MatrixDataPlaneIngestPlanInput {
+                source_ref: format!("source-pack://{source_pack_id}"),
+                fact_type: "manufacturing.event".to_string(),
+                partition_ref: None,
+                high_watermark: None,
+                estimated_rows: None,
+                raw_checksum: None,
+                metric_ids: Vec::new(),
+            })
+            .expect("ingest plan builds");
+
+        assert!(
+            plan.affected_metric_ids
+                .iter()
+                .any(|metric_id| metric_id == "manufacturing_event_count")
+        );
+        assert!(plan.compute_jobs.iter().any(|job| {
+            job.metric_ids
+                .iter()
+                .any(|metric_id| metric_id == "manufacturing_event_count")
+        }));
     }
 
     #[test]
@@ -7322,10 +11941,12 @@ mod tests {
             .evaluate_evidence_quality(&packet.packet_id)
             .expect("quality gate evaluates");
         assert_eq!(review_gate.decision, "review");
-        assert!(review_gate
-            .required_actions
-            .iter()
-            .any(|action| action == "run_incident_analysis"));
+        assert!(
+            review_gate
+                .required_actions
+                .iter()
+                .any(|action| action == "run_incident_analysis")
+        );
         assert_eq!(
             store
                 .get_quality_gate(&review_gate.gate_id)
@@ -7492,12 +12113,16 @@ mod tests {
         assert_eq!(payload.template_id, "ops.alert.compact");
         assert_eq!(payload.requested_capability, "channel.feishu.send_text");
         assert!(payload.resource_ref.starts_with("text://"));
-        assert!(payload
-            .constraints
-            .contains(&"payload_kind:text".to_string()));
-        assert!(payload
-            .constraints
-            .contains(&"target_ref_present".to_string()));
+        assert!(
+            payload
+                .constraints
+                .contains(&"payload_kind:text".to_string())
+        );
+        assert!(
+            payload
+                .constraints
+                .contains(&"target_ref_present".to_string())
+        );
 
         let delivered = store
             .attach_cockpit_report_delivery(
@@ -7518,6 +12143,7 @@ mod tests {
         assert!(!delivery_state.retryable);
         assert_eq!(delivery_state.attempt_count, 1);
         assert_eq!(delivery_state.retry_attempt_count, 0);
+        let delivered_revision = delivered.revision;
         let delivered = store
             .attach_cockpit_report_delivery(
                 &report.report_id,
@@ -7531,6 +12157,27 @@ mod tests {
             )
             .expect("report delivery deduplicates");
         assert_eq!(delivered.delivery_receipts.len(), 1);
+        assert_eq!(delivered.revision, delivered_revision);
+        assert!(
+            store
+                .attach_cockpit_report_delivery(
+                    &report.report_id,
+                    MfgCockpitReportDeliveryReceipt::new(
+                        report.report_id.clone(),
+                        "cpx-report-test",
+                        "dispatched",
+                        "sent",
+                        Some("cpa-report-test".to_string()),
+                    ),
+                )
+                .is_err()
+        );
+        let unchanged = store
+            .get_cockpit_report(&report.report_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.status, "delivery_planned");
+        assert_eq!(unchanged.revision, delivered_revision);
         for attempt in 1..=3 {
             store
                 .attach_cockpit_report_delivery(
@@ -7559,9 +12206,11 @@ mod tests {
         );
         assert!(!delivery_state.retryable);
         assert_eq!(delivery_state.recommended_mode, "manual_review");
-        assert!(delivery_state
-            .reasons
-            .contains(&"delivery:retry_attempts_exhausted:3".to_string()));
+        assert!(
+            delivery_state
+                .reasons
+                .contains(&"delivery:retry_attempts_exhausted:3".to_string())
+        );
     }
 
     #[test]
@@ -7603,13 +12252,322 @@ mod tests {
             .expect("single widget projects");
         assert_eq!(projection.profile_revision, saved.revision);
         assert_eq!(projection.widget.instance_id, "default-attention");
-        assert!(store
-            .cockpit_widget_projection(&saved.profile_id, "default-quality")
-            .is_ok());
+        assert!(
+            store
+                .cockpit_widget_projection(&saved.profile_id, "default-quality")
+                .is_ok()
+        );
         assert!(matches!(
             store.cockpit_widget_projection(&saved.profile_id, "missing"),
             Err(MfgRepositoryError::NotFound(_))
         ));
+    }
+
+    fn dead_letter_report(repository: &MfgRepository, suffix: &str) -> MfgCockpitReportSnapshot {
+        let profile = MfgCockpitProfile::from_input(MfgCockpitProfileInput {
+            profile_id: Some(format!("review-profile-{suffix}")),
+            owner_ref: "principal:review-requester".to_string(),
+            display_name: Some("Review fixture".to_string()),
+            focus_refs: Vec::new(),
+            focus_metric_ids: Vec::new(),
+            thresholds: Value::Null,
+            template_id: None,
+            cadence: Some("daily".to_string()),
+            expected_revision: None,
+            scope: None,
+            layout: None,
+            global_filters: Value::Null,
+            widget_instances: Vec::new(),
+            sharing_policy: None,
+        });
+        repository.upsert_cockpit_profile(&profile, None).unwrap();
+        let report = repository
+            .generate_cockpit_report(
+                &profile.profile_id,
+                MfgCockpitReportRequest {
+                    report_id: Some(format!("review-report-{suffix}")),
+                    cadence: Some("daily".to_string()),
+                    delivery_ref: Some("channel://feishu/user/review-target".to_string()),
+                    note: None,
+                },
+            )
+            .unwrap();
+        for attempt in 1..=3 {
+            repository
+                .attach_cockpit_report_delivery(
+                    &report.report_id,
+                    MfgCockpitReportDeliveryReceipt::new(
+                        report.report_id.clone(),
+                        format!("review-failure-{suffix}-{attempt}"),
+                        "blocked",
+                        "runtime_unavailable",
+                        Some(format!("review-audit-{suffix}-{attempt}")),
+                    ),
+                )
+                .unwrap();
+        }
+        repository
+            .get_cockpit_report(&report.report_id)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn report_delivery_review_saga_is_idempotent_cas_bound_and_effect_recoverable() {
+        let repository = MfgRepository::in_memory().unwrap();
+        let report = dead_letter_report(&repository, "force");
+        let review = repository
+            .create_report_delivery_review(
+                &report,
+                report.revision,
+                "principal:review-requester",
+                "retry after manual evidence review",
+                vec!["evidence:delivery-failure".to_string()],
+                "review-create-force",
+            )
+            .unwrap();
+        let replay = repository
+            .create_report_delivery_review(
+                &report,
+                report.revision,
+                "principal:review-requester",
+                "retry after manual evidence review",
+                vec!["evidence:delivery-failure".to_string()],
+                "review-create-force",
+            )
+            .unwrap();
+        assert_eq!(review.review_id, replay.review_id);
+        let pending = repository
+            .bind_report_delivery_review_approval(
+                &review.review_id,
+                review.revision,
+                "mfg-approval:force",
+                "principal:review-requester",
+                "review-bind-force",
+            )
+            .unwrap();
+        assert!(matches!(
+            repository.bind_report_delivery_review_approval(
+                &review.review_id,
+                review.revision,
+                "mfg-approval:force",
+                "principal:review-requester",
+                "review-bind-stale",
+            ),
+            Err(MfgRepositoryError::RevisionConflict { .. })
+        ));
+        let prepared = repository
+            .prepare_report_delivery_review_decision(
+                &review.review_id,
+                pending.revision,
+                MfgReportDeliveryReviewDecision::ForceRetry,
+                "principal:reviewer",
+                "approved retry",
+                vec!["evidence:reviewed".to_string()],
+                None,
+                "lease:force",
+                "review-decision-force",
+            )
+            .unwrap();
+        let activated = repository
+            .activate_report_delivery_review_decision(
+                &review.review_id,
+                prepared.revision,
+                "principal:reviewer",
+                "review-activate-force",
+            )
+            .unwrap();
+        assert_eq!(
+            activated.status,
+            MfgReportDeliveryReviewStatus::DecisionPendingEffect
+        );
+        let effects = repository.claim_report_delivery_review_effects(10).unwrap();
+        assert_eq!(effects.len(), 1);
+        let completed = repository
+            .complete_report_delivery_review_effect(
+                &effects[0].effect_key,
+                "cross-plane:receipt:force",
+                "principal:reviewer",
+            )
+            .unwrap();
+        assert_eq!(
+            completed.status,
+            MfgReportDeliveryReviewStatus::EffectAppliedForceRetry
+        );
+        assert_eq!(
+            completed.effect_receipt_ref.as_deref(),
+            Some("cross-plane:receipt:force")
+        );
+    }
+
+    #[test]
+    fn report_delivery_review_reroute_outbox_reopens_and_keeps_one_effect_key() {
+        let path =
+            std::env::temp_dir().join(format!("mfg-review-reopen-{}.sqlite", uuid::Uuid::new_v4()));
+        let effect_key;
+        {
+            let repository = MfgRepository::open(&path).unwrap();
+            let report = dead_letter_report(&repository, "reroute-reopen");
+            let requested = repository
+                .create_report_delivery_review(
+                    &report,
+                    report.revision,
+                    "principal:review-requester",
+                    "reroute after provider outage",
+                    vec!["evidence:provider-outage".to_string()],
+                    "review-create-reroute-reopen",
+                )
+                .unwrap();
+            let pending = repository
+                .bind_report_delivery_review_approval(
+                    &requested.review_id,
+                    requested.revision,
+                    "mfg-approval:reroute-reopen",
+                    "principal:review-requester",
+                    "review-bind-reroute-reopen",
+                )
+                .unwrap();
+            let prepared = repository
+                .prepare_report_delivery_review_decision(
+                    &pending.review_id,
+                    pending.revision,
+                    MfgReportDeliveryReviewDecision::Reroute,
+                    "principal:reviewer",
+                    "reroute to the fallback provider",
+                    vec!["evidence:fallback-validated".to_string()],
+                    Some(MfgReportDeliveryReviewRerouteTarget {
+                        target_ref: "channel://feishu/user/fallback".to_string(),
+                        provider_account: "provider:fallback".to_string(),
+                        channel: "feishu".to_string(),
+                        requested_capability: "channel.send".to_string(),
+                    }),
+                    "lease:reroute-reopen",
+                    "review-decision-reroute-reopen",
+                )
+                .unwrap();
+            repository
+                .activate_report_delivery_review_decision(
+                    &prepared.review_id,
+                    prepared.revision,
+                    "principal:reviewer",
+                    "review-activate-reroute-reopen",
+                )
+                .unwrap();
+            let claimed = repository.claim_report_delivery_review_effects(10).unwrap();
+            assert_eq!(claimed.len(), 1);
+            assert_eq!(claimed[0].action, MfgReportDeliveryReviewDecision::Reroute);
+            assert_eq!(
+                claimed[0].payload["target_ref"],
+                "channel://feishu/user/fallback"
+            );
+            effect_key = claimed[0].effect_key.clone();
+        }
+
+        let reopened = MfgRepository::open(&path).unwrap();
+        let reclaimed = reopened.claim_report_delivery_review_effects(10).unwrap();
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].effect_key, effect_key);
+        assert_eq!(reclaimed[0].attempt_count, 2);
+        let terminal = reopened
+            .complete_report_delivery_review_effect(
+                &effect_key,
+                "cross-plane:receipt:reroute-reopen",
+                "principal:reviewer",
+            )
+            .unwrap();
+        assert_eq!(
+            terminal.status,
+            MfgReportDeliveryReviewStatus::EffectAppliedReroute
+        );
+        assert!(
+            reopened
+                .claim_report_delivery_review_effects(10)
+                .unwrap()
+                .is_empty()
+        );
+        drop(reopened);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    }
+
+    #[test]
+    fn review_local_terminals_preserve_delivery_semantics() {
+        for (decision, expected_review, expected_report) in [
+            (
+                MfgReportDeliveryReviewDecision::Reject,
+                MfgReportDeliveryReviewStatus::Rejected,
+                "delivery_dead_lettered",
+            ),
+            (
+                MfgReportDeliveryReviewDecision::Abandon,
+                MfgReportDeliveryReviewStatus::Abandoned,
+                "delivery_abandoned",
+            ),
+            (
+                MfgReportDeliveryReviewDecision::Resolve,
+                MfgReportDeliveryReviewStatus::ResolvedExternal,
+                "delivery_resolved_external",
+            ),
+        ] {
+            let repository = MfgRepository::in_memory().unwrap();
+            let suffix = review_decision_string(decision);
+            let report = dead_letter_report(&repository, &suffix);
+            let requested = repository
+                .create_report_delivery_review(
+                    &report,
+                    report.revision,
+                    "principal:review-requester",
+                    "manual review",
+                    vec!["evidence:failure".to_string()],
+                    &format!("create-{suffix}"),
+                )
+                .unwrap();
+            let pending = repository
+                .bind_report_delivery_review_approval(
+                    &requested.review_id,
+                    requested.revision,
+                    &format!("approval-{suffix}"),
+                    "principal:review-requester",
+                    &format!("bind-{suffix}"),
+                )
+                .unwrap();
+            let prepared = repository
+                .prepare_report_delivery_review_decision(
+                    &pending.review_id,
+                    pending.revision,
+                    decision,
+                    "principal:reviewer",
+                    if decision == MfgReportDeliveryReviewDecision::Resolve {
+                        "resolved by external operator"
+                    } else {
+                        "reviewed"
+                    },
+                    vec!["evidence:reviewed".to_string()],
+                    None,
+                    &format!("lease-{suffix}"),
+                    &format!("decision-{suffix}"),
+                )
+                .unwrap();
+            let terminal = repository
+                .activate_report_delivery_review_decision(
+                    &prepared.review_id,
+                    prepared.revision,
+                    "principal:reviewer",
+                    &format!("activate-{suffix}"),
+                )
+                .unwrap();
+            assert_eq!(terminal.status, expected_review);
+            assert!(terminal.effect_receipt_ref.is_some());
+            let report = repository
+                .get_cockpit_report(&report.report_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                MfgCockpitReportDeliveryState::from_report(&report).classification,
+                expected_report
+            );
+        }
     }
 
     #[test]
@@ -7673,6 +12631,192 @@ mod tests {
     }
 
     #[test]
+    fn playbook_upsert_distinguishes_create_from_revision_checked_update() {
+        let repository = MfgRepository::in_memory().unwrap();
+        let now = Utc::now();
+        let playbook = MfgPlaybook {
+            playbook_id: "playbook-revision".to_string(),
+            revision: 1,
+            domain: "supply".to_string(),
+            scenario: "shortage".to_string(),
+            trigger_fact_types: Vec::new(),
+            metric_keys: vec!["shortage_risk".to_string()],
+            recommended_steps: Vec::new(),
+            required_evidence: Vec::new(),
+            quality_gate_policy: "quality_gate".to_string(),
+            cross_plane_policy: "dry_run_first".to_string(),
+            success_metrics: vec!["shortage_risk".to_string()],
+            created_from_case_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let created = repository.upsert_playbook(&playbook, None).unwrap();
+        assert_eq!(created.revision, 1);
+        assert!(matches!(
+            repository.upsert_playbook(&playbook, None),
+            Err(MfgRepositoryError::RevisionConflict { .. })
+        ));
+        let updated = repository
+            .upsert_playbook(&playbook, Some(created.revision))
+            .unwrap();
+        assert_eq!(updated.revision, 2);
+    }
+
+    #[test]
+    fn alert_subscription_and_assignment_upserts_emit_create_then_update_actions() {
+        let repository = MfgRepository::in_memory().unwrap();
+        let actor = "principal:operator";
+
+        let rule = MfgAlertRule::from_input(MfgAlertRuleInput {
+            rule_id: Some("alert-rule-revision".to_string()),
+            owner_ref: actor.to_string(),
+            name: "Revision rule".to_string(),
+            metric_refs: Vec::new(),
+            entity_refs: Vec::new(),
+            condition: Value::Null,
+            severity: "warning".to_string(),
+            enabled: true,
+            expected_revision: None,
+        });
+        let (created_rule, created_rule_receipt) = repository
+            .upsert_alert_rule_receipted(&rule, None, actor, "rule-create-key")
+            .unwrap();
+        assert_eq!(created_rule_receipt.action_id, "mfg.alert_rule.create");
+        let mut changed_rule = created_rule.clone();
+        changed_rule.name = "Revision rule updated".to_string();
+        let (updated_rule, updated_rule_receipt) = repository
+            .upsert_alert_rule_receipted(
+                &changed_rule,
+                Some(created_rule.revision),
+                actor,
+                "rule-update-key",
+            )
+            .unwrap();
+        assert_eq!(updated_rule.revision, 2);
+        assert_eq!(updated_rule_receipt.action_id, "mfg.alert_rule.update");
+
+        let subscription = MfgAlertSubscription::from_input(
+            MfgAlertSubscriptionInput {
+                subscription_id: Some("alert-subscription-revision".to_string()),
+                rule_id: created_rule.rule_id,
+                channels: vec!["webui".to_string()],
+                enabled: true,
+                expected_revision: None,
+            },
+            actor.to_string(),
+        );
+        let (created_subscription, created_subscription_receipt) = repository
+            .upsert_alert_subscription_receipted(
+                &subscription,
+                None,
+                actor,
+                "subscription-create-key",
+            )
+            .unwrap();
+        assert_eq!(
+            created_subscription_receipt.action_id,
+            "mfg.alert_subscription.create"
+        );
+        let mut changed_subscription = created_subscription.clone();
+        changed_subscription.channels.push("tui".to_string());
+        let (updated_subscription, updated_subscription_receipt) = repository
+            .upsert_alert_subscription_receipted(
+                &changed_subscription,
+                Some(created_subscription.revision),
+                actor,
+                "subscription-update-key",
+            )
+            .unwrap();
+        assert_eq!(updated_subscription.revision, 2);
+        assert_eq!(
+            updated_subscription_receipt.action_id,
+            "mfg.alert_subscription.update"
+        );
+
+        let assignment = MfgAssignment::from_input(
+            MfgAssignmentInput {
+                assignment_id: Some("assignment-revision".to_string()),
+                task_ref: "task:revision-fixture".to_string(),
+                workflow_id: None,
+                workflow_node_id: None,
+                incident_id: None,
+                assignee_ref: "principal:worker".to_string(),
+                assignee_kind: "user".to_string(),
+                watcher_refs: Vec::new(),
+                priority: "normal".to_string(),
+                due_at: None,
+                sla_minutes: None,
+                notification_targets: Vec::new(),
+                visibility: "private".to_string(),
+                expected_revision: None,
+            },
+            actor.to_string(),
+        );
+        let (created_assignment, created_assignment_receipt) = repository
+            .upsert_assignment_receipted(&assignment, None, actor, "assignment-create-key")
+            .unwrap();
+        assert_eq!(
+            created_assignment_receipt.action_id,
+            "mfg.assignment.create"
+        );
+        let mut changed_assignment = created_assignment.clone();
+        changed_assignment.priority = "high".to_string();
+        let (updated_assignment, updated_assignment_receipt) = repository
+            .upsert_assignment_receipted(
+                &changed_assignment,
+                Some(created_assignment.revision),
+                actor,
+                "assignment-update-key",
+            )
+            .unwrap();
+        assert_eq!(updated_assignment.revision, 2);
+        assert_eq!(
+            updated_assignment_receipt.action_id,
+            "mfg.assignment.update"
+        );
+        repository
+            .record_command_notifications(
+                "assignment-update-key",
+                vec!["surface://feishu/message-42?status=sent".to_string()],
+            )
+            .unwrap();
+        assert_eq!(
+            repository
+                .command_notification_refs_for_resource(&format!(
+                    "mfg:assignment:{}",
+                    updated_assignment.assignment_id
+                ))
+                .unwrap(),
+            vec!["surface://feishu/message-42?status=sent".to_string()]
+        );
+        assert!(matches!(
+            repository.upsert_assignment(
+                &MfgAssignment::from_input(
+                    MfgAssignmentInput {
+                        assignment_id: Some("assignment-create-with-revision".to_string()),
+                        task_ref: "task:revision-fixture".to_string(),
+                        workflow_id: None,
+                        workflow_node_id: None,
+                        incident_id: None,
+                        assignee_ref: "principal:worker".to_string(),
+                        assignee_kind: "user".to_string(),
+                        watcher_refs: Vec::new(),
+                        priority: "normal".to_string(),
+                        due_at: None,
+                        sla_minutes: None,
+                        notification_targets: Vec::new(),
+                        visibility: "private".to_string(),
+                        expected_revision: Some(0),
+                    },
+                    actor.to_string(),
+                ),
+                Some(0)
+            ),
+            Err(MfgRepositoryError::RevisionConflict { .. })
+        ));
+    }
+
+    #[test]
     fn cockpit_profile_mutations_persist_actor_bound_idempotency_receipts() {
         let store = MfgRepository::in_memory().expect("store opens");
         let profile = MfgCockpitProfile::from_input(MfgCockpitProfileInput {
@@ -7713,20 +12857,36 @@ mod tests {
         assert_eq!(replayed.revision, saved.revision);
         assert_eq!(replay_receipt.receipt_id, receipt.receipt_id);
         assert!(replay_receipt.idempotent_replay);
+        assert_eq!(receipt.action_id, "mfg.cockpit.profile.create");
+        assert_eq!(replay_receipt.action_id, "mfg.cockpit.profile.create");
         assert!(receipt.audit_ref.contains("cockpit-profile-idempotency"));
+
+        let mut changed = saved.clone();
+        changed.display_name = "Idempotent cockpit updated".to_string();
+        let (updated, update_receipt) = store
+            .upsert_cockpit_profile_receipted(
+                &changed,
+                Some(saved.revision),
+                "profile.upsert",
+                "user:planner",
+                "cockpit-update-key",
+            )
+            .expect("profile updates with a receipt");
+        assert_eq!(updated.revision, 2);
+        assert_eq!(update_receipt.action_id, "mfg.cockpit.profile.update");
 
         let (deleted, deletion_receipt) = store
             .delete_cockpit_profile_receipted(
-                &saved.profile_id,
-                saved.revision,
+                &updated.profile_id,
+                updated.revision,
                 "user:planner",
                 "cockpit-delete-key",
             )
             .expect("profile deletes with a receipt");
         let (deleted_replay, deletion_replay) = store
             .delete_cockpit_profile_receipted(
-                &saved.profile_id,
-                saved.revision,
+                &updated.profile_id,
+                updated.revision,
                 "user:planner",
                 "cockpit-delete-key",
             )
@@ -7735,7 +12895,12 @@ mod tests {
             deleted.expect("first deletion returns profile").profile_id,
             saved.profile_id
         );
-        assert!(deleted_replay.is_none());
+        assert_eq!(
+            deleted_replay
+                .expect("replay returns the original deleted snapshot")
+                .profile_id,
+            saved.profile_id
+        );
         assert_eq!(deletion_replay.receipt_id, deletion_receipt.receipt_id);
         assert!(deletion_replay.idempotent_replay);
     }
@@ -7801,6 +12966,7 @@ mod tests {
             .expect("incident loads")
             .expect("incident exists");
         assert_eq!(updated_incident.status, "analyzed");
+        assert_eq!(updated_incident.revision, incident.revision + 1);
         assert_eq!(store.health().unwrap().analysis_count, 1);
     }
 
@@ -7874,6 +13040,7 @@ mod tests {
             execution.receipt["cross_plane_receipts"][0]["cross_plane_receipt_id"],
             "cpx-matrix-test"
         );
+        let bridge_updated_at = execution.updated_at;
         let execution = store
             .attach_cross_plane_receipt(
                 &execution.execution_id,
@@ -7887,15 +13054,57 @@ mod tests {
             )
             .expect("bridge receipt deduplicates");
         assert_eq!(execution.cross_plane_receipts.len(), 1);
+        assert_eq!(execution.updated_at, bridge_updated_at);
+        assert!(
+            store
+                .attach_cross_plane_receipt(
+                    &execution.execution_id,
+                    MfgCrossPlaneBridgeReceipt::new(
+                        execution.execution_id.clone(),
+                        "cpx-matrix-test",
+                        "dispatched",
+                        "sent",
+                        Some("cpa-matrix-test".to_string()),
+                    ),
+                )
+                .is_err()
+        );
+        let unchanged = store
+            .get_execution(&execution.execution_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.status, "cross_plane_planned");
+        assert_eq!(unchanged.updated_at, bridge_updated_at);
 
+        let feedback = MfgActionFeedback::new("resolved", "supplier commit secured", Some(-260.0));
         let execution = store
-            .record_execution_feedback(
-                &execution.execution_id,
-                MfgActionFeedback::new("resolved", "supplier commit secured", Some(-260.0)),
-            )
+            .record_execution_feedback(&execution.execution_id, feedback.clone())
             .expect("feedback saves");
         assert_eq!(execution.status, "feedback_resolved");
         assert_eq!(execution.feedback.as_ref().unwrap().outcome, "resolved");
+        let feedback_updated_at = execution.updated_at;
+        let replayed = store
+            .record_execution_feedback(&execution.execution_id, feedback)
+            .expect("identical feedback replays");
+        assert_eq!(replayed.updated_at, feedback_updated_at);
+        assert!(
+            store
+                .record_execution_feedback(
+                    &execution.execution_id,
+                    MfgActionFeedback::new(
+                        "needs_followup",
+                        "attempt to replace immutable outcome",
+                        Some(40.0),
+                    ),
+                )
+                .is_err()
+        );
+        let unchanged = store
+            .get_execution(&execution.execution_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.status, "feedback_resolved");
+        assert_eq!(unchanged.updated_at, feedback_updated_at);
         assert_eq!(
             store
                 .get_execution(&execution.execution_id)
@@ -7909,5 +13118,6 @@ mod tests {
             .unwrap()
             .expect("incident exists");
         assert_eq!(incident.status, "closed");
+        assert_eq!(incident.revision, 3);
     }
 }

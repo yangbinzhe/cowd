@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock, Weak};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use async_trait::async_trait;
 use harness_contract::agent::{
@@ -128,6 +128,8 @@ pub struct AgentRuntime {
     records: RwLock<BTreeMap<String, AgentRunRecord>>,
     backends: RwLock<BTreeMap<AgentBackendKind, Arc<dyn AgentRuntimeBackend>>>,
     services: RwLock<Option<Weak<RuntimeServices>>>,
+    pending_cancellations: Mutex<BTreeSet<String>>,
+    lifecycle_lock: Mutex<()>,
 }
 
 impl AgentRuntime {
@@ -143,6 +145,8 @@ impl AgentRuntime {
             records: RwLock::new(BTreeMap::new()),
             backends: RwLock::new(BTreeMap::new()),
             services: RwLock::new(None),
+            pending_cancellations: Mutex::new(BTreeSet::new()),
+            lifecycle_lock: Mutex::new(()),
         };
         runtime.restore_projection();
         runtime
@@ -453,6 +457,44 @@ impl AgentRuntime {
         let packet = self.attach_predecessor_context(packet).await?;
         let packet = self.ensure_runtime_binding(packet)?;
         let backend_kind = backend_from_packet(&packet);
+        ensure_team_backend_trusted(&packet, backend_kind)?;
+        if self
+            .pending_cancellations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&packet.agent_id)
+        {
+            let returned = cancelled_return(
+                &packet,
+                "agent cancelled before provider/backend admission".to_string(),
+            );
+            self.persist_snapshot(
+                AgentRunSnapshot {
+                    run_id: packet.run_id.clone(),
+                    agent_id: packet.agent_id.clone(),
+                    task_id: packet.task_id.clone(),
+                    session_id: packet.session_id.clone(),
+                    graph_id: packet.graph_id.clone(),
+                    node_id: packet.node_id.clone(),
+                    attempt: packet.attempt,
+                    expected_graph_revision: packet.expected_graph_revision,
+                    backend: backend_kind,
+                    status: AgentStatus::Cancelled,
+                    revision: 0,
+                    model: None,
+                    provider: None,
+                    binding: packet.binding.clone(),
+                    started_at_ms: now_ms(),
+                    updated_at_ms: now_ms(),
+                    failure: returned.failure.clone(),
+                },
+                "agent.cancelled",
+                "cancelled before backend admission",
+                None,
+                Some(returned.clone()),
+            )?;
+            return Ok(returned);
+        }
         let selection = match self.selector.select(nonempty(&packet.model_lease)) {
             Ok(selection) => selection,
             Err(error) => {
@@ -550,9 +592,50 @@ impl AgentRuntime {
             failure: None,
         };
         self.persist_snapshot(snapshot, "agent.prepared", "prepared", None, None)?;
+        if self
+            .pending_cancellations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&packet.agent_id)
+        {
+            let returned = cancelled_return(
+                &packet,
+                "agent cancelled after prepare and before backend admission".to_string(),
+            );
+            let mut cancelled = self.get(&packet.agent_id).ok_or_else(|| {
+                format!("prepared agent projection `{}` is missing", packet.agent_id)
+            })?;
+            cancelled.status = AgentStatus::Cancelled;
+            cancelled.updated_at_ms = now_ms();
+            cancelled.failure = returned.failure.clone();
+            self.persist_snapshot(
+                cancelled,
+                "agent.cancelled",
+                "cancelled before backend admission",
+                None,
+                Some(returned.clone()),
+            )?;
+            return Ok(returned);
+        }
         let mut running = self
             .get(&packet.agent_id)
             .ok_or_else(|| format!("prepared agent projection `{}` is missing", packet.agent_id))?;
+        if running.status == AgentStatus::Cancelled {
+            let returned = cancelled_return(
+                &packet,
+                "agent cancelled during backend admission".to_string(),
+            );
+            running.failure = returned.failure.clone();
+            running.updated_at_ms = now_ms();
+            self.persist_snapshot(
+                running,
+                "agent.terminal",
+                "cancelled during backend admission",
+                None,
+                Some(returned.clone()),
+            )?;
+            return Ok(returned);
+        }
         running.status = AgentStatus::Running;
         running.updated_at_ms = now_ms();
         self.persist_snapshot(running.clone(), "agent.running", "running", None, None)?;
@@ -576,9 +659,15 @@ impl AgentRuntime {
         // A cancel/shutdown command is durable lifecycle truth. Backends may
         // observe the interruption as a transport/process error, but they may
         // not overwrite a committed cancellation with `failed` or `completed`.
-        if self
-            .get(&packet.agent_id)
-            .is_some_and(|snapshot| snapshot.status == AgentStatus::Cancelled)
+        let cancellation_requested = self
+            .pending_cancellations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&packet.agent_id);
+        if cancellation_requested
+            || self
+                .get(&packet.agent_id)
+                .is_some_and(|snapshot| snapshot.status == AgentStatus::Cancelled)
         {
             returned.status = AgentTerminalStatus::Cancelled;
             returned.outcome.clear();
@@ -1045,6 +1134,45 @@ impl AgentRuntime {
         returned: Option<AgentReturnPacket>,
         evaluation: Option<AgentRunEvaluation>,
     ) -> Result<AgentCommandReceipt, String> {
+        let _lifecycle_guard = self
+            .lifecycle_lock
+            .lock()
+            .map_err(|_| "AgentRuntime lifecycle lock poisoned".to_string())?;
+        let current = self
+            .records
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&snapshot.agent_id)
+            .and_then(|record| record.snapshot.clone());
+        match current {
+            Some(current) if current.run_id == snapshot.run_id => {
+                if current.status.is_terminal() && !snapshot.status.is_terminal() {
+                    return Err(format!(
+                        "Agent lifecycle cannot regress terminal {:?} to {:?}",
+                        current.status, snapshot.status
+                    ));
+                }
+                if snapshot.revision != current.revision {
+                    return Err(format!(
+                        "Agent lifecycle transition is stale for {}: expected revision {}, actual {}",
+                        snapshot.agent_id, snapshot.revision, current.revision
+                    ));
+                }
+            }
+            Some(current) if !current.status.is_terminal() => {
+                return Err(format!(
+                    "Agent {} already owns active run {}",
+                    snapshot.agent_id, current.run_id
+                ));
+            }
+            Some(_) | None if snapshot.revision != 0 => {
+                return Err(format!(
+                    "Agent lifecycle initial transition for {} must start at revision 0",
+                    snapshot.agent_id
+                ));
+            }
+            Some(_) | None => {}
+        }
         let stream_id = agent_stream_id(&snapshot.agent_id);
         snapshot.revision = self
             .event_store
@@ -1203,6 +1331,56 @@ impl AgentTaskBackend for AgentRuntime {
     async fn execute(&self, packet: AgentTaskPacket) -> Result<AgentReturnPacket, String> {
         self.execute_task(packet).await
     }
+
+    async fn cancel(&self, packet: &AgentTaskPacket) -> Result<(), String> {
+        self.pending_cancellations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(packet.agent_id.clone());
+        let Some(snapshot) = self.get(&packet.agent_id) else {
+            return Ok(());
+        };
+        if snapshot.status.is_terminal() {
+            self.pending_cancellations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&packet.agent_id);
+            return Ok(());
+        }
+        let receipt = self
+            .command(AgentCommandRequest {
+                command_id: format!("graph-cancel:{}:{}", packet.graph_id, packet.node_id),
+                agent_id: packet.agent_id.clone(),
+                expected_revision: snapshot.revision,
+                command: AgentCommand::Cancel,
+                input: None,
+            })
+            .await;
+        if receipt.accepted
+            || receipt.reject_reason == Some(AgentCommandRejectReason::Terminal)
+            || self
+                .get(&packet.agent_id)
+                .is_some_and(|snapshot| snapshot.status == AgentStatus::Cancelled)
+        {
+            self.pending_cancellations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&packet.agent_id);
+            Ok(())
+        } else {
+            Err(format!(
+                "AgentRuntime cancel rejected for {}: {}",
+                packet.agent_id, receipt.message
+            ))
+        }
+    }
+
+    fn cancellation_finalized(&self, packet: &AgentTaskPacket) {
+        self.pending_cancellations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&packet.agent_id);
+    }
 }
 
 pub struct AgentRuntimeResolver {
@@ -1287,6 +1465,20 @@ fn backend_from_packet(packet: &AgentTaskPacket) -> AgentBackendKind {
             AgentBackendKind::ProcessJsonl
         }
         _ => AgentBackendKind::InProcess,
+    }
+}
+
+fn ensure_team_backend_trusted(
+    packet: &AgentTaskPacket,
+    backend_kind: AgentBackendKind,
+) -> Result<(), String> {
+    if packet.team_id.is_some() && backend_kind != AgentBackendKind::InProcess {
+        Err(
+            "Team acceptance/evidence/change receipts require the Cowd-native in-process Runtime backend"
+                .to_string(),
+        )
+    } else {
+        Ok(())
     }
 }
 
@@ -1406,6 +1598,15 @@ fn failed_return(packet: &AgentTaskPacket, failure: String) -> AgentReturnPacket
     )
 }
 
+fn cancelled_return(packet: &AgentTaskPacket, failure: String) -> AgentReturnPacket {
+    return_packet(
+        packet,
+        AgentTerminalStatus::Cancelled,
+        String::new(),
+        Some(failure),
+    )
+}
+
 fn return_packet(
     packet: &AgentTaskPacket,
     status: AgentTerminalStatus,
@@ -1428,13 +1629,18 @@ fn return_packet(
         acceptance: Vec::new(),
         evidence_refs: Vec::new(),
         changes: Vec::new(),
+        runtime_change_receipts: Vec::new(),
         conflicts: Vec::new(),
         unresolved: Vec::new(),
         input_tokens: 0,
         output_tokens: 0,
+        cached_tokens: 0,
         model: String::new(),
         provider: String::new(),
         tool_calls: 0,
+        duplicate_tool_calls: 0,
+        runtime_write_attempt_paths: Vec::new(),
+        runtime_observed_resource_scopes: Vec::new(),
         failure,
     }
 }
@@ -1488,13 +1694,18 @@ mod tests {
                 acceptance: vec!["verified".into()],
                 evidence_refs: Vec::new(),
                 changes: Vec::new(),
+                runtime_change_receipts: Vec::new(),
                 conflicts: Vec::new(),
                 unresolved: Vec::new(),
                 input_tokens: 3,
                 output_tokens: 2,
+                cached_tokens: 0,
                 model: selection.model,
                 provider: selection.provider,
                 tool_calls: 0,
+                duplicate_tool_calls: 0,
+                runtime_write_attempt_paths: Vec::new(),
+                runtime_observed_resource_scopes: Vec::new(),
                 failure: None,
             })
         }
@@ -1585,6 +1796,7 @@ mod tests {
             constraints: Vec::new(),
             context_refs: Vec::new(),
             evidence_refs: Vec::new(),
+            resource_scopes: Vec::new(),
             allowed_tools: Vec::new(),
             allowed_skills: Vec::new(),
             permission_lease: "read_only".into(),
@@ -1594,6 +1806,76 @@ mod tests {
             managed_invocation: None,
             idempotency_key: format!("idempotency-{agent_id}"),
         }
+    }
+
+    #[test]
+    fn process_backend_cannot_mint_team_acceptance_or_change_receipts() {
+        let mut packet = task("external-team");
+        packet.team_id = Some("team-1".to_string());
+        packet.binding.as_mut().expect("binding").executor =
+            harness_contract::agent::AgentExecutorPolicy::ProcessJsonl {
+                command_ref: "external/worker".to_string(),
+            };
+
+        let backend = backend_from_packet(&packet);
+        assert_eq!(backend, AgentBackendKind::ProcessJsonl);
+        assert!(ensure_team_backend_trusted(&packet, backend).is_err());
+    }
+
+    #[tokio::test]
+    async fn graph_cancel_before_agent_poll_persists_terminal_cancelled_without_backend_work() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("store"));
+        let runtime = AgentRuntime::new(store, configured_registry());
+        runtime.register_backend(Arc::new(CompletedBackend));
+        let packet = task("cancel-before-poll");
+
+        AgentTaskBackend::cancel(&runtime, &packet)
+            .await
+            .expect("queue graph cancellation");
+        let returned = runtime
+            .execute_task(packet.clone())
+            .await
+            .expect("cancelled return");
+
+        assert_eq!(returned.status, AgentTerminalStatus::Cancelled);
+        assert_eq!(
+            runtime
+                .get(&packet.agent_id)
+                .expect("cancelled projection")
+                .status,
+            AgentStatus::Cancelled
+        );
+        assert!(runtime
+            .events(&packet.agent_id)
+            .iter()
+            .any(|event| event.status == AgentStatus::Cancelled));
+    }
+
+    #[test]
+    fn stale_prepare_or_running_snapshot_cannot_overwrite_terminal_cancellation() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("store"));
+        let runtime = AgentRuntime::new(store, configured_registry());
+        let packet = task("cancel-cas");
+        let prepared = legacy_snapshot(&packet, AgentStatus::Prepared);
+        runtime
+            .persist_snapshot(prepared, "agent.prepared", "prepared", None, None)
+            .expect("prepare");
+        let stale_prepared = runtime.get(&packet.agent_id).expect("prepared projection");
+        let mut cancelled = stale_prepared.clone();
+        cancelled.status = AgentStatus::Cancelled;
+        runtime
+            .persist_snapshot(cancelled, "agent.command", "cancelled", None, None)
+            .expect("cancel");
+
+        let mut stale_running = stale_prepared;
+        stale_running.status = AgentStatus::Running;
+        assert!(runtime
+            .persist_snapshot(stale_running, "agent.running", "running", None, None)
+            .is_err());
+        assert_eq!(
+            runtime.get(&packet.agent_id).expect("terminal").status,
+            AgentStatus::Cancelled
+        );
     }
 
     fn legacy_snapshot(packet: &AgentTaskPacket, status: AgentStatus) -> AgentRunSnapshot {

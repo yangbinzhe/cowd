@@ -13,15 +13,15 @@
 #![allow(dead_code)]
 
 use crossterm::event::{Event, KeyCode, KeyEventKind};
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
-use ratatui::Frame;
 
 use crate::components::base::{Component, EventResult, RenderContext};
 use crate::keybind::Action;
-use crate::runtime_control_store::RuntimeControlSnapshot;
+use crate::runtime_control_store::{MfgOperationsState, RuntimeControlSnapshot};
 use crate::workbench::action_registry;
 
 // ═══════════════════════════════════════════════════════════════════
@@ -116,11 +116,7 @@ fn fuzzy_match_score(query: &str, text: &str) -> usize {
         }
     }
 
-    if matched == q.len() {
-        matched * 25
-    } else {
-        0
-    }
+    if matched == q.len() { matched * 25 } else { 0 }
 }
 
 /// Compute the combined score for a command entry against a query.
@@ -180,7 +176,7 @@ fn registry_entries_from_payload(payload: &serde_json::Value) -> Vec<CommandEntr
 }
 
 fn workbench_registry_entries() -> Vec<CommandEntry> {
-    action_registry::registered_actions()
+    let mut entries = action_registry::registered_actions()
         .into_iter()
         .map(|action| {
             CommandEntry::static_entry(
@@ -192,7 +188,22 @@ fn workbench_registry_entries() -> Vec<CommandEntry> {
                 action.action,
             )
         })
-        .collect()
+        .collect::<Vec<_>>();
+    entries.extend(
+        action_registry::registered_mfg_actions()
+            .into_iter()
+            .map(|action| {
+                CommandEntry::static_entry(
+                    action.label,
+                    format!(
+                        "{} · domain:mfg · risk:{:?} · receipt:{}",
+                        action.description, action.risk, action.receipt_target
+                    ),
+                    action.action,
+                )
+            }),
+    );
+    entries
 }
 
 fn static_entries_from_payload(payload: &serde_json::Value) -> Vec<CommandEntry> {
@@ -297,6 +308,54 @@ impl CommandPalette {
         self.run_search();
     }
 
+    pub fn sync_mfg_actions(&mut self, state: &MfgOperationsState) {
+        let canonical_ids = app_mfg_contract::mfg_tui_action_contracts()
+            .into_iter()
+            .map(|action| action.action_id.as_str().to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        self.all_commands
+            .retain(|entry| !canonical_ids.contains(&entry.name));
+        self.all_commands.extend(
+            action_registry::registered_mfg_actions()
+                .into_iter()
+                .filter_map(|action| {
+                    let contract = state
+                        .action_contracts()
+                        .into_iter()
+                        .find(|contract| contract.action_id.as_str() == action.id)?;
+                    if !state.action_is_capability_enabled(&contract) {
+                        return None;
+                    }
+                    let blocked = state.action_usability_label(&contract) == "blocked";
+                    let description = if blocked {
+                        format!(
+                            "{} · domain:mfg · risk:{:?} · receipt:{} · select a canonical target in MFG before dispatch",
+                            action.description, action.risk, action.receipt_target
+                        )
+                    } else {
+                        format!(
+                            "{} · domain:mfg · risk:{:?} · receipt:{}",
+                            action.description, action.risk, action.receipt_target
+                        )
+                    };
+                    Some(CommandEntry::static_entry(
+                        action.label,
+                        description,
+                        if blocked {
+                            // A capability-authorized action without the
+                            // current resource/CAS context remains discoverable
+                            // in the palette, but opens the operational panel
+                            // instead of issuing an invalid mutation.
+                            Action::Execute("/mfg".into())
+                        } else {
+                            action.action
+                        },
+                    ))
+                }),
+        );
+        self.run_search();
+    }
+
     // ── Registration ────────────────────────────────────────────
 
     /// Register a new command in the palette.
@@ -391,27 +450,49 @@ impl CommandPalette {
                 Action::Execute("/approvals".into()),
             ));
             if let Some(approval) = snapshot.approval_items.first() {
-                self.all_commands.push(CommandEntry::dynamic(
-                    "Approve First Pending Request",
-                    format!(
-                        "{} [{}] {}",
-                        approval.tool_name,
-                        approval.risk.as_deref().unwrap_or("unknown"),
-                        approval.input_preview
-                    ),
-                    Action::RespondGatewayApproval {
-                        id: approval.id.clone(),
-                        approved: true,
-                    },
-                ));
-                self.all_commands.push(CommandEntry::dynamic(
-                    "Reject First Pending Request",
-                    format!("Reject {}", approval.id),
-                    Action::RespondGatewayApproval {
-                        id: approval.id.clone(),
-                        approved: false,
-                    },
-                ));
+                if approval.is_mfg_source() {
+                    if let Some(review_ref) = approval
+                        .review_ref
+                        .as_deref()
+                        .filter(|review| !review.trim().is_empty())
+                    {
+                        self.all_commands.push(CommandEntry::dynamic(
+                            "Open Typed MFG Review",
+                            format!(
+                                "Review {review_ref} requires one of the governed typed decisions"
+                            ),
+                            Action::Execute(format!("/mfg review {review_ref}")),
+                        ));
+                    } else {
+                        self.all_commands.push(CommandEntry::dynamic(
+                            "Inspect Invalid MFG Approval",
+                            "MFG approval is missing its typed review reference; generic approve/reject is disabled",
+                            Action::Execute("/approvals".into()),
+                        ));
+                    }
+                } else {
+                    self.all_commands.push(CommandEntry::dynamic(
+                        "Approve First Pending Request",
+                        format!(
+                            "{} [{}] {}",
+                            approval.tool_name,
+                            approval.risk.as_deref().unwrap_or("unknown"),
+                            approval.input_preview
+                        ),
+                        Action::RespondGatewayApproval {
+                            id: approval.id.clone(),
+                            approved: true,
+                        },
+                    ));
+                    self.all_commands.push(CommandEntry::dynamic(
+                        "Reject First Pending Request",
+                        format!("Reject {}", approval.id),
+                        Action::RespondGatewayApproval {
+                            id: approval.id.clone(),
+                            approved: false,
+                        },
+                    ));
+                }
             }
         }
 
@@ -649,11 +730,7 @@ impl CommandPalette {
                 .enumerate()
                 .filter_map(|(i, entry)| {
                     let score = score_entry(query, entry);
-                    if score > 0 {
-                        Some((i, score))
-                    } else {
-                        None
-                    }
+                    if score > 0 { Some((i, score)) } else { None }
                 })
                 .collect();
 
@@ -1137,7 +1214,7 @@ mod tests {
     use super::*;
     use crate::components::RenderContext;
     use crate::skin::SkinConfig;
-    use crate::test_utils::{gateway_command_projection_fixture, MockTerminal};
+    use crate::test_utils::{MockTerminal, gateway_command_projection_fixture};
     use crossterm::event::KeyModifiers;
 
     // ── Helpers ───────────────────────────────────────────────────
@@ -1306,6 +1383,7 @@ mod tests {
                 risk: Some("high".to_string()),
                 requester: Some("session".to_string()),
                 input_preview: "rm -rf /tmp/example".to_string(),
+                ..crate::runtime_control_store::ApprovalSummary::default()
             }],
             cross_plane_grants_active: Some(3),
             cross_plane_actions_24h: Some(5),
@@ -1315,14 +1393,16 @@ mod tests {
         p.sync_runtime_actions(&snapshot);
 
         assert!(p.command_count() > before);
-        assert!(p
-            .all_commands
-            .iter()
-            .any(|entry| { entry.dynamic && entry.name == "Inspect Runtime" }));
-        assert!(p
-            .all_commands
-            .iter()
-            .any(|entry| { entry.dynamic && entry.action == Action::Execute("/tasks".into()) }));
+        assert!(
+            p.all_commands
+                .iter()
+                .any(|entry| { entry.dynamic && entry.name == "Inspect Runtime" })
+        );
+        assert!(
+            p.all_commands
+                .iter()
+                .any(|entry| { entry.dynamic && entry.action == Action::Execute("/tasks".into()) })
+        );
         assert!(p.all_commands.iter().any(|entry| {
             entry.dynamic && entry.action == Action::Execute("/approvals".into())
         }));
@@ -1351,6 +1431,117 @@ mod tests {
         assert!(p.all_commands.iter().any(|entry| {
             entry.dynamic && entry.action == Action::Execute("/cross-plane".into())
         }));
+    }
+
+    #[test]
+    fn typed_mfg_approval_never_exposes_generic_boolean_response_actions() {
+        let mut palette = setup_palette();
+        let snapshot = RuntimeControlSnapshot {
+            gateway_running: true,
+            pending_approvals: Some(1),
+            approval_items: vec![crate::runtime_control_store::ApprovalSummary {
+                id: "mfg-approval:review-1".to_string(),
+                tool_name: "mfg.report.review.typed_decision".to_string(),
+                risk: Some("high".to_string()),
+                requester: Some("mfg:cockpit-report:report-1".to_string()),
+                input_preview: "Review dead-letter report".to_string(),
+                source_kind: Some("mfg".to_string()),
+                resource_ref: Some("mfg:cockpit-report:report-1".to_string()),
+                review_ref: Some("review-1".to_string()),
+            }],
+            ..RuntimeControlSnapshot::default()
+        };
+        palette.sync_runtime_actions(&snapshot);
+        assert!(palette.all_commands.iter().any(|entry| {
+            entry.name == "Open Typed MFG Review"
+                && matches!(
+                    &entry.action,
+                    Action::Execute(command) if command == "/mfg review review-1"
+                )
+        }));
+        assert!(
+            !palette
+                .all_commands
+                .iter()
+                .any(|entry| matches!(&entry.action, Action::RespondGatewayApproval { .. }))
+        );
+
+        let malformed = RuntimeControlSnapshot {
+            gateway_running: true,
+            pending_approvals: Some(1),
+            approval_items: vec![crate::runtime_control_store::ApprovalSummary {
+                id: "mfg-approval:invalid".to_string(),
+                source_kind: Some("mfg".to_string()),
+                ..crate::runtime_control_store::ApprovalSummary::default()
+            }],
+            ..RuntimeControlSnapshot::default()
+        };
+        palette.sync_runtime_actions(&malformed);
+        assert!(
+            palette
+                .all_commands
+                .iter()
+                .any(|entry| entry.name == "Inspect Invalid MFG Approval")
+        );
+        assert!(
+            !palette
+                .all_commands
+                .iter()
+                .any(|entry| matches!(&entry.action, Action::RespondGatewayApproval { .. }))
+        );
+    }
+
+    #[test]
+    fn mfg_capability_loss_removes_actions_from_the_palette() {
+        let mut palette = setup_palette();
+        let mut state = MfgOperationsState::default();
+        state.contract = Some(app_mfg_contract::MfgFrontendContractV1 {
+            kind: "mfg.frontend_contract".to_string(),
+            contract_version: app_mfg_contract::MfgContractVersion::default(),
+            generated_at: chrono::Utc::now(),
+            app_id: "mfg.manufacturing".to_string(),
+            active_route_count: 0,
+            planned_route_count: 0,
+            routes: app_mfg_contract::mfg_route_contracts(),
+            actions: app_mfg_contract::mfg_action_contracts(),
+            surfaces: vec![app_mfg_contract::MfgSurfaceContract {
+                surface: app_mfg_contract::MfgSurfaceKind::Tui,
+                role: app_mfg_contract::MfgSurfaceRole::ConsoleOperationalControl,
+                entrypoints: vec!["/mfg".to_string()],
+                routes: app_mfg_contract::mfg_tui_route_contracts()
+                    .into_iter()
+                    .map(|route| route.route_id)
+                    .collect(),
+                actions: app_mfg_contract::mfg_tui_action_contracts()
+                    .into_iter()
+                    .map(|action| action.action_id)
+                    .collect(),
+            }],
+            granted_capabilities: vec!["mfg.read".to_string(), "mfg.alert.respond".to_string()],
+        });
+        state.granted_capabilities = vec!["mfg.read".to_string(), "mfg.alert.respond".to_string()];
+        palette.sync_mfg_actions(&state);
+        assert!(
+            palette
+                .all_commands
+                .iter()
+                .any(|entry| entry.name == "mfg.alert.resolve")
+        );
+        assert!(
+            !palette
+                .all_commands
+                .iter()
+                .any(|entry| entry.name == "mfg.assignment.complete")
+        );
+
+        state.granted_capabilities = vec!["mfg.read".to_string()];
+        palette.sync_mfg_actions(&state);
+        assert!(
+            !palette
+                .all_commands
+                .iter()
+                .any(|entry| entry.name == "mfg.alert.resolve")
+        );
     }
 
     #[test]
@@ -1482,10 +1673,11 @@ mod tests {
 
         assert_eq!(first_dynamic, 1);
         assert!(second_dynamic >= 3);
-        assert!(!p
-            .all_commands
-            .iter()
-            .any(|entry| entry.dynamic && entry.name == "Start Gateway"));
+        assert!(
+            !p.all_commands
+                .iter()
+                .any(|entry| entry.dynamic && entry.name == "Start Gateway")
+        );
     }
 
     // ── Search scoring ────────────────────────────────────────────

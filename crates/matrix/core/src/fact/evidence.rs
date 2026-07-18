@@ -2,14 +2,14 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixEvidenceSourceRef {
     pub kind: String,
     pub reference: String,
     pub summary: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixEvidencePacket {
     pub packet_id: String,
     #[serde(default)]
@@ -164,7 +164,12 @@ impl MatrixEvidencePacket {
         };
         format!(
             "MATRIX EvidencePacket {}: {}. metric_evidence={}, change_evidence={}, confidence={:.2}, missing_evidence={}",
-            self.packet_id, self.problem_statement, metric_count, change_count, self.confidence, missing
+            self.packet_id,
+            self.problem_statement,
+            metric_count,
+            change_count,
+            self.confidence,
+            missing
         )
     }
 }

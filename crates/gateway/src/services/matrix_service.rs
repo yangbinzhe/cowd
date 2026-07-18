@@ -72,6 +72,16 @@ impl MatrixService {
         self.envelope("repository")
     }
 
+    pub(crate) fn resource_revision(
+        &self,
+        config_home: impl AsRef<Path>,
+        resource_kind: &str,
+        resource_id: &str,
+    ) -> Result<u64, GatewayMatrixRepositoryError> {
+        self.sqlite_repository(config_home)?
+            .resource_revision_for_existing(resource_kind, resource_id)
+    }
+
     pub(crate) fn repository_health(
         &self,
         config_home: impl AsRef<Path>,
@@ -93,6 +103,17 @@ impl MatrixService {
     ) -> Result<MatrixSourcePack, GatewayMatrixRepositoryError> {
         self.sqlite_repository(config_home)?
             .upsert_source_pack(source_pack)
+    }
+
+    pub(crate) fn upsert_source_pack_checked(
+        &self,
+        config_home: impl AsRef<Path>,
+        source_pack: MatrixSourcePack,
+        expected_revision: Option<u64>,
+    ) -> Result<matrix_repository::MatrixRevisioned<MatrixSourcePack>, GatewayMatrixRepositoryError>
+    {
+        self.sqlite_repository(config_home)?
+            .upsert_source_pack_checked(source_pack, expected_revision)
     }
 
     pub(crate) fn list_source_packs(
@@ -301,6 +322,10 @@ impl MatrixService {
             raw_checksum: Some(batch.checksum.clone()),
             metric_ids: Vec::new(),
         })?;
+        // A connector batch is an applied ingestion, unlike the public
+        // ingest-plan preview endpoint.  Advance its durable watermark only
+        // after source rows and their snapshot committed successfully.
+        repository.commit_data_plane_ingest(&plan)?;
         let receipt_id = stable_receipt_id(&[
             batch.adapter_id.as_str(),
             batch.resource_ref.as_str(),
@@ -366,6 +391,17 @@ impl MatrixService {
         self.sqlite_repository(config_home)?.upsert_entity(entity)
     }
 
+    pub(crate) fn upsert_entity_checked(
+        &self,
+        config_home: impl AsRef<Path>,
+        entity: &MatrixEntity,
+        expected_revision: Option<u64>,
+    ) -> Result<matrix_repository::MatrixRevisioned<MatrixEntity>, GatewayMatrixRepositoryError>
+    {
+        self.sqlite_repository(config_home)?
+            .upsert_entity_checked(entity, expected_revision)
+    }
+
     pub(crate) fn get_entity(
         &self,
         config_home: impl AsRef<Path>,
@@ -419,6 +455,17 @@ impl MatrixService {
     ) -> Result<MatrixRelation, GatewayMatrixRepositoryError> {
         self.sqlite_repository(config_home)?
             .upsert_relation(relation)
+    }
+
+    pub(crate) fn upsert_relation_checked(
+        &self,
+        config_home: impl AsRef<Path>,
+        relation: &MatrixRelation,
+        expected_revision: Option<u64>,
+    ) -> Result<matrix_repository::MatrixRevisioned<MatrixRelation>, GatewayMatrixRepositoryError>
+    {
+        self.sqlite_repository(config_home)?
+            .upsert_relation_checked(relation, expected_revision)
     }
 
     pub(crate) fn list_entity_relations(
@@ -510,6 +557,19 @@ impl MatrixService {
     ) -> Result<MatrixMetricDependency, GatewayMatrixRepositoryError> {
         self.sqlite_repository(config_home)?
             .upsert_metric_dependency(dependency)
+    }
+
+    pub(crate) fn upsert_metric_dependency_checked(
+        &self,
+        config_home: impl AsRef<Path>,
+        dependency: &MatrixMetricDependency,
+        expected_revision: Option<u64>,
+    ) -> Result<
+        matrix_repository::MatrixRevisioned<MatrixMetricDependency>,
+        GatewayMatrixRepositoryError,
+    > {
+        self.sqlite_repository(config_home)?
+            .upsert_metric_dependency_checked(dependency, expected_revision)
     }
 
     pub(crate) fn metrics_affected_by_fact_type(
@@ -707,6 +767,16 @@ impl MatrixService {
             .evaluate_evidence_quality(packet_id)
     }
 
+    pub(crate) fn evaluate_evidence_quality_with_gate_id(
+        &self,
+        config_home: impl AsRef<Path>,
+        packet_id: &str,
+        gate_id: &str,
+    ) -> Result<MatrixQualityGateDecision, GatewayMatrixRepositoryError> {
+        self.sqlite_repository(config_home)?
+            .evaluate_evidence_quality_with_gate_id(packet_id, gate_id)
+    }
+
     pub(crate) fn get_quality_gate(
         &self,
         config_home: impl AsRef<Path>,
@@ -843,15 +913,19 @@ mod tests {
             .expect("bridge ingest");
 
         assert!(!attention.is_empty());
-        assert!(!service
-            .list_source_packs(&config_home, 10)
-            .expect("source packs")
-            .is_empty());
-        assert!(service
-            .list_facts(&config_home, 10)
-            .expect("facts")
-            .iter()
-            .any(|fact| fact.fact_type.starts_with("knowledge_")));
+        assert!(
+            !service
+                .list_source_packs(&config_home, 10)
+                .expect("source packs")
+                .is_empty()
+        );
+        assert!(
+            service
+                .list_facts(&config_home, 10)
+                .expect("facts")
+                .iter()
+                .any(|fact| fact.fact_type.starts_with("knowledge_"))
+        );
         let _ = std::fs::remove_dir_all(config_home);
     }
 
@@ -899,22 +973,30 @@ mod tests {
             .expect("source batch receipt");
 
         assert_eq!(receipt.row_count, 1);
-        assert!(receipt
-            .matrix_refs
-            .iter()
-            .any(|value| value.starts_with("matrix:source_pack:")));
-        assert!(!service
-            .list_source_packs(&config_home, 10)
-            .expect("source packs")
-            .is_empty());
-        assert!(!service
-            .list_source_snapshots(&config_home, None, 10)
-            .expect("snapshots")
-            .is_empty());
-        assert!(!service
-            .list_data_plane_watermarks(&config_home, 10)
-            .expect("watermarks")
-            .is_empty());
+        assert!(
+            receipt
+                .matrix_refs
+                .iter()
+                .any(|value| value.starts_with("matrix:source_pack:"))
+        );
+        assert!(
+            !service
+                .list_source_packs(&config_home, 10)
+                .expect("source packs")
+                .is_empty()
+        );
+        assert!(
+            !service
+                .list_source_snapshots(&config_home, None, 10)
+                .expect("snapshots")
+                .is_empty()
+        );
+        assert!(
+            !service
+                .list_data_plane_watermarks(&config_home, 10)
+                .expect("watermarks")
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(config_home);
     }
 }

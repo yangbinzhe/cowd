@@ -86,6 +86,11 @@ impl NodeExecutionOutcome {
 #[async_trait]
 pub trait NodeExecutor: Send + Sync {
     fn kind(&self) -> &str;
+    /// Whether cancelling the current attempt and starting a new attempt on
+    /// Resume preserves this executor's durable semantics.
+    fn supports_resumable_pause(&self) -> bool {
+        true
+    }
     fn validate(&self, node: &ExecutionNodeSpec) -> Result<(), NodeExecutorError>;
     async fn start(
         &self,
@@ -103,6 +108,10 @@ pub trait NodeExecutor: Send + Sync {
     async fn cancel(&self, _ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
         Ok(())
     }
+    /// Release process-local cancellation intent after the graph command has
+    /// either committed or definitively failed. Implementations must not
+    /// mutate durable graph state from this callback.
+    fn cancellation_finalized(&self, _ticket: &NodeExecutionTicket) {}
     async fn recover(
         &self,
         ticket: &NodeExecutionTicket,

@@ -1,5 +1,6 @@
 use harness_eval::{
-    default_report_root, run_eval, run_paired_performance, terminal_gate_report_with_report,
+    default_report_root, run_auto_strategy_paired, run_eval, run_paired_performance,
+    terminal_gate_report_with_report, write_auto_strategy_report, AutoStrategyPairedOptions,
     HarnessEvalLevel, HarnessEvalReportStore, HarnessEvalRunnerOptions, PairedPerformanceOptions,
 };
 use std::{path::PathBuf, time::Duration};
@@ -24,6 +25,56 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     match args.first().map(String::as_str) {
+        Some("auto-strategy-paired") => {
+            let output = PathBuf::from(required_option(&args[1..], "--output")?);
+            let repetitions = option_value(&args[1..], "--repetitions")
+                .as_deref()
+                .unwrap_or("3")
+                .parse::<usize>()
+                .map_err(|_| "--repetitions must be an integer".to_string())?;
+            let timeout_secs = option_value(&args[1..], "--timeout-secs")
+                .as_deref()
+                .unwrap_or("900")
+                .parse::<u64>()
+                .map_err(|_| "--timeout-secs must be an integer".to_string())?;
+            let poll_interval_ms = option_value(&args[1..], "--poll-interval-ms")
+                .as_deref()
+                .unwrap_or("50")
+                .parse::<u64>()
+                .map_err(|_| "--poll-interval-ms must be an integer".to_string())?;
+            let report = run_auto_strategy_paired(AutoStrategyPairedOptions {
+                direct_url: option_value(&args[1..], "--direct-url")
+                    .unwrap_or_else(|| "http://127.0.0.1:18652".to_string()),
+                parallel_url: option_value(&args[1..], "--parallel-url")
+                    .unwrap_or_else(|| "http://127.0.0.1:18653".to_string()),
+                auto_url: option_value(&args[1..], "--auto-url")
+                    .unwrap_or_else(|| "http://127.0.0.1:18654".to_string()),
+                provider: required_option(&args[1..], "--provider")?,
+                judge_model: required_option(&args[1..], "--judge-model")?,
+                output: output.clone(),
+                corpus: PathBuf::from(option_value(&args[1..], "--corpus").unwrap_or_else(|| {
+                    "crates/harness-eval/corpora/auto-strategy-v1.json".to_string()
+                })),
+                rubric: PathBuf::from(option_value(&args[1..], "--rubric").unwrap_or_else(|| {
+                    "crates/harness-eval/rubrics/auto-strategy-rubric-v1.json".to_string()
+                })),
+                repetitions,
+                timeout: Duration::from_secs(timeout_secs),
+                poll_interval: Duration::from_millis(poll_interval_ms.max(1)),
+                token: std::env::var("COWD_API_TOKEN").ok(),
+                allow_real_model: args.iter().any(|value| value == "--allow-real-model"),
+            })?;
+            write_auto_strategy_report(&output, &report)?;
+            println!("auto-strategy-paired-report: {}", output.display());
+            if report["status"] != "passed" {
+                return Err(format!(
+                    "auto strategy proof gate is {}; see {}",
+                    report["status"].as_str().unwrap_or("failed"),
+                    output.display()
+                ));
+            }
+            return Ok(());
+        }
         Some("paired-performance") => {
             let baseline_url = required_option(&args[1..], "--baseline-url")?;
             let candidate_url = required_option(&args[1..], "--candidate-url")?;
@@ -158,7 +209,7 @@ fn run() -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "Usage:\n  harness-eval quick [--budget low]\n  harness-eval full [--budget full]\n  harness-eval deep-real --provider <model> --budget full --allow-real-model\n  harness-eval paired-performance --baseline-url <url> --candidate-url <url> --provider <model> --output <path> [--pairs 5] [--timeout-secs 600] [--poll-interval-ms 20]\n  harness-eval review-report --run-dir <dir> [--provider <model>] [--allow-real-model]\n  harness-eval terminal-gate [--evidence-dir <dir>] [--report-json <path>]"
+        "Usage:\n  harness-eval quick [--budget low]\n  harness-eval full [--budget full]\n  harness-eval deep-real --provider <model> --budget full --allow-real-model\n  harness-eval auto-strategy-paired --provider <model> --judge-model <model> --output <path> --allow-real-model [--direct-url http://127.0.0.1:18652] [--parallel-url http://127.0.0.1:18653] [--auto-url http://127.0.0.1:18654] [--repetitions 3]\n  harness-eval paired-performance --baseline-url <url> --candidate-url <url> --provider <model> --output <path> [--pairs 5] [--timeout-secs 600] [--poll-interval-ms 20]\n  harness-eval review-report --run-dir <dir> [--provider <model>] [--allow-real-model]\n  harness-eval terminal-gate [--evidence-dir <dir>] [--report-json <path>]"
     );
 }
 
@@ -169,7 +220,7 @@ fn option_value(args: &[String], key: &str) -> Option<String> {
 }
 
 fn required_option(args: &[String], key: &str) -> Result<String, String> {
-    option_value(args, key).ok_or_else(|| format!("paired-performance requires {key} <value>"))
+    option_value(args, key).ok_or_else(|| format!("command requires {key} <value>"))
 }
 
 fn default_config_home() -> PathBuf {

@@ -79,7 +79,8 @@ where
         roles: vec![
             TeamRoleDefinition {
                 role_id: "implementer".to_string(),
-                responsibility: "Plan, implement, and provide verification evidence".to_string(),
+                responsibility: "Plan, implement, and provide source-level verification evidence"
+                    .to_string(),
                 agent_definition_id: execute.clone(),
                 agent_selector: RevisionSelector::ExactApprovedRevision { revision: 1 },
                 cardinality: RoleCardinalityPolicy::Fixed { count: 1 },
@@ -88,11 +89,13 @@ where
                     AgentCapability::Read,
                     AgentCapability::Search,
                     AgentCapability::Write,
-                    AgentCapability::Test,
                 ],
                 task_contract: TeamRoleTaskContract {
                     contract_ref: "builtin/execute@1".to_string(),
-                    acceptance: vec!["implementation".to_string(), "verification".to_string()],
+                    acceptance: vec![
+                        "implementation".to_string(),
+                        "source_verification".to_string(),
+                    ],
                 },
             },
             TeamRoleDefinition {
@@ -106,7 +109,11 @@ where
                 grant_ceiling: vec![AgentCapability::Read],
                 task_contract: TeamRoleTaskContract {
                     contract_ref: "builtin/review@1".to_string(),
-                    acceptance: vec!["review".to_string(), "evidence".to_string()],
+                    acceptance: vec![
+                        "review".to_string(),
+                        "evidence".to_string(),
+                        "risks".to_string(),
+                    ],
                 },
             },
         ],
@@ -117,6 +124,9 @@ where
         result_contract: TeamResultContract {
             required_fields: vec![
                 "summary".to_string(),
+                "implementation".to_string(),
+                "source_verification".to_string(),
+                "review".to_string(),
                 "evidence".to_string(),
                 "risks".to_string(),
             ],

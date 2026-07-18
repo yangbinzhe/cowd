@@ -308,7 +308,17 @@ impl ExecutionLiveStore {
         session_id: &str,
     ) -> SessionExecutionIndexProjection {
         let mut records = self.records_for_session(session_id);
-        records.sort_by_key(|record| record.live.updated_at_ms);
+        // Millisecond timestamps can tie when an execution is queued and
+        // completed in the same scheduler tick. Revision is the authoritative
+        // in-execution ordering signal, so use it before the stable identity
+        // tie-breaker instead of exposing an older running record as latest.
+        records.sort_by(|left, right| {
+            left.live
+                .updated_at_ms
+                .cmp(&right.live.updated_at_ms)
+                .then_with(|| left.live.revision.cmp(&right.live.revision))
+                .then_with(|| left.execution_id.cmp(&right.execution_id))
+        });
         let latest = records.last();
         SessionExecutionIndexProjection {
             session_id: session_id.to_string(),

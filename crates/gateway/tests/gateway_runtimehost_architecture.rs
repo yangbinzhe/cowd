@@ -268,12 +268,15 @@ fn assert_root_rs_files(src: &str, allowed: &[&str]) {
 #[test]
 fn runtime_host_owns_gateway_runtime_implementation() {
     let root = repo_root();
-    assert!(root
-        .join("crates/gateway/src/runtime_host/mod.rs")
-        .is_file());
-    assert!(!root
-        .join("crates/gateway/src/runtime_host/commands.rs")
-        .exists());
+    assert!(
+        root.join("crates/gateway/src/runtime_host/mod.rs")
+            .is_file()
+    );
+    assert!(
+        !root
+            .join("crates/gateway/src/runtime_host/commands.rs")
+            .exists()
+    );
     let source = production_part(&read_repo("crates/gateway/src/runtime_host/mod.rs")).to_string();
     assert!(source.contains("pub struct RuntimeHostConfig"));
     assert!(source.contains("pub async fn run_gateway_runtime"));
@@ -328,7 +331,7 @@ fn production_turns_enter_the_execution_graph_host_once() {
     // surface can attach to its durable cursor before provider work starts.
     // That is the canonical execution path; `start(graph)` is only a
     // convenience wrapper and must not be required by this architecture test.
-    assert!(host.contains("let registered = services"));
+    assert!(host.contains("let mut registered = services"));
     assert!(host.contains(".graph_runner()\n                .register(graph)"));
     assert!(host.contains(".run_until_quiescent(&registered.id)"));
     assert!(host.contains("ExecutionGraphCompiler"));
@@ -390,7 +393,7 @@ fn approval_api_uses_workspace_runtime_queue_for_decisions() {
     let source = production_part(&full_source);
     assert!(source.contains("runtime_services"));
     assert!(source.contains("approval_queue()"));
-    assert!(source.contains(".pending()"));
+    assert!(source.contains(".list()"));
     assert!(source.contains(".decide("));
     for forbidden in [
         "get_pending_requests",
@@ -695,9 +698,8 @@ fn message_connector_contracts_drive_gateway_surface_readiness() {
     ))
     .to_string();
     assert!(
-        message_connector_routes.contains(
-            "use surface::message::{message_connector_required_fields, MessageConnectorContract};"
-        ),
+        message_connector_routes.contains("MessageConnectorContract")
+            && message_connector_routes.contains("message_connector_required_fields"),
         "gateway message readiness routes must consume message connector contract"
     );
     assert!(

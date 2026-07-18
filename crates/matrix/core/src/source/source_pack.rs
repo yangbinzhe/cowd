@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixSourcePack {
     pub source_pack_id: String,
     pub source_name: String,
@@ -35,14 +35,14 @@ fn unix_epoch() -> DateTime<Utc> {
     DateTime::<Utc>::UNIX_EPOCH
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixSourceEntityMapping {
     pub source_entity: String,
     pub matrix_entity_type: String,
     pub source_key_field: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixSourceFactMapping {
     pub source_table: String,
     pub fact_type: String,
@@ -57,7 +57,7 @@ pub struct MatrixSourceFactMapping {
     pub delta_signature: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixSourceRelationMapping {
     pub source_table: String,
     pub relation_type: String,
@@ -68,7 +68,7 @@ pub struct MatrixSourceRelationMapping {
     pub dedup_key: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixSourcePackValidation {
     pub source_pack_id: String,
     pub status: String,
@@ -79,7 +79,7 @@ pub struct MatrixSourcePackValidation {
     pub validated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixSourceDeltaPlan {
     pub source_pack_id: String,
     #[serde(default)]

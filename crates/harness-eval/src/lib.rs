@@ -24,6 +24,7 @@ use runtime::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+mod auto_strategy_paired;
 mod evolution;
 mod live_scenario_runner;
 mod paired_performance;
@@ -35,6 +36,9 @@ mod runner;
 mod terminal_gate;
 mod terminal_matrix;
 
+pub use auto_strategy_paired::{
+    run_auto_strategy_paired, write_auto_strategy_report, AutoStrategyPairedOptions,
+};
 pub use evolution::{
     evaluate_evolution_closure, DefinitionEvolutionEvalRunner, DefinitionEvolutionScenarioCatalog,
     DefinitionEvolutionScenarioExecutor, DefinitionEvolutionWorkload, EvolutionClosureReport,
@@ -2753,9 +2757,9 @@ mod tests {
                     .and_then(Value::as_str)
                     .is_some()
             })));
-        assert!(reality_context_eval_specs().iter().all(|spec| {
-            expected_patterns.contains(&spec.expected_pattern)
-        }));
+        assert!(reality_context_eval_specs()
+            .iter()
+            .all(|spec| { expected_patterns.contains(&spec.expected_pattern) }));
     }
 
     #[test]

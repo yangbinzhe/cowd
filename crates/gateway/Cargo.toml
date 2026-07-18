@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 harness-contract = { path = "../harness-contract" }
+app-mfg-contract = { path = "../app-mfg-contract" }
 auth-broker = { path = "../auth-broker" }
 harness-eval = { path = "../harness-eval" }
 fact-kernel = { path = "../fact-kernel" }
@@ -41,6 +42,7 @@ provider = { path = "../provider" }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 serde_yaml.workspace = true
+schemars.workspace = true
 session = { path = "../session" }
 mcp = { path = "../mcp" }
 matrix-core = { path = "../matrix/core" }

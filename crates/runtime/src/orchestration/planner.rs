@@ -1,18 +1,18 @@
 use harness_contract::core::{ExecutionModifier, ExecutionPattern, TaskComplexity, TaskRisk};
 use harness_contract::strategy::{
-    understand, StrategyInput, StrategyProposal, TaskDuration, TaskUnderstanding,
+    StrategyInput, StrategyProposal, TaskDuration, TaskUnderstanding, understand,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::execution_core::deliberation::DeliberationPlan;
 use crate::execution_core::pattern_catalog::ExecutionPatternCatalog;
 use crate::execution_core::rewoo_plan::{
-    rewoo_plan_for_intent_with_evidence_plan, RewooEvidencePlan,
+    RewooEvidencePlan, rewoo_plan_for_intent_with_evidence_plan,
 };
 use crate::execution_core::strategy_decision::{
     RuntimeExecutionDecision, StrategyDecisionEngine, StrategyResourceHealth,
 };
-use crate::execution_core::tool_dag::{tool_dag_from_rewoo, ToolDagPlan};
+use crate::execution_core::tool_dag::{ToolDagPlan, tool_dag_from_rewoo};
 use crate::orchestration::request::RuntimeOrchestrationRequest;
 use crate::{CollaborationDecision, CollaborationTemplateMatcher};
 
@@ -111,10 +111,13 @@ fn understanding_with_action_signal(
             promote_complexity(&mut understanding, TaskComplexity::Moderate);
         }
         Action::RequestTeam => {
-            understanding.requests_multi_agent = true;
-            understanding.requests_parallelism = true;
-            understanding.independent_workstreams = understanding.independent_workstreams.max(2);
-            promote_complexity(&mut understanding, TaskComplexity::Complex);
+            if !understanding.forbids_team {
+                understanding.requests_multi_agent = true;
+                understanding.requests_parallelism = true;
+                understanding.independent_workstreams =
+                    understanding.independent_workstreams.max(2);
+                promote_complexity(&mut understanding, TaskComplexity::Complex);
+            }
         }
         Action::RequestDeliberation => {
             understanding.requests_deliberation = true;

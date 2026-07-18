@@ -29,7 +29,10 @@ pub(super) async fn append_mfg_execution_outcome(
         outcome.created_at.timestamp_millis().max(0) as u64,
     );
     store
-        .append_session_domain_event_allocating_sequence(&event)
+        .append_session_domain_events_if_checkpoint_absent(
+            &[event],
+            &format!("mfg-outcome:{}", outcome.outcome_id),
+        )
         .await
         .map(|_| ())
         .map_err(|error| error.to_string())

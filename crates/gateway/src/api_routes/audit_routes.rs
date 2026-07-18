@@ -1,13 +1,13 @@
 use std::{collections::HashMap, sync::Arc};
 
 use axum::{
-    extract::{Query, State as AxumState},
+    Json, Router,
+    extract::{Extension, Query, State as AxumState},
     response::IntoResponse,
     routing::get,
-    Json, Router,
 };
 
-use super::AppState;
+use super::{AppState, AuthenticatedPrincipal};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new().route("/api/audit/export", get(audit_export_handler))
@@ -15,6 +15,7 @@ pub(super) fn router() -> Router<Arc<AppState>> {
 
 async fn audit_export_handler(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let limit = params
@@ -31,7 +32,11 @@ async fn audit_export_handler(
     let include_memory = matches!(source, "all" | "memory");
 
     let (approval, approval_total) = if include_approval {
-        let approval = state.services.approval.history(limit + offset, 0).await;
+        let approval = state
+            .services
+            .approval
+            .history(limit + offset, 0, &principal.0)
+            .await;
         let items = approval.as_array().cloned().unwrap_or_default();
         let total = items.len();
         (items, total)

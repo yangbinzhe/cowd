@@ -7,14 +7,16 @@ use harness_contract::execution_graph::{
 };
 
 use crate::execution_core::graph::{
-    NodeExecutionContext, NodeExecutionOutcome, NodeExecutionTicket, NodeExecutor,
-    NodeExecutorError,
+    ExecutionGraphStateStore, NodeExecutionContext, NodeExecutionOutcome, NodeExecutionTicket,
+    NodeExecutor, NodeExecutorError,
 };
 use crate::validate_agent_return;
 
 #[async_trait]
 pub trait AgentTaskBackend: Send + Sync {
     async fn execute(&self, packet: AgentTaskPacket) -> Result<AgentReturnPacket, String>;
+    async fn cancel(&self, packet: &AgentTaskPacket) -> Result<(), String>;
+    fn cancellation_finalized(&self, packet: &AgentTaskPacket);
 }
 
 pub trait AgentTaskBackendResolver: Send + Sync {
@@ -24,6 +26,7 @@ pub trait AgentTaskBackendResolver: Send + Sync {
 /// Stable AgentTask executor resolved from the persistent packet wire.
 pub struct AgentTaskExecutor {
     resolvers: RwLock<Vec<Arc<dyn AgentTaskBackendResolver>>>,
+    state_store: RwLock<Option<ExecutionGraphStateStore>>,
 }
 
 impl AgentTaskExecutor {
@@ -33,7 +36,17 @@ impl AgentTaskExecutor {
     pub fn new() -> Self {
         Self {
             resolvers: RwLock::new(Vec::new()),
+            state_store: RwLock::new(None),
         }
+    }
+
+    #[must_use]
+    pub fn with_state_store(self, state_store: ExecutionGraphStateStore) -> Self {
+        *self
+            .state_store
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(state_store);
+        self
     }
 
     pub fn install_resolver(&self, resolver: Arc<dyn AgentTaskBackendResolver>) {
@@ -54,6 +67,13 @@ impl Default for AgentTaskExecutor {
 impl NodeExecutor for AgentTaskExecutor {
     fn kind(&self) -> &str {
         Self::KIND
+    }
+
+    fn supports_resumable_pause(&self) -> bool {
+        // AgentRuntime owns a terminal run identity. Its Cancel command cannot
+        // be resumed as the same run, so GraphRunner must reject active Pause
+        // instead of publishing a false Paused state.
+        false
     }
 
     fn validate(&self, node: &ExecutionNodeSpec) -> Result<(), NodeExecutorError> {
@@ -101,11 +121,111 @@ impl NodeExecutor for AgentTaskExecutor {
         &self,
         ticket: &NodeExecutionTicket,
     ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
-        let packet: AgentTaskPacket =
+        let mut packet: AgentTaskPacket =
             serde_json::from_str(&ticket.payload_ref).map_err(|error| NodeExecutorError::Poll {
                 node_id: ticket.node_id.clone(),
                 reason: format!("persistent AgentTaskPacket is invalid: {error}"),
             })?;
+        if packet.team_id.is_some() {
+            let state_store = self
+                .state_store
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .ok_or_else(|| NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason: "Team AgentTask execution has no durable graph state reader".into(),
+                })?;
+            let graph = state_store
+                .load_async(ticket.graph_id.clone())
+                .await
+                .map_err(|error| NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason: format!("load Team predecessor evidence: {error}"),
+                })?;
+            let predecessor_ids = graph
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.to == ticket.node_id
+                        && edge.kind
+                            == harness_contract::execution_graph::ExecutionEdgeKind::DependsOn
+                        && graph.nodes.iter().any(|node| {
+                            node.id == edge.from
+                                && node.kind
+                                    == harness_contract::execution_graph::ExecutionNodeKind::AgentTask
+                        })
+                })
+                .map(|edge| edge.from.clone())
+                .collect::<Vec<_>>();
+            let mut upstream_summaries = Vec::new();
+            let mut upstream_changes = Vec::new();
+            for predecessor_id in predecessor_ids {
+                if graph.node_statuses.get(&predecessor_id) != Some(&ExecutionNodeStatus::Completed)
+                {
+                    return Err(NodeExecutorError::Poll {
+                        node_id: ticket.node_id.clone(),
+                        reason: format!(
+                            "Team predecessor `{predecessor_id}` is not durably completed"
+                        ),
+                    });
+                }
+                let predecessor = graph.node_results.get(&predecessor_id).ok_or_else(|| {
+                    NodeExecutorError::Poll {
+                        node_id: ticket.node_id.clone(),
+                        reason: format!(
+                            "Team predecessor `{predecessor_id}` has no committed result"
+                        ),
+                    }
+                })?;
+                packet.evidence_refs.extend(
+                    predecessor
+                        .evidence_refs
+                        .iter()
+                        .filter(|evidence| evidence.is_durable())
+                        .cloned(),
+                );
+                upstream_changes.extend(predecessor.evidence_refs.iter().filter_map(|evidence| {
+                    (evidence.evidence_ref.0.ref_type == "runtime_change")
+                        .then(|| evidence.evidence_ref.0.id.clone())
+                }));
+                if let Some(summary) = predecessor
+                    .summary
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|summary| !summary.is_empty())
+                {
+                    upstream_summaries.push(format!("{predecessor_id}: {summary}"));
+                }
+            }
+            packet.evidence_refs.sort_by(|left, right| {
+                left.evidence_ref
+                    .0
+                    .ref_type
+                    .cmp(&right.evidence_ref.0.ref_type)
+                    .then_with(|| left.evidence_ref.0.id.cmp(&right.evidence_ref.0.id))
+            });
+            packet
+                .evidence_refs
+                .dedup_by(|left, right| left.evidence_ref == right.evidence_ref);
+            if !upstream_summaries.is_empty() {
+                packet.objective.push_str(
+                    "\n\n## Runtime-committed upstream role outcomes\nConsume these durable predecessor outcomes and independently verify them:\n",
+                );
+                packet.objective.push_str(&upstream_summaries.join("\n"));
+                packet.constraints.push(format!(
+                    "upstream_committed_evidence_count:{}",
+                    packet.evidence_refs.len()
+                ));
+            }
+            upstream_changes.sort();
+            upstream_changes.dedup();
+            packet.constraints.extend(
+                upstream_changes
+                    .into_iter()
+                    .map(|scope| format!("upstream_change_scope:{scope}")),
+            );
+        }
         let backend = self
             .resolvers
             .read()
@@ -143,6 +263,31 @@ impl NodeExecutor for AgentTaskExecutor {
                 retryable: false,
                 evidence_refs: returned.evidence_refs.clone(),
             });
+        let usage = agent_execution_usage(&returned);
+        let mut evidence_refs = returned.evidence_refs;
+        evidence_refs.extend(returned.acceptance.iter().map(|criterion| {
+            harness_contract::context::EvidenceAccessRef::unavailable(
+                harness_contract::context::EvidenceRef::new(
+                    "runtime_acceptance",
+                    acceptance_marker_id(&packet.node_id, criterion),
+                ),
+                "application/vnd.cowd.runtime-acceptance+json",
+                format!("execution-node:{}", packet.node_id),
+            )
+        }));
+        evidence_refs.extend(
+            returned
+                .runtime_change_receipts
+                .iter()
+                .filter_map(|receipt| {
+                    let encoded = serde_json::to_string(receipt).ok()?;
+                    Some(harness_contract::context::EvidenceAccessRef::unavailable(
+                        harness_contract::context::EvidenceRef::new("runtime_change", encoded),
+                        "application/vnd.cowd.runtime-change+json",
+                        format!("execution-node:{}", packet.node_id),
+                    ))
+                }),
+        );
         Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
             status,
             result_ref: Some(format!(
@@ -158,18 +303,73 @@ impl NodeExecutor for AgentTaskExecutor {
             )),
             summary: (!returned.outcome.trim().is_empty())
                 .then(|| bounded_semantic_summary(&returned.outcome)),
-            evidence_refs: returned.evidence_refs,
+            evidence_refs,
             failure,
-            usage: ExecutionUsage {
-                model: (!returned.model.trim().is_empty()).then(|| returned.model.clone()),
-                input_tokens: returned.input_tokens,
-                output_tokens: returned.output_tokens,
-                tool_calls: returned.tool_calls,
-                ..ExecutionUsage::default()
-            },
+            usage,
             finished_at_ms: crate::tool_invocation::now_ms(),
         }))
     }
+
+    async fn cancel(&self, ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
+        let packet: AgentTaskPacket =
+            serde_json::from_str(&ticket.payload_ref).map_err(|error| NodeExecutorError::Poll {
+                node_id: ticket.node_id.clone(),
+                reason: format!("persistent AgentTaskPacket is invalid during cancel: {error}"),
+            })?;
+        let backend = self
+            .resolvers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find_map(|resolver| resolver.resolve(&packet))
+            .ok_or_else(|| NodeExecutorError::Unavailable {
+                executor_kind: Self::KIND.into(),
+                node_id: ticket.node_id.clone(),
+            })?;
+        backend
+            .cancel(&packet)
+            .await
+            .map_err(|reason| NodeExecutorError::Poll {
+                node_id: ticket.node_id.clone(),
+                reason,
+            })
+    }
+
+    fn cancellation_finalized(&self, ticket: &NodeExecutionTicket) {
+        let Ok(packet) = serde_json::from_str::<AgentTaskPacket>(&ticket.payload_ref) else {
+            return;
+        };
+        let backend = self
+            .resolvers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find_map(|resolver| resolver.resolve(&packet));
+        if let Some(backend) = backend {
+            backend.cancellation_finalized(&packet);
+        }
+    }
+}
+
+fn agent_execution_usage(returned: &AgentReturnPacket) -> ExecutionUsage {
+    ExecutionUsage {
+        model: (!returned.model.trim().is_empty()).then(|| returned.model.clone()),
+        input_tokens: returned.input_tokens,
+        output_tokens: returned.output_tokens,
+        cached_tokens: returned.cached_tokens,
+        tool_calls: returned.tool_calls,
+        duplicate_tool_calls: returned.duplicate_tool_calls,
+        runtime_write_attempt_paths: returned.runtime_write_attempt_paths.clone(),
+        runtime_observed_resource_scopes: returned.runtime_observed_resource_scopes.clone(),
+        ..ExecutionUsage::default()
+    }
+}
+
+#[must_use]
+pub(crate) fn acceptance_marker_id(node_id: &str, criterion: &str) -> String {
+    format!("{node_id}:{criterion}")
 }
 
 fn bounded_semantic_summary(value: &str) -> String {
@@ -240,6 +440,7 @@ mod tests {
             constraints: Vec::new(),
             context_refs: Vec::new(),
             evidence_refs: Vec::new(),
+            resource_scopes: Vec::new(),
             allowed_tools: Vec::new(),
             allowed_skills: Vec::new(),
             permission_lease: "permission-1".into(),
@@ -268,13 +469,18 @@ mod tests {
             acceptance: vec!["reviewed".into()],
             evidence_refs: Vec::new(),
             changes: Vec::new(),
+            runtime_change_receipts: Vec::new(),
             conflicts: Vec::new(),
             unresolved: Vec::new(),
             input_tokens: 10,
             output_tokens: 5,
+            cached_tokens: 0,
             model: "test".into(),
             provider: "test".into(),
             tool_calls: 0,
+            duplicate_tool_calls: 0,
+            runtime_write_attempt_paths: Vec::new(),
+            runtime_observed_resource_scopes: Vec::new(),
             failure: None,
         }
     }
@@ -294,6 +500,19 @@ mod tests {
     fn accepts_complete_bound_return_packet() {
         let task = task();
         validate_agent_return(&task, &returned(&task)).expect("valid return packet");
+    }
+
+    #[test]
+    fn duplicate_tool_telemetry_survives_the_agent_return_to_graph_usage_boundary() {
+        let task = task();
+        let mut returned = returned(&task);
+        returned.tool_calls = 5;
+        returned.duplicate_tool_calls = 2;
+
+        let usage = agent_execution_usage(&returned);
+
+        assert_eq!(usage.tool_calls, 5);
+        assert_eq!(usage.duplicate_tool_calls, 2);
     }
 
     #[test]

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MatrixSourceKind {
     Api,
@@ -14,7 +14,7 @@ pub enum MatrixSourceKind {
     Connector,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixSourceSnapshot {
     pub snapshot_id: String,
     #[serde(default)]
@@ -87,7 +87,7 @@ impl MatrixSourceSnapshot {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixSourceSnapshotInput {
     #[serde(default)]
     pub snapshot_id: Option<String>,
@@ -113,7 +113,7 @@ pub struct MatrixSourceSnapshotInput {
     pub metadata: Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixSourceSnapshotPlan {
     pub source_pack_id: String,
     pub source_ref: String,
@@ -130,7 +130,7 @@ pub struct MatrixSourceSnapshotPlan {
     pub planned_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixSourceSnapshotApplyReport {
     pub snapshot_id: String,
     pub source_pack_id: String,

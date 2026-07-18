@@ -32,21 +32,21 @@ pub use analysis::{
     MfgAttributionCandidate, MfgImpactPath, MfgOperationalAnalysis, MfgRecommendedAction,
 };
 pub use app::{
-    manufacturing_app_descriptor, MfgApplicationDescriptor, MfgApplicationDomain,
-    MfgApplicationSurface, MfgApplicationSurfaceKind,
+    MfgApplicationDescriptor, MfgApplicationDomain, MfgApplicationSurface,
+    MfgApplicationSurfaceKind, manufacturing_app_descriptor,
 };
 pub use cockpit::{
-    default_mfg_widget_instances, mfg_cockpit_filter_merge_policy,
-    mfg_cockpit_global_filter_schema, mfg_widget_catalog, MfgCockpitProfile,
-    MfgCockpitProfileInput, MfgCockpitProjection, MfgCockpitReportDeliveryPayload,
-    MfgCockpitReportDeliveryPayloadRequest, MfgCockpitReportDeliveryReceipt,
-    MfgCockpitReportDeliveryState, MfgCockpitReportRequest, MfgCockpitReportSnapshot,
-    MfgCockpitWidget, MfgCockpitWidgetProjection, MfgDashboardLayout, MfgDashboardScope,
-    MfgDashboardSharingPolicy, MfgWidgetDefinition, MfgWidgetInstance, MfgWidgetPlacement,
+    MfgCockpitProfile, MfgCockpitProfileInput, MfgCockpitProjection,
+    MfgCockpitReportDeliveryPayload, MfgCockpitReportDeliveryPayloadRequest,
+    MfgCockpitReportDeliveryReceipt, MfgCockpitReportDeliveryState, MfgCockpitReportRequest,
+    MfgCockpitReportSnapshot, MfgCockpitWidget, MfgCockpitWidgetProjection, MfgDashboardLayout,
+    MfgDashboardScope, MfgDashboardSharingPolicy, MfgWidgetDefinition, MfgWidgetInstance,
+    MfgWidgetPlacement, default_mfg_widget_instances, mfg_cockpit_filter_merge_policy,
+    mfg_cockpit_global_filter_schema, mfg_widget_catalog,
 };
 pub use domain::{
-    server_manufacturing_domain_pack, server_manufacturing_seed_plan, MfgDomainPack,
-    MfgDomainScenario, MfgDomainSeedPlan, MfgDomainSeedResult,
+    MfgDomainPack, MfgDomainScenario, MfgDomainSeedPlan, MfgDomainSeedResult,
+    server_manufacturing_domain_pack, server_manufacturing_seed_plan,
 };
 pub use execution::{
     MfgActionExecution, MfgActionExecutionRequest, MfgActionFeedback, MfgCrossPlaneBridgeReceipt,
@@ -58,12 +58,13 @@ pub use operations::{
     MfgAlertCommand, MfgAlertCommandInput, MfgAlertOccurrence, MfgAlertRule, MfgAlertRuleInput,
     MfgAlertSubscription, MfgAlertSubscriptionInput, MfgAssignment, MfgAssignmentCommand,
     MfgAssignmentCommandInput, MfgAssignmentInput, MfgCommandReceipt, MfgForecastProjection,
-    MfgForecastSignal, MfgLiveProjection, MfgLiveProjectionEvent, MfgSurfaceNotificationTarget,
+    MfgForecastSignal, MfgLiveDeltaRead, MfgLiveEpoch, MfgLiveProjectionEvent, MfgLiveSnapshotRead,
+    MfgSurfaceNotificationTarget,
 };
 pub use skill::{
-    plan_server_manufacturing_skills, run_server_manufacturing_skill,
-    server_manufacturing_skill_pack, skill_agent_node_id, MfgSkillManifest, MfgSkillPlan,
-    MfgSkillRun,
+    MfgSkillExecutionContext, MfgSkillManifest, MfgSkillPlan, MfgSkillRun, MfgSkillTelemetry,
+    MfgSkillToolCall, MfgSkillToolResult, plan_server_manufacturing_skills,
+    run_server_manufacturing_skill, server_manufacturing_skill_pack, skill_agent_node_id,
 };
 pub use store::MfgStore;
 pub use workflow::{
@@ -72,7 +73,7 @@ pub use workflow::{
     MfgWorkflowStatus,
 };
 
-pub use repository::{MfgHealth, MfgMetricRecomputeResult, MfgRepositoryError};
+pub use repository::{MfgHealth, MfgMetricRecomputeResult, MfgMutationClaim, MfgRepositoryError};
 
 #[must_use]
 pub fn mfg_seed_plan() -> MfgDomainSeedPlan {

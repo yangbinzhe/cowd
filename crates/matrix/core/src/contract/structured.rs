@@ -8,14 +8,14 @@ use crate::{
     MatrixSourceFactMapping, MatrixSourcePack,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum StructuredTargetKind {
     Entity,
     Fact,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct StructuredMapping {
     pub mapping_id: String,
     pub source_ref: String,
@@ -36,7 +36,7 @@ pub struct StructuredMapping {
     pub metadata: Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct StructuredSource {
     pub source_id: String,
     pub source_name: String,
@@ -61,7 +61,7 @@ pub struct StructuredSource {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct StructuredFact {
     pub fact_id: String,
     pub snapshot_id: String,
@@ -87,14 +87,14 @@ pub struct StructuredFact {
     pub domain: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct StructuredEvidenceSourceRef {
     pub kind: String,
     pub reference: String,
     pub summary: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct StructuredEvidence {
     pub evidence_id: String,
     #[serde(default)]
@@ -123,7 +123,7 @@ pub struct StructuredEvidence {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct StructuredWatermark {
     pub source_ref: String,
     pub fact_type: String,
@@ -133,7 +133,7 @@ pub struct StructuredWatermark {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct StructuredComputeRequest {
     #[serde(default)]
     pub job_id: Option<String>,
@@ -150,7 +150,7 @@ pub struct StructuredComputeRequest {
     pub priority: Option<f32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct StructuredIngestPlanInput {
     pub source_ref: String,
     pub fact_type: String,
@@ -166,7 +166,7 @@ pub struct StructuredIngestPlanInput {
     pub metric_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct StructuredIngestPlan {
     pub batch_id: String,
     pub source_ref: String,
@@ -183,7 +183,7 @@ pub struct StructuredIngestPlan {
     pub planned_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct StructuredDeltaPlan {
     pub source_ref: String,
     #[serde(default)]

@@ -1,16 +1,16 @@
 use std::{collections::HashMap, sync::Arc};
 
 use axum::{
+    Json, Router,
     extract::{Extension, Query, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
 use runtime::ApprovalConfig;
 use serde::Deserialize;
 
-use super::{api_error, AppState, AuthenticatedPrincipal, ErrorResponse};
+use super::{AppState, AuthenticatedPrincipal, ErrorResponse, api_error};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -23,6 +23,7 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         )
         .route("/api/approval/solo", post(toggle_solo_handler))
         .route("/api/approval/history", get(approval_history_handler))
+        .route("/api/approval/:id", get(approval_exact_handler))
 }
 
 #[derive(Deserialize)]
@@ -44,8 +45,11 @@ struct RiskReceiptRequest {
     session_id: Option<String>,
 }
 
-async fn approval_pending_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    Json(state.services.approval.pending().await)
+async fn approval_pending_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+) -> impl IntoResponse {
+    Json(state.services.approval.pending(&principal.0).await)
 }
 
 async fn approval_config_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
@@ -69,6 +73,7 @@ async fn toggle_solo_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl
 
 async fn approval_history_handler(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let limit = params
@@ -80,7 +85,36 @@ async fn approval_history_handler(
         .get("offset")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0);
-    Json(state.services.approval.history(limit, offset).await)
+    Json(
+        state
+            .services
+            .approval
+            .history(limit, offset, &principal.0)
+            .await,
+    )
+}
+
+async fn approval_exact_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .approval
+        .exact(&id, &principal.0)
+        .await
+        .map(Json)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!(
+                        "approval {id} not found or outside the authenticated principal scope"
+                    ),
+                }),
+            )
+        })
 }
 
 async fn approval_respond_handler(
@@ -96,10 +130,10 @@ async fn approval_respond_handler(
         .await
         .map(Json)
         .map_err(|error| {
-            let status = if error == "approval_human_interactive_capability_required" {
-                StatusCode::FORBIDDEN
-            } else {
-                StatusCode::NOT_FOUND
+            let status = match error.as_str() {
+                "approval_human_interactive_capability_required" => StatusCode::FORBIDDEN,
+                "mfg_review_requires_typed_decision_service" => StatusCode::CONFLICT,
+                _ => StatusCode::NOT_FOUND,
             };
             api_error(status, error)
         })

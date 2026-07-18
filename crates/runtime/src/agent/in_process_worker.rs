@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, Weak};
 
@@ -7,6 +8,7 @@ use harness_contract::agent::{
     AgentCommandRequest, AgentInput, AgentReturnPacket, AgentTaskPacket, AgentTerminalStatus,
 };
 use harness_contract::turn::{InputSourceKind, SessionInputEnvelope};
+use sha2::{Digest, Sha256};
 
 use crate::{
     ContextProfile, PermissionMode, PermissionPolicy, RuntimeExecutionHost, RuntimeServices,
@@ -23,13 +25,61 @@ use crate::agent_runtime::AgentRuntimeBackend;
 pub struct InProcessAgentWorker {
     services: Weak<RuntimeServices>,
     active_runs: Mutex<BTreeMap<String, ActiveInProcessRun>>,
+    pending_cancellations: Mutex<BTreeSet<String>>,
+    completed_runs: Mutex<VecDeque<String>>,
 }
+
+const COMPLETED_RUN_TOMBSTONE_LIMIT: usize = 1_024;
 
 #[derive(Clone)]
 struct ActiveInProcessRun {
     cancellation: crate::CancellationToken,
     session_id: String,
     input_stream: crate::SessionInputStream,
+    completion: Arc<tokio::sync::Notify>,
+    completed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct ActiveRunCleanup<'a> {
+    worker: &'a InProcessAgentWorker,
+    run_id: String,
+    completion: Arc<tokio::sync::Notify>,
+    completed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct PendingCancellationOwner<'a> {
+    pending: &'a Mutex<BTreeSet<String>>,
+    run_id: String,
+}
+
+impl Drop for PendingCancellationOwner<'_> {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.run_id);
+    }
+}
+
+impl Drop for ActiveRunCleanup<'_> {
+    fn drop(&mut self) {
+        // The tombstone is visible before the active handle disappears; the
+        // completion flag/notification are published only after all maps are
+        // clean. This also runs when the execute future is aborted.
+        self.worker.record_completed_run(&self.run_id);
+        self.worker
+            .active_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.run_id);
+        self.worker
+            .pending_cancellations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.run_id);
+        self.completed.store(true, Ordering::SeqCst);
+        self.completion.notify_waiters();
+    }
 }
 
 impl InProcessAgentWorker {
@@ -38,7 +88,30 @@ impl InProcessAgentWorker {
         Self {
             services,
             active_runs: Mutex::new(BTreeMap::new()),
+            pending_cancellations: Mutex::new(BTreeSet::new()),
+            completed_runs: Mutex::new(VecDeque::new()),
         }
+    }
+
+    fn record_completed_run(&self, run_id: &str) {
+        let mut completed = self
+            .completed_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !completed.iter().any(|candidate| candidate == run_id) {
+            completed.push_back(run_id.to_string());
+        }
+        while completed.len() > COMPLETED_RUN_TOMBSTONE_LIMIT {
+            completed.pop_front();
+        }
+    }
+
+    fn run_completed(&self, run_id: &str) -> bool {
+        self.completed_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|candidate| candidate == run_id)
     }
 }
 
@@ -103,6 +176,10 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             .iter()
             .map(|definition| definition.name.clone())
             .filter(|tool| packet_allowed_tools.contains(tool))
+            .filter(|tool| {
+                packet.team_id.is_none()
+                    || delegated_tool_supports_bounded_scope(host.as_ref(), tool)
+            })
             .collect::<BTreeSet<_>>();
         let tool_names = allowed_tools.iter().cloned().collect::<Vec<_>>();
         let tool_executor = Arc::new(ScopedRuntimeToolExecutor {
@@ -112,8 +189,15 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             model_lease: selection.model.clone(),
             execution_id: packet.graph_id.clone(),
             node_id: packet.node_id.clone(),
+            workspace_root: services.workspace_root().to_path_buf(),
+            resource_scopes: packet
+                .team_id
+                .as_ref()
+                .map(|_| packet.resource_scopes.clone()),
             evaluation_isolated: binding.evaluation.is_some(),
             managed_invocation: packet.managed_invocation.clone(),
+            next_receipt_sequence: AtomicU64::new(0),
+            receipts: Mutex::new(Vec::new()),
         });
         let policy = permission_policy(&packet.permission_lease, &allowed_tools);
         let cancellation = crate::CancellationToken::new();
@@ -204,11 +288,17 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         if let Some(limit) = agent_model_step_limit(packet.budget_lease.max_tokens) {
             runtime.set_model_step_limit_override(limit);
         }
+        runtime.set_delegated_focus_policy(
+            packet_focus_novelty_target_bp(&packet),
+            packet_focus_acceptance_scopes(&packet),
+        );
         // Delegated Agents share the parent Session's evidence authority, but
         // only the parent Turn may publish conversation messages. The child
         // result returns through AgentReturnPacket and the Team reducer.
         runtime.set_transcript_persistence(false);
         let input_stream = runtime.session_input_stream();
+        let completion = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.active_runs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -218,8 +308,24 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                     cancellation: cancellation.clone(),
                     session_id: child_session_id,
                     input_stream,
+                    completion: Arc::clone(&completion),
+                    completed: Arc::clone(&completed),
                 },
             );
+        let active_run_cleanup = ActiveRunCleanup {
+            worker: self,
+            run_id: packet.run_id.clone(),
+            completion: Arc::clone(&completion),
+            completed: Arc::clone(&completed),
+        };
+        if self
+            .pending_cancellations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&packet.run_id)
+        {
+            cancellation.cancel();
+        }
         runtime.install_turn_control(cancellation, crate::HookAbortSignal::default());
         let _ = services.agent_runtime().record_progress(
             &packet.agent_id,
@@ -234,13 +340,49 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         // it can be joined before the terminal Agent result is committed.
         drop(runtime);
         let _ = progress_reporter.join();
-        self.active_runs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&packet.run_id);
+        drop(active_run_cleanup);
         let summary = result.map_err(|error| format!("in-process agent turn failed: {error}"))?;
         let evidence_refs =
             agent_evidence_refs(&packet, &summary.context_turn_report.audit_projections);
+        let (acceptance, runtime_change_receipts) =
+            runtime_evaluated_acceptance(&packet, &summary, &evidence_refs, &tool_executor);
+        let mut runtime_write_attempt_paths = summary.write_attempt_paths.clone();
+        runtime_write_attempt_paths.extend(
+            tool_executor
+                .receipts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|receipt| {
+                    receipt.effect_kind == harness_contract::tool::ToolEffectKind::Write
+                })
+                .flat_map(|receipt| receipt.paths.iter().cloned()),
+        );
+        runtime_write_attempt_paths.sort();
+        runtime_write_attempt_paths.dedup();
+        let mut runtime_observed_resource_scopes = tool_executor
+            .receipts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .flat_map(|receipt| {
+                let mode = if receipt.effect_kind == harness_contract::tool::ToolEffectKind::Write {
+                    "write"
+                } else {
+                    "read"
+                };
+                receipt
+                    .paths
+                    .iter()
+                    .map(move |path| format!("{mode}:{path}"))
+            })
+            .collect::<Vec<_>>();
+        runtime_observed_resource_scopes.sort();
+        runtime_observed_resource_scopes.dedup();
+        let changes = runtime_change_receipts
+            .iter()
+            .map(|receipt| receipt.path.clone())
+            .collect();
         let (status, failure) =
             agent_terminal_outcome(summary.terminal_completion, &summary.final_answer);
         Ok(AgentReturnPacket {
@@ -256,13 +398,18 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             expected_graph_revision: packet.expected_graph_revision,
             status,
             outcome: summary.final_answer,
-            acceptance: packet.acceptance,
+            acceptance,
             evidence_refs,
-            changes: Vec::new(),
+            changes,
+            runtime_change_receipts,
             conflicts: Vec::new(),
             unresolved: Vec::new(),
             input_tokens: u64::from(summary.usage.input_tokens),
             output_tokens: u64::from(summary.usage.output_tokens),
+            cached_tokens: summary
+                .model_telemetry
+                .cache_create_tokens
+                .saturating_add(summary.model_telemetry.cache_read_tokens),
             // Keep the model that actually completed the child turn. The
             // selector value remains the requested lease and may differ after
             // a configured provider fallback.
@@ -273,6 +420,9 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                 .unwrap_or(selection.model),
             provider: selection.provider,
             tool_calls: summary.tool_results.len() as u64,
+            duplicate_tool_calls: summary.duplicate_tool_calls,
+            runtime_write_attempt_paths,
+            runtime_observed_resource_scopes,
             failure,
         })
     }
@@ -285,14 +435,96 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         match request.command {
             harness_contract::agent::AgentCommand::Interrupt
             | harness_contract::agent::AgentCommand::Cancel
-            | harness_contract::agent::AgentCommand::Shutdown => self
-                .active_runs
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(&handle.run_id)
-                .map(|active| active.cancellation.clone())
-                .map(|token| token.cancel())
-                .ok_or(harness_contract::agent::AgentCommandRejectReason::UnsupportedByBackend),
+            | harness_contract::agent::AgentCommand::Shutdown => {
+                self.pending_cancellations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(handle.run_id.clone());
+                let _pending_owner = PendingCancellationOwner {
+                    pending: &self.pending_cancellations,
+                    run_id: handle.run_id.clone(),
+                };
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+                loop {
+                    let active = self
+                        .active_runs
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get(&handle.run_id)
+                        .map(|active| {
+                            (
+                                active.cancellation.clone(),
+                                Arc::clone(&active.completion),
+                                Arc::clone(&active.completed),
+                            )
+                        });
+                    if let Some((token, completion, completed)) = active {
+                        token.cancel();
+                        tokio::time::timeout_at(deadline, async {
+                            loop {
+                                let notified = completion.notified();
+                                if completed.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                notified.await;
+                            }
+                        })
+                        .await
+                        .map_err(|_| {
+                            harness_contract::agent::AgentCommandRejectReason::UnsupportedByBackend
+                        })?;
+                        if self
+                            .active_runs
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .contains_key(&handle.run_id)
+                        {
+                            return Err(
+                                harness_contract::agent::AgentCommandRejectReason::UnsupportedByBackend,
+                            );
+                        }
+                        self.pending_cancellations
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove(&handle.run_id);
+                        break;
+                    }
+                    if self.run_completed(&handle.run_id) {
+                        self.pending_cancellations
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove(&handle.run_id);
+                        break;
+                    }
+                    let pending = self
+                        .pending_cancellations
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .contains(&handle.run_id);
+                    if !pending
+                        && !self
+                            .active_runs
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .contains_key(&handle.run_id)
+                    {
+                        // The worker consumed the pending cancellation and
+                        // removed its active handle after cleanup.
+                        break;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        self.pending_cancellations
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove(&handle.run_id);
+                        return Err(
+                            harness_contract::agent::AgentCommandRejectReason::UnsupportedByBackend,
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                Ok(())
+            }
             harness_contract::agent::AgentCommand::SendInput => {
                 let input = request
                     .input
@@ -337,9 +569,49 @@ fn agent_model_step_limit(max_tokens: u64) -> Option<usize> {
     // hundreds of thousands of provider tokens.
     Some(
         usize::try_from(max_tokens.saturating_add(3_999) / 4_000)
-            .unwrap_or(8)
-            .clamp(3, 8),
+            .unwrap_or(6)
+            .clamp(3, 6),
     )
+}
+
+fn packet_focus_novelty_target_bp(packet: &AgentTaskPacket) -> u16 {
+    packet
+        .constraints
+        .iter()
+        .find_map(|constraint| {
+            constraint
+                .strip_prefix("focus_novelty_target_bp:")
+                .and_then(|value| value.parse::<u16>().ok())
+        })
+        .unwrap_or(0)
+        .min(10_000)
+}
+
+fn packet_focus_acceptance_scopes(packet: &AgentTaskPacket) -> Vec<String> {
+    let Some(value) = packet.constraints.iter().find_map(|constraint| {
+        constraint
+            .strip_prefix("focus_output_acceptance:")
+            .filter(|value| !value.trim().is_empty())
+    }) else {
+        return Vec::new();
+    };
+    let criteria = value.split(',').map(str::trim).collect::<Vec<_>>();
+    if criteria.is_empty()
+        || criteria
+            .iter()
+            .any(|criterion| !criterion.starts_with("evidence_scope:"))
+    {
+        return Vec::new();
+    }
+    let mut scopes = criteria
+        .into_iter()
+        .filter_map(|criterion| criterion.strip_prefix("evidence_scope:"))
+        .filter(|scope| !scope.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    scopes.sort();
+    scopes.dedup();
+    scopes
 }
 
 fn agent_terminal_outcome(
@@ -388,8 +660,23 @@ struct ScopedRuntimeToolExecutor {
     model_lease: String,
     execution_id: String,
     node_id: String,
+    workspace_root: std::path::PathBuf,
+    /// `Some` marks a Team child and is always enforced. An empty list means
+    /// no workspace authority; it never expands to the whole repository.
+    resource_scopes: Option<Vec<String>>,
     evaluation_isolated: bool,
     managed_invocation: Option<harness_contract::managed_agent::ManagedAgentInvocationFence>,
+    next_receipt_sequence: AtomicU64,
+    receipts: Mutex<Vec<ScopedToolExecutionReceipt>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScopedToolExecutionReceipt {
+    sequence: u64,
+    effect_kind: harness_contract::tool::ToolEffectKind,
+    paths: Vec<String>,
+    before_digests: BTreeMap<String, Option<String>>,
+    after_digests: BTreeMap<String, Option<String>>,
 }
 
 impl ToolExecutor for ScopedRuntimeToolExecutor {
@@ -415,6 +702,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
                 "tool `{tool_name}` is outside the AgentTaskPacket allow-list"
             )));
         }
+        self.enforce_resource_ceiling(tool_name, input)?;
         self.execute_scoped(tool_name, input, None)
     }
 
@@ -477,6 +765,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
                 "agent tool authorization does not match the allowed tool request",
             ));
         }
+        self.enforce_resource_ceiling(tool_name, input)?;
         self.execute_scoped(tool_name, input, Some(authorization.clone()))
     }
 
@@ -498,12 +787,96 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
 }
 
 impl ScopedRuntimeToolExecutor {
+    fn enforce_resource_ceiling(&self, tool_name: &str, input: &str) -> Result<(), ToolError> {
+        let Some(allowed_scopes) = self.resource_scopes.as_deref() else {
+            return Ok(());
+        };
+        let input = serde_json::from_str::<serde_json::Value>(input)
+            .map_err(|error| ToolError::new(format!("invalid scoped tool input: {error}")))?;
+        let descriptor = self
+            .host
+            .delegated_tool_effect_descriptor(tool_name, &input)
+            .ok_or_else(|| ToolError::new("tool has no enforceable Runtime effect descriptor"))?;
+        if descriptor.spawns_process
+            || matches!(
+                descriptor.effect_kind,
+                harness_contract::tool::ToolEffectKind::Process
+                    | harness_contract::tool::ToolEffectKind::Package
+                    | harness_contract::tool::ToolEffectKind::System
+                    | harness_contract::tool::ToolEffectKind::Destructive
+                    | harness_contract::tool::ToolEffectKind::Unknown
+            )
+        {
+            return Err(ToolError::new(format!(
+                "tool `{tool_name}` cannot prove a bounded Team resource scope"
+            )));
+        }
+        let requested = crate::tool_execution_plan::resource_scope_for_tool_request(
+            tool_name,
+            &input,
+            crate::ToolSafetyCategory::from_tool_name(tool_name),
+        );
+        if requested.network {
+            return allowed_scopes
+                .iter()
+                .any(|scope| scope == "network:*")
+                .then_some(())
+                .ok_or_else(|| {
+                    ToolError::new(format!(
+                        "tool `{tool_name}` is outside the Team network resource lease"
+                    ))
+                });
+        }
+        if requested.unknown || requested.kind == "runtime" || requested.paths.is_empty() {
+            return Err(ToolError::new(format!(
+                "tool `{tool_name}` did not declare a bounded workspace path"
+            )));
+        }
+        let write = matches!(
+            descriptor.effect_kind,
+            harness_contract::tool::ToolEffectKind::Write
+        );
+        for path in &requested.paths {
+            if !resource_path_is_authorized(&self.workspace_root, path, allowed_scopes, write) {
+                return Err(ToolError::new(format!(
+                    "tool `{tool_name}` path `{path}` is outside the Agent focus/resource lease"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn execute_scoped(
         &self,
         tool_name: &str,
         input: &str,
         authorization: Option<harness_contract::tool::ToolExecutionAuthorization>,
     ) -> Result<String, ToolError> {
+        let parsed_input = serde_json::from_str::<serde_json::Value>(input)
+            .map_err(|error| ToolError::new(format!("invalid scoped tool input: {error}")))?;
+        let descriptor = self
+            .host
+            .delegated_tool_effect_descriptor(tool_name, &parsed_input)
+            .ok_or_else(|| ToolError::new("tool has no enforceable Runtime effect descriptor"))?;
+        let requested = crate::tool_execution_plan::resource_scope_for_tool_request(
+            tool_name,
+            &parsed_input,
+            crate::ToolSafetyCategory::from_tool_name(tool_name),
+        );
+        let sequence = self
+            .next_receipt_sequence
+            .fetch_add(1, Ordering::SeqCst)
+            .saturating_add(1);
+        let before_digests = requested
+            .paths
+            .iter()
+            .map(|path| {
+                (
+                    path.clone(),
+                    workspace_file_sha256(&self.workspace_root, path),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         let idempotency_key = authorization
             .as_ref()
             .and_then(|value| value.idempotency_key.clone())
@@ -531,7 +904,29 @@ impl ScopedRuntimeToolExecutor {
         };
         let outcome = self.host.execute_runtime_tool(&request);
         match outcome.status {
-            RuntimeToolExecutionStatus::Executed => Ok(outcome.output.unwrap_or_default()),
+            RuntimeToolExecutionStatus::Executed => {
+                let after_digests = requested
+                    .paths
+                    .iter()
+                    .map(|path| {
+                        (
+                            path.clone(),
+                            workspace_file_sha256(&self.workspace_root, path),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                self.receipts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(ScopedToolExecutionReceipt {
+                        sequence,
+                        effect_kind: descriptor.effect_kind,
+                        paths: requested.paths,
+                        before_digests,
+                        after_digests,
+                    });
+                Ok(outcome.output.unwrap_or_default())
+            }
             RuntimeToolExecutionStatus::BlockedPermission => Err(ToolError::new(
                 outcome
                     .error
@@ -544,6 +939,115 @@ impl ScopedRuntimeToolExecutor {
             )),
         }
     }
+}
+
+fn workspace_file_sha256(workspace_root: &std::path::Path, relative: &str) -> Option<String> {
+    let parts = normalized_relative_parts(relative)?;
+    let path = workspace_root.join(parts.iter().collect::<std::path::PathBuf>());
+    let metadata = std::fs::symlink_metadata(&path).ok()?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    Some(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn delegated_tool_supports_bounded_scope(host: &dyn RuntimeExecutionHost, tool_name: &str) -> bool {
+    host.delegated_tool_effect_descriptor(tool_name, &serde_json::json!({}))
+        .is_some_and(|descriptor| {
+            !descriptor.spawns_process
+                && !matches!(
+                    descriptor.effect_kind,
+                    harness_contract::tool::ToolEffectKind::Process
+                        | harness_contract::tool::ToolEffectKind::Package
+                        | harness_contract::tool::ToolEffectKind::System
+                        | harness_contract::tool::ToolEffectKind::Destructive
+                        | harness_contract::tool::ToolEffectKind::Unknown
+                )
+        })
+}
+
+fn resource_path_is_authorized(
+    workspace_root: &std::path::Path,
+    requested: &str,
+    allowed_scopes: &[String],
+    write: bool,
+) -> bool {
+    let Some(requested_parts) = normalized_relative_parts(requested) else {
+        return false;
+    };
+    let Ok(canonical_root) = workspace_root.canonicalize() else {
+        return false;
+    };
+    let requested_relative = requested_parts.iter().collect::<std::path::PathBuf>();
+    let requested_path = workspace_root.join(&requested_relative);
+    let Some(canonical_requested_ancestor) = canonical_existing_ancestor(&requested_path) else {
+        return false;
+    };
+    if !canonical_requested_ancestor.starts_with(&canonical_root) {
+        return false;
+    }
+    allowed_scopes.iter().any(|scope| {
+        let (mode, allowed) = scope.split_once(':').unwrap_or(("", ""));
+        if (write && mode != "write") || (!write && mode != "read" && mode != "write") {
+            return false;
+        }
+        let Some(allowed_parts) = normalized_relative_parts(allowed) else {
+            return false;
+        };
+        if allowed_parts.is_empty() {
+            return false;
+        }
+        let allowed_relative = allowed_parts.iter().collect::<std::path::PathBuf>();
+        let lexical_match = if workspace_root.join(&allowed_relative).is_dir() {
+            requested_parts.starts_with(&allowed_parts)
+        } else {
+            requested_parts == allowed_parts
+        };
+        if !lexical_match {
+            return false;
+        }
+        let Ok(canonical_allowed) = workspace_root.join(&allowed_relative).canonicalize() else {
+            return false;
+        };
+        if canonical_allowed != canonical_root.join(&allowed_relative) {
+            // A scope whose lexical identity resolves through a symlink can
+            // alias another focus partition and defeat overlap accounting.
+            return false;
+        }
+        canonical_allowed.starts_with(&canonical_root)
+            && canonical_requested_ancestor.starts_with(&canonical_allowed)
+    })
+}
+
+fn canonical_existing_ancestor(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut candidate = path;
+    loop {
+        match candidate.canonicalize() {
+            Ok(canonical) => return Some(canonical),
+            Err(_) => candidate = candidate.parent()?,
+        }
+    }
+}
+
+fn normalized_relative_parts(value: &str) -> Option<Vec<String>> {
+    let normalized = value.trim().replace('\\', "/");
+    if normalized.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for component in std::path::Path::new(&normalized).components() {
+        match component {
+            std::path::Component::Normal(part) => {
+                parts.push(part.to_string_lossy().into_owned());
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    Some(parts)
 }
 
 fn permission_policy(lease: &str, tools: &BTreeSet<String>) -> PermissionPolicy {
@@ -571,6 +1075,14 @@ fn system_prompt(
         "Use only native tool calls exposed by this runtime. Never write simulated tool syntax such as <tool_call>, <function=...>, <parameter=...>, or JSON-shaped pseudo-calls in final text. If no native tool is authorized, answer directly from the supplied objective and upstream evidence.".into(),
         format!("Objective: {}", packet.objective),
         format!("Workspace root: {}", workspace_root.display()),
+        format!(
+            "Authorized resource scopes: {}. Use only relative paths inside these scopes; a missing path never means the whole workspace.",
+            if packet.resource_scopes.is_empty() {
+                "(none)".to_string()
+            } else {
+                packet.resource_scopes.join(", ")
+            }
+        ),
     ];
     if let Some(binding) = &packet.binding {
         prompt.push(format!(
@@ -595,6 +1107,32 @@ fn system_prompt(
     }
     if !packet.acceptance.is_empty() {
         prompt.push(format!("Acceptance: {}", packet.acceptance.join("; ")));
+    }
+    if let Some(contract) = packet_acceptance_contract(packet) {
+        let mut fields = contract
+            .iter()
+            .filter_map(|requirement| match &requirement.check {
+                harness_contract::team::TeamAcceptanceCheck::StructuredField { field }
+                | harness_contract::team::TeamAcceptanceCheck::WorkspaceChange { field, .. } => {
+                    Some(field.as_str())
+                }
+                harness_contract::team::TeamAcceptanceCheck::SourceVerification { .. } => {
+                    Some("source_verification")
+                }
+                harness_contract::team::TeamAcceptanceCheck::UpstreamReview => Some("review"),
+                harness_contract::team::TeamAcceptanceCheck::UpstreamEvidence => None,
+                harness_contract::team::TeamAcceptanceCheck::LegacyEvidenceBound { .. } => {
+                    Some("legacy_acceptance")
+                }
+                harness_contract::team::TeamAcceptanceCheck::ScopedEvidence { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        fields.sort();
+        fields.dedup();
+        prompt.push(format!(
+            "Return exactly one JSON object without markdown fences. Populate every required structured field with a non-empty value: {}. Runtime derives acceptance from committed tool receipts, change paths, upstream evidence bindings, and this exact schema; repeating acceptance text does not satisfy it.",
+            fields.join(", ")
+        ));
     }
     if !tool_names.is_empty() {
         prompt.push(format!(
@@ -622,6 +1160,226 @@ fn agent_evidence_refs(
     refs
 }
 
+fn runtime_evaluated_acceptance(
+    packet: &AgentTaskPacket,
+    summary: &crate::TurnSummary,
+    evidence_refs: &[harness_contract::context::EvidenceAccessRef],
+    tool_executor: &ScopedRuntimeToolExecutor,
+) -> (
+    Vec<String>,
+    Vec<harness_contract::agent::AgentChangeReceipt>,
+) {
+    let produced_evidence = evidence_refs.iter().any(|evidence| {
+        crate::agent_result_validator::is_materialized_durable_evidence(evidence)
+            && !packet
+                .evidence_refs
+                .iter()
+                .any(|input| input.evidence_ref == evidence.evidence_ref)
+    });
+    let mut receipts = tool_executor
+        .receipts
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    receipts.sort_by_key(|receipt| receipt.sequence);
+    let changes = materialized_change_receipts(&receipts);
+    let observed_paths = receipts
+        .iter()
+        .flat_map(|receipt| receipt.paths.iter().cloned())
+        .collect::<Vec<_>>();
+    let output = serde_json::from_str::<serde_json::Value>(&summary.final_answer)
+        .ok()
+        .and_then(|value| value.as_object().cloned());
+    let field_present = |field: harness_contract::team::TeamStructuredOutputField| {
+        output
+            .as_ref()
+            .and_then(|object| object.get(field.as_str()))
+            .is_some_and(materialized_json_value)
+    };
+    let scope_observed =
+        |scope: &str, paths: &[String]| paths.iter().any(|path| path_within_scope(path, scope));
+    let changes_in_scopes = |scopes: &[String]| {
+        !changes.is_empty()
+            && changes.iter().all(|change| {
+                scopes
+                    .iter()
+                    .any(|scope| path_within_scope(&change.path, scope))
+            })
+    };
+    let upstream_changes = packet
+        .constraints
+        .iter()
+        .filter_map(|constraint| constraint.strip_prefix("upstream_change_scope:"))
+        .filter_map(|value| {
+            serde_json::from_str::<harness_contract::agent::AgentChangeReceipt>(value).ok()
+        })
+        .collect::<Vec<_>>();
+    let upstream_evidence = packet
+        .evidence_refs
+        .iter()
+        .any(crate::agent_result_validator::is_materialized_durable_evidence);
+    let acceptance = packet_acceptance_contract(packet)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|requirement| match &requirement.check {
+            harness_contract::team::TeamAcceptanceCheck::StructuredField { field } => {
+                // A pure reducer is grounded by the immutable predecessor
+                // evidence carried in its packet. Requiring it to reacquire
+                // the same source solely to populate a structured synthesis
+                // field would defeat the upstream-only acceptance contract.
+                (produced_evidence || upstream_evidence) && field_present(*field)
+            }
+            harness_contract::team::TeamAcceptanceCheck::ScopedEvidence { scopes } => {
+                produced_evidence
+                    && !scopes.is_empty()
+                    && scopes
+                        .iter()
+                        .all(|scope| scope_observed(scope, &observed_paths))
+            }
+            harness_contract::team::TeamAcceptanceCheck::WorkspaceChange { field, scopes } => {
+                produced_evidence && field_present(*field) && changes_in_scopes(scopes)
+            }
+            harness_contract::team::TeamAcceptanceCheck::SourceVerification { scopes } => {
+                produced_evidence
+                    && field_present(
+                        harness_contract::team::TeamStructuredOutputField::SourceVerification,
+                    )
+                    && changes_in_scopes(scopes)
+                    && changes.iter().all(|change| {
+                        has_matching_pre_write_read_receipt(change, &receipts)
+                            && has_matching_read_receipt(change, &receipts, true)
+                    })
+            }
+            harness_contract::team::TeamAcceptanceCheck::UpstreamReview => {
+                produced_evidence
+                    && field_present(harness_contract::team::TeamStructuredOutputField::Review)
+                    && upstream_evidence
+                    && !upstream_changes.is_empty()
+                    && upstream_changes
+                        .iter()
+                        .all(|change| has_matching_read_receipt(change, &receipts, false))
+            }
+            harness_contract::team::TeamAcceptanceCheck::UpstreamEvidence => upstream_evidence,
+            harness_contract::team::TeamAcceptanceCheck::LegacyEvidenceBound { scopes } => {
+                produced_evidence
+                    && !scopes.is_empty()
+                    && scopes
+                        .iter()
+                        .all(|scope| scope_observed(scope, &observed_paths))
+                    && output
+                        .as_ref()
+                        .and_then(|object| object.get("legacy_acceptance"))
+                        .and_then(serde_json::Value::as_object)
+                        .and_then(|legacy| legacy.get(&requirement.criterion))
+                        .is_some_and(materialized_json_value)
+            }
+        })
+        .map(|requirement| requirement.criterion)
+        .collect::<Vec<_>>();
+    (acceptance, changes)
+}
+
+fn materialized_change_receipts(
+    receipts: &[ScopedToolExecutionReceipt],
+) -> Vec<harness_contract::agent::AgentChangeReceipt> {
+    receipts
+        .iter()
+        .filter(|receipt| receipt.effect_kind == harness_contract::tool::ToolEffectKind::Write)
+        .flat_map(|receipt| {
+            receipt.paths.iter().filter_map(|path| {
+                let before = receipt.before_digests.get(path).cloned().flatten();
+                let after = receipt.after_digests.get(path).cloned().flatten()?;
+                (before.as_deref() != Some(after.as_str())).then(|| {
+                    harness_contract::agent::AgentChangeReceipt {
+                        path: path.clone(),
+                        before_sha256: before,
+                        after_sha256: after,
+                        write_sequence: receipt.sequence,
+                    }
+                })
+            })
+        })
+        .collect()
+}
+
+fn has_matching_read_receipt(
+    change: &harness_contract::agent::AgentChangeReceipt,
+    receipts: &[ScopedToolExecutionReceipt],
+    require_later_sequence: bool,
+) -> bool {
+    receipts.iter().any(|receipt| {
+        (!require_later_sequence || receipt.sequence > change.write_sequence)
+            && receipt.effect_kind == harness_contract::tool::ToolEffectKind::Read
+            && receipt.paths.contains(&change.path)
+            && receipt
+                .after_digests
+                .get(&change.path)
+                .and_then(|digest| digest.as_deref())
+                == Some(change.after_sha256.as_str())
+    })
+}
+
+fn has_matching_pre_write_read_receipt(
+    change: &harness_contract::agent::AgentChangeReceipt,
+    receipts: &[ScopedToolExecutionReceipt],
+) -> bool {
+    let Some(before_sha256) = change.before_sha256.as_deref() else {
+        // A new file needs a separate typed absence proof, which this
+        // contract does not yet expose. Do not call it source-verified.
+        return false;
+    };
+    receipts.iter().any(|receipt| {
+        receipt.sequence < change.write_sequence
+            && receipt.effect_kind == harness_contract::tool::ToolEffectKind::Read
+            && receipt.paths.contains(&change.path)
+            && receipt
+                .after_digests
+                .get(&change.path)
+                .and_then(|digest| digest.as_deref())
+                == Some(before_sha256)
+    })
+}
+
+fn packet_acceptance_contract(
+    packet: &AgentTaskPacket,
+) -> Option<Vec<harness_contract::team::TeamAcceptanceRequirement>> {
+    packet
+        .constraints
+        .iter()
+        .find_map(|constraint| constraint.strip_prefix("team_acceptance_contract:"))
+        .and_then(|value| serde_json::from_str(value).ok())
+}
+
+fn materialized_json_value(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::String(value) => !value.trim().is_empty(),
+        serde_json::Value::Array(values) => !values.is_empty(),
+        serde_json::Value::Object(values) => !values.is_empty(),
+        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => true,
+    }
+}
+
+fn normalized_scope(value: &str) -> &str {
+    let value = value.trim();
+    let value = ["read:", "write:", "workspace:"]
+        .into_iter()
+        .find_map(|prefix| value.strip_prefix(prefix))
+        .unwrap_or(value);
+    value.trim_start_matches("./").trim_end_matches('/')
+}
+
+fn path_within_scope(path: &str, scope: &str) -> bool {
+    let path = normalized_scope(path);
+    let scope = normalized_scope(scope);
+    !path.is_empty()
+        && !scope.is_empty()
+        && (path == scope
+            || path
+                .strip_prefix(scope)
+                .is_some_and(|suffix| suffix.starts_with('/')))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -629,6 +1387,103 @@ mod tests {
     use super::*;
     use harness_contract::agent::AgentCommand;
     use harness_contract::turn::TurnId;
+
+    fn scoped_receipt(
+        sequence: u64,
+        effect_kind: harness_contract::tool::ToolEffectKind,
+        path: &str,
+        before: Option<&str>,
+        after: Option<&str>,
+    ) -> ScopedToolExecutionReceipt {
+        ScopedToolExecutionReceipt {
+            sequence,
+            effect_kind,
+            paths: vec![path.to_string()],
+            before_digests: BTreeMap::from([(path.to_string(), before.map(str::to_string))]),
+            after_digests: BTreeMap::from([(path.to_string(), after.map(str::to_string))]),
+        }
+    }
+
+    #[test]
+    fn change_and_source_verification_require_digest_delta_and_post_write_read() {
+        let unchanged = vec![scoped_receipt(
+            1,
+            harness_contract::tool::ToolEffectKind::Write,
+            "src/lib.rs",
+            Some("same"),
+            Some("same"),
+        )];
+        assert!(materialized_change_receipts(&unchanged).is_empty());
+
+        let read_before_write = vec![
+            scoped_receipt(
+                1,
+                harness_contract::tool::ToolEffectKind::Read,
+                "src/lib.rs",
+                Some("before"),
+                Some("before"),
+            ),
+            scoped_receipt(
+                2,
+                harness_contract::tool::ToolEffectKind::Write,
+                "src/lib.rs",
+                Some("before"),
+                Some("after"),
+            ),
+        ];
+        let change = materialized_change_receipts(&read_before_write)
+            .pop()
+            .expect("real digest change");
+        assert!(has_matching_pre_write_read_receipt(
+            &change,
+            &read_before_write
+        ));
+        assert!(!has_matching_read_receipt(
+            &change,
+            &read_before_write,
+            true
+        ));
+
+        let write_then_read = vec![
+            scoped_receipt(
+                1,
+                harness_contract::tool::ToolEffectKind::Write,
+                "src/lib.rs",
+                Some("before"),
+                Some("after"),
+            ),
+            scoped_receipt(
+                2,
+                harness_contract::tool::ToolEffectKind::Read,
+                "src/lib.rs",
+                Some("after"),
+                Some("after"),
+            ),
+        ];
+        let ungrounded = materialized_change_receipts(&write_then_read)
+            .pop()
+            .expect("digest changed");
+        assert!(!has_matching_pre_write_read_receipt(
+            &ungrounded,
+            &write_then_read
+        ));
+        assert!(has_matching_read_receipt(
+            &ungrounded,
+            &write_then_read,
+            true
+        ));
+
+        let mut verified = read_before_write;
+        verified.push(scoped_receipt(
+            3,
+            harness_contract::tool::ToolEffectKind::Read,
+            "src/lib.rs",
+            Some("after"),
+            Some("after"),
+        ));
+        assert!(has_matching_pre_write_read_receipt(&change, &verified));
+        assert!(has_matching_read_receipt(&change, &verified, true));
+    }
 
     struct NoopRuntimeExecutionHost;
 
@@ -730,7 +1585,7 @@ mod tests {
         assert_eq!(agent_model_step_limit(0), None);
         assert_eq!(agent_model_step_limit(8_000), Some(3));
         assert_eq!(agent_model_step_limit(24_000), Some(6));
-        assert_eq!(agent_model_step_limit(128_000), Some(8));
+        assert_eq!(agent_model_step_limit(128_000), Some(6));
     }
 
     #[test]
@@ -745,6 +1600,83 @@ mod tests {
     }
 
     #[test]
+    fn team_tool_boundary_enforces_the_exact_focus_scope() {
+        let root = tempfile::tempdir().expect("scoped workspace");
+        std::fs::create_dir_all(root.path().join("crates/runtime")).expect("runtime scope");
+        std::fs::create_dir_all(root.path().join("crates/gateway")).expect("gateway scope");
+        let executor = ScopedRuntimeToolExecutor {
+            host: Arc::new(EchoRuntimeExecutionHost),
+            allowed_tools: BTreeSet::from(["read_file".to_string(), "grep_search".to_string()]),
+            session_id: "session".to_string(),
+            model_lease: "model".to_string(),
+            execution_id: "graph".to_string(),
+            node_id: "node".to_string(),
+            workspace_root: root.path().to_path_buf(),
+            resource_scopes: Some(vec!["read:crates/runtime".to_string()]),
+            evaluation_isolated: false,
+            managed_invocation: None,
+            next_receipt_sequence: AtomicU64::new(0),
+            receipts: Mutex::new(Vec::new()),
+        };
+
+        executor
+            .enforce_resource_ceiling("read_file", r#"{"path":"crates/runtime/src/lib.rs"}"#)
+            .expect("in-scope read");
+        assert!(executor
+            .enforce_resource_ceiling("read_file", r#"{"path":"crates/gateway/src/lib.rs"}"#,)
+            .is_err());
+        assert!(executor
+            .enforce_resource_ceiling("read_file", r#"{"path":"../secret"}"#)
+            .is_err());
+        assert!(executor
+            .enforce_resource_ceiling("grep_search", r#"{"pattern":"unsafe"}"#)
+            .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn team_tool_boundary_rejects_symlink_escape_for_existing_and_new_targets() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("scoped workspace");
+        let outside = tempfile::tempdir().expect("outside workspace");
+        std::fs::create_dir_all(root.path().join("crates/runtime")).expect("runtime scope");
+        std::fs::write(outside.path().join("secret.txt"), "secret").expect("outside fixture");
+        symlink(outside.path(), root.path().join("crates/runtime/escape"))
+            .expect("workspace symlink");
+        let executor = ScopedRuntimeToolExecutor {
+            host: Arc::new(EchoRuntimeExecutionHost),
+            allowed_tools: BTreeSet::from(["read_file".to_string(), "write_file".to_string()]),
+            session_id: "session".to_string(),
+            model_lease: "model".to_string(),
+            execution_id: "graph".to_string(),
+            node_id: "node".to_string(),
+            workspace_root: root.path().to_path_buf(),
+            resource_scopes: Some(vec![
+                "read:crates/runtime".to_string(),
+                "write:crates/runtime".to_string(),
+            ]),
+            evaluation_isolated: false,
+            managed_invocation: None,
+            next_receipt_sequence: AtomicU64::new(0),
+            receipts: Mutex::new(Vec::new()),
+        };
+
+        assert!(executor
+            .enforce_resource_ceiling(
+                "read_file",
+                r#"{"path":"crates/runtime/escape/secret.txt"}"#,
+            )
+            .is_err());
+        assert!(executor
+            .enforce_resource_ceiling(
+                "write_file",
+                r#"{"path":"crates/runtime/escape/new.txt","content":"denied"}"#,
+            )
+            .is_err());
+    }
+
+    #[test]
     fn scoped_executor_advertises_only_packet_authorized_tools() {
         let executor = ScopedRuntimeToolExecutor {
             host: Arc::new(NoopRuntimeExecutionHost),
@@ -753,8 +1685,12 @@ mod tests {
             model_lease: "model".to_string(),
             execution_id: "graph".to_string(),
             node_id: "node".to_string(),
+            workspace_root: std::path::PathBuf::from("/workspace"),
+            resource_scopes: None,
             evaluation_isolated: false,
             managed_invocation: None,
+            next_receipt_sequence: AtomicU64::new(0),
+            receipts: Mutex::new(Vec::new()),
         };
 
         assert!(executor.has_registered_tools());
@@ -790,8 +1726,12 @@ mod tests {
             model_lease: "model".to_string(),
             execution_id: "graph".to_string(),
             node_id: "node".to_string(),
+            workspace_root: std::path::PathBuf::from("/workspace"),
+            resource_scopes: None,
             evaluation_isolated: false,
             managed_invocation: None,
+            next_receipt_sequence: AtomicU64::new(0),
+            receipts: Mutex::new(Vec::new()),
         };
         let descriptor = executor
             .describe_tool_effect("read_file", &serde_json::json!({"path": "README.md"}))
@@ -839,6 +1779,7 @@ mod tests {
                 "session-event://session/1",
                 "session:session",
             )],
+            resource_scopes: Vec::new(),
             allowed_tools: Vec::new(),
             allowed_skills: Vec::new(),
             permission_lease: "read_only".into(),
@@ -888,6 +1829,8 @@ mod tests {
                 cancellation: crate::CancellationToken::new(),
                 session_id: "child-session".into(),
                 input_stream: stream.clone(),
+                completion: Arc::new(tokio::sync::Notify::new()),
+                completed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         );
         worker
@@ -914,6 +1857,130 @@ mod tests {
         assert_eq!(inbox.items[0].content_preview, "use the new requirement");
         assert!(worker.capabilities().supports_input);
         assert!(!worker.capabilities().supports_pause);
+    }
+
+    #[tokio::test]
+    async fn cancel_waits_for_cleanup_and_completed_tombstone_is_race_safe() {
+        let worker = Arc::new(InProcessAgentWorker::new(Weak::new()));
+        let cancellation = crate::CancellationToken::new();
+        let completion = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        worker.active_runs.lock().unwrap().insert(
+            "run-cancel".into(),
+            ActiveInProcessRun {
+                cancellation: cancellation.clone(),
+                session_id: "child-session".into(),
+                input_stream: crate::SessionInputStream::new("child-session"),
+                completion: Arc::clone(&completion),
+                completed: Arc::clone(&completed),
+            },
+        );
+        let cleanup = ActiveRunCleanup {
+            worker: worker.as_ref(),
+            run_id: "run-cancel".into(),
+            completion,
+            completed,
+        };
+        let handle = AgentRunHandle {
+            run_id: "run-cancel".into(),
+            agent_id: "agent-cancel".into(),
+            backend: AgentBackendKind::InProcess,
+            revision: 1,
+            status: harness_contract::agent::AgentStatus::Running,
+        };
+        let request = AgentCommandRequest {
+            command_id: "cancel-1".into(),
+            agent_id: "agent-cancel".into(),
+            expected_revision: 1,
+            command: AgentCommand::Cancel,
+            input: None,
+        };
+        let cancel = {
+            let worker = Arc::clone(&worker);
+            let handle = handle.clone();
+            let request = request.clone();
+            tokio::spawn(async move { worker.command(&handle, &request).await })
+        };
+        cancellation.cancelled().await;
+        drop(cleanup);
+        tokio::time::timeout(std::time::Duration::from_secs(1), cancel)
+            .await
+            .expect("cancel returns after cleanup")
+            .expect("cancel task joins")
+            .expect("cancel is accepted");
+        assert!(worker.active_runs.lock().unwrap().is_empty());
+        assert!(worker.pending_cancellations.lock().unwrap().is_empty());
+        assert!(worker.run_completed("run-cancel"));
+
+        // A command arriving in the just-completed/no-active window must use
+        // the bounded tombstone instead of waiting ten seconds as if the run
+        // had not registered yet.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            worker.command(&handle, &request),
+        )
+        .await
+        .expect("completed tombstone resolves cancellation")
+        .expect("completed cancellation is idempotent");
+        assert!(worker.pending_cancellations.lock().unwrap().is_empty());
+
+        // Dropping a command future while it is waiting for an active run (or
+        // immediately after observing a completion tombstone) must also
+        // release its pending entry; no worker cleanup may still be available
+        // to do that on its behalf.
+        let aborted_token = crate::CancellationToken::new();
+        let aborted_completion = Arc::new(tokio::sync::Notify::new());
+        let aborted_completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        worker.active_runs.lock().unwrap().insert(
+            "run-aborted-command".into(),
+            ActiveInProcessRun {
+                cancellation: aborted_token.clone(),
+                session_id: "child-session".into(),
+                input_stream: crate::SessionInputStream::new("child-session"),
+                completion: Arc::clone(&aborted_completion),
+                completed: Arc::clone(&aborted_completed),
+            },
+        );
+        let aborted_cleanup = ActiveRunCleanup {
+            worker: worker.as_ref(),
+            run_id: "run-aborted-command".into(),
+            completion: aborted_completion,
+            completed: aborted_completed,
+        };
+        let aborted_handle = AgentRunHandle {
+            run_id: "run-aborted-command".into(),
+            agent_id: "agent-aborted-command".into(),
+            ..handle.clone()
+        };
+        let aborted = {
+            let worker = Arc::clone(&worker);
+            let request = request.clone();
+            tokio::spawn(async move { worker.command(&aborted_handle, &request).await })
+        };
+        aborted_token.cancelled().await;
+        aborted.abort();
+        let _ = aborted.await;
+        assert!(
+            worker.pending_cancellations.lock().unwrap().is_empty(),
+            "PendingCancellationOwner must clean a dropped command future"
+        );
+        drop(aborted_cleanup);
+
+        worker.record_completed_run("run-completed-abort-window");
+        worker
+            .pending_cancellations
+            .lock()
+            .unwrap()
+            .insert("run-completed-abort-window".into());
+        let completed_window_owner = PendingCancellationOwner {
+            pending: &worker.pending_cancellations,
+            run_id: "run-completed-abort-window".into(),
+        };
+        drop(completed_window_owner);
+        assert!(
+            worker.pending_cancellations.lock().unwrap().is_empty(),
+            "an abort between pending insertion and tombstone inspection must be leak-free"
+        );
     }
 
     #[test]
@@ -944,6 +2011,7 @@ mod tests {
             constraints: Vec::new(),
             context_refs: Vec::new(),
             evidence_refs: Vec::new(),
+            resource_scopes: Vec::new(),
             allowed_tools: Vec::new(),
             allowed_skills: Vec::new(),
             permission_lease: "read_only".into(),

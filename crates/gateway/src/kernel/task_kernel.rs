@@ -48,6 +48,16 @@ impl TaskKernel {
         self.inner.start_goal(objective, yolo_mode)
     }
 
+    pub(crate) fn start_goal_idempotent(
+        &self,
+        task_id: &str,
+        objective: impl Into<String>,
+        yolo_mode: bool,
+    ) -> Result<TaskRecord, String> {
+        self.inner
+            .start_goal_idempotent(task_id, objective, yolo_mode)
+    }
+
     pub(crate) fn transition(
         &self,
         task_id: &str,

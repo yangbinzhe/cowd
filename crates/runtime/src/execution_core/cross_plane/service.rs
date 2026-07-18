@@ -29,6 +29,8 @@ pub enum CrossPlaneRuntimeError {
     Serialization(#[from] serde_json::Error),
     #[error("cross-plane state query failed: {0}")]
     Query(String),
+    #[error("cross-plane idempotency conflict: {0}")]
+    IdempotencyConflict(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +98,10 @@ impl CrossPlaneRuntimeService {
         key: &str,
     ) -> Option<CrossPlaneExecutionReceipt> {
         self.control.find_execution_by_idempotency_key(key)
+    }
+    #[must_use]
+    pub fn find_execution(&self, receipt_id: &str) -> Option<CrossPlaneExecutionReceipt> {
+        self.control.find_execution(receipt_id)
     }
     #[must_use]
     pub fn resolve_identity(
@@ -175,16 +181,25 @@ impl CrossPlaneRuntimeService {
         receipt: CrossPlaneExecutionReceipt,
         consume_single_use_grant: bool,
     ) -> Result<(String, CrossPlaneExecutionReceipt), CrossPlaneRuntimeError> {
-        self.mutate("execution_recorded", move |control| {
+        self.mutate_checked("execution_recorded", move |control| {
             if let Some(existing) = receipt
                 .idempotency_key
                 .as_deref()
                 .and_then(|key| control.find_execution_by_idempotency_key(key))
             {
-                return (
+                if existing.mode != receipt.mode
+                    || existing.action != receipt.action
+                    || existing.dispatch_target != receipt.dispatch_target
+                {
+                    return Err(CrossPlaneRuntimeError::IdempotencyConflict(format!(
+                        "key {} is bound to another action",
+                        receipt.idempotency_key.as_deref().unwrap_or_default()
+                    )));
+                }
+                return Ok((
                     existing.audit_record_id.clone().unwrap_or_default(),
                     existing,
-                );
+                ));
             }
             if consume_single_use_grant {
                 if let Some((grant_id, remaining_uses)) =
@@ -197,7 +212,7 @@ impl CrossPlaneRuntimeService {
             let audit_id = audit.id.clone();
             control.record_audit(audit);
             control.record_execution(receipt.clone());
-            (audit_id, receipt)
+            Ok((audit_id, receipt))
         })
     }
 
@@ -216,7 +231,18 @@ impl CrossPlaneRuntimeService {
             .event_by_idempotency_key(&stream_id, "dispatch-intent")?
             .is_some()
         {
-            return Ok(());
+            let existing = self.dispatch_intent(idempotency_key)?.ok_or_else(|| {
+                CrossPlaneRuntimeError::Query(
+                    "dispatch intent event exists without a readable target".to_string(),
+                )
+            })?;
+            return if existing == *target {
+                Ok(())
+            } else {
+                Err(CrossPlaneRuntimeError::IdempotencyConflict(format!(
+                    "dispatch key {idempotency_key} is bound to another target"
+                )))
+            };
         }
         let revision = self.event_store.stream_revision(&stream_id)?;
         self.event_store.append_batch_if_revision(
@@ -370,6 +396,7 @@ impl CrossPlaneRuntimeService {
             "cross_plane_connector",
             serde_json::to_string(action).unwrap_or_default(),
         );
+        tool.id = format!("cross-plane-tool-{digest:x}");
         tool.idempotency_key = format!("{idempotency_key}:tool");
         let tool_id = tool.id.clone();
         if let Some(required_approval) = decision.required_approval.as_ref() {
@@ -385,6 +412,7 @@ impl CrossPlaneRuntimeService {
                 })
                 .to_string(),
             );
+            approval.id = format!("cross-plane-approval-{digest:x}");
             approval.idempotency_key = format!("{idempotency_key}:approval");
             let approval_id = approval.id.clone();
             graph.nodes.push(approval);
@@ -409,6 +437,50 @@ impl CrossPlaneRuntimeService {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let before = self.control.snapshot();
         let result = operation(&self.control);
+        let revision = self.event_store.stream_revision(STREAM_ID)?;
+        let payload = serde_json::to_value(self.control.snapshot())?;
+        let append = self.event_store.append_batch_if_revision(
+            STREAM_ID,
+            revision,
+            format!("cross-plane:{kind}:{}", uuid::Uuid::new_v4()),
+            vec![RuntimeEventInput {
+                stream_id: STREAM_ID.to_string(),
+                scope: RuntimeEventScope::CrossPlane,
+                kind: kind.to_string(),
+                status: Some("committed".to_string()),
+                actor: Some("cross_plane_runtime".to_string()),
+                refs: vec![RuntimeEventRef {
+                    kind: "workspace".to_string(),
+                    id: STREAM_ID.to_string(),
+                }],
+                payload,
+            }
+            .into()],
+        );
+        if let Err(error) = append {
+            self.control.replace_snapshot(before);
+            return Err(error.into());
+        }
+        Ok(result)
+    }
+
+    fn mutate_checked<T>(
+        &self,
+        kind: &str,
+        operation: impl FnOnce(&CrossPlaneControlPlane) -> Result<T, CrossPlaneRuntimeError>,
+    ) -> Result<T, CrossPlaneRuntimeError> {
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = self.control.snapshot();
+        let result = match operation(&self.control) {
+            Ok(result) => result,
+            Err(error) => {
+                self.control.replace_snapshot(before);
+                return Err(error);
+            }
+        };
         let revision = self.event_store.stream_revision(STREAM_ID)?;
         let payload = serde_json::to_value(self.control.snapshot())?;
         let append = self.event_store.append_batch_if_revision(
@@ -523,6 +595,51 @@ mod tests {
         assert_eq!(first.1.id, second.1.id);
         assert_eq!(service.list_audit(10, 0).len(), 1);
         assert_eq!(service.list_executions(10, 0).len(), 1);
+    }
+
+    #[test]
+    fn execution_receipt_rejects_a_different_atomic_owner() {
+        let service = CrossPlaneRuntimeService::open(Arc::new(
+            RuntimeEventStore::try_open_in_memory().unwrap(),
+        ))
+        .unwrap();
+        let record = |actor: &str, capability: &str| {
+            let action = CrossPlaneAction::new(actor, capability);
+            let (_, decision, evidence) =
+                service.decide_with_connector_context(action.clone(), None, Utc::now());
+            let audit = CrossPlaneAuditRecord::new(
+                action.clone(),
+                decision.clone(),
+                "planned",
+                "atomic owner fixture",
+            )
+            .with_evidence(evidence);
+            let receipt = CrossPlaneExecutionReceipt::new(
+                Some("shared-atomic-key".to_string()),
+                "commit",
+                "planned",
+                "not_started",
+                action,
+                decision,
+                Vec::new(),
+                Some(audit.id.clone()),
+            );
+            (audit, receipt)
+        };
+        let (audit, receipt) = record("alice", "channel.send");
+        service.record_action_execution(audit, receipt).unwrap();
+        let (audit, receipt) = record("bob", "service.execute");
+        assert!(matches!(
+            service.record_action_execution(audit, receipt),
+            Err(CrossPlaneRuntimeError::IdempotencyConflict(_))
+        ));
+        assert_eq!(service.list_audit(10, 0).len(), 1);
+        assert_eq!(service.list_executions(10, 0).len(), 1);
+        let owner = service
+            .find_execution_by_idempotency_key("shared-atomic-key")
+            .unwrap();
+        assert_eq!(owner.action.actor_principal, "alice");
+        assert_eq!(owner.action.requested_capability, "channel.send");
     }
 
     #[test]

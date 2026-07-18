@@ -28,30 +28,68 @@ impl TestRunner {
     }
 
     pub fn run<F>(&mut self, name: &str, f: F)
-    where F: FnOnce() -> anyhow::Result<()>
+    where
+        F: FnOnce() -> anyhow::Result<()>,
     {
         let test_start = Instant::now();
         // Classify scenario
-        if name.contains("cross") || name.contains("e2e") { self.cross_scenarios += 1; }
-        else if name.contains("server") { self.server_scenarios += 1; }
-        else { self.tui_scenarios += 1; }
+        if name.contains("cross") || name.contains("e2e") {
+            self.cross_scenarios += 1;
+        } else if name.contains("server") {
+            self.server_scenarios += 1;
+        } else {
+            self.tui_scenarios += 1;
+        }
 
         match f() {
             Ok(()) => {
                 let ms = test_start.elapsed().as_millis() as u64;
                 println!("  ✅ {:<30} {:>4}.{:03}s", name, ms / 1000, ms % 1000);
                 self.results.push(TestResult {
-                    name: name.to_string(), passed: true, duration_ms: ms, error: None,
+                    name: name.to_string(),
+                    passed: true,
+                    duration_ms: ms,
+                    error: None,
                 });
             }
             Err(e) => {
                 let ms = test_start.elapsed().as_millis() as u64;
-                println!("  ❌ {:<30} {:>4}.{:03}s  {}", name, ms / 1000, ms % 1000, e);
+                println!(
+                    "  ❌ {:<30} {:>4}.{:03}s  {}",
+                    name,
+                    ms / 1000,
+                    ms % 1000,
+                    e
+                );
                 self.results.push(TestResult {
-                    name: name.to_string(), passed: false, duration_ms: ms, error: Some(e.to_string()),
+                    name: name.to_string(),
+                    passed: false,
+                    duration_ms: ms,
+                    error: Some(e.to_string()),
                 });
             }
         }
+    }
+
+    pub fn record_failure(&mut self, name: &str, error: impl Into<String>) {
+        self.results.push(TestResult {
+            name: name.to_string(),
+            passed: false,
+            duration_ms: 0,
+            error: Some(error.into()),
+        });
+    }
+
+    pub fn failed_count(&self) -> usize {
+        self.results.iter().filter(|result| !result.passed).count()
+    }
+
+    pub fn has_failures(&self) -> bool {
+        self.failed_count() > 0
+    }
+
+    pub fn executed_count(&self) -> usize {
+        self.results.len()
     }
 
     pub fn report(&self) {
@@ -67,7 +105,14 @@ impl TestRunner {
         println!("  Total:        {total}");
         println!("  Passed:       {passed}");
         println!("  Failed:       {failed}");
-        println!("  Pass rate:    {:.0}%", if total > 0 { passed as f64 / total as f64 * 100.0 } else { 0.0 });
+        println!(
+            "  Pass rate:    {:.0}%",
+            if total > 0 {
+                passed as f64 / total as f64 * 100.0
+            } else {
+                0.0
+            }
+        );
         println!("  ───────────────────────────────────────");
         println!("  TUI tests:    {}", self.tui_scenarios);
         println!("  Server tests: {}", self.server_scenarios);
@@ -93,14 +138,27 @@ impl TestRunner {
         } else {
             let fail_rate = failed as f64 / total as f64 * 100.0;
             if fail_rate > 50.0 {
-                println!("    🔴 Critical: {:.0}% failure rate. Check TUI/Server runtime.", fail_rate);
+                println!(
+                    "    🔴 Critical: {:.0}% failure rate. Check TUI/Server runtime.",
+                    fail_rate
+                );
             } else if fail_rate > 20.0 {
-                println!("    🟡 Warning: {:.0}% failure rate. Investigate failures.", fail_rate);
+                println!(
+                    "    🟡 Warning: {:.0}% failure rate. Investigate failures.",
+                    fail_rate
+                );
             } else {
-                println!("    🟢 Note: {:.0}% failure rate. Minor issues detected.", fail_rate);
+                println!(
+                    "    🟢 Note: {:.0}% failure rate. Minor issues detected.",
+                    fail_rate
+                );
             }
             if failed > 0 && self.cross_scenarios > 0 {
-                let cross_failed = self.results.iter().filter(|r| !r.passed && r.name.contains("cross")).count();
+                let cross_failed = self
+                    .results
+                    .iter()
+                    .filter(|r| !r.passed && r.name.contains("cross"))
+                    .count();
                 if cross_failed > 0 {
                     println!("    🔄 Cross-test failures detected. TUI↔Server sync may be broken.");
                 }

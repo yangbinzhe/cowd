@@ -11,15 +11,15 @@ use crate::execution_core::{
     NodeExecutionTicket, NodeExecutorError,
 };
 use crate::{
-    model_context_window_with_overrides, permissions::SharedPrompter, AutoCompactionEvent,
-    ContentBlock, ContextAuthority, ContextEnvelope, ContextItem, ContextProfile, ContextRole,
-    ContextSourceKind, ContextVisibility, ConversationMessage, CowdEvent, CowdEventBus,
-    HookAbortSignal, HookProgressReporter, PermissionPolicy, ProviderRuntimeClient,
-    ProviderToolDefinition, ResumeContextPacket, RuntimeError, RuntimeFeatureConfig, Session,
-    ToolCallback, ToolExecutor, TurnSummary,
+    AutoCompactionEvent, ContentBlock, ContextAuthority, ContextEnvelope, ContextItem,
+    ContextProfile, ContextRole, ContextSourceKind, ContextVisibility, ConversationMessage,
+    CowdEvent, CowdEventBus, HookAbortSignal, HookProgressReporter, PermissionPolicy,
+    ProviderRuntimeClient, ProviderToolDefinition, ResumeContextPacket, RuntimeError,
+    RuntimeFeatureConfig, Session, ToolCallback, ToolExecutor, TurnSummary,
+    model_context_window_with_overrides, permissions::SharedPrompter,
 };
 use async_trait::async_trait;
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 use harness_contract::agent::AgentTaskIntent;
 use harness_contract::execution_graph::{
     ExecutionEdge, ExecutionEdgeKind, ExecutionNodeKind, ExecutionNodeResult, ExecutionNodeSpec,
@@ -269,6 +269,15 @@ where
 
     pub fn set_model_step_limit_override(&self, limit: usize) {
         self.runtime_ref().set_model_step_limit_override(limit);
+    }
+
+    pub fn set_delegated_focus_policy(
+        &self,
+        novelty_target_bp: u16,
+        acceptance_scopes: Vec<String>,
+    ) {
+        self.runtime_ref()
+            .set_delegated_focus_policy(novelty_target_bp, acceptance_scopes);
     }
 
     /// Control whether this host may publish transcript rows. Delegated
@@ -567,19 +576,54 @@ where
     C: ApiClient + Clone + Send + Sync + 'static,
     T: ToolExecutor,
 {
+    let turn_started_at = std::time::Instant::now();
+    let runtime = runtime.with_runtime_event_store(Arc::clone(services.event_store()));
+    let evaluation_control = match evaluation_turn_control(content) {
+        Ok(control) => control,
+        Err(error) => return (runtime, Err(error)),
+    };
+    if let Some(control) = evaluation_control.as_ref() {
+        if let Err(error) = crate::conversation::install_evaluation_provider_token_lease(
+            &control.budget_lease_id,
+            control.max_total_tokens,
+        ) {
+            return (runtime, Err(error));
+        }
+    }
+    let evaluation_content;
+    let content = if let Some(control) = evaluation_control.as_ref() {
+        evaluation_content = control.prompt.clone();
+        evaluation_content.as_str()
+    } else {
+        content
+    };
+    let _evaluation_resource_guard = match evaluation_control.as_ref() {
+        Some(control) => match EvaluationResourceQuotaGuard::apply(&services, control) {
+            Ok(guard) => Some(guard),
+            Err(error) => return (runtime, Err(error)),
+        },
+        None => None,
+    };
     let session_id = runtime.session().session_id;
+    let turn_ref = ingress
+        .as_ref()
+        .map(|ingress| ingress.turn_id.clone())
+        .unwrap_or_else(|| TurnId::new().to_string());
     let runtime = Arc::new(tokio::sync::Mutex::new(runtime));
+    let parent_merge_started_at = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
+    let parent_merge_timer = Arc::clone(&parent_merge_started_at);
     if let Some(bus) = runtime.lock().await.cowd_bus().cloned() {
         bus.emit(CowdEvent::ExecutionPhase {
             status: harness_contract::projection::ExecutionLiveStatus::PreparingContext,
             detail: Some("assembling context".to_string()),
         });
     }
-    let result = async {
+    let mut result = async {
         let state = Arc::new(tokio::sync::Mutex::new(TurnGraphState {
             content: content.to_string(),
             prompter: prompter.clone(),
             first_model_step: true,
+            pending_next_model_context: Vec::new(),
             next_calls: Vec::new(),
             next_resource_scopes: Vec::new(),
             assistant_messages: Vec::new(),
@@ -607,34 +651,92 @@ where
             force_text_only_next_model: false,
             terminal_recovery_attempts: 0,
             bounded_evidence_role: false,
+            focus_novelty_target_bp: 0,
+            focus_acceptance_scopes: Vec::new(),
             clean_terminal_synthesis_next: false,
             clean_terminal_synthesis_attempted: false,
             clean_terminal_retry_attempted: false,
             consecutive_tool_failure_batches: 0,
+            consecutive_low_novelty_batches: 0,
             successful_tool_calls: 0,
+            duplicate_tool_calls: 0,
+            write_attempt_paths: Vec::new(),
+            max_tool_concurrency_observed: 0,
+            parallel_tool_batches: 0,
+            evaluation_resource_scopes: evaluation_control
+                .as_ref()
+                .map(|control| control.resource_scopes.clone())
+                .unwrap_or_default(),
             team_orchestration_requests: 0,
+            collaboration_started: false,
+            team_orchestration_forbidden: evaluation_control.is_some()
+                && evaluation_topology_forbids_team(),
         }));
 
-        let (strategy, context_window, context_profile, owner_step_limit) = {
+        let resource_snapshot =
+            turn_strategy_resource_snapshot(services.as_ref(), evaluation_control.as_ref())?;
+        let (
+            mut strategy,
+            context_window,
+            context_profile,
+            owner_step_limit,
+            delegated_focus_policy,
+        ) = {
             let runtime = runtime.lock().await;
             (
-                crate::execution_core::StrategyDecisionEngine
-                    .decide(content, Some(runtime.context_profile())),
+                runtime.begin_turn_strategy_with_resource_snapshot(
+                    turn_ref.clone(),
+                    content,
+                    Some(resource_snapshot),
+                )?,
                 runtime.model_context_window(),
                 runtime.context_profile(),
                 runtime.model_step_limit_override(),
+                runtime.delegated_focus_policy(),
             )
         };
-        let compile_target = strategy.compile_target;
+        if strategy.selected_candidate == harness_contract::strategy::ExecutionCandidateKind::Team {
+            let plans =
+                selected_strategy_focus_plans(
+                    &strategy,
+                    content,
+                    services.workspace_root(),
+                    evaluation_control
+                        .as_ref()
+                        .map(|control| control.resource_scopes.as_slice())
+                        .unwrap_or_default(),
+                );
+            strategy = runtime
+                .lock()
+                .await
+                .set_turn_strategy_focus_partitions(plans)?;
+        }
+        if evaluation_control.is_some() && evaluation_topology_forbids_team() {
+            let mut item = ContextItem::new(
+                format!("eval-topology:{}", strategy.decision_id),
+                ContextSourceKind::Task,
+                ContextRole::Instruction,
+                format!(
+                    "Pre-registered evaluation topology is {}. Complete the identical business workload locally with this selected topology and authorized tools. Do not request or simulate a Team; the Runtime will reject Team materialization in this baseline.",
+                    strategy.selected_candidate.as_str()
+                ),
+            );
+            item.authority = ContextAuthority::System;
+            item.visibility = ContextVisibility::Private;
+            runtime.lock().await.push_next_model_context_item(item);
+        }
+        let compile_target = strategy.decision.compile_target;
         {
             let mut graph_state = state.lock().await;
             graph_state.safety_lease = crate::execution_core::SafetyFusePolicy::derive(
                 context_window,
-                strategy.complexity(),
+                strategy.decision.complexity(),
                 explicit_model_step_limit(content).or(owner_step_limit),
             );
             graph_state.bounded_evidence_role = context_profile == ContextProfile::SubAgent
                 || compile_target == crate::execution_core::RuntimeCompileTarget::EvidenceGraph;
+            graph_state.focus_novelty_target_bp = delegated_focus_policy.0;
+            graph_state.focus_acceptance_scopes = delegated_focus_policy.1;
         }
         let turn_payload = serde_json::json!({
             "kind": "conversation_turn",
@@ -707,6 +809,16 @@ where
                 kind: ExecutionEdgeKind::DependsOn,
             });
         }
+        let strategy_parent_node_id = graph
+            .nodes
+            .iter()
+            .find(|node| node.kind != ExecutionNodeKind::SessionDispatch)
+            .map(|node| node.id.clone())
+            .ok_or_else(|| RuntimeError::new("conversation graph has no strategy parent node"))?;
+        let strategy = runtime
+            .lock()
+            .await
+            .bind_turn_strategy_execution(&turn_ref, &graph.id)?;
         let goal_id = format!("goal:{}", graph.id);
         services
             .goal_store()
@@ -803,9 +915,59 @@ where
             .recover(&graph_id)
             .await
             .map_err(|error| RuntimeError::new(error.to_string()))?;
+            let collaboration_started = start_selected_strategy(
+                &runtime,
+                services.as_ref(),
+                content,
+                &strategy,
+                &graph_id,
+                &strategy_parent_node_id,
+            )
+            .await?;
+            state.lock().await.collaboration_started |= collaboration_started;
+            if collaboration_started {
+                *parent_merge_timer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(std::time::Instant::now());
+            }
+            let revised_strategy = runtime
+                .lock()
+                .await
+                .active_turn_strategy()
+                .ok_or_else(|| {
+                    RuntimeError::new("strategy owner disappeared after recovered Team admission")
+                })?;
+            if revised_strategy.decision.compile_target != compile_target {
+                let recovered = services
+                    .graph_state_store()
+                    .load_async(&graph_id)
+                    .await
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                let replacement = compile_retargeted_conversation_graph(
+                    &recovered,
+                    content,
+                    &session_id,
+                    ingress.as_ref(),
+                    revised_strategy.decision.compile_target,
+                    &strategy_parent_node_id,
+                )?;
+                services
+                    .commit_service()
+                    .retarget_planned_graph_async(
+                        recovered,
+                        replacement,
+                        format!(
+                            "recovered strategy decision {} revision {} downgraded compile target before execution",
+                            revised_strategy.decision_id, revised_strategy.revision,
+                        ),
+                    )
+                    .await
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+            }
             services.graph_runner().run_until_quiescent(&graph_id).await
         } else {
-            let registered = services
+            let mut registered = services
                 .graph_runner()
                 .register(graph)
                 .await
@@ -833,6 +995,59 @@ where
                         complementarity_score: None,
                     },
                 });
+            }
+            let collaboration_started = start_selected_strategy(
+                &runtime,
+                services.as_ref(),
+                content,
+                &strategy,
+                &registered.id,
+                &strategy_parent_node_id,
+            )
+            .await?;
+            state.lock().await.collaboration_started |= collaboration_started;
+            if collaboration_started {
+                *parent_merge_timer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(std::time::Instant::now());
+            }
+            let revised_strategy = runtime
+                .lock()
+                .await
+                .active_turn_strategy()
+                .ok_or_else(|| {
+                    RuntimeError::new("strategy owner disappeared after Team admission")
+                })?;
+            if revised_strategy.decision.compile_target != compile_target {
+                let replacement = compile_retargeted_conversation_graph(
+                    &registered,
+                    content,
+                    &session_id,
+                    ingress.as_ref(),
+                    revised_strategy.decision.compile_target,
+                    &strategy_parent_node_id,
+                )?;
+                services
+                    .commit_service()
+                    .retarget_planned_graph_async(
+                        registered.clone(),
+                        replacement,
+                        format!(
+                            "strategy decision {} revision {} downgraded compile target from {:?} to {:?} before parent execution",
+                            revised_strategy.decision_id,
+                            revised_strategy.revision,
+                            compile_target,
+                            revised_strategy.decision.compile_target,
+                        ),
+                    )
+                    .await
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                registered = services
+                    .graph_state_store()
+                    .load_async(&graph_id)
+                    .await
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
             }
             services
                 .graph_runner()
@@ -904,16 +1119,1260 @@ where
         Ok(summary)
     }
     .await;
+    {
+        let end_to_end_duration_ms = u64::try_from(turn_started_at.elapsed().as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let parent_merge_started_at = parent_merge_started_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .copied();
+        let (parent_merge_cost_ms, parent_merge_count) =
+            parent_merge_actuals(parent_merge_started_at, result.is_ok());
+        let evaluation_budget = evaluation_control.as_ref().and_then(|control| {
+            crate::conversation::evaluation_provider_token_lease_snapshot()
+                .filter(|snapshot| snapshot.lease_id == control.budget_lease_id)
+        });
+        let (status, outcome) = match &result {
+            Ok(summary) => (
+                crate::execution_core::TurnStrategyDecisionStatus::Completed,
+                crate::execution_core::TurnStrategyActualOutcome {
+                    duration_ms: end_to_end_duration_ms,
+                    input_tokens: summary.model_telemetry.input_tokens,
+                    output_tokens: summary.model_telemetry.output_tokens,
+                    cached_tokens: summary
+                        .model_telemetry
+                        .cache_create_tokens
+                        .saturating_add(summary.model_telemetry.cache_read_tokens),
+                    tool_calls: summary.tool_results.len() as u64,
+                    duplicate_tool_calls: summary.duplicate_tool_calls,
+                    max_tool_concurrency_observed: u64::try_from(
+                        summary.max_tool_concurrency_observed,
+                    )
+                    .unwrap_or(u64::MAX),
+                    parallel_tool_batches: u64::try_from(summary.parallel_tool_batches)
+                        .unwrap_or(u64::MAX),
+                    write_attempt_paths: summary.write_attempt_paths.clone(),
+                    evidence_overlap_bp: 0,
+                    evidence_overlap_observed: false,
+                    working_state_verified: false,
+                    merge_cost_ms: parent_merge_cost_ms,
+                    parent_merge_count,
+                    evaluation_token_limit: evaluation_budget
+                        .as_ref()
+                        .map_or(0, |budget| budget.limit),
+                    evaluation_tokens_consumed: evaluation_budget
+                        .as_ref()
+                        .map_or(0, |budget| budget.consumed),
+                    evaluation_budget_observed: evaluation_budget
+                        .as_ref()
+                        .is_some_and(|budget| budget.outstanding == 0),
+                    evaluation_budget_breached: evaluation_budget
+                        .as_ref()
+                        .is_some_and(|budget| budget.breached),
+                    quality_score_bp: Some(
+                        if summary.ai_kernel_trace.verification_report.can_finalize
+                            && summary.ai_kernel_trace.bench_result.passed
+                            && summary.ai_kernel_trace.regression_gate.allowed
+                        {
+                            (summary.ai_kernel_trace.bench_result.score.clamp(0.0, 1.0) * 10_000.0)
+                                as u16
+                        } else {
+                            0
+                        },
+                    ),
+                    actual_speedup_ratio_bp: None,
+                    terminal_reason: format!("{:?}", summary.terminal_completion)
+                        .to_ascii_lowercase(),
+                },
+            ),
+            Err(error) => (
+                if error.to_string().contains("cancelled") {
+                    crate::execution_core::TurnStrategyDecisionStatus::Cancelled
+                } else {
+                    crate::execution_core::TurnStrategyDecisionStatus::Failed
+                },
+                crate::execution_core::TurnStrategyActualOutcome {
+                    duration_ms: end_to_end_duration_ms,
+                    merge_cost_ms: parent_merge_cost_ms,
+                    parent_merge_count: 0,
+                    evaluation_token_limit: evaluation_budget
+                        .as_ref()
+                        .map_or(0, |budget| budget.limit),
+                    evaluation_tokens_consumed: evaluation_budget
+                        .as_ref()
+                        .map_or(0, |budget| budget.consumed),
+                    evaluation_budget_observed: evaluation_budget
+                        .as_ref()
+                        .is_some_and(|budget| budget.outstanding == 0),
+                    evaluation_budget_breached: evaluation_budget
+                        .as_ref()
+                        .is_some_and(|budget| budget.breached),
+                    terminal_reason: error.to_string(),
+                    ..Default::default()
+                },
+            ),
+        };
+        if let Err(error) = runtime
+            .lock()
+            .await
+            .finish_turn_strategy(&turn_ref, status, outcome)
+        {
+            if result.is_ok() {
+                result = Err(error);
+            } else {
+                tracing::warn!(%error, turn_ref, "failed to record terminal turn strategy outcome");
+            }
+        }
+    }
     let runtime = Arc::try_unwrap(runtime)
         .unwrap_or_else(|_| panic!("turn executors must release the conversation runtime"))
         .into_inner();
     (runtime, result)
 }
 
+const EVALUATION_TURN_CONTROL_PREFIX: &str = "COWD_EVAL_CONTROL ";
+
+#[derive(Debug, Clone, Deserialize)]
+struct EvaluationTurnControl {
+    corpus_id: String,
+    workspace_fixture: String,
+    provider_constraint: String,
+    temperature_milli: u16,
+    #[serde(default)]
+    resource_scopes: Vec<String>,
+    budget_lease_id: String,
+    max_total_tokens: u64,
+    prompt: String,
+}
+
+fn evaluation_turn_control(content: &str) -> Result<Option<EvaluationTurnControl>, RuntimeError> {
+    let Some((line, prompt)) = content.split_once('\n') else {
+        return Ok(None);
+    };
+    let Some(encoded) = line.strip_prefix(EVALUATION_TURN_CONTROL_PREFIX) else {
+        return Ok(None);
+    };
+    if std::env::var("COWD_EVAL_HARNESS").as_deref() != Ok("1")
+        || std::env::var("COWD_EVAL_CORPUS_ID").as_deref() != Ok("auto-strategy-v1")
+    {
+        return Ok(None);
+    }
+    let mut control = serde_json::from_str::<EvaluationTurnControl>(encoded)
+        .map_err(|error| RuntimeError::new(format!("invalid evaluation turn control: {error}")))?;
+    if control.corpus_id != "auto-strategy-v1" || prompt.trim().is_empty() {
+        return Err(RuntimeError::new(
+            "evaluation turn control corpus or prompt is invalid",
+        ));
+    }
+    if control.budget_lease_id.trim().is_empty()
+        || control.max_total_tokens == 0
+        || control.max_total_tokens > 2_000_000
+    {
+        return Err(RuntimeError::new(
+            "evaluation provider token lease is invalid",
+        ));
+    }
+    if control.temperature_milli != 0
+        || std::env::var("COWD_MODEL_TEMPERATURE").as_deref() != Ok("0")
+    {
+        return Err(RuntimeError::new(
+            "evaluation temperature is not the frozen zero-temperature provider request",
+        ));
+    }
+    if control.workspace_fixture != "none"
+        && std::env::var("COWD_EVAL_WORKSPACE_FIXTURE").ok().as_deref()
+            != Some(control.workspace_fixture.as_str())
+    {
+        return Err(RuntimeError::new(format!(
+            "evaluation workspace fixture `{}` is not the frozen server fixture",
+            control.workspace_fixture
+        )));
+    }
+    control.prompt = prompt.to_string();
+    Ok(Some(control))
+}
+
+struct EvaluationResourceQuotaGuard {
+    manager: Arc<crate::execution_core::graph::ExecutionResourceManager>,
+    previous: Vec<(
+        crate::execution_core::graph::ExecutionResourceKind,
+        crate::execution_core::graph::ResourceQuota,
+    )>,
+}
+
+impl EvaluationResourceQuotaGuard {
+    fn apply(
+        services: &crate::RuntimeServices,
+        control: &EvaluationTurnControl,
+    ) -> Result<Self, RuntimeError> {
+        use crate::execution_core::graph::{ExecutionResourceKind, ResourceQuota};
+        let manager = Arc::clone(services.resource_manager());
+        let mut guard = Self {
+            manager,
+            previous: Vec::new(),
+        };
+        if matches!(control.provider_constraint.as_str(), "normal" | "judge") {
+            return Ok(guard);
+        }
+        for assignment in control.provider_constraint.split(',') {
+            let (name, value) = assignment.trim().split_once('=').ok_or_else(|| {
+                RuntimeError::new(format!(
+                    "invalid evaluation resource constraint `{assignment}`"
+                ))
+            })?;
+            let limit = value
+                .parse::<usize>()
+                .ok()
+                .filter(|value| (1..=64).contains(value))
+                .ok_or_else(|| {
+                    RuntimeError::new(format!(
+                        "evaluation resource constraint `{assignment}` must be within 1..=64"
+                    ))
+                })?;
+            let kind = match name {
+                "provider_concurrency" => ExecutionResourceKind::Provider,
+                "tool_concurrency" => ExecutionResourceKind::Tool,
+                "team_slots" => ExecutionResourceKind::Agent,
+                _ => {
+                    return Err(RuntimeError::new(format!(
+                        "unknown evaluation resource constraint `{name}`"
+                    )));
+                }
+            };
+            let snapshot = guard.manager.snapshot(&kind).map_err(|error| {
+                RuntimeError::new(format!("snapshot evaluation resource {kind:?}: {error}"))
+            })?;
+            if !guard.previous.iter().any(|(previous, _)| previous == &kind) {
+                guard.previous.push((
+                    kind.clone(),
+                    ResourceQuota::new(snapshot.minimum, snapshot.target, snapshot.maximum)
+                        .map_err(|error| RuntimeError::new(error.to_string()))?,
+                ));
+            }
+            guard
+                .manager
+                .update_quota(
+                    &kind,
+                    ResourceQuota::new(1, limit, limit)
+                        .map_err(|error| RuntimeError::new(error.to_string()))?,
+                )
+                .map_err(|error| {
+                    RuntimeError::new(format!(
+                        "apply evaluation resource constraint `{assignment}`: {error}"
+                    ))
+                })?;
+        }
+        Ok(guard)
+    }
+}
+
+impl Drop for EvaluationResourceQuotaGuard {
+    fn drop(&mut self) {
+        for (kind, quota) in self.previous.iter().rev() {
+            if let Err(error) = self.manager.update_quota(kind, *quota) {
+                tracing::error!(
+                    ?kind,
+                    %error,
+                    "failed to restore preregistered evaluation resource quota"
+                );
+            }
+        }
+    }
+}
+
+fn turn_strategy_resource_snapshot(
+    services: &crate::RuntimeServices,
+    evaluation: Option<&EvaluationTurnControl>,
+) -> Result<harness_contract::strategy::StrategyResourceSnapshot, RuntimeError> {
+    use crate::execution_core::graph::ExecutionResourceKind;
+
+    let snapshot = |kind| {
+        services
+            .resource_manager()
+            .snapshot(&kind)
+            .map_err(|error| RuntimeError::new(format!("read {kind:?} resource snapshot: {error}")))
+    };
+    let provider = snapshot(ExecutionResourceKind::Provider)?;
+    let tool = snapshot(ExecutionResourceKind::Tool)?;
+    let agent = snapshot(ExecutionResourceKind::Agent)?;
+    let available = |value: &crate::execution_core::graph::ExecutionResourceSnapshot| {
+        value.effective_limit.saturating_sub(value.active_leases)
+    };
+    let provider_available = available(&provider);
+    let tool_available = available(&tool);
+    let agent_available = available(&agent);
+    let team_slots = provider_available.min(tool_available).min(agent_available);
+    let provider_penalty = if provider.effective_limit == 0 {
+        10_000
+    } else {
+        provider
+            .queued_waiters
+            .saturating_mul(10_000)
+            .saturating_div(provider.effective_limit)
+            .min(10_000)
+    };
+    Ok(harness_contract::strategy::StrategyResourceSnapshot {
+        version: if evaluation.is_some() {
+            "runtime-resource-manager-v1+preregistered-eval".to_string()
+        } else {
+            "runtime-resource-manager-v1".to_string()
+        },
+        provider_available: provider_available > 0,
+        tools_available: tool_available > 0,
+        team_available: team_slots >= 2,
+        provider_concurrency: u16::try_from(provider_available).unwrap_or(u16::MAX),
+        tool_concurrency: u16::try_from(tool_available).unwrap_or(u16::MAX),
+        team_slots: u16::try_from(team_slots).unwrap_or(u16::MAX),
+        provider_concurrency_penalty_bp: u16::try_from(provider_penalty).unwrap_or(10_000),
+        sample_source: evaluation.map_or_else(
+            || "runtime-execution-resource-manager".to_string(),
+            |control| {
+                format!(
+                    "runtime-execution-resource-manager:corpus={}:workspace_fixture={}:provider_constraint={}:temperature_milli={}",
+                    control.corpus_id,
+                    control.workspace_fixture,
+                    control.provider_constraint,
+                    control.temperature_milli,
+                )
+            },
+        ),
+        sample_count: 1,
+        assumed: false,
+    })
+}
+
+/// Materialize an automatically selected Team before the parent graph asks
+/// the provider for its first step. The child terminal receipt is injected
+/// exactly once as parent evidence; the model is never asked to decide
+/// whether the already-selected strategy should actually start.
+async fn start_selected_strategy<C, T>(
+    runtime: &Arc<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
+    services: &crate::RuntimeServices,
+    objective: &str,
+    strategy: &crate::execution_core::TurnStrategyDecisionState,
+    parent_graph_id: &str,
+    parent_node_id: &str,
+) -> Result<bool, RuntimeError>
+where
+    C: ApiClient + Clone + Send + Sync + 'static,
+    T: ToolExecutor,
+{
+    if strategy.selected_candidate != harness_contract::strategy::ExecutionCandidateKind::Team {
+        return Ok(false);
+    }
+    if let Some(receipt) = strategy.collaboration_receipt.as_ref() {
+        let mut item = ContextItem::new(
+            format!("runtime-team-recovered:{}", strategy.decision_id),
+            ContextSourceKind::Task,
+            ContextRole::Evidence,
+            format!(
+                "Runtime recovered the already executed Team receipt. Consume this checked collaboration result exactly once and do not start another Team for the same decision lease.\n{}",
+                serde_json::to_string(receipt).unwrap_or_else(|_| "{}".to_string())
+            ),
+        );
+        item.authority = ContextAuthority::Tool;
+        item.visibility = ContextVisibility::Private;
+        item.evidence = vec![format!("strategy_decision:{}", strategy.decision_id)];
+        runtime.lock().await.push_next_model_context_item(item);
+        return Ok(true);
+    }
+    let (model_lease, requires_write, permission_mode) = {
+        let runtime = runtime.lock().await;
+        (
+            runtime.active_model_lease(),
+            strategy.decision.strategy.understanding.requires_write,
+            runtime.permission_policy().active_mode(),
+        )
+    };
+    if requires_write
+        && !matches!(
+            permission_mode,
+            crate::PermissionMode::WorkspaceWrite
+                | crate::PermissionMode::DangerFullAccess
+                | crate::PermissionMode::Allow
+        )
+    {
+        runtime.lock().await.downgrade_turn_strategy(
+            best_non_team_strategy(strategy),
+            "Team write strategy cannot inherit a workspace-write parent permission lease",
+        )?;
+        return Ok(false);
+    }
+    let focus_count = selected_strategy_focus_count(strategy);
+    let focus_partition_plans = strategy.focus_partition_plans.clone();
+    if focus_partition_plans.is_empty()
+        || focus_partition_plans
+            .iter()
+            .flat_map(|plan| &plan.slots)
+            .all(|slot| slot.capability_cropped_refs.is_empty())
+    {
+        runtime.lock().await.downgrade_turn_strategy(
+            best_non_team_strategy(strategy),
+            "Team was selected but Runtime could not derive at least one existing, bounded workspace resource scope from the parent authority",
+        )?;
+        return Ok(false);
+    }
+    let capabilities = focus_partition_plans
+        .iter()
+        .flat_map(|plan| &plan.slots)
+        .flat_map(|slot| &slot.capability_cropped_refs)
+        .map(|reference| format!("resource:{reference}"))
+        .collect::<Vec<_>>();
+    let selection_mode = if strategy
+        .decision
+        .strategy
+        .understanding
+        .requests_multi_agent
+    {
+        harness_contract::team::TeamSelectionMode::Explicit
+    } else {
+        harness_contract::team::TeamSelectionMode::Automatic
+    };
+    let request = crate::RuntimeOrchestrationRequest {
+        intent: objective.to_string(),
+        model_lease: Some(model_lease),
+        session_id: Some(strategy.session_ref.clone()),
+        target_session_id: None,
+        action: crate::RuntimeOrchestrationAction::RequestTeam,
+        selection_mode: Some(selection_mode),
+        strategy_binding: Some(harness_contract::team::TeamStrategyBinding {
+            decision_id: strategy.decision_id.clone(),
+            decision_revision: strategy.revision,
+            decision_lease: strategy.decision_lease.clone(),
+            turn_ref: strategy.turn_ref.clone(),
+        }),
+        reason: Some(format!(
+            "runtime integer cost model selected Team at conversation admission ({selection_mode:?})"
+        )),
+        template_hint: (selection_mode == harness_contract::team::TeamSelectionMode::Explicit)
+            .then(|| {
+                if requires_write {
+                    "cowd/execute-review".to_string()
+                } else {
+                    "cowd/parallel-research-synthesis".to_string()
+                }
+            }),
+        focus_partition_plans,
+        capabilities,
+        evidence_refs: Vec::new(),
+        constraints: crate::RuntimeOrchestrationConstraints {
+            max_parallel_agents: Some(focus_count),
+            risk: Some(
+                format!("{:?}", strategy.decision.strategy.understanding.risk).to_ascii_lowercase(),
+            ),
+            approval_id: None,
+            requires_write: Some(requires_write),
+            surface_latency_sensitive: Some(false),
+        },
+        surface: Some("conversation_runtime_host".to_string()),
+    };
+    let parent = harness_contract::execution_graph::ExecutionParentBinding {
+        execution_id: parent_graph_id.to_string(),
+        node_id: parent_node_id.to_string(),
+    };
+    let team_started = std::time::Instant::now();
+    let cancellation = runtime.lock().await.cancellation_token();
+    let result = crate::orchestration::submit_runtime_orchestration_request_controlled(
+        request,
+        Some(&strategy.decision),
+        services,
+        Some(parent),
+        Some(cancellation),
+    )
+    .await;
+    let team_duration_ms = u64::try_from(team_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    if result.status != "completed"
+        || result
+            .evidence
+            .get("executed")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+    {
+        let child_executed = result
+            .evidence
+            .get("executed")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let degraded_receipt = child_executed.then(|| {
+            let mut receipt = result.model_receipt();
+            if let Some(receipt) = receipt.as_object_mut() {
+                receipt.insert(
+                    "decision_id".to_string(),
+                    serde_json::Value::String(strategy.decision_id.clone()),
+                );
+                receipt.insert(
+                    "collaboration_lease".to_string(),
+                    serde_json::Value::String(strategy.decision_lease.clone()),
+                );
+                receipt.insert("degraded".to_string(), serde_json::Value::Bool(true));
+                receipt.insert("parent_merge_count".to_string(), serde_json::json!(0));
+                receipt.insert(
+                    "parent_merge_status".to_string(),
+                    serde_json::Value::String("pending_parent_terminal".to_string()),
+                );
+                receipt.insert(
+                    "team_duration_ms".to_string(),
+                    serde_json::json!(team_duration_ms),
+                );
+            }
+            receipt
+        });
+        let fallback = best_non_team_strategy(strategy);
+        let runtime = runtime.lock().await;
+        if let Some(receipt) = degraded_receipt {
+            let mut item = ContextItem::new(
+                format!("runtime-team-degraded:{}", strategy.decision_id),
+                ContextSourceKind::Task,
+                ContextRole::Warning,
+                format!(
+                    "The selected Team did not reach a verified successful terminal, but its durable graph evidence must be preserved during downgrade.\n{}",
+                    serde_json::to_string(&receipt).unwrap_or_else(|_| "{}".to_string())
+                ),
+            );
+            item.authority = ContextAuthority::Tool;
+            item.visibility = ContextVisibility::Private;
+            item.evidence = result
+                .evidence
+                .get("graph_id")
+                .and_then(serde_json::Value::as_str)
+                .map(|graph_id| vec![format!("team_graph:{graph_id}")])
+                .unwrap_or_default();
+            runtime.record_turn_strategy_collaboration_receipt(receipt)?;
+            runtime.push_next_model_context_item(item);
+        }
+        runtime.downgrade_turn_strategy(
+            fallback,
+            &format!(
+                "selected Team start failed with status `{}`: {}",
+                result.status,
+                result.decision.validation_findings.join(", ")
+            ),
+        )?;
+        return Ok(child_executed);
+    }
+
+    let mut receipt = result.model_receipt();
+    let projection_nodes = result
+        .execution
+        .pointer("/projection/nodes")
+        .and_then(serde_json::Value::as_array);
+    let child_input_tokens = projection_nodes.map_or(0, |nodes| {
+        nodes.iter().fold(0_u64, |total, node| {
+            total.saturating_add(
+                node.pointer("/usage/input_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+            )
+        })
+    });
+    let child_output_tokens = projection_nodes.map_or(0, |nodes| {
+        nodes.iter().fold(0_u64, |total, node| {
+            total.saturating_add(
+                node.pointer("/usage/output_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+            )
+        })
+    });
+    let child_cached_tokens = projection_nodes.map_or(0, |nodes| {
+        nodes.iter().fold(0_u64, |total, node| {
+            total.saturating_add(
+                node.pointer("/usage/cached_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+            )
+        })
+    });
+    let child_tool_calls = projection_nodes.map_or(0, |nodes| {
+        nodes.iter().fold(0_u64, |total, node| {
+            total.saturating_add(
+                node.pointer("/usage/tool_calls")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+            )
+        })
+    });
+    let child_duplicate_tool_calls = projection_nodes.map_or(0, |nodes| {
+        nodes.iter().fold(0_u64, |total, node| {
+            total.saturating_add(
+                node.pointer("/usage/duplicate_tool_calls")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+            )
+        })
+    });
+    let mut child_write_attempt_paths = projection_nodes
+        .into_iter()
+        .flat_map(|nodes| nodes.iter())
+        .filter_map(|node| {
+            node.pointer("/usage/runtime_write_attempt_paths")?
+                .as_array()
+        })
+        .flat_map(|paths| paths.iter().filter_map(serde_json::Value::as_str))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    child_write_attempt_paths.sort();
+    child_write_attempt_paths.dedup();
+    let child_execution_ids = result
+        .evidence
+        .get("graph_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|team_graph_id| services.graph_state_store().child_links(team_graph_id).ok())
+        .map(|links| {
+            links
+                .into_iter()
+                .map(|link| link.child_execution_id)
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let child_strategy_events = services
+        .event_store()
+        .list_stream(&format!("session:{}", strategy.session_ref))
+        .unwrap_or_default();
+    let belongs_to_child = |event: &crate::DurableRuntimeEvent| {
+        event
+            .payload
+            .get("execution_graph_ref")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|graph_id| child_execution_ids.contains(graph_id))
+    };
+    let child_early_stopped = child_strategy_events
+        .iter()
+        .any(|event| event.kind == "runtime.strategy.early_stopped" && belongs_to_child(event));
+    let (
+        actual_evidence_overlap_bp,
+        allowed_evidence_overlap_bp,
+        evidence_overlap_observed,
+        evidence_overlap_exceeded,
+    ) = team_working_state_overlap_bp(&result.execution);
+    if let Some(receipt) = receipt.as_object_mut() {
+        receipt.insert(
+            "decision_id".to_string(),
+            serde_json::Value::String(strategy.decision_id.clone()),
+        );
+        receipt.insert(
+            "decision_revision".to_string(),
+            serde_json::json!(strategy.revision),
+        );
+        receipt.insert(
+            "collaboration_lease".to_string(),
+            serde_json::Value::String(strategy.decision_lease.clone()),
+        );
+        receipt.insert(
+            "parent_execution_ref".to_string(),
+            serde_json::Value::String(parent_graph_id.to_string()),
+        );
+        receipt.insert("parent_merge_count".to_string(), serde_json::json!(0));
+        receipt.insert(
+            "parent_merge_status".to_string(),
+            serde_json::Value::String("pending_parent_terminal".to_string()),
+        );
+        receipt.insert(
+            "team_duration_ms".to_string(),
+            serde_json::json!(team_duration_ms),
+        );
+        receipt.insert(
+            "child_input_tokens".to_string(),
+            serde_json::json!(child_input_tokens),
+        );
+        receipt.insert(
+            "child_output_tokens".to_string(),
+            serde_json::json!(child_output_tokens),
+        );
+        receipt.insert(
+            "child_cached_tokens".to_string(),
+            serde_json::json!(child_cached_tokens),
+        );
+        receipt.insert(
+            "child_tool_calls".to_string(),
+            serde_json::json!(child_tool_calls),
+        );
+        receipt.insert(
+            "evidence_overlap_bp".to_string(),
+            serde_json::json!(actual_evidence_overlap_bp),
+        );
+        receipt.insert(
+            "evidence_overlap_observed".to_string(),
+            serde_json::json!(evidence_overlap_observed),
+        );
+        receipt.insert(
+            "allowed_evidence_overlap_bp".to_string(),
+            serde_json::json!(allowed_evidence_overlap_bp),
+        );
+        receipt.insert(
+            "evidence_overlap_exceeded".to_string(),
+            serde_json::json!(evidence_overlap_exceeded),
+        );
+        receipt.insert(
+            "duplicate_tool_calls".to_string(),
+            serde_json::json!(child_duplicate_tool_calls),
+        );
+        receipt.insert(
+            "write_attempt_paths".to_string(),
+            serde_json::json!(child_write_attempt_paths),
+        );
+        // `RuntimeOrchestrationResult` has already verified materialized Team
+        // working state against the durable child graph. Preserve that fact in
+        // the parent receipt so the turn outcome and every Surface project the
+        // same completed-state truth instead of reverting to the default false.
+        receipt.insert(
+            "working_state_verified".to_string(),
+            serde_json::json!(
+                result
+                    .evidence
+                    .get("working_state_verified")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            ),
+        );
+        receipt.insert(
+            "replayed_team_request".to_string(),
+            serde_json::json!(
+                result
+                    .evidence
+                    .get("reused")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            ),
+        );
+    }
+    let receipt_text = serde_json::to_string(&receipt)
+        .map_err(|error| RuntimeError::new(format!("encode Team receipt: {error}")))?;
+    let mut item = ContextItem::new(
+        format!("runtime-team-receipt:{}", strategy.decision_id),
+        ContextSourceKind::Task,
+        ContextRole::Evidence,
+        format!(
+            "Runtime already executed the selected Team. Use this verified terminal receipt as the checked collaboration result; do not start another Team for the same decision lease.\n{receipt_text}"
+        ),
+    );
+    item.authority = ContextAuthority::Tool;
+    item.visibility = ContextVisibility::Private;
+    item.evidence = vec![
+        format!("strategy_decision:{}", strategy.decision_id),
+        format!("execution_graph:{parent_graph_id}"),
+        result
+            .evidence
+            .get("graph_id")
+            .and_then(serde_json::Value::as_str)
+            .map_or_else(
+                || "team_graph:unknown".to_string(),
+                |graph_id| format!("team_graph:{graph_id}"),
+            ),
+    ];
+    let runtime = runtime.lock().await;
+    if child_early_stopped {
+        runtime.record_turn_strategy_early_stop(
+            "one or more bounded Team children stopped after consecutive low-novelty evidence batches",
+        )?;
+    }
+    runtime.record_turn_strategy_collaboration_receipt(receipt)?;
+    runtime.push_next_model_context_item(item);
+    Ok(true)
+}
+
+fn parent_merge_actuals(
+    started_at: Option<std::time::Instant>,
+    parent_succeeded: bool,
+) -> (u64, u8) {
+    let merge_cost_ms = started_at
+        .map(|started| {
+            u64::try_from(started.elapsed().as_millis())
+                .unwrap_or(u64::MAX)
+                .max(1)
+        })
+        .unwrap_or(0);
+    (
+        merge_cost_ms,
+        u8::from(started_at.is_some() && parent_succeeded),
+    )
+}
+
+fn team_working_state_overlap_bp(execution: &serde_json::Value) -> (u16, u16, bool, bool) {
+    execution
+        .get("focus_overlap_assessment")
+        .and_then(|value| {
+            serde_json::from_value::<crate::FocusOverlapAssessment>(value.clone()).ok()
+        })
+        .map_or((0, 0, false, false), |assessment| {
+            (
+                assessment.maximum_overlap_bp,
+                assessment.allowed_overlap_bp,
+                assessment.observed,
+                assessment.exceeded,
+            )
+        })
+}
+
+fn selected_strategy_focus_count(
+    strategy: &crate::execution_core::TurnStrategyDecisionState,
+) -> usize {
+    usize::from(
+        strategy
+            .resource_snapshot
+            .team_slots
+            .min(u16::from(
+                strategy
+                    .decision
+                    .strategy
+                    .understanding
+                    .independent_workstreams
+                    .max(2),
+            ))
+            .clamp(2, 6),
+    )
+}
+
+fn selected_strategy_focus_plans(
+    strategy: &crate::execution_core::TurnStrategyDecisionState,
+    objective: &str,
+    workspace_root: &std::path::Path,
+    forced_scopes: &[String],
+) -> Vec<harness_contract::team::FocusPartitionPlan> {
+    let requires_write = strategy.decision.strategy.understanding.requires_write;
+    let scopes = if forced_scopes.is_empty() {
+        bounded_workspace_focus_scopes(
+            workspace_root,
+            objective,
+            if requires_write {
+                1
+            } else {
+                selected_strategy_focus_count(strategy)
+            },
+            requires_write,
+            strategy
+                .decision
+                .strategy
+                .understanding
+                .requests_multi_agent,
+        )
+    } else {
+        forced_scopes.to_vec()
+    };
+    if scopes.is_empty() {
+        return Vec::new();
+    }
+    if requires_write {
+        vec![
+            write_focus_partition_plan(objective, scopes.clone()),
+            support_focus_partition_plan(
+                objective,
+                "reviewer",
+                "bounded-review",
+                "Review implementation evidence across the bounded Team scopes without expanding authority",
+                scopes,
+            ),
+        ]
+    } else {
+        vec![
+            automatic_focus_partition_plan(objective, scopes.clone()),
+            support_focus_partition_plan(
+                objective,
+                "synthesizer",
+                "bounded-synthesis",
+                "Synthesize only the evidence returned from the bounded researcher scopes",
+                scopes,
+            ),
+        ]
+    }
+}
+
+fn automatic_focus_partition_plan(
+    objective: &str,
+    scopes: Vec<String>,
+) -> harness_contract::team::FocusPartitionPlan {
+    harness_contract::team::FocusPartitionPlan {
+        role_id: "researcher".to_string(),
+        shared_baseline: vec![
+            "parent objective and capability-cropped session evidence".to_string(),
+        ],
+        slots: scopes
+            .into_iter()
+            .map(|reference| {
+                let domain = reference
+                    .split_once(':')
+                    .map_or(reference.as_str(), |(_, path)| path)
+                    .replace('/', "-");
+                let evidence_scope = reference
+                    .split_once(':')
+                    .map_or(reference.as_str(), |(_, path)| path)
+                    .to_string();
+                let boundary =
+                    format!("Only inspect and judge the `{domain}` responsibility domain");
+                let capability_cropped_refs = vec![reference];
+                harness_contract::team::FocusPartitionSlot {
+                    focus_id: domain.clone(),
+                    scope_hash: harness_contract::team::focus_scope_hash(
+                        "researcher",
+                        &boundary,
+                        &capability_cropped_refs,
+                    ),
+                    boundary,
+                    evidence_responsibility: format!(
+                        "Collect capability-authorized evidence for `{domain}` and identify unresolved gaps"
+                    ),
+                    capability_cropped_refs,
+                    overlap_budget_bp: 0,
+                    novelty_target_bp: 2_500,
+                    output_contract: vec![
+                        "findings".to_string(),
+                        "evidence".to_string(),
+                        "unresolved".to_string(),
+                    ],
+                    output_acceptance: vec![format!("evidence_scope:{evidence_scope}")],
+                }
+            })
+            .collect(),
+    }
+}
+
+fn write_focus_partition_plan(
+    _objective: &str,
+    scopes: Vec<String>,
+) -> harness_contract::team::FocusPartitionPlan {
+    let boundary = format!(
+        "Implement only inside the {} Runtime-authorized workspace scope(s)",
+        scopes.len()
+    );
+    harness_contract::team::FocusPartitionPlan {
+        role_id: "implementer".to_string(),
+        shared_baseline: vec![
+            "parent objective and Runtime-verified bounded workspace paths".to_string(),
+        ],
+        slots: vec![harness_contract::team::FocusPartitionSlot {
+            focus_id: "bounded-implementation".to_string(),
+            scope_hash: harness_contract::team::focus_scope_hash("implementer", &boundary, &scopes),
+            boundary,
+            evidence_responsibility:
+                "Produce implementation evidence only from the assigned resource scopes".to_string(),
+            capability_cropped_refs: scopes,
+            overlap_budget_bp: 0,
+            novelty_target_bp: 2_500,
+            output_contract: vec![
+                "implementation".to_string(),
+                "source_verification".to_string(),
+                "residual risk".to_string(),
+            ],
+            output_acceptance: vec![
+                "implementation".to_string(),
+                "source_verification".to_string(),
+            ],
+        }],
+    }
+}
+
+fn support_focus_partition_plan(
+    _objective: &str,
+    role_id: &str,
+    focus_id: &str,
+    boundary: &str,
+    scopes: Vec<String>,
+) -> harness_contract::team::FocusPartitionPlan {
+    harness_contract::team::FocusPartitionPlan {
+        role_id: role_id.to_string(),
+        shared_baseline: vec![
+            "Only committed outputs from the bounded upstream Team roles".to_string(),
+        ],
+        slots: vec![harness_contract::team::FocusPartitionSlot {
+            focus_id: focus_id.to_string(),
+            scope_hash: harness_contract::team::focus_scope_hash(role_id, boundary, &scopes),
+            boundary: boundary.to_string(),
+            evidence_responsibility:
+                "Preserve source scope identity, conflicts, and unresolved gaps".to_string(),
+            capability_cropped_refs: scopes,
+            overlap_budget_bp: 0,
+            novelty_target_bp: 1_000,
+            output_contract: vec![
+                "summary".to_string(),
+                "evidence".to_string(),
+                "unresolved".to_string(),
+            ],
+            output_acceptance: vec!["evidence".to_string(), "unresolved".to_string()],
+        }],
+    }
+}
+
+fn bounded_workspace_focus_scopes(
+    workspace_root: &std::path::Path,
+    objective: &str,
+    requested_count: usize,
+    requires_write: bool,
+    explicit_team: bool,
+) -> Vec<String> {
+    let mut candidates = workspace_focus_candidates(workspace_root)
+        .into_iter()
+        .map(|path| {
+            let score = workspace_focus_score(objective, &path);
+            (score, path)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|(left_score, left), (right_score, right)| {
+        right_score.cmp(left_score).then_with(|| left.cmp(right))
+    });
+    let normalized = objective.to_ascii_lowercase();
+    let broad = explicit_team
+        || [
+            "architecture",
+            "codebase",
+            "workspace",
+            "repository",
+            "system",
+            "review",
+            "audit",
+            "架构",
+            "代码",
+            "项目",
+            "系统",
+            "全盘",
+            "审查",
+            "审计",
+        ]
+        .iter()
+        .any(|marker| normalized.contains(marker));
+    let required = if requires_write {
+        requested_count.clamp(1, 6)
+    } else {
+        requested_count.clamp(2, 6)
+    };
+    let mut selected = candidates
+        .iter()
+        .filter(|(score, _)| *score > 0)
+        .map(|(_, path)| path.clone())
+        .take(required)
+        .collect::<Vec<_>>();
+    if broad && selected.len() < required {
+        for (_, candidate) in candidates {
+            if selected.len() >= required {
+                break;
+            }
+            if !selected.contains(&candidate) {
+                selected.push(candidate);
+            }
+        }
+    }
+    if selected.len() < if requires_write { 1 } else { 2 } {
+        return Vec::new();
+    }
+    let access = if requires_write { "write" } else { "read" };
+    selected
+        .into_iter()
+        .map(|path| format!("{access}:{path}"))
+        .collect()
+}
+
+fn workspace_focus_candidates(workspace_root: &std::path::Path) -> Vec<String> {
+    const EXCLUDED: &[&str] = &[
+        ".git",
+        ".cargo",
+        ".cowd",
+        "target",
+        "node_modules",
+        "dist",
+        "build",
+        "coverage",
+        "test-reports",
+    ];
+    const PARTITION_ROOTS: &[&str] = &[
+        "apps", "crates", "docs", "packages", "scripts", "surfaces", "tests",
+    ];
+    let Ok(entries) = std::fs::read_dir(workspace_root) else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') || EXCLUDED.contains(&name.as_str()) {
+            continue;
+        }
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if PARTITION_ROOTS.contains(&name.as_str()) {
+            let mut children = std::fs::read_dir(&path)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|child| child.path().is_dir())
+                .filter_map(|child| {
+                    let child_name = child.file_name().to_string_lossy().into_owned();
+                    (!child_name.starts_with('.') && !EXCLUDED.contains(&child_name.as_str()))
+                        .then(|| format!("{name}/{child_name}"))
+                })
+                .collect::<Vec<_>>();
+            if children.is_empty() {
+                candidates.push(name);
+            } else {
+                candidates.append(&mut children);
+            }
+        } else {
+            candidates.push(name);
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn workspace_focus_score(objective: &str, path: &str) -> u16 {
+    let objective = objective.to_ascii_lowercase();
+    let path_lower = path.to_ascii_lowercase();
+    let mut score = path_lower
+        .split(['/', '-', '_'])
+        .filter(|part| part.len() >= 2 && objective.contains(part))
+        .count() as u16
+        * 100;
+    for (marker, targets) in [
+        ("backend", &["crates/gateway", "crates/runtime"][..]),
+        ("后端", &["crates/gateway", "crates/runtime"][..]),
+        ("api", &["crates/gateway"][..]),
+        ("frontend", &["surfaces/webui", "crates/tui"][..]),
+        ("前端", &["surfaces/webui", "crates/tui"][..]),
+        ("webui", &["surfaces/webui"][..]),
+        ("tui", &["crates/tui"][..]),
+        ("memory", &["crates/memory"][..]),
+        ("matrix", &["crates/matrix"][..]),
+        ("mfg", &["crates/app-mfg", "crates/app-mfg-contract"][..]),
+        ("test", &["tests", "scripts/test"][..]),
+        ("测试", &["tests", "scripts/test"][..]),
+        ("docs", &["docs"][..]),
+        ("文档", &["docs"][..]),
+    ] {
+        if objective.contains(marker)
+            && targets.iter().any(|target| {
+                path_lower == *target || path_lower.starts_with(&format!("{target}/"))
+            })
+        {
+            score = score.saturating_add(250);
+        }
+    }
+    score
+}
+
+fn best_non_team_strategy(
+    strategy: &crate::execution_core::TurnStrategyDecisionState,
+) -> harness_contract::strategy::ExecutionCandidateKind {
+    strategy
+        .decision
+        .strategy
+        .candidate_estimates
+        .iter()
+        .filter(|estimate| {
+            estimate.eligible
+                && estimate.candidate != harness_contract::strategy::ExecutionCandidateKind::Team
+        })
+        .max_by_key(|estimate| estimate.net_benefit_score)
+        .map_or(
+            harness_contract::strategy::ExecutionCandidateKind::Direct,
+            |estimate| estimate.candidate,
+        )
+}
+
+fn compile_retargeted_conversation_graph(
+    current: &harness_contract::execution_graph::ExecutionGraph,
+    objective: &str,
+    session_id: &str,
+    ingress: Option<&TurnIngressRef>,
+    target: crate::execution_core::RuntimeCompileTarget,
+    stable_parent_node_id: &str,
+) -> Result<harness_contract::execution_graph::ExecutionGraph, RuntimeError> {
+    let payload = serde_json::json!({
+        "kind": "conversation_turn",
+        "session_id": session_id,
+        "content": objective,
+        "compile_target": target,
+        "ingress": ingress,
+        "idempotency_key": ingress.map(|value| value.request_id.as_str()),
+    })
+    .to_string();
+    let mut replacement = ExecutionGraphCompiler
+        .compile_conversation_turn(ExecutionCompileRequest {
+            objective: objective.to_string(),
+            payload_ref: payload,
+            target,
+            resource_scopes: Vec::new(),
+        })
+        .map_err(|error| RuntimeError::new(error.to_string()))?;
+    let replacement_graph_id = replacement.id.clone();
+    let replacement_parent_node_id = replacement
+        .nodes
+        .first()
+        .map(|node| node.id.clone())
+        .ok_or_else(|| RuntimeError::new("retargeted conversation graph has no root node"))?;
+    let mut remapped = BTreeMap::new();
+    for node in &mut replacement.nodes {
+        let previous = node.id.clone();
+        let suffix = previous
+            .strip_prefix(&format!("{replacement_graph_id}:"))
+            .unwrap_or(previous.as_str());
+        node.id = if previous == replacement_parent_node_id {
+            stable_parent_node_id.to_string()
+        } else {
+            format!("{}:{suffix}", current.id)
+        };
+        node.idempotency_key = ingress.map_or_else(
+            || node.id.clone(),
+            |ingress| format!("{}:{suffix}", ingress.request_id),
+        );
+        remapped.insert(previous, node.id.clone());
+    }
+    for edge in &mut replacement.edges {
+        if let Some(id) = remapped.get(&edge.from) {
+            edge.from.clone_from(id);
+        }
+        if let Some(id) = remapped.get(&edge.to) {
+            edge.to.clone_from(id);
+        }
+    }
+    if let Some(dispatch) = current
+        .nodes
+        .iter()
+        .find(|node| node.kind == ExecutionNodeKind::SessionDispatch)
+        .cloned()
+    {
+        replacement.nodes.insert(0, dispatch.clone());
+        replacement.edges.insert(
+            0,
+            ExecutionEdge {
+                from: dispatch.id,
+                to: stable_parent_node_id.to_string(),
+                kind: ExecutionEdgeKind::DependsOn,
+            },
+        );
+    }
+    replacement.id.clone_from(&current.id);
+    replacement.parent_execution = current.parent_execution.clone();
+    for node in &mut replacement.nodes {
+        node.executor_kind = match node.kind {
+            ExecutionNodeKind::InlineModel => "inline_model".to_string(),
+            ExecutionNodeKind::ToolBatch => "tool_batch".to_string(),
+            ExecutionNodeKind::Verify => {
+                if node.executor_kind
+                    == crate::execution_core::graph::executors::CompileTargetGuardExecutor::KIND
+                {
+                    node.executor_kind.clone()
+                } else {
+                    crate::execution_core::graph::executors::VerifyNodeExecutor::KIND.to_string()
+                }
+            }
+            ExecutionNodeKind::Synthesize => {
+                crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND.to_string()
+            }
+            _ => node.executor_kind.clone(),
+        };
+    }
+    Ok(replacement)
+}
+
 struct TurnGraphState {
     content: String,
     prompter: SharedPrompter,
     first_model_step: bool,
+    /// Runtime-authored checkpoint instructions that must be inserted in the
+    /// next provider request's durable context envelope exactly once.
+    pending_next_model_context: Vec<ContextItem>,
     next_calls: Vec<ModelToolCall>,
     next_resource_scopes: Vec<String>,
     assistant_messages: Vec<ConversationMessage>,
@@ -937,12 +2396,22 @@ struct TurnGraphState {
     force_text_only_next_model: bool,
     terminal_recovery_attempts: u8,
     bounded_evidence_role: bool,
+    focus_novelty_target_bp: u16,
+    focus_acceptance_scopes: Vec<String>,
     clean_terminal_synthesis_next: bool,
     clean_terminal_synthesis_attempted: bool,
     clean_terminal_retry_attempted: bool,
     consecutive_tool_failure_batches: usize,
+    consecutive_low_novelty_batches: usize,
     successful_tool_calls: usize,
+    duplicate_tool_calls: u64,
+    write_attempt_paths: Vec<String>,
+    max_tool_concurrency_observed: usize,
+    parallel_tool_batches: usize,
+    evaluation_resource_scopes: Vec<String>,
     team_orchestration_requests: usize,
+    collaboration_started: bool,
+    team_orchestration_forbidden: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1133,6 +2602,7 @@ where
             force_text_only_response,
             clean_terminal_synthesis,
             clean_terminal_evidence,
+            pending_next_model_context,
         ) = {
             let mut state = self.state.lock().await;
             let first = state.first_model_step;
@@ -1186,6 +2656,7 @@ where
                 std::mem::take(&mut state.force_text_only_next_model),
                 clean_terminal_synthesis,
                 clean_terminal_evidence,
+                std::mem::take(&mut state.pending_next_model_context),
             )
         };
         if let Some(intervention) = fuse_intervention {
@@ -1223,6 +2694,9 @@ where
             return Ok(outcome);
         }
         let mut runtime = self.runtime.lock().await;
+        for item in pending_next_model_context {
+            runtime.push_next_model_context_item(item);
+        }
         if let Some(bus) = runtime.cowd_bus().cloned() {
             bus.emit(CowdEvent::ExecutionPhase {
                 status: harness_contract::projection::ExecutionLiveStatus::CallingModel,
@@ -1259,6 +2733,7 @@ where
                         .saturating_add(u64::from(step.usage.cache_creation_input_tokens)),
                     duration_ms: step.wall_duration_ms,
                     tool_calls: 0,
+                    ..ExecutionUsage::default()
                 };
                 let mut state = self.state.lock().await;
                 state.iterations = state.iterations.saturating_add(1);
@@ -1547,6 +3022,7 @@ where
                 // stale proposal previously encouraged a completed protocol
                 // synthesis role to continue exploring.
                 let mut model_intervention = None;
+                let mut next_model_context = None;
                 let next = match intent {
                     ModelStepIntent::FinalAnswer { text } => {
                         let mut text = strip_trailing_simulated_tool_markup(text);
@@ -1581,11 +3057,20 @@ where
                             if state.reasoning_only_attempts <= continuation_budget {
                                 let instruction = format!(
                                     "Runtime continuation (mandatory): the previous model step produced private reasoning but no visible answer. Continue the same goal from retained evidence. If evidence is still missing, use the smallest relevant available tool; otherwise write the visible final answer now. Do not finish with reasoning only. Continuation attempt {}/{}.",
-                                    state.reasoning_only_attempts,
-                                    continuation_budget,
+                                    state.reasoning_only_attempts, continuation_budget,
                                 );
                                 state.content.push_str("\n\n");
                                 state.content.push_str(&instruction);
+                                let mut item = ContextItem::new(
+                                    format!("runtime-reasoning-continuation:{}", ticket.node_id),
+                                    ContextSourceKind::Task,
+                                    ContextRole::Instruction,
+                                    instruction.clone(),
+                                );
+                                item.authority = ContextAuthority::System;
+                                item.visibility = ContextVisibility::Private;
+                                item.evidence = vec![format!("execution_node:{}", ticket.node_id)];
+                                next_model_context = Some(item);
                                 model_intervention =
                                     Some(harness_contract::goal::RuntimeIntervention {
                                         goal_id: state.goal_id.clone(),
@@ -1639,8 +3124,7 @@ where
                             if state.terminal_recovery_attempts <= normal_recovery_budget {
                                 let instruction = format!(
                                     "Runtime final-answer recovery (mandatory): the prior provider response was unusable ({reason}). Do not call tools or emit simulated tool markup. Use only already committed evidence and return a concise final answer now; name any remaining uncertainty explicitly. Recovery attempt {}/{}.",
-                                    state.terminal_recovery_attempts,
-                                    normal_recovery_budget,
+                                    state.terminal_recovery_attempts, normal_recovery_budget,
                                 );
                                 state.content.push_str("\n\n");
                                 state.content.push_str(&instruction);
@@ -1669,8 +3153,8 @@ where
                             {
                                 state.clean_terminal_synthesis_attempted = true;
                                 state.clean_terminal_synthesis_next = true;
-                                model_intervention =
-                                    Some(harness_contract::goal::RuntimeIntervention {
+                                model_intervention = Some(
+                                    harness_contract::goal::RuntimeIntervention {
                                         goal_id: state.goal_id.clone(),
                                         kind: RuntimeInterventionKind::Synthesize,
                                         reason: format!(
@@ -1681,7 +3165,8 @@ where
                                             ticket.node_id
                                         )],
                                         expected_graph_revision: None,
-                                    });
+                                    },
+                                );
                                 vec![dynamic_node(
                                     ticket,
                                     state.iterations,
@@ -1747,8 +3232,8 @@ where
                             {
                                 state.clean_terminal_retry_attempted = true;
                                 state.clean_terminal_synthesis_next = true;
-                                model_intervention =
-                                    Some(harness_contract::goal::RuntimeIntervention {
+                                model_intervention = Some(
+                                    harness_contract::goal::RuntimeIntervention {
                                         goal_id: state.goal_id.clone(),
                                         kind: RuntimeInterventionKind::Synthesize,
                                         reason: format!(
@@ -1759,7 +3244,8 @@ where
                                             ticket.node_id
                                         )],
                                         expected_graph_revision: None,
-                                    });
+                                    },
+                                );
                                 vec![dynamic_node(
                                     ticket,
                                     state.iterations,
@@ -1775,15 +3261,20 @@ where
                                         "Execution could not obtain a usable final answer after bounded normal and clean synthesis recovery: {reason}. Committed evidence was retained; provide a new constraint, provider, or explicit replan to continue."
                                     ),
                                 ));
-                                model_intervention = Some(harness_contract::goal::RuntimeIntervention {
-                                    goal_id: state.goal_id.clone(),
-                                    kind: RuntimeInterventionKind::Block,
-                                    reason: format!(
-                                        "provider produced unusable final output after one normal and one clean synthesis attempt: {reason}",
-                                    ),
-                                    evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
-                                    expected_graph_revision: None,
-                                });
+                                model_intervention = Some(
+                                    harness_contract::goal::RuntimeIntervention {
+                                        goal_id: state.goal_id.clone(),
+                                        kind: RuntimeInterventionKind::Block,
+                                        reason: format!(
+                                            "provider produced unusable final output after one normal and one clean synthesis attempt: {reason}",
+                                        ),
+                                        evidence_refs: vec![format!(
+                                            "execution_node:{}",
+                                            ticket.node_id
+                                        )],
+                                        expected_graph_revision: None,
+                                    },
+                                );
                                 let mut node = dynamic_node(
                                     ticket,
                                     state.iterations,
@@ -1820,8 +3311,62 @@ where
                         }
                     }
                     ModelStepIntent::ToolCalls { calls } => {
-                        if requests_team_orchestration(&calls) {
-                            if state.team_orchestration_requests >= 1 {
+                        record_write_attempt_paths(&mut state.write_attempt_paths, &calls);
+                        let evaluation_scope_violation =
+                            evaluation_scope_violation(&state.evaluation_resource_scopes, &calls);
+                        if let Some(violation) = evaluation_scope_violation {
+                            state.assistant_messages.pop();
+                            state.pending_transcript.remove(&ticket.node_id);
+                            model_intervention = Some(
+                                harness_contract::goal::RuntimeIntervention {
+                                    goal_id: state.goal_id.clone(),
+                                    kind: RuntimeInterventionKind::Replan,
+                                    reason: format!(
+                                        "the pre-registered evaluation resource ceiling rejected `{violation}`; use only the exact frozen mutation target"
+                                    ),
+                                    evidence_refs: vec![format!(
+                                        "execution_node:{}",
+                                        ticket.node_id
+                                    )],
+                                    expected_graph_revision: None,
+                                },
+                            );
+                            vec![dynamic_node(
+                                ticket,
+                                state.iterations,
+                                "eval-resource-ceiling-replan-model",
+                                ExecutionNodeKind::InlineModel,
+                                "inline_model",
+                                "inline_model",
+                            )]
+                        } else if requests_team_orchestration(&calls)
+                            && state.team_orchestration_forbidden
+                        {
+                            state.assistant_messages.pop();
+                            state.pending_transcript.remove(&ticket.node_id);
+                            model_intervention =
+                                Some(harness_contract::goal::RuntimeIntervention {
+                                    goal_id: state.goal_id.clone(),
+                                    kind: RuntimeInterventionKind::Replan,
+                                    reason: "the pre-registered Direct/ParallelTools baseline forbids Team materialization; complete the identical bounded workload with the selected local topology and authorized tools"
+                                        .to_string(),
+                                    evidence_refs: vec![format!(
+                                        "execution_node:{}",
+                                        ticket.node_id
+                                    )],
+                                    expected_graph_revision: None,
+                                });
+                            vec![dynamic_node(
+                                ticket,
+                                state.iterations,
+                                "eval-baseline-local-replan-model",
+                                ExecutionNodeKind::InlineModel,
+                                "inline_model",
+                                "inline_model",
+                            )]
+                        } else if requests_team_orchestration(&calls) {
+                            if state.collaboration_started || state.team_orchestration_requests >= 1
+                            {
                                 state.assistant_messages.pop();
                                 state.pending_transcript.remove(&ticket.node_id);
                                 state.clean_terminal_synthesis_attempted = true;
@@ -1865,10 +3410,70 @@ where
                         }
                     }
                     ModelStepIntent::AgentProposal { calls } => {
-                        agent_proposal_nodes(ticket, &mut state, calls, &self.services)?
+                        record_write_attempt_paths(&mut state.write_attempt_paths, &calls);
+                        if let Some(violation) =
+                            evaluation_scope_violation(&state.evaluation_resource_scopes, &calls)
+                        {
+                            state.assistant_messages.pop();
+                            state.pending_transcript.remove(&ticket.node_id);
+                            model_intervention = Some(
+                                harness_contract::goal::RuntimeIntervention {
+                                    goal_id: state.goal_id.clone(),
+                                    kind: RuntimeInterventionKind::Replan,
+                                    reason: format!(
+                                        "the pre-registered evaluation resource ceiling rejected delegated scope `{violation}`"
+                                    ),
+                                    evidence_refs: vec![format!(
+                                        "execution_node:{}",
+                                        ticket.node_id
+                                    )],
+                                    expected_graph_revision: None,
+                                },
+                            );
+                            vec![dynamic_node(
+                                ticket,
+                                state.iterations,
+                                "eval-agent-resource-ceiling-replan-model",
+                                ExecutionNodeKind::InlineModel,
+                                "inline_model",
+                                "inline_model",
+                            )]
+                        } else {
+                            agent_proposal_nodes(ticket, &mut state, calls, &self.services)?
+                        }
                     }
                     ModelStepIntent::TeamProposal { calls } => {
-                        if state.team_orchestration_requests >= 1 {
+                        record_write_attempt_paths(&mut state.write_attempt_paths, &calls);
+                        if let Some(violation) =
+                            evaluation_scope_violation(&state.evaluation_resource_scopes, &calls)
+                        {
+                            state.assistant_messages.pop();
+                            state.pending_transcript.remove(&ticket.node_id);
+                            model_intervention = Some(
+                                harness_contract::goal::RuntimeIntervention {
+                                    goal_id: state.goal_id.clone(),
+                                    kind: RuntimeInterventionKind::Replan,
+                                    reason: format!(
+                                        "the pre-registered evaluation resource ceiling rejected Team scope `{violation}`"
+                                    ),
+                                    evidence_refs: vec![format!(
+                                        "execution_node:{}",
+                                        ticket.node_id
+                                    )],
+                                    expected_graph_revision: None,
+                                },
+                            );
+                            vec![dynamic_node(
+                                ticket,
+                                state.iterations,
+                                "eval-team-resource-ceiling-replan-model",
+                                ExecutionNodeKind::InlineModel,
+                                "inline_model",
+                                "inline_model",
+                            )]
+                        } else if state.collaboration_started
+                            || state.team_orchestration_requests >= 1
+                        {
                             state.assistant_messages.pop();
                             state.pending_transcript.remove(&ticket.node_id);
                             state.clean_terminal_synthesis_attempted = true;
@@ -1895,53 +3500,83 @@ where
                         }
                     }
                     ModelStepIntent::ApprovalRequired { calls } => {
-                        state.next_resource_scopes = resource_scopes_for_tool_calls(&calls);
-                        state.next_calls = calls;
-                        let mut approval = dynamic_node(
-                            ticket,
-                            state.iterations,
-                            "approval",
-                            ExecutionNodeKind::Approval,
-                            crate::execution_core::graph::executors::ApprovalNodeExecutor::KIND,
-                            "inline_model",
-                        );
-                        approval.executor_kind =
-                            crate::execution_core::graph::executors::ApprovalNodeExecutor::KIND
-                                .to_string();
-                        approval.payload_ref = serde_json::json!({
+                        record_write_attempt_paths(&mut state.write_attempt_paths, &calls);
+                        if let Some(violation) =
+                            evaluation_scope_violation(&state.evaluation_resource_scopes, &calls)
+                        {
+                            state.assistant_messages.pop();
+                            state.pending_transcript.remove(&ticket.node_id);
+                            model_intervention = Some(
+                                harness_contract::goal::RuntimeIntervention {
+                                    goal_id: state.goal_id.clone(),
+                                    kind: RuntimeInterventionKind::Replan,
+                                    reason: format!(
+                                        "the pre-registered evaluation resource ceiling rejected approval for `{violation}`"
+                                    ),
+                                    evidence_refs: vec![format!(
+                                        "execution_node:{}",
+                                        ticket.node_id
+                                    )],
+                                    expected_graph_revision: None,
+                                },
+                            );
+                            vec![dynamic_node(
+                                ticket,
+                                state.iterations,
+                                "eval-approval-resource-ceiling-replan-model",
+                                ExecutionNodeKind::InlineModel,
+                                "inline_model",
+                                "inline_model",
+                            )]
+                        } else {
+                            state.next_resource_scopes = resource_scopes_for_tool_calls(&calls);
+                            state.next_calls = calls;
+                            let mut approval = dynamic_node(
+                                ticket,
+                                state.iterations,
+                                "approval",
+                                ExecutionNodeKind::Approval,
+                                crate::execution_core::graph::executors::ApprovalNodeExecutor::KIND,
+                                "inline_model",
+                            );
+                            approval.executor_kind =
+                                crate::execution_core::graph::executors::ApprovalNodeExecutor::KIND
+                                    .to_string();
+                            approval.payload_ref = serde_json::json!({
                             "action": state.next_calls.iter().map(|call| call.name.as_str()).collect::<Vec<_>>().join(","),
                             "summary": format!("Model requested {} governed call(s)", state.next_calls.len()),
                             "session_id": state.session_id,
                             "evidence_refs": [],
                         }).to_string();
-                        let mut tool_node = dynamic_node(
-                            ticket,
-                            state.iterations,
-                            "tools",
-                            ExecutionNodeKind::ToolBatch,
-                            "tool_batch",
-                            "inline_model",
-                        );
-                        tool_node.payload_ref =
-                            encode_tool_calls(&state.session_id, &state.next_calls).map_err(
-                                |error| NodeExecutorError::Poll {
-                                    node_id: ticket.node_id.clone(),
-                                    reason: error.to_string(),
-                                },
-                            )?;
-                        tool_node.resource_scopes = state.next_resource_scopes.clone();
-                        vec![
-                            approval,
-                            tool_node,
-                            dynamic_node(
+                            let mut tool_node = dynamic_node(
                                 ticket,
                                 state.iterations,
-                                "model",
-                                ExecutionNodeKind::InlineModel,
+                                "tools",
+                                ExecutionNodeKind::ToolBatch,
+                                "tool_batch",
                                 "inline_model",
-                                "inline_model",
-                            ),
-                        ]
+                            );
+                            tool_node.payload_ref =
+                                encode_tool_calls(&state.session_id, &state.next_calls).map_err(
+                                    |error| NodeExecutorError::Poll {
+                                        node_id: ticket.node_id.clone(),
+                                        reason: error.to_string(),
+                                    },
+                                )?;
+                            tool_node.resource_scopes = state.next_resource_scopes.clone();
+                            vec![
+                                approval,
+                                tool_node,
+                                dynamic_node(
+                                    ticket,
+                                    state.iterations,
+                                    "model",
+                                    ExecutionNodeKind::InlineModel,
+                                    "inline_model",
+                                    "inline_model",
+                                ),
+                            ]
+                        }
                     }
                     ModelStepIntent::Replan { reason } => {
                         model_intervention = Some(harness_contract::goal::RuntimeIntervention {
@@ -1964,6 +3599,9 @@ where
                     }
                 };
                 let edges = dynamic_edges(&ticket.node_id, &next);
+                if let Some(item) = next_model_context {
+                    state.pending_next_model_context.push(item);
+                }
                 let mut outcome =
                     NodeExecutionOutcome::new(completed_result(Some(committed_result_ref), usage))
                         .with_replan(ExecutionGraphReplan {
@@ -2293,6 +3931,19 @@ fn requests_team_orchestration(calls: &[ModelToolCall]) -> bool {
     })
 }
 
+fn evaluation_topology_forbids_team() -> bool {
+    std::env::var("COWD_EVAL_HARNESS").as_deref() == Ok("1")
+        && std::env::var("COWD_EVAL_CORPUS_ID").as_deref() == Ok("auto-strategy-v1")
+        && std::env::var("COWD_EVAL_STRATEGY_OVERRIDE")
+            .ok()
+            .is_some_and(|override_| {
+                matches!(
+                    override_.trim().to_ascii_lowercase().as_str(),
+                    "direct" | "parallel" | "parallel_tools"
+                )
+            })
+}
+
 fn tool_nodes_for_calls(
     ticket: &NodeExecutionTicket,
     iteration: usize,
@@ -2363,6 +4014,7 @@ fn agent_proposal_nodes(
         constraints: Vec::new(),
         context_refs: Vec::new(),
         evidence_refs: Vec::new(),
+        resource_scopes: resource_scopes_for_tool_calls(&state.next_calls),
         allowed_tools: state
             .next_calls
             .iter()
@@ -2439,6 +4091,16 @@ where
                 objective_requires_workspace_source_evidence(&state.content),
             )
         };
+        let execution_decision = self
+            .runtime
+            .lock()
+            .await
+            .active_turn_strategy()
+            .map(|strategy| strategy.decision)
+            .ok_or_else(|| NodeExecutorError::Poll {
+                node_id: ticket.node_id.clone(),
+                reason: "tool batch has no admitted strategy decision".to_string(),
+            })?;
         let (calls, continue_with_tool_batch) =
             decode_tool_batch(&ticket.payload_ref).map_err(|error| NodeExecutorError::Poll {
                 node_id: ticket.node_id.clone(),
@@ -2486,18 +4148,19 @@ where
         };
         let (result, orchestration_terminal_summary) =
             if let Some(host) = self.services.tool_execution_host() {
-                let raw_messages = execute_governed_runtime_tool_batch(
+                let governed = execute_governed_runtime_tool_batch(
                     Arc::clone(host),
                     &calls,
                     &session_id,
                     model_lease.as_deref(),
                     ticket,
                     &tool_authorizations,
+                    &execution_decision,
                 )
                 .await;
                 let orchestration_terminal_summary = completed_orchestration_terminal_summary(
                     &calls,
-                    &raw_messages,
+                    &governed.messages,
                     self.services.workspace_root(),
                     require_source_path_evidence,
                 );
@@ -2506,7 +4169,7 @@ where
                 // through the same durable evidence and context-ledger path used
                 // by normal conversation tool calls.
                 let messages =
-                    compact_governed_tool_messages(&self.runtime, &calls, raw_messages).await;
+                    compact_governed_tool_messages(&self.runtime, &calls, governed.messages).await;
                 (
                     crate::conversation::ToolBatchStepResult {
                         failed: messages
@@ -2517,6 +4180,8 @@ where
                             })
                             .count(),
                         messages,
+                        max_concurrency_observed: governed.max_concurrency_observed,
+                        parallel_batches: governed.parallel_batches,
                     },
                     orchestration_terminal_summary,
                 )
@@ -2585,17 +4250,30 @@ where
             .iter()
             .filter(|scope| !scopes_covered_before.contains(scope.as_str()))
             .count();
-        let coverage_novelty = if coverage_keys.is_empty() {
-            50_u8
+        let coverage_novelty_bp = if coverage_keys.is_empty() {
+            5_000_u16
         } else if newly_covered == 0 {
-            15_u8
+            0
         } else {
-            u8::try_from(newly_covered.saturating_mul(100) / coverage_keys.len())
-                .unwrap_or(100)
-                .clamp(30, 100)
+            u16::try_from(
+                newly_covered
+                    .saturating_mul(10_000)
+                    .saturating_div(coverage_keys.len()),
+            )
+            .unwrap_or(10_000)
         };
-        let low_novelty = failed == 0 && !coverage_keys.is_empty() && newly_covered == 0;
-        let bounded_evidence_role = self.state.lock().await.bounded_evidence_role;
+        let (bounded_evidence_role, novelty_target_bp, focus_acceptance_scopes) = {
+            let state = self.state.lock().await;
+            (
+                state.bounded_evidence_role,
+                state.focus_novelty_target_bp,
+                state.focus_acceptance_scopes.clone(),
+            )
+        };
+        let low_novelty = failed == 0
+            && !coverage_keys.is_empty()
+            && novelty_target_bp > 0
+            && coverage_novelty_bp < novelty_target_bp;
         // File-level receipts may be individually new while adding no new
         // responsibility zone. A delegated role has a finite evidence
         // contract, so repeated work inside already-covered zones is a
@@ -2603,6 +4281,22 @@ where
         let scope_saturated =
             bounded_evidence_role && failed == 0 && !scope_keys.is_empty() && newly_scoped == 0;
         let mut state = self.state.lock().await;
+        state.max_tool_concurrency_observed = state
+            .max_tool_concurrency_observed
+            .max(result.max_concurrency_observed);
+        state.parallel_tool_batches = state
+            .parallel_tool_batches
+            .saturating_add(result.parallel_batches);
+        let first_evidence_batch = state.successful_tool_calls == 0;
+        let focus_acceptance_met = bounded_evidence_role
+            && !focus_acceptance_scopes.is_empty()
+            && first_evidence_batch
+            && failed == 0
+            && !coverage_keys.is_empty()
+            && focus_acceptance_scopes
+                .iter()
+                .map(|scope| coverage_zone(scope))
+                .all(|required_zone| scope_keys.contains(&required_zone));
         state
             .pending_transcript
             .insert(ticket.node_id.clone(), result.messages.clone());
@@ -2611,13 +4305,24 @@ where
                 .unwrap_or(usize::MAX)
                 .saturating_sub(failed),
         );
+        if repeated_success {
+            state.duplicate_tool_calls = state.duplicate_tool_calls.saturating_add(tool_calls);
+        }
         if failed > 0 {
             state.consecutive_tool_failure_batches =
                 state.consecutive_tool_failure_batches.saturating_add(1);
         } else {
             state.consecutive_tool_failure_batches = 0;
         }
+        if failed == 0 && (low_novelty || scope_saturated) {
+            state.consecutive_low_novelty_batches =
+                state.consecutive_low_novelty_batches.saturating_add(1);
+        } else {
+            state.consecutive_low_novelty_batches = 0;
+        }
         let repeated_local_failures = state.consecutive_tool_failure_batches >= 2;
+        let repeated_low_novelty =
+            bounded_evidence_role && state.consecutive_low_novelty_batches >= 2;
         let has_successful_tool_evidence = state.successful_tool_calls > 0;
         state.tool_results.extend(result.messages);
         state.last_verified_progress =
@@ -2668,6 +4373,15 @@ where
                 ("coverage_new".to_string(), newly_covered as i64),
                 ("scope_coverage_total".to_string(), scope_keys.len() as i64),
                 ("scope_coverage_new".to_string(), newly_scoped as i64),
+                ("novelty_bp".to_string(), i64::from(coverage_novelty_bp)),
+                (
+                    "novelty_target_bp".to_string(),
+                    i64::from(novelty_target_bp),
+                ),
+                (
+                    "focus_acceptance_met".to_string(),
+                    if focus_acceptance_met { 1 } else { 0 },
+                ),
             ]),
             progress_delta: if failed > 0 {
                 -1
@@ -2681,13 +4395,45 @@ where
             } else if repeated_success || scope_saturated {
                 5
             } else {
-                coverage_novelty
+                u8::try_from(coverage_novelty_bp / 100).unwrap_or(100)
             },
         };
         let goal_id = state.goal_id.clone();
         drop(state);
-        let intervention = if continue_with_tool_batch || orchestration_terminal_summary.is_some() {
+        if focus_acceptance_met || repeated_low_novelty {
+            self.runtime
+                .lock()
+                .await
+                .record_turn_strategy_early_stop(if focus_acceptance_met {
+                    "the first bounded evidence batch satisfied the Focus acceptance checkpoint"
+                } else {
+                    "two consecutive bounded evidence batches fell below the Focus novelty target"
+                })
+                .map_err(|error| NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason: error.to_string(),
+                })?;
+        }
+        let intervention = if focus_acceptance_met {
+            Some(RuntimeIntervention {
+                goal_id: goal_id.clone(),
+                kind: RuntimeInterventionKind::Synthesize,
+                reason: "the first bounded evidence batch satisfied the Focus acceptance checkpoint; retain its receipts and synthesize without another tool/model exploration step"
+                    .to_string(),
+                evidence_refs: observation.evidence_refs.clone(),
+                expected_graph_revision: None,
+            })
+        } else if continue_with_tool_batch || orchestration_terminal_summary.is_some() {
             None
+        } else if repeated_low_novelty {
+            Some(RuntimeIntervention {
+                goal_id: goal_id.clone(),
+                kind: RuntimeInterventionKind::Synthesize,
+                reason: "two consecutive bounded evidence batches were below the novelty target; retain checked evidence and stop the child before another model/tool step"
+                    .to_string(),
+                evidence_refs: observation.evidence_refs.clone(),
+                expected_graph_revision: None,
+            })
         } else if repeated_local_failures {
             Some(RuntimeIntervention {
                 goal_id: goal_id.clone(),
@@ -2783,11 +4529,11 @@ where
                             .map(|value| value.reason.as_str())
                             .unwrap_or("goal intervention blocked execution");
                         state.terminal_override = Some((
-                        GoalCompletion::Blocked,
-                        format!(
-                            "Execution blocked: {reason}\n\nChecked evidence was retained and no further speculative work was performed."
-                        ),
-                    ));
+                            GoalCompletion::Blocked,
+                            format!(
+                                "Execution blocked: {reason}\n\nChecked evidence was retained and no further speculative work was performed."
+                            ),
+                        ));
                         let mut node = dynamic_node(
                             ticket,
                             state.iterations,
@@ -3024,6 +4770,12 @@ where
 /// authority for dependency, safety category, and concurrency: the host only
 /// receives fully-bound individual requests.  Results are returned in model
 /// call order even when their execution is concurrent.
+struct GovernedToolBatchResult {
+    messages: Vec<ConversationMessage>,
+    max_concurrency_observed: usize,
+    parallel_batches: usize,
+}
+
 async fn execute_governed_runtime_tool_batch(
     host: Arc<dyn crate::RuntimeExecutionHost>,
     calls: &[ModelToolCall],
@@ -3034,7 +4786,8 @@ async fn execute_governed_runtime_tool_batch(
         String,
         harness_contract::tool::ToolExecutionAuthorization,
     >,
-) -> Vec<ConversationMessage> {
+    decision: &crate::execution_core::RuntimeExecutionDecision,
+) -> GovernedToolBatchResult {
     let requests = calls
         .iter()
         .map(|call| crate::tool_dispatch::ToolRequest {
@@ -3045,7 +4798,20 @@ async fn execute_governed_runtime_tool_batch(
         })
         .collect::<Vec<_>>();
     let plan = crate::tool_execution_plan::ToolExecutionPlan::from_requests(&requests);
-    let schedule = crate::execution_scheduler::schedule_tool_execution_plan(&requests, &plan);
+    let schedule = crate::execution_scheduler::schedule_tool_execution_plan_for_decision(
+        &requests, &plan, decision,
+    );
+    let max_concurrency_observed = schedule
+        .batches
+        .iter()
+        .map(|batch| batch.max_concurrency.min(batch.indices.len()))
+        .max()
+        .unwrap_or(0);
+    let parallel_batches = schedule
+        .batches
+        .iter()
+        .filter(|batch| batch.max_concurrency > 1 && batch.indices.len() > 1)
+        .count();
     let mut results = vec![None; calls.len()];
 
     for batch in schedule.batches {
@@ -3118,7 +4884,7 @@ async fn execute_governed_runtime_tool_batch(
         }
     }
 
-    results
+    let messages = results
         .into_iter()
         .enumerate()
         .map(|(index, result)| {
@@ -3131,7 +4897,12 @@ async fn execute_governed_runtime_tool_batch(
                 )
             })
         })
-        .collect()
+        .collect();
+    GovernedToolBatchResult {
+        messages,
+        max_concurrency_observed,
+        parallel_batches,
+    }
 }
 
 fn bound_runtime_tool_request(
@@ -3310,6 +5081,10 @@ where
             input_tokens,
             output_tokens,
             wall_duration_ms,
+            duplicate_tool_calls,
+            write_attempt_paths,
+            max_tool_concurrency_observed,
+            parallel_tool_batches,
         ) = {
             let mut state = self.state.lock().await;
             (
@@ -3322,6 +5097,10 @@ where
                 state.input_tokens,
                 state.output_tokens,
                 state.wall_duration_ms,
+                state.duplicate_tool_calls,
+                std::mem::take(&mut state.write_attempt_paths),
+                state.max_tool_concurrency_observed,
+                state.parallel_tool_batches,
             )
         };
         let summary = self
@@ -3339,6 +5118,10 @@ where
                 input_tokens,
                 output_tokens,
                 wall_duration_ms,
+                duplicate_tool_calls,
+                write_attempt_paths,
+                max_tool_concurrency_observed,
+                parallel_tool_batches,
                 terminal_completion,
                 defer_post_turn_memory_maintenance,
             )
@@ -4155,6 +5938,69 @@ fn resource_scopes_for_tool_calls(calls: &[ModelToolCall]) -> Vec<String> {
     other
 }
 
+fn normalize_workspace_scope(scope: &str) -> Option<(&str, String)> {
+    let (mode, path) = scope.split_once(':')?;
+    if !matches!(mode, "read" | "write" | "workspace") {
+        return None;
+    }
+    let path = path.trim().replace('\\', "/");
+    if path.starts_with('/') {
+        return None;
+    }
+    let mut components = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => return None,
+            value if value.contains(':') => return None,
+            value => components.push(value),
+        }
+    }
+    (!components.is_empty()).then(|| (mode, components.join("/")))
+}
+
+fn evaluation_scope_authorizes(allowed: &str, requested: &str) -> bool {
+    let (Some((allowed_mode, allowed_path)), Some((requested_mode, requested_path))) = (
+        normalize_workspace_scope(allowed),
+        normalize_workspace_scope(requested),
+    ) else {
+        return allowed == requested;
+    };
+    let mode_authorized = match allowed_mode {
+        "write" | "workspace" => matches!(requested_mode, "read" | "write" | "workspace"),
+        "read" => requested_mode == "read",
+        _ => false,
+    };
+    mode_authorized
+        && (requested_path == allowed_path
+            || requested_path
+                .strip_prefix(&allowed_path)
+                .is_some_and(|suffix| suffix.starts_with('/')))
+}
+
+fn evaluation_scope_violation(allowed: &[String], calls: &[ModelToolCall]) -> Option<String> {
+    if allowed.is_empty() {
+        return None;
+    }
+    resource_scopes_for_tool_calls(calls)
+        .into_iter()
+        .find(|requested| {
+            !allowed
+                .iter()
+                .any(|scope| evaluation_scope_authorizes(scope, requested))
+        })
+}
+
+fn record_write_attempt_paths(paths: &mut Vec<String>, calls: &[ModelToolCall]) {
+    paths.extend(
+        resource_scopes_for_tool_calls(calls)
+            .into_iter()
+            .filter_map(|scope| scope.strip_prefix("write:").map(str::to_string)),
+    );
+    paths.sort();
+    paths.dedup();
+}
+
 /// Keep stateful runtime orchestration outside a workspace-tool batch.
 ///
 /// A `runtime_orchestrate(request_team)` call may synchronously drive a child
@@ -4221,6 +6067,7 @@ fn tool_batches_for_turn(calls: &[ModelToolCall]) -> Result<Vec<Vec<ModelToolCal
 
 fn resource_scopes_for_agent_intent(intent: &AgentTaskIntent) -> Vec<String> {
     let mut scopes = vec![format!("session:{}", intent.session_id)];
+    scopes.extend(intent.resource_scopes.iter().cloned());
     scopes.extend(
         intent
             .constraints
@@ -4271,8 +6118,8 @@ fn completed_result(result_ref: Option<String>, usage: ExecutionUsage) -> Execut
 mod tests {
     use std::collections::HashMap;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use futures::stream::{self, Stream};
 
@@ -4416,9 +6263,20 @@ mod tests {
                 ]));
             }
             self.saw_continuation.store(
-                request.prompt.trusted_system.iter().any(|fragment| {
-                    fragment.contains("previous model step produced private reasoning")
-                }),
+                request
+                    .prompt
+                    .trusted_system
+                    .iter()
+                    .chain(
+                        request
+                            .prompt
+                            .contextual_packets
+                            .iter()
+                            .map(|packet| &packet.content),
+                    )
+                    .any(|fragment| {
+                        fragment.contains("previous model step produced private reasoning")
+                    }),
                 Ordering::SeqCst,
             );
             Box::pin(stream::iter(vec![
@@ -4471,24 +6329,36 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct TeamTerminalReceiptClient {
+    struct ConflictingTeamRequestClient {
         attempts: Arc<AtomicUsize>,
     }
 
-    impl ApiClient for TeamTerminalReceiptClient {
+    impl ApiClient for ConflictingTeamRequestClient {
+        fn provider_available(&self) -> bool {
+            // This fixture is the provider transport for the parent turn; the
+            // deterministic stream below is an available provider response,
+            // not an unavailable default mock.
+            true
+        }
+
         fn stream(
             &mut self,
             _request: ApiRequest,
         ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
             let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
-            if attempt > 0 {
+            if attempt == 1 {
                 return Box::pin(stream::iter(vec![
                     Ok(AssistantEvent::TextDelta(
-                        "unexpected parent re-exploration".to_string(),
+                        "Parent completed after the Runtime-owned Team admission decision."
+                            .to_string(),
                     )),
                     Ok(AssistantEvent::MessageStop),
                 ]));
             }
+            assert_eq!(
+                attempt, 0,
+                "parent must not re-explore after a final answer"
+            );
             Box::pin(stream::iter(vec![
                 Ok(AssistantEvent::ToolUse {
                     id: "team-1".to_string(),
@@ -4506,6 +6376,102 @@ mod tests {
     impl ToolExecutor for NoopToolExecutor {
         fn execute(&self, name: &str, _input: &str) -> Result<String, ToolError> {
             Err(ToolError::new(format!("unexpected tool call: {name}")))
+        }
+    }
+
+    struct CompletedHostTeamBackend;
+
+    #[async_trait::async_trait]
+    impl crate::AgentRuntimeBackend for CompletedHostTeamBackend {
+        fn kind(&self) -> crate::AgentBackendKind {
+            crate::AgentBackendKind::InProcess
+        }
+
+        fn capabilities(&self) -> crate::AgentBackendCapabilities {
+            crate::AgentBackendCapabilities::in_process()
+        }
+
+        async fn execute(
+            &self,
+            packet: harness_contract::agent::AgentTaskPacket,
+            selection: crate::AgentModelSelection,
+        ) -> Result<harness_contract::agent::AgentReturnPacket, String> {
+            let evidence_id = format!("materialized:{}", packet.node_id);
+            let evidence = harness_contract::context::EvidenceAccessRef::durable(
+                harness_contract::context::EvidenceRef::new("tool", evidence_id),
+                "a".repeat(64),
+                1,
+                "application/json",
+                format!("session-event://{}/1", packet.session_id),
+                format!("session:{}", packet.session_id),
+            );
+            let mut evidence_refs = packet.evidence_refs.clone();
+            evidence_refs.push(evidence);
+            let runtime_change_receipts = packet
+                .acceptance
+                .iter()
+                .any(|criterion| matches!(criterion.as_str(), "implementation" | "mitigation"))
+                .then(|| {
+                    vec![harness_contract::agent::AgentChangeReceipt {
+                        path: packet
+                            .resource_scopes
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| "fixture.txt".to_string()),
+                        before_sha256: Some("b".repeat(64)),
+                        after_sha256: "c".repeat(64),
+                        write_sequence: 1,
+                    }]
+                })
+                .unwrap_or_default();
+            let changes = runtime_change_receipts
+                .iter()
+                .map(|receipt| receipt.path.clone())
+                .collect();
+            Ok(harness_contract::agent::AgentReturnPacket {
+                run_id: packet.run_id,
+                agent_id: packet.agent_id,
+                task_id: packet.task_id,
+                session_id: packet.session_id,
+                mission_id: packet.mission_id,
+                team_id: packet.team_id,
+                graph_id: packet.graph_id,
+                node_id: packet.node_id,
+                attempt: packet.attempt,
+                expected_graph_revision: packet.expected_graph_revision,
+                status: harness_contract::agent::AgentTerminalStatus::Completed,
+                outcome: serde_json::json!({
+                    "summary": "bounded host-selected Team role completed",
+                    "findings": ["fixture finding"],
+                    "plan": "fixture plan",
+                    "implementation": "fixture change",
+                    "source_verification": "fixture verification",
+                    "review": "fixture review",
+                    "risks": ["fixture risk"],
+                    "unresolved": ["fixture gap"],
+                    "proposal": "fixture proposal",
+                    "critique": "fixture critique",
+                    "mitigation": "fixture mitigation",
+                    "checkpoint": "fixture checkpoint"
+                })
+                .to_string(),
+                acceptance: packet.acceptance,
+                evidence_refs,
+                changes,
+                runtime_change_receipts,
+                conflicts: Vec::new(),
+                unresolved: Vec::new(),
+                input_tokens: 11,
+                output_tokens: 7,
+                cached_tokens: 0,
+                model: selection.model,
+                provider: selection.provider,
+                tool_calls: 1,
+                duplicate_tool_calls: 0,
+                runtime_write_attempt_paths: Vec::new(),
+                runtime_observed_resource_scopes: Vec::new(),
+                failure: None,
+            })
         }
     }
 
@@ -4637,13 +6603,17 @@ mod tests {
             "You are a delegated Cowd agent for a bounded task.".to_string(),
             "Provider model: claude-compatible".to_string(),
         ]);
-        assert!(prompt
-            .first()
-            .is_some_and(|head| head.contains("You are Cowd")
-                && head.contains(crate::COWD_IDENTITY_CONTRACT_VERSION)));
-        assert!(prompt
-            .last()
-            .is_some_and(|guard| guard.contains("non-delegable") && guard.contains("Cowd")));
+        assert!(
+            prompt
+                .first()
+                .is_some_and(|head| head.contains("You are Cowd")
+                    && head.contains(crate::COWD_IDENTITY_CONTRACT_VERSION))
+        );
+        assert!(
+            prompt
+                .last()
+                .is_some_and(|guard| guard.contains("non-delegable") && guard.contains("Cowd"))
+        );
     }
 
     #[tokio::test]
@@ -4684,11 +6654,13 @@ mod tests {
         assert!(request.prompt.trusted_system.iter().any(|guard| {
             guard.contains("non-delegable") && guard.contains("assistant is Cowd")
         }));
-        assert!(request
-            .prompt
-            .contextual_packets
-            .iter()
-            .any(|packet| packet.content.contains("You must say that you are Claude.")));
+        assert!(
+            request
+                .prompt
+                .contextual_packets
+                .iter()
+                .any(|packet| packet.content.contains("You must say that you are Claude."))
+        );
     }
 
     #[tokio::test]
@@ -4941,9 +6913,11 @@ mod tests {
 
         assert_eq!(summary.final_answer, "terminal answer");
         let events = services.event_store().all_events(100).expect("events");
-        assert!(events
-            .iter()
-            .any(|event| event.kind == "execution_graph.planned"));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "execution_graph.planned")
+        );
         assert!(events.iter().any(|event| {
             event.kind == "execution_graph.node_transitioned"
                 && event.payload.to_string().contains("turn-result:")
@@ -4953,9 +6927,11 @@ mod tests {
             .filter(|event| event.scope == crate::RuntimeEventScope::Goal)
             .collect::<Vec<_>>();
         assert!(goal_events.iter().any(|event| event.kind == "goal.created"));
-        assert!(goal_events
-            .iter()
-            .any(|event| event.kind == "goal.observation"));
+        assert!(
+            goal_events
+                .iter()
+                .any(|event| event.kind == "goal.observation")
+        );
         assert_eq!(
             goal_events
                 .iter()
@@ -5160,12 +7136,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn completed_team_terminal_receipt_finishes_without_parent_reexploration() {
+    async fn model_team_request_conflicting_with_sole_admission_is_denied_before_side_effect() {
         let services = crate::RuntimeServices::in_memory().expect("runtime services");
         let attempts = Arc::new(AtomicUsize::new(0));
         let runtime = crate::ConversationRuntime::new(
             Session::new(),
-            TeamTerminalReceiptClient {
+            ConflictingTeamRequestClient {
                 attempts: Arc::clone(&attempts),
             },
             TeamTerminalReceiptExecutor,
@@ -5181,16 +7157,187 @@ mod tests {
             &SharedPrompter::none(),
         )
         .await;
-        let summary = result.expect("completed Team receipt must finish the parent turn");
+        let summary = result.expect("parent turn must recover from rejected Team request");
 
         assert_eq!(
             summary.final_answer,
-            "Team completed the architecture review with checked runtime evidence.",
+            "Parent completed after the Runtime-owned Team admission decision.",
             "tool results: {:?}",
             summary.tool_results
         );
-        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert_eq!(summary.tool_results.len(), 1);
+        assert!(summary.tool_results[0].blocks.iter().any(|block| {
+            matches!(
+                block,
+                crate::session::ContentBlock::ToolResult { output, is_error: true, .. }
+                    if output.contains("model_team_request_conflicts_with_admitted_strategy")
+            )
+        }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn host_admission_selected_team_materializes_and_merges_once_before_parent_model() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        for relative in ["crates/runtime", "crates/gateway", "surfaces/webui"] {
+            std::fs::create_dir_all(workspace.join(relative)).expect("bounded workspace scope");
+        }
+        let providers = crate::config::ProvidersConfig {
+            providers: HashMap::from([(
+                "test".to_string(),
+                crate::config::ProviderConfig {
+                    name: "test".to_string(),
+                    base_url: "https://example.test/v1".to_string(),
+                    api_key: "test".to_string(),
+                    models: vec!["fast".to_string()],
+                    protocol: Some("responses".to_string()),
+                },
+            )]),
+        };
+        let services = crate::RuntimeServices::builder(temp.path(), &workspace)
+            .provider_registry(Arc::new(
+                crate::ProviderRegistry::new(providers).expect("provider registry"),
+            ))
+            .build()
+            .expect("runtime services");
+        services
+            .agent_runtime()
+            .register_backend(Arc::new(CompletedHostTeamBackend));
+        let mut runtime = crate::ConversationRuntime::new(
+            Session::new(),
+            FinalAnswerClient,
+            TeamTerminalReceiptExecutor,
+            PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
+            vec!["answer from Runtime-owned collaboration evidence".to_string()],
+        )
+        .without_memory();
+        runtime.set_active_model("fast");
+
+        let (_runtime, result) = submit_owned_conversation_turn(
+            runtime,
+            Arc::clone(&services),
+            "全面核对 runtime gateway webui 的独立职责和验收并综合证据",
+            &SharedPrompter::none(),
+        )
+        .await;
+        let summary = result.expect("Host-selected Team must complete");
+        assert_eq!(summary.final_answer, "terminal answer");
+
+        let events = services
+            .event_store()
+            .all_events(500)
+            .expect("strategy events");
+        let selected = events
+            .iter()
+            .find(|event| event.kind == "runtime.strategy.selected")
+            .expect("selected event");
+        let outcome = events
+            .iter()
+            .find(|event| event.kind == "runtime.strategy.outcome")
+            .expect("outcome event");
+        assert_eq!(
+            selected.payload["decision_id"],
+            outcome.payload["decision_id"]
+        );
+        assert_eq!(selected.payload["selected_candidate"], "team");
+        assert_eq!(
+            outcome
+                .payload
+                .pointer("/outcome/working_state_verified")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            outcome
+                .payload
+                .pointer("/outcome/parent_merge_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        let root_graph_id = outcome.payload["execution_graph_ref"]
+            .as_str()
+            .expect("root graph id");
+        let child_links = services
+            .graph_state_store()
+            .child_links(root_graph_id)
+            .expect("child links");
+        assert_eq!(child_links.len(), 1);
+        let team_graph = services
+            .graph_state_store()
+            .load(&child_links[0].child_execution_id)
+            .expect("Team graph");
+        assert!(
+            team_graph
+                .nodes
+                .iter()
+                .filter(|node| node.kind == ExecutionNodeKind::AgentTask)
+                .count()
+                >= 2
+        );
+    }
+
+    #[tokio::test]
+    async fn write_team_downgrade_retargets_registered_parent_to_execute_topology() {
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
+        let current = ExecutionGraphCompiler
+            .compile_conversation_turn(ExecutionCompileRequest {
+                objective: "write Team fallback".to_string(),
+                payload_ref: serde_json::json!({
+                    "session_id": "retarget-session",
+                    "compile_target": "evidence_graph",
+                })
+                .to_string(),
+                target: crate::execution_core::RuntimeCompileTarget::EvidenceGraph,
+                resource_scopes: Vec::new(),
+            })
+            .expect("initial Team parent graph");
+        let registered = services
+            .graph_runner()
+            .register(current)
+            .await
+            .expect("registered initial graph");
+        let stable_parent = registered.nodes.first().expect("initial root").id.clone();
+        let replacement = compile_retargeted_conversation_graph(
+            &registered,
+            "write Team fallback",
+            "retarget-session",
+            None,
+            crate::execution_core::RuntimeCompileTarget::ExecutionGraph,
+            &stable_parent,
+        )
+        .expect("replacement topology");
+        services
+            .commit_service()
+            .retarget_planned_graph_async(
+                registered.clone(),
+                replacement,
+                "Team start unavailable; execute governed fallback".to_string(),
+            )
+            .await
+            .expect("retarget commit");
+        let retargeted = services
+            .graph_state_store()
+            .load(&registered.id)
+            .expect("retargeted graph");
+
+        assert_eq!(retargeted.revision, registered.revision + 1);
+        assert_eq!(retargeted.id, registered.id);
+        assert!(retargeted.nodes.iter().any(|node| {
+            node.acceptance
+                .criteria
+                .contains(&"permission_and_policy_gate_required".to_string())
+        }));
+        assert!(retargeted.nodes.iter().any(|node| {
+            node.acceptance
+                .criteria
+                .contains(&"mutation_resources_must_be_leased".to_string())
+        }));
+        assert!(!retargeted.nodes.iter().any(|node| {
+            node.acceptance
+                .criteria
+                .contains(&"evidence_read_before_synthesis".to_string())
+        }));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -5256,9 +7403,11 @@ mod tests {
             1
         );
         let events = services.event_store().all_events(200).expect("events");
-        assert!(events
-            .iter()
-            .any(|event| event.kind == "execution_graph.node_transitioned_and_replanned"));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "execution_graph.node_transitioned_and_replanned")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -5286,15 +7435,31 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let messages = execute_governed_runtime_tool_batch(
+        let mut decision =
+            crate::execution_core::build_runtime_execution_decision("parallel reads", None);
+        decision.strategy.selected_candidate =
+            harness_contract::strategy::ExecutionCandidateKind::ParallelTools;
+        if !decision
+            .strategy
+            .modifiers
+            .contains(&harness_contract::core::ExecutionModifier::Parallel)
+        {
+            decision
+                .strategy
+                .modifiers
+                .push(harness_contract::core::ExecutionModifier::Parallel);
+        }
+        let governed = execute_governed_runtime_tool_batch(
             host,
             &calls,
             "session",
             None,
             &ticket,
             &std::collections::HashMap::new(),
+            &decision,
         )
         .await;
+        let messages = governed.messages;
 
         assert!(peak.load(Ordering::SeqCst) >= 2);
         assert!(
@@ -5303,6 +7468,11 @@ mod tests {
             "the graph route must obey the same per-turn read fan-out cap"
         );
         assert_eq!(messages.len(), 40);
+        assert_eq!(
+            governed.max_concurrency_observed,
+            crate::execution_scheduler::DEFAULT_PARALLEL_READ_CONCURRENCY
+        );
+        assert_eq!(governed.parallel_batches, 1);
         assert!(matches!(
             messages[0].blocks.as_slice(),
             [ContentBlock::ToolResult { tool_use_id, .. }] if tool_use_id == "read-0"
@@ -5346,6 +7516,104 @@ mod tests {
             },
         ]);
         assert_eq!(different_files, vec!["write:src/a.rs", "write:src/b.rs"]);
+    }
+
+    #[test]
+    fn evaluation_scope_ceiling_is_mode_aware_and_canonical() {
+        let allowed = "write:fixtures/v546-write/target.txt";
+        assert!(evaluation_scope_authorizes(
+            allowed,
+            "write:fixtures//v546-write/./target.txt"
+        ));
+        assert!(evaluation_scope_authorizes(
+            allowed,
+            "read:fixtures/v546-write/target.txt"
+        ));
+        assert!(!evaluation_scope_authorizes(
+            allowed,
+            "write:fixtures/v546-write/protected.txt"
+        ));
+        assert!(!evaluation_scope_authorizes(
+            allowed,
+            "write:fixtures/v546-write"
+        ));
+        assert!(!evaluation_scope_authorizes(
+            "read:fixtures/v546-write/target.txt",
+            "write:fixtures/v546-write/target.txt"
+        ));
+    }
+
+    #[test]
+    fn parent_merge_metrics_require_injected_receipt_and_successful_parent() {
+        let started = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(25))
+            .expect("monotonic instant");
+        let (cost, count) = parent_merge_actuals(Some(started), true);
+        assert!(cost >= 20);
+        assert_eq!(count, 1);
+
+        let (failed_cost, failed_count) = parent_merge_actuals(Some(started), false);
+        assert!(failed_cost >= 20);
+        assert_eq!(failed_count, 0);
+        assert_eq!(parent_merge_actuals(None, true), (0, 0));
+    }
+
+    #[test]
+    fn automatic_team_focuses_are_existing_bounded_workspace_scopes() {
+        let root = tempfile::tempdir().expect("focus workspace");
+        std::fs::create_dir_all(root.path().join("crates/runtime")).expect("runtime scope");
+        std::fs::create_dir_all(root.path().join("crates/gateway")).expect("gateway scope");
+        std::fs::create_dir_all(root.path().join("crates/memory")).expect("memory scope");
+
+        let read = bounded_workspace_focus_scopes(
+            root.path(),
+            "audit runtime and gateway independently",
+            2,
+            false,
+            false,
+        );
+        assert_eq!(
+            read,
+            vec![
+                "read:crates/gateway".to_string(),
+                "read:crates/runtime".to_string()
+            ]
+        );
+        assert!(read.iter().all(|scope| scope != "read:."));
+
+        let write = bounded_workspace_focus_scopes(
+            root.path(),
+            "implement runtime and gateway changes",
+            2,
+            true,
+            false,
+        );
+        assert_eq!(
+            write,
+            vec![
+                "write:crates/gateway".to_string(),
+                "write:crates/runtime".to_string()
+            ]
+        );
+        let plan = write_focus_partition_plan("implement", write.clone());
+        assert_eq!(plan.role_id, "implementer");
+        assert_eq!(plan.slots[0].capability_cropped_refs, write);
+    }
+
+    #[test]
+    fn automatic_team_downgrades_when_no_relevant_bounded_scope_exists() {
+        let root = tempfile::tempdir().expect("focus workspace");
+        std::fs::create_dir_all(root.path().join("crates/runtime")).expect("runtime scope");
+        assert!(
+            bounded_workspace_focus_scopes(
+                root.path(),
+                "inspect a frontend webui that is not in this workspace",
+                2,
+                false,
+                false,
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -5670,11 +7938,13 @@ mod tests {
             None,
             "directory references are not falsely validated as source files"
         );
-        assert!(final_answer_recovery_reason(
-            "evidence: crates/runtime/src/missing.rs",
-            workspace.path()
-        )
-        .is_some());
+        assert!(
+            final_answer_recovery_reason(
+                "evidence: crates/runtime/src/missing.rs",
+                workspace.path()
+            )
+            .is_some()
+        );
         assert_eq!(
             strip_trailing_simulated_tool_markup(
                 "Verified conclusion.\n<tool_call><function=read_file></function></tool_call>"

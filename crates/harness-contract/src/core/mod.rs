@@ -115,6 +115,7 @@ impl ExecutionPattern {
                 WithExternalResearch,
                 WithReviewer,
                 WithTrace,
+                WithVerifier,
                 WithWorktreeIsolation,
             ],
             Self::Supervise => &[
@@ -361,6 +362,7 @@ mod tests {
                 WithExternalResearch,
                 WithReviewer,
                 WithTrace,
+                WithVerifier,
                 WithWorktreeIsolation,
             ]
         );

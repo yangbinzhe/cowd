@@ -8,8 +8,9 @@ use crate::components::chat_view::ChatView;
 #[cfg(test)]
 use ratatui::layout::Rect;
 
-use super::types::{LayoutNode, PanelDef, Split, SplitDirection, TabDef, TabGroup};
 use super::LayoutTree;
+use super::types::{LayoutNode, PanelDef, Split, SplitDirection, TabDef, TabGroup};
+use crate::components::Component;
 use crate::components::agent_team_panel::AgentTeamPanel;
 use crate::components::approval_cockpit_panel::ApprovalCockpitPanel;
 use crate::components::diff_viewer::DiffViewer;
@@ -18,12 +19,12 @@ use crate::components::file_changes_panel::FileChangesPanel;
 use crate::components::file_tree::FileTree;
 use crate::components::gateway_panel::GatewayPanel;
 use crate::components::goal_workbench_panel::GoalWorkbenchPanel;
+use crate::components::mfg_operations_panel::MfgOperationsPanel;
 use crate::components::runtime_activity_panel::RuntimeActivityPanel;
 use crate::components::session_sidebar::SessionSidebar;
 use crate::components::surface_panel::SurfacePanel;
 use crate::components::todo_panel::TodoPanel;
 use crate::components::tool_ops_panel::ToolOpsPanel;
-use crate::components::Component;
 #[cfg(test)]
 use crate::components::{EventResult, RenderContext};
 use crate::workbench::panel_registry;
@@ -70,7 +71,8 @@ impl Component for PlaceholderComponent {
 ///         ├── Tab 6: "files"        (📁)
 ///         ├── Tab 7: "sessions"     (◫)
 ///         ├── Tab 8: "surfaces"     (S)
-///         └── Tab 9: "gateway"      (🌐)
+///         ├── Tab 9: "mfg"           (M)
+///         └── Tab 10: "gateway"      (🌐)
 /// ```
 #[must_use]
 pub fn build_default_layout() -> LayoutTree {
@@ -90,6 +92,7 @@ pub fn build_default_layout() -> LayoutTree {
                     "files" => "📁",
                     "sessions" => "◫",
                     "surfaces" => "S",
+                    "mfg" => "M",
                     "gateway" => "🌐",
                     _ => "?",
                 }
@@ -105,6 +108,7 @@ pub fn build_default_layout() -> LayoutTree {
                 "files" => Box::new(FileTree::new()) as Box<dyn Component>,
                 "sessions" => Box::new(SessionSidebar::new("")) as Box<dyn Component>,
                 "surfaces" => Box::new(SurfacePanel::new()) as Box<dyn Component>,
+                "mfg" => Box::new(MfgOperationsPanel::new()) as Box<dyn Component>,
                 "gateway" => Box::new(GatewayPanel::new()) as Box<dyn Component>,
                 _ => Box::new(RuntimeActivityPanel::new()) as Box<dyn Component>,
             },
@@ -358,7 +362,7 @@ mod tests {
                 // Second child: TabGroup with panel tabs
                 match &split.children[1] {
                     LayoutNode::TabGroup(tg) => {
-                        assert_eq!(tg.tabs.len(), 10, "expected 10 panel tabs");
+                        assert_eq!(tg.tabs.len(), 11, "expected 11 panel tabs");
                         assert_eq!(tg.active, 0, "first tab should be active by default");
 
                         let expected: &[(&str, &str)] = &[
@@ -371,6 +375,7 @@ mod tests {
                             ("files", "Files"),
                             ("sessions", "Sessions"),
                             ("surfaces", "Surfaces"),
+                            ("mfg", "MFG"),
                             ("gateway", "Gateway"),
                         ];
                         for (i, (id, label)) in expected.iter().enumerate() {
@@ -666,6 +671,10 @@ mod tests {
 
                         tg.next_tab();
                         assert_eq!(tg.active, 9);
+                        assert_eq!(tg.active_tab().unwrap().id, "mfg");
+
+                        tg.next_tab();
+                        assert_eq!(tg.active, 10);
                         assert_eq!(tg.active_tab().unwrap().id, "gateway");
 
                         // Wrap around
@@ -674,7 +683,7 @@ mod tests {
 
                         // Wrap around with prev
                         tg.prev_tab();
-                        assert_eq!(tg.active, 9);
+                        assert_eq!(tg.active, 10);
                     }
                     _ => panic!("expected TabGroup as second child"),
                 }
@@ -700,7 +709,8 @@ mod tests {
                     assert_eq!(tg.tabs[6].icon.as_deref(), Some("📁"));
                     assert_eq!(tg.tabs[7].icon.as_deref(), Some("◫"));
                     assert_eq!(tg.tabs[8].icon.as_deref(), Some("S"));
-                    assert_eq!(tg.tabs[9].icon.as_deref(), Some("🌐"));
+                    assert_eq!(tg.tabs[9].icon.as_deref(), Some("M"));
+                    assert_eq!(tg.tabs[10].icon.as_deref(), Some("🌐"));
                 }
                 _ => panic!("expected TabGroup as second child"),
             },
@@ -753,9 +763,11 @@ mod tests {
         let mut state = LayoutState::new();
 
         // Switch to tab 3 (goals)
-        if let LayoutNode::Split(split) = &mut tree.root { if let LayoutNode::TabGroup(ref mut tg) = &mut split.children[1] {
-            tg.active = 3;
-        } }
+        if let LayoutNode::Split(split) = &mut tree.root {
+            if let LayoutNode::TabGroup(ref mut tg) = &mut split.children[1] {
+                tg.active = 3;
+            }
+        }
 
         state.toggle_sidebar(&mut tree); // hide → ratio 1.0
         state.toggle_sidebar(&mut tree); // show → restore

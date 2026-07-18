@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use storage::{SqliteConnectionFactory, StorageHandle};
@@ -13,18 +13,18 @@ use thiserror::Error;
 
 use crate::MatrixSqliteDataPlane;
 use matrix_core::{
-    build_metric_compute_jobs, MatrixAttentionItem, MatrixChangeEvent, MatrixComputeJob,
-    MatrixComputeJobInput, MatrixComputePlan, MatrixConnectorRun, MatrixConnectorRunInput,
-    MatrixDataPlane, MatrixDataPlaneHealth, MatrixDataPlaneIngestPlan,
-    MatrixDataPlaneIngestPlanInput, MatrixDataPlaneWatermark, MatrixEntity, MatrixEvidencePacket,
-    MatrixEvidenceSourceRef, MatrixFact, MatrixImpactHop, MatrixImpactTrace,
-    MatrixMetricAttentionPlan, MatrixMetricAttentionScore, MatrixMetricDefinition,
-    MatrixMetricDependency, MatrixMetricLineage, MatrixMetricSnapshot, MatrixMetricSnapshotItem,
-    MatrixMetricState, MatrixOntologyPack, MatrixQualityGateDecision, MatrixRelation,
-    MatrixScenarioResult, MatrixScenarioRun, MatrixScenarioRunStatus, MatrixScenarioSpec,
-    MatrixSeverity, MatrixSourceDeltaPlan, MatrixSourceKey, MatrixSourcePack,
-    MatrixSourcePackValidation, MatrixSourceSnapshot, MatrixSourceSnapshotApplyReport,
-    MatrixSourceSnapshotInput, MatrixSourceSnapshotPlan,
+    MatrixAttentionItem, MatrixChangeEvent, MatrixComputeJob, MatrixComputeJobInput,
+    MatrixComputePlan, MatrixConnectorRun, MatrixConnectorRunInput, MatrixDataPlane,
+    MatrixDataPlaneHealth, MatrixDataPlaneIngestPlan, MatrixDataPlaneIngestPlanInput,
+    MatrixDataPlaneWatermark, MatrixEntity, MatrixEvidencePacket, MatrixEvidenceSourceRef,
+    MatrixFact, MatrixImpactHop, MatrixImpactTrace, MatrixMetricAttentionPlan,
+    MatrixMetricAttentionScore, MatrixMetricDefinition, MatrixMetricDependency,
+    MatrixMetricLineage, MatrixMetricSnapshot, MatrixMetricSnapshotItem, MatrixMetricState,
+    MatrixOntologyPack, MatrixQualityGateDecision, MatrixRelation, MatrixScenarioResult,
+    MatrixScenarioRun, MatrixScenarioRunStatus, MatrixScenarioSpec, MatrixSeverity,
+    MatrixSourceDeltaPlan, MatrixSourceKey, MatrixSourcePack, MatrixSourcePackValidation,
+    MatrixSourceSnapshot, MatrixSourceSnapshotApplyReport, MatrixSourceSnapshotInput,
+    MatrixSourceSnapshotPlan, build_metric_compute_jobs,
 };
 
 #[derive(Debug, Error)]
@@ -41,6 +41,22 @@ pub enum MatrixSqliteRepositoryError {
     InvalidScenario(String),
     #[error("matrix scenario state conflict: {0}")]
     ScenarioState(String),
+    #[error(
+        "matrix revision conflict for {resource_ref}: expected {expected:?}, actual {actual:?}"
+    )]
+    RevisionConflict {
+        resource_ref: String,
+        expected: Option<u64>,
+        actual: Option<u64>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MatrixRevisioned<T> {
+    pub resource: T,
+    pub previous_revision: Option<u64>,
+    pub revision: u64,
+    pub created: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,6 +175,7 @@ impl MatrixSqliteRepository {
         &self,
         input: MatrixDataPlaneIngestPlanInput,
     ) -> Result<MatrixDataPlaneIngestPlan, MatrixSqliteRepositoryError> {
+        let source_ref = input.source_ref.clone();
         let mut plan = MatrixSqliteDataPlane::new(self.health()?.data_plane_watermark_count)
             .plan_ingest(input);
         if plan.affected_metric_ids.is_empty() {
@@ -168,6 +185,25 @@ impl MatrixSqliteRepository {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut affected = metrics_affected_by_fact_type(&connection, &plan.fact_type)?;
             affected.extend(metric_ids_for_fact_type(&connection, &plan.fact_type)?);
+            // A source-pack is the canonical declaration of the metrics that
+            // its facts materialize. A newly saved pack need not already have
+            // persisted metric dependencies, so fact-type lookup alone would
+            // incorrectly return an empty first-use ingest plan.
+            if let Some(source_pack_id) = source_ref
+                .strip_prefix("source-pack://")
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                if let Some(source_pack) = find_source_pack(&connection, source_pack_id)? {
+                    affected.extend(
+                        source_pack
+                            .fact_mappings
+                            .iter()
+                            .filter(|mapping| mapping.fact_type == plan.fact_type)
+                            .map(|mapping| mapping.metric_key.clone()),
+                    );
+                }
+            }
             affected.sort();
             affected.dedup();
             plan.compute_jobs = affected
@@ -184,23 +220,96 @@ impl MatrixSqliteRepository {
                 .collect();
             plan.affected_metric_ids = affected;
         }
+        Ok(plan)
+    }
+
+    /// Commit the durable cursor of an already-applied source batch.
+    ///
+    /// Planning deliberately has no persistence side effect: callers may use
+    /// it for previews.  The source-ingestion pipeline invokes this only after
+    /// its snapshot rows have been applied, so a watermark is never advanced
+    /// for a batch that did not reach the Matrix store.
+    pub fn commit_data_plane_ingest(
+        &self,
+        plan: &MatrixDataPlaneIngestPlan,
+    ) -> Result<(), MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        upsert_data_plane_watermark(&connection, &plan.watermark)?;
-        Ok(plan)
+        upsert_data_plane_watermark(&connection, &plan.watermark)
     }
 
     pub fn upsert_entity(
         &self,
         entity: &MatrixEntity,
     ) -> Result<MatrixEntity, MatrixSqliteRepositoryError> {
+        Ok(self.upsert_entity_revisioned(entity, None, false)?.resource)
+    }
+
+    pub fn resource_revision_for_existing(
+        &self,
+        resource_kind: &str,
+        resource_id: &str,
+    ) -> Result<u64, MatrixSqliteRepositoryError> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        upsert_entity(&connection, entity)
+        Ok(connection
+            .query_row(
+                "SELECT revision FROM matrix_resource_revision
+                 WHERE resource_kind = ?1 AND resource_id = ?2",
+                params![resource_kind, resource_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|revision| revision as u64)
+            .unwrap_or(1))
+    }
+
+    pub fn upsert_entity_checked(
+        &self,
+        entity: &MatrixEntity,
+        expected_revision: Option<u64>,
+    ) -> Result<MatrixRevisioned<MatrixEntity>, MatrixSqliteRepositoryError> {
+        self.upsert_entity_revisioned(entity, expected_revision, true)
+    }
+
+    fn upsert_entity_revisioned(
+        &self,
+        entity: &MatrixEntity,
+        expected_revision: Option<u64>,
+        enforce_revision: bool,
+    ) -> Result<MatrixRevisioned<MatrixEntity>, MatrixSqliteRepositoryError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let transaction = connection.transaction()?;
+        let existing =
+            find_entity_by_canonical(&transaction, &entity.entity_type, &entity.canonical_key)?;
+        let resource_id = existing
+            .as_ref()
+            .map(|item| item.entity_id.as_str())
+            .unwrap_or(entity.entity_id.as_str());
+        let (previous_revision, revision, created) = prepare_matrix_resource_revision(
+            &transaction,
+            "entity",
+            resource_id,
+            existing.is_some(),
+            expected_revision,
+            enforce_revision,
+        )?;
+        let resource = upsert_entity(&transaction, entity)?;
+        persist_matrix_resource_revision(&transaction, "entity", &resource.entity_id, revision)?;
+        transaction.commit()?;
+        Ok(MatrixRevisioned {
+            resource,
+            previous_revision,
+            revision,
+            created,
+        })
     }
 
     pub fn get_entity(
@@ -266,7 +375,6 @@ impl MatrixSqliteRepository {
                 "entity match candidate below confidence threshold".to_string(),
             )
         })?;
-        insert_entity_match_candidate(&connection, &candidate)?;
         Ok(candidate)
     }
 
@@ -278,16 +386,43 @@ impl MatrixSqliteRepository {
         survivorship_rule: &str,
         notes: Option<String>,
     ) -> Result<matrix_core::MatrixEntityConflictDecision, MatrixSqliteRepositoryError> {
-        let connection = self
+        let mut connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        find_entity_match_candidate(&connection, candidate_id)?
-            .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(candidate_id.to_string()))?;
-        let survivor = find_entity(&connection, survivor_entity_id)?
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let survivor = find_entity(&transaction, survivor_entity_id)?
             .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(survivor_entity_id.to_string()))?;
-        let retired = find_entity(&connection, retired_entity_id)?
+        let retired = find_entity(&transaction, retired_entity_id)?
             .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(retired_entity_id.to_string()))?;
+        let candidate = match find_entity_match_candidate(&transaction, candidate_id)? {
+            Some(candidate) => candidate,
+            None => {
+                let candidate =
+                    matrix_core::match_candidate(&survivor, &retired).ok_or_else(|| {
+                        MatrixSqliteRepositoryError::NotFound(
+                            "entity match candidate below confidence threshold".to_string(),
+                        )
+                    })?;
+                if candidate.candidate_id != candidate_id {
+                    return Err(MatrixSqliteRepositoryError::NotFound(
+                        candidate_id.to_string(),
+                    ));
+                }
+                insert_entity_match_candidate(&transaction, &candidate)?;
+                candidate
+            }
+        };
+        let candidate_pair_matches = (candidate.left_entity_id == survivor_entity_id
+            && candidate.right_entity_id == retired_entity_id)
+            || (candidate.left_entity_id == retired_entity_id
+                && candidate.right_entity_id == survivor_entity_id);
+        if !candidate_pair_matches {
+            return Err(MatrixSqliteRepositoryError::InvalidScenario(
+                "entity conflict decision does not match the candidate pair".to_string(),
+            ));
+        }
         let decision = matrix_core::MatrixEntityConflictDecision {
             decision_id: format!("entity-conflict-decision-{}", uuid::Uuid::new_v4()),
             candidate_id: candidate_id.to_string(),
@@ -302,7 +437,8 @@ impl MatrixSqliteRepository {
             }),
             decided_at: Utc::now(),
         };
-        insert_entity_conflict_decision(&connection, &decision)?;
+        insert_entity_conflict_decision(&transaction, &decision)?;
+        transaction.commit()?;
         Ok(decision)
     }
 
@@ -350,11 +486,62 @@ impl MatrixSqliteRepository {
         &self,
         relation: &MatrixRelation,
     ) -> Result<MatrixRelation, MatrixSqliteRepositoryError> {
-        let connection = self
+        Ok(self
+            .upsert_relation_revisioned(relation, None, false)?
+            .resource)
+    }
+
+    pub fn upsert_relation_checked(
+        &self,
+        relation: &MatrixRelation,
+        expected_revision: Option<u64>,
+    ) -> Result<MatrixRevisioned<MatrixRelation>, MatrixSqliteRepositoryError> {
+        self.upsert_relation_revisioned(relation, expected_revision, true)
+    }
+
+    fn upsert_relation_revisioned(
+        &self,
+        relation: &MatrixRelation,
+        expected_revision: Option<u64>,
+        enforce_revision: bool,
+    ) -> Result<MatrixRevisioned<MatrixRelation>, MatrixSqliteRepositoryError> {
+        let mut connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        upsert_relation(&connection, relation)
+        let transaction = connection.transaction()?;
+        let existing = find_relation_by_key(
+            &transaction,
+            &relation.relation_type,
+            &relation.from_entity_id,
+            &relation.to_entity_id,
+        )?;
+        let resource_id = existing
+            .as_ref()
+            .map(|item| item.relation_id.as_str())
+            .unwrap_or(relation.relation_id.as_str());
+        let (previous_revision, revision, created) = prepare_matrix_resource_revision(
+            &transaction,
+            "relation",
+            resource_id,
+            existing.is_some(),
+            expected_revision,
+            enforce_revision,
+        )?;
+        let resource = upsert_relation(&transaction, relation)?;
+        persist_matrix_resource_revision(
+            &transaction,
+            "relation",
+            &resource.relation_id,
+            revision,
+        )?;
+        transaction.commit()?;
+        Ok(MatrixRevisioned {
+            resource,
+            previous_revision,
+            revision,
+            created,
+        })
     }
 
     pub fn list_entity_relations(
@@ -402,11 +589,62 @@ impl MatrixSqliteRepository {
         &self,
         dependency: &MatrixMetricDependency,
     ) -> Result<MatrixMetricDependency, MatrixSqliteRepositoryError> {
-        let connection = self
+        Ok(self
+            .upsert_metric_dependency_revisioned(dependency, None, false)?
+            .resource)
+    }
+
+    pub fn upsert_metric_dependency_checked(
+        &self,
+        dependency: &MatrixMetricDependency,
+        expected_revision: Option<u64>,
+    ) -> Result<MatrixRevisioned<MatrixMetricDependency>, MatrixSqliteRepositoryError> {
+        self.upsert_metric_dependency_revisioned(dependency, expected_revision, true)
+    }
+
+    fn upsert_metric_dependency_revisioned(
+        &self,
+        dependency: &MatrixMetricDependency,
+        expected_revision: Option<u64>,
+        enforce_revision: bool,
+    ) -> Result<MatrixRevisioned<MatrixMetricDependency>, MatrixSqliteRepositoryError> {
+        let mut connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        upsert_metric_dependency(&connection, dependency)
+        let transaction = connection.transaction()?;
+        let existing = find_metric_dependency_by_key(
+            &transaction,
+            &dependency.upstream_metric_id,
+            &dependency.downstream_metric_id,
+            &dependency.dependency_type,
+        )?;
+        let resource_id = existing
+            .as_ref()
+            .map(|item| item.dependency_id.as_str())
+            .unwrap_or(dependency.dependency_id.as_str());
+        let (previous_revision, revision, created) = prepare_matrix_resource_revision(
+            &transaction,
+            "metric_dependency",
+            resource_id,
+            existing.is_some(),
+            expected_revision,
+            enforce_revision,
+        )?;
+        let resource = upsert_metric_dependency(&transaction, dependency)?;
+        persist_matrix_resource_revision(
+            &transaction,
+            "metric_dependency",
+            &resource.dependency_id,
+            revision,
+        )?;
+        transaction.commit()?;
+        Ok(MatrixRevisioned {
+            resource,
+            previous_revision,
+            revision,
+            created,
+        })
     }
 
     pub fn metric_lineage(
@@ -553,13 +791,57 @@ impl MatrixSqliteRepository {
         &self,
         source_pack: MatrixSourcePack,
     ) -> Result<MatrixSourcePack, MatrixSqliteRepositoryError> {
-        let source_pack = source_pack.normalized();
-        let connection = self
+        Ok(self
+            .upsert_source_pack_revisioned(source_pack, None, false)?
+            .resource)
+    }
+
+    pub fn upsert_source_pack_checked(
+        &self,
+        source_pack: MatrixSourcePack,
+        expected_revision: Option<u64>,
+    ) -> Result<MatrixRevisioned<MatrixSourcePack>, MatrixSqliteRepositoryError> {
+        self.upsert_source_pack_revisioned(source_pack, expected_revision, true)
+    }
+
+    fn upsert_source_pack_revisioned(
+        &self,
+        source_pack: MatrixSourcePack,
+        expected_revision: Option<u64>,
+        enforce_revision: bool,
+    ) -> Result<MatrixRevisioned<MatrixSourcePack>, MatrixSqliteRepositoryError> {
+        let mut source_pack = source_pack.normalized();
+        let mut connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        insert_source_pack(&connection, &source_pack)?;
-        Ok(source_pack)
+        let transaction = connection.transaction()?;
+        let existing = find_source_pack(&transaction, &source_pack.source_pack_id)?;
+        if let Some(existing) = &existing {
+            source_pack.created_at = existing.created_at.to_owned();
+        }
+        let (previous_revision, revision, created) = prepare_matrix_resource_revision(
+            &transaction,
+            "source_pack",
+            &source_pack.source_pack_id,
+            existing.is_some(),
+            expected_revision,
+            enforce_revision,
+        )?;
+        insert_source_pack(&transaction, &source_pack)?;
+        persist_matrix_resource_revision(
+            &transaction,
+            "source_pack",
+            &source_pack.source_pack_id,
+            revision,
+        )?;
+        transaction.commit()?;
+        Ok(MatrixRevisioned {
+            resource: source_pack,
+            previous_revision,
+            revision,
+            created,
+        })
     }
 
     pub fn get_source_pack(
@@ -1331,6 +1613,35 @@ impl MatrixSqliteRepository {
         Ok(decision)
     }
 
+    pub fn evaluate_evidence_quality_with_gate_id(
+        &self,
+        packet_id: &str,
+        gate_id: &str,
+    ) -> Result<MatrixQualityGateDecision, MatrixSqliteRepositoryError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(existing) = find_quality_gate(&transaction, gate_id)? {
+            if existing.target_ref == format!("matrix:evidence:{packet_id}") {
+                transaction.commit()?;
+                return Ok(existing);
+            }
+            return Err(MatrixSqliteRepositoryError::InvalidScenario(format!(
+                "quality gate id {gate_id} is bound to another evidence packet"
+            )));
+        }
+        let packet = find_evidence_packet(&transaction, packet_id)?
+            .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(packet_id.to_string()))?;
+        let mut decision = MatrixQualityGateDecision::for_evidence_packet(&packet);
+        decision.gate_id = gate_id.to_string();
+        insert_quality_gate(&transaction, &decision)?;
+        transaction.commit()?;
+        Ok(decision)
+    }
+
     pub fn get_quality_gate(
         &self,
         gate_id: &str,
@@ -1362,7 +1673,7 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             updated_at TEXT NOT NULL
         );
         INSERT INTO matrix_schema (id, schema_version, updated_at)
-        VALUES (1, 19, datetime('now'))
+        VALUES (1, 20, datetime('now'))
         ON CONFLICT(id) DO UPDATE SET
             schema_version = CASE
                 WHEN matrix_schema.schema_version < excluded.schema_version
@@ -1543,6 +1854,14 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_matrix_source_pack_source
             ON matrix_source_pack(source_name, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS matrix_resource_revision (
+            resource_kind TEXT NOT NULL,
+            resource_id TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(resource_kind, resource_id)
+        );
 
         CREATE TABLE IF NOT EXISTS matrix_data_plane_watermark (
             source_ref TEXT NOT NULL,
@@ -1774,6 +2093,75 @@ fn insert_entity_conflict_decision(
             decision.retired_entity_id,
             serde_json::to_string(decision)?,
             decision.decided_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn prepare_matrix_resource_revision(
+    connection: &Connection,
+    resource_kind: &str,
+    resource_id: &str,
+    exists: bool,
+    expected_revision: Option<u64>,
+    enforce_revision: bool,
+) -> Result<(Option<u64>, u64, bool), MatrixSqliteRepositoryError> {
+    let stored_revision = connection
+        .query_row(
+            "SELECT revision FROM matrix_resource_revision
+             WHERE resource_kind = ?1 AND resource_id = ?2",
+            params![resource_kind, resource_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .map(|revision| revision as u64);
+    let actual = if exists {
+        stored_revision.or(Some(1))
+    } else {
+        None
+    };
+    if enforce_revision {
+        let matches = if exists {
+            expected_revision == actual
+        } else {
+            expected_revision.is_none()
+        };
+        if !matches {
+            return Err(MatrixSqliteRepositoryError::RevisionConflict {
+                resource_ref: format!("matrix:{resource_kind}:{resource_id}"),
+                expected: expected_revision,
+                actual,
+            });
+        }
+    }
+    let revision = actual.unwrap_or_default().checked_add(1).ok_or_else(|| {
+        MatrixSqliteRepositoryError::RevisionConflict {
+            resource_ref: format!("matrix:{resource_kind}:{resource_id}"),
+            expected: expected_revision,
+            actual,
+        }
+    })?;
+    Ok((actual, revision, !exists))
+}
+
+fn persist_matrix_resource_revision(
+    connection: &Connection,
+    resource_kind: &str,
+    resource_id: &str,
+    revision: u64,
+) -> Result<(), MatrixSqliteRepositoryError> {
+    connection.execute(
+        "INSERT INTO matrix_resource_revision (
+            resource_kind, resource_id, revision, updated_at
+         ) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(resource_kind, resource_id) DO UPDATE SET
+            revision = excluded.revision,
+            updated_at = excluded.updated_at",
+        params![
+            resource_kind,
+            resource_id,
+            revision as i64,
+            Utc::now().to_rfc3339(),
         ],
     )?;
     Ok(())
@@ -2857,7 +3245,10 @@ fn list_scenario_runs(
     let (sql, parameter) = match scenario_id {
         Some(scenario_id) => (
             "SELECT run_json FROM matrix_scenario_run WHERE scenario_id = ?1 ORDER BY started_at DESC, run_id ASC LIMIT ?2",
-            vec![rusqlite::types::Value::Text(scenario_id.to_string()), rusqlite::types::Value::Integer(limit.max(1) as i64)],
+            vec![
+                rusqlite::types::Value::Text(scenario_id.to_string()),
+                rusqlite::types::Value::Integer(limit.max(1) as i64),
+            ],
         ),
         None => (
             "SELECT run_json FROM matrix_scenario_run ORDER BY started_at DESC, run_id ASC LIMIT ?1",
@@ -3541,9 +3932,223 @@ fn attention_from_change(
 mod tests {
     use super::*;
     use matrix_core::{
+        MatrixEntityInput, MatrixMetricDependencyInput, MatrixRelationInput,
         MatrixScenarioOutputContract, MatrixSnapshotRef, MatrixSourceEntityMapping,
         MatrixSourceFactMapping, MatrixSourceKind, MatrixSourceRelationMapping,
     };
+
+    fn minimal_source_pack(id: &str) -> MatrixSourcePack {
+        MatrixSourcePack {
+            source_pack_id: id.to_string(),
+            source_name: "revision-fixture".to_string(),
+            owner: "test".to_string(),
+            access_mode: "manual".to_string(),
+            refresh_mode: "snapshot".to_string(),
+            entity_mappings: Vec::new(),
+            fact_mappings: Vec::new(),
+            relation_mappings: Vec::new(),
+            reconciliation_rules: Vec::new(),
+            quality_rules: Vec::new(),
+            freshness_sla: None,
+            security_policy: None,
+            metadata: Value::Null,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn data_plane_ingest_plan_includes_metric_declared_by_source_pack() {
+        let repository = MatrixSqliteRepository::in_memory().expect("repository opens");
+        let source_pack_id = "source-pack-ingest-metric";
+        let mut source_pack = minimal_source_pack(source_pack_id);
+        source_pack.fact_mappings = vec![MatrixSourceFactMapping {
+            source_table: "manufacturing_events".to_string(),
+            fact_type: "manufacturing.event".to_string(),
+            metric_key: "manufacturing_event_count".to_string(),
+            entity_ref_fields: vec!["asset_id".to_string()],
+            measure_fields: Vec::new(),
+            event_time_field: None,
+            dedup_key: "event_id".to_string(),
+            delta_signature: "updated_at".to_string(),
+        }];
+        repository
+            .upsert_source_pack(source_pack)
+            .expect("source pack saves");
+
+        let plan = repository
+            .plan_data_plane_ingest(MatrixDataPlaneIngestPlanInput {
+                source_ref: format!("source-pack://{source_pack_id}"),
+                fact_type: "manufacturing.event".to_string(),
+                partition_ref: None,
+                high_watermark: None,
+                estimated_rows: None,
+                raw_checksum: None,
+                metric_ids: Vec::new(),
+            })
+            .expect("ingest plan builds");
+
+        assert!(
+            plan.affected_metric_ids
+                .iter()
+                .any(|metric_id| metric_id == "manufacturing_event_count")
+        );
+        assert!(plan.compute_jobs.iter().any(|job| {
+            job.metric_ids
+                .iter()
+                .any(|metric_id| metric_id == "manufacturing_event_count")
+        }));
+    }
+
+    #[test]
+    fn checked_matrix_upserts_require_exact_revision_for_all_four_resources() {
+        let repository = MatrixSqliteRepository::in_memory().unwrap();
+
+        let source = repository
+            .upsert_source_pack_checked(minimal_source_pack("source-revision"), None)
+            .unwrap();
+        assert!(source.created);
+        assert_eq!(source.revision, 1);
+        assert!(matches!(
+            repository.upsert_source_pack_checked(minimal_source_pack("source-revision"), None),
+            Err(MatrixSqliteRepositoryError::RevisionConflict { .. })
+        ));
+        assert_eq!(
+            repository
+                .upsert_source_pack_checked(
+                    minimal_source_pack("source-revision"),
+                    Some(source.revision),
+                )
+                .unwrap()
+                .revision,
+            2
+        );
+
+        let left = MatrixEntity::from_input(MatrixEntityInput {
+            entity_id: Some("entity-left".to_string()),
+            entity_type: "part".to_string(),
+            canonical_key: "left".to_string(),
+            display_name: None,
+            source_keys: Vec::new(),
+            attributes: Value::Null,
+            confidence: None,
+        });
+        let entity = repository.upsert_entity_checked(&left, None).unwrap();
+        assert_eq!(entity.revision, 1);
+        assert!(matches!(
+            repository.upsert_entity_checked(&left, None),
+            Err(MatrixSqliteRepositoryError::RevisionConflict { .. })
+        ));
+        assert_eq!(
+            repository
+                .upsert_entity_checked(&left, Some(entity.revision))
+                .unwrap()
+                .revision,
+            2
+        );
+
+        let right = MatrixEntity::from_input(MatrixEntityInput {
+            entity_id: Some("entity-right".to_string()),
+            entity_type: "part".to_string(),
+            canonical_key: "right".to_string(),
+            display_name: None,
+            source_keys: Vec::new(),
+            attributes: Value::Null,
+            confidence: None,
+        });
+        repository.upsert_entity(&right).unwrap();
+        let relation = MatrixRelation::from_input(MatrixRelationInput {
+            relation_id: Some("relation-revision".to_string()),
+            relation_type: "depends_on".to_string(),
+            from_entity_id: left.entity_id.clone(),
+            to_entity_id: right.entity_id.clone(),
+            attributes: Value::Null,
+            confidence: None,
+        });
+        let relation = repository.upsert_relation_checked(&relation, None).unwrap();
+        assert_eq!(relation.revision, 1);
+        assert!(matches!(
+            repository.upsert_relation_checked(&relation.resource, None),
+            Err(MatrixSqliteRepositoryError::RevisionConflict { .. })
+        ));
+        assert_eq!(
+            repository
+                .upsert_relation_checked(&relation.resource, Some(relation.revision))
+                .unwrap()
+                .revision,
+            2
+        );
+
+        let dependency = MatrixMetricDependency::from_input(MatrixMetricDependencyInput {
+            dependency_id: Some("dependency-revision".to_string()),
+            upstream_metric_id: "metric-a".to_string(),
+            downstream_metric_id: "metric-b".to_string(),
+            dependency_type: "derived_from".to_string(),
+            entity_relation_type: None,
+            required_fact_types: Vec::new(),
+            transformation_ref: None,
+            confidence: None,
+            notes: None,
+        });
+        let dependency = repository
+            .upsert_metric_dependency_checked(&dependency, None)
+            .unwrap();
+        assert_eq!(dependency.revision, 1);
+        assert!(matches!(
+            repository.upsert_metric_dependency_checked(&dependency.resource, None),
+            Err(MatrixSqliteRepositoryError::RevisionConflict { .. })
+        ));
+        assert_eq!(
+            repository
+                .upsert_metric_dependency_checked(&dependency.resource, Some(dependency.revision),)
+                .unwrap()
+                .revision,
+            2
+        );
+    }
+
+    #[test]
+    fn entity_match_preview_is_pure_and_decision_materializes_the_stable_candidate() {
+        let repository = MatrixSqliteRepository::in_memory().unwrap();
+        for entity_id in ["entity-preview-left", "entity-preview-right"] {
+            repository
+                .upsert_entity(&MatrixEntity::from_input(MatrixEntityInput {
+                    entity_id: Some(entity_id.to_string()),
+                    entity_type: "part".to_string(),
+                    canonical_key: entity_id.to_string(),
+                    display_name: Some("Shared preview identity".to_string()),
+                    source_keys: Vec::new(),
+                    attributes: Value::Null,
+                    confidence: None,
+                }))
+                .unwrap();
+        }
+
+        let first = repository
+            .propose_entity_match("entity-preview-left", "entity-preview-right")
+            .unwrap();
+        let second = repository
+            .propose_entity_match("entity-preview-left", "entity-preview-right")
+            .unwrap();
+        assert_eq!(first.candidate_id, second.candidate_id);
+        let preview_health = repository.health().unwrap();
+        assert_eq!(preview_health.entity_match_candidate_count, 0);
+        assert_eq!(preview_health.entity_conflict_decision_count, 0);
+
+        let decision = repository
+            .decide_entity_conflict(
+                &first.candidate_id,
+                "entity-preview-left",
+                "entity-preview-right",
+                "prefer_verified_source",
+                Some("governed commit".to_string()),
+            )
+            .unwrap();
+        assert_eq!(decision.candidate_id, first.candidate_id);
+        let committed_health = repository.health().unwrap();
+        assert_eq!(committed_health.entity_match_candidate_count, 1);
+        assert_eq!(committed_health.entity_conflict_decision_count, 1);
+    }
 
     #[test]
     fn source_snapshot_apply_maps_rows_to_matrix_records_idempotently() {
@@ -3646,10 +4251,11 @@ mod tests {
 
         let facts = repository.list_facts(10).unwrap();
         assert_eq!(facts.len(), 2);
-        assert!(facts.iter().all(|fact| fact
-            .entity_refs
-            .iter()
-            .any(|reference| reference.starts_with("matrix:entity:entity-"))));
+        assert!(facts.iter().all(|fact| {
+            fact.entity_refs
+                .iter()
+                .any(|reference| reference.starts_with("matrix:entity:entity-"))
+        }));
 
         let snapshots = repository
             .list_source_snapshots(Some("source-pack-supply-orders"), 10)

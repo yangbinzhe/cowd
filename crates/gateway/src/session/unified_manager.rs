@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::Utc;
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 use memory::{SessionMissionOutboxOperation, SessionMissionOutboxRequest, SessionRecord};
 use runtime::session_lifecycle::SessionLifecycleManager;
 use tokio::sync::Mutex;
@@ -66,6 +66,11 @@ pub(crate) struct EnsureSessionRequest {
     pub(crate) source: SessionSource,
     pub(crate) title: Option<String>,
     pub(crate) user_id: Option<String>,
+    pub(crate) owner_principal_id: Option<String>,
+    /// Existing records created before principal ownership was introduced are
+    /// deliberately fail-closed.  Only a route that has verified an
+    /// interactive management capability may request their audited migration.
+    pub(crate) allow_legacy_owner_migration: bool,
     pub(crate) chat_id: Option<String>,
     pub(crate) metadata: serde_json::Value,
     pub(crate) mission_operation: SessionMissionOutboxOperation,
@@ -83,6 +88,8 @@ impl EnsureSessionRequest {
             source,
             title: None,
             user_id: None,
+            owner_principal_id: None,
+            allow_legacy_owner_migration: false,
             chat_id: None,
             metadata: serde_json::json!({}),
             mission_operation: SessionMissionOutboxOperation::Register,
@@ -154,10 +161,63 @@ impl UnifiedSessionManager {
         let lock = self.lock_for(session_id).await;
         let _guard = lock.lock().await;
         let session_kernel = self.runtime.session_kernel();
-        let existing = session_kernel
+        let mut existing = session_kernel
             .stored_session(session_id)
             .await
             .map_err(|error| error.to_string())?;
+        if let Some(requested_owner) = request.owner_principal_id.as_deref() {
+            if let Some(record) = existing.as_mut() {
+                let existing_owner = record
+                    .metadata_json
+                    .as_deref()
+                    .and_then(|metadata| serde_json::from_str::<serde_json::Value>(metadata).ok())
+                    .and_then(|metadata| {
+                        metadata
+                            .get("owner_principal_id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    });
+                if existing_owner
+                    .as_deref()
+                    .is_some_and(|owner| owner != requested_owner)
+                {
+                    return Err("session is owned by another authenticated principal".to_string());
+                }
+                if existing_owner.is_none() {
+                    if !request.allow_legacy_owner_migration {
+                        return Err(
+                            "legacy session has no owner and requires privileged owner migration"
+                                .to_string(),
+                        );
+                    }
+                    let mut metadata = record
+                        .metadata_json
+                        .as_deref()
+                        .and_then(|metadata| {
+                            serde_json::from_str::<serde_json::Value>(metadata).ok()
+                        })
+                        .and_then(|metadata| metadata.as_object().cloned())
+                        .unwrap_or_default();
+                    metadata.insert(
+                        "owner_principal_id".to_string(),
+                        serde_json::Value::String(requested_owner.to_string()),
+                    );
+                    metadata.insert(
+                        "owner_migration".to_string(),
+                        serde_json::json!({
+                            "kind": "privileged_legacy_claim_v1",
+                            "claimed_by": requested_owner,
+                            "claimed_at": Utc::now().to_rfc3339(),
+                        }),
+                    );
+                    record.metadata_json = Some(serde_json::Value::Object(metadata).to_string());
+                    session_kernel
+                        .update_stored_session(record)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+        }
 
         if self.runtime.has_active_session(session_id) {
             self.resource_lifecycle.register(session_id).await;
@@ -285,6 +345,12 @@ impl UnifiedSessionManager {
             "source".to_string(),
             serde_json::Value::String(platform.clone()),
         );
+        if let Some(owner) = request.owner_principal_id.as_ref() {
+            metadata.insert(
+                "owner_principal_id".to_string(),
+                serde_json::Value::String(owner.clone()),
+            );
+        }
         metadata.insert(
             "workspace_root".to_string(),
             serde_json::Value::String(
@@ -575,6 +641,25 @@ mod tests {
     use crate::gateway::ActiveSessions;
     use crate::session_kernel::SessionKernel;
     use crate::session_lifecycle_kernel::SessionLifecycleKernel;
+    use model_protocol::provider_config::{ProviderConfig, ProvidersConfig};
+
+    fn test_provider_registry() -> Arc<runtime::ProviderRegistry> {
+        Arc::new(
+            runtime::ProviderRegistry::new(ProvidersConfig {
+                providers: HashMap::from([(
+                    "test".to_string(),
+                    ProviderConfig {
+                        name: "test".to_string(),
+                        base_url: "http://127.0.0.1:9/v1".to_string(),
+                        api_key: "test".to_string(),
+                        models: vec![crate::DEFAULT_MODEL.to_string(), "test-model".to_string()],
+                        protocol: Some("completions".to_string()),
+                    },
+                )]),
+            })
+            .expect("valid inert test provider registry"),
+        )
+    }
 
     fn test_manager(
         max_active_sessions: usize,
@@ -618,7 +703,7 @@ mod tests {
                 session_kernel,
                 lifecycle_kernel,
                 std::time::Instant::now(),
-                Arc::new(runtime::ProviderRegistry::empty()),
+                test_provider_registry(),
                 Arc::new(runtime::UpgradeCoordinator::new()),
                 runtime_services,
             )
@@ -695,11 +780,107 @@ mod tests {
         }
         assert_eq!(created, 1);
         assert_eq!(active.list(), vec!["session-concurrent".to_string()]);
-        assert!(store
-            .get_session("session-concurrent")
+        assert!(
+            store
+                .get_session("session-concurrent")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_owner_is_rejected_before_runtime_or_lifecycle_activation() {
+        let (manager, store, active, lifecycle) = test_manager(8);
+        let mut owner_request = EnsureSessionRequest::new(
+            "session-owned",
+            Some("test-model".to_string()),
+            SessionSource::Tui,
+        );
+        owner_request.owner_principal_id = Some("principal-a".to_string());
+        manager.ensure_session(owner_request).await.unwrap();
+        assert!(manager.unload_runtime("session-owned").await);
+        assert!(active.get("session-owned").is_none());
+        assert!(lifecycle.check_session("session-owned").await.is_none());
+
+        let mut foreign_request =
+            EnsureSessionRequest::new("session-owned", None, SessionSource::MissionControl);
+        foreign_request.owner_principal_id = Some("principal-b".to_string());
+        let error = manager.ensure_session(foreign_request).await.unwrap_err();
+
+        assert!(error.contains("owned by another"), "{error}");
+        assert!(active.get("session-owned").is_none());
+        assert!(lifecycle.check_session("session-owned").await.is_none());
+        let record = store
+            .get_session("session-owned")
             .await
             .unwrap()
-            .is_some());
+            .expect("owned durable record");
+        assert_eq!(
+            record
+                .metadata_json
+                .as_deref()
+                .and_then(|metadata| serde_json::from_str::<serde_json::Value>(metadata).ok())
+                .and_then(|metadata| metadata["owner_principal_id"].as_str().map(str::to_string))
+                .as_deref(),
+            Some("principal-a")
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_ownerless_session_requires_privileged_audited_migration() {
+        let (manager, store, active, lifecycle) = test_manager(8);
+        manager
+            .ensure_session(EnsureSessionRequest::new(
+                "session-legacy-ownerless",
+                Some("test-model".to_string()),
+                SessionSource::WebUi,
+            ))
+            .await
+            .expect("legacy record fixture");
+        assert!(manager.unload_runtime("session-legacy-ownerless").await);
+
+        let mut ordinary =
+            EnsureSessionRequest::new("session-legacy-ownerless", None, SessionSource::Tui);
+        ordinary.owner_principal_id = Some("ordinary-principal".to_string());
+        let error = manager.ensure_session(ordinary).await.unwrap_err();
+        assert!(
+            error.contains("requires privileged owner migration"),
+            "{error}"
+        );
+        assert!(active.get("session-legacy-ownerless").is_none());
+        assert!(
+            lifecycle
+                .check_session("session-legacy-ownerless")
+                .await
+                .is_none()
+        );
+
+        let mut privileged =
+            EnsureSessionRequest::new("session-legacy-ownerless", None, SessionSource::Tui);
+        privileged.owner_principal_id = Some("manager-principal".to_string());
+        privileged.allow_legacy_owner_migration = true;
+        manager
+            .ensure_session(privileged)
+            .await
+            .expect("privileged migration succeeds");
+        let record = store
+            .get_session("session-legacy-ownerless")
+            .await
+            .unwrap()
+            .expect("migrated record");
+        let metadata: serde_json::Value =
+            serde_json::from_str(record.metadata_json.as_deref().expect("metadata"))
+                .expect("metadata json");
+        assert_eq!(metadata["owner_principal_id"], "manager-principal");
+        assert_eq!(
+            metadata["owner_migration"]["kind"],
+            "privileged_legacy_claim_v1"
+        );
+        assert_eq!(
+            metadata["owner_migration"]["claimed_by"],
+            "manager-principal"
+        );
     }
 
     #[tokio::test]
@@ -725,11 +906,13 @@ mod tests {
 
         assert!(error.contains("sessions limit"), "{error}");
         assert!(active.get("session-activation-failure").is_none());
-        assert!(store
-            .get_session("session-activation-failure")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .get_session("session-activation-failure")
+                .await
+                .unwrap()
+                .is_none()
+        );
         let records = store
             .claim_session_mission_outbox(
                 manager.runtime().runtime_services().workspace_key(),
@@ -814,11 +997,13 @@ mod tests {
             .unwrap();
         assert!(manager.unload_runtime("session-recover").await);
         assert!(active.get("session-recover").is_none());
-        assert!(store
-            .get_session("session-recover")
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            store
+                .get_session("session-recover")
+                .await
+                .unwrap()
+                .is_some()
+        );
 
         let outcome = manager
             .ensure_session(EnsureSessionRequest::new(
@@ -893,15 +1078,17 @@ mod tests {
             lifecycle.check_session("session-durable").await,
             Some(runtime::session_lifecycle::SessionStatus::Active)
         );
-        assert!(manager
-            .ensure_session(EnsureSessionRequest::new(
-                "session-over-limit",
-                None,
-                SessionSource::WebUi,
-            ))
-            .await
-            .unwrap_err()
-            .contains("active session limit"));
+        assert!(
+            manager
+                .ensure_session(EnsureSessionRequest::new(
+                    "session-over-limit",
+                    None,
+                    SessionSource::WebUi,
+                ))
+                .await
+                .unwrap_err()
+                .contains("active session limit")
+        );
     }
 
     #[tokio::test]
@@ -946,11 +1133,13 @@ mod tests {
 
         assert_eq!(manager.run_resource_cleanup().await, 1);
         assert!(active.get("session-idle-cleanup").is_none());
-        assert!(store
-            .get_session("session-idle-cleanup")
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            store
+                .get_session("session-idle-cleanup")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]

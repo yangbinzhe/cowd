@@ -1,13 +1,24 @@
-use crate::tui::TuiSession;
-use crate::reporter::TestRunner;
 use crate::llm;
+use crate::reporter::TestRunner;
+use crate::tui::{TuiLaunchConfig, TuiSession};
 
 pub fn has_scenario(name: &str) -> bool {
-    matches!(name, "tui_whichkey" | "tui_cmd_palette" | "tui_history" | "tui_toast" | "tui_fork_export" | "tui_multi_input" | "tui_interact" | "" | "all")
+    matches!(
+        name,
+        "tui_whichkey"
+            | "tui_cmd_palette"
+            | "tui_history"
+            | "tui_toast"
+            | "tui_fork_export"
+            | "tui_multi_input"
+            | "tui_interact"
+            | ""
+            | "all"
+    )
 }
 
 pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
-    let tui = TuiSession::new("tui-interact")?;
+    let tui = TuiSession::new(TuiLaunchConfig::from_env("tui-interact")?)?;
     tui.wait_until_ready(15)?;
     println!("\n── TUI Interact ──");
 
@@ -24,20 +35,24 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
     });
 
     runner.run("Command Palette Ctrl+P", || {
-        tui.send_ctrl('p')?; std::thread::sleep(std::time::Duration::from_millis(300));
+        tui.send_ctrl('p')?;
+        std::thread::sleep(std::time::Duration::from_millis(300));
         tui.send_key("Escape")?;
         Ok(())
     });
 
     runner.run("Input history Alt+Up", || {
-        tui.send("test history")?; tui.enter()?;
+        tui.send("test history")?;
+        tui.enter()?;
         tui.wait_for("history", 3)?;
-        tui.send_alt("Up")?; std::thread::sleep(std::time::Duration::from_millis(300));
+        tui.send_alt("Up")?;
+        std::thread::sleep(std::time::Duration::from_millis(300));
         Ok(())
     });
 
     runner.run("Toast via Ctrl+Y", || {
-        tui.send_ctrl('y')?; std::thread::sleep(std::time::Duration::from_millis(300));
+        tui.send_ctrl('y')?;
+        std::thread::sleep(std::time::Duration::from_millis(300));
         Ok(())
     });
 

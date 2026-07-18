@@ -15,7 +15,7 @@ use harness_contract::{
 
 use super::*;
 use crate::execution_core::RuntimeCompileTarget;
-use crate::runtime_event_store::RuntimeEventStore;
+use crate::runtime_event_store::{RuntimeEventInput, RuntimeEventScope, RuntimeEventStore};
 use tokio::sync::Notify;
 
 struct TestExecutor {
@@ -115,6 +115,15 @@ struct ReplanRaceExecutor {
     release_poll: Notify,
 }
 
+struct CancelNestedRunnerExecutor {
+    runner: OnceLock<ExecutionGraphRunner>,
+    poll_entered: Notify,
+    release_poll: Notify,
+    cancel_entered: Notify,
+    release_cancel: Notify,
+    nested_completed: AtomicBool,
+}
+
 struct PostCommitExecutor {
     after_commits: AtomicUsize,
     invalid_domain_event: bool,
@@ -172,6 +181,62 @@ impl NodeExecutor for ReentrantRunnerExecutor {
                 reason: error.to_string(),
             })?;
         Ok(NodeExecutionOutcome::new(completed_result(&ticket.node_id)))
+    }
+}
+
+#[async_trait]
+impl NodeExecutor for CancelNestedRunnerExecutor {
+    fn kind(&self) -> &str {
+        "cancel_nested_runner"
+    }
+
+    fn supports_resumable_pause(&self) -> bool {
+        false
+    }
+
+    fn validate(&self, _node: &ExecutionNodeSpec) -> Result<(), NodeExecutorError> {
+        Ok(())
+    }
+
+    async fn start(
+        &self,
+        context: NodeExecutionContext,
+    ) -> Result<NodeExecutionTicket, NodeExecutorError> {
+        Ok(NodeExecutionTicket {
+            graph_id: context.graph.id.clone(),
+            node_id: context.node.id.clone(),
+            executor_kind: self.kind().to_string(),
+            attempt: context.attempt,
+            idempotency_key: format!("{}:cancel-nested", context.node.idempotency_key),
+            payload_ref: context.node.payload_ref.clone(),
+        })
+    }
+
+    async fn poll_or_await(
+        &self,
+        ticket: &NodeExecutionTicket,
+    ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+        self.poll_entered.notify_one();
+        self.release_poll.notified().await;
+        Ok(NodeExecutionOutcome::new(completed_result(&ticket.node_id)))
+    }
+
+    async fn cancel(&self, ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
+        self.runner
+            .get()
+            .expect("runner is installed for nested cancellation")
+            .start(ExecutionGraph::new(
+                "nested graph during parent cancellation",
+            ))
+            .await
+            .map_err(|error| NodeExecutorError::Cancel {
+                node_id: ticket.node_id.clone(),
+                reason: error.to_string(),
+            })?;
+        self.nested_completed.store(true, Ordering::SeqCst);
+        self.cancel_entered.notify_one();
+        self.release_cancel.notified().await;
+        Ok(())
     }
 }
 
@@ -658,10 +723,12 @@ fn conversation_compile_targets_have_distinct_initial_dags_and_constraints() {
     assert_eq!(inline.nodes.len(), 1);
     assert_eq!(evidence.nodes.len(), 2);
     assert_eq!(execution.nodes.len(), 3);
-    assert!(evidence.nodes[0]
-        .acceptance
-        .criteria
-        .contains(&"evidence_read_before_synthesis".to_string()));
+    assert!(
+        evidence.nodes[0]
+            .acceptance
+            .criteria
+            .contains(&"evidence_read_before_synthesis".to_string())
+    );
     assert!(execution.nodes.iter().any(|node| {
         node.resource_scopes == ["write:src/lib.rs"]
             && node
@@ -787,6 +854,144 @@ async fn cancel_queued_during_start_commits_before_poll_and_prevents_side_effect
         state.load(&graph_id).unwrap().node_statuses["race"],
         ExecutionNodeStatus::Cancelled
     );
+}
+
+#[tokio::test]
+async fn aborted_cancel_releases_intent_and_nested_child_graph_can_progress() {
+    let (registry, state, commits) = harness();
+    let executor = Arc::new(CancelNestedRunnerExecutor {
+        runner: OnceLock::new(),
+        poll_entered: Notify::new(),
+        release_poll: Notify::new(),
+        cancel_entered: Notify::new(),
+        release_cancel: Notify::new(),
+        nested_completed: AtomicBool::new(false),
+    });
+    registry.register(executor.clone()).unwrap();
+    let runner = test_runner(registry, state.clone(), commits);
+    executor
+        .runner
+        .set(runner.clone())
+        .unwrap_or_else(|_| panic!("runner is installed once"));
+
+    let mut graph = ExecutionGraph::new("abort cancellation intent");
+    let mut candidate = node("cancel-probe");
+    candidate.executor_kind = executor.kind().to_string();
+    graph.nodes.push(candidate);
+    let graph_id = graph.id.clone();
+    let run = {
+        let runner = runner.clone();
+        tokio::spawn(async move { runner.start(graph).await })
+    };
+    executor.poll_entered.notified().await;
+    let running = state.load(&graph_id).unwrap();
+
+    let cancel = {
+        let runner = runner.clone();
+        let graph_id = graph_id.clone();
+        tokio::spawn(async move {
+            runner
+                .command(
+                    &graph_id,
+                    ExecutionGraphCommand::Cancel {
+                        expected_revision: running.revision,
+                        reason: "abort command future".to_string(),
+                    },
+                )
+                .await
+        })
+    };
+    executor.cancel_entered.notified().await;
+    assert!(
+        executor.nested_completed.load(Ordering::SeqCst),
+        "executor.cancel must advance a nested graph without the parent coordination lock"
+    );
+
+    // Make the parent result wait on the in-flight command intent, then abort
+    // that command. CommandIntentOwner::drop must wake the old waiter.
+    executor.release_poll.notify_one();
+    tokio::task::yield_now().await;
+    cancel.abort();
+    let _ = cancel.await;
+    tokio::time::timeout(Duration::from_secs(1), run)
+        .await
+        .expect("old intent waiter is released")
+        .expect("run task joins")
+        .expect("parent graph can finish after command abort");
+
+    let completed = state.load(&graph_id).unwrap();
+    assert_eq!(
+        completed.node_statuses["cancel-probe"],
+        ExecutionNodeStatus::Completed
+    );
+    let cancelled = tokio::time::timeout(
+        Duration::from_secs(1),
+        runner.command(
+            &graph_id,
+            ExecutionGraphCommand::Cancel {
+                expected_revision: completed.revision,
+                reason: "subsequent command".to_string(),
+            },
+        ),
+    )
+    .await
+    .expect("subsequent command is not stuck")
+    .expect("subsequent command is accepted");
+    assert_eq!(
+        cancelled.node_statuses["cancel-probe"],
+        ExecutionNodeStatus::Completed
+    );
+}
+
+#[tokio::test]
+async fn active_non_resumable_executor_rejects_pause_without_cancelling() {
+    let (registry, state, commits) = harness();
+    let executor = Arc::new(CancelNestedRunnerExecutor {
+        runner: OnceLock::new(),
+        poll_entered: Notify::new(),
+        release_poll: Notify::new(),
+        cancel_entered: Notify::new(),
+        release_cancel: Notify::new(),
+        nested_completed: AtomicBool::new(false),
+    });
+    registry.register(executor.clone()).unwrap();
+    let runner = test_runner(registry, state.clone(), commits);
+    executor
+        .runner
+        .set(runner.clone())
+        .unwrap_or_else(|_| panic!("runner is installed once"));
+
+    let mut graph = ExecutionGraph::new("non-resumable active pause");
+    let mut candidate = node("agent-like");
+    candidate.executor_kind = executor.kind().to_string();
+    graph.nodes.push(candidate);
+    let graph_id = graph.id.clone();
+    let run = {
+        let runner = runner.clone();
+        tokio::spawn(async move { runner.start(graph).await })
+    };
+    executor.poll_entered.notified().await;
+    let running = state.load(&graph_id).unwrap();
+    assert!(matches!(
+        runner
+            .command(
+                &graph_id,
+                ExecutionGraphCommand::Pause {
+                    expected_revision: running.revision,
+                    reason: "unsupported active pause".to_string(),
+                },
+            )
+            .await,
+        Err(ExecutionRunnerError::Commit(
+            ExecutionCommitError::InvalidCommand(_)
+        ))
+    ));
+    assert_eq!(
+        state.load(&graph_id).unwrap().node_statuses["agent-like"],
+        ExecutionNodeStatus::Running
+    );
+    executor.release_poll.notify_one();
+    run.await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -924,10 +1129,12 @@ fn terminal_replan_is_one_transaction_and_survives_projection_restart() {
         projected.node_statuses["tool"],
         ExecutionNodeStatus::Planned
     );
-    assert!(projected
-        .nodes
-        .iter()
-        .any(|candidate| candidate.id == "tool"));
+    assert!(
+        projected
+            .nodes
+            .iter()
+            .any(|candidate| candidate.id == "tool")
+    );
 }
 
 #[tokio::test]
@@ -972,10 +1179,12 @@ async fn cancel_wins_over_inflight_dynamic_replan_without_partial_graph_mutation
         projected.node_statuses["model"],
         ExecutionNodeStatus::Cancelled
     );
-    assert!(!projected
-        .nodes
-        .iter()
-        .any(|candidate| candidate.id == "late-tool"));
+    assert!(
+        !projected
+            .nodes
+            .iter()
+            .any(|candidate| candidate.id == "late-tool")
+    );
 }
 
 #[tokio::test]
@@ -1468,11 +1677,13 @@ async fn restart_replays_completed_effect_receipt_without_provider_or_tool_reexe
         .await
         .unwrap();
 
-    assert!(executor
-        .calls
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .is_empty());
+    assert!(
+        executor
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    );
     assert_eq!(
         state.load(&graph_id).unwrap().node_statuses["durable"],
         ExecutionNodeStatus::Completed
@@ -1538,11 +1749,13 @@ async fn restart_blocks_inflight_effect_without_receipt_as_typed_uncertain() {
             .kind,
         "effect_completion_uncertain"
     );
-    assert!(executor
-        .calls
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .is_empty());
+    assert!(
+        executor
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -1614,11 +1827,13 @@ async fn post_commit_callback_never_holds_graph_coordination_lock() {
     release.notify_one();
     let report = run.await.unwrap().unwrap();
     assert!(report.completed >= 1);
-    assert!(state
-        .load(&graph_id)
-        .unwrap()
-        .node_statuses
-        .contains_key("successor"));
+    assert!(
+        state
+            .load(&graph_id)
+            .unwrap()
+            .node_statuses
+            .contains_key("successor")
+    );
 }
 
 #[tokio::test]
@@ -1807,5 +2022,40 @@ async fn verify_satisfied_evidence_allows_exactly_one_terminal_synthesis() {
             .terminal_result_ref
             .as_deref(),
         Some(format!("terminal:{}", graph.id).as_str())
+    );
+}
+
+#[test]
+fn graph_enumeration_excludes_legacy_non_graph_execution_scope_streams() {
+    let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("event store"));
+    let commits = ExecutionCommitService::new(Arc::clone(&event_store));
+    let mut graph = ExecutionGraph::new("canonical graph");
+    graph.nodes.push(node("canonical"));
+    let graph = commits
+        .register_graph(graph)
+        .expect("graph registers")
+        .graph;
+    event_store
+        .append(RuntimeEventInput {
+            stream_id: "session:legacy-strategy".to_string(),
+            scope: RuntimeEventScope::ExecutionGraph,
+            kind: "runtime.strategy.selected".to_string(),
+            status: Some("running".to_string()),
+            actor: Some("legacy".to_string()),
+            refs: Vec::new(),
+            payload: serde_json::json!({"decision_id": "legacy"}),
+        })
+        .expect("legacy event records");
+
+    let state = ExecutionGraphStateStore::new(event_store);
+    assert_eq!(
+        state.graph_ids().expect("graph ids"),
+        vec![graph.id.clone()]
+    );
+    assert_eq!(
+        state
+            .nonterminal_graph_ids()
+            .expect("nonterminal graph ids"),
+        vec![graph.id]
     );
 }

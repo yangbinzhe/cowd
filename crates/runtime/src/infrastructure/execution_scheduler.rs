@@ -52,6 +52,7 @@ pub async fn acquire_process_tool_permit() -> Result<OwnedSemaphorePermit, Strin
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionBatchMode {
     ParallelRead,
+    SerialStrategy,
     LimitedWrite,
     LimitedNetwork,
     SerialDestructive,
@@ -266,14 +267,40 @@ pub fn schedule_tool_requests_for_decision(
 pub fn schedule_tool_execution_plan_for_decision(
     requests: &[ToolRequest],
     plan: &ToolExecutionPlan,
-    _decision: &RuntimeExecutionDecision,
+    decision: &RuntimeExecutionDecision,
 ) -> ToolSchedule {
-    // A strategy's Parallel modifier is a planning preference, not a safety
-    // switch.  Independent, read-only calls are already safe to run in
-    // parallel; requiring the modifier made ordinary multi-read model turns
-    // serial for no safety benefit. Dependencies, safety category and scope
-    // policy below remain the authority for every side effect.
-    schedule_tool_execution_plan(requests, plan)
+    if decision.strategy.selected_candidate
+        == harness_contract::strategy::ExecutionCandidateKind::Direct
+    {
+        let id_to_index = requests
+            .iter()
+            .enumerate()
+            .map(|(index, request)| (request.tool_use_id.as_str(), index))
+            .collect::<BTreeMap<_, _>>();
+        let mut depths = HashMap::new();
+        let mut serial_waves = BTreeMap::<usize, Vec<usize>>::new();
+        for index in 0..requests.len() {
+            let depth =
+                task_dependency_depth(index, plan, &id_to_index, &mut depths, &mut BTreeSet::new());
+            serial_waves.entry(depth).or_default().push(index);
+        }
+        let mut batches = Vec::new();
+        for (depth, indices) in serial_waves {
+            push_batch(
+                &mut batches,
+                ExecutionBatchMode::SerialStrategy,
+                indices,
+                1,
+                &format!(
+                    "Direct strategy executes dependency depth {depth} serially in model order"
+                ),
+                requests,
+            );
+        }
+        ToolSchedule { batches }
+    } else {
+        schedule_tool_execution_plan(requests, plan)
+    }
 }
 
 fn push_batch(
@@ -356,6 +383,11 @@ mod tests {
     fn decision_with_modifiers(modifiers: &[ExecutionModifier]) -> RuntimeExecutionDecision {
         let mut decision = build_runtime_execution_decision("explain this function", None);
         decision.strategy.modifiers = modifiers.to_vec();
+        decision.strategy.selected_candidate = if modifiers.contains(&ExecutionModifier::Parallel) {
+            harness_contract::strategy::ExecutionCandidateKind::ParallelTools
+        } else {
+            harness_contract::strategy::ExecutionCandidateKind::Direct
+        };
         decision
     }
 
@@ -497,7 +529,7 @@ mod tests {
     }
 
     #[test]
-    fn decision_scheduler_parallelizes_independent_reads_without_parallel_modifier() {
+    fn decision_scheduler_serializes_every_tool_for_direct_candidate() {
         let requests = [
             request(
                 "write-1",
@@ -512,14 +544,14 @@ mod tests {
 
         let schedule = schedule_tool_requests_for_decision(&requests, &decision);
 
-        assert_eq!(schedule.batches.len(), 4);
+        assert_eq!(schedule.batches.len(), 1);
         assert_eq!(
             schedule
                 .batches
                 .iter()
                 .map(|batch| batch.indices.clone())
                 .collect::<Vec<_>>(),
-            vec![vec![1], vec![2], vec![0], vec![3]]
+            vec![vec![0, 1, 2, 3]]
         );
         assert_eq!(
             schedule
@@ -527,17 +559,9 @@ mod tests {
                 .iter()
                 .map(|batch| batch.mode)
                 .collect::<Vec<_>>(),
-            vec![
-                ExecutionBatchMode::ParallelRead,
-                ExecutionBatchMode::LimitedNetwork,
-                ExecutionBatchMode::LimitedWrite,
-                ExecutionBatchMode::SerialDestructive,
-            ]
+            vec![ExecutionBatchMode::SerialStrategy]
         );
-        assert_eq!(
-            schedule.batches[0].max_concurrency,
-            DEFAULT_PARALLEL_READ_CONCURRENCY
-        );
+        assert_eq!(schedule.batches[0].max_concurrency, 1);
     }
 
     #[test]
@@ -568,12 +592,69 @@ mod tests {
         assert_eq!(schedule.batches[2].indices, vec![0]);
     }
 
+    #[test]
+    fn direct_candidate_topologically_orders_forward_dependencies_without_parallelism() {
+        let mut dependent = request(
+            "write",
+            "write_file",
+            r#"{"path":"src/lib.rs","content":"x"}"#,
+        );
+        dependent.depends_on.push("read".to_string());
+        let requests = [
+            dependent,
+            request("read", "read_file", r#"{"path":"src/lib.rs"}"#),
+        ];
+        let decision = decision_with_modifiers(&[]);
+
+        let schedule = schedule_tool_requests_for_decision(&requests, &decision);
+
+        assert_eq!(
+            schedule
+                .batches
+                .iter()
+                .map(|batch| batch.indices.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![1], vec![0]]
+        );
+        assert!(schedule
+            .batches
+            .iter()
+            .all(|batch| batch.mode == ExecutionBatchMode::SerialStrategy
+                && batch.max_concurrency == 1));
+    }
+
+    #[test]
+    fn direct_candidate_keeps_unknown_or_cyclic_dependencies_serial_and_total() {
+        let mut unknown = request("unknown", "read_file", r#"{"path":"a"}"#);
+        unknown.depends_on.push("missing".to_string());
+        let mut left = request("left", "read_file", r#"{"path":"b"}"#);
+        left.depends_on.push("right".to_string());
+        let mut right = request("right", "read_file", r#"{"path":"c"}"#);
+        right.depends_on.push("left".to_string());
+        let requests = [unknown, left, right];
+        let decision = decision_with_modifiers(&[]);
+
+        let schedule = schedule_tool_requests_for_decision(&requests, &decision);
+        let mut indices = schedule
+            .batches
+            .iter()
+            .flat_map(|batch| batch.indices.iter().copied())
+            .collect::<Vec<_>>();
+        indices.sort_unstable();
+
+        assert_eq!(indices, vec![0, 1, 2]);
+        assert!(schedule
+            .batches
+            .iter()
+            .all(|batch| batch.max_concurrency == 1));
+    }
+
     #[tokio::test]
     async fn dozens_of_ordinary_reads_run_in_one_bounded_wave_and_keep_model_order() {
         let requests = (0..40)
             .map(|index| request(&format!("read-{index}"), "read_file", "{}"))
             .collect::<Vec<_>>();
-        let decision = decision_with_modifiers(&[]);
+        let decision = decision_with_modifiers(&[ExecutionModifier::Parallel]);
         let schedule = schedule_tool_requests_for_decision(&requests, &decision);
         let batch = schedule.batches.first().expect("parallel read batch");
         assert_eq!(batch.mode, ExecutionBatchMode::ParallelRead);

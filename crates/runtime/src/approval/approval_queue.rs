@@ -22,6 +22,9 @@ pub enum ApprovalSourceKind {
     Steward,
     /// A Runtime-governed release decision for an evolution candidate.
     Evolution,
+    /// A typed MFG business review. ApprovalQueue stores only the correlated
+    /// approval fact; app-mfg remains the review/effect state owner.
+    Mfg,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,6 +34,10 @@ pub struct ApprovalSource {
     pub agent_id: Option<String>,
     pub team_id: Option<String>,
     pub mission_id: Option<String>,
+    #[serde(default)]
+    pub resource_ref: Option<String>,
+    #[serde(default)]
+    pub review_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,8 +222,17 @@ impl ApprovalQueue {
         // EvolutionGovernanceService. Letting this generic queue decide the
         // approval would leave a release review approved without its matching
         // Runtime release assignment.
-        if request.source.kind == ApprovalSourceKind::Evolution {
-            return Err("evolution_release_requires_typed_decision_service".to_string());
+        if matches!(
+            request.source.kind,
+            ApprovalSourceKind::Evolution | ApprovalSourceKind::Mfg
+        ) {
+            return Err(match request.source.kind {
+                ApprovalSourceKind::Evolution => {
+                    "evolution_release_requires_typed_decision_service".to_string()
+                }
+                ApprovalSourceKind::Mfg => "mfg_review_requires_typed_decision_service".to_string(),
+                _ => unreachable!(),
+            });
         }
         if request.status != GlobalApprovalStatus::Pending {
             return Ok(GlobalApprovalDecisionReceipt {
@@ -269,6 +285,100 @@ impl ApprovalQueue {
                 .into()],
             )
             .map_err(|e| e.to_string())?;
+        request.status = next_status;
+        request.resolved_at_ms = Some(resolved_at_ms);
+        Ok(receipt)
+    }
+
+    /// Record a decision already authorized by the typed MFG review service.
+    ///
+    /// The caller must first persist the MFG decision intent and consume its
+    /// one-time decision lease. This method verifies the Approval correlation
+    /// before appending the generic decision fact, and never owns MFG effect
+    /// or terminal state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_mfg_decision_fact(
+        &self,
+        approval_id: &str,
+        review_ref: &str,
+        decided_by: &str,
+        approved: bool,
+        decision: &str,
+        reason: &str,
+        decision_lease_ref: &str,
+    ) -> Result<GlobalApprovalDecisionReceipt, String> {
+        if review_ref.trim().is_empty()
+            || decided_by.trim().is_empty()
+            || decision.trim().is_empty()
+            || decision_lease_ref.trim().is_empty()
+        {
+            return Err("mfg_typed_decision_fact_is_incomplete".to_string());
+        }
+        let mut requests = self
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let request = requests
+            .get_mut(approval_id)
+            .ok_or_else(|| format!("approval request not found: {approval_id}"))?;
+        if request.source.kind != ApprovalSourceKind::Mfg
+            || request.source.review_ref.as_deref() != Some(review_ref)
+        {
+            return Err("mfg_approval_correlation_mismatch".to_string());
+        }
+        let next_status = if approved {
+            GlobalApprovalStatus::Approved
+        } else {
+            GlobalApprovalStatus::Denied
+        };
+        if request.status != GlobalApprovalStatus::Pending {
+            if request.status == next_status {
+                return Ok(GlobalApprovalDecisionReceipt {
+                    approval_id: request.approval_id.clone(),
+                    status: request.status,
+                    route_back: request.source.clone(),
+                    message: format!("approval already {}", status_label(request.status)),
+                });
+            }
+            return Err("mfg_approval_decision_conflict".to_string());
+        }
+        let resolved_at_ms = now_ms();
+        let receipt = GlobalApprovalDecisionReceipt {
+            approval_id: request.approval_id.clone(),
+            status: next_status,
+            route_back: request.source.clone(),
+            message: format!("MFG {decision} recorded for review {review_ref} by {decided_by}"),
+        };
+        let stream_id = format!("approval:{}", request.approval_id);
+        let revision = self
+            .event_store
+            .stream_revision(&stream_id)
+            .map_err(|error| error.to_string())?;
+        self.event_store
+            .append_batch_if_revision(
+                stream_id.clone(),
+                revision,
+                format!("mfg-approval-decision:{review_ref}:{decision}"),
+                vec![RuntimeEventInput {
+                    stream_id,
+                    scope: RuntimeEventScope::Approval,
+                    kind: "approval.decided.mfg".to_string(),
+                    status: Some(next_status.as_str().to_string()),
+                    actor: Some(decided_by.to_string()),
+                    refs: approval_source_refs(&request.source),
+                    payload: serde_json::json!({
+                        "approved": approved,
+                        "decision": decision,
+                        "reason": reason,
+                        "review_ref": review_ref,
+                        "decision_lease_ref": decision_lease_ref,
+                        "message": receipt.message,
+                        "resolved_at_ms": resolved_at_ms,
+                    }),
+                }
+                .into()],
+            )
+            .map_err(|error| error.to_string())?;
         request.status = next_status;
         request.resolved_at_ms = Some(resolved_at_ms);
         Ok(receipt)
@@ -427,6 +537,18 @@ fn approval_source_refs(source: &ApprovalSource) -> Vec<RuntimeEventRef> {
             id: id.clone(),
         });
     }
+    if let Some(id) = &source.resource_ref {
+        refs.push(RuntimeEventRef {
+            kind: "resource".to_string(),
+            id: id.clone(),
+        });
+    }
+    if let Some(id) = &source.review_ref {
+        refs.push(RuntimeEventRef {
+            kind: "review".to_string(),
+            id: id.clone(),
+        });
+    }
     refs
 }
 
@@ -457,7 +579,7 @@ fn restore_requests(event_store: &RuntimeEventStore) -> BTreeMap<String, GlobalA
                     requests.insert(request.approval_id.clone(), request);
                 }
             }
-            "approval.decided" | "approval.timed_out" => {
+            "approval.decided" | "approval.decided.mfg" | "approval.timed_out" => {
                 let Some(approval_id) = event.stream_id.strip_prefix("approval:") else {
                     continue;
                 };
@@ -503,6 +625,8 @@ mod tests {
             agent_id: None,
             team_id: None,
             mission_id: None,
+            resource_ref: None,
+            review_ref: None,
         }
     }
 
@@ -605,6 +729,62 @@ mod tests {
             .expect("timeout alternative");
         assert_eq!(receipt.status, GlobalApprovalStatus::TimedOut);
         assert!(receipt.message.contains("alternative"));
+    }
+
+    #[test]
+    fn mfg_source_rejects_generic_decision_and_accepts_only_typed_correlated_fact() {
+        let queue = queue();
+        let request = queue
+            .submit_scoped(
+                "mfg-approval:review-1",
+                SubmitGlobalApprovalRequest {
+                    source: ApprovalSource {
+                        kind: ApprovalSourceKind::Mfg,
+                        session_id: None,
+                        agent_id: None,
+                        team_id: None,
+                        mission_id: None,
+                        resource_ref: Some("mfg:cockpit-report:report-1".to_string()),
+                        review_ref: Some("review-1".to_string()),
+                    },
+                    action: "mfg.report.review.typed_decision".to_string(),
+                    summary: "review failed report delivery".to_string(),
+                    risk: TaskRisk::High,
+                    evidence_refs: vec!["digest:dead-letter".to_string()],
+                    timeout_policy: ApprovalTimeoutPolicy::Pending,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            queue
+                .decide(
+                    &crate::security::test_human_interactive_principal(),
+                    ApprovalDecisionCommand {
+                        approval_id: request.approval_id.clone(),
+                        approved: true,
+                        reason: "generic bypass".to_string(),
+                    },
+                )
+                .unwrap_err(),
+            "mfg_review_requires_typed_decision_service"
+        );
+        let receipt = queue
+            .record_mfg_decision_fact(
+                &request.approval_id,
+                "review-1",
+                "principal:reviewer",
+                true,
+                "force_retry",
+                "reviewed",
+                "lease:review-1",
+            )
+            .unwrap();
+        assert_eq!(receipt.status, GlobalApprovalStatus::Approved);
+        queue.refresh();
+        assert_eq!(
+            queue.get(&request.approval_id).unwrap().status,
+            GlobalApprovalStatus::Approved
+        );
     }
 
     #[test]

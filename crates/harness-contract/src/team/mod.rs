@@ -18,8 +18,10 @@ pub use definition::{
     TeamTemplateRevision, TeamTemplateRevisionRef, TeamTopologyContract,
 };
 pub use instantiation::{
-    FocusPartitionPlan, FocusPartitionSlot, TeamInstantiationRequest, TeamRoleBindingOverride,
-    TeamRoleCardinalityOverride, TeamSelectionMode, TeamTemplateSelector,
+    focus_scope_hash, FocusPartitionPlan, FocusPartitionSlot, TeamAcceptanceCheck,
+    TeamAcceptanceRequirement, TeamInstantiationRequest, TeamRoleBindingOverride,
+    TeamRoleCardinalityOverride, TeamSelectionMode, TeamStrategyBinding, TeamStructuredOutputField,
+    TeamTemplateSelector,
 };
 
 /// A graph-derived role trace exposed to projections. It is not an executable

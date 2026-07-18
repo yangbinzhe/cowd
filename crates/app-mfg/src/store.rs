@@ -1,6 +1,10 @@
 use std::path::Path;
 
 use crate::repository::{MfgHealth, MfgMetricRecomputeResult, MfgRepository, MfgRepositoryError};
+use app_mfg_contract::{
+    MfgReportDeliveryReview, MfgReportDeliveryReviewDecision, MfgReportDeliveryReviewEffect,
+    MfgReportDeliveryReviewRerouteTarget,
+};
 use matrix_core::{
     MatrixAttentionItem, MatrixChangeEvent, MatrixEntity, MatrixEvidencePacket, MatrixFact,
     MatrixMetricDefinition, MatrixOntologyPack, MatrixQualityGateDecision, MatrixSourcePack,
@@ -12,8 +16,8 @@ use crate::{
     MfgAssignmentCommandInput, MfgCasePromotion, MfgCockpitProfile, MfgCockpitProjection,
     MfgCockpitReportDeliveryReceipt, MfgCockpitReportRequest, MfgCockpitReportSnapshot,
     MfgCockpitWidgetProjection, MfgCommandReceipt, MfgCrossPlaneBridgeReceipt, MfgDomainSeedResult,
-    MfgForecastProjection, MfgIncident, MfgLiveProjection, MfgMemoryCase, MfgOperationalAnalysis,
-    MfgPlaybook, MfgSkillRun, MfgWorkflowGraph,
+    MfgForecastProjection, MfgIncident, MfgLiveDeltaRead, MfgLiveEpoch, MfgLiveSnapshotRead,
+    MfgMemoryCase, MfgOperationalAnalysis, MfgPlaybook, MfgSkillRun, MfgWorkflowGraph,
 };
 
 /// Application-layer store facade for MFG.
@@ -123,6 +127,16 @@ impl MfgStore {
         self.repository.build_evidence_packet(attention_id, title)
     }
 
+    pub fn build_evidence_packet_idempotent(
+        &self,
+        packet_id: &str,
+        attention_id: Option<&str>,
+        title: Option<&str>,
+    ) -> Result<MatrixEvidencePacket, MfgRepositoryError> {
+        self.repository
+            .build_evidence_packet_idempotent(packet_id, attention_id, title)
+    }
+
     pub fn evaluate_evidence_quality(
         &self,
         packet_id: &str,
@@ -155,6 +169,15 @@ impl MfgStore {
         self.repository.analyze_incident(incident_id)
     }
 
+    pub fn analyze_incident_idempotent(
+        &self,
+        incident_id: &str,
+        analysis_id: &str,
+    ) -> Result<MfgOperationalAnalysis, MfgRepositoryError> {
+        self.repository
+            .analyze_incident_idempotent(incident_id, analysis_id)
+    }
+
     pub fn latest_analysis_for_incident(
         &self,
         incident_id: &str,
@@ -177,6 +200,31 @@ impl MfgStore {
     ) -> Result<MfgActionExecution, MfgRepositoryError> {
         self.repository
             .execute_recommended_action(analysis_id, action_id, request)
+    }
+
+    pub fn preview_recommended_action(
+        &self,
+        analysis_id: &str,
+        action_id: &str,
+        request: &MfgActionExecutionRequest,
+    ) -> Result<MfgActionExecution, MfgRepositoryError> {
+        self.repository
+            .preview_recommended_action(analysis_id, action_id, request)
+    }
+
+    pub fn execute_recommended_action_idempotent(
+        &self,
+        analysis_id: &str,
+        action_id: &str,
+        execution_id: &str,
+        request: &MfgActionExecutionRequest,
+    ) -> Result<MfgActionExecution, MfgRepositoryError> {
+        self.repository.execute_recommended_action_idempotent(
+            analysis_id,
+            action_id,
+            execution_id,
+            request,
+        )
     }
 
     pub fn get_execution(
@@ -272,8 +320,9 @@ impl MfgStore {
     pub fn upsert_playbook(
         &self,
         playbook: &MfgPlaybook,
+        expected_revision: Option<u64>,
     ) -> Result<MfgPlaybook, MfgRepositoryError> {
-        self.repository.upsert_playbook(playbook)
+        self.repository.upsert_playbook(playbook, expected_revision)
     }
 
     pub fn get_playbook(
@@ -376,6 +425,16 @@ impl MfgStore {
         self.repository.generate_cockpit_report(profile_id, request)
     }
 
+    pub fn generate_cockpit_report_idempotent(
+        &self,
+        profile_id: &str,
+        report_id: &str,
+        request: MfgCockpitReportRequest,
+    ) -> Result<MfgCockpitReportSnapshot, MfgRepositoryError> {
+        self.repository
+            .generate_cockpit_report_idempotent(profile_id, report_id, request)
+    }
+
     pub fn get_cockpit_report(
         &self,
         report_id: &str,
@@ -398,6 +457,138 @@ impl MfgStore {
     ) -> Result<MfgCockpitReportSnapshot, MfgRepositoryError> {
         self.repository
             .attach_cockpit_report_delivery(report_id, receipt)
+    }
+
+    pub fn create_report_delivery_review(
+        &self,
+        report: &MfgCockpitReportSnapshot,
+        expected_report_revision: u64,
+        requester_principal: &str,
+        reason: &str,
+        evidence_refs: Vec<String>,
+        idempotency_key: &str,
+    ) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+        self.repository.create_report_delivery_review(
+            report,
+            expected_report_revision,
+            requester_principal,
+            reason,
+            evidence_refs,
+            idempotency_key,
+        )
+    }
+
+    pub fn bind_report_delivery_review_approval(
+        &self,
+        review_id: &str,
+        expected_revision: u64,
+        approval_id: &str,
+        actor_principal: &str,
+        idempotency_key: &str,
+    ) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+        self.repository.bind_report_delivery_review_approval(
+            review_id,
+            expected_revision,
+            approval_id,
+            actor_principal,
+            idempotency_key,
+        )
+    }
+
+    pub fn get_report_delivery_review(
+        &self,
+        review_id: &str,
+    ) -> Result<Option<MfgReportDeliveryReview>, MfgRepositoryError> {
+        self.repository.get_report_delivery_review(review_id)
+    }
+
+    pub fn report_delivery_review_by_transition_key(
+        &self,
+        review_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<MfgReportDeliveryReview>, MfgRepositoryError> {
+        self.repository
+            .report_delivery_review_by_transition_key(review_id, idempotency_key)
+    }
+
+    pub fn list_report_delivery_reviews(
+        &self,
+        report_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MfgReportDeliveryReview>, MfgRepositoryError> {
+        self.repository
+            .list_report_delivery_reviews(report_id, limit)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_report_delivery_review_decision(
+        &self,
+        review_id: &str,
+        expected_revision: u64,
+        decision: MfgReportDeliveryReviewDecision,
+        reviewer_principal: &str,
+        reason: &str,
+        evidence_refs: Vec<String>,
+        reroute: Option<MfgReportDeliveryReviewRerouteTarget>,
+        decision_lease_ref: &str,
+        idempotency_key: &str,
+    ) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+        self.repository.prepare_report_delivery_review_decision(
+            review_id,
+            expected_revision,
+            decision,
+            reviewer_principal,
+            reason,
+            evidence_refs,
+            reroute,
+            decision_lease_ref,
+            idempotency_key,
+        )
+    }
+
+    pub fn activate_report_delivery_review_decision(
+        &self,
+        review_id: &str,
+        expected_revision: u64,
+        actor_principal: &str,
+        idempotency_key: &str,
+    ) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+        self.repository.activate_report_delivery_review_decision(
+            review_id,
+            expected_revision,
+            actor_principal,
+            idempotency_key,
+        )
+    }
+
+    pub fn claim_report_delivery_review_effects(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<MfgReportDeliveryReviewEffect>, MfgRepositoryError> {
+        self.repository.claim_report_delivery_review_effects(limit)
+    }
+
+    pub fn complete_report_delivery_review_effect(
+        &self,
+        effect_key: &str,
+        receipt_ref: &str,
+        actor_principal: &str,
+    ) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+        self.repository.complete_report_delivery_review_effect(
+            effect_key,
+            receipt_ref,
+            actor_principal,
+        )
+    }
+
+    pub fn fail_report_delivery_review_effect(
+        &self,
+        effect_key: &str,
+        error: &str,
+        actor_principal: &str,
+    ) -> Result<MfgReportDeliveryReview, MfgRepositoryError> {
+        self.repository
+            .fail_report_delivery_review_effect(effect_key, error, actor_principal)
     }
 
     pub fn delete_cockpit_profile(
@@ -562,12 +753,39 @@ impl MfgStore {
         self.repository.command_assignment(assignment_id, command)
     }
 
-    pub fn live_projection(
+    pub fn reserve_assignment_completion(
         &self,
-        cursor: Option<u64>,
+        assignment_id: &str,
+        expected_revision: u64,
+        actor_ref: &str,
+        correlation_id: &str,
+    ) -> Result<MfgAssignment, MfgRepositoryError> {
+        self.repository.reserve_assignment_completion(
+            assignment_id,
+            expected_revision,
+            actor_ref,
+            correlation_id,
+        )
+    }
+
+    pub fn live_epoch(&self) -> Result<MfgLiveEpoch, MfgRepositoryError> {
+        self.repository.live_epoch()
+    }
+
+    pub fn rotate_live_epoch(&self, reason: &str) -> Result<MfgLiveEpoch, MfgRepositoryError> {
+        self.repository.rotate_live_epoch(reason)
+    }
+
+    pub fn live_snapshot_read(&self) -> Result<MfgLiveSnapshotRead, MfgRepositoryError> {
+        self.repository.live_snapshot_read()
+    }
+
+    pub fn live_delta_read(
+        &self,
+        cursor: u64,
         limit: usize,
-    ) -> Result<MfgLiveProjection, MfgRepositoryError> {
-        self.repository.live_projection(cursor, limit)
+    ) -> Result<MfgLiveDeltaRead, MfgRepositoryError> {
+        self.repository.live_delta_read(cursor, limit)
     }
 
     pub fn record_command_notifications(
@@ -577,6 +795,109 @@ impl MfgStore {
     ) -> Result<MfgCommandReceipt, MfgRepositoryError> {
         self.repository
             .record_command_notifications(idempotency_key, notification_refs)
+    }
+
+    pub fn command_notification_refs_for_resource(
+        &self,
+        resource_ref: &str,
+    ) -> Result<Vec<String>, MfgRepositoryError> {
+        self.repository
+            .command_notification_refs_for_resource(resource_ref)
+    }
+
+    pub fn native_command_receipt_by_identity(
+        &self,
+        idempotency_key: &str,
+        actor_principal: &str,
+        action_id: &str,
+        resource_ref: &str,
+    ) -> Result<Option<MfgCommandReceipt>, MfgRepositoryError> {
+        self.repository.native_command_receipt_by_identity(
+            idempotency_key,
+            actor_principal,
+            action_id,
+            resource_ref,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_mutation_receipt(
+        &self,
+        idempotency_key: &str,
+        actor_principal: &str,
+        action_id: &str,
+        resource_ref: &str,
+        expected_revision: Option<u64>,
+        payload_digest: &str,
+        correlation_id: &str,
+    ) -> Result<crate::MfgMutationClaim, MfgRepositoryError> {
+        self.repository.claim_mutation_receipt(
+            idempotency_key,
+            actor_principal,
+            action_id,
+            resource_ref,
+            expected_revision,
+            payload_digest,
+            correlation_id,
+        )
+    }
+
+    pub fn release_mutation_claim(
+        &self,
+        idempotency_key: &str,
+        actor_principal: &str,
+        action_id: &str,
+        payload_digest: &str,
+    ) -> Result<bool, MfgRepositoryError> {
+        self.repository.release_mutation_claim(
+            idempotency_key,
+            actor_principal,
+            action_id,
+            payload_digest,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_mutation_receipt(
+        &self,
+        idempotency_key: &str,
+        actor_principal: &str,
+        action_id: &str,
+        resource_ref: &str,
+        payload_digest: &str,
+    ) -> Result<Option<(app_mfg_contract::MfgReceiptV1, serde_json::Value)>, MfgRepositoryError>
+    {
+        self.repository.find_mutation_receipt(
+            idempotency_key,
+            actor_principal,
+            action_id,
+            resource_ref,
+            payload_digest,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_mutation_receipt(
+        &self,
+        idempotency_key: &str,
+        actor_principal: &str,
+        action_id: &str,
+        resource_ref: &str,
+        expected_revision: Option<u64>,
+        result_revision: Option<u64>,
+        payload_digest: &str,
+        response: &serde_json::Value,
+    ) -> Result<app_mfg_contract::MfgReceiptV1, MfgRepositoryError> {
+        self.repository.record_mutation_receipt(
+            idempotency_key,
+            actor_principal,
+            action_id,
+            resource_ref,
+            expected_revision,
+            result_revision,
+            payload_digest,
+            response,
+        )
     }
 
     pub fn save_workflow_graph(
@@ -594,6 +915,16 @@ impl MfgStore {
         packet: &MatrixEvidencePacket,
     ) -> Result<(MfgIncident, MfgWorkflowGraph), MfgRepositoryError> {
         self.repository.create_incident_workflow(incident, packet)
+    }
+
+    pub fn create_incident_workflow_idempotent(
+        &self,
+        incident: &MfgIncident,
+        packet: &MatrixEvidencePacket,
+        workflow_id: &str,
+    ) -> Result<(MfgIncident, MfgWorkflowGraph), MfgRepositoryError> {
+        self.repository
+            .create_incident_workflow_idempotent(incident, packet, workflow_id)
     }
 
     pub fn plan_incident_workflow_skills(
@@ -653,7 +984,25 @@ impl MfgStore {
 #[cfg(test)]
 mod workflow_tests {
     use super::*;
-    use crate::{run_server_manufacturing_skill, server_manufacturing_skill_pack, MfgSkillPlan};
+    use crate::{MfgSkillPlan, run_server_manufacturing_skill, server_manufacturing_skill_pack};
+
+    fn runtime_completed(mut run: MfgSkillRun) -> MfgSkillRun {
+        run.status = "completed".to_string();
+        run.runtime_execution_ref = Some("runtime-execution://test-skill-graph".to_string());
+        run.runtime_commit_cursor = Some(1);
+        run.tool_results = run
+            .tool_plan
+            .iter()
+            .map(|call| crate::MfgSkillToolResult {
+                tool_name: call.tool_name.clone(),
+                status: "completed".to_string(),
+                summary: "test Runtime tool receipt".to_string(),
+                result: serde_json::json!({"test": true}),
+                evidence_refs: Vec::new(),
+            })
+            .collect();
+        run
+    }
 
     #[test]
     fn workflow_store_isolates_incidents_and_task_lookup() {
@@ -746,19 +1095,28 @@ mod workflow_tests {
         let planned = store
             .save_workflow_graph(&planned, Some(expected_revision))
             .unwrap();
-        let run = run_server_manufacturing_skill(&incident, &skill, None, Some(&packet));
+        let run = runtime_completed(run_server_manufacturing_skill(
+            &incident,
+            &skill,
+            None,
+            Some(&packet),
+        ));
         let (recorded_run, completed) = store.record_skill_run_and_complete_workflow(&run).unwrap();
 
         assert!(completed.revision > planned.revision);
         assert_eq!(completed.incident_id, incident.incident_id);
         assert_eq!(recorded_run.execution_id, run.execution_id);
-        assert!(store
-            .get_skill_run(run.execution_id.as_deref().unwrap())
-            .unwrap()
-            .is_some());
-        assert!(completed
-            .evidence
-            .iter()
-            .any(|item| item.kind == "mfg_skill_run"));
+        assert!(
+            store
+                .get_skill_run(run.execution_id.as_deref().unwrap())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            completed
+                .evidence
+                .iter()
+                .any(|item| item.kind == "mfg_skill_run")
+        );
     }
 }

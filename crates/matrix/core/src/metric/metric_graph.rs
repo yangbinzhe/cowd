@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixMetricDependencyInput {
     #[serde(default)]
     pub dependency_id: Option<String>,
@@ -20,7 +20,7 @@ pub struct MatrixMetricDependencyInput {
     pub notes: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixMetricDependency {
     pub dependency_id: String,
     pub upstream_metric_id: String,
@@ -64,7 +64,7 @@ impl MatrixMetricDependency {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatrixMetricLineage {
     pub metric_id: String,
     #[serde(default)]

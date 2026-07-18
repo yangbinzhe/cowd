@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgIncident {
     pub incident_id: String,
     pub title: String,
@@ -10,8 +10,14 @@ pub struct MfgIncident {
     pub task_id: Option<String>,
     pub workflow_graph_id: Option<String>,
     pub status: String,
+    #[serde(default = "default_incident_revision")]
+    pub revision: u64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+const fn default_incident_revision() -> u64 {
+    1
 }
 
 impl MfgIncident {
@@ -26,6 +32,7 @@ impl MfgIncident {
             task_id: None,
             workflow_graph_id: None,
             status: "open".to_string(),
+            revision: default_incident_revision(),
             created_at: now,
             updated_at: now,
         }

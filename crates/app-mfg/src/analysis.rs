@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use matrix_core::MatrixEvidencePacket;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgAttributionCandidate {
     pub cause_id: String,
     pub cause_type: String,
@@ -18,7 +18,7 @@ pub struct MfgAttributionCandidate {
     pub priority_score: f32,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgImpactPath {
     pub path_id: String,
     pub from_entity: String,
@@ -31,7 +31,7 @@ pub struct MfgImpactPath {
     pub confidence: f32,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgRecommendedAction {
     pub action_id: String,
     pub action_type: String,
@@ -46,7 +46,7 @@ pub struct MfgRecommendedAction {
     pub governance: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgOperationalAnalysis {
     pub analysis_id: String,
     pub incident_id: String,
@@ -59,7 +59,13 @@ pub struct MfgOperationalAnalysis {
     pub recommended_actions: Vec<MfgRecommendedAction>,
     pub confidence: f32,
     pub status: String,
+    #[serde(default = "default_analysis_revision")]
+    pub revision: u64,
     pub created_at: DateTime<Utc>,
+}
+
+const fn default_analysis_revision() -> u64 {
+    1
 }
 
 impl MfgOperationalAnalysis {
@@ -74,6 +80,7 @@ impl MfgOperationalAnalysis {
             recommended_actions: Vec::new(),
             confidence: packet.confidence,
             status: "draft".to_string(),
+            revision: default_analysis_revision(),
             created_at: Utc::now(),
         };
 

@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "rubric_id": "auto-strategy-rubric-v1",
+  "judge_prompt_revision": "blind-judge-20260716-r1",
+  "criteria": [
+    {
+      "criterion_id": "task_correctness",
+      "weight_bp": 3500,
+      "instruction": "结论必须正确完成任务目标，不能用自报状态代替实际结果。"
+    },
+    {
+      "criterion_id": "evidence_grounding",
+      "weight_bp": 2500,
+      "instruction": "要求证据的任务必须给出可追溯证据，且证据与结论直接相关。"
+    },
+    {
+      "criterion_id": "acceptance_coverage",
+      "weight_bp": 2000,
+      "instruction": "逐项覆盖冻结任务的 acceptance，不得遗漏责任域或失败样本。"
+    },
+    {
+      "criterion_id": "scope_discipline",
+      "weight_bp": 1000,
+      "instruction": "避免重复探索、越权路径、无关改动和不必要的协作成本。"
+    },
+    {
+      "criterion_id": "synthesis_quality",
+      "weight_bp": 1000,
+      "instruction": "综合结果应清晰、无内部矛盾，并明确剩余不确定性。"
+    }
+  ],
+  "failure_penalty_bp": 10000,
+  "timeout_penalty_bp": 10000,
+  "empty_result_penalty_bp": 10000
+}

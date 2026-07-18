@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use matrix_core::{
     MatrixEntity, MatrixEntityInput, MatrixFact, MatrixFactInput, MatrixMetricDefinition,
@@ -8,7 +8,7 @@ use matrix_core::{
     MatrixSourceKey,
 };
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgDomainScenario {
     pub scenario_id: String,
     pub title: String,
@@ -21,7 +21,7 @@ pub struct MfgDomainScenario {
     pub expected_relations: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgDomainPack {
     pub domain_id: String,
     pub name: String,
@@ -37,7 +37,7 @@ pub struct MfgDomainPack {
     pub scenarios: Vec<MfgDomainScenario>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgDomainSeedPlan {
     pub pack: MfgDomainPack,
     #[serde(default)]
@@ -52,7 +52,7 @@ pub struct MfgDomainSeedPlan {
     pub facts: Vec<MatrixFact>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MfgDomainSeedResult {
     pub domain_id: String,
     pub version: String,

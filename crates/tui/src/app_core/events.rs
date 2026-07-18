@@ -53,6 +53,15 @@ impl CowdEventSender {
     pub fn try_send(&self, event: CowdEvent) -> Result<(), mpsc::error::TrySendError<CowdEvent>> {
         self.send(event)
     }
+
+    /// Backpressured delivery for durable projection streams. The producer
+    /// must not advance its cursor until the UI has accepted the envelope.
+    pub async fn send_wait(
+        &self,
+        event: CowdEvent,
+    ) -> Result<(), mpsc::error::SendError<CowdEvent>> {
+        self.inner.send(event).await
+    }
 }
 
 impl CowdEventReceiver {
@@ -76,19 +85,59 @@ fn is_reliable_event(event: &CowdEvent) -> bool {
             | CowdEvent::TurnError { .. }
             | CowdEvent::ApprovalRequested { .. }
             | CowdEvent::ExecutionProjectionDelta { .. }
+            | CowdEvent::ExecutionProjectionLoaded { .. }
+            | CowdEvent::ExecutionProjectionAccessRevoked { .. }
             | CowdEvent::ExecutionGraphSummary { .. }
+            | CowdEvent::MfgContract { .. }
+            | CowdEvent::MfgSnapshot { .. }
+            | CowdEvent::MfgReadFailed { .. }
+            | CowdEvent::MfgActionAccepted { .. }
+            | CowdEvent::MfgActionFailed { .. }
     )
 }
 
 fn retain_reliable_event(queue: &mut VecDeque<CowdEvent>, event: CowdEvent) {
     match &event {
-        CowdEvent::ExecutionProjectionDelta { delta } => {
+        CowdEvent::ExecutionProjectionDelta { generation, delta } => {
             if let Some(index) = queue.iter().position(|queued| {
-                matches!(queued, CowdEvent::ExecutionProjectionDelta { delta: queued_delta }
-                    if queued_delta.execution_id == delta.execution_id)
+                matches!(queued, CowdEvent::ExecutionProjectionDelta {
+                    generation: queued_generation,
+                    delta: queued_delta,
+                } if queued_generation == generation
+                    && queued_delta.execution_id == delta.execution_id)
             }) {
                 queue[index] = event;
                 return;
+            }
+        }
+        CowdEvent::ExecutionProjectionLoaded {
+            generation,
+            projection,
+        } => {
+            if let Some(index) = queue.iter().position(|queued| {
+                matches!(queued, CowdEvent::ExecutionProjectionLoaded {
+                    generation: queued_generation,
+                    projection: queued_projection,
+                } if queued_generation == generation
+                    && queued_projection.execution_id == projection.execution_id)
+            }) {
+                queue[index] = event;
+                return;
+            }
+        }
+        CowdEvent::ExecutionProjectionAccessRevoked {
+            generation,
+            execution_id,
+            ..
+        } => {
+            if let Some(index) = queue.iter().position(|queued| {
+                matches!(queued, CowdEvent::ExecutionProjectionAccessRevoked {
+                    generation: queued_generation,
+                    execution_id: queued_execution_id,
+                    ..
+                } if queued_generation == generation && queued_execution_id == execution_id)
+            }) {
+                queue.remove(index);
             }
         }
         CowdEvent::ExecutionGraphSummary { summary } => {
@@ -102,6 +151,68 @@ fn retain_reliable_event(queue: &mut VecDeque<CowdEvent>, event: CowdEvent) {
                 }
             }
         }
+        CowdEvent::MfgContract { .. }
+        | CowdEvent::MfgSnapshot { .. }
+        | CowdEvent::MfgReadFailed { .. }
+        | CowdEvent::MfgActionAccepted { .. }
+        | CowdEvent::MfgActionFailed { .. } => {
+            if let Some(index) = queue.iter().position(|queued| match (&event, queued) {
+                (
+                    CowdEvent::MfgContract {
+                        generation: event_generation,
+                        ..
+                    },
+                    CowdEvent::MfgContract {
+                        generation: queued_generation,
+                        ..
+                    },
+                ) => queued_generation == event_generation,
+                (
+                    CowdEvent::MfgSnapshot {
+                        generation: event_generation,
+                        ..
+                    },
+                    CowdEvent::MfgSnapshot {
+                        generation: queued_generation,
+                        ..
+                    },
+                ) => queued_generation == event_generation,
+                (
+                    CowdEvent::MfgReadFailed {
+                        generation: event_generation,
+                        section: event_section,
+                        ..
+                    },
+                    CowdEvent::MfgReadFailed {
+                        generation: queued_generation,
+                        section: queued_section,
+                        ..
+                    },
+                ) => queued_generation == event_generation && queued_section == event_section,
+                (
+                    CowdEvent::MfgActionAccepted {
+                        intent_id: event_intent,
+                        ..
+                    }
+                    | CowdEvent::MfgActionFailed {
+                        intent_id: event_intent,
+                        ..
+                    },
+                    CowdEvent::MfgActionAccepted {
+                        intent_id: queued_intent,
+                        ..
+                    }
+                    | CowdEvent::MfgActionFailed {
+                        intent_id: queued_intent,
+                        ..
+                    },
+                ) => queued_intent == event_intent,
+                _ => false,
+            }) {
+                queue[index] = event;
+                return;
+            }
+        }
         _ => {}
     }
 
@@ -113,7 +224,13 @@ fn retain_reliable_event(queue: &mut VecDeque<CowdEvent>, event: CowdEvent) {
             matches!(
                 queued,
                 CowdEvent::ExecutionProjectionDelta { .. }
+                    | CowdEvent::ExecutionProjectionAccessRevoked { .. }
                     | CowdEvent::ExecutionGraphSummary { .. }
+                    | CowdEvent::MfgContract { .. }
+                    | CowdEvent::MfgSnapshot { .. }
+                    | CowdEvent::MfgReadFailed { .. }
+                    | CowdEvent::MfgActionAccepted { .. }
+                    | CowdEvent::MfgActionFailed { .. }
             )
         }) {
             queue.remove(index);
@@ -185,11 +302,34 @@ mod tests {
             })
             .expect("capacity");
         }
-        assert!(tx
-            .try_send(CowdEvent::TextDelta {
+        assert!(
+            tx.try_send(CowdEvent::TextDelta {
                 text: "overflow".into(),
             })
-            .is_err());
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_stream_delivery_waits_for_capacity_instead_of_dropping() {
+        let (tx, mut rx) = cowd_event_channel();
+        for index in 0..EVENT_CHANNEL_CAPACITY {
+            tx.try_send(CowdEvent::TextDelta {
+                text: index.to_string(),
+            })
+            .expect("capacity");
+        }
+        let pending = tokio::spawn({
+            let tx = tx.clone();
+            async move {
+                tx.send_wait(CowdEvent::MfgLiveStopped { generation: 7 })
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(!pending.is_finished());
+        let _ = rx.try_recv().expect("free one event slot");
+        assert!(pending.await.expect("sender task").is_ok());
     }
 
     #[test]
@@ -203,6 +343,7 @@ mod tests {
         }
         for cursor in 1_u64..=10_000 {
             tx.send(CowdEvent::ExecutionProjectionDelta {
+                generation: 7,
                 delta: harness_contract::projection::ProjectionDelta {
                     schema_version: 1,
                     execution_id: "execution-a".to_string(),
@@ -217,7 +358,8 @@ mod tests {
         assert_eq!(reliable.len(), 1);
         assert!(matches!(
             reliable.front(),
-            Some(CowdEvent::ExecutionProjectionDelta { delta }) if delta.target_cursor == 10_000
+            Some(CowdEvent::ExecutionProjectionDelta { generation: 7, delta })
+                if delta.target_cursor == 10_000
         ));
     }
 

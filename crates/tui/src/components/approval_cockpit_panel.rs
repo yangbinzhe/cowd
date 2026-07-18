@@ -19,6 +19,8 @@ pub struct ApprovalCockpitPanel {
     cross_plane_actions_24h: Option<u64>,
     lease_owner: Option<String>,
     lease_mode: Option<String>,
+    focused_backlink_target: Option<String>,
+    focused_backlink_resolution: Option<String>,
     degraded_reasons: Vec<String>,
     gateway_running: bool,
 }
@@ -42,11 +44,97 @@ impl ApprovalCockpitPanel {
         self.gateway_running = app.server_running;
     }
 
+    pub fn focus_backlink_target(&mut self, target: impl Into<String>) {
+        let target = target.into();
+        let approval_id = target
+            .strip_prefix("approval://")
+            .and_then(|value| value.split(['?', '#']).next())
+            .unwrap_or(target.as_str());
+        if let Some(index) = self.approval_items.iter().position(|item| {
+            approval_id == item.id
+                || item
+                    .review_ref
+                    .as_deref()
+                    .is_some_and(|review| approval_id == review)
+        }) {
+            self.approval_items.rotate_left(index);
+        }
+        self.focused_backlink_resolution =
+            Some("loading exact approval from pending and history".to_string());
+        self.focused_backlink_target = Some(target);
+    }
+
+    pub fn clear_backlink_target(&mut self) {
+        self.focused_backlink_target = None;
+        self.focused_backlink_resolution = None;
+    }
+
+    #[must_use]
+    pub fn accepts_backlink_result(&self, target: &str) -> bool {
+        self.focused_backlink_target.as_deref() == Some(target)
+    }
+
+    pub fn record_backlink_object(
+        &mut self,
+        target: impl Into<String>,
+        object: &serde_json::Value,
+    ) {
+        let target = target.into();
+        if !self.accepts_backlink_result(&target) {
+            return;
+        }
+        let id = object
+            .get("id")
+            .or_else(|| object.get("approval_id"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("canonical approval");
+        let status = object
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("loaded");
+        self.focused_backlink_resolution = Some(format!("{id} status {status}"));
+    }
+
+    pub fn record_backlink_failure(
+        &mut self,
+        target: impl Into<String>,
+        message: impl Into<String>,
+    ) {
+        let target = target.into();
+        if !self.accepts_backlink_result(&target) {
+            return;
+        }
+        self.focused_backlink_resolution = Some(format!("Resolution failed: {}", message.into()));
+    }
+
     fn render_lines(&self) -> Text<'_> {
         let pending = self.pending_approvals.unwrap_or_default();
         let grants = self.cross_plane_grants_active.unwrap_or_default();
         let actions = self.cross_plane_actions_24h.unwrap_or_default();
-        let mut lines = vec![
+        let mut lines = Vec::new();
+        if let Some(target) = self.focused_backlink_target.as_deref() {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "Backlink target: ",
+                    Style::default().fg(Color::LightMagenta),
+                ),
+                Span::styled(target.to_string(), Style::default().fg(Color::White)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "Resolved object: ",
+                    Style::default().fg(Color::LightMagenta),
+                ),
+                Span::styled(
+                    self.focused_backlink_resolution
+                        .as_deref()
+                        .unwrap_or("loading exact approval")
+                        .to_string(),
+                    Style::default().fg(Color::White),
+                ),
+            ]));
+        }
+        lines.extend([
             Line::from(vec![
                 Span::styled("Gateway: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
@@ -79,7 +167,7 @@ impl ApprovalCockpitPanel {
                 "Local permission prompts: {}",
                 self.permission_count
             )),
-        ];
+        ]);
 
         if let Some(req) = self.local_approval.as_ref() {
             lines.push(Line::from(vec![
@@ -112,6 +200,21 @@ impl ApprovalCockpitPanel {
                     lines.push(Line::from(Span::styled(
                         format!("  {}", truncate(&item.input_preview, 64)),
                         Style::default().fg(Color::DarkGray),
+                    )));
+                }
+                if item.is_mfg_review() {
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "  typed MFG review {} · /mfg review {}; generic boolean disabled",
+                            item.review_ref.as_deref().unwrap_or("unknown"),
+                            item.review_ref.as_deref().unwrap_or("unknown")
+                        ),
+                        Style::default().fg(Color::LightMagenta),
+                    )));
+                } else if item.is_mfg_source() {
+                    lines.push(Line::from(Span::styled(
+                        "  invalid MFG approval: typed review reference missing; generic boolean disabled",
+                        Style::default().fg(Color::LightRed),
                     )));
                 }
             }
@@ -235,6 +338,7 @@ mod tests {
             risk: Some("high".to_string()),
             requester: Some("session".to_string()),
             input_preview: "rm -rf /tmp/example".to_string(),
+            ..ApprovalSummary::default()
         }];
         app.gateway_cross_plane_grants_active = Some(3);
         app.gateway_cross_plane_actions_24h = Some(9);
