@@ -588,27 +588,60 @@ fn packet_focus_novelty_target_bp(packet: &AgentTaskPacket) -> u16 {
 }
 
 fn packet_focus_acceptance_scopes(packet: &AgentTaskPacket) -> Vec<String> {
-    let Some(value) = packet.constraints.iter().find_map(|constraint| {
+    focus_acceptance_scopes_from_constraints(&packet.constraints)
+}
+
+fn focus_acceptance_scopes_from_constraints(constraints: &[String]) -> Vec<String> {
+    let explicit = constraints.iter().find_map(|constraint| {
         constraint
             .strip_prefix("focus_output_acceptance:")
             .filter(|value| !value.trim().is_empty())
-    }) else {
-        return Vec::new();
-    };
-    let criteria = value.split(',').map(str::trim).collect::<Vec<_>>();
-    if criteria.is_empty()
-        || criteria
-            .iter()
-            .any(|criterion| !criterion.starts_with("evidence_scope:"))
-    {
-        return Vec::new();
-    }
-    let mut scopes = criteria
+    });
+    let mut scopes = explicit
+        .map(|value| value.split(',').map(str::trim).collect::<Vec<_>>())
+        .filter(|criteria| {
+            !criteria.is_empty()
+                && criteria
+                    .iter()
+                    .all(|criterion| criterion.starts_with("evidence_scope:"))
+        })
         .into_iter()
+        .flatten()
         .filter_map(|criterion| criterion.strip_prefix("evidence_scope:"))
         .filter(|scope| !scope.is_empty())
         .map(str::to_string)
         .collect::<Vec<_>>();
+    if scopes.is_empty() {
+        // A mutation role may expose semantic output names such as
+        // `implementation` instead of `evidence_scope:*`. Preserve the
+        // Runtime-owned workspace-change acceptance contract so repeated
+        // reads cannot be mistaken for completed mutation work.
+        scopes.extend(
+            constraints
+                .iter()
+                .find_map(|constraint| {
+                    constraint
+                        .strip_prefix("team_acceptance_contract:")
+                        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+                })
+                .and_then(|value| value.as_array().cloned())
+                .into_iter()
+                .flatten()
+                .filter_map(|criterion| criterion.get("check").cloned())
+                .filter(|check| {
+                    check.get("kind").and_then(serde_json::Value::as_str)
+                        == Some("workspace_change")
+                })
+                .filter_map(|check| {
+                    check
+                        .get("scopes")
+                        .and_then(serde_json::Value::as_array)
+                        .cloned()
+                })
+                .flatten()
+                .filter_map(|scope| scope.as_str().map(str::to_string)),
+        );
+    }
     scopes.sort();
     scopes.dedup();
     scopes
@@ -1586,6 +1619,24 @@ mod tests {
         assert_eq!(agent_model_step_limit(8_000), Some(3));
         assert_eq!(agent_model_step_limit(24_000), Some(6));
         assert_eq!(agent_model_step_limit(128_000), Some(6));
+    }
+
+    #[test]
+    fn workspace_change_contract_retains_the_required_write_scope() {
+        let constraints = vec![
+            "focus_output_acceptance:implementation, source_verification".to_string(),
+            "team_acceptance_contract:[{\"criterion\":\"implementation\",\"check\":{\"kind\":\"workspace_change\",\"scopes\":[\"write:fixtures/target.txt\"]}},{\"criterion\":\"source_verification\",\"check\":{\"kind\":\"source_verification\",\"scopes\":[\"write:fixtures/target.txt\"]}}]".to_string(),
+        ];
+
+        assert_eq!(
+            focus_acceptance_scopes_from_constraints(&constraints),
+            ["write:fixtures/target.txt"]
+        );
+        let review_constraints = vec![
+            "focus_output_acceptance:evidence, review, risks".to_string(),
+            "team_acceptance_contract:[{\"criterion\":\"evidence\",\"check\":{\"kind\":\"scoped_evidence\",\"scopes\":[\"read:fixtures/target.txt\",\"write:fixtures/target.txt\"]}}]".to_string(),
+        ];
+        assert!(focus_acceptance_scopes_from_constraints(&review_constraints).is_empty());
     }
 
     #[test]

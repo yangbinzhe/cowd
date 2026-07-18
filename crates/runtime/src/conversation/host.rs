@@ -4223,6 +4223,15 @@ where
         });
         let coverage_keys = tool_batch_coverage_keys(&calls);
         let scope_keys = tool_batch_scope_keys(&calls);
+        let resource_scope_keys =
+            graph_resource_scopes_for_tool_calls(&calls, self.services.workspace_root())
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+        let successful_resource_scope_keys = if failed == 0 {
+            resource_scope_keys.clone()
+        } else {
+            BTreeSet::new()
+        };
         let covered_before = prior_observations
             .iter()
             .filter(|observation| observation.kind == RuntimeObservationKind::ToolProgress)
@@ -4234,6 +4243,12 @@ where
             .filter(|observation| observation.kind == RuntimeObservationKind::ToolProgress)
             .flat_map(|observation| observation.evidence_refs.iter())
             .filter_map(|reference| reference.strip_prefix("tool_scope:"))
+            .collect::<BTreeSet<_>>();
+        let resource_scopes_covered_before = prior_observations
+            .iter()
+            .filter(|observation| observation.kind == RuntimeObservationKind::ToolProgress)
+            .flat_map(|observation| observation.evidence_refs.iter())
+            .filter_map(|reference| reference.strip_prefix("tool_resource_scope:"))
             .collect::<BTreeSet<_>>();
         let newly_covered = coverage_keys
             .iter()
@@ -4282,16 +4297,15 @@ where
         state.parallel_tool_batches = state
             .parallel_tool_batches
             .saturating_add(result.parallel_batches);
-        let first_evidence_batch = state.successful_tool_calls == 0;
         let focus_acceptance_met = bounded_evidence_role
             && !focus_acceptance_scopes.is_empty()
-            && first_evidence_batch
             && failed == 0
-            && !coverage_keys.is_empty()
-            && focus_acceptance_scopes
-                .iter()
-                .map(|scope| coverage_zone(scope))
-                .all(|required_zone| scope_keys.contains(&required_zone));
+            && focus_acceptance_scopes.iter().all(|required_scope| {
+                successful_resource_scope_keys.contains(required_scope)
+                    || resource_scopes_covered_before.contains(required_scope.as_str())
+            });
+        let focus_acceptance_pending =
+            bounded_evidence_role && !focus_acceptance_scopes.is_empty() && !focus_acceptance_met;
         state
             .pending_transcript
             .insert(ticket.node_id.clone(), result.messages.clone());
@@ -4363,6 +4377,11 @@ where
                         .map(|coverage| format!("tool_coverage:{coverage}")),
                 )
                 .chain(scope_keys.iter().map(|scope| format!("tool_scope:{scope}")))
+                .chain(
+                    successful_resource_scope_keys
+                        .iter()
+                        .map(|scope| format!("tool_resource_scope:{scope}")),
+                )
                 .collect(),
             metrics: BTreeMap::from([
                 ("tool_calls".to_string(), tool_calls as i64),
@@ -4398,7 +4417,7 @@ where
         };
         let goal_id = state.goal_id.clone();
         drop(state);
-        if focus_acceptance_met || repeated_evidence_saturation {
+        if focus_acceptance_met || (repeated_evidence_saturation && !focus_acceptance_pending) {
             self.runtime
                 .lock()
                 .await
@@ -4425,6 +4444,17 @@ where
             })
         } else if continue_with_tool_batch || orchestration_terminal_summary.is_some() {
             None
+        } else if repeated_evidence_saturation && focus_acceptance_pending {
+            Some(RuntimeIntervention {
+                goal_id: goal_id.clone(),
+                kind: RuntimeInterventionKind::Replan,
+                reason: format!(
+                    "bounded evidence reads repeated before required action scope(s) were observed: {}; execute one authorized missing action instead of rereading or synthesizing",
+                    focus_acceptance_scopes.join(", ")
+                ),
+                evidence_refs: observation.evidence_refs.clone(),
+                expected_graph_revision: None,
+            })
         } else if repeated_evidence_saturation {
             Some(RuntimeIntervention {
                 goal_id: goal_id.clone(),
