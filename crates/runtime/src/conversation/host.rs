@@ -4765,6 +4765,29 @@ where
             state
                 .focus_observed_resource_scopes
                 .extend(verified_focus_acceptance_scope_keys.iter().cloned());
+            if let Some(instruction) = upstream_verification_completion_instruction(
+                &verified_focus_acceptance_scope_keys,
+            ) {
+                // Runtime, rather than the provider, compiled and executed the
+                // reviewer's exact-path reads. Tell the following synthesis
+                // request what those retained receipts mean. Without this
+                // authority-preserving hand-off, a text-only synthesis can
+                // incorrectly claim that independent verification was
+                // impossible merely because acquisition is already complete.
+                let mut item = ContextItem::new(
+                    format!("runtime-upstream-verification-complete:{}", ticket.node_id),
+                    ContextSourceKind::ToolTrace,
+                    ContextRole::Instruction,
+                    instruction,
+                );
+                item.authority = ContextAuthority::System;
+                item.visibility = ContextVisibility::Private;
+                item.evidence = calls
+                    .iter()
+                    .map(|call| format!("tool_call:{}", call.id))
+                    .collect();
+                state.pending_next_model_context.push(item);
+            }
         }
         let pending_write_paths = state
             .focus_acceptance_pending_scopes
@@ -7169,6 +7192,27 @@ fn verified_focus_acceptance_scope_keys(
         .collect()
 }
 
+/// Explain a completed Runtime-owned reviewer prefetch to the synthesis step.
+///
+/// The instruction is deliberately limited to upstream-review scopes. A
+/// post-write verification has different ownership semantics and ordinary
+/// reads must never be promoted into an independent review claim.
+fn upstream_verification_completion_instruction(
+    verified_scopes: &BTreeSet<String>,
+) -> Option<String> {
+    let paths = verified_scopes
+        .iter()
+        .filter_map(|scope| scope.strip_prefix("verify_upstream_change:"))
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Runtime reviewer evidence (authoritative): before this synthesis, the governed tool DAG performed this role's independent exact-path read for [{}]. The retained read receipt and digest are role-local evidence, not an upstream self-report. Tools are now disabled because evidence acquisition is complete, not because verification was unavailable. Base the review on the retained receipt; do not claim that independent retrieval or verification was impossible. Distinguish verified file state from any semantic uncertainty, and report genuine risks without denying the completed Runtime read.",
+        paths.join(", ")
+    ))
+}
+
 /// Keep stateful runtime orchestration outside a workspace-tool batch.
 ///
 /// A `runtime_orchestrate(request_team)` call may synchronously drive a child
@@ -9039,6 +9083,25 @@ mod tests {
         let required = vec!["verify_after_write:fixtures/target.txt".to_string()];
         let verified = verified_focus_acceptance_scope_keys(&required, &successful, &covered);
         assert!(verified.contains("verify_after_write:fixtures/target.txt"));
+    }
+
+    #[test]
+    fn completed_upstream_prefetch_is_explained_without_promoting_other_reads() {
+        let verified = BTreeSet::from([
+            "verify_upstream_change:fixtures/target.txt".to_string(),
+            "verify_after_write:fixtures/owned.txt".to_string(),
+        ]);
+        let instruction = upstream_verification_completion_instruction(&verified)
+            .expect("reviewer instruction");
+
+        assert!(instruction.contains("fixtures/target.txt"));
+        assert!(!instruction.contains("fixtures/owned.txt"));
+        assert!(instruction.contains("independent exact-path read"));
+        assert!(instruction.contains("Tools are now disabled"));
+        assert!(upstream_verification_completion_instruction(&BTreeSet::from([
+            "verify_after_write:fixtures/owned.txt".to_string(),
+        ]))
+        .is_none());
     }
 
     #[test]

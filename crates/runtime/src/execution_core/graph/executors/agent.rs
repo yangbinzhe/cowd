@@ -158,7 +158,6 @@ impl NodeExecutor for AgentTaskExecutor {
                 })
                 .map(|edge| edge.from.clone())
                 .collect::<Vec<_>>();
-            let mut upstream_summaries = Vec::new();
             let mut upstream_changes = Vec::new();
             for predecessor_id in predecessor_ids {
                 if graph.node_statuses.get(&predecessor_id) != Some(&ExecutionNodeStatus::Completed)
@@ -189,14 +188,6 @@ impl NodeExecutor for AgentTaskExecutor {
                     (evidence.evidence_ref.0.ref_type == "runtime_change")
                         .then(|| evidence.evidence_ref.0.id.clone())
                 }));
-                if let Some(summary) = predecessor
-                    .summary
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|summary| !summary.is_empty())
-                {
-                    upstream_summaries.push(format!("{predecessor_id}: {summary}"));
-                }
             }
             packet.evidence_refs.sort_by(|left, right| {
                 left.evidence_ref
@@ -208,11 +199,12 @@ impl NodeExecutor for AgentTaskExecutor {
             packet
                 .evidence_refs
                 .dedup_by(|left, right| left.evidence_ref == right.evidence_ref);
-            if !upstream_summaries.is_empty() {
-                packet.objective.push_str(
-                    "\n\n## Runtime-committed upstream role outcomes\nConsume these durable predecessor outcomes and independently verify them:\n",
-                );
-                packet.objective.push_str(&upstream_summaries.join("\n"));
+            if !upstream_changes.is_empty() {
+                // AgentRuntime materializes the canonical predecessor terminal
+                // outcomes exactly once when it starts this task. The graph
+                // executor only binds durable evidence and change scopes;
+                // copying summaries into the objective here duplicated the
+                // same JSON and increased reviewer prompt latency.
                 packet.constraints.push(format!(
                     "upstream_committed_evidence_count:{}",
                     packet.evidence_refs.len()
