@@ -194,7 +194,6 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                 .team_id
                 .as_ref()
                 .map(|_| packet.resource_scopes.clone()),
-            evaluation_isolated: binding.evaluation.is_some(),
             managed_invocation: packet.managed_invocation.clone(),
             next_receipt_sequence: AtomicU64::new(0),
             receipts: Mutex::new(Vec::new()),
@@ -413,9 +412,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         let _ = services.agent_runtime().record_progress(
             &packet.agent_id,
             "agent.acceptance.evaluated",
-            &format!(
-                "accepted={acceptance:?}; changes={changes:?}; receipts={receipt_summary:?}"
-            ),
+            &format!("accepted={acceptance:?}; changes={changes:?}; receipts={receipt_summary:?}"),
         );
         let (status, failure) =
             agent_terminal_outcome(summary.terminal_completion, &summary.final_answer);
@@ -740,7 +737,6 @@ struct ScopedRuntimeToolExecutor {
     /// `Some` marks a Team child and is always enforced. An empty list means
     /// no workspace authority; it never expands to the whole repository.
     resource_scopes: Option<Vec<String>>,
-    evaluation_isolated: bool,
     managed_invocation: Option<harness_contract::managed_agent::ManagedAgentInvocationFence>,
     next_receipt_sequence: AtomicU64,
     receipts: Mutex<Vec<ScopedToolExecutionReceipt>>,
@@ -772,6 +768,11 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
             return serde_json::to_string(&receipt).map_err(|error| {
                 ToolError::new(format!("serialize agent tool discovery: {error}"))
             });
+        }
+        if tool_name == "checkpoint_create" {
+            return Err(ToolError::new(
+                "checkpoint_create is a Runtime-internal mutation guard and cannot be invoked by the delegated model",
+            ));
         }
         if !self.allowed_tools.contains(tool_name) {
             return Err(ToolError::new(format!(
@@ -824,8 +825,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
         tool_name: &str,
         input: &serde_json::Value,
     ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
-        self.allowed_tools
-            .contains(tool_name)
+        (self.allowed_tools.contains(tool_name) || tool_name == "checkpoint_create")
             .then(|| self.host.delegated_tool_effect_descriptor(tool_name, input))
             .flatten()
     }
@@ -836,7 +836,15 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
         tool_name: &str,
         input: &str,
     ) -> Result<String, ToolError> {
-        if authorization.tool_id != tool_name || !self.allowed_tools.contains(tool_name) {
+        if authorization.tool_id != tool_name {
+            return Err(ToolError::new(
+                "agent tool authorization does not match the allowed tool request",
+            ));
+        }
+        if tool_name == "checkpoint_create" {
+            return self.execute_internal_checkpoint(input, authorization.clone());
+        }
+        if !self.allowed_tools.contains(tool_name) {
             return Err(ToolError::new(
                 "agent tool authorization does not match the allowed tool request",
             ));
@@ -851,6 +859,16 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
             .collect()
     }
 
+    fn has_tool(&self, tool_name: &str) -> bool {
+        tool_name == "ToolSearch"
+            || self.allowed_tools.contains(tool_name)
+            || (tool_name == "checkpoint_create"
+                && self
+                    .host
+                    .delegated_tool_effect_descriptor(tool_name, &serde_json::json!({}))
+                    .is_some())
+    }
+
     fn classify_tool_safety(
         &self,
         tool_name: &str,
@@ -863,6 +881,59 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
 }
 
 impl ScopedRuntimeToolExecutor {
+    fn execute_internal_checkpoint(
+        &self,
+        input: &str,
+        authorization: harness_contract::tool::ToolExecutionAuthorization,
+    ) -> Result<String, ToolError> {
+        if self
+            .host
+            .delegated_tool_effect_descriptor("checkpoint_create", &serde_json::json!({}))
+            .is_none()
+        {
+            return Err(ToolError::new(
+                "Runtime ToolHost has no checkpoint_create capability",
+            ));
+        }
+        let request = RuntimeToolExecutionRequest {
+            idempotency_key: authorization
+                .idempotency_key
+                .clone()
+                .unwrap_or_else(|| format!("agent-checkpoint:{}", uuid::Uuid::new_v4())),
+            tool_use_id: format!("agent-checkpoint:{}", uuid::Uuid::new_v4()),
+            tool_name: "checkpoint_create".to_string(),
+            input: input.to_string(),
+            category: crate::ToolSafetyCategory::WriteLocal,
+            authorization: Some(authorization),
+            session_id: Some(self.session_id.clone()),
+            model_lease: Some(self.model_lease.clone()),
+            parent_execution: Some(harness_contract::execution_graph::ExecutionParentBinding {
+                execution_id: self.execution_id.clone(),
+                node_id: self.node_id.clone(),
+            }),
+            // An Agent evaluation Binding is candidate provenance, not the
+            // tool-free Judge surface. The exact Team resource ceiling above
+            // remains the business-effect sandbox. This checkpoint is a
+            // Runtime-owned guard and is deliberately not an Agent effect.
+            evaluation_isolated: false,
+            managed_invocation: None,
+        };
+        let outcome = self.host.execute_runtime_tool(&request);
+        match outcome.status {
+            RuntimeToolExecutionStatus::Executed => Ok(outcome.output.unwrap_or_default()),
+            RuntimeToolExecutionStatus::BlockedPermission => Err(ToolError::new(
+                outcome
+                    .error
+                    .unwrap_or_else(|| "checkpoint blocked by policy".into()),
+            )),
+            RuntimeToolExecutionStatus::Failed => Err(ToolError::new(
+                outcome
+                    .error
+                    .unwrap_or_else(|| "checkpoint creation failed".into()),
+            )),
+        }
+    }
+
     fn enforce_resource_ceiling(&self, tool_name: &str, input: &str) -> Result<(), ToolError> {
         let Some(allowed_scopes) = self.resource_scopes.as_deref() else {
             return Ok(());
@@ -975,7 +1046,10 @@ impl ScopedRuntimeToolExecutor {
                 execution_id: self.execution_id.clone(),
                 node_id: self.node_id.clone(),
             }),
-            evaluation_isolated: self.evaluation_isolated,
+            // Candidate-evaluation provenance does not make the child a
+            // Judge. ScopedRuntimeToolExecutor already enforces the exact
+            // Runtime-compiled resource ceiling for every business effect.
+            evaluation_isolated: false,
             managed_invocation: self.managed_invocation.clone(),
         };
         let outcome = self.host.execute_runtime_tool(&request);
@@ -1646,16 +1720,26 @@ mod tests {
             ToolPermissionMode,
         };
 
-        matches!(tool_name, "read_file" | "grep_search").then(|| ToolEffectDescriptor {
+        let (effect_kind, operation, required_permission) = match tool_name {
+            "read_file" | "grep_search" => (
+                ToolEffectKind::Read,
+                PermissionOperation::Read,
+                ToolPermissionMode::ReadOnly,
+            ),
+            "checkpoint_create" | "write_file" => (
+                ToolEffectKind::Write,
+                PermissionOperation::Write,
+                ToolPermissionMode::WorkspaceWrite,
+            ),
+            _ => return None,
+        };
+        Some(ToolEffectDescriptor {
             tool_id: tool_name.to_string(),
             descriptor_hash: format!("test-host:{tool_name}"),
-            effect_kind: ToolEffectKind::Read,
+            effect_kind,
             idempotency: ToolIdempotency::Idempotent,
-            scopes: vec![PermissionScope::new(
-                PermissionResource::File,
-                PermissionOperation::Read,
-            )],
-            required_permission: ToolPermissionMode::ReadOnly,
+            scopes: vec![PermissionScope::new(PermissionResource::File, operation)],
+            required_permission,
             approval_class: ToolApprovalClass::None,
             uses_network: false,
             spawns_process: false,
@@ -1729,7 +1813,6 @@ mod tests {
             node_id: "node".to_string(),
             workspace_root: root.path().to_path_buf(),
             resource_scopes: Some(vec!["read:crates/runtime".to_string()]),
-            evaluation_isolated: false,
             managed_invocation: None,
             next_receipt_sequence: AtomicU64::new(0),
             receipts: Mutex::new(Vec::new()),
@@ -1772,7 +1855,6 @@ mod tests {
                 "read:crates/runtime".to_string(),
                 "write:crates/runtime".to_string(),
             ]),
-            evaluation_isolated: false,
             managed_invocation: None,
             next_receipt_sequence: AtomicU64::new(0),
             receipts: Mutex::new(Vec::new()),
@@ -1803,7 +1885,6 @@ mod tests {
             node_id: "node".to_string(),
             workspace_root: std::path::PathBuf::from("/workspace"),
             resource_scopes: None,
-            evaluation_isolated: false,
             managed_invocation: None,
             next_receipt_sequence: AtomicU64::new(0),
             receipts: Mutex::new(Vec::new()),
@@ -1831,6 +1912,54 @@ mod tests {
             discovery.activation_candidates,
             vec!["grep_search", "read_file"]
         );
+        assert!(executor.has_tool("checkpoint_create"));
+        assert!(!executor
+            .available_tool_names()
+            .contains(&"checkpoint_create".to_string()));
+        assert!(executor
+            .execute("checkpoint_create", r#"{"label":"model"}"#)
+            .is_err());
+    }
+
+    #[test]
+    fn scoped_executor_routes_hidden_checkpoint_for_runtime_guard_only() {
+        let executor = ScopedRuntimeToolExecutor {
+            host: Arc::new(EchoRuntimeExecutionHost),
+            allowed_tools: BTreeSet::from(["read_file".to_string()]),
+            session_id: "session".to_string(),
+            model_lease: "model".to_string(),
+            execution_id: "graph".to_string(),
+            node_id: "node".to_string(),
+            workspace_root: std::path::PathBuf::from("/workspace"),
+            resource_scopes: Some(vec!["read:README.md".to_string()]),
+            managed_invocation: None,
+            next_receipt_sequence: AtomicU64::new(0),
+            receipts: Mutex::new(Vec::new()),
+        };
+        let descriptor = executor
+            .describe_tool_effect("checkpoint_create", &serde_json::json!({"label": "guard"}))
+            .expect("Runtime guard must see the hidden checkpoint descriptor");
+        let authorization = crate::ToolPolicy
+            .authorize(
+                &descriptor,
+                "agent-checkpoint-test",
+                PermissionMode::WorkspaceWrite,
+                30,
+            )
+            .expect("Runtime should authorize its internal checkpoint")
+            .authorization;
+
+        assert_eq!(
+            executor
+                .execute_authorized(&authorization, "checkpoint_create", r#"{"label":"guard"}"#,)
+                .expect("hidden checkpoint should reach the pinned Runtime host"),
+            "authorized:checkpoint_create"
+        );
+        assert!(executor
+            .receipts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty());
     }
 
     #[test]
@@ -1844,7 +1973,6 @@ mod tests {
             node_id: "node".to_string(),
             workspace_root: std::path::PathBuf::from("/workspace"),
             resource_scopes: None,
-            evaluation_isolated: false,
             managed_invocation: None,
             next_receipt_sequence: AtomicU64::new(0),
             receipts: Mutex::new(Vec::new()),
