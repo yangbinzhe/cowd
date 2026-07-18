@@ -4796,11 +4796,16 @@ where
                 .iter()
                 .all(|scope| scope.starts_with("verify_after_write:"))
         {
+            // `state.iterations` names the model step that compiled the
+            // currently executing write ToolBatch. A Runtime-authored
+            // follow-up must use the next namespace or Runner will correctly
+            // reject it as a duplicate node replan.
+            let followup_iteration = state.iterations.saturating_add(1);
             automatic_focus_verification = focus_verification_tool_calls(
                 &state.focus_acceptance_pending_scopes,
-                state.iterations,
+                followup_iteration,
             )
-            .map(|calls| (state.session_id.clone(), state.iterations, calls));
+            .map(|calls| (state.session_id.clone(), followup_iteration, calls));
         }
         state
             .pending_transcript
@@ -8968,6 +8973,37 @@ mod tests {
             1
         )
         .is_none());
+    }
+
+    #[test]
+    fn runtime_followup_verification_uses_a_fresh_node_namespace() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let ticket = NodeExecutionTicket {
+            graph_id: "graph".to_string(),
+            node_id: "graph:3:tools-1".to_string(),
+            executor_kind: "tool_batch".to_string(),
+            attempt: 1,
+            idempotency_key: "write-batch".to_string(),
+            payload_ref: String::new(),
+        };
+        let followup_iteration = 3usize.saturating_add(1);
+        let calls = focus_verification_tool_calls(
+            &["verify_after_write:fixtures/target.txt".into()],
+            followup_iteration,
+        )
+        .expect("verification calls");
+        let nodes = tool_nodes_for_calls(
+            &ticket,
+            followup_iteration,
+            "session",
+            calls,
+            workspace.path(),
+        )
+        .expect("verification nodes");
+
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].id, "graph:4:tools-1");
+        assert_ne!(nodes[0].id, ticket.node_id);
     }
 
     #[test]
