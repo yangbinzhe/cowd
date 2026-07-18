@@ -6,7 +6,8 @@ use std::time::Instant;
 
 use glob::Pattern;
 use regex::RegexBuilder;
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
 use walkdir::WalkDir;
 
 use crate::path_policy::WorkspacePathPolicy;
@@ -135,15 +136,44 @@ pub struct GrepSearchInput {
     #[serde(rename = "-C")]
     pub context_short: Option<usize>,
     pub context: Option<usize>,
-    #[serde(rename = "-n")]
+    #[serde(
+        rename = "-n",
+        default,
+        deserialize_with = "deserialize_optional_boolish"
+    )]
     pub line_numbers: Option<bool>,
-    #[serde(rename = "-i")]
+    #[serde(
+        rename = "-i",
+        default,
+        deserialize_with = "deserialize_optional_boolish"
+    )]
     pub case_insensitive: Option<bool>,
     #[serde(rename = "type")]
     pub file_type: Option<String>,
     pub head_limit: Option<usize>,
     pub offset: Option<usize>,
+    #[serde(default, deserialize_with = "deserialize_optional_boolish")]
     pub multiline: Option<bool>,
+}
+
+fn deserialize_optional_boolish<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Bool(value)) => Ok(Some(value)),
+        Some(serde_json::Value::String(value)) if value.eq_ignore_ascii_case("true") => {
+            Ok(Some(true))
+        }
+        Some(serde_json::Value::String(value)) if value.eq_ignore_ascii_case("false") => {
+            Ok(Some(false))
+        }
+        Some(value) => Err(D::Error::custom(format!(
+            "expected a boolean or the string true/false, got {value}"
+        ))),
+    }
 }
 
 /// Result payload returned by the grep-style search tool.
@@ -394,7 +424,7 @@ pub fn grep_search(
     let output_mode = input
         .output_mode
         .clone()
-        .unwrap_or_else(|| String::from("files_with_matches"));
+        .unwrap_or_else(|| String::from("content"));
     let context = input.context.or(input.context_short).unwrap_or(0);
 
     let mut filenames = Vec::new();
@@ -738,6 +768,69 @@ mod tests {
         )
         .expect("grep should succeed");
         assert!(grep_output.content.unwrap_or_default().contains("hello"));
+    }
+
+    #[test]
+    fn grep_defaults_to_matching_content() {
+        let dir = temp_path("grep-default-content");
+        std::fs::create_dir_all(&dir).expect("directory should be created");
+        let policy = WorkspacePathPolicy::new(&dir);
+        let file = dir.join("config.rs");
+        write_file(
+            &policy,
+            file.to_string_lossy().as_ref(),
+            "fn parse_label(value: &str) {\n    match value {\n        _ => {}\n    }\n}\n",
+        )
+        .expect("file write should succeed");
+
+        let output = grep_search(
+            &policy,
+            &GrepSearchInput {
+                pattern: Some(String::from("parse_label")),
+                path: Some(file.to_string_lossy().into_owned()),
+                glob: None,
+                output_mode: None,
+                before: None,
+                after: None,
+                context_short: None,
+                context: None,
+                line_numbers: None,
+                case_insensitive: None,
+                file_type: None,
+                head_limit: None,
+                offset: None,
+                multiline: None,
+            },
+        )
+        .expect("grep should succeed");
+
+        assert_eq!(output.mode.as_deref(), Some("content"));
+        assert!(output
+            .content
+            .as_deref()
+            .is_some_and(|content| content.contains(":1:fn parse_label")));
+    }
+
+    #[test]
+    fn grep_accepts_boolean_strings_from_model_tool_calls() {
+        let parsed: GrepSearchInput = serde_json::from_value(serde_json::json!({
+            "pattern": "label",
+            "-n": "false",
+            "-i": "TRUE",
+            "multiline": "true"
+        }))
+        .expect("common model boolean strings should be normalized");
+
+        assert_eq!(parsed.line_numbers, Some(false));
+        assert_eq!(parsed.case_insensitive, Some(true));
+        assert_eq!(parsed.multiline, Some(true));
+        assert!(
+            serde_json::from_value::<GrepSearchInput>(serde_json::json!({
+                "pattern": "label",
+                "-i": "yes"
+            }))
+            .is_err()
+        );
     }
 
     #[test]

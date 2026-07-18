@@ -6,7 +6,8 @@ use std::time::Instant;
 
 use glob::Pattern;
 use regex::RegexBuilder;
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
 use walkdir::WalkDir;
 
 /// Maximum file size that can be read (10 MB).
@@ -133,15 +134,44 @@ pub struct GrepSearchInput {
     #[serde(rename = "-C")]
     pub context_short: Option<usize>,
     pub context: Option<usize>,
-    #[serde(rename = "-n")]
+    #[serde(
+        rename = "-n",
+        default,
+        deserialize_with = "deserialize_optional_boolish"
+    )]
     pub line_numbers: Option<bool>,
-    #[serde(rename = "-i")]
+    #[serde(
+        rename = "-i",
+        default,
+        deserialize_with = "deserialize_optional_boolish"
+    )]
     pub case_insensitive: Option<bool>,
     #[serde(rename = "type")]
     pub file_type: Option<String>,
     pub head_limit: Option<usize>,
     pub offset: Option<usize>,
+    #[serde(default, deserialize_with = "deserialize_optional_boolish")]
     pub multiline: Option<bool>,
+}
+
+fn deserialize_optional_boolish<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Bool(value)) => Ok(Some(value)),
+        Some(serde_json::Value::String(value)) if value.eq_ignore_ascii_case("true") => {
+            Ok(Some(true))
+        }
+        Some(serde_json::Value::String(value)) if value.eq_ignore_ascii_case("false") => {
+            Ok(Some(false))
+        }
+        Some(value) => Err(D::Error::custom(format!(
+            "expected a boolean or the string true/false, got {value}"
+        ))),
+    }
 }
 
 /// Result payload returned by the grep-style search tool.
@@ -375,7 +405,7 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     let output_mode = input
         .output_mode
         .clone()
-        .unwrap_or_else(|| String::from("files_with_matches"));
+        .unwrap_or_else(|| String::from("content"));
     let context = input.context.or(input.context_short).unwrap_or(0);
 
     let mut filenames = Vec::new();
