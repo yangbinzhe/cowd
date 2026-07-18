@@ -1382,19 +1382,17 @@ fn runtime_evaluated_acceptance(
     Vec<String>,
     Vec<harness_contract::agent::AgentChangeReceipt>,
 ) {
-    let produced_evidence = evidence_refs.iter().any(|evidence| {
-        crate::agent_result_validator::is_materialized_durable_evidence(evidence)
-            && !packet
-                .evidence_refs
-                .iter()
-                .any(|input| input.evidence_ref == evidence.evidence_ref)
-    });
     let mut receipts = tool_executor
         .receipts
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     receipts.sort_by_key(|receipt| receipt.sequence);
+    // A fresh, successfully committed scoped tool receipt is independent
+    // evidence even when its content-addressed EvidenceRef equals an upstream
+    // read of the same unchanged file. Comparing only EvidenceRef identity
+    // incorrectly erased reviewer verification from the acceptance result.
+    let produced_evidence = produced_runtime_evidence(packet, evidence_refs, &receipts);
     let changes = materialized_change_receipts(&receipts);
     let observed_paths = receipts
         .iter()
@@ -1402,10 +1400,10 @@ fn runtime_evaluated_acceptance(
         .collect::<Vec<_>>();
     let output = structured_agent_output(&summary.final_answer);
     let field_present = |field: harness_contract::team::TeamStructuredOutputField| {
-        output
+        let value = output
             .as_ref()
-            .and_then(|object| object.get(field.as_str()))
-            .is_some_and(materialized_json_value)
+            .and_then(|object| object.get(field.as_str()));
+        structured_field_materialized(field, value)
     };
     let scope_observed =
         |scope: &str, paths: &[String]| paths.iter().any(|path| path_within_scope(path, scope));
@@ -1488,6 +1486,37 @@ fn runtime_evaluated_acceptance(
         .map(|requirement| requirement.criterion)
         .collect::<Vec<_>>();
     (acceptance, changes)
+}
+
+fn produced_runtime_evidence(
+    packet: &AgentTaskPacket,
+    evidence_refs: &[harness_contract::context::EvidenceAccessRef],
+    receipts: &[ScopedToolExecutionReceipt],
+) -> bool {
+    !receipts.is_empty()
+        || evidence_refs.iter().any(|evidence| {
+            crate::agent_result_validator::is_materialized_durable_evidence(evidence)
+                && !packet
+                    .evidence_refs
+                    .iter()
+                    .any(|input| input.evidence_ref == evidence.evidence_ref)
+        })
+}
+
+fn structured_field_materialized(
+    field: harness_contract::team::TeamStructuredOutputField,
+    value: Option<&serde_json::Value>,
+) -> bool {
+    if field == harness_contract::team::TeamStructuredOutputField::Risks {
+        // An explicit empty list is a meaningful reviewed conclusion: no
+        // risks were identified. The key must still be present; omission,
+        // null, or an empty prose string remains non-materialized.
+        value.is_some_and(|value| {
+            matches!(value, serde_json::Value::Array(_)) || materialized_json_value(value)
+        })
+    } else {
+        value.is_some_and(materialized_json_value)
+    }
 }
 
 fn materialized_change_receipts(
@@ -1653,6 +1682,39 @@ mod tests {
         }
     }
 
+    fn test_agent_packet(
+        evidence_refs: Vec<harness_contract::context::EvidenceAccessRef>,
+    ) -> AgentTaskPacket {
+        AgentTaskPacket {
+            run_id: "run".into(),
+            agent_id: "agent".into(),
+            task_id: "task".into(),
+            session_id: "session".into(),
+            mission_id: None,
+            team_id: Some("team".into()),
+            graph_id: "graph".into(),
+            node_id: "node".into(),
+            attempt: 1,
+            expected_graph_revision: 0,
+            objective: "review".into(),
+            acceptance: Vec::new(),
+            constraints: Vec::new(),
+            context_refs: Vec::new(),
+            evidence_refs,
+            resource_scopes: Vec::new(),
+            allowed_tools: Vec::new(),
+            allowed_skills: Vec::new(),
+            permission_lease: "read_only".into(),
+            model_lease: "model".into(),
+            budget_lease: harness_contract::context::ContextBudgetLeaseRef::new(
+                "budget", "agent", "agent", 0, 1,
+            ),
+            binding: None,
+            managed_invocation: None,
+            idempotency_key: "key".into(),
+        }
+    }
+
     #[test]
     fn change_and_source_verification_require_digest_delta_and_post_write_read() {
         let unchanged = vec![scoped_receipt(
@@ -1732,6 +1794,53 @@ mod tests {
         ));
         assert!(has_matching_pre_write_read_receipt(&change, &verified));
         assert!(has_matching_read_receipt(&change, &verified, true));
+    }
+
+    #[test]
+    fn fresh_tool_receipt_is_evidence_even_when_content_ref_matches_upstream() {
+        let upstream = harness_contract::context::EvidenceAccessRef::durable(
+            harness_contract::context::EvidenceRef::new("tool", "same-content"),
+            "sha256:same",
+            1,
+            "text/plain",
+            "session-event://session/upstream",
+            "session:session",
+        );
+        let packet = test_agent_packet(vec![upstream.clone()]);
+        assert!(!produced_runtime_evidence(
+            &packet,
+            &[upstream.clone()],
+            &[]
+        ));
+        assert!(produced_runtime_evidence(
+            &packet,
+            &[upstream],
+            &[scoped_receipt(
+                1,
+                harness_contract::tool::ToolEffectKind::Read,
+                "fixtures/target.txt",
+                Some("same"),
+                Some("same"),
+            )],
+        ));
+    }
+
+    #[test]
+    fn explicit_empty_risk_list_is_a_materialized_review_result() {
+        use harness_contract::team::TeamStructuredOutputField;
+
+        assert!(structured_field_materialized(
+            TeamStructuredOutputField::Risks,
+            Some(&serde_json::json!([])),
+        ));
+        assert!(!structured_field_materialized(
+            TeamStructuredOutputField::Risks,
+            None,
+        ));
+        assert!(!structured_field_materialized(
+            TeamStructuredOutputField::Review,
+            Some(&serde_json::json!([])),
+        ));
     }
 
     struct NoopRuntimeExecutionHost;

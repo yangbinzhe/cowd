@@ -89,6 +89,9 @@ struct EvaluationProviderTokenLeaseState {
     lease_id: String,
     limit: u64,
     remaining: u64,
+    input_consumed: u64,
+    output_consumed: u64,
+    cached_consumed: u64,
     outstanding: usize,
     breached: bool,
 }
@@ -98,6 +101,9 @@ pub(crate) struct EvaluationProviderTokenLeaseSnapshot {
     pub lease_id: String,
     pub limit: u64,
     pub consumed: u64,
+    pub input_consumed: u64,
+    pub output_consumed: u64,
+    pub cached_consumed: u64,
     pub outstanding: usize,
     pub breached: bool,
 }
@@ -127,6 +133,9 @@ pub(crate) fn install_evaluation_provider_token_lease(
         lease_id: lease_id.to_string(),
         limit,
         remaining: limit,
+        input_consumed: 0,
+        output_consumed: 0,
+        cached_consumed: 0,
         outstanding: 0,
         breached: false,
     });
@@ -145,6 +154,9 @@ pub(crate) fn evaluation_provider_token_lease_snapshot()
                     lease_id: lease.lease_id.clone(),
                     limit: lease.limit,
                     consumed: lease.limit.saturating_sub(lease.remaining),
+                    input_consumed: lease.input_consumed,
+                    output_consumed: lease.output_consumed,
+                    cached_consumed: lease.cached_consumed,
                     outstanding: lease.outstanding,
                     breached: lease.breached,
                 })
@@ -213,10 +225,11 @@ impl EvaluationProviderTokenReservation {
         if self.reconciled {
             return;
         }
-        let actual = u64::from(usage.input_tokens)
-            .saturating_add(u64::from(usage.output_tokens))
-            .saturating_add(u64::from(usage.cache_creation_input_tokens))
+        let input = u64::from(usage.input_tokens);
+        let output = u64::from(usage.output_tokens);
+        let cached = u64::from(usage.cache_creation_input_tokens)
             .saturating_add(u64::from(usage.cache_read_input_tokens));
+        let actual = input.saturating_add(output).saturating_add(cached);
         if actual == 0 {
             // Missing provider usage is not permission to refund a hard
             // reservation. Drop will close the outstanding request while
@@ -226,6 +239,9 @@ impl EvaluationProviderTokenReservation {
         if let Some(lease) = EVALUATION_PROVIDER_TOKEN_LEASE.get() {
             if let Ok(mut lease) = lease.lock() {
                 if let Some(lease) = lease.as_mut() {
+                    lease.input_consumed = lease.input_consumed.saturating_add(input);
+                    lease.output_consumed = lease.output_consumed.saturating_add(output);
+                    lease.cached_consumed = lease.cached_consumed.saturating_add(cached);
                     if actual <= self.reserved {
                         lease.remaining = lease
                             .remaining
@@ -7325,15 +7341,22 @@ where
             }
             if let Some(receipt) = state.collaboration_receipt.as_ref() {
                 let metric = |name: &str| receipt.get(name).and_then(serde_json::Value::as_u64);
-                outcome.input_tokens = outcome
-                    .input_tokens
-                    .saturating_add(metric("child_input_tokens").unwrap_or(0));
-                outcome.output_tokens = outcome
-                    .output_tokens
-                    .saturating_add(metric("child_output_tokens").unwrap_or(0));
-                outcome.cached_tokens = outcome
-                    .cached_tokens
-                    .saturating_add(metric("child_cached_tokens").unwrap_or(0));
+                // A process-wide evaluation lease already includes Team
+                // children and every fallback request. Adding the receipt a
+                // second time inflated projected usage and broke the hard
+                // budget equality gate. Production turns have no evaluation
+                // lease and still merge child telemetry here.
+                if outcome.evaluation_token_limit == 0 {
+                    outcome.input_tokens = outcome
+                        .input_tokens
+                        .saturating_add(metric("child_input_tokens").unwrap_or(0));
+                    outcome.output_tokens = outcome
+                        .output_tokens
+                        .saturating_add(metric("child_output_tokens").unwrap_or(0));
+                    outcome.cached_tokens = outcome
+                        .cached_tokens
+                        .saturating_add(metric("child_cached_tokens").unwrap_or(0));
+                }
                 outcome.tool_calls = outcome
                     .tool_calls
                     .saturating_add(metric("child_tool_calls").unwrap_or(0));

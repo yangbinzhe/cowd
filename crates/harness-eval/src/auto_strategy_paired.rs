@@ -1461,12 +1461,10 @@ fn cancel_and_wait_for_terminal(
             serde_json::from_value::<harness_contract::projection::ExecutionProjection>(value)
                 .map_err(|error| format!("decode cancelled execution projection: {error}"))
         })?;
-        let child_executions_terminal = projection.child_executions.iter().all(|child| {
-            matches!(
-                child.status.as_str(),
-                "completed" | "failed" | "cancelled" | "blocked"
-            )
-        });
+        let child_executions_terminal = projection
+            .child_executions
+            .iter()
+            .all(|child| child_execution_status_terminal(&child.status));
         let agents_terminal = projection.agents.iter().all(|agent| {
             agent.status.as_deref().is_some_and(|status| {
                 matches!(status, "completed" | "failed" | "cancelled" | "blocked")
@@ -1600,17 +1598,25 @@ fn apply_projection_metrics(
     sample.team_child_count = projection.child_executions.len();
     sample.team_agent_count = projection.agents.len();
     let child_terminal = !projection.child_executions.is_empty()
-        && projection.child_executions.iter().all(|child| {
-            matches!(
-                child.status.as_str(),
-                "completed" | "failed" | "cancelled" | "blocked"
-            )
-        });
+        && projection
+            .child_executions
+            .iter()
+            .all(|child| child_execution_status_terminal(&child.status));
     sample.team_materialized = sample.selected_candidate.as_deref() == Some("team")
         && sample.team_child_count >= 1
         && sample.team_agent_count >= 2
         && child_terminal
         && sample.parent_merge_count == 1;
+}
+
+fn child_execution_status_terminal(status: &str) -> bool {
+    // Runtime execution summaries intentionally expose `terminal` when the
+    // child graph completed without a failure. Older projections used the
+    // more specific `completed`; both are valid terminal vocabulary.
+    matches!(
+        status,
+        "terminal" | "completed" | "failed" | "cancelled" | "blocked"
+    )
 }
 
 fn apply_blind_judge(
@@ -2799,6 +2805,14 @@ mod tests {
             sample.error.as_deref(),
             Some("verify_mutation_fixture:target unchanged")
         );
+    }
+
+    #[test]
+    fn runtime_terminal_child_status_is_not_misclassified_as_running() {
+        assert!(child_execution_status_terminal("terminal"));
+        assert!(child_execution_status_terminal("completed"));
+        assert!(child_execution_status_terminal("failed"));
+        assert!(!child_execution_status_terminal("running"));
     }
 
     #[test]

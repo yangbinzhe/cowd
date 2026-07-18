@@ -930,6 +930,7 @@ where
             .map_err(|error| RuntimeError::new(error.to_string()))?;
             let collaboration_started = start_selected_strategy(
                 &runtime,
+                &state,
                 services.as_ref(),
                 content,
                 &strategy,
@@ -1011,6 +1012,7 @@ where
             }
             let collaboration_started = start_selected_strategy(
                 &runtime,
+                &state,
                 services.as_ref(),
                 content,
                 &strategy,
@@ -1152,12 +1154,27 @@ where
                 crate::execution_core::TurnStrategyDecisionStatus::Completed,
                 crate::execution_core::TurnStrategyActualOutcome {
                     duration_ms: end_to_end_duration_ms,
-                    input_tokens: summary.model_telemetry.input_tokens,
-                    output_tokens: summary.model_telemetry.output_tokens,
-                    cached_tokens: summary
-                        .model_telemetry
-                        .cache_create_tokens
-                        .saturating_add(summary.model_telemetry.cache_read_tokens),
+                    // The evaluation lease is process-wide and reconciles
+                    // every parent, Team child, fallback and judge provider
+                    // request. Its typed totals are therefore authoritative
+                    // when installed; normal turns retain summary telemetry.
+                    input_tokens: evaluation_budget.as_ref().map_or(
+                        summary.model_telemetry.input_tokens,
+                        |budget| budget.input_consumed,
+                    ),
+                    output_tokens: evaluation_budget.as_ref().map_or(
+                        summary.model_telemetry.output_tokens,
+                        |budget| budget.output_consumed,
+                    ),
+                    cached_tokens: evaluation_budget.as_ref().map_or_else(
+                        || {
+                            summary
+                                .model_telemetry
+                                .cache_create_tokens
+                                .saturating_add(summary.model_telemetry.cache_read_tokens)
+                        },
+                        |budget| budget.cached_consumed,
+                    ),
                     tool_calls: summary.tool_results.len() as u64,
                     duplicate_tool_calls: summary.duplicate_tool_calls,
                     max_tool_concurrency_observed: u64::try_from(
@@ -1462,6 +1479,7 @@ fn turn_strategy_resource_snapshot(
 /// whether the already-selected strategy should actually start.
 async fn start_selected_strategy<C, T>(
     runtime: &Arc<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
+    turn_state: &Arc<tokio::sync::Mutex<TurnGraphState>>,
     services: &crate::RuntimeServices,
     objective: &str,
     strategy: &crate::execution_core::TurnStrategyDecisionState,
@@ -1488,6 +1506,12 @@ where
         item.authority = ContextAuthority::Tool;
         item.visibility = ContextVisibility::Private;
         item.evidence = vec![format!("strategy_decision:{}", strategy.decision_id)];
+        if let Some(terminal_summary) = verified_team_terminal_summary(receipt) {
+            turn_state.lock().await.terminal_override = Some((
+                GoalCompletion::Satisfied,
+                terminal_summary,
+            ));
+        }
         runtime.lock().await.push_next_model_context_item(item);
         return Ok(true);
     }
@@ -1879,6 +1903,8 @@ where
                 |graph_id| format!("team_graph:{graph_id}"),
             ),
     ];
+    let terminal_summary = verified_team_terminal_summary(&receipt)
+        .ok_or_else(|| RuntimeError::new("verified Team completed without a terminal summary"))?;
     let runtime = runtime.lock().await;
     if child_early_stopped {
         runtime.record_turn_strategy_early_stop(
@@ -1887,7 +1913,39 @@ where
     }
     runtime.record_turn_strategy_collaboration_receipt(receipt)?;
     runtime.push_next_model_context_item(item);
+    // Never await the turn-state mutex while retaining the ConversationRuntime
+    // mutex; later graph executors acquire these owners in the opposite phase.
+    drop(runtime);
+    turn_state.lock().await.terminal_override =
+        Some((GoalCompletion::Satisfied, terminal_summary));
     Ok(true)
+}
+
+fn verified_team_terminal_summary(receipt: &serde_json::Value) -> Option<String> {
+    let working_state_verified = receipt
+        .get("working_state_verified")
+        .and_then(serde_json::Value::as_bool)
+        .or_else(|| {
+            receipt
+                .pointer("/evidence/working_state_verified")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(false);
+    (receipt.get("status").and_then(serde_json::Value::as_str) == Some("completed")
+        && working_state_verified
+        && receipt
+            .pointer("/execution/terminal_result_available")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false))
+    .then(|| {
+        receipt
+            .get("terminal_summary")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|summary| !summary.is_empty())
+            .map(str::to_string)
+    })
+    .flatten()
 }
 
 fn parent_merge_actuals(
@@ -2619,6 +2677,31 @@ where
         &self,
         ticket: &NodeExecutionTicket,
     ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+        if self.state.lock().await.terminal_override.is_some() {
+            // A verified Host-admitted Team already produced the canonical
+            // terminal synthesis. Do not spend another provider/tool loop
+            // restating or re-executing that checked result in the parent.
+            let mut synthesize = dynamic_node(
+                ticket,
+                0,
+                "precommitted-terminal-synthesize",
+                ExecutionNodeKind::Synthesize,
+                crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND,
+                "inline_model",
+            );
+            synthesize.executor_kind =
+                crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND.to_string();
+            return Ok(NodeExecutionOutcome::new(completed_result(
+                Some(format!("{}:precommitted-terminal", ticket.graph_id)),
+                ExecutionUsage::default(),
+            ))
+            .with_replan(ExecutionGraphReplan {
+                nodes: vec![synthesize.clone()],
+                edges: dynamic_edges(&ticket.node_id, &[synthesize]),
+                reason: "verified Team terminal result bypassed duplicate parent model execution"
+                    .to_string(),
+            }));
+        }
         let (
             content,
             first_step,
@@ -3083,6 +3166,10 @@ where
                                 state.pending_focus_terminal_candidate = Some(text.clone());
                                 state.assistant_messages.pop();
                                 state.pending_transcript.remove(&ticket.node_id);
+                                let verification_calls = focus_verification_tool_calls(
+                                    &state.focus_acceptance_pending_scopes,
+                                    state.iterations,
+                                );
                                 state.content.push_str("\n\n");
                                 state.content.push_str(&instruction);
                                 let mut item = ContextItem::new(
@@ -3106,14 +3193,24 @@ where
                                         )],
                                         expected_graph_revision: None,
                                     });
-                                Some(vec![dynamic_node(
-                                    ticket,
-                                    state.iterations,
-                                    "focus-acceptance-recovery-model",
-                                    ExecutionNodeKind::InlineModel,
-                                    "inline_model",
-                                    "inline_model",
-                                )])
+                                if let Some(calls) = verification_calls {
+                                    Some(tool_nodes_for_calls(
+                                        ticket,
+                                        state.iterations,
+                                        &state.session_id,
+                                        calls,
+                                        self.services.workspace_root(),
+                                    )?)
+                                } else {
+                                    Some(vec![dynamic_node(
+                                        ticket,
+                                        state.iterations,
+                                        "focus-acceptance-recovery-model",
+                                        ExecutionNodeKind::InlineModel,
+                                        "inline_model",
+                                        "inline_model",
+                                    )])
+                                }
                             } else {
                                 let reason = format!(
                                     "delegated role returned a second final answer before completing Focus acceptance actions: {}",
@@ -3424,7 +3521,11 @@ where
                         }
                     }
                     ModelStepIntent::ToolCalls { calls } => {
-                        record_write_attempt_paths(&mut state.write_attempt_paths, &calls);
+                        record_write_attempt_paths(
+                            &mut state.write_attempt_paths,
+                            &calls,
+                            self.services.workspace_root(),
+                        );
                         let pending_focus_write_action = pending_focus_write_action_violation(
                             &state.focus_acceptance_pending_scopes,
                             &state.focus_observed_resource_scopes,
@@ -3531,7 +3632,11 @@ where
                         }
                     }
                     ModelStepIntent::AgentProposal { calls } => {
-                        record_write_attempt_paths(&mut state.write_attempt_paths, &calls);
+                        record_write_attempt_paths(
+                            &mut state.write_attempt_paths,
+                            &calls,
+                            self.services.workspace_root(),
+                        );
                         if let Some(violation) = evaluation_scope_violation(
                             &state.evaluation_resource_scopes,
                             &calls,
@@ -3555,7 +3660,11 @@ where
                         }
                     }
                     ModelStepIntent::TeamProposal { calls } => {
-                        record_write_attempt_paths(&mut state.write_attempt_paths, &calls);
+                        record_write_attempt_paths(
+                            &mut state.write_attempt_paths,
+                            &calls,
+                            self.services.workspace_root(),
+                        );
                         if let Some(violation) = evaluation_scope_violation(
                             &state.evaluation_resource_scopes,
                             &calls,
@@ -3603,7 +3712,11 @@ where
                         }
                     }
                     ModelStepIntent::ApprovalRequired { calls } => {
-                        record_write_attempt_paths(&mut state.write_attempt_paths, &calls);
+                        record_write_attempt_paths(
+                            &mut state.write_attempt_paths,
+                            &calls,
+                            self.services.workspace_root(),
+                        );
                         if let Some(violation) = evaluation_scope_violation(
                             &state.evaluation_resource_scopes,
                             &calls,
@@ -6464,14 +6577,47 @@ fn evaluation_scope_rejection_outcome(
     )
 }
 
-fn record_write_attempt_paths(paths: &mut Vec<String>, calls: &[ModelToolCall]) {
+fn record_write_attempt_paths(
+    paths: &mut Vec<String>,
+    calls: &[ModelToolCall],
+    workspace_root: &std::path::Path,
+) {
     paths.extend(
-        resource_scopes_for_tool_calls(calls)
+        graph_resource_scopes_for_tool_calls(calls, workspace_root)
             .into_iter()
             .filter_map(|scope| scope.strip_prefix("write:").map(str::to_string)),
     );
     paths.sort();
     paths.dedup();
+}
+
+/// Compile deterministic post-write verification into governed read calls.
+///
+/// Focus acceptance scopes are Runtime-authored and already bounded by the
+/// delegated role contract. Executing their exact reads here avoids spending
+/// another provider round trip merely to ask the model to repeat a mechanical
+/// action. Mixed or malformed scopes retain the normal model-driven recovery.
+fn focus_verification_tool_calls(
+    pending_scopes: &[String],
+    iteration: usize,
+) -> Option<Vec<ModelToolCall>> {
+    if pending_scopes.is_empty() {
+        return None;
+    }
+    pending_scopes
+        .iter()
+        .enumerate()
+        .map(|(index, scope)| {
+            let path = scope.strip_prefix("verify_after_write:")?;
+            let (_, path) = normalize_workspace_scope(&format!("read:{path}"))?;
+            (path != ".").then(|| ModelToolCall {
+                id: format!("runtime-focus-verify-{iteration}-{index}"),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": path}).to_string(),
+                depends_on: Vec::new(),
+            })
+        })
+        .collect()
 }
 
 /// Keep stateful runtime orchestration outside a workspace-tool batch.
@@ -7711,7 +7857,12 @@ mod tests {
         )
         .await;
         let summary = result.expect("Host-selected Team must complete");
-        assert_eq!(summary.final_answer, "terminal answer");
+        assert!(summary
+            .final_answer
+            .contains("# Terminal review/synthesis"));
+        assert!(summary
+            .final_answer
+            .contains("bounded host-selected Team role completed"));
 
         let events = services
             .event_store()
@@ -8055,6 +8206,67 @@ mod tests {
             graph_resource_scopes_for_tool_calls(&calls, root.path()),
             vec!["write:."]
         );
+    }
+
+    #[test]
+    fn write_attempt_paths_are_projectable_workspace_relative_refs() {
+        let root = tempfile::tempdir().expect("workspace");
+        let target = root.path().join("fixtures/target.txt");
+        let calls = [ModelToolCall {
+            id: "write".into(),
+            name: "write_file".into(),
+            input: serde_json::json!({"path": target, "content": "updated"}).to_string(),
+            depends_on: Vec::new(),
+        }];
+        let mut attempts = Vec::new();
+
+        record_write_attempt_paths(&mut attempts, &calls, root.path());
+
+        assert_eq!(attempts, vec!["fixtures/target.txt"]);
+    }
+
+    #[test]
+    fn focus_verification_compiles_only_exact_post_write_reads() {
+        let calls = focus_verification_tool_calls(
+            &[
+                "verify_after_write:fixtures/a.txt".into(),
+                "verify_after_write:fixtures/b.txt".into(),
+            ],
+            7,
+        )
+        .expect("exact verification calls");
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|call| call.name == "read_file"));
+        assert_eq!(calls[0].id, "runtime-focus-verify-7-0");
+        assert!(calls[0].input.contains("fixtures/a.txt"));
+        assert!(focus_verification_tool_calls(&["workspace_change:src/lib.rs".into()], 1)
+            .is_none());
+        assert!(focus_verification_tool_calls(
+            &["verify_after_write:../outside.txt".into()],
+            1
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn only_verified_materialized_team_result_can_bypass_parent_model() {
+        let verified = serde_json::json!({
+            "status": "completed",
+            "working_state_verified": true,
+            "terminal_summary": "checked result",
+            "execution": {"terminal_result_available": true}
+        });
+        assert_eq!(
+            verified_team_terminal_summary(&verified).as_deref(),
+            Some("checked result")
+        );
+
+        let mut unverified = verified.clone();
+        unverified["working_state_verified"] = serde_json::json!(false);
+        assert!(verified_team_terminal_summary(&unverified).is_none());
+        let mut missing_result = verified;
+        missing_result["execution"]["terminal_result_available"] = serde_json::json!(false);
+        assert!(verified_team_terminal_summary(&missing_result).is_none());
     }
 
     #[test]
