@@ -655,6 +655,8 @@ where
             bounded_evidence_role: false,
             focus_novelty_target_bp: 0,
             focus_acceptance_scopes: Vec::new(),
+            focus_acceptance_pending_scopes: Vec::new(),
+            pending_focus_terminal_candidate: None,
             clean_terminal_synthesis_next: false,
             clean_terminal_synthesis_attempted: false,
             clean_terminal_retry_attempted: false,
@@ -742,6 +744,7 @@ where
             graph_state.bounded_evidence_role = context_profile == ContextProfile::SubAgent
                 || compile_target == crate::execution_core::RuntimeCompileTarget::EvidenceGraph;
             graph_state.focus_novelty_target_bp = delegated_focus_policy.0;
+            graph_state.focus_acceptance_pending_scopes = delegated_focus_policy.1.clone();
             graph_state.focus_acceptance_scopes = delegated_focus_policy.1;
         }
         let turn_payload = serde_json::json!({
@@ -2408,6 +2411,8 @@ struct TurnGraphState {
     bounded_evidence_role: bool,
     focus_novelty_target_bp: u16,
     focus_acceptance_scopes: Vec<String>,
+    focus_acceptance_pending_scopes: Vec<String>,
+    pending_focus_terminal_candidate: Option<String>,
     clean_terminal_synthesis_next: bool,
     clean_terminal_synthesis_attempted: bool,
     clean_terminal_retry_attempted: bool,
@@ -3058,6 +3063,84 @@ where
                                 &text,
                             );
                         }
+                        let focus_acceptance_continuation = if state.bounded_evidence_role
+                            && !state.focus_acceptance_pending_scopes.is_empty()
+                            && !reasoning_only_response
+                            && !text.trim().is_empty()
+                        {
+                            if state.pending_focus_terminal_candidate.is_none() {
+                                let pending = state.focus_acceptance_pending_scopes.join(", ");
+                                let instruction = format!(
+                                    "Runtime Focus acceptance recovery (mandatory): retain the candidate final JSON, but do not finish yet. Complete the missing Runtime-verified action(s) with native tools: {pending}. For verify_after_write:path, perform a new exact-path read after the committed write receipt. Do not return another final answer until these actions complete."
+                                );
+                                state.pending_focus_terminal_candidate = Some(text.clone());
+                                state.assistant_messages.pop();
+                                state.pending_transcript.remove(&ticket.node_id);
+                                state.content.push_str("\n\n");
+                                state.content.push_str(&instruction);
+                                let mut item = ContextItem::new(
+                                    format!("runtime-focus-acceptance-recovery:{}", ticket.node_id),
+                                    ContextSourceKind::Task,
+                                    ContextRole::Instruction,
+                                    instruction.clone(),
+                                );
+                                item.authority = ContextAuthority::System;
+                                item.visibility = ContextVisibility::Private;
+                                item.evidence = vec![format!("execution_node:{}", ticket.node_id)];
+                                next_model_context = Some(item);
+                                model_intervention =
+                                    Some(harness_contract::goal::RuntimeIntervention {
+                                        goal_id: state.goal_id.clone(),
+                                        kind: RuntimeInterventionKind::Replan,
+                                        reason: instruction,
+                                        evidence_refs: vec![format!(
+                                            "execution_node:{}",
+                                            ticket.node_id
+                                        )],
+                                        expected_graph_revision: None,
+                                    });
+                                Some(vec![dynamic_node(
+                                    ticket,
+                                    state.iterations,
+                                    "focus-acceptance-recovery-model",
+                                    ExecutionNodeKind::InlineModel,
+                                    "inline_model",
+                                    "inline_model",
+                                )])
+                            } else {
+                                let reason = format!(
+                                    "delegated role returned a second final answer before completing Focus acceptance actions: {}",
+                                    state.focus_acceptance_pending_scopes.join(", ")
+                                );
+                                state.assistant_messages.pop();
+                                state.pending_transcript.remove(&ticket.node_id);
+                                state.terminal_override =
+                                    Some((GoalCompletion::Blocked, reason.clone()));
+                                model_intervention =
+                                    Some(harness_contract::goal::RuntimeIntervention {
+                                        goal_id: state.goal_id.clone(),
+                                        kind: RuntimeInterventionKind::Block,
+                                        reason,
+                                        evidence_refs: vec![format!(
+                                            "execution_node:{}",
+                                            ticket.node_id
+                                        )],
+                                        expected_graph_revision: None,
+                                    });
+                                let mut node = dynamic_node(
+                                    ticket,
+                                    state.iterations,
+                                    "focus-acceptance-block-synthesize",
+                                    ExecutionNodeKind::Synthesize,
+                                    crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND,
+                                    "inline_model",
+                                );
+                                node.executor_kind = crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND.to_string();
+                                Some(vec![node])
+                            }
+                        } else {
+                            None
+                        };
                         let normal_reasoning_continuation = if reasoning_only_response
                             && !force_text_only_response
                             && !step.text_only_response
@@ -3113,7 +3196,9 @@ where
                         } else {
                             None
                         };
-                        if let Some(next) = normal_reasoning_continuation {
+                        if let Some(next) = focus_acceptance_continuation {
+                            next
+                        } else if let Some(next) = normal_reasoning_continuation {
                             next
                         // A frozen Judge turn deliberately returns machine JSON
                         // rather than a user-facing answer. The harness validates
@@ -4312,16 +4397,22 @@ where
         state.parallel_tool_batches = state
             .parallel_tool_batches
             .saturating_add(result.parallel_batches);
+        let focus_acceptance_pending_scopes = focus_acceptance_scopes
+            .iter()
+            .filter(|required_scope| {
+                !successful_resource_scope_keys.contains(*required_scope)
+                    && !verified_after_write_scope_keys.contains(*required_scope)
+                    && !resource_scopes_covered_before.contains(required_scope.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         let focus_acceptance_met = bounded_evidence_role
             && !focus_acceptance_scopes.is_empty()
             && failed == 0
-            && focus_acceptance_scopes.iter().all(|required_scope| {
-                successful_resource_scope_keys.contains(required_scope)
-                    || verified_after_write_scope_keys.contains(required_scope)
-                    || resource_scopes_covered_before.contains(required_scope.as_str())
-            });
+            && focus_acceptance_pending_scopes.is_empty();
         let focus_acceptance_pending =
             bounded_evidence_role && !focus_acceptance_scopes.is_empty() && !focus_acceptance_met;
+        state.focus_acceptance_pending_scopes = focus_acceptance_pending_scopes;
         state
             .pending_transcript
             .insert(ticket.node_id.clone(), result.messages.clone());
@@ -4565,18 +4656,38 @@ where
                     .map_or(RuntimeInterventionKind::Continue, |value| value.kind);
                 match kind {
                     RuntimeInterventionKind::Synthesize => {
-                        state.force_text_only_next_model = true;
-                        state.content.push_str(
-                        "\n\nRuntime evidence checkpoint: consecutive tool batches added no new evidence coverage. The next response must synthesize a final answer from retained receipts; tools are disabled for that response. State remaining uncertainty explicitly.\n",
-                    );
-                        dynamic_node(
-                            ticket,
-                            state.iterations,
-                            "policy-text-only-conclusion",
-                            ExecutionNodeKind::InlineModel,
-                            "inline_model",
-                            "inline_model",
-                        )
+                        let focus_terminal_candidate = if focus_acceptance_met {
+                            state.pending_focus_terminal_candidate.take()
+                        } else {
+                            None
+                        };
+                        if let Some(candidate) = focus_terminal_candidate {
+                            state.focus_acceptance_pending_scopes.clear();
+                            state.terminal_override = Some((GoalCompletion::Satisfied, candidate));
+                            let mut node = dynamic_node(
+                                ticket,
+                                state.iterations,
+                                "focus-acceptance-synthesize",
+                                ExecutionNodeKind::Synthesize,
+                                crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND,
+                                "inline_model",
+                            );
+                            node.executor_kind = crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND.to_string();
+                            node
+                        } else {
+                            state.force_text_only_next_model = true;
+                            state.content.push_str(
+                            "\n\nRuntime evidence checkpoint: consecutive tool batches added no new evidence coverage. The next response must synthesize a final answer from retained receipts; tools are disabled for that response. State remaining uncertainty explicitly.\n",
+                        );
+                            dynamic_node(
+                                ticket,
+                                state.iterations,
+                                "policy-text-only-conclusion",
+                                ExecutionNodeKind::InlineModel,
+                                "inline_model",
+                                "inline_model",
+                            )
+                        }
                     }
                     RuntimeInterventionKind::Block => {
                         let reason = intervention
