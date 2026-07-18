@@ -24,10 +24,10 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 pub const AUTO_STRATEGY_SEED: u64 = 20_260_716;
-pub const DEFAULT_MAX_TOKENS: u64 = 8_000_000;
+pub const DEFAULT_MAX_TOKENS: u64 = 20_000_000;
 pub const DEFAULT_MAX_COST_USD_MILLI: u64 = 50_000;
-const BUSINESS_SAMPLE_TOKEN_LEASE: u64 = 48_000;
-const JUDGE_SAMPLE_TOKEN_LEASE: u64 = 16_000;
+const BUSINESS_SAMPLE_TOKEN_LEASE: u64 = 128_000;
+const JUDGE_SAMPLE_TOKEN_LEASE: u64 = 32_000;
 const FROZEN_CORPUS_SHA256: &str =
     "d8dc4ba671dacd7a12b41d0cbe17d1cb4f2d5f5055cb2b9e7cefab2bb8c22e3c";
 const FROZEN_RUBRIC_SHA256: &str =
@@ -2502,7 +2502,7 @@ mod tests {
 
     #[test]
     fn hard_budgets_can_only_be_lowered() {
-        assert!(DEFAULT_MAX_TOKENS == 8_000_000);
+        assert!(DEFAULT_MAX_TOKENS == 20_000_000);
         assert!(DEFAULT_MAX_COST_USD_MILLI == 50_000);
         assert_eq!(
             provider_admission_token_limit(
