@@ -4281,6 +4281,8 @@ where
             && !coverage_keys.is_empty()
             && novelty_target_bp > 0
             && coverage_novelty_bp < novelty_target_bp;
+        let evidence_saturated =
+            failed == 0 && !coverage_keys.is_empty() && newly_covered == 0 && newly_scoped == 0;
         // File-level receipts may be individually new while adding no new
         // responsibility zone. A delegated role has a finite evidence
         // contract, so repeated work inside already-covered zones is a
@@ -4321,19 +4323,22 @@ where
         } else {
             state.consecutive_tool_failure_batches = 0;
         }
-        if failed == 0 && (low_novelty || scope_saturated) {
+        if failed == 0 && (low_novelty || scope_saturated || evidence_saturated) {
             state.consecutive_low_novelty_batches =
                 state.consecutive_low_novelty_batches.saturating_add(1);
         } else {
             state.consecutive_low_novelty_batches = 0;
         }
         let repeated_local_failures = state.consecutive_tool_failure_batches >= 2;
-        let repeated_low_novelty =
-            bounded_evidence_role && state.consecutive_low_novelty_batches >= 2;
+        let repeated_evidence_saturation = state.consecutive_low_novelty_batches
+            >= evidence_saturation_limit(bounded_evidence_role);
         let has_successful_tool_evidence = state.successful_tool_calls > 0;
         state.tool_results.extend(result.messages);
-        state.last_verified_progress =
-            failed == 0 && !repeated_success && !low_novelty && !scope_saturated;
+        state.last_verified_progress = failed == 0
+            && !repeated_success
+            && !low_novelty
+            && !scope_saturated
+            && !evidence_saturated;
         let observation = RuntimeObservation {
             goal_id: state.goal_id.clone(),
             kind: RuntimeObservationKind::ToolProgress,
@@ -4342,9 +4347,9 @@ where
                 format!(
                     "tool batch reused an already-completed action calls={tool_calls}; retained receipt must be used before another identical request"
                 )
-            } else if failed_tools.is_empty() && scope_saturated {
+            } else if failed_tools.is_empty() && (scope_saturated || evidence_saturated) {
                 format!(
-                    "tool batch completed calls={tool_calls} but added no new bounded evidence scope; retain receipts and synthesize"
+                    "tool batch completed calls={tool_calls} but added no new evidence coverage; retain receipts and converge"
                 )
             } else if failed_tools.is_empty() {
                 format!(
@@ -4392,14 +4397,14 @@ where
             ]),
             progress_delta: if failed > 0 {
                 -1
-            } else if repeated_success || low_novelty || scope_saturated {
+            } else if repeated_success || low_novelty || scope_saturated || evidence_saturated {
                 0
             } else {
                 1
             },
             novelty: if failed > 0 {
                 20
-            } else if repeated_success || scope_saturated {
+            } else if repeated_success || scope_saturated || evidence_saturated {
                 5
             } else {
                 u8::try_from(coverage_novelty_bp / 100).unwrap_or(100)
@@ -4407,14 +4412,16 @@ where
         };
         let goal_id = state.goal_id.clone();
         drop(state);
-        if focus_acceptance_met || repeated_low_novelty {
+        if focus_acceptance_met || repeated_evidence_saturation {
             self.runtime
                 .lock()
                 .await
                 .record_turn_strategy_early_stop(if focus_acceptance_met {
                     "the first bounded evidence batch satisfied the Focus acceptance checkpoint"
+                } else if bounded_evidence_role {
+                    "two consecutive bounded evidence batches added no required evidence coverage"
                 } else {
-                    "two consecutive bounded evidence batches fell below the Focus novelty target"
+                    "three consecutive main-turn tool batches added no evidence coverage"
                 })
                 .map_err(|error| NodeExecutorError::Poll {
                     node_id: ticket.node_id.clone(),
@@ -4432,12 +4439,16 @@ where
             })
         } else if continue_with_tool_batch || orchestration_terminal_summary.is_some() {
             None
-        } else if repeated_low_novelty {
+        } else if repeated_evidence_saturation {
             Some(RuntimeIntervention {
                 goal_id: goal_id.clone(),
                 kind: RuntimeInterventionKind::Synthesize,
-                reason: "two consecutive bounded evidence batches were below the novelty target; retain checked evidence and stop the child before another model/tool step"
-                    .to_string(),
+                reason: if bounded_evidence_role {
+                    "two consecutive bounded evidence batches added no required coverage; retain checked evidence and stop the child before another model/tool step"
+                } else {
+                    "three consecutive main-turn tool batches added no evidence coverage; disable tools and synthesize from retained receipts before the token lease is exhausted"
+                }
+                .to_string(),
                 evidence_refs: observation.evidence_refs.clone(),
                 expected_graph_revision: None,
             })
@@ -5745,6 +5756,14 @@ fn tool_batch_coverage_keys(calls: &[ModelToolCall]) -> BTreeSet<String> {
         .iter()
         .flat_map(tool_call_coverage_keys)
         .collect::<BTreeSet<_>>()
+}
+
+/// Delegated evidence roles have a deliberately tighter contract. Main turns
+/// get one additional no-progress batch so a multi-chunk file read is not cut
+/// off prematurely, but must still converge before repeatedly rebuilding an
+/// ever-larger provider context from unchanged evidence.
+const fn evidence_saturation_limit(bounded_evidence_role: bool) -> usize {
+    if bounded_evidence_role { 2 } else { 3 }
 }
 
 /// Responsibility-zone coverage is intentionally coarser than file coverage.
@@ -7933,6 +7952,30 @@ mod tests {
             ConversationMessage::tool_result("c", "read_file", "ok", false),
         ];
         assert_eq!(failed_tool_names(&messages), vec!["runtime_orchestrate"]);
+    }
+
+    #[test]
+    fn evidence_saturation_converges_main_turns_without_child_aggressiveness() {
+        assert_eq!(evidence_saturation_limit(true), 2);
+        assert_eq!(evidence_saturation_limit(false), 3);
+
+        let first = ModelToolCall {
+            id: "read-a".into(),
+            name: "read_file".into(),
+            input: r#"{"path":"src/lib.rs","offset":0,"limit":80}"#.into(),
+            depends_on: Vec::new(),
+        };
+        let second = ModelToolCall {
+            id: "read-b".into(),
+            name: "read_file".into(),
+            input: r#"{"path":"src/lib.rs","offset":80,"limit":80}"#.into(),
+            depends_on: Vec::new(),
+        };
+        assert_eq!(
+            tool_batch_coverage_keys(&[first]),
+            tool_batch_coverage_keys(&[second]),
+            "offset-only rereads must count toward the bounded convergence threshold"
+        );
     }
 
     #[test]
