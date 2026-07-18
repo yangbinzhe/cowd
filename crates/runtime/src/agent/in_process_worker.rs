@@ -682,6 +682,20 @@ fn focus_acceptance_scopes_from_constraints(constraints: &[String]) -> Vec<Strin
                 }),
         );
     }
+    // Reviewer roles receive predecessor change receipts only after the Team
+    // graph has durably completed the upstream node. Convert those immutable
+    // bindings into exact read obligations so a model cannot skip independent
+    // verification merely because the upstream summary already looks
+    // convincing. The host executes these reads through the governed tool DAG.
+    scopes.extend(
+        constraints
+            .iter()
+            .filter_map(|constraint| constraint.strip_prefix("upstream_change_scope:"))
+            .filter_map(|value| {
+                serde_json::from_str::<harness_contract::agent::AgentChangeReceipt>(value).ok()
+            })
+            .map(|change| format!("verify_after_write:{}", change.path)),
+    );
     scopes.sort();
     scopes.dedup();
     scopes
@@ -1663,7 +1677,8 @@ pub(crate) fn structured_agent_output(
     if let Ok(serde_json::Value::Object(object)) = serde_json::from_str(text) {
         return has_contract_field(&object).then_some(object);
     }
-    text.char_indices()
+    if let Some(object) = text
+        .char_indices()
         .filter(|(_, character)| *character == '{')
         .filter_map(|(start, _)| {
             serde_json::Deserializer::from_str(&text[start..])
@@ -1673,6 +1688,43 @@ pub(crate) fn structured_agent_output(
         })
         .filter_map(|value| value.as_object().cloned())
         .find(has_contract_field)
+    {
+        return Some(object);
+    }
+
+    // Some providers occasionally honor the requested field names but return
+    // exact level-two Markdown sections instead of JSON. Normalize only those
+    // explicit contract headings; arbitrary prose remains non-structured.
+    // Runtime acceptance still requires independent tool/change receipts, so
+    // this cannot turn a self-reported review into verified evidence.
+    let mut object = serde_json::Map::new();
+    let mut active_field: Option<&str> = None;
+    let mut active_lines = Vec::new();
+    let flush = |object: &mut serde_json::Map<String, serde_json::Value>,
+                 field: Option<&str>,
+                 lines: &mut Vec<&str>| {
+        if let Some(field) = field {
+            let value = lines.join("\n").trim().to_string();
+            if !value.is_empty() {
+                object.insert(field.to_string(), serde_json::Value::String(value));
+            }
+        }
+        lines.clear();
+    };
+    for line in text.lines() {
+        if let Some(heading) = line.strip_prefix("## ") {
+            flush(&mut object, active_field, &mut active_lines);
+            let normalized = heading.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+            active_field = CONTRACT_FIELDS
+                .iter()
+                .copied()
+                .find(|field| *field == normalized);
+        } else if active_field.is_some() {
+            active_lines.push(line);
+        }
+    }
+    flush(&mut object, active_field, &mut active_lines);
+    (!object.is_empty()).then_some(object)
 }
 
 fn normalized_scope(value: &str) -> &str {
@@ -2057,8 +2109,12 @@ mod tests {
         let review_constraints = vec![
             "focus_output_acceptance:evidence, review, risks".to_string(),
             "team_acceptance_contract:[{\"criterion\":\"evidence\",\"check\":{\"kind\":\"scoped_evidence\",\"scopes\":[\"read:fixtures/target.txt\",\"write:fixtures/target.txt\"]}}]".to_string(),
+            "upstream_change_scope:{\"path\":\"fixtures/target.txt\",\"before_sha256\":\"before\",\"after_sha256\":\"after\",\"write_sequence\":3}".to_string(),
         ];
-        assert!(focus_acceptance_scopes_from_constraints(&review_constraints).is_empty());
+        assert_eq!(
+            focus_acceptance_scopes_from_constraints(&review_constraints),
+            ["verify_after_write:fixtures/target.txt"]
+        );
     }
 
     #[test]
@@ -2264,6 +2320,16 @@ mod tests {
         assert!(structured_agent_output("implementation completed in prose").is_none());
         assert!(structured_agent_output(r#"prefix {"unrelated":"claim"} suffix"#).is_none());
         assert!(structured_agent_output(r#"{"unrelated":"claim"}"#).is_none());
+    }
+
+    #[test]
+    fn structured_agent_output_normalizes_only_exact_contract_headings() {
+        let markdown =
+            "intro\n\n## Review\nverified from fresh receipts\n\n## Risks\nNone identified.\n";
+        let output = structured_agent_output(markdown).expect("heading contract");
+        assert_eq!(output["review"], "verified from fresh receipts");
+        assert_eq!(output["risks"], "None identified.");
+        assert!(structured_agent_output("Review complete; no risks.").is_none());
     }
 
     #[test]

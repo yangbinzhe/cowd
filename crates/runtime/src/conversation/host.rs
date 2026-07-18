@@ -3590,6 +3590,7 @@ where
                                 ticket,
                                 &mut state,
                                 &violation,
+                                self.services.workspace_root(),
                                 "eval-resource-ceiling-replan-model",
                                 format!(
                                     "the pre-registered evaluation resource ceiling rejected `{violation}`; authorized exact scopes are [{authorized_scopes}]. Do not use broad workspace, shell, execute-code, glob, or pathless search calls. Use exact-path file tools for those scopes, including the authorized write tool when the objective requires mutation"
@@ -3686,6 +3687,7 @@ where
                                 ticket,
                                 &mut state,
                                 &violation,
+                                self.services.workspace_root(),
                                 "eval-agent-resource-ceiling-replan-model",
                                 format!(
                                     "the pre-registered evaluation resource ceiling rejected delegated scope `{violation}`"
@@ -3714,6 +3716,7 @@ where
                                 ticket,
                                 &mut state,
                                 &violation,
+                                self.services.workspace_root(),
                                 "eval-team-resource-ceiling-replan-model",
                                 format!(
                                     "the pre-registered evaluation resource ceiling rejected Team scope `{violation}`"
@@ -3766,6 +3769,7 @@ where
                                 ticket,
                                 &mut state,
                                 &violation,
+                                self.services.workspace_root(),
                                 "eval-approval-resource-ceiling-replan-model",
                                 format!(
                                     "the pre-registered evaluation resource ceiling rejected approval for `{violation}`"
@@ -6622,6 +6626,7 @@ fn evaluation_scope_rejection_outcome(
     ticket: &NodeExecutionTicket,
     state: &mut TurnGraphState,
     violation: &str,
+    workspace_root: &std::path::Path,
     replan_node_suffix: &str,
     reason: String,
 ) -> (RuntimeIntervention, Vec<ExecutionNodeSpec>) {
@@ -6644,6 +6649,38 @@ fn evaluation_scope_rejection_outcome(
                 "inline_model",
             )],
         );
+    }
+
+    // A provider may ignore the exact-path correction and repeat a broad
+    // `read:.` request. The registered evaluation contract already contains
+    // the exact paths, so compile those independent reads into one governed
+    // ToolBatch instead of spending another provider turn or blocking useful
+    // work. This recovery is deliberately unavailable to writes, malformed
+    // paths, unbounded scope sets, and any third violation.
+    if state.evaluation_scope_rejections == 2 && violation == "read:." {
+        if let Some(calls) = evaluation_scope_recovery_tool_calls(
+            &state.evaluation_resource_scopes,
+            state.iterations,
+        ) {
+            if let Ok(nodes) = tool_nodes_for_calls(
+                ticket,
+                state.iterations,
+                &state.session_id,
+                calls,
+                workspace_root,
+            ) {
+                return (
+                    RuntimeIntervention {
+                        goal_id: state.goal_id.clone(),
+                        kind: RuntimeInterventionKind::Replan,
+                        reason: "replaced a repeated broad read request with bounded, exact-path reads from the pre-registered evaluation contract".to_string(),
+                        evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
+                        expected_graph_revision: None,
+                    },
+                    nodes,
+                );
+            }
+        }
     }
 
     let terminal_reason = format!(
@@ -6669,6 +6706,43 @@ fn evaluation_scope_rejection_outcome(
             expected_graph_revision: None,
         },
         vec![node],
+    )
+}
+
+/// Compile a repeated broad evaluation read into bounded exact-path calls.
+///
+/// The returned calls are dependency-free so the existing ToolBatch scheduler
+/// can execute them concurrently. Write scopes authorize verification reads,
+/// but never become write calls in this recovery path.
+fn evaluation_scope_recovery_tool_calls(
+    scopes: &[String],
+    iteration: usize,
+) -> Option<Vec<ModelToolCall>> {
+    let mut paths = scopes
+        .iter()
+        .filter_map(|scope| {
+            let (mode, path) = normalize_workspace_scope(scope)?;
+            matches!(mode, "read" | "write" | "workspace")
+                .then_some(path)
+                .filter(|path| path != ".")
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    if paths.is_empty() || paths.len() > 8 {
+        return None;
+    }
+    Some(
+        paths
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| ModelToolCall {
+                id: format!("runtime-eval-exact-read-{iteration}-{index}"),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": path}).to_string(),
+                depends_on: Vec::new(),
+            })
+            .collect(),
     )
 }
 
@@ -8365,6 +8439,32 @@ mod tests {
             1
         )
         .is_none());
+    }
+
+    #[test]
+    fn evaluation_scope_recovery_compiles_bounded_parallel_exact_reads() {
+        let calls = evaluation_scope_recovery_tool_calls(
+            &[
+                "write:fixtures/target.txt".into(),
+                "read:fixtures/protected.txt".into(),
+                "session:ignored".into(),
+            ],
+            9,
+        )
+        .expect("bounded exact reads");
+        assert_eq!(calls.len(), 2);
+        assert!(calls
+            .iter()
+            .all(|call| { call.name == "read_file" && call.depends_on.is_empty() }));
+        assert_eq!(calls[0].id, "runtime-eval-exact-read-9-0");
+        assert!(calls[0].input.contains("fixtures/protected.txt"));
+        assert!(calls[1].input.contains("fixtures/target.txt"));
+        assert!(evaluation_scope_recovery_tool_calls(&["read:.".into()], 1).is_none());
+
+        let too_many = (0..9)
+            .map(|index| format!("read:fixtures/{index}.txt"))
+            .collect::<Vec<_>>();
+        assert!(evaluation_scope_recovery_tool_calls(&too_many, 1).is_none());
     }
 
     #[test]

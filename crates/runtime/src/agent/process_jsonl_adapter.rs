@@ -4,6 +4,9 @@ use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::{Arc, Mutex};
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 use async_trait::async_trait;
 use harness_contract::agent::{
     AgentCommand, AgentCommandRejectReason, AgentCommandRequest, AgentReturnPacket, AgentTaskPacket,
@@ -143,9 +146,7 @@ impl AgentRuntimeBackend for ProcessJsonlAdapter {
             AgentCommand::Pause | AgentCommand::Resume => {
                 Err(AgentCommandRejectReason::UnsupportedByBackend)
             }
-            AgentCommand::Cancel | AgentCommand::Shutdown => active
-                .child
-                .kill()
+            AgentCommand::Cancel | AgentCommand::Shutdown => terminate_process_tree(&mut active)
                 .map_err(|_| AgentCommandRejectReason::UnsupportedByBackend),
             AgentCommand::SendInput | AgentCommand::Interrupt => {
                 let payload = Self::command_envelope(request)?;
@@ -177,8 +178,13 @@ fn execute_child(
     launch_spec.working_directory = Some(workspace_root.clone());
     let prepared = shell_command(&format!("exec {invocation}"), &launch_spec)
         .map_err(|error| format!("prepare hardened ProcessJsonl sandbox failed: {error}"))?;
-    let mut child = prepared
-        .into_command()
+    let mut command = prepared.into_command();
+    // The sandbox launcher may fork an inner namespace process. Give the
+    // entire launch tree its own process group before spawn so cancellation
+    // cannot leave a re-parented descendant holding JSONL pipes open.
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -239,6 +245,31 @@ fn execute_child(
         return Err(format!("ProcessJsonl worker exited with {status}"));
     }
     result
+}
+
+#[cfg(unix)]
+fn terminate_process_tree(active: &mut ActiveProcess) -> std::io::Result<()> {
+    let process_group = active.child.id() as i32;
+    // SAFETY: `execute_child` creates the child as leader of a fresh process
+    // group. A negative PID therefore targets only this adapter-owned launch
+    // tree; the live `Child` handle prevents confusing it with an arbitrary
+    // unrelated process in normal operation.
+    let result = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            active.child.kill().or(Ok(()))
+        } else {
+            Err(error)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_process_tree(active: &mut ActiveProcess) -> std::io::Result<()> {
+    active.child.kill()
 }
 
 fn shell_quote(value: &str) -> String {
@@ -376,7 +407,10 @@ mod tests {
             )
             .await;
         assert!(receipt.is_ok());
-        let result = execution.await.expect("execution task");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), execution)
+            .await
+            .expect("process tree cancellation must not leave a pipe-holding descendant")
+            .expect("execution task");
         assert!(result.is_err());
         assert!(adapter
             .registry
