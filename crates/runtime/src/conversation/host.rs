@@ -655,6 +655,7 @@ where
             force_text_only_next_model: evaluation_control
                 .as_ref()
                 .is_some_and(|control| control.provider_constraint == "judge"),
+            force_tool_allowlist_next_model: None,
             terminal_recovery_attempts: 0,
             delegated_agent_role: false,
             bounded_evidence_role: false,
@@ -2512,6 +2513,7 @@ struct TurnGraphState {
     last_verified_progress: bool,
     reasoning_only_attempts: u8,
     force_text_only_next_model: bool,
+    force_tool_allowlist_next_model: Option<BTreeSet<String>>,
     terminal_recovery_attempts: u8,
     delegated_agent_role: bool,
     bounded_evidence_role: bool,
@@ -2754,6 +2756,7 @@ where
             first_step,
             fuse_intervention,
             force_text_only_response,
+            force_tool_allowlist,
             clean_terminal_synthesis,
             clean_terminal_evidence,
             pending_next_model_context,
@@ -2808,6 +2811,7 @@ where
                 // recovery may schedule another explicit override below, but
                 // stale state must never disable tools for later turns.
                 std::mem::take(&mut state.force_text_only_next_model),
+                state.force_tool_allowlist_next_model.take(),
                 clean_terminal_synthesis,
                 clean_terminal_evidence,
                 std::mem::take(&mut state.pending_next_model_context),
@@ -2857,8 +2861,12 @@ where
                 detail: Some("requesting model".to_string()),
             });
         }
-        if force_text_only_response && !clean_terminal_synthesis {
-            runtime.require_next_model_final_response();
+        if !clean_terminal_synthesis {
+            if force_text_only_response {
+                runtime.require_next_model_final_response();
+            } else if let Some(tool_ids) = force_tool_allowlist {
+                runtime.require_next_model_tools(tool_ids);
+            }
         }
         let transcript_len = runtime.session_async().await.messages.len();
         let result = if clean_terminal_synthesis {
@@ -6680,6 +6688,7 @@ fn focus_action_rejection_outcome(
     state.focus_action_rejections = state.focus_action_rejections.saturating_add(1);
     let pending = pending_writes.join(", ");
     if state.focus_action_rejections <= 2 {
+        state.force_tool_allowlist_next_model = Some(required_mutation_tool_allowlist());
         let reason = format!(
             "the delegated mutation role already has its required pre-write read receipt; the next accepted action must invoke an authorized write tool for [{pending}]. Do not reread, search, glob, synthesize, or claim the change in prose before the committed write receipt exists"
         );
@@ -6799,6 +6808,7 @@ fn evaluation_scope_rejection_outcome(
         state.required_write_for_completion,
         &state.write_attempt_paths,
     ) {
+        state.force_tool_allowlist_next_model = Some(required_mutation_tool_allowlist());
         let reason = "exact-path evidence is already retained, but the mutation objective has not attempted its authorized write. Do not read the workspace broadly again. Invoke the smallest authorized exact-path write now, or return an honest blocked result if the retained evidence is insufficient".to_string();
         return (
             RuntimeIntervention {
@@ -6817,6 +6827,45 @@ fn evaluation_scope_rejection_outcome(
                 "inline_model",
             )],
         );
+    }
+
+    // If the broad read is requested after a successful write receipt, it
+    // represents verification intent rather than another pre-write
+    // exploration. Compile one final bounded exact-read batch from the existing
+    // evaluation lease;
+    // no model-authored path, extra write, or scope expansion is admitted.
+    if post_write_exact_read_recovery_allowed(
+        state.evaluation_scope_rejections,
+        violation,
+        state.required_write_for_completion,
+        state
+            .focus_observed_resource_scopes
+            .iter()
+            .any(|scope| scope.starts_with("write:")),
+    ) {
+        if let Some(calls) = evaluation_scope_recovery_tool_calls(
+            &state.evaluation_resource_scopes,
+            state.iterations,
+        ) {
+            if let Ok(nodes) = tool_nodes_for_calls(
+                ticket,
+                state.iterations,
+                &state.session_id,
+                calls,
+                workspace_root,
+            ) {
+                return (
+                    RuntimeIntervention {
+                        goal_id: state.goal_id.clone(),
+                        kind: RuntimeInterventionKind::Replan,
+                        reason: "replaced a post-write broad read with bounded, exact-path verification reads from the pre-registered evaluation contract".to_string(),
+                        evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
+                        expected_graph_revision: None,
+                    },
+                    nodes,
+                );
+            }
+        }
     }
 
     let terminal_reason = format!(
@@ -6855,6 +6904,22 @@ fn required_write_final_replan_allowed(
         && violation == "read:."
         && required_write_for_completion
         && write_attempt_paths.is_empty()
+}
+
+fn post_write_exact_read_recovery_allowed(
+    rejection_count: u8,
+    violation: &str,
+    required_write_for_completion: bool,
+    successful_write_observed: bool,
+) -> bool {
+    rejection_count == 3
+        && violation == "read:."
+        && required_write_for_completion
+        && successful_write_observed
+}
+
+fn required_mutation_tool_allowlist() -> BTreeSet<String> {
+    BTreeSet::from(["edit_file".to_string(), "write_file".to_string()])
 }
 
 /// Compile a repeated broad evaluation read into bounded exact-path calls.
@@ -8729,6 +8794,34 @@ mod tests {
             true,
             &["fixtures/target.txt".into()],
         ));
+        assert!(post_write_exact_read_recovery_allowed(
+            3,
+            "read:.",
+            true,
+            true,
+        ));
+        assert!(!post_write_exact_read_recovery_allowed(
+            2,
+            "read:.",
+            true,
+            true,
+        ));
+        assert!(!post_write_exact_read_recovery_allowed(
+            3,
+            "read:src",
+            true,
+            true,
+        ));
+        assert!(!post_write_exact_read_recovery_allowed(
+            3,
+            "read:.",
+            true,
+            false,
+        ));
+        assert_eq!(
+            required_mutation_tool_allowlist(),
+            BTreeSet::from(["edit_file".to_string(), "write_file".to_string()])
+        );
     }
 
     #[test]

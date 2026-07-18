@@ -882,10 +882,15 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
                         .delegated_tool_effect_descriptor(tool_name, &input)
                 });
         }
-        self.allowed_tools
-            .contains(tool_name)
-            .then(|| self.host.delegated_tool_effect_descriptor(tool_name, input))
-            .flatten()
+        self.allowed_tools.contains(tool_name).then(|| {
+            let normalized = normalize_workspace_internal_resource_value(
+                tool_name,
+                input.clone(),
+                &self.workspace_root,
+            );
+            self.host
+                .delegated_tool_effect_descriptor(tool_name, &normalized)
+        })?
     }
 
     fn execute_authorized(
@@ -1190,8 +1195,23 @@ fn normalize_workspace_internal_resource_paths(
     input: &str,
     workspace_root: &std::path::Path,
 ) -> Result<String, ToolError> {
-    let mut parsed = serde_json::from_str::<serde_json::Value>(input)
+    let parsed = serde_json::from_str::<serde_json::Value>(input)
         .map_err(|error| ToolError::new(format!("invalid scoped tool input: {error}")))?;
+    let parsed = normalize_workspace_internal_resource_value(tool_name, parsed, workspace_root);
+    serde_json::to_string(&parsed)
+        .map_err(|error| ToolError::new(format!("serialize normalized scoped tool input: {error}")))
+}
+
+/// Normalize workspace-internal absolute resource paths before both effect
+/// description and execution. Keeping those two inputs byte-equivalent is a
+/// security invariant: an input-sensitive ToolHost must be able to verify the
+/// authorization descriptor without treating the safe relative rewrite as a
+/// stale or escalated effect.
+fn normalize_workspace_internal_resource_value(
+    tool_name: &str,
+    mut parsed: serde_json::Value,
+    workspace_root: &std::path::Path,
+) -> serde_json::Value {
     let requested = crate::tool_execution_plan::resource_scope_for_tool_request(
         tool_name,
         &parsed,
@@ -1211,7 +1231,7 @@ fn normalize_workspace_internal_resource_paths(
         })
         .collect::<BTreeMap<_, _>>();
     if replacements.is_empty() {
-        return Ok(input.to_string());
+        return parsed;
     }
 
     fn rewrite(value: &mut serde_json::Value, replacements: &BTreeMap<String, String>) {
@@ -1238,8 +1258,7 @@ fn normalize_workspace_internal_resource_paths(
     }
 
     rewrite(&mut parsed, &replacements);
-    serde_json::to_string(&parsed)
-        .map_err(|error| ToolError::new(format!("serialize normalized scoped tool input: {error}")))
+    parsed
 }
 
 fn workspace_file_sha256(workspace_root: &std::path::Path, relative: &str) -> Option<String> {
@@ -2133,6 +2152,59 @@ mod tests {
         }
     }
 
+    struct InputSensitiveRuntimeExecutionHost;
+
+    impl InputSensitiveRuntimeExecutionHost {
+        fn descriptor(
+            tool_name: &str,
+            input: &serde_json::Value,
+        ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
+            let mut descriptor = test_tool_descriptor(tool_name)?;
+            let encoded = serde_json::to_vec(input).ok()?;
+            descriptor.descriptor_hash = format!("input:{:x}", Sha256::digest(encoded));
+            Some(descriptor)
+        }
+    }
+
+    impl crate::RuntimeExecutionHost for InputSensitiveRuntimeExecutionHost {
+        fn execute_runtime_tool(
+            &self,
+            request: &crate::RuntimeToolExecutionRequest,
+        ) -> crate::RuntimeToolExecutionOutcome {
+            let parsed = serde_json::from_str::<serde_json::Value>(&request.input).ok();
+            let current_hash = parsed.as_ref().and_then(|input| {
+                Self::descriptor(&request.tool_name, input)
+                    .map(|descriptor| descriptor.descriptor_hash)
+            });
+            let authorized_hash = request
+                .authorization
+                .as_ref()
+                .map(|authorization| authorization.descriptor_hash.as_str());
+            let authorized = current_hash.as_deref() == authorized_hash;
+            crate::RuntimeToolExecutionOutcome {
+                tool_use_id: request.tool_use_id.clone(),
+                tool_name: request.tool_name.clone(),
+                status: if authorized {
+                    crate::RuntimeToolExecutionStatus::Executed
+                } else {
+                    crate::RuntimeToolExecutionStatus::BlockedPermission
+                },
+                category: request.category,
+                output: authorized.then(|| format!("authorized:{}", request.tool_name)),
+                error: (!authorized).then(|| "tool authorization is stale".to_string()),
+                evidence_ref: format!("agent-tool:{}", request.tool_use_id),
+            }
+        }
+
+        fn delegated_tool_effect_descriptor(
+            &self,
+            tool_name: &str,
+            input: &serde_json::Value,
+        ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
+            Self::descriptor(tool_name, input)
+        }
+    }
+
     fn test_tool_descriptor(
         tool_name: &str,
     ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
@@ -2348,6 +2420,51 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(receipts.len(), 1);
         assert_eq!(receipts[0].paths, ["crates/runtime/src/lib.rs"]);
+    }
+
+    #[test]
+    fn absolute_path_authorization_and_execution_share_the_normalized_descriptor() {
+        let root = tempfile::tempdir().expect("scoped workspace");
+        let target = root.path().join("fixtures/target.txt");
+        std::fs::create_dir_all(target.parent().expect("target parent")).expect("scope directory");
+        std::fs::write(&target, "checked").expect("scope file");
+        let executor = ScopedRuntimeToolExecutor {
+            host: Arc::new(InputSensitiveRuntimeExecutionHost),
+            allowed_tools: BTreeSet::from(["read_file".to_string()]),
+            session_id: "session".to_string(),
+            model_lease: "model".to_string(),
+            execution_id: "graph".to_string(),
+            node_id: "node".to_string(),
+            workspace_root: root.path().to_path_buf(),
+            resource_scopes: Some(vec!["read:fixtures/target.txt".to_string()]),
+            managed_invocation: None,
+            next_receipt_sequence: AtomicU64::new(0),
+            receipts: Mutex::new(Vec::new()),
+        };
+        let absolute_value = serde_json::json!({"path": target});
+        let descriptor = executor
+            .describe_tool_effect("read_file", &absolute_value)
+            .expect("normalized effect descriptor");
+        let authorization = crate::ToolPolicy
+            .authorize(&descriptor, "absolute-agent-read", PermissionMode::ReadOnly, 30)
+            .expect("normalized read authorization")
+            .authorization;
+
+        assert_eq!(
+            executor
+                .execute_authorized(
+                    &authorization,
+                    "read_file",
+                    &absolute_value.to_string(),
+                )
+                .expect("same normalized descriptor must remain current"),
+            "authorized:read_file"
+        );
+        let receipts = executor
+            .receipts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(receipts[0].paths, ["fixtures/target.txt"]);
     }
 
     #[cfg(unix)]

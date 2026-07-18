@@ -1716,12 +1716,13 @@ fn apply_blind_judge(
             .filter(|value| valid_judge_output(value, &labels, &options.judge_model));
         let isolated =
             judge_attempt_isolated(&judge, parsed.as_ref(), &options.judge_model, attempt_limit);
+        let known_zero_usage = zero_provider_usage_proven(&judge, consumed);
         judge_usage.tokens = judge_usage.tokens.saturating_add(consumed);
         judge_usage.cost_usd_milli = judge_usage
             .cost_usd_milli
             .saturating_add(judge.cost_usd_milli);
-        judge_usage.usage_observed &= judge.usage_observed;
-        judge_usage.cost_observed &= judge.cost_observed;
+        judge_usage.usage_observed &= judge.usage_observed || known_zero_usage;
+        judge_usage.cost_observed &= judge.cost_observed || known_zero_usage;
         remaining_tokens = remaining_tokens.saturating_sub(consumed);
         judge_attempts.push(json!({
             "attempt": attempt,
@@ -1732,6 +1733,7 @@ fn apply_blind_judge(
             "observed_models": judge.models_used,
             "parsed": parsed.is_some(),
             "isolation_verified": isolated,
+            "zero_provider_usage_proven": known_zero_usage,
         }));
         final_parsed = parsed;
         final_judge = Some(judge);
@@ -1797,6 +1799,35 @@ fn apply_blind_judge(
         });
     }
     judge_usage
+}
+
+/// A governed Judge attempt may terminate before dispatching any provider
+/// request. That is a known zero, not missing usage, only when the complete
+/// Runtime projection and evaluation lease independently agree that no model
+/// ran and no token/cost was consumed. Failed polling or a partial projection
+/// remains unobserved and therefore fail-closed.
+fn zero_provider_usage_proven(sample: &Sample, consumed: u64) -> bool {
+    let Some(nodes) = sample.projection.pointer("/graph/nodes").and_then(Value::as_array) else {
+        return false;
+    };
+    consumed == 0
+        && sample.input_tokens == 0
+        && sample.output_tokens == 0
+        && sample.cached_tokens == 0
+        && sample.cost_usd_milli == 0
+        && sample.models_used.is_empty()
+        && sample.evaluation_control_observed
+        && sample.evaluation_budget_observed
+        && !sample.evaluation_budget_breached
+        && sample.evaluation_tokens_consumed == 0
+        && !nodes.is_empty()
+        && nodes.iter().all(|node| {
+            let usage = node.get("usage").unwrap_or(&Value::Null);
+            value_u64(usage, &["input_tokens"]) == 0
+                && value_u64(usage, &["output_tokens"]) == 0
+                && value_u64(usage, &["cached_tokens"]) == 0
+                && usage.get("model").is_none_or(Value::is_null)
+        })
 }
 
 fn judge_attempt_isolated(
@@ -2928,6 +2959,40 @@ mod tests {
             "qwen3.7-plus",
             1_000,
         ));
+    }
+
+    #[test]
+    fn complete_projection_can_prove_a_zero_provider_judge_attempt() {
+        let task = AutoStrategyTask {
+            task_id: "judge-zero-usage-proof".to_string(),
+            expected_candidate: "direct".to_string(),
+            prompt: "judge".to_string(),
+            acceptance: vec!["strict JSON scores".to_string()],
+            workspace_fixture: "none".to_string(),
+            provider_constraint: "judge".to_string(),
+            mutation_fixture: None,
+            judge_only: true,
+        };
+        let mut sample = sample_shell(&task, 0, false, 0, Condition::Direct);
+        sample.evaluation_control_observed = true;
+        sample.evaluation_budget_observed = true;
+        sample.evaluation_tokens_consumed = 0;
+        sample.projection = json!({
+            "graph": {
+                "nodes": [
+                    {"kind": "session_dispatch", "usage": {"input_tokens": 0, "output_tokens": 0, "cached_tokens": 0}},
+                    {"kind": "synthesize", "usage": {"input_tokens": 0, "output_tokens": 0, "cached_tokens": 0}}
+                ]
+            }
+        });
+
+        assert!(zero_provider_usage_proven(&sample, 0));
+        sample.projection = Value::Null;
+        assert!(!zero_provider_usage_proven(&sample, 0));
+        sample.projection = json!({
+            "graph": {"nodes": [{"usage": {"input_tokens": 1, "model": "qwen3.7-plus"}}]}
+        });
+        assert!(!zero_provider_usage_proven(&sample, 0));
     }
 
     #[test]

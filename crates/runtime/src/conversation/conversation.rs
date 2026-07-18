@@ -1353,6 +1353,11 @@ pub struct ConversationRuntime<C, T> {
     /// One governed checkpoint can require a conclusion from evidence already
     /// held by the turn. It affects only the next provider request.
     next_model_text_only: AtomicBool,
+    /// One governed checkpoint can narrow exactly the next provider request to
+    /// a named subset of already-discovered tools. This never grants a tool or
+    /// widens its permission/resource lease, and normal exposure is restored
+    /// after the request.
+    next_model_tool_allowlist: std::sync::Mutex<Option<BTreeSet<String>>>,
     /// Bounded short-term tool trace context for subsequent turns.
     tool_trace_context_items: std::sync::Mutex<Vec<ContextItem>>,
     /// Governance observations produced by tool calls in the active turn.
@@ -1613,6 +1618,7 @@ where
             external_context_items: std::sync::Mutex::new(Vec::new()),
             next_model_context_items: std::sync::Mutex::new(Vec::new()),
             next_model_text_only: AtomicBool::new(false),
+            next_model_tool_allowlist: std::sync::Mutex::new(None),
             tool_trace_context_items: std::sync::Mutex::new(Vec::new()),
             turn_tool_observations: std::sync::Mutex::new(Vec::new()),
             active_turn_strategy: std::sync::Mutex::new(None),
@@ -1878,6 +1884,18 @@ where
     /// checkpoint. The normal dynamic tool exposure is restored afterwards.
     pub(crate) fn require_next_model_final_response(&self) {
         self.next_model_text_only.store(true, Ordering::SeqCst);
+    }
+
+    /// Restrict exactly one provider request to an existing subset of tools.
+    /// Tool discovery, authorization and resource ceilings remain authoritative;
+    /// unknown names are omitted rather than activated.
+    pub(crate) fn require_next_model_tools(
+        &self,
+        tool_ids: impl IntoIterator<Item = String>,
+    ) {
+        if let Ok(mut allowlist) = self.next_model_tool_allowlist.lock() {
+            *allowlist = Some(tool_ids.into_iter().collect());
+        }
     }
 
     /// Run one clean, zero-tool synthesis request from the original objective
@@ -3440,6 +3458,11 @@ where
         }
 
         let text_only_response = self.next_model_text_only.swap(false, Ordering::SeqCst);
+        let one_shot_tool_allowlist = self
+            .next_model_tool_allowlist
+            .lock()
+            .ok()
+            .and_then(|mut allowlist| allowlist.take());
         let explicitly_forbids_tool_use =
             harness_contract::strategy::prompt_explicitly_forbids_tool_use(user_input);
         let discovery = self.tool_executor.tool_discovery_receipt();
@@ -3466,6 +3489,7 @@ where
                     )
                 })
         };
+        let one_shot_tool_overlay = one_shot_tool_allowlist.is_some();
         let mut exposure = if text_only_response || explicitly_forbids_tool_use {
             ToolExposureState {
                 catalog_revision: exposure.catalog_revision,
@@ -3480,6 +3504,34 @@ where
                 revision: exposure.revision.saturating_add(1),
                 fallback_full: false,
             }
+        } else if let Some(allowlist) = one_shot_tool_allowlist {
+            let eligible_tools = exposure
+                .bootstrap
+                .iter()
+                .chain(exposure.active.iter())
+                .chain(exposure.deferred.iter())
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let active = eligible_tools
+                .iter()
+                .filter(|tool_id| allowlist.contains(*tool_id))
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let deferred = available_tools
+                .iter()
+                .filter(|tool_id| !active.contains(*tool_id))
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            ToolExposureState {
+                catalog_revision: exposure.catalog_revision,
+                bootstrap: Default::default(),
+                active,
+                deferred,
+                reason: "governed focus checkpoint restricts the next action to required mutation tools"
+                    .to_string(),
+                revision: exposure.revision.saturating_add(1),
+                fallback_full: false,
+            }
         } else {
             exposure
         };
@@ -3490,7 +3542,7 @@ where
         // A text-only checkpoint is a one-request overlay. Keep the normal
         // catalog state for discovery/projection, while still sending an
         // explicit empty schema set for this provider request.
-        if !text_only_response && !explicitly_forbids_tool_use {
+        if !text_only_response && !explicitly_forbids_tool_use && !one_shot_tool_overlay {
             if let Ok(mut state) = self.tool_exposure_state.lock() {
                 *state = Some(exposure.clone());
             }
@@ -10176,6 +10228,80 @@ mod tests {
                 .deferred_ids
                 .contains(&"custom_reader".to_string())
         );
+    }
+
+    struct MutationExposureToolExecutor;
+
+    impl crate::ToolExecutor for MutationExposureToolExecutor {
+        fn execute(&self, _name: &str, _input: &str) -> Result<String, crate::ToolError> {
+            Err(crate::ToolError::new("exposure test executor must not run"))
+        }
+
+        fn available_tool_names(&self) -> Vec<String> {
+            vec![
+                "ToolSearch".to_string(),
+                "read_file".to_string(),
+                "grep_search".to_string(),
+                "edit_file".to_string(),
+                "write_file".to_string(),
+            ]
+        }
+    }
+
+    #[tokio::test]
+    async fn mutation_checkpoint_exposes_only_writes_for_one_model_request() {
+        let projections = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let api = ExposureRecordingApi {
+            projections: Arc::clone(&projections),
+        };
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            api,
+            MutationExposureToolExecutor,
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+
+        runtime.require_next_model_tools([
+            "edit_file".to_string(),
+            "write_file".to_string(),
+            "unknown_mutator".to_string(),
+        ]);
+        runtime
+            .begin_turn_strategy("test-mutation-exposure-turn", "write the authorized file")
+            .expect("test turn strategy admission");
+        runtime
+            .execute_model_step("write the authorized file", true)
+            .await
+            .expect("write-only model step");
+        runtime
+            .execute_model_step("write the authorized file", false)
+            .await
+            .expect("restored model step");
+
+        let projections = projections.lock().unwrap();
+        assert_eq!(projections.len(), 2);
+        assert_eq!(
+            projections[0].active_ids,
+            vec!["edit_file".to_string(), "write_file".to_string()]
+        );
+        assert!(!projections[0]
+            .active_ids
+            .contains(&"unknown_mutator".to_string()));
+        assert!(projections[0]
+            .deferred_ids
+            .contains(&"read_file".to_string()));
+        assert!(projections[1]
+            .active_ids
+            .contains(&"ToolSearch".to_string()));
+        assert!(projections[1]
+            .active_ids
+            .contains(&"read_file".to_string()));
+        assert!(projections[1]
+            .active_ids
+            .contains(&"grep_search".to_string()));
+        assert!(projections[1].exposure_revision > projections[0].exposure_revision);
     }
 
     #[derive(Clone)]
