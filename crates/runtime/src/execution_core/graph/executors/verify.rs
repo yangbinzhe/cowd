@@ -151,17 +151,11 @@ impl NodeExecutor for VerifyNodeExecutor {
                             )
                         })
                         .collect::<BTreeSet<_>>();
-                    let produced_evidence = result.evidence_refs.iter().any(|reference| {
-                        crate::agent_result_validator::is_materialized_durable_evidence(reference)
-                            && !packet
-                                .evidence_refs
-                                .iter()
-                                .any(|input| input.evidence_ref == reference.evidence_ref)
-                            && !upstream_evidence.contains(&(
-                                reference.evidence_ref.0.ref_type.clone(),
-                                reference.evidence_ref.0.id.clone(),
-                            ))
-                    });
+                    let produced_evidence = produced_team_evidence(
+                        result,
+                        &packet.evidence_refs,
+                        &upstream_evidence,
+                    );
                     let completed_acceptance = packet.acceptance.iter().all(|criterion| {
                         result.evidence_refs.iter().any(|reference| {
                             reference.evidence_ref.0.ref_type == "runtime_acceptance"
@@ -362,6 +356,31 @@ fn packet_constraint(
         .map(str::to_string)
 }
 
+fn produced_team_evidence(
+    result: &ExecutionNodeResult,
+    input_evidence: &[EvidenceAccessRef],
+    upstream_evidence: &BTreeSet<(String, String)>,
+) -> bool {
+    // Content-addressed verification reads can legitimately retain the same
+    // EvidenceRef as their upstream input. The Agent executor carries the
+    // Runtime-derived tool/scoped usage into the committed node result, so a
+    // fresh scoped tool observation proves reacquisition without weakening
+    // the durable evidence requirement.
+    let fresh_runtime_tool_observed = result.usage.tool_calls > 0
+        && !result.usage.runtime_observed_resource_scopes.is_empty();
+    result.evidence_refs.iter().any(|reference| {
+        crate::agent_result_validator::is_materialized_durable_evidence(reference)
+            && (fresh_runtime_tool_observed
+                || (!input_evidence
+                    .iter()
+                    .any(|input| input.evidence_ref == reference.evidence_ref)
+                    && !upstream_evidence.contains(&(
+                        reference.evidence_ref.0.ref_type.clone(),
+                        reference.evidence_ref.0.id.clone(),
+                    ))))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,5 +470,40 @@ mod tests {
         let result = executor.poll_or_await(&ticket).await.unwrap().result;
         assert_eq!(result.status, ExecutionNodeStatus::Completed);
         assert_eq!(result.evidence_refs.len(), 1);
+    }
+
+    #[test]
+    fn team_verification_accepts_fresh_scoped_read_with_same_evidence_ref() {
+        let shared = evidence("same-content");
+        let upstream = BTreeSet::from([(
+            shared.evidence_ref.0.ref_type.clone(),
+            shared.evidence_ref.0.id.clone(),
+        )]);
+        let mut result = ExecutionNodeResult {
+            status: ExecutionNodeStatus::Completed,
+            result_ref: Some("agent-return:reviewer".to_string()),
+            summary: Some("reviewed".to_string()),
+            evidence_refs: vec![shared.clone()],
+            failure: None,
+            usage: ExecutionUsage {
+                tool_calls: 1,
+                runtime_observed_resource_scopes: vec!["read:src".to_string()],
+                ..ExecutionUsage::default()
+            },
+            finished_at_ms: 1,
+        };
+
+        assert!(produced_team_evidence(
+            &result,
+            std::slice::from_ref(&shared),
+            &upstream,
+        ));
+
+        result.usage.runtime_observed_resource_scopes.clear();
+        assert!(!produced_team_evidence(
+            &result,
+            std::slice::from_ref(&shared),
+            &upstream,
+        ));
     }
 }
