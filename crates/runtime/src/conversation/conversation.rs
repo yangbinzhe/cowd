@@ -8023,6 +8023,42 @@ fn strategy_experience_path() -> std::path::PathBuf {
         .join("strategy-experience.json")
 }
 
+fn eval_override_selection(
+    override_: &str,
+    _requires_write: bool,
+    _sample_source: &str,
+) -> Result<
+    Option<(
+        harness_contract::strategy::ExecutionCandidateKind,
+        harness_contract::core::ExecutionPattern,
+    )>,
+    RuntimeError,
+> {
+    let normalized = override_.trim().to_ascii_lowercase();
+    let selection = match normalized.as_str() {
+        "auto" => return Ok(None),
+        // Direct 是评测候选身份，不是移除安全门的许可。只读复杂任务和
+        // 盲审规约同样可能携带 policy gates；裁剪为 Direct 图会让请求在
+        // 模型调用前物化失败。Execute 图不会强制调用工具或启用并行，
+        // 因而既保留完整策略门，也保持 Direct 候选的串行执行语义。
+        "direct" => (
+            harness_contract::strategy::ExecutionCandidateKind::Direct,
+            harness_contract::core::ExecutionPattern::Execute,
+        ),
+        // Parallel 同样只增加并行修饰符，不以 Explore 图替换原有安全门。
+        "parallel_tools" | "parallel" => (
+            harness_contract::strategy::ExecutionCandidateKind::ParallelTools,
+            harness_contract::core::ExecutionPattern::Execute,
+        ),
+        unknown => {
+            return Err(RuntimeError::new(format!(
+                "unsupported eval-only strategy override `{unknown}`"
+            )));
+        }
+    };
+    Ok(Some(selection))
+}
+
 fn apply_eval_strategy_override(
     decision: &mut crate::execution_core::RuntimeExecutionDecision,
 ) -> Result<(), RuntimeError> {
@@ -8034,29 +8070,13 @@ fn apply_eval_strategy_override(
     let Ok(override_) = std::env::var("COWD_EVAL_STRATEGY_OVERRIDE") else {
         return Ok(());
     };
-    let (candidate, pattern) = match override_.trim().to_ascii_lowercase().as_str() {
-        "auto" => return Ok(()),
-        "direct" => (
-            harness_contract::strategy::ExecutionCandidateKind::Direct,
-            if decision.strategy.understanding.requires_write {
-                harness_contract::core::ExecutionPattern::Execute
-            } else {
-                harness_contract::core::ExecutionPattern::Direct
-            },
-        ),
-        "parallel_tools" | "parallel" => (
-            harness_contract::strategy::ExecutionCandidateKind::ParallelTools,
-            if decision.strategy.understanding.requires_write {
-                harness_contract::core::ExecutionPattern::Execute
-            } else {
-                harness_contract::core::ExecutionPattern::Explore
-            },
-        ),
-        unknown => {
-            return Err(RuntimeError::new(format!(
-                "unsupported eval-only strategy override `{unknown}`"
-            )));
-        }
+    let Some((candidate, pattern)) = eval_override_selection(
+        &override_,
+        decision.strategy.understanding.requires_write,
+        &decision.strategy.resource_snapshot.sample_source,
+    )?
+    else {
+        return Ok(());
     };
     decision
         .strategy
@@ -8376,6 +8396,7 @@ mod tests {
         ModelStepIntent, ModelToolCall, RuntimeError, StaticToolExecutor, ToolExposureState,
         apply_explicit_team_requirement, apply_named_e2e_strategy_fixture,
         build_cc_memory_config_with_budget, deterministic_checkpoint_id,
+        eval_override_selection,
         enforce_explicit_team_requirement, image_user_message_from_path,
         is_runtime_team_orchestration_call, memory_project_id_for_session,
         model_team_request_conflicts_with_admission, prepared_vision_payload, preview_chars,
@@ -8417,6 +8438,42 @@ mod tests {
         let mut segments = prompt.trusted_system.clone();
         segments.extend(prompt.contextual_messages());
         segments.join("\n")
+    }
+
+    #[test]
+    fn direct_eval_candidate_keeps_policy_complete_graph() {
+        use harness_contract::core::ExecutionPattern;
+        use harness_contract::strategy::ExecutionCandidateKind;
+
+        let judge = eval_override_selection(
+            "direct",
+            false,
+            "runtime-execution-resource-manager:corpus=auto-strategy-v1:provider_constraint=judge:temperature_milli=0",
+        )
+        .expect("judge override")
+        .expect("judge selection");
+        assert_eq!(judge, (ExecutionCandidateKind::Direct, ExecutionPattern::Execute));
+
+        let business = eval_override_selection(
+            "direct",
+            false,
+            "runtime-execution-resource-manager:corpus=auto-strategy-v1:provider_constraint=business",
+        )
+        .expect("business override")
+        .expect("business selection");
+        assert_eq!(business, (ExecutionCandidateKind::Direct, ExecutionPattern::Execute));
+
+        let parallel = eval_override_selection(
+            "parallel_tools",
+            false,
+            "runtime-execution-resource-manager:corpus=auto-strategy-v1:provider_constraint=business",
+        )
+        .expect("parallel override")
+        .expect("parallel selection");
+        assert_eq!(
+            parallel,
+            (ExecutionCandidateKind::ParallelTools, ExecutionPattern::Execute)
+        );
     }
 
     #[test]
