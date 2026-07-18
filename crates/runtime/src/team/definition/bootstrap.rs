@@ -68,7 +68,10 @@ where
     let manifest = TeamTemplateManifest {
         api_version: "cowd.team/v1".to_string(),
         template_id,
-        revision: 1,
+        // The V550 execute/review acceptance and evidence contract changed.
+        // Builtin revisions are immutable on disk, so publish a new revision
+        // instead of colliding with installations that already stored v1.
+        revision: 2,
         name: "Execute and Review".to_string(),
         lifecycle: RevisionLifecycle::Published,
         topology: TeamTopologyContract {

@@ -753,7 +753,7 @@ mod tests {
             .iter()
             .find(|entry| entry.revision_ref.template_id == team)
             .expect("execute-review builtin Team template");
-        assert_eq!(execute_review.revision_ref.revision, 1);
+        assert_eq!(execute_review.revision_ref.revision, 2);
     }
 
     #[test]
