@@ -4251,6 +4251,20 @@ where
             .flat_map(|observation| observation.evidence_refs.iter())
             .filter_map(|reference| reference.strip_prefix("tool_resource_scope:"))
             .collect::<BTreeSet<_>>();
+        // Source verification is sequence-sensitive: a read only proves the
+        // post-write state when a committed write receipt already exists from
+        // an earlier batch. A same-wave read/write pair is deliberately not
+        // accepted because the scheduler may execute independent calls in
+        // either order.
+        let verified_after_write_scope_keys = successful_resource_scope_keys
+            .iter()
+            .filter_map(|scope| scope.strip_prefix("read:"))
+            .filter_map(|path| {
+                resource_scopes_covered_before
+                    .contains(format!("write:{path}").as_str())
+                    .then(|| format!("verify_after_write:{path}"))
+            })
+            .collect::<BTreeSet<_>>();
         let newly_covered = coverage_keys
             .iter()
             .filter(|coverage| !covered_before.contains(coverage.as_str()))
@@ -4303,6 +4317,7 @@ where
             && failed == 0
             && focus_acceptance_scopes.iter().all(|required_scope| {
                 successful_resource_scope_keys.contains(required_scope)
+                    || verified_after_write_scope_keys.contains(required_scope)
                     || resource_scopes_covered_before.contains(required_scope.as_str())
             });
         let focus_acceptance_pending =
@@ -4380,6 +4395,11 @@ where
                 .chain(scope_keys.iter().map(|scope| format!("tool_scope:{scope}")))
                 .chain(
                     successful_resource_scope_keys
+                        .iter()
+                        .map(|scope| format!("tool_resource_scope:{scope}")),
+                )
+                .chain(
+                    verified_after_write_scope_keys
                         .iter()
                         .map(|scope| format!("tool_resource_scope:{scope}")),
                 )

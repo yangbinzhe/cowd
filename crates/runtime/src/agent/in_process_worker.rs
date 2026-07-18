@@ -628,18 +628,27 @@ fn focus_acceptance_scopes_from_constraints(constraints: &[String]) -> Vec<Strin
                 .into_iter()
                 .flatten()
                 .filter_map(|criterion| criterion.get("check").cloned())
-                .filter(|check| {
-                    check.get("kind").and_then(serde_json::Value::as_str)
-                        == Some("workspace_change")
-                })
-                .filter_map(|check| {
+                .flat_map(|check| {
+                    let kind = check
+                        .get("kind")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
                     check
                         .get("scopes")
                         .and_then(serde_json::Value::as_array)
                         .cloned()
-                })
-                .flatten()
-                .filter_map(|scope| scope.as_str().map(str::to_string)),
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|scope| scope.as_str().map(str::to_string))
+                        .filter_map(|scope| match kind {
+                            "workspace_change" => Some(scope),
+                            "source_verification" => scope
+                                .split_once(':')
+                                .map(|(_, path)| format!("verify_after_write:{path}")),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                }),
         );
     }
     scopes.sort();
@@ -1649,7 +1658,10 @@ mod tests {
 
         assert_eq!(
             focus_acceptance_scopes_from_constraints(&constraints),
-            ["write:fixtures/target.txt"]
+            [
+                "verify_after_write:fixtures/target.txt",
+                "write:fixtures/target.txt"
+            ]
         );
         let review_constraints = vec![
             "focus_output_acceptance:evidence, review, risks".to_string(),
