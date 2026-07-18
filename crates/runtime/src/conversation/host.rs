@@ -3199,7 +3199,7 @@ where
                             if state.pending_focus_terminal_candidate.is_none() {
                                 let pending = state.focus_acceptance_pending_scopes.join(", ");
                                 let instruction = format!(
-                                    "Runtime Focus acceptance recovery (mandatory): retain the candidate final JSON, but do not finish yet. Complete the missing Runtime-verified action(s) with native tools: {pending}. For verify_after_write:path, perform a new exact-path read after the committed write receipt. Do not return another final answer until these actions complete."
+                                    "Runtime Focus acceptance recovery (mandatory): retain the candidate final JSON, but do not finish yet. Complete the missing Runtime-verified action(s) with native tools: {pending}. For verify_after_write:path, perform a new exact-path read after this role's committed write receipt. For verify_upstream_change:path, independently read the exact upstream-changed path. Do not return another final answer until these actions complete."
                                 );
                                 state.pending_focus_terminal_candidate = Some(text.clone());
                                 state.assistant_messages.pop();
@@ -4532,15 +4532,6 @@ where
         // an earlier batch. A same-wave read/write pair is deliberately not
         // accepted because the scheduler may execute independent calls in
         // either order.
-        let verified_after_write_scope_keys = successful_resource_scope_keys
-            .iter()
-            .filter_map(|scope| scope.strip_prefix("read:"))
-            .filter_map(|path| {
-                resource_scopes_covered_before
-                    .contains(format!("write:{path}").as_str())
-                    .then(|| format!("verify_after_write:{path}"))
-            })
-            .collect::<BTreeSet<_>>();
         let newly_covered = coverage_keys
             .iter()
             .filter(|coverage| !covered_before.contains(coverage.as_str()))
@@ -4569,6 +4560,11 @@ where
                 state.focus_acceptance_scopes.clone(),
             )
         };
+        let verified_focus_acceptance_scope_keys = verified_focus_acceptance_scope_keys(
+            &focus_acceptance_scopes,
+            &successful_resource_scope_keys,
+            &resource_scopes_covered_before,
+        );
         let low_novelty = failed == 0
             && !coverage_keys.is_empty()
             && novelty_target_bp > 0
@@ -4592,7 +4588,7 @@ where
             .iter()
             .filter(|required_scope| {
                 !successful_resource_scope_keys.contains(*required_scope)
-                    && !verified_after_write_scope_keys.contains(*required_scope)
+                    && !verified_focus_acceptance_scope_keys.contains(*required_scope)
                     && !resource_scopes_covered_before.contains(required_scope.as_str())
             })
             .cloned()
@@ -4610,7 +4606,7 @@ where
                 .extend(successful_resource_scope_keys.iter().cloned());
             state
                 .focus_observed_resource_scopes
-                .extend(verified_after_write_scope_keys.iter().cloned());
+                .extend(verified_focus_acceptance_scope_keys.iter().cloned());
         }
         state
             .pending_transcript
@@ -4711,7 +4707,7 @@ where
                         .map(|scope| format!("tool_resource_scope:{scope}")),
                 )
                 .chain(
-                    verified_after_write_scope_keys
+                    verified_focus_acceptance_scope_keys
                         .iter()
                         .map(|scope| format!("tool_resource_scope:{scope}")),
                 )
@@ -6777,7 +6773,9 @@ fn focus_verification_tool_calls(
         .iter()
         .enumerate()
         .map(|(index, scope)| {
-            let path = scope.strip_prefix("verify_after_write:")?;
+            let path = scope
+                .strip_prefix("verify_after_write:")
+                .or_else(|| scope.strip_prefix("verify_upstream_change:"))?;
             let (_, path) = normalize_workspace_scope(&format!("read:{path}"))?;
             (path != ".").then(|| ModelToolCall {
                 id: format!("runtime-focus-verify-{iteration}-{index}"),
@@ -6785,6 +6783,36 @@ fn focus_verification_tool_calls(
                 input: serde_json::json!({"path": path}).to_string(),
                 depends_on: Vec::new(),
             })
+        })
+        .collect()
+}
+
+/// Translate successful exact reads into the two distinct Focus contracts.
+///
+/// A role may verify its own write only after that write is already covered.
+/// An upstream-review role never owns the predecessor write, so its fresh
+/// exact read satisfies the separately typed upstream-change obligation.
+fn verified_focus_acceptance_scope_keys(
+    required_scopes: &[String],
+    successful_resource_scopes: &BTreeSet<String>,
+    resource_scopes_covered_before: &BTreeSet<&str>,
+) -> BTreeSet<String> {
+    successful_resource_scopes
+        .iter()
+        .filter_map(|scope| scope.strip_prefix("read:"))
+        .flat_map(|path| {
+            let upstream = format!("verify_upstream_change:{path}");
+            let after_write = format!("verify_after_write:{path}");
+            let mut verified = Vec::new();
+            if required_scopes.contains(&upstream) {
+                verified.push(upstream);
+            }
+            if required_scopes.contains(&after_write)
+                && resource_scopes_covered_before.contains(format!("write:{path}").as_str())
+            {
+                verified.push(after_write);
+            }
+            verified
         })
         .collect()
 }
@@ -8423,7 +8451,7 @@ mod tests {
         let calls = focus_verification_tool_calls(
             &[
                 "verify_after_write:fixtures/a.txt".into(),
-                "verify_after_write:fixtures/b.txt".into(),
+                "verify_upstream_change:fixtures/b.txt".into(),
             ],
             7,
         )
@@ -8439,6 +8467,21 @@ mod tests {
             1
         )
         .is_none());
+    }
+
+    #[test]
+    fn upstream_read_verification_does_not_require_a_reviewer_owned_write() {
+        let successful = BTreeSet::from(["read:fixtures/target.txt".to_string()]);
+        let required = vec!["verify_upstream_change:fixtures/target.txt".to_string()];
+        let verified =
+            verified_focus_acceptance_scope_keys(&required, &successful, &BTreeSet::new());
+        assert!(verified.contains("verify_upstream_change:fixtures/target.txt"));
+        assert!(!verified.contains("verify_after_write:fixtures/target.txt"));
+
+        let covered = BTreeSet::from(["write:fixtures/target.txt"]);
+        let required = vec!["verify_after_write:fixtures/target.txt".to_string()];
+        let verified = verified_focus_acceptance_scope_keys(&required, &successful, &covered);
+        assert!(verified.contains("verify_after_write:fixtures/target.txt"));
     }
 
     #[test]

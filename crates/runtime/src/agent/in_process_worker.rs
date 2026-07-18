@@ -694,7 +694,7 @@ fn focus_acceptance_scopes_from_constraints(constraints: &[String]) -> Vec<Strin
             .filter_map(|value| {
                 serde_json::from_str::<harness_contract::agent::AgentChangeReceipt>(value).ok()
             })
-            .map(|change| format!("verify_after_write:{}", change.path)),
+            .map(|change| format!("verify_upstream_change:{}", change.path)),
     );
     scopes.sort();
     scopes.dedup();
@@ -1687,7 +1687,11 @@ pub(crate) fn structured_agent_output(
                 .and_then(Result::ok)
         })
         .filter_map(|value| value.as_object().cloned())
-        .find(has_contract_field)
+        // An agent may quote an upstream JSON result before returning its own
+        // terminal object. The terminal contract is the last matching object,
+        // while exact whole-response JSON was already handled above.
+        .filter(has_contract_field)
+        .last()
     {
         return Some(object);
     }
@@ -2113,7 +2117,7 @@ mod tests {
         ];
         assert_eq!(
             focus_acceptance_scopes_from_constraints(&review_constraints),
-            ["verify_after_write:fixtures/target.txt"]
+            ["verify_upstream_change:fixtures/target.txt"]
         );
     }
 
@@ -2330,6 +2334,15 @@ mod tests {
         assert_eq!(output["review"], "verified from fresh receipts");
         assert_eq!(output["risks"], "None identified.");
         assert!(structured_agent_output("Review complete; no risks.").is_none());
+
+        let quoted_upstream_then_terminal = concat!(
+            "upstream: {\"implementation\":\"done\",\"source_verification\":\"old\"}\n",
+            "terminal: {\"review\":\"verified\",\"risks\":\"none\"}"
+        );
+        let output = structured_agent_output(quoted_upstream_then_terminal)
+            .expect("last embedded contract object");
+        assert!(output.get("implementation").is_none());
+        assert_eq!(output["review"], "verified");
     }
 
     #[test]
