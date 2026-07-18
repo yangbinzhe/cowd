@@ -207,6 +207,7 @@ mod tests {
             prompt: crate::PromptAssembly::default(),
             messages: Vec::new(),
             model: String::new(),
+            reasoning_effort_override: None,
             budget: crate::context_ledger::RequestBudgetReport::for_attempt(
                 "dummy", 128_000, 4_096, 128, 256, 0,
             ),

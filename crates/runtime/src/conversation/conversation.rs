@@ -600,6 +600,10 @@ pub struct ApiRequest {
     pub messages: Vec<ConversationMessage>,
     /// Runtime-selected primary model ID.
     pub model: String,
+    /// Runtime-owned one-shot reasoning policy for this provider attempt.
+    /// The transport adapter decides whether the selected model supports the
+    /// requested effort; unsupported backends retain their configured policy.
+    pub reasoning_effort_override: Option<String>,
     /// Request-local capacity contract used for diagnostics and ledger
     /// reconciliation. Provider must not mutate routing or budget ownership.
     pub budget: crate::context_ledger::RequestBudgetReport,
@@ -1358,6 +1362,9 @@ pub struct ConversationRuntime<C, T> {
     /// widens its permission/resource lease, and normal exposure is restored
     /// after the request.
     next_model_tool_allowlist: std::sync::Mutex<Option<BTreeSet<String>>>,
+    /// One governed checkpoint can lower the cognitive budget of exactly one
+    /// provider request after deterministic evidence acquisition is complete.
+    next_model_reasoning_effort: std::sync::Mutex<Option<String>>,
     /// Bounded short-term tool trace context for subsequent turns.
     tool_trace_context_items: std::sync::Mutex<Vec<ContextItem>>,
     /// Governance observations produced by tool calls in the active turn.
@@ -1619,6 +1626,7 @@ where
             next_model_context_items: std::sync::Mutex::new(Vec::new()),
             next_model_text_only: AtomicBool::new(false),
             next_model_tool_allowlist: std::sync::Mutex::new(None),
+            next_model_reasoning_effort: std::sync::Mutex::new(None),
             tool_trace_context_items: std::sync::Mutex::new(Vec::new()),
             turn_tool_observations: std::sync::Mutex::new(Vec::new()),
             active_turn_strategy: std::sync::Mutex::new(None),
@@ -1895,6 +1903,14 @@ where
     ) {
         if let Ok(mut allowlist) = self.next_model_tool_allowlist.lock() {
             *allowlist = Some(tool_ids.into_iter().collect());
+        }
+    }
+
+    /// Override reasoning effort for exactly one provider request. Provider
+    /// adapters ignore this when the selected model has no compatible control.
+    pub(crate) fn require_next_model_reasoning_effort(&self, effort: impl Into<String>) {
+        if let Ok(mut next) = self.next_model_reasoning_effort.lock() {
+            *next = Some(effort.into());
         }
     }
 
@@ -2881,6 +2897,7 @@ where
             prompt: packed_prompt,
             messages: messages.to_vec(),
             model: model.to_string(),
+            reasoning_effort_override: None,
             budget,
         })
     }
@@ -3463,6 +3480,11 @@ where
             .lock()
             .ok()
             .and_then(|mut allowlist| allowlist.take());
+        let one_shot_reasoning_effort = self
+            .next_model_reasoning_effort
+            .lock()
+            .ok()
+            .and_then(|mut effort| effort.take());
         let explicitly_forbids_tool_use =
             harness_contract::strategy::prompt_explicitly_forbids_tool_use(user_input);
         let discovery = self.tool_executor.tool_discovery_receipt();
@@ -3688,6 +3710,7 @@ where
                         continue;
                     }
                 };
+            request.reasoning_effort_override = one_shot_reasoning_effort.clone();
             let mut evaluation_reservation =
                 match EvaluationProviderTokenReservation::acquire(&mut request) {
                     Ok(reservation) => reservation,
@@ -8839,6 +8862,7 @@ mod tests {
             prompt: PromptAssembly::new(vec!["system".to_string()]),
             messages: vec![ConversationMessage::user_text("status".to_string())],
             model: "test".to_string(),
+            reasoning_effort_override: None,
             budget: crate::context_ledger::RequestBudgetReport::for_attempt(
                 "test", 32_768, 4_096, 128, 256, 0,
             ),
@@ -8847,6 +8871,7 @@ mod tests {
             prompt: PromptAssembly::new(vec!["system".repeat(5_000)]),
             messages: vec![ConversationMessage::user_text("evidence".repeat(10_000))],
             model: "test".to_string(),
+            reasoning_effort_override: None,
             budget: crate::context_ledger::RequestBudgetReport::for_attempt(
                 "test", 1_000_000, 32_000, 128, 256, 0,
             ),
@@ -8969,6 +8994,45 @@ mod tests {
                 head.contains("You are Cowd") && head.contains(COWD_IDENTITY_CONTRACT_VERSION)
             })
         }));
+    }
+
+    #[tokio::test]
+    async fn one_shot_reasoning_effort_is_request_local_and_survives_fallback() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let api = RouteRecordingApi {
+            requests: Arc::clone(&requests),
+        };
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            api,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            SystemPromptBuilder::new().build(),
+        )
+        .without_memory()
+        .with_model_context_window(128_000);
+        runtime.set_active_model("primary");
+        runtime.fallbacks = vec!["fallback".to_string()];
+        runtime
+            .begin_turn_strategy("test-reasoning-turn", "reduce verified receipts")
+            .expect("test turn strategy admission");
+        runtime.require_next_model_reasoning_effort("none");
+
+        runtime
+            .execute_model_step("reduce verified receipts", true)
+            .await
+            .expect("fallback candidate should complete");
+
+        let requests = requests.lock().expect("requests");
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| {
+            request.reasoning_effort_override.as_deref() == Some("none")
+        }));
+        assert!(runtime
+            .next_model_reasoning_effort
+            .lock()
+            .expect("reasoning effort")
+            .is_none());
     }
 
     #[derive(Clone)]
@@ -10112,6 +10176,7 @@ mod tests {
                 prompt: PromptAssembly::default(),
                 messages: Vec::new(),
                 model: "test".to_string(),
+                reasoning_effort_override: None,
                 budget: crate::context_ledger::RequestBudgetReport::for_attempt(
                     "test", 128_000, 4_096, 128, 256, 0,
                 ),

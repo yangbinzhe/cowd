@@ -656,6 +656,7 @@ where
                 .as_ref()
                 .is_some_and(|control| control.provider_constraint == "judge"),
             force_tool_allowlist_next_model: None,
+            force_reasoning_effort_next_model: None,
             terminal_recovery_attempts: 0,
             delegated_agent_role: false,
             bounded_evidence_role: false,
@@ -2515,6 +2516,9 @@ struct TurnGraphState {
     reasoning_only_attempts: u8,
     force_text_only_next_model: bool,
     force_tool_allowlist_next_model: Option<BTreeSet<String>>,
+    /// Request-local cognitive budget selected by a governed checkpoint.
+    /// It is consumed once and never changes the session/provider default.
+    force_reasoning_effort_next_model: Option<String>,
     terminal_recovery_attempts: u8,
     delegated_agent_role: bool,
     bounded_evidence_role: bool,
@@ -2801,6 +2805,7 @@ where
             fuse_intervention,
             force_text_only_response,
             force_tool_allowlist,
+            force_reasoning_effort,
             clean_terminal_synthesis,
             clean_terminal_evidence,
             pending_next_model_context,
@@ -2856,6 +2861,7 @@ where
                 // stale state must never disable tools for later turns.
                 std::mem::take(&mut state.force_text_only_next_model),
                 state.force_tool_allowlist_next_model.take(),
+                state.force_reasoning_effort_next_model.take(),
                 clean_terminal_synthesis,
                 clean_terminal_evidence,
                 std::mem::take(&mut state.pending_next_model_context),
@@ -2910,6 +2916,9 @@ where
                 runtime.require_next_model_final_response();
             } else if let Some(tool_ids) = force_tool_allowlist {
                 runtime.require_next_model_tools(tool_ids);
+            }
+            if let Some(effort) = force_reasoning_effort {
+                runtime.require_next_model_reasoning_effort(effort);
             }
         }
         let transcript_len = runtime.session_async().await.messages.len();
@@ -4787,6 +4796,11 @@ where
                     .map(|call| format!("tool_call:{}", call.id))
                     .collect();
                 state.pending_next_model_context.push(item);
+                // Evidence acquisition is complete and the next Reviewer
+                // request only reduces authoritative receipts into bounded
+                // JSON. Avoid a default deep-thinking pass for this exact
+                // deterministic synthesis.
+                state.force_reasoning_effort_next_model = Some("none".to_string());
             }
         }
         let pending_write_paths = state

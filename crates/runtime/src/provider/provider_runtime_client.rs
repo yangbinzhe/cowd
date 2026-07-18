@@ -22,6 +22,32 @@ use crate::provider_registry::{ProviderRegistry, ProviderRegistrySnapshot};
 pub use provider::OutputContentBlock as ProviderOutputContentBlock;
 pub use provider::ToolDefinition as ProviderToolDefinition;
 
+fn request_reasoning_effort(
+    model: &str,
+    request_override: Option<String>,
+    configured: Option<String>,
+) -> Option<String> {
+    let lowered = model.to_ascii_lowercase();
+    let canonical = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
+    let qwen_hybrid = canonical.starts_with("qwen3.7-")
+        || canonical.starts_with("qwen3.6-")
+        || canonical.starts_with("qwen3.5-");
+    let deepseek_v4 = matches!(canonical, "deepseek-v4-pro" | "deepseek-v4-flash");
+    if deepseek_v4 {
+        return request_override
+            .filter(|effort| matches!(effort.as_str(), "high" | "max"))
+            .or_else(|| {
+                configured.map(|effort| match effort.as_str() {
+                    "low" | "medium" => "high".to_string(),
+                    _ => effort,
+                })
+            });
+    }
+    request_override
+        .filter(|effort| effort == "none" && qwen_hybrid)
+        .or(configured)
+}
+
 #[derive(Clone)]
 struct ProviderEntry {
     model: String,
@@ -237,6 +263,11 @@ impl ProviderRuntimeClient {
             }
         };
         let (sender, receiver) = mpsc::unbounded();
+        let reasoning_effort = request_reasoning_effort(
+            &entry.model,
+            request.reasoning_effort_override.clone(),
+            self.reasoning_effort.clone(),
+        );
         let producer = match tokio::runtime::Handle::try_current() {
             Ok(handle) => Some(
                 handle.spawn(forward_provider_attempt(
@@ -253,7 +284,7 @@ impl ProviderRuntimeClient {
                         .budget
                         .context_window_tokens
                         .min(u64::from(u32::MAX)) as u32,
-                    self.reasoning_effort.clone(),
+                    reasoning_effort,
                     self.emit_output,
                     self.stream_callback.clone(),
                     sender,
@@ -673,7 +704,7 @@ fn prompt_cache_record_to_runtime_event(
 
 #[cfg(test)]
 mod tests {
-    use super::tool_definitions_for_exposure;
+    use super::{request_reasoning_effort, tool_definitions_for_exposure};
     use crate::config::{ProviderConfig, ProvidersConfig};
     use crate::{ProviderRegistry, ProviderRuntimeClient};
     use harness_contract::tool::ToolExposureProjection;
@@ -751,5 +782,25 @@ mod tests {
         );
         ProviderRuntimeClient::new(registry, "primary".to_string(), Vec::new())
             .expect("single selected model must be valid");
+    }
+
+    #[test]
+    fn latest_deepseek_v4_reasoning_effort_is_normalized_without_none() {
+        assert_eq!(
+            request_reasoning_effort(
+                "deepseek-v4-pro",
+                Some("none".to_string()),
+                Some("medium".to_string()),
+            ),
+            Some("high".to_string())
+        );
+        assert_eq!(
+            request_reasoning_effort(
+                "deepseek/deepseek-v4-flash",
+                Some("max".to_string()),
+                Some("high".to_string()),
+            ),
+            Some("max".to_string())
+        );
     }
 }

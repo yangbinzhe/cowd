@@ -1148,9 +1148,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "missing value for --reasoning-effort".to_string())?;
-                if !matches!(value.as_str(), "low" | "medium" | "high") {
+                if !matches!(value.as_str(), "low" | "medium" | "high" | "max") {
                     return Err(format!(
-                        "invalid value for --reasoning-effort: '{value}'; must be low, medium, or high"
+                        "invalid value for --reasoning-effort: '{value}'; must be low, medium, high, or max"
                     ));
                 }
                 reasoning_effort = Some(value.clone());
@@ -1158,9 +1158,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             flag if flag.starts_with("--reasoning-effort=") => {
                 let value = &flag[19..];
-                if !matches!(value, "low" | "medium" | "high") {
+                if !matches!(value, "low" | "medium" | "high" | "max") {
                     return Err(format!(
-                        "invalid value for --reasoning-effort: '{value}'; must be low, medium, or high"
+                        "invalid value for --reasoning-effort: '{value}'; must be low, medium, high, or max"
                     ));
                 }
                 reasoning_effort = Some(value.to_string());
@@ -8575,7 +8575,7 @@ UU conflicted.rs",
 
     #[test]
     fn accepts_valid_reasoning_effort_values() {
-        for value in ["low", "medium", "high"] {
+        for value in ["low", "medium", "high", "max"] {
             let result = parse_args(&["--reasoning-effort".to_string(), value.to_string()]);
             assert!(
                 result.is_ok(),

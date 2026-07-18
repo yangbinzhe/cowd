@@ -1192,6 +1192,17 @@ fn is_reasoning_model(model: &str) -> bool {
         || canonical.contains("thinking")
 }
 
+/// Hybrid Qwen families expose their Chat Completions reasoning switch as the
+/// non-standard top-level `enable_thinking` field. Keep this capability map at
+/// the wire boundary so Runtime remains provider-agnostic.
+fn supports_qwen_hybrid_thinking(model: &str) -> bool {
+    let lowered = model.to_ascii_lowercase();
+    let canonical = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
+    canonical.starts_with("qwen3.7-")
+        || canonical.starts_with("qwen3.6-")
+        || canonical.starts_with("qwen3.5-")
+}
+
 /// Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
 /// The prefix is used only to select transport; the backend expects the
 /// bare model id.
@@ -1284,8 +1295,15 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
             payload["stop"] = json!(stop);
         }
     }
+    // Qwen hybrid Chat Completions models use `enable_thinking`, not the
+    // standard `reasoning_effort`, to disable their default thinking pass.
+    if request.reasoning_effort.as_deref() == Some("none")
+        && supports_qwen_hybrid_thinking(&request.model)
+    {
+        payload["enable_thinking"] = json!(false);
+    }
     // reasoning_effort for OpenAI-compatible reasoning models (o4-mini, o3, etc.)
-    if let Some(effort) = &request.reasoning_effort {
+    else if let Some(effort) = &request.reasoning_effort {
         payload["reasoning_effort"] = json!(effort);
     }
 
@@ -3087,6 +3105,29 @@ mod tests {
         assert!(!is_reasoning_model("qwen-max"));
         assert!(!is_reasoning_model("qwen/qwen-plus"));
         assert!(!is_reasoning_model("qwen-turbo"));
+    }
+
+    #[test]
+    fn qwen_hybrid_none_effort_disables_thinking_at_wire_boundary() {
+        let request = MessageRequest {
+            model: "qwen3.7-plus".to_string(),
+            max_tokens: 1024,
+            messages: vec![],
+            stream: true,
+            reasoning_effort: Some("none".to_string()),
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        assert_eq!(payload["enable_thinking"], json!(false));
+        assert!(payload.get("reasoning_effort").is_none());
+
+        let unsupported = MessageRequest {
+            model: "gpt-4o".to_string(),
+            ..request
+        };
+        let payload = build_chat_completion_request(&unsupported, OpenAiCompatConfig::openai());
+        assert!(payload.get("enable_thinking").is_none());
+        assert_eq!(payload["reasoning_effort"], json!("none"));
     }
 
     #[test]

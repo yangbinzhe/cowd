@@ -32,7 +32,8 @@ pub struct MessageRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<Vec<String>>,
     /// Reasoning effort level for OpenAI-compatible reasoning models (e.g. `o4-mini`).
-    /// Accepted values: `"low"`, `"medium"`, `"high"`. Omitted when `None`.
+    /// Common values: `"low"`, `"medium"`, `"high"`; latest DeepSeek V4
+    /// additionally supports `"max"`. Omitted when `None`.
     /// Silently ignored by backends that do not support it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
