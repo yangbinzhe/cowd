@@ -324,66 +324,122 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
                     .unwrap_or(0),
                 scored_repetition,
             );
-            let mut group = Vec::new();
-            for (order_index, condition) in order.into_iter().enumerate() {
-                if execution_isolation_stopped {
-                    group.push(not_run_sample(
-                        task,
-                        scored_repetition,
-                        warmup,
-                        order_index,
-                        condition,
-                        "a prior timed-out execution did not reach a terminal state after cancellation; workspace reset is unsafe",
-                    ));
-                    continue;
-                }
-                if budget_stopped || total_tokens >= max_tokens || total_cost >= max_cost_usd_milli
-                {
-                    budget_stopped = true;
-                    group.push(budget_not_run_sample(
-                        task,
-                        scored_repetition,
-                        warmup,
-                        order_index,
-                        condition,
-                        total_tokens,
-                        max_tokens,
-                        total_cost,
-                        max_cost_usd_milli,
-                    ));
-                    continue;
-                }
-                let Some(sample_token_limit) = provider_admission_token_limit(
+            let mut group = if execution_isolation_stopped {
+                order
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(order_index, condition)| {
+                        not_run_sample(
+                            task,
+                            scored_repetition,
+                            warmup,
+                            order_index,
+                            condition,
+                            "a prior timed-out execution did not reach a terminal state after cancellation; workspace reset is unsafe",
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            } else if budget_stopped
+                || total_tokens >= max_tokens
+                || total_cost >= max_cost_usd_milli
+            {
+                budget_stopped = true;
+                order
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(order_index, condition)| {
+                        budget_not_run_sample(
+                            task,
+                            scored_repetition,
+                            warmup,
+                            order_index,
+                            condition,
+                            total_tokens,
+                            max_tokens,
+                            total_cost,
+                            max_cost_usd_milli,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                // 三个条件拥有独立 Gateway、数据库和工作区，因此可并发运行；
+                // 同一条件内仍按组串行，保证 workspace reset 不发生竞争。
+                // 预算按整组均分后预留，避免并发请求超卖全局硬上限。
+                let condition_count = u64::try_from(order.len()).unwrap_or(1).max(1);
+                let sample_token_limit = provider_admission_token_limit(
                     &options.provider,
-                    max_tokens.saturating_sub(total_tokens),
-                    max_cost_usd_milli.saturating_sub(total_cost),
+                    max_tokens.saturating_sub(total_tokens) / condition_count,
+                    max_cost_usd_milli.saturating_sub(total_cost) / condition_count,
                     business_sample_token_lease,
-                ) else {
+                );
+                let Some(sample_token_limit) = sample_token_limit else {
                     budget_stopped = true;
-                    group.push(budget_not_run_sample(
-                        task,
-                        scored_repetition,
-                        warmup,
-                        order_index,
-                        condition,
-                        total_tokens,
-                        max_tokens,
-                        total_cost,
-                        max_cost_usd_milli,
+                    samples.extend(order.iter().copied().enumerate().map(
+                        |(order_index, condition)| {
+                            budget_not_run_sample(
+                                task,
+                                scored_repetition,
+                                warmup,
+                                order_index,
+                                condition,
+                                total_tokens,
+                                max_tokens,
+                                total_cost,
+                                max_cost_usd_milli,
+                            )
+                        },
                     ));
                     continue;
                 };
-                let mut sample = run_sample(
-                    &client,
-                    &endpoints[&condition],
-                    &options,
-                    task,
-                    scored_repetition,
-                    warmup,
-                    order_index,
-                    condition,
-                    sample_token_limit,
-                );
+                thread::scope(|scope| {
+                    let mut workers = Vec::with_capacity(order.len());
+                    for (order_index, condition) in order.iter().copied().enumerate() {
+                        let endpoint = &endpoints[&condition];
+                        let client = &client;
+                        let options = &options;
+                        workers.push((
+                            order_index,
+                            condition,
+                            scope.spawn(move || {
+                                run_sample(
+                                    client,
+                                    endpoint,
+                                    options,
+                                    task,
+                                    scored_repetition,
+                                    warmup,
+                                    order_index,
+                                    condition,
+                                    sample_token_limit,
+                                )
+                            }),
+                        ));
+                    }
+                    workers
+                        .into_iter()
+                        .map(|(order_index, condition, worker)| {
+                            worker.join().unwrap_or_else(|_| {
+                                let mut sample = sample_shell(
+                                    task,
+                                    scored_repetition,
+                                    warmup,
+                                    order_index,
+                                    condition,
+                                );
+                                sample.status = "worker_panicked".to_string();
+                                sample.error = Some(
+                                    "condition worker panicked; retained as failed sample"
+                                        .to_string(),
+                                );
+                                sample
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+            };
+            for sample in &mut group {
                 execution_isolation_stopped |= sample.status == "isolation_failed";
                 total_tokens = total_tokens
                     .saturating_add(sample.input_tokens)
@@ -394,7 +450,7 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
                     && sample.cost_observed
                     && sample.evaluation_budget_observed
                     && !sample.evaluation_budget_breached
-                    && sample.evaluation_token_limit == sample_token_limit
+                    && sample.evaluation_token_limit == business_sample_token_lease
                     && sample.evaluation_tokens_consumed
                         == sample
                             .input_tokens
@@ -407,7 +463,6 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
                         "fail-closed budget exceeded tokens={total_tokens}/{max_tokens} cost_milli={total_cost}/{max_cost_usd_milli}"
                     ));
                 }
-                group.push(sample);
             }
             if !warmup && !budget_stopped && !execution_isolation_stopped {
                 if let Some(judge_token_limit) = provider_admission_token_limit(
