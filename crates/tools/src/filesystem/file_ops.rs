@@ -8,6 +8,7 @@ use glob::Pattern;
 use regex::RegexBuilder;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
+use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::path_policy::WorkspacePathPolicy;
@@ -45,6 +46,11 @@ pub struct TextFilePayload {
     pub start_line: usize,
     #[serde(rename = "totalLines")]
     pub total_lines: usize,
+    #[serde(rename = "byteLength")]
+    pub byte_length: u64,
+    pub sha256: String,
+    #[serde(rename = "endsWithNewline")]
+    pub ends_with_newline: bool,
 }
 
 /// Output envelope for the `read_file` tool.
@@ -242,6 +248,9 @@ pub fn read_file(
             num_lines: end_index.saturating_sub(start_index),
             start_line: start_index.saturating_add(1),
             total_lines: lines.len(),
+            byte_length: metadata.len(),
+            sha256: format!("{:x}", Sha256::digest(content.as_bytes())),
+            ends_with_newline: content.ends_with('\n'),
         },
     })
 }

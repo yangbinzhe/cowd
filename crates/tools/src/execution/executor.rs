@@ -4806,6 +4806,12 @@ mod tests {
         let read_full_output: serde_json::Value = serde_json::from_str(&read_full).expect("json");
         assert_eq!(read_full_output["file"]["content"], "alpha\nbeta\ngamma");
         assert_eq!(read_full_output["file"]["startLine"], 1);
+        assert_eq!(read_full_output["file"]["byteLength"], 17);
+        assert_eq!(read_full_output["file"]["endsWithNewline"], true);
+        assert_eq!(
+            read_full_output["file"]["sha256"],
+            "4fdbc441ea7b546100e086ac1e4fc5ae6749b7314311c99db05be450eca12996"
+        );
 
         let read_slice = execute_tool(
             "read_file",
@@ -5739,6 +5745,9 @@ mod tests {
 
     #[test]
     fn repl_executes_python_code() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = execute_tool(
             "REPL",
             &json!({"language": "python", "code": "print(1 + 1)", "timeout_ms": 500}),

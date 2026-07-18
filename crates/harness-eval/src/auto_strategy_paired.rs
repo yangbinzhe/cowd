@@ -2643,18 +2643,16 @@ fn start_ttft_observer(
                         let _ = ready_tx.send(Ok(()));
                     }
                 }
-                Some("TextDelta")
-                    if !first_sent
-                        && event
-                            .get("content")
-                            .or_else(|| event.get("text"))
-                            .and_then(Value::as_str)
-                            .is_some_and(|text| !text.is_empty()) =>
-                {
+                Some("TextDelta") if !first_sent && visible_output_text(&event).is_some() => {
                     first_sent = true;
                     let _ = first_tx.send(Instant::now());
                 }
-                Some("TerminalCommitted") => break,
+                Some("TerminalCommitted") => {
+                    if !first_sent && visible_output_text(&event).is_some() {
+                        let _ = first_tx.send(Instant::now());
+                    }
+                    break;
+                }
                 _ => {}
             }
         }
@@ -2666,6 +2664,18 @@ fn start_ttft_observer(
         .recv_timeout(Duration::from_secs(5))
         .map_err(|_| "SSE Connected event timed out".to_string())??;
     Ok(first_rx)
+}
+
+fn visible_output_text(event: &Value) -> Option<&str> {
+    match event.get("type").and_then(Value::as_str) {
+        Some("TextDelta") => event
+            .get("content")
+            .or_else(|| event.get("text"))
+            .and_then(Value::as_str),
+        Some("TerminalCommitted") => event.get("response").and_then(Value::as_str),
+        _ => None,
+    }
+    .filter(|text| !text.is_empty())
 }
 
 fn apply_observed_cost(sample: &mut Sample, requested_model: &str) {
@@ -2800,6 +2810,26 @@ fn valid_sha256(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durable_terminal_response_counts_as_first_visible_output() {
+        assert_eq!(
+            visible_output_text(&json!({
+                "type": "TerminalCommitted",
+                "response": "committed answer"
+            })),
+            Some("committed answer")
+        );
+        assert_eq!(
+            visible_output_text(&json!({"type": "TextDelta", "text": "delta"})),
+            Some("delta")
+        );
+        assert!(visible_output_text(&json!({
+            "type": "TerminalCommitted",
+            "response": ""
+        }))
+        .is_none());
+    }
 
     #[test]
     fn latin_schedule_is_stable_and_balanced() {

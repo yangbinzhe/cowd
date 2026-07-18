@@ -5142,6 +5142,7 @@ where
                                     &state.focus_observed_resource_scopes,
                                     &state.write_attempt_paths,
                                     &state.tool_results,
+                                    self.services.workspace_root(),
                                 )
                             })
                         } else {
@@ -7208,7 +7209,7 @@ fn upstream_verification_completion_instruction(
         return None;
     }
     Some(format!(
-        "Runtime reviewer evidence (authoritative): before this synthesis, the governed tool DAG performed this role's independent exact-path read for [{}]. The retained read receipt, exact content and tool:// reference are role-local evidence, not an upstream self-report. Tools are now disabled because acquisition is complete, not because verification was unavailable. Return one concise JSON object under 800 output tokens: cite the retained tool:// references and exact content, distinguish verified state from genuine semantic risk, and do not claim that independent retrieval or content inspection was impossible.",
+        "Runtime reviewer evidence (authoritative): before this synthesis, the governed tool DAG performed this role's independent exact-path read for [{}]. The retained read receipt, exact content, byteLength, sha256, endsWithNewline and tool:// reference are role-local evidence, not an upstream self-report. Tools are now disabled because acquisition is complete, not because verification was unavailable. Return one concise JSON object under 800 output tokens: cite exact byte metadata and upstream read/write receipts (including protected-path evidence), distinguish verified state from genuine risk, and do not claim that content, trailing-newline, or unchanged-scope verification was impossible when the receipts prove it.",
         paths.join(", ")
     ))
 }
@@ -7356,6 +7357,7 @@ fn runtime_verified_implementation_terminal_candidate(
     observed_scopes: &BTreeSet<String>,
     write_attempt_paths: &[String],
     tool_results: &[ConversationMessage],
+    workspace_root: &std::path::Path,
 ) -> Option<String> {
     let fields = required.iter().map(String::as_str).collect::<BTreeSet<_>>();
     if fields != BTreeSet::from(["implementation", "source_verification"]) {
@@ -7377,7 +7379,7 @@ fn runtime_verified_implementation_terminal_candidate(
     {
         return None;
     }
-    let receipts = runtime_tool_receipt_evidence(tool_results);
+    let receipts = runtime_tool_receipt_evidence(tool_results, workspace_root);
     if receipts.is_empty() {
         return None;
     }
@@ -7403,7 +7405,10 @@ fn runtime_verified_implementation_terminal_candidate(
     .ok()
 }
 
-fn runtime_tool_receipt_evidence(messages: &[ConversationMessage]) -> Vec<serde_json::Value> {
+fn runtime_tool_receipt_evidence(
+    messages: &[ConversationMessage],
+    workspace_root: &std::path::Path,
+) -> Vec<serde_json::Value> {
     messages
         .iter()
         .flat_map(|message| message.blocks.iter())
@@ -7430,12 +7435,51 @@ fn runtime_tool_receipt_evidence(messages: &[ConversationMessage]) -> Vec<serde_
                     "tool_call_id": tool_use_id,
                     "tool": tool_name,
                     "evidence_ref": evidence_ref,
-                    "paths": cited_workspace_paths(output),
+                    "paths": tool_receipt_workspace_paths(output, workspace_root),
                 }))
             }
             _ => None,
         })
         .collect()
+}
+
+fn tool_receipt_workspace_paths(
+    output: &str,
+    workspace_root: &std::path::Path,
+) -> Vec<String> {
+    let Some(object_start) = output.find('{') else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&output[object_start..]) else {
+        return Vec::new();
+    };
+    let Some(raw) = value
+        .pointer("/file/filePath")
+        .or_else(|| value.get("filePath"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Vec::new();
+    };
+    let path = std::path::Path::new(raw);
+    let relative = if path.is_absolute() {
+        path.strip_prefix(workspace_root).ok()
+    } else {
+        Some(path)
+    };
+    relative
+        .filter(|path| {
+            !path.as_os_str().is_empty()
+                && !path.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                })
+        })
+        .map(|path| vec![path.to_string_lossy().replace('\\', "/")])
+        .unwrap_or_default()
 }
 
 fn completed_result(result_ref: Option<String>, usage: ExecutionUsage) -> ExecutionNodeResult {
@@ -7521,6 +7565,7 @@ mod tests {
 
     #[test]
     fn runtime_materializes_only_fully_verified_implementation_handoffs() {
+        let workspace = tempfile::tempdir().expect("workspace");
         let required = vec!["implementation".into(), "source_verification".into()];
         let observed = BTreeSet::from([
             "read:fixtures/target.txt".to_string(),
@@ -7535,7 +7580,10 @@ mod tests {
                 ConversationMessage::tool_result(
                     "read-before",
                     "read_file",
-                    "Tool `read_file` completed. Evidence: tool://before-ref. content=old",
+                    format!(
+                        "Tool `read_file` completed. Evidence: tool://before-ref. {{\"file\":{{\"filePath\":\"{}\",\"content\":\"old\"}}}}",
+                        workspace.path().join("fixtures/target.txt").display()
+                    ),
                     false,
                 ),
                 ConversationMessage::tool_result(
@@ -7547,10 +7595,14 @@ mod tests {
                 ConversationMessage::tool_result(
                     "read-after",
                     "read_file",
-                    "Tool `read_file` completed. Evidence: tool://after-ref. content=new",
+                    format!(
+                        "Tool `read_file` completed. Evidence: tool://after-ref. {{\"file\":{{\"filePath\":\"{}\",\"content\":\"new\"}}}}",
+                        workspace.path().join("fixtures/target.txt").display()
+                    ),
                     false,
                 ),
             ],
+            workspace.path(),
         )
         .expect("verified handoff");
         let candidate: serde_json::Value = serde_json::from_str(&candidate).unwrap();
@@ -7559,6 +7611,10 @@ mod tests {
         assert_eq!(
             candidate["implementation"]["receipts"][1]["evidence_ref"],
             "tool://write-ref"
+        );
+        assert_eq!(
+            candidate["implementation"]["receipts"][0]["paths"][0],
+            "fixtures/target.txt"
         );
         assert_eq!(
             candidate["source_verification"]["post_write_evidence_ref"],
@@ -7579,6 +7635,7 @@ mod tests {
                     "Tool `write_file` completed. Evidence: tool://write-ref. changed",
                     false,
                 )],
+                workspace.path(),
             )
             .is_none()
         );
@@ -7593,6 +7650,7 @@ mod tests {
                     "Tool `read_file` completed. Evidence: tool://read-ref. content=new",
                     false,
                 )],
+                workspace.path(),
             )
             .is_none()
         );

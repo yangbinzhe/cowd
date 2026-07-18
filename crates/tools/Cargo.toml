@@ -19,6 +19,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 serde_yaml.workspace = true
+sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 urlencoding = "2"
 thiserror = "2"
