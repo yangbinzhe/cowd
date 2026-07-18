@@ -17,10 +17,10 @@ use std::{
 
 use reqwest::{
     blocking::Client,
-    header::{HeaderMap, HeaderValue, AUTHORIZATION},
+    header::{AUTHORIZATION, HeaderMap, HeaderValue},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 pub const AUTO_STRATEGY_SEED: u64 = 20_260_716;
@@ -1220,6 +1220,7 @@ fn run_sample(
             &format!("/api/sessions/{session_id}/messages?limit=200"),
         ) {
             Ok(messages) => {
+                clear_recovered_poll_error(&mut sample, &["poll_messages:"]);
                 if let Some(response) = latest_assistant_text(&messages) {
                     sample.response = response;
                 }
@@ -1238,6 +1239,10 @@ fn run_sample(
                     projection.clone(),
                 ) {
                     Ok(typed) => {
+                        clear_recovered_poll_error(
+                            &mut sample,
+                            &["poll_full_projection:", "decode_full_projection:"],
+                        );
                         apply_projection_metrics(&mut sample, &typed);
                         let terminal = projection_is_terminal_sample(&typed);
                         let successful = projection_is_successful_sample(&sample, &typed);
@@ -1330,6 +1335,21 @@ fn run_sample(
         }
     }
     sample
+}
+
+/// Admission returns the durable ingress graph identity before asynchronous
+/// session dispatch necessarily makes its projection visible. A 404/403 (or a
+/// partially decoded projection) in that short window is only a poll state, not
+/// a permanent sample failure. Once the same channel returns a valid response,
+/// remove only that channel's transient error and retain every unrelated error.
+fn clear_recovered_poll_error(sample: &mut Sample, recovered_prefixes: &[&str]) {
+    if sample.error.as_deref().is_some_and(|error| {
+        recovered_prefixes
+            .iter()
+            .any(|prefix| error.starts_with(prefix))
+    }) {
+        sample.error = None;
+    }
 }
 
 fn cancel_and_wait_for_terminal(
@@ -1939,19 +1959,21 @@ fn evaluate_samples(
                 && mutation_samples.into_iter().all(|sample| {
                     sample.workspace_mutation_verified
                         && sample.workspace_changed_paths
-                            == vec![task
-                                .mutation_fixture
-                                .as_ref()
-                                .expect("filtered mutation fixture")
-                                .target_path
-                                .clone()]
+                            == vec![
+                                task.mutation_fixture
+                                    .as_ref()
+                                    .expect("filtered mutation fixture")
+                                    .target_path
+                                    .clone(),
+                            ]
                         && sample.write_attempt_paths
-                            == vec![task
-                                .mutation_fixture
-                                .as_ref()
-                                .expect("filtered mutation fixture")
-                                .target_path
-                                .clone()]
+                            == vec![
+                                task.mutation_fixture
+                                    .as_ref()
+                                    .expect("filtered mutation fixture")
+                                    .target_path
+                                    .clone(),
+                            ]
                         && sample.workspace_mutation_error.is_none()
                 })
         });
@@ -2085,7 +2107,7 @@ fn build_strategy_calibration_records(
     use harness_contract::{
         core::ExecutionPattern,
         strategy::{
-            understand, PairedStrategyCalibrationEvidence, StrategyExperienceRecord, StrategyInput,
+            PairedStrategyCalibrationEvidence, StrategyExperienceRecord, StrategyInput, understand,
         },
     };
 
@@ -2642,6 +2664,40 @@ mod tests {
             {"role": "assistant", "content": "legacy"}
         ]);
         assert_eq!(latest_assistant_text(&legacy).as_deref(), Some("legacy"));
+    }
+
+    #[test]
+    fn recovered_projection_poll_clears_only_its_transient_error() {
+        let task = AutoStrategyTask {
+            task_id: "poll-recovery".to_string(),
+            expected_candidate: "direct".to_string(),
+            prompt: "inspect".to_string(),
+            acceptance: vec!["complete".to_string()],
+            workspace_fixture: "fixture".to_string(),
+            provider_constraint: "normal".to_string(),
+            mutation_fixture: None,
+            judge_only: false,
+        };
+        let mut sample = sample_shell(&task, 0, true, 0, Condition::Direct);
+        sample.error = Some(
+            "poll_full_projection:HTTP 404 Not Found: execution graph is not visible yet"
+                .to_string(),
+        );
+        clear_recovered_poll_error(
+            &mut sample,
+            &["poll_full_projection:", "decode_full_projection:"],
+        );
+        assert!(sample.error.is_none());
+
+        sample.error = Some("verify_mutation_fixture:target unchanged".to_string());
+        clear_recovered_poll_error(
+            &mut sample,
+            &["poll_full_projection:", "decode_full_projection:"],
+        );
+        assert_eq!(
+            sample.error.as_deref(),
+            Some("verify_mutation_fixture:target unchanged")
+        );
     }
 
     #[test]
