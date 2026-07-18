@@ -1,7 +1,7 @@
 use harness_eval::{
-    default_report_root, run_auto_strategy_paired, run_eval, run_paired_performance,
-    terminal_gate_report_with_report, write_auto_strategy_report, AutoStrategyPairedOptions,
-    HarnessEvalLevel, HarnessEvalReportStore, HarnessEvalRunnerOptions, PairedPerformanceOptions,
+    AutoStrategyPairedOptions, HarnessEvalLevel, HarnessEvalReportStore, HarnessEvalRunnerOptions,
+    PairedPerformanceOptions, default_report_root, run_auto_strategy_paired, run_eval,
+    run_paired_performance, terminal_gate_report_with_report, write_auto_strategy_report,
 };
 use std::{path::PathBuf, time::Duration};
 
@@ -39,7 +39,11 @@ fn run() -> Result<(), String> {
                 .map_err(|_| "--timeout-secs must be an integer".to_string())?;
             let poll_interval_ms = option_value(&args[1..], "--poll-interval-ms")
                 .as_deref()
-                .unwrap_or("50")
+                // TTFT has a dedicated SSE observer. Polling the growing
+                // execution projection at 20Hz only repeats serialization and
+                // local transfer; 2Hz keeps terminal detection responsive
+                // without making the evaluator the gateway's CPU bottleneck.
+                .unwrap_or("500")
                 .parse::<u64>()
                 .map_err(|_| "--poll-interval-ms must be an integer".to_string())?;
             let report = run_auto_strategy_paired(AutoStrategyPairedOptions {

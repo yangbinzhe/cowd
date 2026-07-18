@@ -245,6 +245,7 @@ fi
       --corpus "crates/harness-eval/corpora/auto-strategy-v1.json" \
       --rubric "crates/harness-eval/rubrics/auto-strategy-rubric-v1.json" \
       --repetitions 3 \
+      --poll-interval-ms "${COWD_AUTO_STRATEGY_POLL_INTERVAL_MS:-500}" \
       --output "${REPORT}" \
       "${allow_real[@]}"
 )
