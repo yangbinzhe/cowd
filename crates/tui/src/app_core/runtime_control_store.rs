@@ -3504,7 +3504,7 @@ impl SurfaceSummary {
         match self.lifecycle.as_str() {
             "managed" | "one-shot" => true,
             "builtin" => false,
-            _ => self.entry.is_some(),
+            _ => false,
         }
     }
 }
@@ -5588,6 +5588,19 @@ pub(crate) mod tests {
         assert!(surface.entry.is_none());
         assert!(surface.is_external());
         assert_eq!(surface.transport, "uds-http2");
+    }
+
+    #[test]
+    fn unknown_surface_lifecycle_does_not_fall_back_to_legacy_entry() {
+        let value = serde_json::json!({
+            "id": "surface:legacy",
+            "lifecycle": "unknown",
+            "entry": "cowd-edge-legacy"
+        });
+        let surface = surface_summary_from_json(&value).expect("legacy surface summary");
+
+        assert!(surface.entry.is_some());
+        assert!(!surface.is_external());
     }
 
     #[test]

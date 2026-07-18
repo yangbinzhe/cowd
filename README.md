@@ -624,15 +624,18 @@ Surface 通过 `surface.json` 描述自己：
   "id": "feishu",
   "name": "Feishu Message Connector",
   "kind": "message-connector",
-  "entry": "./cowd-edge-feishu-message",
-  "transport": "stdio-jsonl",
-  "lifecycle": "managed",
+  "runtime": {
+    "kind": "managed",
+    "artifact": "cowd-edge-open-platform-message",
+    "driver_profile": "feishu-message",
+    "transport": "uds-http2"
+  },
   "capabilities": ["message.ingress", "message.egress", "message.callback", "health"],
   "routes": [
     { "kind": "callback", "path": "/events", "method": "POST", "public": true }
   ],
   "resources": [],
-  "health": { "mode": "jsonl", "interval_ms": 30000 },
+  "health": { "mode": "http2", "interval_ms": 30000 },
   "default_enabled": false
 }
 ```
