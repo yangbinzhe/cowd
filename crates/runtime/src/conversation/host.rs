@@ -3398,6 +3398,7 @@ where
                                     state.iterations,
                                     &state.session_id,
                                     calls,
+                                    self.services.workspace_root(),
                                 )?
                             }
                         } else {
@@ -3406,6 +3407,7 @@ where
                                 state.iterations,
                                 &state.session_id,
                                 calls,
+                                self.services.workspace_root(),
                             )?
                         }
                     }
@@ -3529,7 +3531,10 @@ where
                                 "inline_model",
                             )]
                         } else {
-                            state.next_resource_scopes = resource_scopes_for_tool_calls(&calls);
+                            state.next_resource_scopes = graph_resource_scopes_for_tool_calls(
+                                &calls,
+                                self.services.workspace_root(),
+                            );
                             state.next_calls = calls;
                             let mut approval = dynamic_node(
                                 ticket,
@@ -3949,6 +3954,7 @@ fn tool_nodes_for_calls(
     iteration: usize,
     session_id: &str,
     calls: Vec<ModelToolCall>,
+    workspace_root: &std::path::Path,
 ) -> Result<Vec<ExecutionNodeSpec>, NodeExecutorError> {
     let batches = tool_batches_for_turn(&calls).map_err(|reason| NodeExecutorError::Poll {
         node_id: ticket.node_id.clone(),
@@ -3973,7 +3979,8 @@ fn tool_nodes_for_calls(
                         node_id: ticket.node_id.clone(),
                         reason: error.to_string(),
                     })?;
-            tool_node.resource_scopes = resource_scopes_for_tool_calls(&calls);
+            tool_node.resource_scopes =
+                graph_resource_scopes_for_tool_calls(&calls, workspace_root);
             Ok(tool_node)
         })
         .collect()
@@ -5938,6 +5945,64 @@ fn resource_scopes_for_tool_calls(calls: &[ModelToolCall]) -> Vec<String> {
     other
 }
 
+/// Compile model-provided paths into graph lock scopes without turning a bad
+/// path into a terminal graph failure.  These scopes only coordinate concurrent
+/// work; the governed tool host remains the authority that permits or rejects
+/// the actual filesystem operation.
+///
+/// A path outside the workspace (or containing a parent traversal) is therefore
+/// represented by a conservative workspace-wide lock.  The tool still receives
+/// the original path and returns its normal security error to the model, which
+/// lets the next model step correct a typo instead of leaving the turn without a
+/// terminal result.
+fn graph_resource_scopes_for_tool_calls(
+    calls: &[ModelToolCall],
+    workspace_root: &std::path::Path,
+) -> Vec<String> {
+    let mut scopes = resource_scopes_for_tool_calls(calls);
+    let mut invalid_read = false;
+    let mut invalid_write = false;
+    scopes.retain(|scope| {
+        let Some((mode, path)) = scope.split_once(':') else {
+            return true;
+        };
+        if !matches!(mode, "read" | "write") {
+            return true;
+        }
+        let requested = std::path::Path::new(path.trim());
+        let valid = if requested.is_absolute() {
+            requested.starts_with(workspace_root)
+        } else {
+            !requested.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        };
+        if valid {
+            true
+        } else {
+            invalid_write |= mode == "write";
+            invalid_read |= mode == "read";
+            false
+        }
+    });
+
+    if invalid_write || (invalid_read && scopes.iter().any(|scope| scope.starts_with("write:"))) {
+        scopes.retain(|scope| !scope.starts_with("read:") && !scope.starts_with("write:"));
+        scopes.push("write:.".to_string());
+    } else if invalid_read {
+        scopes.retain(|scope| !scope.starts_with("read:"));
+        scopes.push("read:.".to_string());
+    }
+    scopes.sort();
+    scopes.dedup();
+    scopes
+}
+
 fn normalize_workspace_scope(scope: &str) -> Option<(&str, String)> {
     let (mode, path) = scope.split_once(':')?;
     if !matches!(mode, "read" | "write" | "workspace") {
@@ -7516,6 +7581,56 @@ mod tests {
             },
         ]);
         assert_eq!(different_files, vec!["write:src/a.rs", "write:src/b.rs"]);
+    }
+
+    #[test]
+    fn invalid_model_paths_use_conservative_graph_locks_for_tool_recovery() {
+        let root = tempfile::tempdir().expect("workspace");
+        let inside = root.path().join("src/lib.rs");
+        let outside = root.path().with_file_name("mistyped-workspace/src/lib.rs");
+        let calls = [
+            ModelToolCall {
+                id: "valid".into(),
+                name: "grep_search".into(),
+                input: serde_json::json!({"path": inside, "pattern": "Runtime"}).to_string(),
+                depends_on: Vec::new(),
+            },
+            ModelToolCall {
+                id: "typo".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path": outside}).to_string(),
+                depends_on: Vec::new(),
+            },
+        ];
+
+        assert_eq!(
+            graph_resource_scopes_for_tool_calls(&calls, root.path()),
+            vec!["read:."]
+        );
+    }
+
+    #[test]
+    fn invalid_read_scope_with_a_write_takes_one_workspace_write_lock() {
+        let root = tempfile::tempdir().expect("workspace");
+        let calls = [
+            ModelToolCall {
+                id: "write".into(),
+                name: "write_file".into(),
+                input: r#"{"path":"src/lib.rs","content":"updated"}"#.into(),
+                depends_on: Vec::new(),
+            },
+            ModelToolCall {
+                id: "typo".into(),
+                name: "read_file".into(),
+                input: r#"{"path":"../other/src/lib.rs"}"#.into(),
+                depends_on: Vec::new(),
+            },
+        ];
+
+        assert_eq!(
+            graph_resource_scopes_for_tool_calls(&calls, root.path()),
+            vec!["write:."]
+        );
     }
 
     #[test]
