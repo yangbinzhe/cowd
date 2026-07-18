@@ -19,6 +19,7 @@ MODEL_CACHE_WRITE_USD_PER_MILLION="${COWD_AUTO_STRATEGY_CACHE_WRITE_USD_PER_MILL
 MODEL_CACHE_READ_USD_PER_MILLION="${COWD_AUTO_STRATEGY_CACHE_READ_USD_PER_MILLION:-0}"
 MODEL_CONTEXT_WINDOW="${COWD_AUTO_STRATEGY_CONTEXT_WINDOW:-128000}"
 MODEL_MAX_OUTPUT_TOKENS="${COWD_AUTO_STRATEGY_MAX_OUTPUT_TOKENS:-64000}"
+DIAGNOSTIC_TASK_ID="${COWD_AUTO_STRATEGY_DIAGNOSTIC_TASK_ID:-}"
 API_TOKEN="${COWD_API_TOKEN:-auto-strategy-$$_credential}"
 SCENARIO_ID="auto-strategy-paired-$$-$(date +%s)"
 SCENARIO_ROOT="${TMPDIR:-/tmp}/${SCENARIO_ID}"
@@ -259,33 +260,47 @@ fi
 require_clean_source "${ROOT}" "backend"
 require_clean_source "${EDGE_ROOT}" "frontend"
 
-jq -e '
-  .kind == "harness_eval.auto_strategy_paired.v1"
-  and .status == "passed"
-  and .gate.passed == true
-  and .gate.claim_allowed == true
-  and .gate.automatic_team_materialization_gate == true
-  and .gate.workspace_reset_gate == true
-  and .gate.workspace_mutation_gate == true
-  and .gate.hard_budget_lease_gate == true
-  and .gate.tool_topology_observation_gate == true
-  and .gate.baseline_topology_isolation_gate == true
-  and .gate.routing_gate == true
-  and .gate.judge_isolation_gate == true
-' "${REPORT}" >/dev/null
-jq -n \
-  --arg scenario_id "${SCENARIO_ID}" \
-  --arg artifact_dir "${ARTIFACT_DIR}" \
-  --arg report "${REPORT}" \
-  --arg backend_commit "${WORKSPACE_REVISION}" \
-  --arg frontend_commit "${FRONTEND_WORKSPACE_REVISION}" \
-  '{
-    schema_version: 1,
-    producer: "auto-strategy-paired.v1",
-    scenario_id: $scenario_id,
-    artifact_dir: $artifact_dir,
-    report: $report,
-    backend_commit: $backend_commit,
-    frontend_commit: $frontend_commit
-  }' >"${POINTER}"
+if [[ -n "${DIAGNOSTIC_TASK_ID}" ]]; then
+  jq -e --arg task_id "${DIAGNOSTIC_TASK_ID}" '
+    .kind == "harness_eval.auto_strategy_paired.v1"
+    and .status == "diagnostic_passed"
+    and .provenance.diagnostic_task_id == $task_id
+    and .gate.passed == false
+    and .gate.claim_allowed == false
+    and .gate.diagnostic_passed == true
+    and .gate.all_samples_completed == true
+  ' "${REPORT}" >/dev/null
+else
+  jq -e '
+    .kind == "harness_eval.auto_strategy_paired.v1"
+    and .status == "passed"
+    and .gate.passed == true
+    and .gate.claim_allowed == true
+    and .gate.automatic_team_materialization_gate == true
+    and .gate.workspace_reset_gate == true
+    and .gate.workspace_mutation_gate == true
+    and .gate.hard_budget_lease_gate == true
+    and .gate.tool_topology_observation_gate == true
+    and .gate.baseline_topology_isolation_gate == true
+    and .gate.routing_gate == true
+    and .gate.judge_isolation_gate == true
+  ' "${REPORT}" >/dev/null
+fi
+if [[ -z "${DIAGNOSTIC_TASK_ID}" ]]; then
+  jq -n \
+    --arg scenario_id "${SCENARIO_ID}" \
+    --arg artifact_dir "${ARTIFACT_DIR}" \
+    --arg report "${REPORT}" \
+    --arg backend_commit "${WORKSPACE_REVISION}" \
+    --arg frontend_commit "${FRONTEND_WORKSPACE_REVISION}" \
+    '{
+      schema_version: 1,
+      producer: "auto-strategy-paired.v1",
+      scenario_id: $scenario_id,
+      artifact_dir: $artifact_dir,
+      report: $report,
+      backend_commit: $backend_commit,
+      frontend_commit: $frontend_commit
+    }' >"${POINTER}"
+fi
 echo "auto-strategy-paired-report: ${REPORT}"

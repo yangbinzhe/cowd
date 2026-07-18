@@ -66,7 +66,16 @@ fn run() -> Result<(), String> {
             })?;
             write_auto_strategy_report(&output, &report)?;
             println!("auto-strategy-paired-report: {}", output.display());
-            if report["status"] != "passed" {
+            let diagnostic = std::env::var("COWD_AUTO_STRATEGY_DIAGNOSTIC_TASK_ID")
+                .is_ok_and(|value| !value.trim().is_empty());
+            let accepted = if diagnostic {
+                report["status"] == "diagnostic_passed"
+                    && report["gate"]["diagnostic_passed"] == true
+                    && report["gate"]["claim_allowed"] == false
+            } else {
+                report["status"] == "passed"
+            };
+            if !accepted {
                 return Err(format!(
                     "auto strategy proof gate is {}; see {}",
                     report["status"].as_str().unwrap_or("failed"),
@@ -209,7 +218,7 @@ fn run() -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "Usage:\n  harness-eval quick [--budget low]\n  harness-eval full [--budget full]\n  harness-eval deep-real --provider <model> --budget full --allow-real-model\n  harness-eval auto-strategy-paired --provider <model> --judge-model <model> --output <path> --allow-real-model [--direct-url http://127.0.0.1:18652] [--parallel-url http://127.0.0.1:18653] [--auto-url http://127.0.0.1:18654] [--repetitions 3]\n  harness-eval paired-performance --baseline-url <url> --candidate-url <url> --provider <model> --output <path> [--pairs 5] [--timeout-secs 600] [--poll-interval-ms 20]\n  harness-eval review-report --run-dir <dir> [--provider <model>] [--allow-real-model]\n  harness-eval terminal-gate [--evidence-dir <dir>] [--report-json <path>]"
+        "Usage:\n  harness-eval quick [--budget low]\n  harness-eval full [--budget full]\n  harness-eval deep-real --provider <model> --budget full --allow-real-model\n  harness-eval auto-strategy-paired --provider <model> --judge-model <model> --output <path> --allow-real-model [--direct-url http://127.0.0.1:18652] [--parallel-url http://127.0.0.1:18653] [--auto-url http://127.0.0.1:18654] [--repetitions 3] (set COWD_AUTO_STRATEGY_DIAGNOSTIC_TASK_ID for a non-claiming frozen-task diagnostic)\n  harness-eval paired-performance --baseline-url <url> --candidate-url <url> --provider <model> --output <path> [--pairs 5] [--timeout-secs 600] [--poll-interval-ms 20]\n  harness-eval review-report --run-dir <dir> [--provider <model>] [--allow-real-model]\n  harness-eval terminal-gate [--evidence-dir <dir>] [--report-json <path>]"
     );
 }
 

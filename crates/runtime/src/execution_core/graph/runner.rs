@@ -587,15 +587,19 @@ impl ExecutionGraphRunner {
         let mut worktree_path = None;
         for scope in &node.resource_scopes {
             if let Some(path) = scope.strip_prefix("read:") {
-                scope_requests.push(ScopeLockRequest {
-                    scope: self.scoped_resource_for_path(&node.id, path)?,
-                    mode: ScopeLockMode::Read,
-                });
+                if node.kind != harness_contract::execution_graph::ExecutionNodeKind::AgentTask {
+                    scope_requests.push(ScopeLockRequest {
+                        scope: self.scoped_resource_for_path(&node.id, path)?,
+                        mode: ScopeLockMode::Read,
+                    });
+                }
             } else if let Some(path) = scope.strip_prefix("write:") {
-                scope_requests.push(ScopeLockRequest {
-                    scope: self.scoped_resource_for_path(&node.id, path)?,
-                    mode: ScopeLockMode::Write,
-                });
+                if node.kind != harness_contract::execution_graph::ExecutionNodeKind::AgentTask {
+                    scope_requests.push(ScopeLockRequest {
+                        scope: self.scoped_resource_for_path(&node.id, path)?,
+                        mode: ScopeLockMode::Write,
+                    });
+                }
             } else if let Some(path) = scope.strip_prefix("worktree:") {
                 worktree_path = Some(validate_worktree_path(&self.workspace_root, path).map_err(
                     |reason| ExecutionRunnerError::Resource {
@@ -605,6 +609,12 @@ impl ExecutionGraphRunner {
                 )?);
             }
         }
+        // AgentTask 是委派/授权边界，不是文件副作用边界。其 in-process
+        // 子代理会在同一个 Runner 中创建真正执行 read/write 的 ToolBatch。
+        // 如果父 AgentTask 在等待子图期间持有文件锁，子 ToolBatch 对同一路径
+        // 的合法读写会永久等待父节点结束，形成父等子、子等父的自死锁。
+        // 文件互斥仍由叶子效果节点获取，AgentTask 继续持有 Agent 配额和
+        // 可选 worktree 租约，授权范围也仍保留在节点合同中。
         let scope = if scope_requests.is_empty() {
             None
         } else {

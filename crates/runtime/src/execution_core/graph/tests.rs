@@ -173,8 +173,12 @@ impl NodeExecutor for ReentrantRunnerExecutor {
             .runner
             .get()
             .expect("runner is installed for reentrant executor");
+        let mut nested = ExecutionGraph::new("nested execution from tool-like node");
+        let mut nested_tool = node("nested-tool");
+        nested_tool.resource_scopes = vec!["read:fixtures/shared.txt".to_string()];
+        nested.nodes.push(nested_tool);
         runner
-            .start(ExecutionGraph::new("nested execution from tool-like node"))
+            .start(nested)
             .await
             .map_err(|error| NodeExecutorError::Poll {
                 node_id: ticket.node_id.clone(),
@@ -1226,11 +1230,19 @@ async fn nested_graph_submission_from_executor_never_deadlocks_runner_coordinati
         runner: OnceLock::new(),
     });
     registry.register(executor.clone()).unwrap();
+    registry
+        .register(Arc::new(TestExecutor::new(
+            Vec::new(),
+            Duration::from_millis(1),
+        )))
+        .unwrap();
     let runner = test_runner(registry, state.clone(), commits);
     assert!(executor.runner.set(runner.clone()).is_ok());
     let mut graph = ExecutionGraph::new("parent submits nested graph");
     let mut node = node("orchestrate");
+    node.kind = ExecutionNodeKind::AgentTask;
     node.executor_kind = "reentrant_runner".to_string();
+    node.resource_scopes = vec!["write:fixtures/shared.txt".to_string()];
     graph.nodes.push(node);
     let graph_id = graph.id.clone();
 

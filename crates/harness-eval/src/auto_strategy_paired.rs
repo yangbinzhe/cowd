@@ -188,7 +188,7 @@ struct JudgeUsage {
 
 pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Value, String> {
     validate_options(&options)?;
-    let (corpus, corpus_hash) = load_corpus(&options.corpus)?;
+    let (mut corpus, corpus_hash) = load_corpus(&options.corpus)?;
     let (rubric, rubric_hash) = load_rubric(&options.rubric)?;
     if corpus_hash != FROZEN_CORPUS_SHA256 || rubric_hash != FROZEN_RUBRIC_SHA256 {
         return Err(
@@ -197,6 +197,17 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
         );
     }
     validate_assets(&corpus, &rubric)?;
+    let diagnostic_task_id = std::env::var("COWD_AUTO_STRATEGY_DIAGNOSTIC_TASK_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    if let Some(task_id) = diagnostic_task_id.as_deref() {
+        corpus.tasks.retain(|task| task.task_id == task_id);
+        if corpus.tasks.len() != 1 {
+            return Err(format!(
+                "diagnostic task `{task_id}` is not present exactly once in the frozen corpus"
+            ));
+        }
+    }
     let max_tokens = lowered_budget("COWD_AUTO_STRATEGY_MAX_TOKENS", DEFAULT_MAX_TOKENS)?;
     let max_cost_usd_milli = lowered_budget(
         "COWD_AUTO_STRATEGY_MAX_COST_USD_MILLI",
@@ -283,6 +294,8 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
         "condition_invariant_fingerprint": condition_invariant_fingerprint,
         "temperature_milli": 0,
         "strongest_non_team_baseline_rule": "pre-registered: consider Direct and ParallelTools only; quality>=8000bp is eligible; among eligible choose lower median wall time; if neither is eligible choose higher quality; exact ties choose Direct",
+        "diagnostic_task_id": diagnostic_task_id,
+        "formal_claim_scope": if diagnostic_task_id.is_some() { "diagnostic-only; never a formal corpus claim" } else { "full frozen corpus" },
     });
     if !options.allow_real_model {
         return Ok(json!({
@@ -534,7 +547,7 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
             samples.extend(group);
         }
     }
-    let report = evaluate_samples(
+    let mut report = evaluate_samples(
         &corpus,
         samples,
         provenance,
@@ -546,6 +559,39 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
         budget_observation_complete,
         business_sample_token_lease,
     );
+    if diagnostic_task_id.is_some() {
+        let gate = &report["gate"];
+        let all_samples_completed = report["samples"]
+            .as_array()
+            .is_some_and(|samples| {
+                !samples.is_empty()
+                    && samples
+                        .iter()
+                        .all(|sample| sample["status"].as_str() == Some("completed"))
+            });
+        let diagnostic_passed = all_samples_completed
+            && report["completeness_bp"].as_u64() == Some(10_000)
+            && gate["per_task_pair_gate"] == true
+            && gate["routing_gate"] == true
+            && gate["judge_isolation_gate"] == true
+            && gate["provenance_complete"] == true
+            && gate["budget_observation_complete"] == true
+            && gate["automatic_team_materialization_gate"] == true
+            && gate["workspace_mutation_gate"] == true
+            && gate["workspace_reset_gate"] == true
+            && gate["hard_budget_lease_gate"] == true
+            && gate["baseline_topology_isolation_gate"] == true
+            && gate["tool_topology_observation_gate"] == true;
+        report["status"] = json!(if diagnostic_passed {
+            "diagnostic_passed"
+        } else {
+            "diagnostic_failed"
+        });
+        report["gate"]["passed"] = json!(false);
+        report["gate"]["claim_allowed"] = json!(false);
+        report["gate"]["diagnostic_passed"] = json!(diagnostic_passed);
+        report["gate"]["all_samples_completed"] = json!(all_samples_completed);
+    }
     Ok(report)
 }
 
