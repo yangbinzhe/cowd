@@ -6602,7 +6602,15 @@ where
             .runtime_budget_plan()
             .tool_result_budget
             .per_tool_max_tokens as u64;
-        let requested = raw_tokens.min(per_tool_limit).max(1);
+        // `build_tool_receipt` spends part of the granted budget on its
+        // evidence URI and structured summary prefix. Reserving only the raw
+        // body size made even a tiny exact `read_file` JSON lose its `content`
+        // field to head-tail truncation. Keep bounded headroom for the receipt
+        // envelope while preserving the existing per-tool hard ceiling.
+        let requested = raw_tokens
+            .saturating_add(96)
+            .min(per_tool_limit)
+            .max(1);
         let granted = self
             .turn_context_ledger
             .lock()
@@ -8523,6 +8531,37 @@ mod tests {
     use std::fs;
     use std::pin::Pin;
     use std::sync::Arc;
+
+    #[test]
+    fn small_exact_tool_result_retains_content_after_receipt_envelope() {
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+        let output = serde_json::json!({
+            "type": "text",
+            "path": "fixtures/target.txt",
+            "content": "implemented-v546-0\n",
+            "totalLines": 1,
+            "truncated": false,
+        })
+        .to_string();
+        let receipt = runtime.tool_model_receipt(
+            "read_file",
+            &output,
+            false,
+            &harness_contract::core::EvidenceRef::new("tool", "small-exact-read"),
+            None,
+        );
+
+        assert!(!receipt.truncated, "{}", receipt.summary);
+        assert!(receipt.summary.contains("implemented-v546-0"));
+        assert!(!receipt.summary.contains("omitted; retrieve"));
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
     use storage::{SqliteConnectionFactory, StorageRegistry};
 

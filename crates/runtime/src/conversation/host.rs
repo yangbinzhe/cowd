@@ -5141,7 +5141,7 @@ where
                                     &state.focus_required_output_fields,
                                     &state.focus_observed_resource_scopes,
                                     &state.write_attempt_paths,
-                                    state.tool_results.len(),
+                                    &state.tool_results,
                                 )
                             })
                         } else {
@@ -7208,7 +7208,7 @@ fn upstream_verification_completion_instruction(
         return None;
     }
     Some(format!(
-        "Runtime reviewer evidence (authoritative): before this synthesis, the governed tool DAG performed this role's independent exact-path read for [{}]. The retained read receipt and digest are role-local evidence, not an upstream self-report. Tools are now disabled because evidence acquisition is complete, not because verification was unavailable. Base the review on the retained receipt; do not claim that independent retrieval or verification was impossible. Distinguish verified file state from any semantic uncertainty, and report genuine risks without denying the completed Runtime read.",
+        "Runtime reviewer evidence (authoritative): before this synthesis, the governed tool DAG performed this role's independent exact-path read for [{}]. The retained read receipt, exact content and tool:// reference are role-local evidence, not an upstream self-report. Tools are now disabled because acquisition is complete, not because verification was unavailable. Return one concise JSON object under 800 output tokens: cite the retained tool:// references and exact content, distinguish verified state from genuine semantic risk, and do not claim that independent retrieval or content inspection was impossible.",
         paths.join(", ")
     ))
 }
@@ -7355,7 +7355,7 @@ fn runtime_verified_implementation_terminal_candidate(
     required: &[String],
     observed_scopes: &BTreeSet<String>,
     write_attempt_paths: &[String],
-    receipt_count: usize,
+    tool_results: &[ConversationMessage],
 ) -> Option<String> {
     let fields = required.iter().map(String::as_str).collect::<BTreeSet<_>>();
     if fields != BTreeSet::from(["implementation", "source_verification"]) {
@@ -7377,19 +7377,65 @@ fn runtime_verified_implementation_terminal_candidate(
     {
         return None;
     }
+    let receipts = runtime_tool_receipt_evidence(tool_results);
+    if receipts.is_empty() {
+        return None;
+    }
+    let post_write_evidence_ref = receipts.iter().rev().find_map(|receipt| {
+        (receipt.get("tool").and_then(serde_json::Value::as_str) == Some("read_file"))
+            .then(|| receipt.get("evidence_ref").cloned())
+            .flatten()
+    })?;
     serde_json::to_string(&serde_json::json!({
         "implementation": {
             "status": "committed",
             "write_paths": write_paths.clone(),
-            "runtime_receipt_count": receipt_count,
+            "runtime_receipt_count": receipts.len(),
+            "receipts": receipts.clone(),
         },
         "source_verification": {
             "status": "verified_after_commit",
             "paths": write_paths,
+            "post_write_evidence_ref": post_write_evidence_ref,
         },
         "risks": "No effect-level risk detected by Runtime; the independent reviewer remains responsible for semantic acceptance against the objective.",
     }))
     .ok()
+}
+
+fn runtime_tool_receipt_evidence(messages: &[ConversationMessage]) -> Vec<serde_json::Value> {
+    messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .enumerate()
+        .filter_map(|(index, block)| match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                tool_name,
+                output,
+                is_error: false,
+            } => {
+                let evidence_ref = output
+                    .split_once("tool://")
+                    .map(|(_, tail)| tail)
+                    .and_then(|tail| tail.split_whitespace().next())
+                    .map(|value| {
+                        format!(
+                            "tool://{}",
+                            value.trim_end_matches(['.', ',', ';', ')', ']', '}'])
+                        )
+                    })?;
+                Some(serde_json::json!({
+                    "sequence": index.saturating_add(1),
+                    "tool_call_id": tool_use_id,
+                    "tool": tool_name,
+                    "evidence_ref": evidence_ref,
+                    "paths": cited_workspace_paths(output),
+                }))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn completed_result(result_ref: Option<String>, usage: ExecutionUsage) -> ExecutionNodeResult {
@@ -7485,11 +7531,39 @@ mod tests {
             &required,
             &observed,
             &["fixtures/target.txt".into()],
-            3,
+            &[
+                ConversationMessage::tool_result(
+                    "read-before",
+                    "read_file",
+                    "Tool `read_file` completed. Evidence: tool://before-ref. content=old",
+                    false,
+                ),
+                ConversationMessage::tool_result(
+                    "write",
+                    "write_file",
+                    "Tool `write_file` completed. Evidence: tool://write-ref. changed",
+                    false,
+                ),
+                ConversationMessage::tool_result(
+                    "read-after",
+                    "read_file",
+                    "Tool `read_file` completed. Evidence: tool://after-ref. content=new",
+                    false,
+                ),
+            ],
         )
         .expect("verified handoff");
         let candidate: serde_json::Value = serde_json::from_str(&candidate).unwrap();
         assert_eq!(candidate["implementation"]["status"], "committed");
+        assert_eq!(candidate["implementation"]["runtime_receipt_count"], 3);
+        assert_eq!(
+            candidate["implementation"]["receipts"][1]["evidence_ref"],
+            "tool://write-ref"
+        );
+        assert_eq!(
+            candidate["source_verification"]["post_write_evidence_ref"],
+            "tool://after-ref"
+        );
         assert_eq!(
             candidate["source_verification"]["status"],
             "verified_after_commit"
@@ -7499,7 +7573,12 @@ mod tests {
                 &required,
                 &BTreeSet::from(["write:fixtures/target.txt".to_string()]),
                 &["fixtures/target.txt".into()],
-                1,
+                &[ConversationMessage::tool_result(
+                    "write",
+                    "write_file",
+                    "Tool `write_file` completed. Evidence: tool://write-ref. changed",
+                    false,
+                )],
             )
             .is_none()
         );
@@ -7508,7 +7587,12 @@ mod tests {
                 &["review".into(), "risks".into()],
                 &observed,
                 &["fixtures/target.txt".into()],
-                3,
+                &[ConversationMessage::tool_result(
+                    "read",
+                    "read_file",
+                    "Tool `read_file` completed. Evidence: tool://read-ref. content=new",
+                    false,
+                )],
             )
             .is_none()
         );
