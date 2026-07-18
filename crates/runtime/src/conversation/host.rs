@@ -667,6 +667,7 @@ where
             focus_observed_resource_scopes: BTreeSet::new(),
             focus_action_rejections: 0,
             pending_focus_terminal_candidate: None,
+            focus_verification_prefetched: false,
             clean_terminal_synthesis_next: false,
             clean_terminal_synthesis_attempted: false,
             clean_terminal_retry_attempted: false,
@@ -2525,6 +2526,9 @@ struct TurnGraphState {
     focus_observed_resource_scopes: BTreeSet<String>,
     focus_action_rejections: u8,
     pending_focus_terminal_candidate: Option<String>,
+    /// Runtime can prefetch a reviewer's immutable upstream-change scopes
+    /// once, without spending a provider request to rediscover exact paths.
+    focus_verification_prefetched: bool,
     clean_terminal_synthesis_next: bool,
     clean_terminal_synthesis_attempted: bool,
     clean_terminal_retry_attempted: bool,
@@ -2748,6 +2752,46 @@ where
                 nodes: vec![synthesize.clone()],
                 edges: dynamic_edges(&ticket.node_id, &[synthesize]),
                 reason: "verified Team terminal result bypassed duplicate parent model execution"
+                    .to_string(),
+            }));
+        }
+        let prefetched_review_calls = {
+            let mut state = self.state.lock().await;
+            let reviewer_prefetch = should_prefetch_focus_verification(
+                state.first_model_step,
+                state.bounded_evidence_role,
+                state.focus_verification_prefetched,
+                &state.focus_acceptance_pending_scopes,
+            );
+            let calls = reviewer_prefetch
+                .then(|| {
+                    focus_verification_tool_calls(
+                        &state.focus_acceptance_pending_scopes,
+                        state.iterations,
+                    )
+                })
+                .flatten();
+            if calls.is_some() {
+                state.focus_verification_prefetched = true;
+            }
+            calls.map(|calls| (state.session_id.clone(), state.iterations, calls))
+        };
+        if let Some((session_id, iteration, calls)) = prefetched_review_calls {
+            let nodes = tool_nodes_for_calls(
+                ticket,
+                iteration,
+                &session_id,
+                calls,
+                self.services.workspace_root(),
+            )?;
+            return Ok(NodeExecutionOutcome::new(completed_result(
+                Some(format!("{}:runtime-review-prefetch", ticket.graph_id)),
+                ExecutionUsage::default(),
+            ))
+            .with_replan(ExecutionGraphReplan {
+                edges: dynamic_edges(&ticket.node_id, &nodes),
+                nodes,
+                reason: "Runtime prefetched exact immutable upstream-change evidence before reviewer synthesis"
                     .to_string(),
             }));
         }
@@ -4690,6 +4734,7 @@ where
         // saturation signal. Main turns retain their normal open exploration.
         let scope_saturated =
             bounded_evidence_role && failed == 0 && !scope_keys.is_empty() && newly_scoped == 0;
+        let mut automatic_focus_verification = None;
         let mut state = self.state.lock().await;
         state.max_tool_concurrency_observed = state
             .max_tool_concurrency_observed
@@ -4720,6 +4765,42 @@ where
             state
                 .focus_observed_resource_scopes
                 .extend(verified_focus_acceptance_scope_keys.iter().cloned());
+        }
+        let pending_write_paths = state
+            .focus_acceptance_pending_scopes
+            .iter()
+            .filter_map(|scope| scope.strip_prefix("write:"))
+            .collect::<Vec<_>>();
+        let successful_write_in_batch = successful_resource_scope_keys
+            .iter()
+            .any(|scope| scope.starts_with("write:"));
+        if state.bounded_evidence_role
+            && !pending_write_paths.is_empty()
+            && !successful_write_in_batch
+            && pending_write_paths.iter().all(|path| {
+                state
+                    .focus_observed_resource_scopes
+                    .contains(&format!("read:{path}"))
+            })
+        {
+            // The provider has already supplied the necessary read evidence.
+            // The next request should author the mutation, not spend another
+            // turn rediscovering the same files.
+            state.force_tool_allowlist_next_model = Some(required_mutation_tool_allowlist());
+        }
+        if state.bounded_evidence_role
+            && successful_write_in_batch
+            && !state.focus_acceptance_pending_scopes.is_empty()
+            && state
+                .focus_acceptance_pending_scopes
+                .iter()
+                .all(|scope| scope.starts_with("verify_after_write:"))
+        {
+            automatic_focus_verification = focus_verification_tool_calls(
+                &state.focus_acceptance_pending_scopes,
+                state.iterations,
+            )
+            .map(|calls| (state.session_id.clone(), state.iterations, calls));
         }
         state
             .pending_transcript
@@ -4983,6 +5064,19 @@ where
                 intervention.kind, intervention.reason
             ));
         }
+        let mut automatic_focus_verification_node =
+            if let Some((session_id, iteration, calls)) = automatic_focus_verification {
+                let mut nodes = tool_nodes_for_calls(
+                    ticket,
+                    iteration,
+                    &session_id,
+                    calls,
+                    self.services.workspace_root(),
+                )?;
+                (nodes.len() == 1).then(|| nodes.remove(0))
+            } else {
+                None
+            };
         let next = {
             let mut state = self.state.lock().await;
             let node = if let Some(answer) = orchestration_terminal_summary.as_ref() {
@@ -5006,15 +5100,22 @@ where
                 match kind {
                     RuntimeInterventionKind::Synthesize => {
                         let focus_terminal_candidate = if focus_acceptance_met {
-                            state
-                                .pending_focus_terminal_candidate
-                                .take()
-                                .and_then(|candidate| {
+                            let retained = state.pending_focus_terminal_candidate.take().and_then(
+                                |candidate| {
                                     normalized_team_terminal_candidate(
                                         &candidate,
                                         &state.focus_required_output_fields,
                                     )
-                                })
+                                },
+                            );
+                            retained.or_else(|| {
+                                runtime_verified_implementation_terminal_candidate(
+                                    &state.focus_required_output_fields,
+                                    &state.focus_observed_resource_scopes,
+                                    &state.write_attempt_paths,
+                                    state.tool_results.len(),
+                                )
+                            })
                         } else {
                             None
                         };
@@ -5070,14 +5171,16 @@ where
                                 .to_string();
                         node
                     }
-                    _ => dynamic_node(
-                        ticket,
-                        state.iterations,
-                        "model",
-                        ExecutionNodeKind::InlineModel,
-                        "inline_model",
-                        "inline_model",
-                    ),
+                    _ => automatic_focus_verification_node.take().unwrap_or_else(|| {
+                        dynamic_node(
+                            ticket,
+                            state.iterations,
+                            "model",
+                            ExecutionNodeKind::InlineModel,
+                            "inline_model",
+                            "inline_model",
+                        )
+                    }),
                 }
             };
             node
@@ -5580,6 +5683,7 @@ where
             .as_ref()
             .map(|(completion, _)| *completion)
             .unwrap_or(GoalCompletion::Satisfied);
+        let stream_runtime_terminal = terminal_override.is_some();
         let final_answer = match terminal_override {
             Some((_, answer)) => answer,
             None => projection
@@ -5594,6 +5698,17 @@ where
                     serde_json::from_str::<String>(encoded).map_err(|error| error.to_string())
                 })?,
         };
+        if stream_runtime_terminal {
+            // A precommitted Team/safety terminal has no parent provider
+            // stream. Publish its already committed visible answer through
+            // the same transient channel used by Direct/Parallel turns so
+            // TUI/WebUI observers do not remain blank until outbox delivery.
+            if let Some(bus) = self.runtime.lock().await.cowd_bus().cloned() {
+                bus.emit(CowdEvent::TextDelta {
+                    text: final_answer.clone(),
+                });
+            }
+        }
         let (
             content,
             assistant_messages,
@@ -7004,6 +7119,21 @@ fn focus_verification_tool_calls(
         .collect()
 }
 
+fn should_prefetch_focus_verification(
+    first_model_step: bool,
+    bounded_evidence_role: bool,
+    already_prefetched: bool,
+    pending_scopes: &[String],
+) -> bool {
+    first_model_step
+        && bounded_evidence_role
+        && !already_prefetched
+        && !pending_scopes.is_empty()
+        && pending_scopes
+            .iter()
+            .all(|scope| scope.starts_with("verify_upstream_change:"))
+}
+
 /// Translate successful exact reads into the two distinct Focus contracts.
 ///
 /// A role may verify its own write only after that write is already covered.
@@ -7168,6 +7298,51 @@ fn normalized_team_terminal_candidate(candidate: &str, required: &[String]) -> O
         .flatten()
 }
 
+/// Materialize the implementer's mechanical hand-off directly from committed
+/// Runtime receipts. The independent reviewer still performs the semantic
+/// comparison against the user objective; this only avoids paying for a model
+/// to restate an already verified write + post-write read as JSON.
+fn runtime_verified_implementation_terminal_candidate(
+    required: &[String],
+    observed_scopes: &BTreeSet<String>,
+    write_attempt_paths: &[String],
+    receipt_count: usize,
+) -> Option<String> {
+    let fields = required.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    if fields != BTreeSet::from(["implementation", "source_verification"]) {
+        return None;
+    }
+    let mut write_paths = observed_scopes
+        .iter()
+        .filter_map(|scope| scope.strip_prefix("write:"))
+        .filter(|path| *path != ".")
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    write_paths.sort();
+    write_paths.dedup();
+    if write_paths.is_empty()
+        || !write_paths.iter().all(|path| {
+            write_attempt_paths.contains(path)
+                && observed_scopes.contains(&format!("verify_after_write:{path}"))
+        })
+    {
+        return None;
+    }
+    serde_json::to_string(&serde_json::json!({
+        "implementation": {
+            "status": "committed",
+            "write_paths": write_paths.clone(),
+            "runtime_receipt_count": receipt_count,
+        },
+        "source_verification": {
+            "status": "verified_after_commit",
+            "paths": write_paths,
+        },
+        "risks": "No effect-level risk detected by Runtime; the independent reviewer remains responsible for semantic acceptance against the objective.",
+    }))
+    .ok()
+}
+
 fn completed_result(result_ref: Option<String>, usage: ExecutionUsage) -> ExecutionNodeResult {
     ExecutionNodeResult {
         status: ExecutionNodeStatus::Completed,
@@ -7246,6 +7421,47 @@ mod tests {
                 &["review".into(), "risks".into()],
             ),
             vec!["risks".to_string()]
+        );
+    }
+
+    #[test]
+    fn runtime_materializes_only_fully_verified_implementation_handoffs() {
+        let required = vec!["implementation".into(), "source_verification".into()];
+        let observed = BTreeSet::from([
+            "read:fixtures/target.txt".to_string(),
+            "write:fixtures/target.txt".to_string(),
+            "verify_after_write:fixtures/target.txt".to_string(),
+        ]);
+        let candidate = runtime_verified_implementation_terminal_candidate(
+            &required,
+            &observed,
+            &["fixtures/target.txt".into()],
+            3,
+        )
+        .expect("verified handoff");
+        let candidate: serde_json::Value = serde_json::from_str(&candidate).unwrap();
+        assert_eq!(candidate["implementation"]["status"], "committed");
+        assert_eq!(
+            candidate["source_verification"]["status"],
+            "verified_after_commit"
+        );
+        assert!(
+            runtime_verified_implementation_terminal_candidate(
+                &required,
+                &BTreeSet::from(["write:fixtures/target.txt".to_string()]),
+                &["fixtures/target.txt".into()],
+                1,
+            )
+            .is_none()
+        );
+        assert!(
+            runtime_verified_implementation_terminal_candidate(
+                &["review".into(), "risks".into()],
+                &observed,
+                &["fixtures/target.txt".into()],
+                3,
+            )
+            .is_none()
         );
     }
 
@@ -8327,6 +8543,8 @@ mod tests {
         services
             .agent_runtime()
             .register_backend(Arc::new(CompletedHostTeamBackend));
+        let bus = crate::CowdEventBus::new();
+        let mut visible_events = bus.subscribe();
         let mut runtime = crate::ConversationRuntime::new(
             Session::new(),
             FinalAnswerClient,
@@ -8334,7 +8552,8 @@ mod tests {
             PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
             vec!["answer from Runtime-owned collaboration evidence".to_string()],
         )
-        .without_memory();
+        .without_memory()
+        .with_cowd_event_bus(bus);
         runtime.set_active_model("fast");
 
         let (_runtime, result) = submit_owned_conversation_turn(
@@ -8351,6 +8570,21 @@ mod tests {
         assert!(summary
             .final_answer
             .contains("bounded host-selected Team role completed"));
+        let mut team_terminal_streamed = false;
+        while let Ok(event) = visible_events.try_recv() {
+            let event = match event {
+                CowdEvent::ExecutionScoped { event, .. } => *event,
+                event => event,
+            };
+            if matches!(event, CowdEvent::TextDelta { text } if text.contains("bounded host-selected Team role completed"))
+            {
+                team_terminal_streamed = true;
+            }
+        }
+        assert!(
+            team_terminal_streamed,
+            "a precommitted Team terminal must be visible on the parent stream"
+        );
 
         let events = services
             .event_store()
@@ -8734,6 +8968,26 @@ mod tests {
             1
         )
         .is_none());
+    }
+
+    #[test]
+    fn only_first_step_upstream_review_is_prefetched() {
+        let scopes = vec!["verify_upstream_change:fixtures/target.txt".to_string()];
+        assert!(should_prefetch_focus_verification(
+            true, true, false, &scopes
+        ));
+        assert!(!should_prefetch_focus_verification(
+            false, true, false, &scopes
+        ));
+        assert!(!should_prefetch_focus_verification(
+            true, true, true, &scopes
+        ));
+        assert!(!should_prefetch_focus_verification(
+            true,
+            true,
+            false,
+            &["verify_after_write:fixtures/target.txt".into()]
+        ));
     }
 
     #[test]

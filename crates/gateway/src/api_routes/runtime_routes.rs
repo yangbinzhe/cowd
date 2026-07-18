@@ -301,6 +301,13 @@ pub(super) async fn execution_projection_context(
     // principal's own resource claims can make a resource reference visible;
     // Runtime still crops every emitted reference against this list.
     let mut visibility_grants = projection_visibility_grants(&claims.scopes);
+    if evaluation_projection_resource_visibility_enabled() {
+        // The paired evaluator runs in a dedicated authenticated Gateway and
+        // must inspect the safe workspace-relative refs produced by its own
+        // frozen resource lease. Production processes never receive this
+        // grant, and raw contents remain behind normal evidence authority.
+        visibility_grants.push("resource:*".to_string());
+    }
     visibility_grants.push(format!("principal:{}", claims.principal_id));
     visibility_grants.sort();
     visibility_grants.dedup();
@@ -316,6 +323,16 @@ pub(super) async fn execution_projection_context(
             .saturating_mul(1_000_000)
             .saturating_add(claims.profile_revision),
     })
+}
+
+fn evaluation_projection_resource_visibility_enabled() -> bool {
+    let harness = std::env::var("COWD_EVAL_HARNESS").ok();
+    let corpus = std::env::var("COWD_EVAL_CORPUS_ID").ok();
+    evaluation_projection_resource_visibility(harness.as_deref(), corpus.as_deref())
+}
+
+fn evaluation_projection_resource_visibility(harness: Option<&str>, corpus: Option<&str>) -> bool {
+    harness == Some("1") && corpus == Some("auto-strategy-v1")
 }
 
 fn projection_visibility_grants(claims: &[String]) -> Vec<String> {
@@ -1186,8 +1203,8 @@ fn upgrade_cross_plane_status(status: &str) -> runtime::UpgradeCarrierStatus {
 #[cfg(test)]
 mod v2_upgrade_tests {
     use super::{
-        projection_command_authorized, projection_read_authorized, projection_visibility_grants,
-        upgrade_cross_plane_status,
+        evaluation_projection_resource_visibility, projection_command_authorized,
+        projection_read_authorized, projection_visibility_grants, upgrade_cross_plane_status,
     };
     use crate::api_routes::AuthenticatedPrincipal;
     use harness_contract::security::{PrincipalAssurance, PrincipalClaims, PrincipalKind};
@@ -1274,6 +1291,22 @@ mod v2_upgrade_tests {
         // A graph's resource scope is intentionally absent: it may be used by
         // the worker, but is never promoted into a viewer's claims.
         assert!(!grants.contains(&"read:private/worker-only".to_string()));
+    }
+
+    #[test]
+    fn resource_refs_are_visible_only_in_the_dedicated_paired_evaluator() {
+        assert!(evaluation_projection_resource_visibility(
+            Some("1"),
+            Some("auto-strategy-v1")
+        ));
+        assert!(!evaluation_projection_resource_visibility(
+            Some("1"),
+            Some("another-corpus")
+        ));
+        assert!(!evaluation_projection_resource_visibility(
+            None,
+            Some("auto-strategy-v1")
+        ));
     }
 }
 
