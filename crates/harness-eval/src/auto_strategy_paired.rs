@@ -24,10 +24,10 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 pub const AUTO_STRATEGY_SEED: u64 = 20_260_716;
-pub const DEFAULT_MAX_TOKENS: u64 = 2_000_000;
+pub const DEFAULT_MAX_TOKENS: u64 = 8_000_000;
 pub const DEFAULT_MAX_COST_USD_MILLI: u64 = 50_000;
-const BUSINESS_SAMPLE_TOKEN_LEASE: u64 = 12_000;
-const JUDGE_SAMPLE_TOKEN_LEASE: u64 = 6_000;
+const BUSINESS_SAMPLE_TOKEN_LEASE: u64 = 48_000;
+const JUDGE_SAMPLE_TOKEN_LEASE: u64 = 16_000;
 const FROZEN_CORPUS_SHA256: &str =
     "d8dc4ba671dacd7a12b41d0cbe17d1cb4f2d5f5055cb2b9e7cefab2bb8c22e3c";
 const FROZEN_RUBRIC_SHA256: &str =
@@ -200,6 +200,14 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
         "COWD_AUTO_STRATEGY_MAX_COST_USD_MILLI",
         DEFAULT_MAX_COST_USD_MILLI,
     )?;
+    let business_sample_token_lease = lowered_budget(
+        "COWD_AUTO_STRATEGY_BUSINESS_SAMPLE_TOKEN_LEASE",
+        BUSINESS_SAMPLE_TOKEN_LEASE,
+    )?;
+    let judge_sample_token_lease = lowered_budget(
+        "COWD_AUTO_STRATEGY_JUDGE_SAMPLE_TOKEN_LEASE",
+        JUDGE_SAMPLE_TOKEN_LEASE,
+    )?;
     let schedule = preregistered_schedule(&corpus, options.repetitions);
     let binary_sha256 = std::env::var("COWD_EVAL_BINARY_SHA256").ok();
     let workspace_revision = std::env::var("COWD_EVAL_WORKSPACE_REVISION").ok();
@@ -230,6 +238,8 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
         "poll_interval_ms": u64::try_from(options.poll_interval.as_millis()).unwrap_or(u64::MAX),
         "token_budget": max_tokens,
         "cost_budget_usd_milli": max_cost_usd_milli,
+        "business_sample_token_lease": business_sample_token_lease,
+        "judge_sample_token_lease": judge_sample_token_lease,
     });
     let condition_invariant_fingerprint = format!(
         "{:x}",
@@ -254,6 +264,8 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
         "order": "fixed Latin rotation by task index and repetition",
         "token_budget": max_tokens,
         "cost_budget_usd_milli": max_cost_usd_milli,
+        "business_sample_token_lease": business_sample_token_lease,
+        "judge_sample_token_lease": judge_sample_token_lease,
         "all_failures_retained": true,
         "bootstrap_cluster": "task_id",
         "binary_sha256": binary_sha256,
@@ -345,7 +357,7 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
                     &options.provider,
                     max_tokens.saturating_sub(total_tokens),
                     max_cost_usd_milli.saturating_sub(total_cost),
-                    BUSINESS_SAMPLE_TOKEN_LEASE,
+                    business_sample_token_lease,
                 ) else {
                     budget_stopped = true;
                     group.push(budget_not_run_sample(
@@ -402,7 +414,7 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
                     &options.judge_model,
                     max_tokens.saturating_sub(total_tokens),
                     max_cost_usd_milli.saturating_sub(total_cost),
-                    JUDGE_SAMPLE_TOKEN_LEASE,
+                    judge_sample_token_lease,
                 ) {
                     let judge_usage = apply_blind_judge(
                         &client,
@@ -453,6 +465,7 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
         max_cost_usd_milli,
         options.repetitions,
         budget_observation_complete,
+        business_sample_token_lease,
     );
     Ok(report)
 }
@@ -1543,6 +1556,7 @@ fn evaluate_samples(
     max_cost: u64,
     repetitions: usize,
     budget_observation_complete: bool,
+    business_sample_token_lease: u64,
 ) -> Value {
     let scored = samples
         .iter()
@@ -1754,7 +1768,7 @@ fn evaluate_samples(
                 && sample.evaluation_control_observed
                 && sample.evaluation_budget_observed
                 && !sample.evaluation_budget_breached
-                && sample.evaluation_token_limit == BUSINESS_SAMPLE_TOKEN_LEASE
+                && sample.evaluation_token_limit == business_sample_token_lease
                 && sample.evaluation_tokens_consumed
                     == sample
                         .input_tokens
@@ -1826,7 +1840,7 @@ fn evaluate_samples(
         .all(|sample| {
             sample.evaluation_budget_observed
                 && !sample.evaluation_budget_breached
-                && sample.evaluation_token_limit == BUSINESS_SAMPLE_TOKEN_LEASE
+                && sample.evaluation_token_limit == business_sample_token_lease
                 && sample.evaluation_tokens_consumed
                     == sample
                         .input_tokens
@@ -2433,7 +2447,7 @@ mod tests {
 
     #[test]
     fn hard_budgets_can_only_be_lowered() {
-        assert!(DEFAULT_MAX_TOKENS == 2_000_000);
+        assert!(DEFAULT_MAX_TOKENS == 8_000_000);
         assert!(DEFAULT_MAX_COST_USD_MILLI == 50_000);
         assert_eq!(
             provider_admission_token_limit(
