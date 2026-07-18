@@ -1356,9 +1356,7 @@ fn runtime_evaluated_acceptance(
         .iter()
         .flat_map(|receipt| receipt.paths.iter().cloned())
         .collect::<Vec<_>>();
-    let output = serde_json::from_str::<serde_json::Value>(&summary.final_answer)
-        .ok()
-        .and_then(|value| value.as_object().cloned());
+    let output = structured_agent_output(&summary.final_answer);
     let field_present = |field: harness_contract::team::TeamStructuredOutputField| {
         output
             .as_ref()
@@ -1527,6 +1525,41 @@ fn materialized_json_value(value: &serde_json::Value) -> bool {
         serde_json::Value::Object(values) => !values.is_empty(),
         serde_json::Value::Bool(_) | serde_json::Value::Number(_) => true,
     }
+}
+
+fn structured_agent_output(text: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+    if let Ok(serde_json::Value::Object(object)) = serde_json::from_str(text) {
+        return Some(object);
+    }
+    const CONTRACT_FIELDS: [&str; 13] = [
+        "summary",
+        "findings",
+        "plan",
+        "implementation",
+        "source_verification",
+        "review",
+        "risks",
+        "unresolved",
+        "proposal",
+        "critique",
+        "mitigation",
+        "checkpoint",
+        "legacy_acceptance",
+    ];
+    text.char_indices()
+        .filter(|(_, character)| *character == '{')
+        .filter_map(|(start, _)| {
+            serde_json::Deserializer::from_str(&text[start..])
+                .into_iter::<serde_json::Value>()
+                .next()
+                .and_then(Result::ok)
+        })
+        .filter_map(|value| value.as_object().cloned())
+        .find(|object| {
+            CONTRACT_FIELDS
+                .iter()
+                .any(|field| object.contains_key(*field))
+        })
 }
 
 fn normalized_scope(value: &str) -> &str {
@@ -1960,6 +1993,24 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_empty());
+    }
+
+    #[test]
+    fn structured_agent_output_accepts_fenced_json_without_trusting_prose() {
+        let exact = r#"{"implementation":"done","source_verification":"receipt"}"#;
+        let fenced = format!("```json\n{exact}\n```\n\nHuman-readable evidence summary.");
+
+        assert_eq!(
+            structured_agent_output(exact),
+            structured_agent_output(&fenced)
+        );
+        assert_eq!(
+            structured_agent_output(&fenced)
+                .and_then(|object| object.get("implementation").cloned()),
+            Some(serde_json::Value::String("done".to_string()))
+        );
+        assert!(structured_agent_output("implementation completed in prose").is_none());
+        assert!(structured_agent_output(r#"prefix {"unrelated":"claim"} suffix"#).is_none());
     }
 
     #[test]
