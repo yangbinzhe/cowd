@@ -92,12 +92,21 @@ pub fn validate_agent_return(
                     harness_contract::team::TeamAcceptanceCheck::UpstreamEvidence
                 )
             });
+            // Evidence refs are content-addressed. A fresh verification read
+            // of unchanged upstream content therefore legitimately returns
+            // the same ref. For Cowd-native Team agents the observed scopes
+            // and acceptance vector are derived from Runtime tool receipts;
+            // together with a real tool call they prove reacquisition even
+            // when ref identity is unchanged.
+            let fresh_runtime_tool_observed = returned.tool_calls > 0
+                && !returned.runtime_observed_resource_scopes.is_empty();
             let produced = returned.evidence_refs.iter().any(|evidence| {
                 is_materialized_durable_evidence(evidence)
-                    && !task
-                        .evidence_refs
-                        .iter()
-                        .any(|input| input.evidence_ref == evidence.evidence_ref)
+                    && (fresh_runtime_tool_observed
+                        || !task
+                            .evidence_refs
+                            .iter()
+                            .any(|input| input.evidence_ref == evidence.evidence_ref))
             });
             if requires_new_tool_evidence && returned.tool_calls == 0 {
                 return Err(AgentResultValidationError::MissingToolExecution);
@@ -283,6 +292,31 @@ mod tests {
         assert_eq!(validate_agent_return(&task, &returned), Ok(()));
 
         task.evidence_refs.clear();
+        assert_eq!(
+            validate_agent_return(&task, &returned),
+            Err(AgentResultValidationError::MissingEvidence)
+        );
+    }
+
+    #[test]
+    fn fresh_runtime_read_accepts_the_same_content_addressed_evidence_ref() {
+        let mut task = team_task();
+        let shared = EvidenceAccessRef::durable(
+            EvidenceRef::new("tool", "same-content"),
+            "c".repeat(64),
+            10,
+            "text/plain",
+            "session-event://session/shared",
+            "session:session",
+        );
+        task.evidence_refs = vec![shared.clone()];
+        let mut returned = team_return(&task);
+        returned.evidence_refs = vec![shared];
+        returned.runtime_observed_resource_scopes = vec!["read:src".to_string()];
+
+        assert_eq!(validate_agent_return(&task, &returned), Ok(()));
+
+        returned.runtime_observed_resource_scopes.clear();
         assert_eq!(
             validate_agent_return(&task, &returned),
             Err(AgentResultValidationError::MissingEvidence)
