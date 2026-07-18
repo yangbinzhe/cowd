@@ -29,6 +29,7 @@ pub const DEFAULT_MAX_COST_USD_MILLI: u64 = 50_000;
 const BUSINESS_SAMPLE_TOKEN_LEASE: u64 = 128_000;
 const JUDGE_SAMPLE_TOKEN_LEASE: u64 = 32_000;
 const DEFAULT_CONDITION_CONCURRENCY: usize = 2;
+const TERMINAL_MESSAGE_VISIBILITY_GRACE: Duration = Duration::from_secs(5);
 const FROZEN_CORPUS_SHA256: &str =
     "d8dc4ba671dacd7a12b41d0cbe17d1cb4f2d5f5055cb2b9e7cefab2bb8c22e3c";
 const FROZEN_RUBRIC_SHA256: &str =
@@ -1211,6 +1212,7 @@ fn run_sample(
         return sample;
     };
     let deadline = started + options.timeout;
+    let mut terminal_observed_at = None;
     loop {
         match get_json(
             client,
@@ -1241,6 +1243,17 @@ fn run_sample(
                         let successful = projection_is_successful_sample(&sample, &typed);
                         sample.projection = projection;
                         if terminal {
+                            let first_terminal =
+                                *terminal_observed_at.get_or_insert_with(Instant::now);
+                            if should_wait_for_terminal_response(
+                                successful,
+                                &sample.response,
+                                first_terminal,
+                                Instant::now(),
+                            ) {
+                                thread::sleep(options.poll_interval);
+                                continue;
+                            }
                             sample.wall_ms =
                                 u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                             if successful && !sample.response.trim().is_empty() {
@@ -1402,6 +1415,17 @@ fn projection_is_successful_sample(
             node.status == harness_contract::execution_graph::ExecutionNodeStatus::Completed
         })
         && (sample.selected_candidate.as_deref() != Some("team") || sample.working_state_verified)
+}
+
+fn should_wait_for_terminal_response(
+    successful: bool,
+    response: &str,
+    first_terminal: Instant,
+    now: Instant,
+) -> bool {
+    successful
+        && response.trim().is_empty()
+        && now.saturating_duration_since(first_terminal) < TERMINAL_MESSAGE_VISIBILITY_GRACE
 }
 
 fn apply_projection_metrics(
@@ -2618,6 +2642,35 @@ mod tests {
             {"role": "assistant", "content": "legacy"}
         ]);
         assert_eq!(latest_assistant_text(&legacy).as_deref(), Some("legacy"));
+    }
+
+    #[test]
+    fn successful_terminal_waits_only_for_bounded_message_visibility_grace() {
+        let first_terminal = Instant::now();
+        assert!(should_wait_for_terminal_response(
+            true,
+            "",
+            first_terminal,
+            first_terminal + Duration::from_secs(1)
+        ));
+        assert!(!should_wait_for_terminal_response(
+            true,
+            "answer",
+            first_terminal,
+            first_terminal + Duration::from_secs(1)
+        ));
+        assert!(!should_wait_for_terminal_response(
+            true,
+            "",
+            first_terminal,
+            first_terminal + TERMINAL_MESSAGE_VISIBILITY_GRACE
+        ));
+        assert!(!should_wait_for_terminal_response(
+            false,
+            "",
+            first_terminal,
+            first_terminal
+        ));
     }
 
     #[test]
