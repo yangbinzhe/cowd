@@ -1634,6 +1634,7 @@ where
             .and_then(serde_json::Value::as_bool)
             != Some(true)
     {
+        let committed_write = orchestration_result_has_committed_write(&result.execution);
         let child_executed = result
             .evidence
             .get("executed")
@@ -1691,6 +1692,18 @@ where
             result.status,
             result.decision.validation_findings.join(", ")
         );
+        if committed_write {
+            // A failed reviewer must never cause the parent strategy to replay
+            // an already committed implementer mutation. Preserve the durable
+            // graph and terminate explicitly as partial/blocked; a later turn
+            // can inspect or repair it under a new authority boundary.
+            let terminal = format!(
+                "Team execution stopped after committing a workspace change; automatic fallback was not started to avoid replaying side effects. {team_failure}. Retrieve the durable Team graph evidence before deciding whether a new repair turn is required."
+            );
+            drop(runtime);
+            turn_state.lock().await.terminal_override = Some((GoalCompletion::Blocked, terminal));
+            return Ok(true);
+        }
         runtime
             .downgrade_turn_strategy(fallback, &team_failure)
             .map_err(|downgrade_error| {
@@ -1926,6 +1939,22 @@ where
     turn_state.lock().await.terminal_override =
         Some((GoalCompletion::Satisfied, terminal_summary));
     Ok(true)
+}
+
+fn orchestration_result_has_committed_write(execution: &serde_json::Value) -> bool {
+    match execution {
+        serde_json::Value::Object(object) => {
+            object.get("ref_type").and_then(serde_json::Value::as_str)
+                == Some("runtime_change")
+                || object
+                    .values()
+                    .any(orchestration_result_has_committed_write)
+        }
+        serde_json::Value::Array(values) => {
+            values.iter().any(orchestration_result_has_committed_write)
+        }
+        _ => false,
+    }
 }
 
 fn verified_team_terminal_summary(receipt: &serde_json::Value) -> Option<String> {
@@ -6814,6 +6843,30 @@ mod tests {
     use futures::stream::{self, Stream};
 
     use super::*;
+
+    #[test]
+    fn committed_team_write_is_detected_before_any_fallback_replay() {
+        let execution = serde_json::json!({
+            "projection": {
+                "graph": {
+                    "node_results": {
+                        "implementer": {
+                            "evidence_refs": [{
+                                "evidence_ref": {
+                                    "ref_type": "runtime_change",
+                                    "id": "{\"path\":\"fixtures/target.txt\"}"
+                                }
+                            }]
+                        }
+                    }
+                }
+            }
+        });
+        assert!(orchestration_result_has_committed_write(&execution));
+        assert!(!orchestration_result_has_committed_write(
+            &serde_json::json!({"projection": {"graph": {"node_results": {}}}})
+        ));
+    }
     use crate::conversation::{ApiRequest, AssistantEvent, ToolError};
 
     #[test]

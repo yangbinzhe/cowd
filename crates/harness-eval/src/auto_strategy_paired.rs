@@ -1675,34 +1675,77 @@ fn apply_blind_judge(
     };
     let mut judge_options = options.clone();
     judge_options.provider.clone_from(&options.judge_model);
-    let judge = run_sample(
-        client,
-        endpoint,
-        &judge_options,
-        &judge_task,
-        samples.first().map_or(0, |sample| sample.repetition),
-        false,
-        0,
-        Condition::Direct,
-        evaluation_token_limit,
-    );
-    let parsed = extract_json_object(&judge.response)
-        .filter(|value| valid_judge_output(value, &labels, &options.judge_model));
-    let judge_isolation_verified = judge.status == "completed"
-        && judge.selected_candidate.as_deref() == Some("direct")
-        && judge.tool_calls == 0
-        && judge.team_child_count == 0
-        && judge.team_agent_count == 0
-        && exact_model_revisions(&judge.models_used, &options.judge_model)
-        && judge.evaluation_budget_observed
-        && !judge.evaluation_budget_breached
-        && judge.evaluation_token_limit == evaluation_token_limit
-        && judge.evaluation_tokens_consumed
-            == judge
-                .input_tokens
-                .saturating_add(judge.output_tokens)
-                .saturating_add(judge.cached_tokens)
-        && parsed.is_some();
+    let repetition = samples.first().map_or(0, |sample| sample.repetition);
+    let mut remaining_tokens = evaluation_token_limit;
+    let mut judge_attempts = Vec::new();
+    let mut judge_usage = JudgeUsage {
+        usage_observed: true,
+        cost_observed: true,
+        ..JudgeUsage::default()
+    };
+    let mut final_judge = None;
+    let mut final_parsed = None;
+    let mut judge_isolation_verified = false;
+    // Provider recovery inside Runtime may still terminate with a governed
+    // blocked synthesis. Give the isolated Judge one additional attempt, but
+    // only from the unconsumed portion of the original Judge token lease.
+    // This is bounded, budget-preserving, and uses a distinct idempotency key.
+    for attempt in 1..=2 {
+        if remaining_tokens == 0 {
+            break;
+        }
+        let mut attempt_task = judge_task.clone();
+        attempt_task.task_id = format!("{}:attempt-{attempt}", judge_task.task_id);
+        let attempt_limit = remaining_tokens;
+        let judge = run_sample(
+            client,
+            endpoint,
+            &judge_options,
+            &attempt_task,
+            repetition,
+            false,
+            attempt - 1,
+            Condition::Direct,
+            attempt_limit,
+        );
+        let consumed = judge
+            .input_tokens
+            .saturating_add(judge.output_tokens)
+            .saturating_add(judge.cached_tokens);
+        let parsed = extract_json_object(&judge.response)
+            .filter(|value| valid_judge_output(value, &labels, &options.judge_model));
+        let isolated =
+            judge_attempt_isolated(&judge, parsed.as_ref(), &options.judge_model, attempt_limit);
+        judge_usage.tokens = judge_usage.tokens.saturating_add(consumed);
+        judge_usage.cost_usd_milli = judge_usage
+            .cost_usd_milli
+            .saturating_add(judge.cost_usd_milli);
+        judge_usage.usage_observed &= judge.usage_observed;
+        judge_usage.cost_observed &= judge.cost_observed;
+        remaining_tokens = remaining_tokens.saturating_sub(consumed);
+        judge_attempts.push(json!({
+            "attempt": attempt,
+            "token_limit": attempt_limit,
+            "tokens_consumed": consumed,
+            "status": judge.status,
+            "error": judge.error,
+            "observed_models": judge.models_used,
+            "parsed": parsed.is_some(),
+            "isolation_verified": isolated,
+        }));
+        final_parsed = parsed;
+        final_judge = Some(judge);
+        if isolated {
+            judge_isolation_verified = true;
+            break;
+        }
+    }
+    let judge = final_judge.expect("positive Judge lease must execute at least one attempt");
+    let parsed = if judge_isolation_verified {
+        final_parsed
+    } else {
+        None
+    };
     let label_by_condition = ordered
         .iter()
         .zip(labels)
@@ -1728,26 +1771,55 @@ fn apply_blind_judge(
             "timeout" => base_score.saturating_sub(rubric.timeout_penalty_bp),
             _ => base_score.saturating_sub(rubric.failure_penalty_bp),
         };
+        let judge_run_status = if judge_isolation_verified {
+            "completed"
+        } else {
+            "isolation_failed"
+        };
+        let judge_error = if judge_isolation_verified {
+            judge.error.clone()
+        } else {
+            Some(format!(
+                "blind Judge did not produce an isolated, model-observed, schema-valid result after {} bounded attempt(s)",
+                judge_attempts.len()
+            ))
+        };
         sample.judge = json!({
             "label": label,
             "rubric_id": rubric.rubric_id,
             "judge_model_revision": options.judge_model,
             "raw": parsed.clone(),
-            "judge_run_status": judge.status.clone(),
-            "judge_error": judge.error.clone(),
+            "judge_run_status": judge_run_status,
+            "judge_error": judge_error,
             "observed_models": judge.models_used.clone(),
             "judge_isolation_verified": judge_isolation_verified,
+            "attempts": judge_attempts.clone(),
         });
     }
-    JudgeUsage {
-        tokens: judge
-            .input_tokens
-            .saturating_add(judge.output_tokens)
-            .saturating_add(judge.cached_tokens),
-        cost_usd_milli: judge.cost_usd_milli,
-        usage_observed: judge.usage_observed,
-        cost_observed: judge.cost_observed,
-    }
+    judge_usage
+}
+
+fn judge_attempt_isolated(
+    judge: &Sample,
+    parsed: Option<&Value>,
+    judge_model: &str,
+    evaluation_token_limit: u64,
+) -> bool {
+    judge.status == "completed"
+        && judge.selected_candidate.as_deref() == Some("direct")
+        && judge.tool_calls == 0
+        && judge.team_child_count == 0
+        && judge.team_agent_count == 0
+        && exact_model_revisions(&judge.models_used, judge_model)
+        && judge.evaluation_budget_observed
+        && !judge.evaluation_budget_breached
+        && judge.evaluation_token_limit == evaluation_token_limit
+        && judge.evaluation_tokens_consumed
+            == judge
+                .input_tokens
+                .saturating_add(judge.output_tokens)
+                .saturating_add(judge.cached_tokens)
+        && parsed.is_some()
 }
 
 fn rendered_task_prompt(task: &AutoStrategyTask, repetition: usize) -> String {
@@ -2813,6 +2885,49 @@ mod tests {
         assert!(child_execution_status_terminal("completed"));
         assert!(child_execution_status_terminal("failed"));
         assert!(!child_execution_status_terminal("running"));
+    }
+
+    #[test]
+    fn judge_requires_observed_exact_model_and_valid_raw_result() {
+        let task = AutoStrategyTask {
+            task_id: "judge-proof".to_string(),
+            expected_candidate: "direct".to_string(),
+            prompt: "judge".to_string(),
+            acceptance: vec!["strict JSON scores".to_string()],
+            workspace_fixture: "none".to_string(),
+            provider_constraint: "judge".to_string(),
+            mutation_fixture: None,
+            judge_only: true,
+        };
+        let mut sample = sample_shell(&task, 0, false, 0, Condition::Direct);
+        sample.status = "completed".to_string();
+        sample.selected_candidate = Some("direct".to_string());
+        sample.evaluation_budget_observed = true;
+        sample.evaluation_token_limit = 1_000;
+        sample.evaluation_tokens_consumed = 15;
+        sample.input_tokens = 10;
+        sample.output_tokens = 5;
+        let parsed = json!({"scores": {"A": 1}, "reasons": {"A": "ok"}});
+
+        assert!(!judge_attempt_isolated(
+            &sample,
+            Some(&parsed),
+            "qwen3.7-plus",
+            1_000,
+        ));
+        sample.models_used = vec!["qwen3.7-plus".to_string()];
+        assert!(judge_attempt_isolated(
+            &sample,
+            Some(&parsed),
+            "qwen3.7-plus",
+            1_000,
+        ));
+        assert!(!judge_attempt_isolated(
+            &sample,
+            None,
+            "qwen3.7-plus",
+            1_000,
+        ));
     }
 
     #[test]

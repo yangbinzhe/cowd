@@ -1415,14 +1415,7 @@ fn runtime_evaluated_acceptance(
                     .any(|scope| path_within_scope(&change.path, scope))
             })
     };
-    let upstream_changes = packet
-        .constraints
-        .iter()
-        .filter_map(|constraint| constraint.strip_prefix("upstream_change_scope:"))
-        .filter_map(|value| {
-            serde_json::from_str::<harness_contract::agent::AgentChangeReceipt>(value).ok()
-        })
-        .collect::<Vec<_>>();
+    let upstream_changes = packet_upstream_change_receipts(packet);
     let upstream_evidence = packet
         .evidence_refs
         .iter()
@@ -1488,6 +1481,38 @@ fn runtime_evaluated_acceptance(
     (acceptance, changes)
 }
 
+fn packet_upstream_change_receipts(
+    packet: &AgentTaskPacket,
+) -> Vec<harness_contract::agent::AgentChangeReceipt> {
+    let mut changes = packet
+        .constraints
+        .iter()
+        .filter_map(|constraint| constraint.strip_prefix("upstream_change_scope:"))
+        .filter_map(|value| {
+            serde_json::from_str::<harness_contract::agent::AgentChangeReceipt>(value).ok()
+        })
+        .chain(packet.evidence_refs.iter().filter_map(|evidence| {
+            (crate::agent_result_validator::is_materialized_durable_evidence(evidence)
+                && evidence.evidence_ref.0.ref_type == "runtime_change")
+                .then(|| {
+                    serde_json::from_str::<harness_contract::agent::AgentChangeReceipt>(
+                        &evidence.evidence_ref.0.id,
+                    )
+                    .ok()
+                })
+                .flatten()
+        }))
+        .collect::<Vec<_>>();
+    changes.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.write_sequence.cmp(&right.write_sequence))
+            .then_with(|| left.after_sha256.cmp(&right.after_sha256))
+    });
+    changes.dedup();
+    changes
+}
+
 fn produced_runtime_evidence(
     packet: &AgentTaskPacket,
     evidence_refs: &[harness_contract::context::EvidenceAccessRef],
@@ -1548,14 +1573,26 @@ fn has_matching_read_receipt(
     require_later_sequence: bool,
 ) -> bool {
     receipts.iter().any(|receipt| {
-        (!require_later_sequence || receipt.sequence > change.write_sequence)
-            && receipt.effect_kind == harness_contract::tool::ToolEffectKind::Read
-            && receipt.paths.contains(&change.path)
-            && receipt
-                .after_digests
-                .get(&change.path)
-                .and_then(|digest| digest.as_deref())
-                == Some(change.after_sha256.as_str())
+        if (require_later_sequence && receipt.sequence <= change.write_sequence)
+            || receipt.effect_kind != harness_contract::tool::ToolEffectKind::Read
+        {
+            return false;
+        }
+        // Tool effect planning may retain an absolute or `./`-prefixed key
+        // while the public receipt path is workspace-relative. Resolve the
+        // digest through the receipt's own key after scope normalization;
+        // looking it up with the upstream spelling made a valid independent
+        // review fail intermittently even though both paths named the same
+        // workspace file.
+        receipt.paths.iter().any(|receipt_path| {
+            path_within_scope(receipt_path, &change.path)
+                && path_within_scope(&change.path, receipt_path)
+                && receipt
+                    .after_digests
+                    .get(receipt_path)
+                    .and_then(|digest| digest.as_deref())
+                    == Some(change.after_sha256.as_str())
+        })
     })
 }
 
@@ -1797,6 +1834,31 @@ mod tests {
     }
 
     #[test]
+    fn upstream_review_matches_normalized_receipt_path_and_its_digest_key() {
+        let change = harness_contract::agent::AgentChangeReceipt {
+            path: "fixtures/v546-write/target.txt".to_string(),
+            before_sha256: Some("before".to_string()),
+            after_sha256: "after".to_string(),
+            write_sequence: 3,
+        };
+        let receipt = ScopedToolExecutionReceipt {
+            sequence: 1,
+            effect_kind: harness_contract::tool::ToolEffectKind::Read,
+            paths: vec!["./fixtures/v546-write/target.txt".to_string()],
+            before_digests: BTreeMap::from([(
+                "./fixtures/v546-write/target.txt".to_string(),
+                Some("after".to_string()),
+            )]),
+            after_digests: BTreeMap::from([(
+                "./fixtures/v546-write/target.txt".to_string(),
+                Some("after".to_string()),
+            )]),
+        };
+
+        assert!(has_matching_read_receipt(&change, &[receipt], false));
+    }
+
+    #[test]
     fn fresh_tool_receipt_is_evidence_even_when_content_ref_matches_upstream() {
         let upstream = harness_contract::context::EvidenceAccessRef::durable(
             harness_contract::context::EvidenceRef::new("tool", "same-content"),
@@ -1823,6 +1885,28 @@ mod tests {
                 Some("same"),
             )],
         ));
+    }
+
+    #[test]
+    fn upstream_change_receipt_is_recovered_from_durable_evidence_binding() {
+        let change = harness_contract::agent::AgentChangeReceipt {
+            path: "fixtures/target.txt".to_string(),
+            before_sha256: Some("before".to_string()),
+            after_sha256: "after".to_string(),
+            write_sequence: 3,
+        };
+        let encoded = serde_json::to_string(&change).expect("change receipt JSON");
+        let evidence = harness_contract::context::EvidenceAccessRef::durable(
+            harness_contract::context::EvidenceRef::new("runtime_change", encoded),
+            "sha256:change",
+            1,
+            "application/json",
+            "session-event://session/change",
+            "session:session",
+        );
+        let packet = test_agent_packet(vec![evidence]);
+
+        assert_eq!(packet_upstream_change_receipts(&packet), vec![change]);
     }
 
     #[test]
