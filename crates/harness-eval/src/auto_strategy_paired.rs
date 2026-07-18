@@ -2487,11 +2487,29 @@ fn latest_assistant_text(value: &Value) -> Option<String> {
         if role != "assistant" {
             return None;
         }
-        message
+        let legacy = message
             .get("content")
             .or_else(|| message.get("text"))
             .and_then(Value::as_str)
-            .map(str::to_string)
+            .filter(|text| !text.trim().is_empty())
+            .map(str::to_string);
+        legacy.or_else(|| {
+            let text = message
+                .get("blocks")
+                .and_then(Value::as_array)?
+                .iter()
+                .filter(|block| {
+                    block
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .is_none_or(|kind| kind == "text")
+                })
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .filter(|text| !text.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.is_empty()).then_some(text)
+        })
     })
 }
 
@@ -2577,6 +2595,29 @@ mod tests {
         assert!(parse_condition_concurrency(Some("0")).is_err());
         assert!(parse_condition_concurrency(Some("4")).is_err());
         assert!(parse_condition_concurrency(Some("many")).is_err());
+    }
+
+    #[test]
+    fn latest_assistant_text_reads_gateway_structured_blocks_and_legacy_text() {
+        let structured = json!({
+            "messages": [
+                {"role": "user", "blocks": [{"type": "text", "text": "ignore"}]},
+                {"role": "assistant", "blocks": [
+                    {"type": "text", "text": "first"},
+                    {"type": "tool_use", "name": "read_file"},
+                    {"type": "text", "text": "second"}
+                ]}
+            ]
+        });
+        assert_eq!(
+            latest_assistant_text(&structured).as_deref(),
+            Some("first\nsecond")
+        );
+
+        let legacy = json!([
+            {"role": "assistant", "content": "legacy"}
+        ]);
+        assert_eq!(latest_assistant_text(&legacy).as_deref(), Some("legacy"));
     }
 
     #[test]
