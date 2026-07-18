@@ -3693,6 +3693,10 @@ where
                     }
                 };
                 let edges = dynamic_edges(&ticket.node_id, &next);
+                if next_model_context.is_none() {
+                    next_model_context =
+                        runtime_replan_context_item(&ticket.node_id, model_intervention.as_ref());
+                }
                 if let Some(item) = next_model_context {
                     state.pending_next_model_context.push(item);
                 }
@@ -5366,6 +5370,27 @@ fn model_intent_summary(intent: &ModelStepIntent) -> String {
         }
         ModelStepIntent::Replan { reason } => format!("model requested replan: {reason}"),
     }
+}
+
+fn runtime_replan_context_item(
+    node_id: &str,
+    intervention: Option<&RuntimeIntervention>,
+) -> Option<ContextItem> {
+    let intervention =
+        intervention.filter(|value| value.kind == RuntimeInterventionKind::Replan)?;
+    let mut item = ContextItem::new(
+        format!("runtime-replan-guidance:{node_id}"),
+        ContextSourceKind::Task,
+        ContextRole::Instruction,
+        format!(
+            "Runtime replan guidance (mandatory): {}",
+            intervention.reason
+        ),
+    );
+    item.authority = ContextAuthority::System;
+    item.visibility = ContextVisibility::Private;
+    item.evidence = intervention.evidence_refs.clone();
+    Some(item)
 }
 
 fn final_answer_recovery_reason(text: &str, workspace_root: &std::path::Path) -> Option<String> {
@@ -8534,6 +8559,28 @@ mod tests {
             ),
             json
         );
+    }
+
+    #[test]
+    fn runtime_replan_is_injected_as_private_system_guidance() {
+        let intervention = RuntimeIntervention {
+            goal_id: "goal".to_string(),
+            kind: RuntimeInterventionKind::Replan,
+            reason: "invoke write_file for the exact target".to_string(),
+            evidence_refs: vec!["execution_node:model-1".to_string()],
+            expected_graph_revision: None,
+        };
+        let item = runtime_replan_context_item("model-1", Some(&intervention))
+            .expect("replan context item");
+
+        assert_eq!(item.authority, ContextAuthority::System);
+        assert_eq!(item.visibility, ContextVisibility::Private);
+        assert!(
+            item.content
+                .contains("invoke write_file for the exact target")
+        );
+        assert_eq!(item.evidence, intervention.evidence_refs);
+        assert!(runtime_replan_context_item("model-1", None).is_none());
     }
 
     #[test]
