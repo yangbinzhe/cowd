@@ -668,6 +668,8 @@ where
             successful_tool_calls: 0,
             duplicate_tool_calls: 0,
             write_attempt_paths: Vec::new(),
+            required_write_for_completion: false,
+            required_write_replans: 0,
             max_tool_concurrency_observed: 0,
             parallel_tool_batches: 0,
             evaluation_resource_scopes: evaluation_control
@@ -857,7 +859,12 @@ where
                 user_sequence: 1,
             })
             .map_err(RuntimeError::new)?;
-        state.lock().await.goal_id = goal_id;
+        {
+            let mut turn_state = state.lock().await;
+            turn_state.goal_id = goal_id;
+            turn_state.required_write_for_completion =
+                strategy.decision.strategy.understanding.requires_write;
+        }
         let inline_kind = "inline_model".to_string();
         let tool_kind = "tool_batch".to_string();
         for node in &mut graph.nodes {
@@ -2486,6 +2493,8 @@ struct TurnGraphState {
     successful_tool_calls: usize,
     duplicate_tool_calls: u64,
     write_attempt_paths: Vec<String>,
+    required_write_for_completion: bool,
+    required_write_replans: u8,
     max_tool_concurrency_observed: usize,
     parallel_tool_batches: usize,
     evaluation_resource_scopes: Vec<String>,
@@ -4596,6 +4605,28 @@ where
         let repeated_local_failures = state.consecutive_tool_failure_batches >= 2;
         let repeated_evidence_saturation = state.consecutive_low_novelty_batches
             >= evidence_saturation_limit(bounded_evidence_role);
+        let successful_write_observed = state
+            .focus_observed_resource_scopes
+            .iter()
+            .any(|scope| scope.starts_with("write:"));
+        let required_write_recovery = should_recover_missing_required_write(
+            state.required_write_for_completion,
+            bounded_evidence_role,
+            repeated_evidence_saturation,
+            &state.write_attempt_paths,
+            successful_write_observed,
+            state.required_write_replans,
+        );
+        let authorized_write_scopes = state
+            .evaluation_resource_scopes
+            .iter()
+            .filter(|scope| scope.starts_with("write:"))
+            .cloned()
+            .collect::<Vec<_>>();
+        if required_write_recovery {
+            state.required_write_replans = state.required_write_replans.saturating_add(1);
+            state.consecutive_low_novelty_batches = 0;
+        }
         let has_successful_tool_evidence = state.successful_tool_calls > 0;
         state.tool_results.extend(result.messages);
         state.last_verified_progress = failed == 0
@@ -4686,7 +4717,11 @@ where
         };
         let goal_id = state.goal_id.clone();
         drop(state);
-        if focus_acceptance_met || (repeated_evidence_saturation && !focus_acceptance_pending) {
+        if focus_acceptance_met
+            || (repeated_evidence_saturation
+                && !focus_acceptance_pending
+                && !required_write_recovery)
+        {
             self.runtime
                 .lock()
                 .await
@@ -4713,6 +4748,21 @@ where
             })
         } else if continue_with_tool_batch || orchestration_terminal_summary.is_some() {
             None
+        } else if required_write_recovery {
+            Some(RuntimeIntervention {
+                goal_id: goal_id.clone(),
+                kind: RuntimeInterventionKind::Replan,
+                reason: format!(
+                    "the objective requires a workspace write, but repeated read-only batches produced no write attempt. Execute one authorized write now before further reading or synthesis. Authorized exact write scopes: {}",
+                    if authorized_write_scopes.is_empty() {
+                        "the bounded scope declared by the active permission lease".to_string()
+                    } else {
+                        authorized_write_scopes.join(", ")
+                    }
+                ),
+                evidence_refs: observation.evidence_refs.clone(),
+                expected_graph_revision: None,
+            })
         } else if repeated_evidence_saturation && focus_acceptance_pending {
             Some(RuntimeIntervention {
                 goal_id: goal_id.clone(),
@@ -6101,6 +6151,22 @@ fn tool_batch_coverage_keys(calls: &[ModelToolCall]) -> BTreeSet<String> {
 /// ever-larger provider context from unchanged evidence.
 const fn evidence_saturation_limit(bounded_evidence_role: bool) -> usize {
     if bounded_evidence_role { 2 } else { 3 }
+}
+
+fn should_recover_missing_required_write(
+    required_write_for_completion: bool,
+    bounded_evidence_role: bool,
+    repeated_evidence_saturation: bool,
+    write_attempt_paths: &[String],
+    successful_write_observed: bool,
+    required_write_replans: u8,
+) -> bool {
+    required_write_for_completion
+        && !bounded_evidence_role
+        && repeated_evidence_saturation
+        && write_attempt_paths.is_empty()
+        && !successful_write_observed
+        && required_write_replans == 0
 }
 
 /// Responsibility-zone coverage is intentionally coarser than file coverage.
@@ -8624,6 +8690,42 @@ mod tests {
             tool_batch_coverage_keys(&[second]),
             "offset-only rereads must count toward the bounded convergence threshold"
         );
+    }
+
+    #[test]
+    fn required_write_gets_one_bounded_replan_before_read_only_synthesis() {
+        assert!(should_recover_missing_required_write(
+            true,
+            false,
+            true,
+            &[],
+            false,
+            0,
+        ));
+        assert!(!should_recover_missing_required_write(
+            true,
+            false,
+            true,
+            &[],
+            false,
+            1,
+        ));
+        assert!(!should_recover_missing_required_write(
+            true,
+            false,
+            true,
+            &["src/lib.rs".into()],
+            false,
+            0,
+        ));
+        assert!(!should_recover_missing_required_write(
+            true,
+            true,
+            true,
+            &[],
+            false,
+            0,
+        ));
     }
 
     #[test]
