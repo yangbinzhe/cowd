@@ -1302,10 +1302,9 @@ mod tests {
             .register_backend(Arc::new(CompletedProtocolBackend {
                 objectives: Arc::clone(&objectives),
             }));
-        let mut decision = crate::execution_core::build_runtime_execution_decision(
-            "全面审查 runtime gateway frontend 三个独立责任域并综合",
-            None,
-        );
+        let objective = "全面审视 crates/runtime、crates/gateway、surfaces/webui 三个独立责任域的策略事件接线、权限边界和用户可见状态，分别给出证据后综合。";
+        let mut decision =
+            crate::execution_core::build_runtime_execution_decision(objective, None);
         assert_eq!(
             decision.strategy.selected_candidate,
             harness_contract::strategy::ExecutionCandidateKind::Team
@@ -1323,11 +1322,14 @@ mod tests {
             node_id: "turn-graph-auto:model".to_string(),
         };
         let mut automatic = request(RuntimeOrchestrationAction::RequestTeam);
-        automatic.intent = "全面审查 runtime gateway frontend 三个独立责任域并综合".to_string();
+        automatic.intent = objective.to_string();
         automatic.model_lease = Some("fast".to_string());
         automatic.selection_mode = Some(harness_contract::team::TeamSelectionMode::Automatic);
         automatic.strategy_binding = Some(binding.clone());
         automatic.constraints.max_parallel_agents = Some(3);
+        automatic.constraints.risk = Some(
+            format!("{:?}", decision.strategy.understanding.risk).to_ascii_lowercase(),
+        );
         let scopes = [
             "read:crates/runtime",
             "read:crates/gateway",
@@ -1337,34 +1339,66 @@ mod tests {
             .iter()
             .map(|scope| format!("resource:{scope}"))
             .collect();
-        automatic.focus_partition_plans = vec![harness_contract::team::FocusPartitionPlan {
-            role_id: "researcher".to_string(),
-            shared_baseline: vec!["same parent objective".to_string()],
-            slots: scopes
-                .iter()
-                .enumerate()
-                .map(
-                    |(index, scope)| harness_contract::team::FocusPartitionSlot {
-                        focus_id: format!("focus-{index}"),
-                        boundary: format!("inspect only {scope}"),
-                        evidence_responsibility: format!("evidence from {scope}"),
-                        capability_cropped_refs: vec![(*scope).to_string()],
-                        scope_hash: harness_contract::team::focus_scope_hash(
-                            "researcher",
-                            &format!("inspect only {scope}"),
-                            &[(*scope).to_string()],
-                        ),
-                        overlap_budget_bp: 0,
-                        novelty_target_bp: 2_500,
-                        output_contract: vec!["findings".to_string(), "evidence".to_string()],
-                        output_acceptance: vec![format!(
-                            "evidence_scope:{}",
-                            scope.trim_start_matches("read:")
-                        )],
-                    },
-                )
-                .collect(),
-        }];
+        automatic.focus_partition_plans = vec![
+            harness_contract::team::FocusPartitionPlan {
+                role_id: "researcher".to_string(),
+                shared_baseline: vec!["same parent objective".to_string()],
+                slots: scopes
+                    .iter()
+                    .enumerate()
+                    .map(
+                        |(index, scope)| harness_contract::team::FocusPartitionSlot {
+                            focus_id: format!("focus-{index}"),
+                            boundary: format!("inspect only {scope}"),
+                            evidence_responsibility: format!("evidence from {scope}"),
+                            capability_cropped_refs: vec![(*scope).to_string()],
+                            scope_hash: harness_contract::team::focus_scope_hash(
+                                "researcher",
+                                &format!("inspect only {scope}"),
+                                &[(*scope).to_string()],
+                            ),
+                            overlap_budget_bp: 0,
+                            novelty_target_bp: 2_500,
+                            output_contract: vec!["findings".to_string(), "evidence".to_string()],
+                            output_acceptance: vec![format!(
+                                "evidence_scope:{}",
+                                scope.trim_start_matches("read:")
+                            )],
+                        },
+                    )
+                    .collect(),
+            },
+            harness_contract::team::FocusPartitionPlan {
+                role_id: "synthesizer".to_string(),
+                shared_baseline: vec!["bounded researcher outputs only".to_string()],
+                slots: vec![harness_contract::team::FocusPartitionSlot {
+                    focus_id: "bounded-synthesis".to_string(),
+                    boundary: "synthesize only bounded researcher evidence".to_string(),
+                    evidence_responsibility: "preserve evidence scope and unresolved gaps"
+                        .to_string(),
+                    capability_cropped_refs: scopes
+                        .iter()
+                        .map(|scope| (*scope).to_string())
+                        .collect(),
+                    scope_hash: harness_contract::team::focus_scope_hash(
+                        "synthesizer",
+                        "synthesize only bounded researcher evidence",
+                        &scopes
+                            .iter()
+                            .map(|scope| (*scope).to_string())
+                            .collect::<Vec<_>>(),
+                    ),
+                    overlap_budget_bp: 0,
+                    novelty_target_bp: 1_000,
+                    output_contract: vec![
+                        "summary".to_string(),
+                        "evidence".to_string(),
+                        "unresolved".to_string(),
+                    ],
+                    output_acceptance: vec!["evidence".to_string(), "unresolved".to_string()],
+                }],
+            },
+        ];
 
         let (left, right) = tokio::join!(
             submit_runtime_orchestration_request(
@@ -1448,6 +1482,35 @@ mod tests {
         assert_eq!(
             objectives.lock().expect("objectives").len(),
             executed_agents
+        );
+    }
+
+    #[test]
+    fn critical_risk_still_requires_global_approval() {
+        let execution = crate::execution_core::build_runtime_execution_decision(
+            "force push 并 reset --hard 清理所有内容",
+            None,
+        );
+        let mut critical = request(RuntimeOrchestrationAction::PlanOnly);
+        critical.constraints.risk = Some("critical".to_string());
+
+        let decision = validator::validate_request(&critical, &execution, None, None);
+
+        assert_eq!(decision.status, "needs_approval");
+        assert!(
+            decision
+                .policy_gates
+                .contains(&harness_contract::core::ExecutionPolicyGate::Risk)
+        );
+        assert!(
+            decision
+                .policy_gates
+                .contains(&harness_contract::core::ExecutionPolicyGate::Approval)
+        );
+        assert!(
+            decision
+                .validation_findings
+                .contains(&"risk_requires_approval".to_string())
         );
     }
 }

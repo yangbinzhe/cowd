@@ -7219,19 +7219,26 @@ where
         candidate: harness_contract::strategy::ExecutionCandidateKind,
         reason: &str,
     ) -> Result<crate::execution_core::TurnStrategyDecisionState, RuntimeError> {
-        let requires_write = self
+        let understanding = self
             .active_turn_strategy()
-            .is_some_and(|state| state.decision.strategy.understanding.requires_write);
+            .map(|state| state.decision.strategy.understanding)
+            .ok_or_else(|| RuntimeError::new("downgraded turn strategy has no owner"))?;
+        let requires_guarded_pattern = understanding.requires_write
+            || matches!(
+                understanding.risk,
+                harness_contract::core::TaskRisk::High
+                    | harness_contract::core::TaskRisk::Critical
+            );
         let pattern = match candidate {
             harness_contract::strategy::ExecutionCandidateKind::Direct => {
-                if requires_write {
+                if requires_guarded_pattern {
                     harness_contract::core::ExecutionPattern::Execute
                 } else {
                     harness_contract::core::ExecutionPattern::Direct
                 }
             }
             harness_contract::strategy::ExecutionCandidateKind::ParallelTools => {
-                if requires_write {
+                if requires_guarded_pattern {
                     harness_contract::core::ExecutionPattern::Execute
                 } else {
                     harness_contract::core::ExecutionPattern::Explore
@@ -10127,7 +10134,10 @@ mod tests {
         assert_eq!(projections.len(), 2);
         assert!(projections[0].active_ids.is_empty());
         assert_eq!(projections[0].deferred_ids.len(), 3);
-        assert_eq!(projections[1].active_ids, vec!["ToolSearch"]);
+        assert_eq!(
+            projections[1].active_ids,
+            vec!["ToolSearch", "grep_search"]
+        );
         assert!(
             projections[1]
                 .deferred_ids

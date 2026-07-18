@@ -47,16 +47,19 @@ pub fn validate_request(
         push_gate(&mut policy_gates, ExecutionPolicyGate::Approval);
         findings.push("risk_gate_requested".to_string());
     }
-    if request
-        .constraints
-        .risk
-        .as_deref()
-        .is_some_and(|risk| matches!(risk, "high" | "critical"))
-    {
+    let requested_risk = request.constraints.risk.as_deref();
+    if requested_risk.is_some_and(|risk| matches!(risk, "high" | "critical")) {
+        push_gate(&mut policy_gates, ExecutionPolicyGate::Risk);
+        findings.push("risk_gate_required".to_string());
+    }
+    // 与 ExecutionPolicyGate::is_required_for 保持同一事实：High 需要
+    // 风险复核，但只有 Critical 才需要人工批准。此前把只读深度审计的
+    // High 也升级为 needs_approval，会让策略正确选中的自动 Team 在
+    // 创建任何子图之前被错误拦截。
+    if requested_risk == Some("critical") {
         if status != "rejected" {
             status = "needs_approval".to_string();
         }
-        push_gate(&mut policy_gates, ExecutionPolicyGate::Risk);
         push_gate(&mut policy_gates, ExecutionPolicyGate::Approval);
         findings.push("risk_requires_approval".to_string());
     }

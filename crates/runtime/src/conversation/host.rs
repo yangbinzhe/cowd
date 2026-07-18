@@ -1642,14 +1642,18 @@ where
             runtime.record_turn_strategy_collaboration_receipt(receipt)?;
             runtime.push_next_model_context_item(item);
         }
-        runtime.downgrade_turn_strategy(
-            fallback,
-            &format!(
-                "selected Team start failed with status `{}`: {}",
-                result.status,
-                result.decision.validation_findings.join(", ")
-            ),
-        )?;
+        let team_failure = format!(
+            "selected Team start failed with status `{}`: {}",
+            result.status,
+            result.decision.validation_findings.join(", ")
+        );
+        runtime
+            .downgrade_turn_strategy(fallback, &team_failure)
+            .map_err(|downgrade_error| {
+                RuntimeError::new(format!(
+                    "{team_failure}; safe fallback failed: {downgrade_error}"
+                ))
+            })?;
         return Ok(child_executed);
     }
 
