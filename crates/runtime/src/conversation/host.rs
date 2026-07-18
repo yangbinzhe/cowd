@@ -652,6 +652,7 @@ where
                 .as_ref()
                 .is_some_and(|control| control.provider_constraint == "judge"),
             terminal_recovery_attempts: 0,
+            delegated_agent_role: false,
             bounded_evidence_role: false,
             focus_novelty_target_bp: 0,
             focus_acceptance_scopes: Vec::new(),
@@ -745,6 +746,7 @@ where
             );
             graph_state.bounded_evidence_role = context_profile == ContextProfile::SubAgent
                 || compile_target == crate::execution_core::RuntimeCompileTarget::EvidenceGraph;
+            graph_state.delegated_agent_role = context_profile == ContextProfile::SubAgent;
             graph_state.focus_novelty_target_bp = delegated_focus_policy.0;
             graph_state.focus_acceptance_pending_scopes = delegated_focus_policy.1.clone();
             graph_state.focus_acceptance_scopes = delegated_focus_policy.1;
@@ -2410,6 +2412,7 @@ struct TurnGraphState {
     reasoning_only_attempts: u8,
     force_text_only_next_model: bool,
     terminal_recovery_attempts: u8,
+    delegated_agent_role: bool,
     bounded_evidence_role: bool,
     focus_novelty_target_bp: u16,
     focus_acceptance_scopes: Vec<String>,
@@ -4181,7 +4184,14 @@ where
                 detail: Some("executing tool batch".to_string()),
             });
         }
-        let (prompter, iteration, session_id, model_lease, require_source_path_evidence) = {
+        let (
+            prompter,
+            iteration,
+            session_id,
+            model_lease,
+            require_source_path_evidence,
+            delegated_agent_role,
+        ) = {
             let state = self.state.lock().await;
             (
                 state.prompter.clone(),
@@ -4189,6 +4199,7 @@ where
                 state.session_id.clone(),
                 state.model.clone(),
                 objective_requires_workspace_source_evidence(&state.content),
+                state.delegated_agent_role,
             )
         };
         let execution_decision = self
@@ -4246,70 +4257,74 @@ where
             }
             auths
         };
-        let (result, orchestration_terminal_summary) =
-            if let Some(host) = self.services.tool_execution_host() {
-                let governed = execute_governed_runtime_tool_batch(
-                    Arc::clone(host),
-                    &calls,
-                    &session_id,
-                    model_lease.as_deref(),
-                    ticket,
-                    &tool_authorizations,
-                    &execution_decision,
-                )
+        let governed_host = if delegated_agent_role {
+            None
+        } else {
+            self.services.tool_execution_host()
+        };
+        let (result, orchestration_terminal_summary) = if let Some(host) = governed_host {
+            let governed = execute_governed_runtime_tool_batch(
+                Arc::clone(host),
+                &calls,
+                &session_id,
+                model_lease.as_deref(),
+                ticket,
+                &tool_authorizations,
+                &execution_decision,
+            )
+            .await;
+            let orchestration_terminal_summary = completed_orchestration_terminal_summary(
+                &calls,
+                &governed.messages,
+                self.services.workspace_root(),
+                require_source_path_evidence,
+            );
+            // Graph scheduling executes outside the legacy adapter. Before
+            // the next model node sees the result, route its raw output
+            // through the same durable evidence and context-ledger path used
+            // by normal conversation tool calls.
+            let messages =
+                compact_governed_tool_messages(&self.runtime, &calls, governed.messages).await;
+            (
+                crate::conversation::ToolBatchStepResult {
+                    failed: messages
+                        .iter()
+                        .flat_map(|message| &message.blocks)
+                        .filter(|block| {
+                            matches!(block, ContentBlock::ToolResult { is_error: true, .. })
+                        })
+                        .count(),
+                    messages,
+                    max_concurrency_observed: governed.max_concurrency_observed,
+                    parallel_batches: governed.parallel_batches,
+                },
+                orchestration_terminal_summary,
+            )
+        } else {
+            let mut runtime = self.runtime.lock().await;
+            let transcript_len = runtime.session_async().await.messages.len();
+            let result = runtime
+                .execute_tool_batch_step(&calls, &prompter, iteration)
                 .await;
-                let orchestration_terminal_summary = completed_orchestration_terminal_summary(
-                    &calls,
-                    &governed.messages,
-                    self.services.workspace_root(),
-                    require_source_path_evidence,
-                );
-                // Graph scheduling executes outside the legacy adapter. Before
-                // the next model node sees the result, route its raw output
-                // through the same durable evidence and context-ledger path used
-                // by normal conversation tool calls.
-                let messages =
-                    compact_governed_tool_messages(&self.runtime, &calls, governed.messages).await;
-                (
-                    crate::conversation::ToolBatchStepResult {
-                        failed: messages
-                            .iter()
-                            .flat_map(|message| &message.blocks)
-                            .filter(|block| {
-                                matches!(block, ContentBlock::ToolResult { is_error: true, .. })
-                            })
-                            .count(),
-                        messages,
-                        max_concurrency_observed: governed.max_concurrency_observed,
-                        parallel_batches: governed.parallel_batches,
-                    },
-                    orchestration_terminal_summary,
-                )
-            } else {
-                let mut runtime = self.runtime.lock().await;
-                let transcript_len = runtime.session_async().await.messages.len();
-                let result = runtime
-                    .execute_tool_batch_step(&calls, &prompter, iteration)
-                    .await;
-                // The legacy conversation engine writes tool messages eagerly. Roll them
-                // back until the graph transition commits; after_commit publishes them.
-                rollback_uncommitted_transcript(
-                    &mut runtime.session_mut_async().await.messages,
-                    transcript_len,
-                );
-                drop(runtime);
-                let result = result.map_err(|error| NodeExecutorError::Poll {
-                    node_id: ticket.node_id.clone(),
-                    reason: error.to_string(),
-                })?;
-                let orchestration_terminal_summary = completed_orchestration_terminal_summary(
-                    &calls,
-                    &result.messages,
-                    self.services.workspace_root(),
-                    require_source_path_evidence,
-                );
-                (result, orchestration_terminal_summary)
-            };
+            // The legacy conversation engine writes tool messages eagerly. Roll them
+            // back until the graph transition commits; after_commit publishes them.
+            rollback_uncommitted_transcript(
+                &mut runtime.session_mut_async().await.messages,
+                transcript_len,
+            );
+            drop(runtime);
+            let result = result.map_err(|error| NodeExecutorError::Poll {
+                node_id: ticket.node_id.clone(),
+                reason: error.to_string(),
+            })?;
+            let orchestration_terminal_summary = completed_orchestration_terminal_summary(
+                &calls,
+                &result.messages,
+                self.services.workspace_root(),
+                require_source_path_evidence,
+            );
+            (result, orchestration_terminal_summary)
+        };
         let tool_calls = result.messages.len() as u64;
         let failed = result.failed;
         let failed_tools = failed_tool_names(&result.messages);
