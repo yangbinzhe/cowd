@@ -4359,6 +4359,30 @@ mod tests {
         assert!(selected_matches.iter().any(|value| value == "WebSearch"));
         assert!(selected_matches.iter().any(|value| value == "ToolSearch"));
 
+        let source_search = execute_tool(
+            "ToolSearch",
+            &json!({"query": "select:grep_search,grep_many,read_file"}),
+        )
+        .expect("ToolSearch should expose executable source tools");
+        let source_output: serde_json::Value =
+            serde_json::from_str(&source_search).expect("valid json");
+        assert_eq!(
+            source_output["activation_candidates"],
+            json!(["grep_search", "grep_many", "read_file"])
+        );
+
+        let exact_grep = execute_tool(
+            "ToolSearch",
+            &json!({"query": "grep_search", "max_results": 1}),
+        )
+        .expect("focused grep discovery should succeed");
+        let exact_grep_output: serde_json::Value =
+            serde_json::from_str(&exact_grep).expect("valid json");
+        assert_eq!(
+            exact_grep_output["activation_candidates"],
+            json!(["grep_search"])
+        );
+
         let removed = execute_tool("ToolSearch", &json!({"query": "select:Agent,WorkerCreate"}))
             .expect("ToolSearch should ignore removed control-plane tools");
         let removed_output: serde_json::Value = serde_json::from_str(&removed).expect("valid json");

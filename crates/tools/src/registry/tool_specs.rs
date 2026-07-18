@@ -822,37 +822,6 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
     ]
 }
-pub(crate) fn deferred_tool_specs() -> Vec<ToolSpec> {
-    mvp_tool_specs()
-        .into_iter()
-        .filter(|spec| {
-            !matches!(
-                spec.name,
-                "bash"
-                    | "read_file"
-                    | "read_many"
-                    | "write_file"
-                    | "edit_file"
-                    | "mutation_preview"
-                    | "edit_many_preview"
-                    | "patch_plan"
-                    | "apply_patch_transaction"
-                    | "checkpoint_create"
-                    | "checkpoint_list"
-                    | "checkpoint_diff"
-                    | "checkpoint_restore"
-                    | "glob_search"
-                    | "glob_many"
-                    | "grep_search"
-                    | "grep_many"
-                    | "workspace_snapshot"
-                    | "tool_batch_readonly"
-                    | "tool_cache_stats"
-            )
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::mvp_tool_specs;

@@ -28,10 +28,8 @@ pub(crate) fn test_process_environment_lock() -> &'static std::sync::Mutex<()> {
 }
 
 // Re-exports from split modules
-pub(crate) use tool_specs::{
-    deferred_tool_specs, normalize_tool_name, permission_mode_from_plugin,
-};
 pub use tool_specs::{mvp_tool_specs, ToolSpec};
+pub(crate) use tool_specs::{normalize_tool_name, permission_mode_from_plugin};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolManifestEntry {
@@ -395,12 +393,10 @@ impl ToolCatalog {
     }
 
     fn searchable_tool_specs(&self) -> Vec<SearchableToolSpec> {
-        let builtin = deferred_tool_specs()
-            .into_iter()
-            .map(|spec| SearchableToolSpec {
-                name: spec.name.to_string(),
-                description: spec.description.to_string(),
-            });
+        let builtin = mvp_tool_specs().into_iter().map(|spec| SearchableToolSpec {
+            name: spec.name.to_string(),
+            description: spec.description.to_string(),
+        });
         let runtime = self.runtime_tools.iter().map(|tool| SearchableToolSpec {
             name: tool.name.clone(),
             description: tool.description.clone().unwrap_or_default(),

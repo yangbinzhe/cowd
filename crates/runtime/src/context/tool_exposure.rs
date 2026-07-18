@@ -53,9 +53,8 @@ const HOT_TOOLS: &[&str] = &[
     "write_file",
     "edit_file",
     "bash",
-    "grep",
-    "glob",
-    "list_files",
+    "grep_search",
+    "glob_search",
 ];
 
 impl ToolExposurePlanner {
@@ -267,6 +266,8 @@ mod tests {
             catalog_revision: 1,
             descriptors: vec![
                 descriptor("read_file", ToolPermissionMode::ReadOnly),
+                descriptor("grep_search", ToolPermissionMode::ReadOnly),
+                descriptor("glob_search", ToolPermissionMode::ReadOnly),
                 descriptor("write_file", ToolPermissionMode::WorkspaceWrite),
             ],
             activation_candidates: Vec::new(),
@@ -280,6 +281,8 @@ mod tests {
         let state = ToolExposurePlanner.plan(&receipt, Vec::new(), &policy);
         assert!(state.fallback_full);
         assert!(state.active.contains("read_file"));
+        assert!(state.active.contains("grep_search"));
+        assert!(state.active.contains("glob_search"));
         assert!(!state.active.contains("write_file"));
     }
 
@@ -291,6 +294,8 @@ mod tests {
             descriptors: vec![
                 descriptor("tool_search", ToolPermissionMode::ReadOnly),
                 descriptor("read_file", ToolPermissionMode::ReadOnly),
+                descriptor("grep_search", ToolPermissionMode::ReadOnly),
+                descriptor("glob_search", ToolPermissionMode::ReadOnly),
                 descriptor("write_file", ToolPermissionMode::WorkspaceWrite),
                 descriptor("bash", ToolPermissionMode::WorkspaceWrite),
                 descriptor("mcp_custom_tool", ToolPermissionMode::ReadOnly),
@@ -305,6 +310,8 @@ mod tests {
 
         let state = ToolExposurePlanner.plan(&receipt, ["tool_search".to_string()], &policy);
         assert!(state.active.contains("read_file"));
+        assert!(state.active.contains("grep_search"));
+        assert!(state.active.contains("glob_search"));
         assert!(state.active.contains("write_file"));
         assert!(state.active.contains("bash"));
         assert!(!state.active.contains("mcp_custom_tool"));
