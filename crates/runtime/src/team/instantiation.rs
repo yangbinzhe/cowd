@@ -558,6 +558,16 @@ fn team_acceptance_contract(
         .filter(|scope| scope.starts_with("write:") || scope.starts_with("workspace:"))
         .cloned()
         .collect::<Vec<_>>();
+    // A downstream reviewer must independently observe the implementation
+    // surface, not every unrelated read-only guard in the parent Team lease.
+    // `UpstreamReview` below still verifies the exact committed digest; this
+    // narrows the generic evidence criterion to the paths an upstream role
+    // could have changed.
+    let review_evidence_scopes = criteria
+        .iter()
+        .any(|criterion| criterion == "review")
+        .then_some(write_scopes.clone())
+        .filter(|scopes| !scopes.is_empty());
     let structured = |criterion: &str, field| TeamAcceptanceRequirement {
         criterion: criterion.to_string(),
         check: TeamAcceptanceCheck::StructuredField { field },
@@ -604,7 +614,9 @@ fn team_acceptance_contract(
                         TeamAcceptanceCheck::UpstreamEvidence
                     } else {
                         TeamAcceptanceCheck::ScopedEvidence {
-                            scopes: workspace_scopes.clone(),
+                            scopes: review_evidence_scopes
+                                .clone()
+                                .unwrap_or_else(|| workspace_scopes.clone()),
                         }
                     },
                 },
@@ -1063,6 +1075,33 @@ mod acceptance_contract_tests {
                 &requirement.check,
                 TeamAcceptanceCheck::ScopedEvidence { .. }
             )
+        }));
+    }
+
+    #[test]
+    fn reviewer_evidence_is_scoped_to_upstream_write_paths() {
+        let contract = team_acceptance_contract(
+            &[
+                "review".to_string(),
+                "evidence".to_string(),
+                "risks".to_string(),
+            ],
+            &[
+                "read:fixtures/protected/sentinel.txt".to_string(),
+                "read:fixtures/write/target.txt".to_string(),
+                "write:fixtures/write/target.txt".to_string(),
+            ],
+            false,
+            false,
+        )
+        .expect("review contract");
+
+        assert!(contract.iter().any(|requirement| {
+            requirement.criterion == "evidence"
+                && requirement.check
+                    == TeamAcceptanceCheck::ScopedEvidence {
+                        scopes: vec!["write:fixtures/write/target.txt".to_string()],
+                    }
         }));
     }
 }
