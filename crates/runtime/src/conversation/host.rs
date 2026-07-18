@@ -656,6 +656,8 @@ where
             focus_novelty_target_bp: 0,
             focus_acceptance_scopes: Vec::new(),
             focus_acceptance_pending_scopes: Vec::new(),
+            focus_observed_resource_scopes: BTreeSet::new(),
+            focus_action_rejections: 0,
             pending_focus_terminal_candidate: None,
             clean_terminal_synthesis_next: false,
             clean_terminal_synthesis_attempted: false,
@@ -2412,6 +2414,8 @@ struct TurnGraphState {
     focus_novelty_target_bp: u16,
     focus_acceptance_scopes: Vec<String>,
     focus_acceptance_pending_scopes: Vec<String>,
+    focus_observed_resource_scopes: BTreeSet<String>,
+    focus_action_rejections: u8,
     pending_focus_terminal_candidate: Option<String>,
     clean_terminal_synthesis_next: bool,
     clean_terminal_synthesis_attempted: bool,
@@ -3418,12 +3422,25 @@ where
                     }
                     ModelStepIntent::ToolCalls { calls } => {
                         record_write_attempt_paths(&mut state.write_attempt_paths, &calls);
+                        let pending_focus_write_action = pending_focus_write_action_violation(
+                            &state.focus_acceptance_pending_scopes,
+                            &state.focus_observed_resource_scopes,
+                            &calls,
+                            self.services.workspace_root(),
+                        );
                         let evaluation_scope_violation = evaluation_scope_violation(
                             &state.evaluation_resource_scopes,
                             &calls,
                             self.services.workspace_root(),
                         );
-                        if let Some(violation) = evaluation_scope_violation {
+                        if let Some(pending_writes) = pending_focus_write_action {
+                            state.assistant_messages.pop();
+                            state.pending_transcript.remove(&ticket.node_id);
+                            let (intervention, next) =
+                                focus_action_rejection_outcome(ticket, &mut state, &pending_writes);
+                            model_intervention = Some(intervention);
+                            next
+                        } else if let Some(violation) = evaluation_scope_violation {
                             state.assistant_messages.pop();
                             state.pending_transcript.remove(&ticket.node_id);
                             let authorized_scopes = state.evaluation_resource_scopes.join(", ");
@@ -4413,6 +4430,14 @@ where
         let focus_acceptance_pending =
             bounded_evidence_role && !focus_acceptance_scopes.is_empty() && !focus_acceptance_met;
         state.focus_acceptance_pending_scopes = focus_acceptance_pending_scopes;
+        if failed == 0 {
+            state
+                .focus_observed_resource_scopes
+                .extend(successful_resource_scope_keys.iter().cloned());
+            state
+                .focus_observed_resource_scopes
+                .extend(verified_after_write_scope_keys.iter().cloned());
+        }
         state
             .pending_transcript
             .insert(ticket.node_id.clone(), result.messages.clone());
@@ -5494,6 +5519,14 @@ fn normalize_terminal_answer_with_evidence(
     workspace_root: &std::path::Path,
     objective: &str,
 ) -> String {
+    let trimmed = text.trim();
+    if serde_json::from_str::<serde_json::Value>(trimmed).is_ok_and(|value| value.is_object()) {
+        // Delegated roles and evaluation Judges own exact machine-readable
+        // output contracts. Appending prose evidence to a valid JSON object
+        // silently corrupts that contract and makes completed Agent work fail
+        // at the parent validation boundary.
+        return trimmed.to_string();
+    }
     if looks_like_unfinished_work_preamble(text) {
         return text.trim().to_string();
     }
@@ -6246,6 +6279,92 @@ fn evaluation_scope_violation(
                 .iter()
                 .any(|scope| evaluation_scope_authorizes(scope, requested))
         })
+}
+
+fn pending_focus_write_action_violation(
+    pending_scopes: &[String],
+    observed_scopes: &BTreeSet<String>,
+    calls: &[ModelToolCall],
+    workspace_root: &std::path::Path,
+) -> Option<Vec<String>> {
+    let pending_writes = pending_scopes
+        .iter()
+        .filter(|scope| scope.starts_with("write:"))
+        .cloned()
+        .collect::<Vec<_>>();
+    if pending_writes.is_empty()
+        || !pending_writes.iter().all(|write_scope| {
+            write_scope
+                .strip_prefix("write:")
+                .is_some_and(|path| observed_scopes.contains(&format!("read:{path}")))
+        })
+    {
+        return None;
+    }
+    let requested = graph_resource_scopes_for_tool_calls(calls, workspace_root);
+    (!requested.iter().any(|scope| {
+        scope.starts_with("write:")
+            && pending_writes
+                .iter()
+                .any(|required| evaluation_scope_authorizes(required, scope))
+    }))
+    .then_some(pending_writes)
+}
+
+fn focus_action_rejection_outcome(
+    ticket: &NodeExecutionTicket,
+    state: &mut TurnGraphState,
+    pending_writes: &[String],
+) -> (RuntimeIntervention, Vec<ExecutionNodeSpec>) {
+    state.focus_action_rejections = state.focus_action_rejections.saturating_add(1);
+    let pending = pending_writes.join(", ");
+    if state.focus_action_rejections <= 2 {
+        let reason = format!(
+            "the delegated mutation role already has its required pre-write read receipt; the next accepted action must invoke an authorized write tool for [{pending}]. Do not reread, search, glob, synthesize, or claim the change in prose before the committed write receipt exists"
+        );
+        return (
+            RuntimeIntervention {
+                goal_id: state.goal_id.clone(),
+                kind: RuntimeInterventionKind::Replan,
+                reason,
+                evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
+                expected_graph_revision: None,
+            },
+            vec![dynamic_node(
+                ticket,
+                state.iterations,
+                "focus-required-write-replan-model",
+                ExecutionNodeKind::InlineModel,
+                "inline_model",
+                "inline_model",
+            )],
+        );
+    }
+
+    let terminal_reason = format!(
+        "Execution blocked after the delegated mutation role repeatedly ignored the required write action [{pending}]. No unverified replacement action was executed."
+    );
+    state.terminal_override = Some((GoalCompletion::Blocked, terminal_reason.clone()));
+    let mut node = dynamic_node(
+        ticket,
+        state.iterations,
+        "focus-required-write-block-synthesize",
+        ExecutionNodeKind::Synthesize,
+        crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND,
+        "inline_model",
+    );
+    node.executor_kind =
+        crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND.to_string();
+    (
+        RuntimeIntervention {
+            goal_id: state.goal_id.clone(),
+            kind: RuntimeInterventionKind::Block,
+            reason: terminal_reason,
+            evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
+            expected_graph_revision: None,
+        },
+        vec![node],
+    )
 }
 
 fn evaluation_scope_rejection_outcome(
@@ -8386,6 +8505,65 @@ mod tests {
                 "Verified conclusion.\n<function=read_file><parameter=path>src/lib.rs".to_string()
             ),
             "Verified conclusion."
+        );
+    }
+
+    #[test]
+    fn structured_terminal_json_is_not_corrupted_by_prose_evidence_normalization() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(workspace.path().join("crates/runtime/src"))
+            .expect("runtime source root");
+        std::fs::write(workspace.path().join("crates/runtime/src/lib.rs"), "lib")
+            .expect("runtime source");
+        std::fs::write(workspace.path().join("crates/runtime/src/host.rs"), "host")
+            .expect("host source");
+        let json = r#"{"implementation":"done","source_verification":"crates/runtime/src/lib.rs"}"#;
+        let tools = vec![ConversationMessage::tool_result(
+            "read-host",
+            "read_file",
+            "verified crates/runtime/src/host.rs",
+            false,
+        )];
+
+        assert_eq!(
+            normalize_terminal_answer_with_evidence(
+                json,
+                &tools,
+                workspace.path(),
+                "审查当前 workspace 源代码并给出 source evidence",
+            ),
+            json
+        );
+    }
+
+    #[test]
+    fn delegated_mutation_rejects_repeated_reads_after_required_pre_read() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(workspace.path().join("fixtures")).expect("fixtures directory");
+        std::fs::write(workspace.path().join("fixtures/target.txt"), "before\n")
+            .expect("target fixture");
+        let pending = vec!["write:fixtures/target.txt".to_string()];
+        let observed = BTreeSet::from(["read:fixtures/target.txt".to_string()]);
+        let reread = vec![ModelToolCall {
+            id: "read-again".to_string(),
+            name: "read_file".to_string(),
+            input: r#"{"path":"fixtures/target.txt"}"#.to_string(),
+            depends_on: Vec::new(),
+        }];
+        let write = vec![ModelToolCall {
+            id: "write".to_string(),
+            name: "write_file".to_string(),
+            input: r#"{"path":"fixtures/target.txt","content":"after\n"}"#.to_string(),
+            depends_on: Vec::new(),
+        }];
+
+        assert_eq!(
+            pending_focus_write_action_violation(&pending, &observed, &reread, workspace.path(),),
+            Some(pending.clone())
+        );
+        assert_eq!(
+            pending_focus_write_action_violation(&pending, &observed, &write, workspace.path()),
+            None
         );
     }
 

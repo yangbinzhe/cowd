@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, Weak};
 
@@ -202,19 +202,30 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         let policy = permission_policy(&packet.permission_lease, &allowed_tools);
         let cancellation = crate::CancellationToken::new();
         let (provider_event_sender, provider_event_receiver) = mpsc::sync_channel(64);
+        let progress_reporter_stop = Arc::new(AtomicBool::new(false));
+        let reporter_stop = Arc::clone(&progress_reporter_stop);
         let progress_runtime = Arc::clone(services.agent_runtime());
         let progress_agent_id = packet.agent_id.clone();
         let progress_run_id = packet.run_id.clone();
         let progress_reporter = std::thread::spawn(move || {
             let mut saw_model_output = false;
-            while let Ok(event) = provider_event_receiver.recv() {
-                if matches!(event, crate::CowdEvent::TextDelta { .. }) && !saw_model_output {
-                    saw_model_output = true;
-                    let _ = progress_runtime.record_progress(
-                        &progress_agent_id,
-                        "agent.provider.first_output",
-                        &format!("provider produced the first output for run {progress_run_id}"),
-                    );
+            while !reporter_stop.load(Ordering::SeqCst) {
+                match provider_event_receiver.recv_timeout(std::time::Duration::from_millis(100)) {
+                    Ok(event) => {
+                        if matches!(event, crate::CowdEvent::TextDelta { .. }) && !saw_model_output
+                        {
+                            saw_model_output = true;
+                            let _ = progress_runtime.record_progress(
+                                &progress_agent_id,
+                                "agent.provider.first_output",
+                                &format!(
+                                    "provider produced the first output for run {progress_run_id}"
+                                ),
+                            );
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
         });
@@ -339,6 +350,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         // reporter owns no runtime state beyond the lifecycle projection, so
         // it can be joined before the terminal Agent result is committed.
         drop(runtime);
+        progress_reporter_stop.store(true, Ordering::SeqCst);
         let _ = progress_reporter.join();
         drop(active_run_cleanup);
         let summary = result.map_err(|error| format!("in-process agent turn failed: {error}"))?;
