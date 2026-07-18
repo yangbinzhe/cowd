@@ -1141,7 +1141,18 @@ fn system_prompt(
     if !packet.acceptance.is_empty() {
         prompt.push(format!("Acceptance: {}", packet.acceptance.join("; ")));
     }
+    let mut required_write_scopes = Vec::new();
     if let Some(contract) = packet_acceptance_contract(packet) {
+        required_write_scopes.extend(contract.iter().flat_map(
+            |requirement| match &requirement.check {
+                harness_contract::team::TeamAcceptanceCheck::WorkspaceChange { scopes, .. } => {
+                    scopes.clone()
+                }
+                _ => Vec::new(),
+            },
+        ));
+        required_write_scopes.sort();
+        required_write_scopes.dedup();
         let mut fields = contract
             .iter()
             .filter_map(|requirement| match &requirement.check {
@@ -1168,10 +1179,18 @@ fn system_prompt(
         ));
     }
     if !tool_names.is_empty() {
-        prompt.push(format!(
-            "Authorized tool contracts are available natively: {}. When the objective asks for source, workspace, file, or current-state evidence, use an authorized read-only tool and cite the resulting paths/receipts; do not substitute prior model knowledge.",
-            tool_names.join(", ")
-        ));
+        if required_write_scopes.is_empty() {
+            prompt.push(format!(
+                "Authorized tool contracts are available natively: {}. When the objective asks for source, workspace, file, or current-state evidence, use an authorized read-only tool and cite the resulting paths/receipts; do not substitute prior model knowledge.",
+                tool_names.join(", ")
+            ));
+        } else {
+            prompt.push(format!(
+                "Authorized tool contracts are available natively: {}. This role has a Runtime-verified workspace-change obligation for: {}. Read each target at most once before mutation, invoke an authorized write tool for the required change, then perform a separate read-only verification. Repeated reads, prose claims, or simulated tool markup cannot replace the committed write receipt.",
+                tool_names.join(", "),
+                required_write_scopes.join(", ")
+            ));
+        }
     }
     prompt
 }
@@ -2046,7 +2065,7 @@ mod tests {
 
     #[test]
     fn delegated_prompt_rejects_simulated_tool_markup() {
-        let packet = AgentTaskPacket {
+        let mut packet = AgentTaskPacket {
             run_id: "run".into(),
             agent_id: "agent".into(),
             task_id: "task".into(),
@@ -2077,5 +2096,19 @@ mod tests {
         let prompt = system_prompt(&packet, std::path::Path::new("/workspace"), &[]).join("\n");
         assert!(prompt.contains("Never write simulated tool syntax"));
         assert!(prompt.contains("If no native tool is authorized, answer directly"));
+
+        packet.objective = "update fixtures/target.txt".into();
+        packet.constraints = vec![
+            "team_acceptance_contract:[{\"criterion\":\"implementation\",\"check\":{\"kind\":\"workspace_change\",\"field\":\"implementation\",\"scopes\":[\"write:fixtures/target.txt\"]}}]".to_string(),
+        ];
+        let mutation_prompt = system_prompt(
+            &packet,
+            std::path::Path::new("/workspace"),
+            &["read_file".into(), "write_file".into()],
+        )
+        .join("\n");
+        assert!(mutation_prompt.contains("Read each target at most once before mutation"));
+        assert!(mutation_prompt.contains("write:fixtures/target.txt"));
+        assert!(mutation_prompt.contains("Repeated reads"));
     }
 }

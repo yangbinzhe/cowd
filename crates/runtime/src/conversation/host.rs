@@ -3341,13 +3341,14 @@ where
                         if let Some(violation) = evaluation_scope_violation {
                             state.assistant_messages.pop();
                             state.pending_transcript.remove(&ticket.node_id);
+                            let authorized_scopes = state.evaluation_resource_scopes.join(", ");
                             let (intervention, next) = evaluation_scope_rejection_outcome(
                                 ticket,
                                 &mut state,
                                 &violation,
                                 "eval-resource-ceiling-replan-model",
                                 format!(
-                                    "the pre-registered evaluation resource ceiling rejected `{violation}`; use only the exact frozen mutation target"
+                                    "the pre-registered evaluation resource ceiling rejected `{violation}`; authorized exact scopes are [{authorized_scopes}]. Do not use broad workspace, shell, execute-code, glob, or pathless search calls. Use exact-path file tools for those scopes, including the authorized write tool when the objective requires mutation"
                                 ),
                             );
                             model_intervention = Some(intervention);
