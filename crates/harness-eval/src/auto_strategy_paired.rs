@@ -306,6 +306,12 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
             options.auto_url.trim_end_matches('/').to_string(),
         ),
     ]);
+    // 每个条件拥有独立的阻塞连接池。SSE TTFT 观察器会长期占用连接，
+    // 若三路共享一个 Client，某一路可能在发出 session 请求前等待连接池。
+    let condition_clients = Condition::ALL
+        .into_iter()
+        .map(|condition| build_client(&options).map(|client| (condition, client)))
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
     let mut samples = Vec::new();
     let mut total_tokens = 0_u64;
     let mut total_cost = 0_u64;
@@ -397,7 +403,7 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
                     let mut workers = Vec::with_capacity(order.len());
                     for (order_index, condition) in order.iter().copied().enumerate() {
                         let endpoint = &endpoints[&condition];
-                        let client = &client;
+                        let client = &condition_clients[&condition];
                         let options = &options;
                         workers.push((
                             order_index,
