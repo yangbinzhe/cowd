@@ -667,6 +667,7 @@ where
                 .as_ref()
                 .map(|control| control.resource_scopes.clone())
                 .unwrap_or_default(),
+            evaluation_scope_rejections: 0,
             team_orchestration_requests: 0,
             collaboration_started: false,
             team_orchestration_forbidden: evaluation_control.is_some()
@@ -2413,6 +2414,7 @@ struct TurnGraphState {
     max_tool_concurrency_observed: usize,
     parallel_tool_batches: usize,
     evaluation_resource_scopes: Vec<String>,
+    evaluation_scope_rejections: u8,
     team_orchestration_requests: usize,
     collaboration_started: bool,
     team_orchestration_forbidden: bool,
@@ -3316,33 +3318,25 @@ where
                     }
                     ModelStepIntent::ToolCalls { calls } => {
                         record_write_attempt_paths(&mut state.write_attempt_paths, &calls);
-                        let evaluation_scope_violation =
-                            evaluation_scope_violation(&state.evaluation_resource_scopes, &calls);
+                        let evaluation_scope_violation = evaluation_scope_violation(
+                            &state.evaluation_resource_scopes,
+                            &calls,
+                            self.services.workspace_root(),
+                        );
                         if let Some(violation) = evaluation_scope_violation {
                             state.assistant_messages.pop();
                             state.pending_transcript.remove(&ticket.node_id);
-                            model_intervention = Some(
-                                harness_contract::goal::RuntimeIntervention {
-                                    goal_id: state.goal_id.clone(),
-                                    kind: RuntimeInterventionKind::Replan,
-                                    reason: format!(
-                                        "the pre-registered evaluation resource ceiling rejected `{violation}`; use only the exact frozen mutation target"
-                                    ),
-                                    evidence_refs: vec![format!(
-                                        "execution_node:{}",
-                                        ticket.node_id
-                                    )],
-                                    expected_graph_revision: None,
-                                },
-                            );
-                            vec![dynamic_node(
+                            let (intervention, next) = evaluation_scope_rejection_outcome(
                                 ticket,
-                                state.iterations,
+                                &mut state,
+                                &violation,
                                 "eval-resource-ceiling-replan-model",
-                                ExecutionNodeKind::InlineModel,
-                                "inline_model",
-                                "inline_model",
-                            )]
+                                format!(
+                                    "the pre-registered evaluation resource ceiling rejected `{violation}`; use only the exact frozen mutation target"
+                                ),
+                            );
+                            model_intervention = Some(intervention);
+                            next
                         } else if requests_team_orchestration(&calls)
                             && state.team_orchestration_forbidden
                         {
@@ -3417,66 +3411,48 @@ where
                     }
                     ModelStepIntent::AgentProposal { calls } => {
                         record_write_attempt_paths(&mut state.write_attempt_paths, &calls);
-                        if let Some(violation) =
-                            evaluation_scope_violation(&state.evaluation_resource_scopes, &calls)
-                        {
+                        if let Some(violation) = evaluation_scope_violation(
+                            &state.evaluation_resource_scopes,
+                            &calls,
+                            self.services.workspace_root(),
+                        ) {
                             state.assistant_messages.pop();
                             state.pending_transcript.remove(&ticket.node_id);
-                            model_intervention = Some(
-                                harness_contract::goal::RuntimeIntervention {
-                                    goal_id: state.goal_id.clone(),
-                                    kind: RuntimeInterventionKind::Replan,
-                                    reason: format!(
-                                        "the pre-registered evaluation resource ceiling rejected delegated scope `{violation}`"
-                                    ),
-                                    evidence_refs: vec![format!(
-                                        "execution_node:{}",
-                                        ticket.node_id
-                                    )],
-                                    expected_graph_revision: None,
-                                },
-                            );
-                            vec![dynamic_node(
+                            let (intervention, next) = evaluation_scope_rejection_outcome(
                                 ticket,
-                                state.iterations,
+                                &mut state,
+                                &violation,
                                 "eval-agent-resource-ceiling-replan-model",
-                                ExecutionNodeKind::InlineModel,
-                                "inline_model",
-                                "inline_model",
-                            )]
+                                format!(
+                                    "the pre-registered evaluation resource ceiling rejected delegated scope `{violation}`"
+                                ),
+                            );
+                            model_intervention = Some(intervention);
+                            next
                         } else {
                             agent_proposal_nodes(ticket, &mut state, calls, &self.services)?
                         }
                     }
                     ModelStepIntent::TeamProposal { calls } => {
                         record_write_attempt_paths(&mut state.write_attempt_paths, &calls);
-                        if let Some(violation) =
-                            evaluation_scope_violation(&state.evaluation_resource_scopes, &calls)
-                        {
+                        if let Some(violation) = evaluation_scope_violation(
+                            &state.evaluation_resource_scopes,
+                            &calls,
+                            self.services.workspace_root(),
+                        ) {
                             state.assistant_messages.pop();
                             state.pending_transcript.remove(&ticket.node_id);
-                            model_intervention = Some(
-                                harness_contract::goal::RuntimeIntervention {
-                                    goal_id: state.goal_id.clone(),
-                                    kind: RuntimeInterventionKind::Replan,
-                                    reason: format!(
-                                        "the pre-registered evaluation resource ceiling rejected Team scope `{violation}`"
-                                    ),
-                                    evidence_refs: vec![format!(
-                                        "execution_node:{}",
-                                        ticket.node_id
-                                    )],
-                                    expected_graph_revision: None,
-                                },
-                            );
-                            vec![dynamic_node(
+                            let (intervention, next) = evaluation_scope_rejection_outcome(
                                 ticket,
-                                state.iterations,
+                                &mut state,
+                                &violation,
                                 "eval-team-resource-ceiling-replan-model",
-                                ExecutionNodeKind::InlineModel,
-                                "inline_model",
-                                "inline_model",
-                            )]
+                                format!(
+                                    "the pre-registered evaluation resource ceiling rejected Team scope `{violation}`"
+                                ),
+                            );
+                            model_intervention = Some(intervention);
+                            next
                         } else if state.collaboration_started
                             || state.team_orchestration_requests >= 1
                         {
@@ -3507,33 +3483,24 @@ where
                     }
                     ModelStepIntent::ApprovalRequired { calls } => {
                         record_write_attempt_paths(&mut state.write_attempt_paths, &calls);
-                        if let Some(violation) =
-                            evaluation_scope_violation(&state.evaluation_resource_scopes, &calls)
-                        {
+                        if let Some(violation) = evaluation_scope_violation(
+                            &state.evaluation_resource_scopes,
+                            &calls,
+                            self.services.workspace_root(),
+                        ) {
                             state.assistant_messages.pop();
                             state.pending_transcript.remove(&ticket.node_id);
-                            model_intervention = Some(
-                                harness_contract::goal::RuntimeIntervention {
-                                    goal_id: state.goal_id.clone(),
-                                    kind: RuntimeInterventionKind::Replan,
-                                    reason: format!(
-                                        "the pre-registered evaluation resource ceiling rejected approval for `{violation}`"
-                                    ),
-                                    evidence_refs: vec![format!(
-                                        "execution_node:{}",
-                                        ticket.node_id
-                                    )],
-                                    expected_graph_revision: None,
-                                },
-                            );
-                            vec![dynamic_node(
+                            let (intervention, next) = evaluation_scope_rejection_outcome(
                                 ticket,
-                                state.iterations,
+                                &mut state,
+                                &violation,
                                 "eval-approval-resource-ceiling-replan-model",
-                                ExecutionNodeKind::InlineModel,
-                                "inline_model",
-                                "inline_model",
-                            )]
+                                format!(
+                                    "the pre-registered evaluation resource ceiling rejected approval for `{violation}`"
+                                ),
+                            );
+                            model_intervention = Some(intervention);
+                            next
                         } else {
                             state.next_resource_scopes = graph_resource_scopes_for_tool_calls(
                                 &calls,
@@ -5985,16 +5952,29 @@ fn graph_resource_scopes_for_tool_calls(
     let mut scopes = resource_scopes_for_tool_calls(calls);
     let mut invalid_read = false;
     let mut invalid_write = false;
-    scopes.retain(|scope| {
-        let Some((mode, path)) = scope.split_once(':') else {
+    scopes.retain_mut(|scope| {
+        let Some((mode, path)) = scope
+            .split_once(':')
+            .map(|(mode, path)| (mode.to_string(), path.trim().to_string()))
+        else {
             return true;
         };
-        if !matches!(mode, "read" | "write") {
+        if !matches!(mode.as_str(), "read" | "write") {
             return true;
         }
-        let requested = std::path::Path::new(path.trim());
+        let requested = std::path::Path::new(&path);
         let valid = if requested.is_absolute() {
-            requested.starts_with(workspace_root)
+            if let Ok(relative) = requested.strip_prefix(workspace_root) {
+                let relative = if relative.as_os_str().is_empty() {
+                    ".".to_string()
+                } else {
+                    relative.to_string_lossy().replace('\\', "/")
+                };
+                *scope = format!("{mode}:{relative}");
+                true
+            } else {
+                false
+            }
         } else {
             !requested.components().any(|component| {
                 matches!(
@@ -6066,17 +6046,79 @@ fn evaluation_scope_authorizes(allowed: &str, requested: &str) -> bool {
                 .is_some_and(|suffix| suffix.starts_with('/')))
 }
 
-fn evaluation_scope_violation(allowed: &[String], calls: &[ModelToolCall]) -> Option<String> {
+fn evaluation_scope_violation(
+    allowed: &[String],
+    calls: &[ModelToolCall],
+    workspace_root: &std::path::Path,
+) -> Option<String> {
     if allowed.is_empty() {
         return None;
     }
-    resource_scopes_for_tool_calls(calls)
+    // Provider tool calls commonly use an absolute path even though the
+    // evaluation contract is workspace-relative. Reuse the production graph
+    // canonicalizer so an in-workspace absolute path is checked against the
+    // same relative scope instead of being rejected and replanned forever.
+    graph_resource_scopes_for_tool_calls(calls, workspace_root)
         .into_iter()
         .find(|requested| {
             !allowed
                 .iter()
                 .any(|scope| evaluation_scope_authorizes(scope, requested))
         })
+}
+
+fn evaluation_scope_rejection_outcome(
+    ticket: &NodeExecutionTicket,
+    state: &mut TurnGraphState,
+    violation: &str,
+    replan_node_suffix: &str,
+    reason: String,
+) -> (RuntimeIntervention, Vec<ExecutionNodeSpec>) {
+    state.evaluation_scope_rejections = state.evaluation_scope_rejections.saturating_add(1);
+    if state.evaluation_scope_rejections == 1 {
+        return (
+            RuntimeIntervention {
+                goal_id: state.goal_id.clone(),
+                kind: RuntimeInterventionKind::Replan,
+                reason,
+                evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
+                expected_graph_revision: None,
+            },
+            vec![dynamic_node(
+                ticket,
+                state.iterations,
+                replan_node_suffix,
+                ExecutionNodeKind::InlineModel,
+                "inline_model",
+                "inline_model",
+            )],
+        );
+    }
+
+    let terminal_reason = format!(
+        "Execution blocked after repeated evaluation scope violations: `{violation}`. No out-of-scope effect was executed; narrow the requested action or explicitly expand the authorized scope."
+    );
+    state.terminal_override = Some((GoalCompletion::Blocked, terminal_reason.clone()));
+    let mut node = dynamic_node(
+        ticket,
+        state.iterations,
+        "eval-resource-ceiling-block-synthesize",
+        ExecutionNodeKind::Synthesize,
+        crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND,
+        "inline_model",
+    );
+    node.executor_kind =
+        crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND.to_string();
+    (
+        RuntimeIntervention {
+            goal_id: state.goal_id.clone(),
+            kind: RuntimeInterventionKind::Block,
+            reason: terminal_reason,
+            evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
+            expected_graph_revision: None,
+        },
+        vec![node],
+    )
 }
 
 fn record_write_attempt_paths(paths: &mut Vec<String>, calls: &[ModelToolCall]) {
@@ -7679,6 +7721,29 @@ mod tests {
             "read:fixtures/v546-write/target.txt",
             "write:fixtures/v546-write/target.txt"
         ));
+    }
+
+    #[test]
+    fn evaluation_scope_ceiling_canonicalizes_absolute_paths_inside_workspace() {
+        let root = tempfile::tempdir().expect("workspace");
+        let target = root.path().join("fixtures/v546-write/target.txt");
+        std::fs::create_dir_all(target.parent().expect("target parent")).expect("fixture parent");
+        std::fs::write(&target, "seed\n").expect("fixture target");
+        let calls = [ModelToolCall {
+            id: "read-target".into(),
+            name: "read_file".into(),
+            input: serde_json::json!({"path": target}).to_string(),
+            depends_on: Vec::new(),
+        }];
+
+        assert_eq!(
+            evaluation_scope_violation(
+                &["write:fixtures/v546-write/target.txt".to_string()],
+                &calls,
+                root.path(),
+            ),
+            None
+        );
     }
 
     #[test]

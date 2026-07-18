@@ -1211,10 +1211,7 @@ fn run_sample(
             "workspace_fixture": task.workspace_fixture,
             "provider_constraint": task.provider_constraint,
             "temperature_milli": 0,
-            "resource_scopes": task.mutation_fixture.as_ref().map_or_else(
-                Vec::<String>::new,
-                |fixture| vec![format!("write:{}", fixture.target_path)]
-            ),
+            "resource_scopes": evaluation_resource_scopes(task),
             "budget_lease_id": format!(
                 "auto-strategy:{}:{}:{}:{}",
                 task.task_id,
@@ -1278,7 +1275,7 @@ fn run_sample(
         match get_json(
             client,
             endpoint,
-            &format!("/api/runtime/executions/{graph_id}?detail_scope=full"),
+            &format!("/api/runtime/executions/{graph_id}"),
         ) {
             Ok(projection) => {
                 match serde_json::from_value::<harness_contract::projection::ExecutionProjection>(
@@ -1289,11 +1286,44 @@ fn run_sample(
                             &mut sample,
                             &["poll_full_projection:", "decode_full_projection:"],
                         );
-                        apply_projection_metrics(&mut sample, &typed);
                         let terminal = projection_is_terminal_sample(&typed);
-                        let successful = projection_is_successful_sample(&sample, &typed);
-                        sample.projection = projection;
                         if terminal {
+                            // Polling a growing Full projection every 500ms made the
+                            // evaluator itself dominate a gateway core and repeatedly
+                            // transferred the same multi-megabyte lineage. Summary is
+                            // sufficient for liveness; fetch Full exactly once at the
+                            // terminal boundary for metrics and audit evidence.
+                            let full_projection = match get_json(
+                                client,
+                                endpoint,
+                                &format!("/api/runtime/executions/{graph_id}?detail_scope=full"),
+                            ) {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    sample.error = Some(format!("poll_full_projection:{error}"));
+                                    thread::sleep(options.poll_interval);
+                                    continue;
+                                }
+                            };
+                            let full_typed = match serde_json::from_value::<
+                                harness_contract::projection::ExecutionProjection,
+                            >(
+                                full_projection.clone()
+                            ) {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    sample.error = Some(format!("decode_full_projection:{error}"));
+                                    thread::sleep(options.poll_interval);
+                                    continue;
+                                }
+                            };
+                            clear_recovered_poll_error(
+                                &mut sample,
+                                &["poll_full_projection:", "decode_full_projection:"],
+                            );
+                            apply_projection_metrics(&mut sample, &full_typed);
+                            let successful = projection_is_successful_sample(&sample, &full_typed);
+                            sample.projection = full_projection;
                             let first_terminal =
                                 *terminal_observed_at.get_or_insert_with(Instant::now);
                             if should_wait_for_terminal_response(
@@ -1317,6 +1347,9 @@ fn run_sample(
                                 );
                             }
                             break;
+                        } else {
+                            apply_projection_metrics(&mut sample, &typed);
+                            sample.projection = projection;
                         }
                     }
                     Err(error) => {
@@ -1718,6 +1751,22 @@ fn rendered_task_prompt(task: &AutoStrategyTask, repetition: usize) -> String {
             )
         },
     )
+}
+
+fn evaluation_resource_scopes(task: &AutoStrategyTask) -> Vec<String> {
+    task.mutation_fixture
+        .as_ref()
+        .map_or_else(Vec::new, |fixture| {
+            // The mutation ceiling constrains effects, not evidence gathering.
+            // A read-only workspace scope lets the model inspect the protected
+            // sentinel or discover the exact target without granting any extra
+            // write authority. The verifier still rejects every changed or
+            // attempted write path outside the frozen target.
+            vec![
+                "read:.".to_string(),
+                format!("write:{}", fixture.target_path),
+            ]
+        })
 }
 
 fn valid_judge_output(value: &Value, labels: &[&str], judge_model: &str) -> bool {
@@ -2811,6 +2860,10 @@ mod tests {
             judge_only: false,
         };
         assert_eq!(rendered_task_prompt(&task, 2), "write after-2");
+        assert_eq!(
+            evaluation_resource_scopes(&task),
+            ["read:.", "write:target"]
+        );
     }
 
     #[test]
