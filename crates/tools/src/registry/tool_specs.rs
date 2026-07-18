@@ -234,7 +234,12 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "label": { "type": "string" }
+                    "label": { "type": "string" },
+                    "paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional workspace-relative paths for a bounded checkpoint."
+                    }
                 },
                 "additionalProperties": false
             }),

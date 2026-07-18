@@ -1061,6 +1061,7 @@ fn create_auto_checkpoint(lease: &ToolHostLease, tool_name: &str) -> Result<(), 
         lease.workspace_root(),
         CheckpointCreateInput {
             label: Some(format!("auto-before-{tool_name}")),
+            paths: Vec::new(),
         },
     )
     .map(|_| ())

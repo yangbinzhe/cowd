@@ -1050,6 +1050,11 @@ fn snapshot_workspace_tree(root: &Path) -> Result<BTreeMap<String, String>, Stri
                 .map_err(|error| format!("strip workspace root: {error}"))?
                 .to_string_lossy()
                 .replace('\\', "/");
+            // `.cowd` is Runtime-owned recovery/audit state, not a business
+            // workspace mutation. Every other path remains in the exact gate.
+            if relative == ".cowd" {
+                continue;
+            }
             let metadata = fs::symlink_metadata(&path)
                 .map_err(|error| format!("read fixture metadata: {error}"))?;
             let mode = workspace_entry_mode(&metadata);
@@ -2895,5 +2900,25 @@ mod tests {
         fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).expect("chmod");
         let with_mode = snapshot_workspace_tree(root.path()).expect("mode snapshot");
         assert_ne!(before, with_mode);
+    }
+
+    #[test]
+    fn workspace_snapshot_excludes_only_root_runtime_private_state() {
+        let root = tempfile::tempdir().expect("snapshot workspace");
+        fs::write(root.path().join("target.txt"), "same bytes").expect("fixture");
+        let before = snapshot_workspace_tree(root.path()).expect("before");
+
+        fs::create_dir_all(root.path().join(".cowd/checkpoints/internal")).expect("Runtime state");
+        fs::write(
+            root.path().join(".cowd/checkpoints/internal/target.txt"),
+            "private copy",
+        )
+        .expect("Runtime private file");
+        let after_runtime_state = snapshot_workspace_tree(root.path()).expect("after Runtime state");
+        assert_eq!(before, after_runtime_state);
+
+        fs::create_dir_all(root.path().join("nested/.cowd")).expect("nested business directory");
+        let after_nested_state = snapshot_workspace_tree(root.path()).expect("after nested state");
+        assert_ne!(before, after_nested_state);
     }
 }

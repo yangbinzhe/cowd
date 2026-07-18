@@ -4700,11 +4700,14 @@ where
                     .map_or(RuntimeInterventionKind::Continue, |value| value.kind);
                 match kind {
                     RuntimeInterventionKind::Synthesize => {
-                        let focus_terminal_candidate = if focus_acceptance_met {
-                            state.pending_focus_terminal_candidate.take()
-                        } else {
-                            None
-                        };
+                        let focus_terminal_candidate =
+                            if focus_acceptance_met {
+                                state.pending_focus_terminal_candidate.take().and_then(
+                                    |candidate| normalized_team_terminal_candidate(&candidate),
+                                )
+                            } else {
+                                None
+                            };
                         if let Some(candidate) = focus_terminal_candidate {
                             state.focus_acceptance_pending_scopes.clear();
                             state.terminal_override = Some((GoalCompletion::Satisfied, candidate));
@@ -4721,8 +4724,8 @@ where
                         } else {
                             state.force_text_only_next_model = true;
                             state.content.push_str(
-                            "\n\nRuntime evidence checkpoint: consecutive tool batches added no new evidence coverage. The next response must synthesize a final answer from retained receipts; tools are disabled for that response. State remaining uncertainty explicitly.\n",
-                        );
+                                "\n\nRuntime evidence checkpoint: the required evidence is complete, but no valid structured terminal candidate is available. Tools are disabled for the next response. Return exactly one JSON object, without Markdown fences or prose, containing every required Team output field from the acceptance contract and grounding each claim in retained receipts. State remaining uncertainty in the required unresolved or risks field.\n",
+                            );
                             dynamic_node(
                                 ticket,
                                 state.iterations,
@@ -6572,6 +6575,11 @@ fn dynamic_edges(from: &str, nodes: &[ExecutionNodeSpec]) -> Vec<ExecutionEdge> 
         .collect()
 }
 
+fn normalized_team_terminal_candidate(candidate: &str) -> Option<String> {
+    crate::agent_in_process_worker::structured_agent_output(candidate)
+        .and_then(|object| serde_json::to_string(&object).ok())
+}
+
 fn completed_result(result_ref: Option<String>, usage: ExecutionUsage) -> ExecutionNodeResult {
     ExecutionNodeResult {
         status: ExecutionNodeStatus::Completed,
@@ -6595,6 +6603,17 @@ mod tests {
 
     use super::*;
     use crate::conversation::{ApiRequest, AssistantEvent, ToolError};
+
+    #[test]
+    fn focus_terminal_candidate_requires_and_normalizes_team_json() {
+        let fenced = "```json\n{\"implementation\":\"done\",\"source_verification\":\"receipt\"}\n```\nprose";
+        assert_eq!(
+            normalized_team_terminal_candidate(fenced).as_deref(),
+            Some("{\"implementation\":\"done\",\"source_verification\":\"receipt\"}")
+        );
+        assert!(normalized_team_terminal_candidate("## Step 4: verify").is_none());
+        assert!(normalized_team_terminal_candidate("{\"unrelated\":true}").is_none());
+    }
 
     #[derive(Clone)]
     struct FinalAnswerClient;

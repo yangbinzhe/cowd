@@ -825,7 +825,17 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
         tool_name: &str,
         input: &serde_json::Value,
     ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
-        (self.allowed_tools.contains(tool_name) || tool_name == "checkpoint_create")
+        if tool_name == "checkpoint_create" {
+            return self
+                .internal_checkpoint_input(input.clone())
+                .ok()
+                .and_then(|input| {
+                    self.host
+                        .delegated_tool_effect_descriptor(tool_name, &input)
+                });
+        }
+        self.allowed_tools
+            .contains(tool_name)
             .then(|| self.host.delegated_tool_effect_descriptor(tool_name, input))
             .flatten()
     }
@@ -881,14 +891,46 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
 }
 
 impl ScopedRuntimeToolExecutor {
+    fn internal_checkpoint_input(
+        &self,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value, ToolError> {
+        let mut object = input
+            .as_object()
+            .cloned()
+            .ok_or_else(|| ToolError::new("Runtime checkpoint input must be a JSON object"))?;
+        if let Some(scopes) = self.resource_scopes.as_deref() {
+            let mut paths = scopes
+                .iter()
+                .filter_map(|scope| scope.strip_prefix("write:"))
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            paths.sort();
+            paths.dedup();
+            if paths.is_empty() {
+                return Err(ToolError::new(
+                    "Runtime checkpoint requires a bounded Team write scope",
+                ));
+            }
+            object.insert("paths".to_string(), serde_json::json!(paths));
+        }
+        Ok(serde_json::Value::Object(object))
+    }
+
     fn execute_internal_checkpoint(
         &self,
         input: &str,
         authorization: harness_contract::tool::ToolExecutionAuthorization,
     ) -> Result<String, ToolError> {
+        let input = serde_json::from_str::<serde_json::Value>(input).map_err(|error| {
+            ToolError::new(format!("invalid Runtime checkpoint input: {error}"))
+        })?;
+        let input = self.internal_checkpoint_input(input)?;
         if self
             .host
-            .delegated_tool_effect_descriptor("checkpoint_create", &serde_json::json!({}))
+            .delegated_tool_effect_descriptor("checkpoint_create", &input)
             .is_none()
         {
             return Err(ToolError::new(
@@ -902,7 +944,9 @@ impl ScopedRuntimeToolExecutor {
                 .unwrap_or_else(|| format!("agent-checkpoint:{}", uuid::Uuid::new_v4())),
             tool_use_id: format!("agent-checkpoint:{}", uuid::Uuid::new_v4()),
             tool_name: "checkpoint_create".to_string(),
-            input: input.to_string(),
+            input: serde_json::to_string(&input).map_err(|error| {
+                ToolError::new(format!("serialize Runtime checkpoint input: {error}"))
+            })?,
             category: crate::ToolSafetyCategory::WriteLocal,
             authorization: Some(authorization),
             session_id: Some(self.session_id.clone()),
@@ -1527,10 +1571,9 @@ fn materialized_json_value(value: &serde_json::Value) -> bool {
     }
 }
 
-fn structured_agent_output(text: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
-    if let Ok(serde_json::Value::Object(object)) = serde_json::from_str(text) {
-        return Some(object);
-    }
+pub(crate) fn structured_agent_output(
+    text: &str,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
     const CONTRACT_FIELDS: [&str; 13] = [
         "summary",
         "findings",
@@ -1546,6 +1589,14 @@ fn structured_agent_output(text: &str) -> Option<serde_json::Map<String, serde_j
         "checkpoint",
         "legacy_acceptance",
     ];
+    let has_contract_field = |object: &serde_json::Map<String, serde_json::Value>| {
+        CONTRACT_FIELDS
+            .iter()
+            .any(|field| object.contains_key(*field))
+    };
+    if let Ok(serde_json::Value::Object(object)) = serde_json::from_str(text) {
+        return has_contract_field(&object).then_some(object);
+    }
     text.char_indices()
         .filter(|(_, character)| *character == '{')
         .filter_map(|(start, _)| {
@@ -1555,11 +1606,7 @@ fn structured_agent_output(text: &str) -> Option<serde_json::Map<String, serde_j
                 .and_then(Result::ok)
         })
         .filter_map(|value| value.as_object().cloned())
-        .find(|object| {
-            CONTRACT_FIELDS
-                .iter()
-                .any(|field| object.contains_key(*field))
-        })
+        .find(has_contract_field)
 }
 
 fn normalized_scope(value: &str) -> &str {
@@ -1964,7 +2011,10 @@ mod tests {
             execution_id: "graph".to_string(),
             node_id: "node".to_string(),
             workspace_root: std::path::PathBuf::from("/workspace"),
-            resource_scopes: Some(vec!["read:README.md".to_string()]),
+            resource_scopes: Some(vec![
+                "read:README.md".to_string(),
+                "write:fixtures/target.txt".to_string(),
+            ]),
             managed_invocation: None,
             next_receipt_sequence: AtomicU64::new(0),
             receipts: Mutex::new(Vec::new()),
@@ -1993,6 +2043,15 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_empty());
+        assert_eq!(
+            executor
+                .internal_checkpoint_input(serde_json::json!({
+                    "label": "guard",
+                    "paths": ["model-must-not-control-this"]
+                }))
+                .expect("bounded checkpoint input")["paths"],
+            serde_json::json!(["fixtures/target.txt"])
+        );
     }
 
     #[test]
@@ -2011,6 +2070,7 @@ mod tests {
         );
         assert!(structured_agent_output("implementation completed in prose").is_none());
         assert!(structured_agent_output(r#"prefix {"unrelated":"claim"} suffix"#).is_none());
+        assert!(structured_agent_output(r#"{"unrelated":"claim"}"#).is_none());
     }
 
     #[test]
