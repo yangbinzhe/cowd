@@ -1,4 +1,4 @@
-use std::io::{BufRead, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -10,8 +10,6 @@ use surface::{
     SurfaceError, SurfaceFailureKind, SurfaceFrame, SurfaceLifecycle, SurfaceOperationResult,
     SurfaceRoute, SurfaceRuntimeSnapshot, SurfaceRuntimeStatus, SurfaceSendRequest,
 };
-use tokio::io::AsyncWriteExt;
-use tokio::sync::oneshot;
 
 use super::{classify_surface_error, managed_actions, normalize_request_path, SurfaceHost};
 
@@ -145,7 +143,7 @@ impl SurfaceHost {
         let Some(surface) = self.get(&request.surface) else {
             return Ok(SurfaceOperationResult::unavailable(&request.surface));
         };
-        if surface.entry.is_none() {
+        if !surface.is_executable() {
             return Ok(SurfaceOperationResult::unavailable(&request.surface));
         }
         let surface_id = normalize_surface_id(&request.surface);
@@ -171,7 +169,7 @@ impl SurfaceHost {
         let Some(surface) = self.get(&request.surface) else {
             return Ok(SurfaceOperationResult::unavailable(&request.surface));
         };
-        if surface.entry.is_none() {
+        if !surface.is_executable() {
             return Ok(SurfaceOperationResult::unavailable(&request.surface));
         }
         let surface_id = normalize_surface_id(&request.surface);
@@ -227,7 +225,7 @@ impl SurfaceHost {
         let Some(descriptor) = self.get(surface) else {
             return Ok(SurfaceOperationResult::unavailable(surface));
         };
-        if descriptor.entry.is_none() {
+        if !descriptor.is_executable() {
             self.set_runtime(SurfaceRuntimeSnapshot::builtin(&descriptor.id))
                 .await;
             return Ok(SurfaceOperationResult::ok(
@@ -313,7 +311,7 @@ impl SurfaceHost {
     ) -> Result<SurfaceOperationResult, SurfaceError> {
         if surface.lifecycle == SurfaceLifecycle::Managed {
             let surface_id = surface.id.clone();
-            let response = match self.invoke_managed(surface.clone(), frame).await {
+            let response = match self.invoke_h2(surface.clone(), frame).await {
                 Ok(response) => response,
                 Err(error) => {
                     self.record_surface_failure(
@@ -335,48 +333,18 @@ impl SurfaceHost {
             })?
     }
 
-    pub(super) async fn invoke_managed(
+    pub(super) async fn invoke_h2(
         &self,
         surface: SurfaceDescriptor,
         frame: SurfaceFrame,
     ) -> Result<SurfaceFrame, SurfaceError> {
-        let request_id = frame_id(&frame).ok_or_else(|| SurfaceError::Invocation {
-            surface: surface.id.clone(),
-            reason: "managed surface request frame missing id".to_string(),
-        })?;
         let process = self.managed_process(surface.clone()).await?;
-        let (sender, receiver) = oneshot::channel();
-        process
-            .pending
-            .lock()
-            .await
-            .insert(request_id.clone(), sender);
-        let encoded = frame.encode_jsonl()?;
-        let write_result: Result<(), std::io::Error> = {
-            let mut stdin = process.stdin.lock().await;
-            if let Err(error) = stdin.write_all(encoded.as_bytes()).await {
-                Err(error)
-            } else {
-                stdin.flush().await
-            }
-        };
-        if let Err(error) = write_result {
-            process.pending.lock().await.remove(&request_id);
-            return Err(SurfaceError::Invocation {
-                surface: surface.id,
-                reason: format!("failed to write managed jsonl request: {error}"),
-            });
-        }
-        tokio::time::timeout(Duration::from_secs(30), receiver)
+        tokio::time::timeout(Duration::from_secs(30), process.client.invoke(&frame))
             .await
             .map_err(|_| SurfaceError::Invocation {
                 surface: surface.id.clone(),
                 reason: "managed surface request timed out".to_string(),
             })?
-            .map_err(|_| SurfaceError::Invocation {
-                surface: surface.id,
-                reason: "managed surface response channel closed".to_string(),
-            })
     }
 }
 
@@ -450,24 +418,98 @@ fn invoke_sidecar(
             surface: surface_id.clone(),
             reason: "sidecar stdout is not available".to_string(),
         })?;
-    let mut reader = std::io::BufReader::new(stdout);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .map_err(|error| SurfaceError::Invocation {
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| SurfaceError::Invocation {
             surface: surface_id.clone(),
-            reason: format!("failed to read jsonl response: {error}"),
+            reason: "sidecar stderr is not available".to_string(),
         })?;
-    if line.trim().is_empty() {
+    let (status, stdout, stderr, stdout_truncated, stderr_truncated) =
+        std::thread::scope(|scope| {
+            let stdout_reader = scope.spawn(|| drain_limited(stdout, 2 * 1024 * 1024));
+            let stderr_reader = scope.spawn(|| drain_limited(stderr, 1024 * 1024));
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let status = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break Ok(status),
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Ok(None) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break Err("one-shot sidecar timed out after 30s".to_string());
+                    }
+                    Err(error) => break Err(format!("one-shot sidecar wait failed: {error}")),
+                }
+            };
+            let stdout = stdout_reader
+                .join()
+                .map_err(|_| "one-shot stdout reader panicked".to_string())?;
+            let stderr = stderr_reader
+                .join()
+                .map_err(|_| "one-shot stderr reader panicked".to_string())?;
+            Ok::<_, String>((status, stdout.0, stderr.0, stdout.1, stderr.1))
+        })
+        .map_err(|reason| SurfaceError::Invocation {
+            surface: surface_id.clone(),
+            reason,
+        })?;
+    status.map_err(|reason| SurfaceError::Invocation {
+        surface: surface_id.clone(),
+        reason,
+    })?;
+    if stdout_truncated {
         return Err(SurfaceError::Invocation {
             surface: surface_id,
-            reason: "sidecar returned no jsonl response".to_string(),
+            reason: "one-shot sidecar stdout exceeded 2 MiB".to_string(),
+        });
+    }
+    if stderr_truncated {
+        tracing::warn!(surface = %surface_id, "one-shot sidecar stderr exceeded 1 MiB and was truncated");
+    }
+    let line = String::from_utf8(stdout)
+        .map_err(|error| SurfaceError::Invocation {
+            surface: surface_id.clone(),
+            reason: format!("sidecar stdout is not UTF-8: {error}"),
+        })?
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default()
+        .to_string();
+    if line.trim().is_empty() {
+        let stderr = String::from_utf8_lossy(&stderr);
+        return Err(SurfaceError::Invocation {
+            surface: surface_id,
+            reason: format!("sidecar returned no jsonl response: {stderr}"),
         });
     }
 
     let response = SurfaceFrame::decode_jsonl(&line)?;
-    let _ = child.wait();
     Ok(operation_result_from_frame(&surface_id, response))
+}
+
+fn drain_limited<R: Read>(mut reader: R, limit: usize) -> (Vec<u8>, bool) {
+    let mut kept = Vec::with_capacity(limit.min(64 * 1024));
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut truncated = false;
+    loop {
+        let Ok(read) = reader.read(&mut buffer) else {
+            break;
+        };
+        if read == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(kept.len());
+        if remaining > 0 {
+            kept.extend_from_slice(&buffer[..read.min(remaining)]);
+        }
+        if read > remaining {
+            truncated = true;
+        }
+    }
+    (kept, truncated)
 }
 
 fn operation_result_from_frame(surface: &str, frame: SurfaceFrame) -> SurfaceOperationResult {
@@ -488,22 +530,6 @@ fn operation_result_from_frame(surface: &str, frame: SurfaceFrame) -> SurfaceOpe
             "surface_unexpected_frame",
             format!("unexpected surface response frame: {other:?}"),
         ),
-    }
-}
-
-pub(super) fn frame_id(frame: &SurfaceFrame) -> Option<String> {
-    match frame {
-        SurfaceFrame::Handshake { id, .. }
-        | SurfaceFrame::HandshakeOk { id, .. }
-        | SurfaceFrame::Configure { id, .. }
-        | SurfaceFrame::Connect { id, .. }
-        | SurfaceFrame::Disconnect { id, .. }
-        | SurfaceFrame::Send { id, .. }
-        | SurfaceFrame::Action { id, .. }
-        | SurfaceFrame::Health { id, .. }
-        | SurfaceFrame::Ok { id, .. } => Some(id.clone()),
-        SurfaceFrame::Error { id, .. } => id.clone(),
-        SurfaceFrame::Event { .. } => None,
     }
 }
 

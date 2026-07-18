@@ -224,7 +224,11 @@ fn edge_surface_projection(
         routes: descriptor.routes.clone(),
         resources: descriptor.resources.clone(),
         source: descriptor.source.clone(),
-        entry: descriptor.entry.clone(),
+        entry: descriptor.entry.clone().or_else(|| {
+            descriptor
+                .managed_artifact()
+                .map(|(artifact, _)| artifact.to_string())
+        }),
         diagnostics: descriptor.diagnostics.clone(),
         message_descriptor: message_connector_descriptor(descriptor, runtime_snapshot.as_ref()),
     }
@@ -398,7 +402,13 @@ mod tests {
             kind: surface::SurfaceKind::MessageConnector,
             status: surface::SurfaceStatus::Ready,
             source: "test".to_string(),
+            runtime: Some(surface::SurfaceRuntimeSpec::Managed {
+                artifact: "cowd-edge-open-platform-message".to_string(),
+                driver_profile: "feishu-message".to_string(),
+                transport: surface::SurfaceTransport::UdsHttp2,
+            }),
             entry: Some("feishu".to_string()),
+            transport: Some(surface::SurfaceTransport::UdsHttp2),
             lifecycle: surface::SurfaceLifecycle::Managed,
             capabilities: vec![surface::SurfaceCapability::new(
                 "message:feishu",

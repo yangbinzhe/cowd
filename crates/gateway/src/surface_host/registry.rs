@@ -246,7 +246,7 @@ impl SurfaceHost {
         let external_surface_count = snapshot
             .surfaces
             .iter()
-            .filter(|surface| surface.entry.is_some())
+            .filter(|surface| surface.is_executable())
             .count();
         let route_count = snapshot
             .surfaces
@@ -319,7 +319,7 @@ impl SurfaceHost {
     }
 
     pub(crate) fn has_external_surface(&self, id: &str) -> bool {
-        self.get(id).is_some_and(|surface| surface.entry.is_some())
+        self.get(id).is_some_and(|surface| surface.is_executable())
     }
 
     pub(super) fn config_for(&self, id: &str) -> Option<serde_json::Value> {

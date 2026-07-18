@@ -583,7 +583,11 @@ printf '%s\n' '{"type":"ok","id":"reply","payload":{"status":"ok","source_batch"
                 "name": "Feishu Bitable Source Connector",
                 "version": "1.0.0",
                 "kind": "source-connector",
-                "entry": "./cowd-edge-fixture-source",
+                "runtime": {
+                    "kind": "one-shot",
+                    "entry": "cowd-edge-fixture-source",
+                    "transport": "stdio-jsonl"
+                },
                 "capabilities": ["source.snapshot"],
                 "default_enabled": true
             }"#,

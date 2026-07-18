@@ -53,7 +53,7 @@ impl SurfaceHost {
                     let elapsed = Utc::now().signed_duration_since(last);
                     elapsed.num_milliseconds() >= surface.health.interval_ms as i64
                 })
-                .unwrap_or(surface.entry.is_some());
+                .unwrap_or(surface.is_executable());
             if due {
                 let _ = self.check_surface_health(&surface.id).await;
             }

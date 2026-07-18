@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, RwLock};
@@ -10,12 +11,13 @@ use surface::{
     SurfaceLifecycle, SurfaceRuntimeError, SurfaceRuntimeSnapshot, SurfaceRuntimeStatus,
     SurfaceSupervisorAction, SurfaceSupervisorEvent,
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command as TokioCommand;
-use tokio::sync::{broadcast, oneshot, Mutex as AsyncMutex};
+use tokio::sync::{broadcast, Mutex as AsyncMutex};
 
+use super::edge_h2::{bootstrap_request, EdgeH2Client};
 use super::types::ManagedSurfaceProcess;
-use super::{frame_id, managed_actions, mark_surface_seen, push_supervisor_event, SurfaceHost};
+use super::{managed_actions, push_supervisor_event, SurfaceHost};
 
 impl SurfaceHost {
     pub(crate) async fn start_surface(
@@ -74,7 +76,7 @@ impl SurfaceHost {
                     let _ = Command::new("kill").arg(pid.to_string()).status();
                 }
             }
-            process.pending.lock().await.clear();
+            let _ = std::fs::remove_dir_all(&process.runtime_dir);
         }
         let mut snapshot = self.runtime_snapshot(&surface).unwrap_or_else(|| {
             SurfaceRuntimeSnapshot::discovered(&surface, SurfaceLifecycle::Managed)
@@ -204,42 +206,7 @@ impl SurfaceHost {
             surface: surface.id.clone(),
             config,
         };
-        let request_id = frame_id(&frame).ok_or_else(|| SurfaceError::Invocation {
-            surface: surface.id.clone(),
-            reason: "managed surface configure frame missing id".to_string(),
-        })?;
-        let (sender, receiver) = oneshot::channel();
-        process
-            .pending
-            .lock()
-            .await
-            .insert(request_id.clone(), sender);
-        let encoded = frame.encode_jsonl()?;
-        let write_result: Result<(), std::io::Error> = {
-            let mut stdin = process.stdin.lock().await;
-            if let Err(error) = stdin.write_all(encoded.as_bytes()).await {
-                Err(error)
-            } else {
-                stdin.flush().await
-            }
-        };
-        if let Err(error) = write_result {
-            process.pending.lock().await.remove(&request_id);
-            return Err(SurfaceError::Invocation {
-                surface: surface.id,
-                reason: format!("failed to write managed configure request: {error}"),
-            });
-        }
-        let response = tokio::time::timeout(std::time::Duration::from_secs(30), receiver)
-            .await
-            .map_err(|_| SurfaceError::Invocation {
-                surface: surface.id.clone(),
-                reason: "managed surface configure timed out".to_string(),
-            })?
-            .map_err(|_| SurfaceError::Invocation {
-                surface: surface.id.clone(),
-                reason: "managed surface configure channel closed".to_string(),
-            })?;
+        let response = process.client.invoke(&frame).await?;
         if matches!(response, SurfaceFrame::Ok { .. }) {
             return Ok(());
         }
@@ -258,27 +225,51 @@ async fn start_managed_process(
     event_tx: broadcast::Sender<SurfaceFrame>,
 ) -> Result<ManagedSurfaceProcess, SurfaceError> {
     let surface_id = surface.id.clone();
-    let entry = surface
-        .entry
-        .clone()
-        .ok_or_else(|| SurfaceError::Unavailable(surface_id.clone()))?;
+    let (artifact, driver_profile) =
+        surface
+            .managed_artifact()
+            .ok_or_else(|| SurfaceError::Invocation {
+                surface: surface_id.clone(),
+                reason: "managed surface is missing managed runtime spec".to_string(),
+            })?;
     let manifest_path = PathBuf::from(&surface.source);
     let working_dir = manifest_path.parent().map(Path::to_path_buf);
-    let mut command_path = PathBuf::from(entry);
-    if command_path.is_relative() {
-        if let Some(root) = &working_dir {
-            command_path = root.join(command_path);
-        }
-    }
-
     let workspace_root = working_dir
         .as_deref()
         .ok_or_else(|| SurfaceError::Invocation {
             surface: surface_id.clone(),
             reason: "managed surface manifest has no parent directory".to_string(),
         })?;
+    let command_path = resolve_managed_artifact(&manifest_path, artifact).map_err(|reason| {
+        SurfaceError::Invocation {
+            surface: surface_id.clone(),
+            reason,
+        }
+    })?;
+    let runtime_dir =
+        create_runtime_dir(&surface_id).map_err(|error| SurfaceError::Invocation {
+            surface: surface_id.clone(),
+            reason: format!("failed to create managed edge runtime directory: {error}"),
+        })?;
+    let socket_path = runtime_dir.join("edge.sock");
+    let credential_path = runtime_dir.join("credential");
+    let token = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    std::fs::write(&credential_path, &token).map_err(|error| SurfaceError::Invocation {
+        surface: surface_id.clone(),
+        reason: format!("failed to write managed edge credential: {error}"),
+    })?;
+    std::fs::set_permissions(&credential_path, std::fs::Permissions::from_mode(0o600)).map_err(
+        |error| SurfaceError::Invocation {
+            surface: surface_id.clone(),
+            reason: format!("failed to secure managed edge credential: {error}"),
+        },
+    )?;
     let mut sandbox = SandboxLaunchSpec::workspace(workspace_root);
     sandbox.working_directory = Some(workspace_root.to_path_buf());
+    if let Some(parent) = command_path.parent() {
+        sandbox.readable_roots.push(parent.to_path_buf());
+    }
+    sandbox.writable_roots.push(runtime_dir.clone());
     let prepared =
         program_command(&command_path, &sandbox).map_err(|error| SurfaceError::Invocation {
             surface: surface_id.clone(),
@@ -286,9 +277,13 @@ async fn start_managed_process(
         })?;
     let mut child = TokioCommand::new(prepared.program)
         .args(prepared.args)
+        .arg("--socket")
+        .arg(&socket_path)
+        .arg("--credential-file")
+        .arg(&credential_path)
         .env_clear()
         .envs(prepared.environment)
-        .stdin(Stdio::piped())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
@@ -302,10 +297,6 @@ async fn start_managed_process(
         })?;
     let pid = child.id();
     let started_at = Utc::now();
-    let stdin = child.stdin.take().ok_or_else(|| SurfaceError::Invocation {
-        surface: surface_id.clone(),
-        reason: "managed sidecar stdin is not available".to_string(),
-    })?;
     let stdout = child
         .stdout
         .take()
@@ -313,51 +304,55 @@ async fn start_managed_process(
             surface: surface_id.clone(),
             reason: "managed sidecar stdout is not available".to_string(),
         })?;
-    let pending: Arc<AsyncMutex<HashMap<String, tokio::sync::oneshot::Sender<SurfaceFrame>>>> =
-        Arc::new(AsyncMutex::new(HashMap::new()));
-    let events = Arc::new(AsyncMutex::new(VecDeque::new()));
-    let reader_pending = pending.clone();
-    let reader_events = events.clone();
-    let reader_runtime = runtime.clone();
-    let reader_ledger = ledger.clone();
-    let reader_surface = surface_id.clone();
-    let reader_event_tx = event_tx.clone();
-    tokio::spawn(async move {
-        let mut lines = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let Ok(frame) = SurfaceFrame::decode_jsonl(&line) else {
-                continue;
-            };
-            mark_surface_seen(&reader_runtime, &reader_surface, pid);
-            if let Some(id) = frame_id(&frame) {
-                if let Some(sender) = reader_pending.lock().await.remove(&id) {
-                    let _ = sender.send(frame);
-                    continue;
-                }
-            }
-            if matches!(frame, SurfaceFrame::Event { .. }) {
-                let mut events = reader_events.lock().await;
-                events.push_back(frame.clone());
-                while events.len() > 200 {
-                    events.pop_front();
-                }
-                let _ = reader_event_tx.send(frame);
-            }
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| SurfaceError::Invocation {
+            surface: surface_id.clone(),
+            reason: "managed sidecar stderr is not available".to_string(),
+        })?;
+    spawn_child_log_drain(surface_id.clone(), "stdout", stdout);
+    spawn_child_log_drain(surface_id.clone(), "stderr", stderr);
+
+    let client = match EdgeH2Client::connect(&socket_path, &surface_id, &token).await {
+        Ok(client) => client,
+        Err(error) => {
+            let _ = child.kill().await;
+            let _ = std::fs::remove_dir_all(&runtime_dir);
+            return Err(error);
         }
-        push_supervisor_event(
-            &reader_ledger,
-            SurfaceSupervisorEvent::new(
-                &reader_surface,
-                SurfaceRuntimeStatus::Unavailable,
-                "managed surface stdout closed",
-            ),
-        )
-        .await;
-    });
+    };
+    let capabilities = surface
+        .capabilities
+        .iter()
+        .map(|capability| capability.capability.clone())
+        .collect::<Vec<_>>();
+    let bootstrap = bootstrap_request(&surface_id, driver_profile, capabilities);
+    let bootstrap_response = match client.bootstrap(&bootstrap).await {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = child.kill().await;
+            let _ = std::fs::remove_dir_all(&runtime_dir);
+            return Err(error);
+        }
+    };
+    if bootstrap_response.surface_id != surface_id
+        || bootstrap_response.driver_profile != driver_profile
+    {
+        let _ = child.kill().await;
+        let _ = std::fs::remove_dir_all(&runtime_dir);
+        return Err(SurfaceError::Invocation {
+            surface: surface_id,
+            reason: "managed edge bootstrap identity mismatch".to_string(),
+        });
+    }
+    let events = Arc::new(AsyncMutex::new(VecDeque::new()));
+    client.spawn_event_stream(events.clone(), event_tx);
     let wait_runtime = runtime.clone();
     let wait_ledger = ledger.clone();
     let wait_managed = managed.clone();
     let wait_surface = surface_id.clone();
+    let wait_runtime_dir = runtime_dir.clone();
     tokio::spawn(async move {
         let status = child.wait().await;
         {
@@ -382,6 +377,7 @@ async fn start_managed_process(
             }
         }
         wait_managed.lock().await.remove(&wait_surface);
+        let _ = std::fs::remove_dir_all(wait_runtime_dir);
         push_supervisor_event(
             &wait_ledger,
             SurfaceSupervisorEvent::new(
@@ -395,8 +391,77 @@ async fn start_managed_process(
     Ok(ManagedSurfaceProcess {
         pid,
         started_at,
-        stdin: AsyncMutex::new(stdin),
-        pending,
+        client,
         events,
+        runtime_dir,
     })
+}
+
+fn resolve_managed_artifact(manifest: &Path, artifact: &str) -> Result<PathBuf, String> {
+    if artifact.is_empty()
+        || artifact.contains('/')
+        || artifact.contains('\\')
+        || artifact == "."
+        || artifact == ".."
+    {
+        return Err("managed artifact must be a trusted file name".to_string());
+    }
+    let mut candidates = Vec::new();
+    if let Some(parent) = manifest.parent() {
+        for ancestor in parent.ancestors().take(5) {
+            candidates.push(ancestor.join("bin").join(artifact));
+        }
+    }
+    if let Some(parent) = std::env::current_exe()
+        .ok()
+        .and_then(|executable| executable.parent().map(Path::to_path_buf))
+    {
+        candidates.push(parent.join("edge").join(artifact));
+        candidates.push(parent.join(artifact));
+    }
+    for candidate in candidates {
+        if candidate.is_file() {
+            return candidate.canonicalize().map_err(|error| {
+                format!(
+                    "failed to canonicalize managed artifact `{}`: {error}",
+                    candidate.display()
+                )
+            });
+        }
+    }
+    Err(format!(
+        "managed artifact `{artifact}` was not found in the trusted Edge bundle"
+    ))
+}
+
+fn create_runtime_dir(surface: &str) -> std::io::Result<PathBuf> {
+    let root = std::env::temp_dir().join("cowd-edge-runtime").join(format!(
+        "{}-{}",
+        normalize_surface_id(surface),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&root)?;
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
+    Ok(root)
+}
+
+fn spawn_child_log_drain<R>(surface: String, stream: &'static str, reader: R)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(reader).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let line = if line.len() > 16 * 1024 {
+                format!("{}…", line.chars().take(16 * 1024).collect::<String>())
+            } else {
+                line
+            };
+            if stream == "stderr" {
+                tracing::warn!(surface = %surface, child_stream = stream, message = %line);
+            } else {
+                tracing::debug!(surface = %surface, child_stream = stream, message = %line);
+            }
+        }
+    });
 }

@@ -424,9 +424,15 @@ fn build_surface_configs(gw: &runtime::GatewayConfig) -> Vec<surface::SurfaceMan
                 name: format!("{id} message connector"),
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 kind: surface::SurfaceKind::MessageConnector,
-                entry: Some(format!("./cowd-edge-{id}-message")),
-                transport: surface::SurfaceTransport::StdioJsonl,
-                lifecycle: surface::SurfaceLifecycle::Managed,
+                runtime: Some(surface::SurfaceRuntimeSpec::Managed {
+                    artifact: if id == "feishu" {
+                        "cowd-edge-open-platform-message".to_string()
+                    } else {
+                        format!("cowd-edge-{id}-message")
+                    },
+                    driver_profile: format!("{id}-message"),
+                    transport: surface::SurfaceTransport::UdsHttp2,
+                }),
                 capabilities: surface::message::message_connector_capabilities(&id)
                     .into_iter()
                     .map(str::to_string)

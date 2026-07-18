@@ -1329,9 +1329,11 @@ mod tests {
             name: "Feishu Message Connector".to_string(),
             version: "0.1.0".to_string(),
             kind: surface::SurfaceKind::MessageConnector,
-            entry: Some("./cowd-edge-feishu-message".to_string()),
-            transport: surface::SurfaceTransport::StdioJsonl,
-            lifecycle: surface::SurfaceLifecycle::Managed,
+            runtime: Some(surface::SurfaceRuntimeSpec::Managed {
+                artifact: "cowd-edge-open-platform-message".to_string(),
+                driver_profile: "feishu-message".to_string(),
+                transport: surface::SurfaceTransport::UdsHttp2,
+            }),
             capabilities: vec![
                 "message.ingress".to_string(),
                 "message.delivery".to_string(),

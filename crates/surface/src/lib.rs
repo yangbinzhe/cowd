@@ -20,6 +20,8 @@ use uuid::Uuid;
 
 pub mod message;
 
+include!("edge_v2_generated.rs");
+
 /// Current wire protocol for Cowd edge sidecars.
 ///
 /// The crate is still named `surface` because WebUI/TUI are real surfaces and
@@ -78,6 +80,7 @@ pub enum EdgeDomain {
 #[serde(rename_all = "kebab-case")]
 pub enum SurfaceTransport {
     StdioJsonl,
+    UdsHttp2,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,8 +91,57 @@ pub enum SurfaceLifecycle {
     Managed,
 }
 
-fn default_lifecycle() -> SurfaceLifecycle {
-    SurfaceLifecycle::OneShot
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum SurfaceRuntimeSpec {
+    OneShot {
+        entry: String,
+        #[serde(default = "default_transport")]
+        transport: SurfaceTransport,
+    },
+    Managed {
+        artifact: String,
+        driver_profile: String,
+        #[serde(default = "default_managed_transport")]
+        transport: SurfaceTransport,
+    },
+}
+
+impl SurfaceRuntimeSpec {
+    #[must_use]
+    pub fn lifecycle(&self) -> SurfaceLifecycle {
+        match self {
+            Self::OneShot { .. } => SurfaceLifecycle::OneShot,
+            Self::Managed { .. } => SurfaceLifecycle::Managed,
+        }
+    }
+
+    #[must_use]
+    pub fn transport(&self) -> SurfaceTransport {
+        match self {
+            Self::OneShot { transport, .. } | Self::Managed { transport, .. } => *transport,
+        }
+    }
+
+    #[must_use]
+    pub fn entry(&self) -> Option<&str> {
+        match self {
+            Self::OneShot { entry, .. } => Some(entry),
+            Self::Managed { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn managed_artifact(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::Managed {
+                artifact,
+                driver_profile,
+                ..
+            } => Some((artifact, driver_profile)),
+            Self::OneShot { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +186,7 @@ pub struct SurfaceResource {
 pub enum SurfaceHealthMode {
     Registry,
     Jsonl,
+    Http2,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -421,17 +474,15 @@ impl SurfaceCapability {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SurfaceManifest {
     pub schema: String,
     pub id: String,
     pub name: String,
     pub version: String,
     pub kind: SurfaceKind,
-    pub entry: Option<String>,
-    #[serde(default = "default_transport")]
-    pub transport: SurfaceTransport,
-    #[serde(default = "default_lifecycle")]
-    pub lifecycle: SurfaceLifecycle,
+    #[serde(default)]
+    pub runtime: Option<SurfaceRuntimeSpec>,
     #[serde(default)]
     pub capabilities: Vec<String>,
     #[serde(default)]
@@ -450,6 +501,10 @@ fn default_transport() -> SurfaceTransport {
     SurfaceTransport::StdioJsonl
 }
 
+fn default_managed_transport() -> SurfaceTransport {
+    SurfaceTransport::UdsHttp2
+}
+
 impl SurfaceManifest {
     #[must_use]
     pub fn builtin(id: &str, name: &str, kind: SurfaceKind, capabilities: &[&str]) -> Self {
@@ -459,9 +514,7 @@ impl SurfaceManifest {
             name: name.to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             kind,
-            entry: None,
-            transport: SurfaceTransport::StdioJsonl,
-            lifecycle: SurfaceLifecycle::Builtin,
+            runtime: None,
             capabilities: capabilities
                 .iter()
                 .map(|item| (*item).to_string())
@@ -501,7 +554,7 @@ impl SurfaceManifest {
                 reason: "id is required".to_string(),
             });
         }
-        if self.entry.is_none()
+        if self.runtime.is_none()
             && !matches!(
                 self.kind,
                 SurfaceKind::InteractiveSurface | SurfaceKind::WebSurface
@@ -509,8 +562,35 @@ impl SurfaceManifest {
         {
             return Err(SurfaceError::InvalidManifest {
                 surface: self.id.clone(),
-                reason: "external edge connector requires entry".to_string(),
+                reason: "external edge connector requires runtime".to_string(),
             });
+        }
+        if let Some(runtime) = &self.runtime {
+            match runtime {
+                SurfaceRuntimeSpec::OneShot { entry, transport } => {
+                    validate_one_shot_entry(&self.id, entry)?;
+                    if *transport != SurfaceTransport::StdioJsonl {
+                        return Err(SurfaceError::InvalidManifest {
+                            surface: self.id.clone(),
+                            reason: "one-shot runtime requires `stdio-jsonl` transport".to_string(),
+                        });
+                    }
+                }
+                SurfaceRuntimeSpec::Managed {
+                    artifact,
+                    driver_profile,
+                    transport,
+                } => {
+                    validate_runtime_name(&self.id, "runtime.artifact", artifact)?;
+                    validate_runtime_name(&self.id, "runtime.driver_profile", driver_profile)?;
+                    if *transport != SurfaceTransport::UdsHttp2 {
+                        return Err(SurfaceError::InvalidManifest {
+                            surface: self.id.clone(),
+                            reason: "managed runtime requires `uds-http2` transport".to_string(),
+                        });
+                    }
+                }
+            }
         }
         for route in &self.routes {
             validate_surface_path(&self.id, "route.path", &route.path)?;
@@ -555,6 +635,37 @@ impl SurfaceManifest {
     }
 }
 
+fn validate_runtime_name(surface: &str, field: &str, value: &str) -> Result<(), SurfaceError> {
+    if value.trim().is_empty()
+        || value.contains('/')
+        || value.contains('\\')
+        || value == "."
+        || value == ".."
+    {
+        return Err(SurfaceError::InvalidManifest {
+            surface: surface.to_string(),
+            reason: format!("{field} must be a non-empty trusted name without path separators"),
+        });
+    }
+    Ok(())
+}
+
+fn validate_one_shot_entry(surface: &str, value: &str) -> Result<(), SurfaceError> {
+    let path = Path::new(value);
+    if value.trim().is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(SurfaceError::InvalidManifest {
+            surface: surface.to_string(),
+            reason: "runtime.entry must be a relative path without parent traversal".to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn validate_surface_path(surface: &str, field: &str, path: &str) -> Result<(), SurfaceError> {
     if !path.starts_with('/') {
         return Err(SurfaceError::InvalidManifest {
@@ -590,7 +701,9 @@ pub struct SurfaceDescriptor {
     pub kind: SurfaceKind,
     pub status: SurfaceStatus,
     pub source: String,
+    pub runtime: Option<SurfaceRuntimeSpec>,
     pub entry: Option<String>,
+    pub transport: Option<SurfaceTransport>,
     pub lifecycle: SurfaceLifecycle,
     pub capabilities: Vec<SurfaceCapability>,
     pub routes: Vec<SurfaceRoute>,
@@ -608,14 +721,23 @@ impl SurfaceDescriptor {
             name: manifest.name.clone(),
             version: manifest.version.clone(),
             kind: manifest.kind,
-            status: if manifest.entry.is_some() {
+            status: if manifest.runtime.is_some() {
                 SurfaceStatus::Discovered
             } else {
                 SurfaceStatus::Builtin
             },
             source: source.into(),
-            entry: manifest.entry.clone(),
-            lifecycle: manifest.lifecycle,
+            runtime: manifest.runtime.clone(),
+            entry: manifest
+                .runtime
+                .as_ref()
+                .and_then(SurfaceRuntimeSpec::entry)
+                .map(ToString::to_string),
+            transport: manifest.runtime.as_ref().map(SurfaceRuntimeSpec::transport),
+            lifecycle: manifest
+                .runtime
+                .as_ref()
+                .map_or(SurfaceLifecycle::Builtin, SurfaceRuntimeSpec::lifecycle),
             capabilities: manifest.capability_rows(),
             routes: manifest.routes.clone(),
             resources: manifest.resources.clone(),
@@ -628,6 +750,18 @@ impl SurfaceDescriptor {
     #[must_use]
     pub fn edge_domain(&self) -> EdgeDomain {
         self.edge_domain
+    }
+
+    #[must_use]
+    pub fn is_executable(&self) -> bool {
+        self.runtime.is_some()
+    }
+
+    #[must_use]
+    pub fn managed_artifact(&self) -> Option<(&str, &str)> {
+        self.runtime
+            .as_ref()
+            .and_then(SurfaceRuntimeSpec::managed_artifact)
     }
 }
 
@@ -908,6 +1042,27 @@ mod tests {
     }
 
     #[test]
+    fn edge_v2_contract_round_trips_bootstrap_and_event_ack() {
+        let request = EdgeBootstrapRequest {
+            protocol: EDGE_PROTOCOL_V2.to_string(),
+            gateway_version: "0.9.550".to_string(),
+            surface_id: "feishu".to_string(),
+            driver_profile: "feishu-message".to_string(),
+            capabilities: vec!["message.health".to_string()],
+        };
+        let encoded = serde_json::to_vec(&request).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<EdgeBootstrapRequest>(&encoded).unwrap(),
+            request
+        );
+        let ack = EdgeEventAck { sequence: 42 };
+        assert_eq!(
+            serde_json::from_str::<EdgeEventAck>(&serde_json::to_string(&ack).unwrap()).unwrap(),
+            ack
+        );
+    }
+
+    #[test]
     fn builtin_surfaces_include_tui_and_webui() {
         let surfaces = builtin_surfaces();
         assert!(surfaces.contains_key("tui"));
@@ -932,9 +1087,12 @@ mod tests {
                 "name": "Feishu Message Connector",
                 "version": "1.0.0",
                 "kind": "message-connector",
-                "entry": "./cowd-edge-feishu-message",
-                "transport": "stdio-jsonl",
-                "lifecycle": "managed",
+                "runtime": {
+                    "kind": "managed",
+                    "artifact": "cowd-edge-open-platform-message",
+                    "driver_profile": "feishu-message",
+                    "transport": "uds-http2"
+                },
                 "capabilities": ["message.send_text", "message.callback"],
                 "routes": [
                     {"kind": "callback", "path": "/webhook", "method": "POST", "public": true}
@@ -942,7 +1100,7 @@ mod tests {
                 "resources": [
                     {"kind": "static", "mount": "/", "dir": "./public", "spa": true}
                 ],
-                "health": {"mode": "jsonl", "interval_ms": 1000}
+                "health": {"mode": "http2", "interval_ms": 1000}
             }"#,
         )
         .unwrap();
@@ -953,7 +1111,7 @@ mod tests {
         assert_eq!(descriptor.edge_domain(), EdgeDomain::MessageConnector);
         assert_eq!(descriptor.routes.len(), 1);
         assert_eq!(descriptor.resources.len(), 1);
-        assert_eq!(descriptor.health.mode, SurfaceHealthMode::Jsonl);
+        assert_eq!(descriptor.health.mode, SurfaceHealthMode::Http2);
     }
 
     #[test]
@@ -965,7 +1123,11 @@ mod tests {
                 "name": "Feishu Bitable Source Connector",
                 "version": "1.0.0",
                 "kind": "source-connector",
-                "entry": "./cowd-edge-feishu-bitable-source",
+                "runtime": {
+                    "kind": "managed",
+                    "artifact": "cowd-edge-bitable-source",
+                    "driver_profile": "feishu-bitable"
+                },
                 "capabilities": ["source.schema_discovery", "source.snapshot", "source.health"]
             }"#,
         )
@@ -1015,7 +1177,11 @@ mod tests {
                 "name": "Bad Surface",
                 "version": "1.0.0",
                 "kind": "external-integration",
-                "entry": "./bad",
+                "runtime": {
+                    "kind": "one-shot",
+                    "entry": "bad",
+                    "transport": "stdio-jsonl"
+                },
                 "resources": [
                     {"kind": "static", "mount": "/assets", "dir": "../secret", "spa": false}
                 ]
@@ -1024,5 +1190,51 @@ mod tests {
         .unwrap();
 
         assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn managed_manifest_rejects_legacy_runtime_fields_and_transport_mismatch() {
+        let legacy = r#"{
+            "schema":"cowd.surface.v1","id":"legacy","name":"Legacy","version":"1.0.0",
+            "kind":"message-connector","entry":"old-sidecar","lifecycle":"managed",
+            "transport":"stdio-jsonl","capabilities":[]
+        }"#;
+        assert!(serde_json::from_str::<SurfaceManifest>(legacy).is_err());
+
+        let mismatched = serde_json::from_str::<SurfaceManifest>(
+            r#"{
+                "schema":"cowd.surface.v1","id":"bad","name":"Bad","version":"1.0.0",
+                "kind":"message-connector","runtime":{"kind":"managed",
+                "artifact":"cowd-edge-bad","driver_profile":"bad","transport":"stdio-jsonl"},
+                "capabilities":[]
+            }"#,
+        )
+        .unwrap();
+        assert!(mismatched.validate().is_err());
+    }
+
+    #[test]
+    fn managed_manifest_rejects_untrusted_artifact_and_profile_names() {
+        for (artifact, profile) in [("../edge", "safe"), ("cowd-edge-safe", "../profile")] {
+            let manifest = SurfaceManifest {
+                schema: SURFACE_PROTOCOL.to_string(),
+                id: "bad".to_string(),
+                name: "Bad".to_string(),
+                version: "1.0.0".to_string(),
+                kind: SurfaceKind::MessageConnector,
+                runtime: Some(SurfaceRuntimeSpec::Managed {
+                    artifact: artifact.to_string(),
+                    driver_profile: profile.to_string(),
+                    transport: SurfaceTransport::UdsHttp2,
+                }),
+                capabilities: Vec::new(),
+                routes: Vec::new(),
+                resources: Vec::new(),
+                health: SurfaceHealthSpec::default(),
+                config_schema: Value::Null,
+                default_enabled: false,
+            };
+            assert!(manifest.validate().is_err());
+        }
     }
 }

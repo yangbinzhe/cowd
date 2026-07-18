@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cowd.dev/contracts/edge/v2/schema.json",
+  "title": "Cowd managed Edge v2 wire contract",
+  "protocol": "cowd.edge.v2",
+  "definitions": {
+    "EdgeBootstrapRequest": {
+      "required": ["protocol", "gateway_version", "surface_id", "driver_profile", "capabilities"],
+      "properties": {
+        "protocol": { "type": "string" },
+        "gateway_version": { "type": "string" },
+        "surface_id": { "type": "string" },
+        "driver_profile": { "type": "string" },
+        "capabilities": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "EdgeBootstrapResponse": {
+      "required": ["protocol", "surface_id", "driver_profile", "capabilities", "max_in_flight"],
+      "properties": {
+        "protocol": { "type": "string" },
+        "surface_id": { "type": "string" },
+        "driver_profile": { "type": "string" },
+        "capabilities": { "type": "array", "items": { "type": "string" } },
+        "max_in_flight": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "EdgeEventEnvelope": {
+      "required": ["sequence", "frame"],
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 1 },
+        "frame": { "$ref": "cowd.surface.v1#/SurfaceFrame" }
+      }
+    },
+    "EdgeEventAck": {
+      "required": ["sequence"],
+      "properties": { "sequence": { "type": "integer", "minimum": 0 } }
+    },
+    "ManagedRuntime": {
+      "required": ["kind", "artifact", "driver_profile", "transport"],
+      "properties": {
+        "kind": { "const": "managed" },
+        "artifact": { "type": "string" },
+        "driver_profile": { "type": "string" },
+        "transport": { "const": "uds-http2" }
+      }
+    }
+  }
+}

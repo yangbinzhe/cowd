@@ -1,7 +1,5 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::{Arc, RwLock};
-
-use chrono::Utc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use surface::{
     normalize_surface_id, SurfaceFailureKind, SurfaceFrame, SurfaceLifecycle, SurfaceRuntimeError,
     SurfaceRuntimeSnapshot, SurfaceRuntimeStatus, SurfaceSupervisorEvent,
@@ -274,31 +272,6 @@ impl SurfaceHost {
         self.push_ledger(SurfaceSupervisorEvent::error(&surface, status, error))
             .await;
         snapshot
-    }
-}
-
-pub(super) fn mark_surface_seen(
-    runtime: &Arc<RwLock<BTreeMap<String, SurfaceRuntimeSnapshot>>>,
-    surface: &str,
-    pid: Option<u32>,
-) {
-    let mut runtime = runtime
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let snapshot = runtime
-        .entry(surface.to_string())
-        .or_insert_with(|| SurfaceRuntimeSnapshot::discovered(surface, SurfaceLifecycle::Managed));
-    snapshot.active = true;
-    snapshot.pid = pid;
-    snapshot.last_seen_at = Some(Utc::now());
-    if matches!(
-        snapshot.status,
-        SurfaceRuntimeStatus::Starting
-            | SurfaceRuntimeStatus::Restarting
-            | SurfaceRuntimeStatus::Discovered
-            | SurfaceRuntimeStatus::Unavailable
-    ) {
-        snapshot.status = SurfaceRuntimeStatus::Ready;
     }
 }
 

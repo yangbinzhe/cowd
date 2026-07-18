@@ -5,6 +5,7 @@ use std::sync::{Arc, RwLock};
 use surface::{SurfaceDescriptor, SurfaceFrame, SurfaceRuntimeSnapshot, SurfaceSupervisorEvent};
 use tokio::sync::{broadcast, Mutex as AsyncMutex};
 
+mod edge_h2;
 mod ingress;
 mod invocation;
 mod ledger;
@@ -27,8 +28,7 @@ pub(crate) use types::{
     SurfaceRouteSummary, SurfaceStaticFile,
 };
 
-use invocation::frame_id;
-use ledger::{mark_surface_seen, push_supervisor_event};
+use ledger::push_supervisor_event;
 use repair::{classify_surface_error, managed_actions};
 use static_assets::normalize_request_path;
 use types::ManagedSurfaceProcess;
@@ -165,8 +165,8 @@ mod tests {
     use super::*;
     use std::fs;
     use surface::{
-        SurfaceFailureKind, SurfaceFrame, SurfaceLifecycle, SurfaceManifest, SurfaceRuntimeStatus,
-        SurfaceSendRequest, SURFACE_MANIFEST_FILE,
+        SurfaceFailureKind, SurfaceManifest, SurfaceRuntimeStatus, SurfaceSendRequest,
+        SURFACE_MANIFEST_FILE,
     };
 
     #[cfg(unix)]
@@ -211,8 +211,11 @@ mod tests {
                 "name": "Echo Surface",
                 "version": "1.0.0",
                 "kind": "external-integration",
-                "entry": "./cowd-edge-echo",
-                "transport": "stdio-jsonl",
+                "runtime": {
+                    "kind": "one-shot",
+                    "entry": "cowd-edge-echo",
+                    "transport": "stdio-jsonl"
+                },
                 "capabilities": ["send_text"],
                 "default_enabled": true
             }"#,
@@ -233,8 +236,11 @@ mod tests {
                 "name": "Echo Surface",
                 "version": "2.0.0",
                 "kind": "external-integration",
-                "entry": "./cowd-edge-echo",
-                "transport": "stdio-jsonl",
+                "runtime": {
+                    "kind": "one-shot",
+                    "entry": "cowd-edge-echo",
+                    "transport": "stdio-jsonl"
+                },
                 "capabilities": ["send_text", "receive_text"],
                 "default_enabled": true
             }"#,
@@ -277,8 +283,11 @@ mod tests {
                 "name": "Echo Surface",
                 "version": "1.0.0",
                 "kind": "external-integration",
-                "entry": "./cowd-edge-echo",
-                "transport": "stdio-jsonl",
+                "runtime": {
+                    "kind": "one-shot",
+                    "entry": "cowd-edge-echo",
+                    "transport": "stdio-jsonl"
+                },
                 "capabilities": ["send_text"],
                 "default_enabled": true
             }"#,
@@ -334,7 +343,11 @@ mod tests {
                 "name": "Panel Surface",
                 "version": "1.0.0",
                 "kind": "external-integration",
-                "entry": "./cowd-edge-panel",
+                "runtime": {
+                    "kind": "one-shot",
+                    "entry": "cowd-edge-panel",
+                    "transport": "stdio-jsonl"
+                },
                 "resources": [
                     {"kind": "static", "mount": "/", "dir": "./public", "spa": true}
                 ]
@@ -393,7 +406,11 @@ mod tests {
                 "name": "Hook Surface",
                 "version": "1.0.0",
                 "kind": "external-integration",
-                "entry": "./cowd-edge-hook",
+                "runtime": {
+                    "kind": "one-shot",
+                    "entry": "cowd-edge-hook",
+                    "transport": "stdio-jsonl"
+                },
                 "routes": [
                     {"kind": "callback", "path": "/webhook", "method": "POST", "public": true}
                 ]
@@ -423,66 +440,6 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn managed_sidecar_reuses_process_and_collects_events() {
-        let root =
-            std::env::temp_dir().join(format!("cowd-edge-managed-test-{}", uuid::Uuid::new_v4()));
-        let surface_dir = root.join("managed");
-        fs::create_dir_all(&surface_dir).unwrap();
-        let sidecar = surface_dir.join("cowd-edge-managed");
-        fs::write(
-            &sidecar,
-            r#"#!/usr/bin/env sh
-while IFS= read -r line; do
-  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
-  printf '%s\n' '{"type":"event","surface":"managed","event":"tick","payload":{"status":"seen"}}'
-  printf '%s\n' "{\"type\":\"ok\",\"id\":\"$id\",\"payload\":{\"status\":\"sent\",\"message_id\":\"managed-1\"}}"
-done
-"#,
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&sidecar).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&sidecar, permissions).unwrap();
-        fs::write(
-            surface_dir.join(SURFACE_MANIFEST_FILE),
-            r#"{
-                "schema": "cowd.surface.v1",
-                "id": "managed",
-                "name": "Managed Surface",
-                "version": "1.0.0",
-                "kind": "external-integration",
-                "entry": "./cowd-edge-managed",
-                "lifecycle": "managed",
-                "capabilities": ["send_text", "inbound"]
-            }"#,
-        )
-        .unwrap();
-
-        let host = SurfaceHost::new(vec![root.clone()]);
-        assert_eq!(host.discover().discovered, 1);
-        let result = host
-            .send(SurfaceSendRequest {
-                surface: "managed".to_string(),
-                recipient: "room-1".to_string(),
-                thread: None,
-                text: "hello".to_string(),
-                idempotency_key: None,
-                metadata: serde_json::Value::Null,
-            })
-            .await
-            .unwrap();
-        assert_eq!(result.status, "sent");
-        assert_eq!(result.message_id.as_deref(), Some("managed-1"));
-        let events = host.events("managed").await;
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, SurfaceFrame::Event { event, .. } if event == "tick")));
-
-        let _ = fs::remove_dir_all(root);
-    }
-
     #[tokio::test]
     async fn repair_policy_opens_circuit_after_bounded_restarts() {
         let host = SurfaceHost::new(Vec::new());
@@ -493,9 +450,11 @@ done
                 name: "Bounded Surface".to_string(),
                 version: "1.0.0".to_string(),
                 kind: surface::SurfaceKind::ExternalIntegration,
-                entry: Some("./missing".to_string()),
-                transport: surface::SurfaceTransport::StdioJsonl,
-                lifecycle: SurfaceLifecycle::Managed,
+                runtime: Some(surface::SurfaceRuntimeSpec::Managed {
+                    artifact: "missing".to_string(),
+                    driver_profile: "bounded".to_string(),
+                    transport: surface::SurfaceTransport::UdsHttp2,
+                }),
                 capabilities: vec!["health".to_string()],
                 routes: Vec::new(),
                 resources: Vec::new(),

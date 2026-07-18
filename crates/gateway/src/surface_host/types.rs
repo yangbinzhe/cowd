@@ -1,20 +1,21 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use surface::{SurfaceFrame, SurfaceResource, SurfaceRoute};
-use tokio::process::ChildStdin;
-use tokio::sync::{oneshot, Mutex as AsyncMutex};
+use tokio::sync::Mutex as AsyncMutex;
+
+use super::edge_h2::EdgeH2Client;
 
 #[derive(Debug)]
 pub(super) struct ManagedSurfaceProcess {
     pub(super) pid: Option<u32>,
     pub(super) started_at: DateTime<Utc>,
-    pub(super) stdin: AsyncMutex<ChildStdin>,
-    pub(super) pending: Arc<AsyncMutex<HashMap<String, oneshot::Sender<SurfaceFrame>>>>,
+    pub(super) client: EdgeH2Client,
     pub(super) events: Arc<AsyncMutex<VecDeque<SurfaceFrame>>>,
+    pub(super) runtime_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize)]
