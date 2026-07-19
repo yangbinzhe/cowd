@@ -519,6 +519,19 @@ pub fn program_command(
     program: &Path,
     spec: &SandboxLaunchSpec,
 ) -> Result<PreparedSandboxCommand, SandboxError> {
+    program_command_with_args(program, &[], spec)
+}
+
+/// Build a hardened command for an executable and its exact argv.
+///
+/// Arguments must be placed inside the inner command before Bubblewrap is
+/// assembled. Appending them to [`PreparedSandboxCommand::args`] would append
+/// to the outer launcher protocol instead of the managed program.
+pub fn program_command_with_args(
+    program: &Path,
+    args: &[String],
+    spec: &SandboxLaunchSpec,
+) -> Result<PreparedSandboxCommand, SandboxError> {
     let workspace = canonical(&spec.workspace_root)?;
     let program = canonical(program)?;
     if !program.starts_with(&workspace) {
@@ -528,8 +541,12 @@ pub fn program_command(
             workspace.display()
         )));
     }
-    let quoted = shell_quote(&program.display().to_string());
-    shell_command(&format!("exec {quoted}"), spec)
+    let mut command = format!("exec {}", shell_quote(&program.display().to_string()));
+    for arg in args {
+        command.push(' ');
+        command.push_str(&shell_quote(arg));
+    }
+    shell_command(&command, spec)
 }
 
 fn bwrap_args(
@@ -1072,6 +1089,41 @@ mod tests {
             assert!(command.get_envs().all(|(key, _)| key != "COWD_API_TOKEN"));
             assert!(command.get_envs().next().is_none());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn program_arguments_execute_inside_the_hardened_command() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if !bwrap_available() {
+            return;
+        }
+        let root = ProbeFixture::new().expect("fixture");
+        let program = root.workspace.join("argv-fixture.sh");
+        fs::write(&program, "#!/bin/sh\nprintf '%s\\n' \"$@\" > argv.out\n")
+            .expect("write argv fixture");
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755))
+            .expect("make argv fixture executable");
+        let args = vec![
+            "alpha".to_string(),
+            "space value".to_string(),
+            "quote'value".to_string(),
+        ];
+
+        let prepared = program_command_with_args(
+            &program,
+            &args,
+            &SandboxLaunchSpec::workspace(&root.workspace),
+        )
+        .expect("prepare argv sandbox");
+        let output = prepared.into_command().output().expect("run argv sandbox");
+
+        assert!(output.status.success(), "{:?}", output);
+        assert_eq!(
+            fs::read_to_string(root.workspace.join("argv.out")).unwrap(),
+            "alpha\nspace value\nquote'value\n"
+        );
     }
 
     #[test]

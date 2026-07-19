@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, RwLock};
 
 use chrono::Utc;
-use sandbox_launcher::{program_command, SandboxLaunchSpec};
+use sandbox_launcher::{program_command_with_args, SandboxLaunchSpec};
 use surface::{
     normalize_surface_id, SurfaceDescriptor, SurfaceError, SurfaceFailureKind, SurfaceFrame,
     SurfaceLifecycle, SurfaceRuntimeError, SurfaceRuntimeSnapshot, SurfaceRuntimeStatus,
@@ -287,19 +287,23 @@ async fn start_managed_process(
     sandbox.working_directory = Some(runtime_dir.clone());
     sandbox.readable_roots.push(manifest_dir.to_path_buf());
     sandbox.writable_roots.push(runtime_dir.clone());
-    let prepared = program_command(&staged_command, &sandbox).map_err(|error| {
-        let _ = std::fs::remove_dir_all(&runtime_dir);
-        SurfaceError::Invocation {
-            surface: surface_id.clone(),
-            reason: format!("managed surface sandbox unavailable: {error}"),
-        }
-    })?;
+    let program_args = vec![
+        "--socket".to_string(),
+        socket_path.display().to_string(),
+        "--credential-file".to_string(),
+        credential_path.display().to_string(),
+    ];
+    let prepared = program_command_with_args(&staged_command, &program_args, &sandbox).map_err(
+        |error| {
+            let _ = std::fs::remove_dir_all(&runtime_dir);
+            SurfaceError::Invocation {
+                surface: surface_id.clone(),
+                reason: format!("managed surface sandbox unavailable: {error}"),
+            }
+        },
+    )?;
     let mut child = TokioCommand::new(prepared.program)
         .args(prepared.args)
-        .arg("--socket")
-        .arg(&socket_path)
-        .arg("--credential-file")
-        .arg(&credential_path)
         .env_clear()
         .envs(prepared.environment)
         .stdin(Stdio::null())
