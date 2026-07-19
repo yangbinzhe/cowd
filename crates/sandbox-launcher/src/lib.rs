@@ -608,6 +608,7 @@ fn bwrap_args(
         "/proc/self/fd/3".to_string(),
         INNER_LAUNCHER_PATH.to_string(),
     ]);
+    append_network_resolver_bind(&mut args, spec.network_enabled)?;
 
     let writable = spec
         .writable_roots
@@ -652,6 +653,50 @@ fn bwrap_args(
     }
     args.extend(["--".to_string(), command]);
     Ok(args)
+}
+
+fn append_network_resolver_bind(
+    args: &mut Vec<String>,
+    network_enabled: bool,
+) -> Result<(), SandboxError> {
+    if !network_enabled {
+        return Ok(());
+    }
+    let resolver = canonical(Path::new("/etc/resolv.conf"))?;
+    if resolver.starts_with("/etc") {
+        return Ok(());
+    }
+    let allowed = [
+        Path::new("/run/systemd/resolve"),
+        Path::new("/run/NetworkManager"),
+        Path::new("/run/resolvconf"),
+    ];
+    if !allowed.iter().any(|root| resolver.starts_with(root)) {
+        return Err(SandboxError::MissingPath(format!(
+            "resolver target `{}` is outside the supported runtime roots",
+            resolver.display()
+        )));
+    }
+    let parent = resolver.parent().ok_or_else(|| {
+        SandboxError::MissingPath("resolver target has no parent directory".to_string())
+    })?;
+    let relative = parent.strip_prefix("/run").map_err(|_| {
+        SandboxError::MissingPath("resolver target is not below /run".to_string())
+    })?;
+    let mut target_parent = PathBuf::from("/run");
+    for component in relative.components() {
+        target_parent.push(component.as_os_str());
+        args.extend([
+            "--dir".to_string(),
+            target_parent.display().to_string(),
+        ]);
+    }
+    args.extend([
+        "--ro-bind".to_string(),
+        resolver.display().to_string(),
+        resolver.display().to_string(),
+    ]);
+    Ok(())
 }
 
 fn launcher_binary_path() -> Result<PathBuf, SandboxError> {
@@ -1166,6 +1211,21 @@ mod tests {
             fs::read_to_string(root.workspace.join("output")).expect("output"),
             "isolated"
         );
+    }
+
+    #[test]
+    fn network_enabled_sandbox_can_read_the_real_resolver_target() {
+        if !bwrap_available() {
+            return;
+        }
+        let root = ProbeFixture::new().expect("fixture");
+        let prepared = shell_command(
+            "target=$(readlink -f /etc/resolv.conf) && test -r \"$target\" && grep -q nameserver \"$target\"",
+            &SandboxLaunchSpec::workspace(&root.workspace),
+        )
+        .expect("prepare resolver sandbox");
+        let output = prepared.into_command().output().expect("run resolver sandbox");
+        assert!(output.status.success(), "{:?}", output);
     }
 
     #[test]
