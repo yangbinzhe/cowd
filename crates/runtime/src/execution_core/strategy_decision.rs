@@ -333,6 +333,7 @@ fn build_runtime_execution_decision_inner(
             } else {
                 10_000
             },
+            provider_profile_fingerprint: String::new(),
             sample_source: if resource_health.observed {
                 "runtime-observed-availability;assumed-capacity-v1".to_string()
             } else {

@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     sync::mpsc,
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use reqwest::{
@@ -2260,6 +2260,12 @@ fn evaluate_samples(
     } else {
         Vec::new()
     };
+    let negative_benefit_observations = build_negative_benefit_observations(
+        corpus,
+        &task_comparisons,
+        &samples,
+        &provenance,
+    );
     json!({
         "kind": "harness_eval.auto_strategy_paired.v1",
         "status": if gate_passed {
@@ -2284,6 +2290,7 @@ fn evaluate_samples(
         "team_cluster_bootstrap_channel_margin_95ci": channel_margin_ci,
         "evolution_paired_sign_confidence_bp": paired_sign_confidence_bp,
         "strategy_calibration_records": strategy_calibration_records,
+        "negative_benefit_observations": negative_benefit_observations,
         "samples": samples,
         "gate": {
             "passed": gate_passed,
@@ -2305,6 +2312,87 @@ fn evaluate_samples(
             "failure_timeout_samples_retained": true,
         }
     })
+}
+
+fn build_negative_benefit_observations(
+    corpus: &AutoStrategyCorpus,
+    task_comparisons: &[Value],
+    samples: &[Sample],
+    provenance: &Value,
+) -> Vec<harness_contract::strategy::NegativeBenefitObservation> {
+    use harness_contract::strategy::{
+        ExecutionCandidateKind, NegativeBenefitObservation, StrategyInput,
+        StrategyWorkloadFingerprint, understand,
+    };
+
+    let Some(provider) = provenance["provider"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Vec::new();
+    };
+    let provider_profile_fingerprint = format!("{:x}", Sha256::digest(provider.as_bytes()));
+    let observed_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            duration.as_millis().min(u128::from(u64::MAX)) as u64
+        });
+    let expires_at_ms = observed_at_ms.saturating_add(30_u64 * 24 * 60 * 60 * 1_000);
+
+    corpus
+        .tasks
+        .iter()
+        .filter(|task| task.expected_candidate == "team")
+        .filter_map(|task| {
+            let comparison = task_comparisons
+                .iter()
+                .find(|comparison| comparison["task_id"].as_str() == Some(task.task_id.as_str()))?;
+            if comparison["valid_pair_count"].as_u64().unwrap_or(0) == 0
+                || comparison["preregistered_channel_margin_bp"]
+                    .as_i64()
+                    .is_none_or(|margin| margin >= 0)
+                || !samples.iter().any(|sample| {
+                    !sample.warmup
+                        && sample.task_id == task.task_id
+                        && sample.condition == Condition::Auto
+                        && sample.status == "completed"
+                        && sample.selected_candidate.as_deref() == Some("team")
+                })
+            {
+                return None;
+            }
+            let baseline_name = comparison["strongest_non_team_baseline"].as_str()?;
+            let baseline = comparison.get(baseline_name)?;
+            let auto = comparison.get("auto")?;
+            let input = StrategyInput::from_prompt(task.prompt.clone());
+            let understanding = understand(&input);
+            Some(NegativeBenefitObservation {
+                workload_fingerprint_sha256: StrategyWorkloadFingerprint::from_input(
+                    &input,
+                    &understanding,
+                )
+                .digest(),
+                provider_profile_fingerprint: provider_profile_fingerprint.clone(),
+                baseline_candidate: if baseline_name == "parallel_tools" {
+                    ExecutionCandidateKind::ParallelTools
+                } else {
+                    ExecutionCandidateKind::Direct
+                },
+                baseline_duration_ms: baseline["critical_path_median_ms"].as_u64()?,
+                baseline_quality_score_bp: u16::try_from(baseline["quality_bp"].as_u64()?).ok()?,
+                team_duration_ms: auto["critical_path_median_ms"].as_u64()?,
+                team_quality_score_bp: u16::try_from(auto["quality_bp"].as_u64()?).ok()?,
+                report_sha256: String::new(),
+                provenance_ref: format!(
+                    "harness_eval.auto_strategy_paired.v1:{}:{}",
+                    provenance["corpus_id"].as_str()?,
+                    task.task_id,
+                ),
+                observed_at_ms,
+                expires_at_ms,
+            })
+        })
+        .collect()
 }
 
 fn build_strategy_calibration_records(

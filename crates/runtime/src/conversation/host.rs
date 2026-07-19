@@ -699,8 +699,19 @@ where
                 && evaluation_topology_forbids_team(),
         }));
 
-        let resource_snapshot =
-            turn_strategy_resource_snapshot(services.as_ref(), evaluation_control.as_ref())?;
+        let provider_profile_fingerprint = {
+            let runtime = runtime.lock().await;
+            runtime
+                .current_model()
+                .filter(|model| !model.trim().is_empty())
+                .map(sha256_digest)
+                .unwrap_or_default()
+        };
+        let resource_snapshot = turn_strategy_resource_snapshot(
+            services.as_ref(),
+            evaluation_control.as_ref(),
+            provider_profile_fingerprint,
+        )?;
         let (
             mut strategy,
             context_window,
@@ -1438,6 +1449,7 @@ impl Drop for EvaluationResourceQuotaGuard {
 fn turn_strategy_resource_snapshot(
     services: &crate::RuntimeServices,
     evaluation: Option<&EvaluationTurnControl>,
+    provider_profile_fingerprint: String,
 ) -> Result<harness_contract::strategy::StrategyResourceSnapshot, RuntimeError> {
     use crate::execution_core::graph::ExecutionResourceKind;
 
@@ -1479,6 +1491,7 @@ fn turn_strategy_resource_snapshot(
         tool_concurrency: u16::try_from(tool_available).unwrap_or(u16::MAX),
         team_slots: u16::try_from(team_slots).unwrap_or(u16::MAX),
         provider_concurrency_penalty_bp: u16::try_from(provider_penalty).unwrap_or(10_000),
+        provider_profile_fingerprint,
         sample_source: evaluation.map_or_else(
             || "runtime-execution-resource-manager".to_string(),
             |control| {

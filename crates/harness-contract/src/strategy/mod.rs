@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -111,6 +112,10 @@ pub struct StrategyResourceSnapshot {
     pub tool_concurrency: u16,
     pub team_slots: u16,
     pub provider_concurrency_penalty_bp: u16,
+    /// SHA-256 of the effective provider/model profile. The raw provider or
+    /// model name is deliberately excluded from public strategy projections.
+    #[serde(default)]
+    pub provider_profile_fingerprint: String,
     pub sample_source: String,
     pub sample_count: u32,
     pub assumed: bool,
@@ -127,6 +132,7 @@ impl Default for StrategyResourceSnapshot {
             tool_concurrency: 1,
             team_slots: 2,
             provider_concurrency_penalty_bp: 0,
+            provider_profile_fingerprint: String::new(),
             sample_source: "assumed-detached-default".to_string(),
             sample_count: 0,
             assumed: true,
@@ -183,6 +189,10 @@ pub struct StrategyInput {
     pub understanding: Option<TaskUnderstanding>,
     #[serde(default)]
     pub resource_snapshot: StrategyResourceSnapshot,
+    /// Expiry-filtered, provenance-checked observations supplied by the
+    /// StrategyExperienceStore. They may veto automatic Team only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub negative_benefit_observations: Vec<NegativeBenefitObservation>,
 }
 
 impl StrategyInput {
@@ -199,6 +209,7 @@ impl StrategyInput {
             proposal: None,
             understanding: None,
             resource_snapshot: StrategyResourceSnapshot::default(),
+            negative_benefit_observations: Vec::new(),
         }
     }
 
@@ -248,6 +259,103 @@ impl StrategyInput {
     pub fn with_resource_snapshot(mut self, snapshot: StrategyResourceSnapshot) -> Self {
         self.resource_snapshot = snapshot;
         self
+    }
+}
+
+/// Non-sensitive workload identity used to scope strategy experience.
+/// It contains responsibility and risk shape, never prompt or path text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StrategyWorkloadFingerprint {
+    pub domain: TaskDomain,
+    pub complexity: TaskComplexity,
+    pub risk: TaskRisk,
+    pub requires_write: bool,
+    pub likely_single_file: bool,
+    pub responsibility_domains: u8,
+    pub independent_judgment: bool,
+    pub tool_dag_shape: String,
+}
+
+impl StrategyWorkloadFingerprint {
+    #[must_use]
+    pub fn from_input(input: &StrategyInput, understanding: &TaskUnderstanding) -> Self {
+        let tool_dag_shape = if understanding.requires_write {
+            if understanding.independent_workstreams > 1 {
+                "mixed_read_serial_write"
+            } else {
+                "bounded_serial_write"
+            }
+        } else if understanding.requires_external_facts
+            || understanding.requests_parallelism
+            || understanding.independent_workstreams > 1
+        {
+            "parallel_idempotent_read"
+        } else {
+            "direct_read_or_reason"
+        };
+        Self {
+            domain: understanding.domain,
+            complexity: understanding.complexity,
+            risk: understanding.risk,
+            requires_write: understanding.requires_write || input.explicit_write,
+            likely_single_file: understanding.likely_single_file,
+            responsibility_domains: understanding.independent_workstreams.max(1),
+            independent_judgment: matches!(understanding.risk, TaskRisk::High | TaskRisk::Critical)
+                || understanding.requests_multi_agent,
+            tool_dag_shape: tool_dag_shape.to_string(),
+        }
+    }
+
+    #[must_use]
+    pub fn digest(&self) -> String {
+        let bytes = serde_json::to_vec(self).unwrap_or_default();
+        format!("{:x}", Sha256::digest(bytes))
+    }
+}
+
+/// A negative paired observation is deliberately one-way: it can prevent an
+/// automatic Team choice but can never become positive calibration for any
+/// non-Direct candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NegativeBenefitObservation {
+    pub workload_fingerprint_sha256: String,
+    pub provider_profile_fingerprint: String,
+    pub baseline_candidate: ExecutionCandidateKind,
+    pub baseline_duration_ms: u64,
+    pub baseline_quality_score_bp: u16,
+    pub team_duration_ms: u64,
+    pub team_quality_score_bp: u16,
+    pub report_sha256: String,
+    pub provenance_ref: String,
+    pub observed_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+
+impl NegativeBenefitObservation {
+    fn validate(&self) -> Result<(), String> {
+        if !is_sha256(&self.workload_fingerprint_sha256)
+            || !is_sha256(&self.provider_profile_fingerprint)
+            || !is_sha256(&self.report_sha256)
+            || self.provenance_ref.trim().is_empty()
+            || self.baseline_candidate == ExecutionCandidateKind::Team
+            || self.baseline_duration_ms == 0
+            || self.team_duration_ms == 0
+            || self.expires_at_ms <= self.observed_at_ms
+        {
+            return Err("negative Team observation has incomplete provenance or bounds".to_string());
+        }
+        let quality_delta =
+            i32::from(self.team_quality_score_bp) - i32::from(self.baseline_quality_score_bp);
+        let speed_channel = self.team_duration_ms.saturating_mul(100)
+            <= self.baseline_duration_ms.saturating_mul(80)
+            && quality_delta >= -200;
+        let quality_channel = quality_delta >= 1_000
+            && self.team_duration_ms.saturating_mul(100)
+                <= self.baseline_duration_ms.saturating_mul(110);
+        if speed_channel || quality_channel {
+            return Err("positive Team result cannot be recorded as a negative veto".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -483,6 +591,8 @@ pub struct StrategyExperienceStore {
     pub records: Vec<StrategyExperienceRecord>,
     #[serde(default)]
     pub trusted_calibration_reports: Vec<StrategyCalibrationImportReceipt>,
+    #[serde(default)]
+    pub negative_benefit_observations: Vec<NegativeBenefitObservation>,
 }
 
 impl StrategyExperienceStore {
@@ -491,6 +601,7 @@ impl StrategyExperienceStore {
         Self {
             records: Vec::new(),
             trusted_calibration_reports: Vec::new(),
+            negative_benefit_observations: Vec::new(),
         }
     }
 
@@ -526,6 +637,78 @@ impl StrategyExperienceStore {
             .as_ref()
             .is_some_and(PairedStrategyCalibrationEvidence::demonstrates_positive_lift);
         self.records.push(record);
+    }
+
+    /// Persist a provenance-complete negative Team result. Duplicate report /
+    /// workload / provider tuples are idempotent and refresh the observation.
+    pub fn record_negative_benefit(
+        &mut self,
+        observation: NegativeBenefitObservation,
+    ) -> Result<(), String> {
+        observation.validate()?;
+        self.negative_benefit_observations.retain(|existing| {
+            existing.report_sha256 != observation.report_sha256
+                || existing.workload_fingerprint_sha256
+                    != observation.workload_fingerprint_sha256
+                || existing.provider_profile_fingerprint
+                    != observation.provider_profile_fingerprint
+        });
+        self.negative_benefit_observations.push(observation);
+        Ok(())
+    }
+
+    /// Import one-way veto evidence from a paired evaluator even when its
+    /// positive claim gate fails. Isolation, provenance and budget evidence
+    /// must still be complete; only the performance/quality benefit claim may
+    /// fail.
+    pub fn import_negative_benefit_report(
+        &mut self,
+        report: &serde_json::Value,
+    ) -> Result<usize, String> {
+        if report["kind"] != "harness_eval.auto_strategy_paired.v1"
+            || report
+                .pointer("/gate/provenance_complete")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            || report
+                .pointer("/gate/budget_observation_complete")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            || report
+                .pointer("/gate/judge_isolation_gate")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            || report
+                .pointer("/gate/workspace_reset_gate")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            || report
+                .pointer("/gate/baseline_topology_isolation_gate")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+        {
+            return Err("negative Team report lacks isolation/provenance gates".to_string());
+        }
+        let report_sha256 = format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(report)
+                    .map_err(|error| format!("encode negative Team report: {error}"))?
+            )
+        );
+        let observations = report
+            .get("negative_benefit_observations")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "negative Team report has no veto observations".to_string())?;
+        let mut imported = 0;
+        for value in observations {
+            let mut observation: NegativeBenefitObservation = serde_json::from_value(value.clone())
+                .map_err(|error| format!("decode negative Team observation: {error}"))?;
+            observation.report_sha256.clone_from(&report_sha256);
+            self.record_negative_benefit(observation)?;
+            imported += 1;
+        }
+        Ok(imported)
     }
 
     /// Import only a fully passed, provenance-bound paired evaluation report.
@@ -1275,7 +1458,17 @@ impl StrategyExperienceStore {
     }
 
     #[must_use]
-    pub fn enrich_input(&self, mut input: StrategyInput) -> StrategyInput {
+    pub fn enrich_input(&self, input: StrategyInput) -> StrategyInput {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| {
+                duration.as_millis().min(u128::from(u64::MAX)) as u64
+            });
+        self.enrich_input_at(input, now_ms)
+    }
+
+    #[must_use]
+    pub fn enrich_input_at(&self, mut input: StrategyInput, now_ms: u64) -> StrategyInput {
         let understanding = input
             .understanding
             .clone()
@@ -1294,6 +1487,14 @@ impl StrategyExperienceStore {
                 .map(|summary| (candidate, summary))
         })
         .collect();
+        input.negative_benefit_observations = self
+            .negative_benefit_observations
+            .iter()
+            .filter(|observation| {
+                observation.observed_at_ms <= now_ms && now_ms < observation.expires_at_ms
+            })
+            .cloned()
+            .collect();
         input
     }
 }
@@ -1449,12 +1650,56 @@ impl StrategyRouter {
         }
         let collaboration_lift =
             estimate_collaboration_lift(&understanding, input.experience.as_ref());
-        let candidate_estimates = estimate_execution_candidates(
+        let mut candidate_estimates = estimate_execution_candidates(
             &understanding,
             input.experience.as_ref(),
             &input.candidate_costs,
             &input.resource_snapshot,
         );
+        let workload_fingerprint =
+            StrategyWorkloadFingerprint::from_input(input, &understanding).digest();
+        let negative_team_veto = (!understanding.requests_multi_agent)
+            .then(|| {
+                input.negative_benefit_observations.iter().find(|observation| {
+                    observation.workload_fingerprint_sha256 == workload_fingerprint
+                        && !input
+                            .resource_snapshot
+                            .provider_profile_fingerprint
+                            .is_empty()
+                        && observation.provider_profile_fingerprint
+                            == input.resource_snapshot.provider_profile_fingerprint
+                })
+            })
+            .flatten();
+        if let Some(observation) = negative_team_veto {
+            if let Some(team) = candidate_estimates
+                .iter_mut()
+                .find(|estimate| estimate.candidate == ExecutionCandidateKind::Team)
+            {
+                team.eligible = false;
+                team.net_benefit_score = i64::MIN / 2;
+                team.reasons.push(format!(
+                    "automatic Team vetoed by workload/profile-scoped negative benefit evidence {}",
+                    &observation.report_sha256[..12]
+                ));
+            }
+            reasons.push(
+                "automatic Team vetoed by an unexpired, provenance-bound negative benefit observation"
+                    .to_string(),
+            );
+        }
+        if !understanding.requests_multi_agent
+            && candidate_estimates.iter().any(|estimate| {
+                estimate.candidate == ExecutionCandidateKind::Team
+                    && estimate.eligible
+                    && estimate.assumed
+            })
+        {
+            reasons.push(
+                "automatic Team requires observed positive net benefit; heuristic-only estimate is insufficient"
+                    .to_string(),
+            );
+        }
         let selected_candidate = if matches!(source, StrategyDecisionSource::ExperienceAdapted) {
             candidate_for_pattern(pattern).unwrap_or_else(|| {
                 select_execution_candidate(
@@ -1544,7 +1789,7 @@ impl StrategyRouter {
             confidence,
             reasons,
             required_capabilities,
-            policy_version: "strategy-decision-v4".to_string(),
+            policy_version: "strategy-decision-v5".to_string(),
             selected_candidate,
             candidate_estimates,
             resource_snapshot: input.resource_snapshot.clone(),
@@ -1687,7 +1932,7 @@ fn estimate_execution_candidates(
     let observed_coordination_ms = team_cost
         .filter(|sample| sample.average_coordination_cost_ms > 0)
         .map_or(1_800, |sample| sample.average_coordination_cost_ms);
-    let team = candidate_estimate(
+    let mut team = candidate_estimate(
         ExecutionCandidateKind::Team,
         team_eligible,
         serial_ms,
@@ -1715,6 +1960,12 @@ fn estimate_execution_candidates(
             resources.team_slots, team_execution_width,
         )],
     );
+    if resources.provider_concurrency_penalty_bp > 0 {
+        team.reasons.push(format!(
+            "provider queue/capacity pressure adds {}bp to Team cost",
+            resources.provider_concurrency_penalty_bp
+        ));
+    }
     [direct, parallel, team]
         .into_iter()
         .map(|mut estimate| {
@@ -1824,7 +2075,9 @@ fn select_execution_candidate(
         if let Some(team) = estimates
             .iter()
             .find(|estimate| estimate.candidate == ExecutionCandidateKind::Team)
-            .filter(|estimate| estimate.eligible)
+            .filter(|estimate| {
+                estimate.eligible && !estimate.assumed && estimate.net_benefit_score > 0
+            })
         {
             return team.candidate;
         }
@@ -1843,7 +2096,9 @@ fn select_execution_candidate(
         .filter(|estimate| estimate.eligible)
         .filter(|estimate| {
             estimate.candidate != ExecutionCandidateKind::Team
-                || resources.provider_concurrency_penalty_bp < 8_000
+                || (resources.provider_concurrency_penalty_bp < 8_000
+                    && !estimate.assumed
+                    && estimate.net_benefit_score > 0)
         })
         .max_by_key(|estimate| {
             (
@@ -2517,6 +2772,31 @@ const CRITICAL_RISK_TERMS: &[&str] = &[
 mod tests {
     use super::*;
 
+    fn with_proven_team_benefit(prompt: &str) -> StrategyInput {
+        let mut input = StrategyInput::from_prompt(prompt);
+        input.candidate_costs.insert(
+            ExecutionCandidateKind::Direct,
+            StrategyCandidateCostSummary {
+                sample_count: 3,
+                average_critical_path_ms: 40_000,
+                average_total_tokens: 1_000,
+                average_coordination_cost_ms: 0,
+                calibration_source: "test:observed-direct".to_string(),
+            },
+        );
+        input.candidate_costs.insert(
+            ExecutionCandidateKind::Team,
+            StrategyCandidateCostSummary {
+                sample_count: 3,
+                average_critical_path_ms: 20_000,
+                average_total_tokens: 1_200,
+                average_coordination_cost_ms: 1_000,
+                calibration_source: "test:observed-team".to_string(),
+            },
+        );
+        input
+    }
+
     fn proposal(pattern: ExecutionPattern, modifiers: Vec<ExecutionModifier>) -> StrategyProposal {
         StrategyProposal {
             pattern,
@@ -2623,14 +2903,14 @@ mod tests {
 
     #[test]
     fn routes_architecture_work_to_execute() {
-        let decision = decide_strategy(&StrategyInput::from_prompt(
+        let decision = decide_strategy(&with_proven_team_benefit(
             "全面重构 runtime gateway service crate 的架构，做完整阶段规划",
         ));
 
         assert_eq!(decision.pattern, ExecutionPattern::Collaborate);
         assert_eq!(decision.understanding.complexity, TaskComplexity::Strategic);
         assert!(decision.uses_modifier(ExecutionModifier::WithVerifier));
-        assert_eq!(decision.policy_version, "strategy-decision-v4");
+        assert_eq!(decision.policy_version, "strategy-decision-v5");
         assert!(
             decision
                 .required_capabilities
@@ -2708,7 +2988,7 @@ mod tests {
             );
         }
         for prompt in team {
-            let decision = decide_strategy(&StrategyInput::from_prompt(prompt));
+            let decision = decide_strategy(&with_proven_team_benefit(prompt));
             assert_eq!(
                 decision.selected_candidate,
                 ExecutionCandidateKind::Team,
@@ -2969,12 +3249,7 @@ mod tests {
         let decision = decide_strategy(&StrategyInput::from_prompt(prompt));
 
         assert!(!decision.understanding.requests_multi_agent);
-        assert_eq!(
-            decision.selected_candidate,
-            ExecutionCandidateKind::Team,
-            "{:?}",
-            decision.candidate_estimates
-        );
+        assert_ne!(decision.selected_candidate, ExecutionCandidateKind::Team);
     }
 
     #[test]
@@ -3401,5 +3676,115 @@ mod tests {
         quality.admission_channel = quality.registered_admission_channel();
         assert_eq!(quality.admission_channel, None);
         assert!(!quality.demonstrates_positive_lift());
+    }
+
+    #[test]
+    fn negative_benefit_is_exact_profile_scoped_expiring_and_veto_only() {
+        let prompt = "全面审查 runtime gateway frontend 三个独立责任域并综合";
+        let mut input = with_proven_team_benefit(prompt);
+        let understanding = understand(&input);
+        let workload = StrategyWorkloadFingerprint::from_input(&input, &understanding).digest();
+        let profile = "a".repeat(64);
+        input.resource_snapshot.provider_profile_fingerprint = profile.clone();
+        let observation = NegativeBenefitObservation {
+            workload_fingerprint_sha256: workload,
+            provider_profile_fingerprint: profile.clone(),
+            baseline_candidate: ExecutionCandidateKind::Direct,
+            baseline_duration_ms: 40_000,
+            baseline_quality_score_bp: 8_500,
+            team_duration_ms: 56_000,
+            team_quality_score_bp: 7_700,
+            report_sha256: "b".repeat(64),
+            provenance_ref: "harness_eval.auto_strategy_paired.v1:negative".to_string(),
+            observed_at_ms: 1_000,
+            expires_at_ms: 2_000,
+        };
+        let mut store = StrategyExperienceStore::new();
+        store.record_negative_benefit(observation).unwrap();
+
+        let candidate_costs = input.candidate_costs.clone();
+        let enriched = |now_ms| {
+            let mut enriched = store.enrich_input_at(input.clone(), now_ms);
+            enriched.candidate_costs.clone_from(&candidate_costs);
+            enriched
+        };
+        let vetoed = decide_strategy(&enriched(1_500));
+        assert_ne!(vetoed.selected_candidate, ExecutionCandidateKind::Team);
+        assert!(vetoed.reasons.iter().any(|reason| reason.contains("vetoed")));
+
+        let expired = decide_strategy(&enriched(2_000));
+        assert_eq!(expired.selected_candidate, ExecutionCandidateKind::Team);
+
+        let mut other_profile = enriched(1_500);
+        other_profile.resource_snapshot.provider_profile_fingerprint = "c".repeat(64);
+        assert_eq!(
+            decide_strategy(&other_profile).selected_candidate,
+            ExecutionCandidateKind::Team
+        );
+
+        let explicit = StrategyInput::from_prompt(
+            "必须启动 Team 分别审查 runtime gateway frontend 并综合",
+        );
+        assert_eq!(
+            decide_strategy(&store.enrich_input_at(explicit, 1_500)).selected_candidate,
+            ExecutionCandidateKind::Team
+        );
+    }
+
+    #[test]
+    fn assumed_team_benefit_never_materializes_automatic_team() {
+        let decision = decide_strategy(&StrategyInput::from_prompt(
+            "全面审查 runtime gateway frontend 三个独立责任域并综合",
+        ));
+        assert_ne!(decision.selected_candidate, ExecutionCandidateKind::Team);
+        let team = decision
+            .candidate_estimates
+            .iter()
+            .find(|estimate| estimate.candidate == ExecutionCandidateKind::Team)
+            .unwrap();
+        assert!(team.assumed);
+    }
+
+    #[test]
+    fn failed_positive_claim_can_import_only_a_negative_veto() {
+        let input = StrategyInput::from_prompt(
+            "全面审查 runtime gateway frontend 三个独立责任域并综合",
+        );
+        let fingerprint =
+            StrategyWorkloadFingerprint::from_input(&input, &understand(&input)).digest();
+        let report = serde_json::json!({
+            "kind": "harness_eval.auto_strategy_paired.v1",
+            "status": "failed",
+            "gate": {
+                "passed": false,
+                "claim_allowed": false,
+                "provenance_complete": true,
+                "budget_observation_complete": true,
+                "judge_isolation_gate": true,
+                "workspace_reset_gate": true,
+                "baseline_topology_isolation_gate": true
+            },
+            "negative_benefit_observations": [{
+                "workload_fingerprint_sha256": fingerprint,
+                "provider_profile_fingerprint": "a".repeat(64),
+                "baseline_candidate": "direct",
+                "baseline_duration_ms": 40_000,
+                "baseline_quality_score_bp": 8_500,
+                "team_duration_ms": 56_000,
+                "team_quality_score_bp": 7_700,
+                "report_sha256": "",
+                "provenance_ref": "harness_eval.auto_strategy_paired.v1:test",
+                "observed_at_ms": 1_000,
+                "expires_at_ms": 2_000
+            }]
+        });
+        let mut store = StrategyExperienceStore::new();
+        assert!(store.import_paired_evaluation_report(&report).is_err());
+        assert_eq!(store.import_negative_benefit_report(&report), Ok(1));
+        assert_eq!(store.records.len(), 0);
+        assert_eq!(store.negative_benefit_observations.len(), 1);
+        assert!(is_sha256(
+            &store.negative_benefit_observations[0].report_sha256
+        ));
     }
 }

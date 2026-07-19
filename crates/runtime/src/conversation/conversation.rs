@@ -1694,6 +1694,11 @@ where
         self.model_context_window
     }
 
+    #[must_use]
+    pub(crate) fn current_model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
     /// Return a human-readable description of memory subsystem health.
     /// `None` when healthy; `Some(msg)` when degraded or unavailable.
     pub fn memory_status(&self) -> Option<&str> {
@@ -7020,22 +7025,34 @@ where
                     serde_json::from_slice::<serde_json::Value>(&bytes)
                         .map_err(|error| error.to_string())
                 })
-                .and_then(|report| store.import_paired_evaluation_report(&report))
             {
-                Ok(imported) if imported > 0 => {
-                    if let Err(error) = store.save(&path) {
+                Ok(report) => {
+                    let positive = store.import_paired_evaluation_report(&report);
+                    let negative = store.import_negative_benefit_report(&report);
+                    let imported = positive.as_ref().copied().unwrap_or(0)
+                        + negative.as_ref().copied().unwrap_or(0);
+                    if imported > 0 {
+                        if let Err(error) = store.save(&path) {
+                            tracing::warn!(
+                                %error,
+                                report_path,
+                                "failed to persist imported strategy calibration"
+                            );
+                        }
+                    }
+                    if let (Err(positive), Err(negative)) = (positive, negative) {
                         tracing::warn!(
-                            %error,
+                            positive_error = %positive,
+                            negative_error = %negative,
                             report_path,
-                            "failed to persist imported paired strategy calibration"
+                            "rejected strategy calibration report"
                         );
                     }
                 }
-                Ok(_) => {}
                 Err(error) => tracing::warn!(
                     %error,
                     report_path,
-                    "rejected paired strategy calibration report"
+                    "failed to read strategy calibration report"
                 ),
             }
         }

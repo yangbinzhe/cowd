@@ -493,6 +493,7 @@ fn sanitize_resource_snapshot(mut snapshot: StrategyResourceSnapshot) -> Strateg
     snapshot.version = safe_public_text(&snapshot.version, 96);
     snapshot.sample_source = safe_public_text(&snapshot.sample_source, 160);
     snapshot.provider_concurrency_penalty_bp = snapshot.provider_concurrency_penalty_bp.min(10_000);
+    snapshot.provider_profile_fingerprint.clear();
     snapshot
 }
 
@@ -2144,6 +2145,11 @@ mod tests {
             estimates[0].reasons,
             vec!["redacted by strategy projection policy".to_string()]
         );
+        let resource = sanitize_resource_snapshot(StrategyResourceSnapshot {
+            provider_profile_fingerprint: "a".repeat(64),
+            ..StrategyResourceSnapshot::default()
+        });
+        assert!(resource.provider_profile_fingerprint.is_empty());
         assert!(safe_public_ref("file:///home/private/secret").is_none());
     }
 
